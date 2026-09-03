@@ -79,6 +79,7 @@ from coordinator import (
     record_credentialed_route_denied,
     record_llm_gateway_fault,
     record_llm_upstream_fault,
+    record_llm_client_disconnect,
     _parse_upstream_error_type,
     _decompress_prefix_for_parse,
     _decompress_full_for_usage,
@@ -94,6 +95,7 @@ from coordinator import (
     NREM_FOLD_ATTEMPT_WARN,
     telemetry_gateway_counters,
     telemetry_credential_counters,
+    telemetry_token_verify_ring,
     _llm_faults_snapshot,
 )
 
@@ -191,7 +193,15 @@ DEFAULT_TARGET = os.environ.get("LLM_DEFAULT_TARGET", FRAMEWORK_DEFAULTS["LLM_DE
 # free-est capable card. NOT least-response-time (long completions make latency
 # meaningless), NOT a gateway queue (forward-and-absorb into llama.cpp's own slot
 # queue keeps the gateway stateless). A backend that fails twice in a window is put
-# in cooldown; requests retry on the next-best backend — one card always serves.
+# in cooldown and EXCLUDED FROM SELECTION until it elapses — but this is
+# per-BACKEND health bookkeeping for the NEXT request's routing decision, not a
+# per-REQUEST retry (S12, OBS round — LLM_MAX_TRIES/"max_tries" promised
+# cross-backend failover this pool never had, and has been removed): a request
+# that fails against the backend it was routed to gets that backend's own 503,
+# not a silent hop to a different card. The one retry that DOES exist is
+# same-target only — a buffered-body request may be replayed once on a fresh
+# connection to the SAME backend after a connection-reuse race (see
+# `have_buffered_body`/`max_attempts` below, in the dispatch loop).
 #
 # LLM_BACKENDS_JSON is the preferred form when any backend needs its own
 # credential (a paid cloud API, e.g. DeepSeek/xAI) or its own model id — the
@@ -827,11 +837,18 @@ def _apply_backend_body_overrides(body: bytes, model: "str | None",
 
 # Failure/cooldown (advisor spec): N fails within a window → cooldown; re-probed
 # (a normal request) after it elapses. A success clears the fail streak.
+# ⛔ S12 (OBS round): this is PER-BACKEND bookkeeping that changes future
+# ROUTING, never a per-request retry. `LLM_MAX_TRIES` used to exist here,
+# read by nothing but the /memory/telemetry render — no code path ever
+# consulted it. The real retry is same-target and buffered-body-gated (see
+# `have_buffered_body`/`max_attempts` in the dispatch loop below): a
+# connection-reuse race may replay ONE buffered request on a fresh
+# connection to the SAME backend. A genuine failure — connect refusal,
+# timeout, a client abort — 503s (or its own status) straight to the
+# caller; it is never silently re-routed to a different backend.
 LLM_FAIL_THRESHOLD = int(os.environ.get("LLM_FAIL_THRESHOLD", "2"))
 LLM_FAIL_WINDOW = float(os.environ.get("LLM_FAIL_WINDOW", "60"))
 LLM_COOLDOWN = float(os.environ.get("LLM_COOLDOWN", "300"))
-# Per-request retries across backends on a connect failure (transparent to client).
-LLM_MAX_TRIES = int(os.environ.get("LLM_MAX_TRIES", "2")) + 1
 
 # ── Fit check (A-1/A-2/N-1/N-3, Model_Attributes_Routing_Plan_2026-08-18) ────
 # est_prompt_tokens = body_chars / CHARS_PER_TOKEN_RATIO, computed GATEWAY-side
@@ -2150,6 +2167,15 @@ class AsyncHiveMindProxy:
             # to False only at the single success return.
             _llm_req_start_mono = time.monotonic() if llm_backend is not None else None
             _llm_req_failed = True
+            # D9 (OBS round): a CLIENT abort (our caller hung up — either
+            # before we could write response headers, at `prepare()`, or
+            # partway through the streamed body) is the CALLER's event, not
+            # the backend's: neither `_llm_mark_ok` nor `_llm_mark_fail` fires
+            # for it, no gateway fault is recorded, and its duration is not a
+            # service time — set True by either abort window below, read by
+            # the mid-stream success gate and by the `finally` at the bottom
+            # of this method to skip `_record_llm_latency` entirely.
+            _client_aborted = False
 
             for attempt in range(max_attempts):
                 try:
@@ -2181,7 +2207,44 @@ class AsyncHiveMindProxy:
                         # unchanged. This header is additive and never set on success.
                         if upstream.status >= 400:
                             proxy_resp.headers["X-SM-Fault-Origin"] = "upstream"
-                        await proxy_resp.prepare(request)
+                        # D9 (OBS round): a NARROW except scoped to `prepare()`
+                        # ONLY — the same classes the mid-stream write path
+                        # below already catches, `(ConnectionResetError,
+                        # IOError)`. Proved (commit body) that aiohttp's own
+                        # web-writer raises exactly this: `web.StreamResponse`
+                        # defaults `_send_headers_immediately = True`, so
+                        # `prepare()` sends headers SYNCHRONOUSLY via
+                        # `http_writer.StreamWriter._write()`, which raises
+                        # `aiohttp.client_exceptions.ClientConnectionResetError`
+                        # ("Cannot write to closing transport") when OUR
+                        # downstream transport (this client's connection to
+                        # US) is already closing — and that class IS-A builtin
+                        # `ConnectionResetError` (checked via its MRO), so this
+                        # narrow except catches it structurally, with no need
+                        # to name the aiohttp class explicitly. Before this
+                        # fix that exception fell through uncaught to the
+                        # per-attempt `except (ClientConnectionResetError,
+                        # ServerDisconnectedError)` below — the clause meant
+                        # for the UPSTREAM connection-reuse race — which
+                        # treats `proxy_resp is not None` (true here, it was
+                        # already constructed above) as "not the retryable
+                        # case" and re-raises into the `ClientError` handler:
+                        # an "Upstream unreachable" ERROR log + `_llm_mark_fail`
+                        # for a card that never saw a single byte of this
+                        # request. ⛔ Deliberately NOT `asyncio.CancelledError`
+                        # (task cancellation is not a client abort — see the
+                        # existing comments below on why swallowing it would
+                        # stall shutdown); it is a `BaseException`, not caught
+                        # by this tuple regardless.
+                        try:
+                            await proxy_resp.prepare(request)
+                        except (ConnectionResetError, IOError) as e:
+                            log.warning(
+                                "Client disconnected before response headers "
+                                "could be sent: %s — %s", target_url, e)
+                            record_llm_client_disconnect()
+                            _client_aborted = True
+                            return proxy_resp
 
                         # Best-effort credential-fault classification (PR A3): only for
                         # the LLM pool (embeddings/reranking never carry a provider key)
@@ -2282,7 +2345,19 @@ class AsyncHiveMindProxy:
                         except (ConnectionResetError, IOError) as e:
                             # OS-level socket reset from the downstream client.
                             # Nothing more can be sent; log and return.
+                            #
+                            # D9 (OBS round): this branch used to fall through
+                            # to `_llm_mark_ok` below unconditionally — a
+                            # mid-stream client abort on a 200 upstream
+                            # recorded SUCCESS and cleared the backend's fail
+                            # streak, the opposite defect from the prepare()
+                            # window (which recorded a FALSE failure). A
+                            # partial write is not "served": mark neither ok
+                            # nor fail, so a genuinely flaky backend's streak
+                            # survives an unrelated client hangup.
                             log.warning("Client disconnected mid-stream: %s — %s", target_url, e)
+                            record_llm_client_disconnect()
+                            _client_aborted = True
 
                         # Fallback classification (PR A3): the loop above never ran its
                         # body — an empty-bodied fault response, or a disconnect before
@@ -2326,7 +2401,10 @@ class AsyncHiveMindProxy:
                             except Exception:
                                 pass   # not a single-object JSON body (e.g. SSE) — skip, never breaks the proxy path
 
-                        if llm_backend is not None:
+                        # D9: a client abort mid-stream (`_client_aborted`,
+                        # set above) is the CALLER's event, not a verdict on
+                        # this backend — neither ok nor fail fires for it.
+                        if llm_backend is not None and not _client_aborted:
                             _llm_mark_ok(llm_backend)   # connected + served — clear fail streak
                         # The exchange completed and the body was fully
                         # written above (write_eof / the disconnect branches
@@ -2335,7 +2413,9 @@ class AsyncHiveMindProxy:
                         # return (the body passes through verbatim either
                         # way, per the X-SM-Fault-Origin comment above), so
                         # the latency instrument's failed flag reads the
-                        # status here rather than assuming success.
+                        # status here rather than assuming success. Unused
+                        # when `_client_aborted` — the `finally` below skips
+                        # `_record_llm_latency` entirely for an abort.
                         _llm_req_failed = upstream.status >= 400
                         return proxy_resp
 
@@ -2453,7 +2533,14 @@ class AsyncHiveMindProxy:
                 # never reach here with a backend set. _llm_req_failed
                 # defaults True and is flipped only at the single success
                 # return above, reading the upstream status there.
-                if _llm_req_start_mono is not None:
+                #
+                # D9 (OBS round): SKIP this entirely on a client abort
+                # (`_client_aborted`) — a `failed=False` record still updates
+                # `latency_max`, and an abort's duration is not a service
+                # time. Accepted survivor bias: this hides "clients hang up
+                # because the backend is slow" from the latency ring (no
+                # second ring is added to recover it — HANDOFF note).
+                if _llm_req_start_mono is not None and not _client_aborted:
                     _record_llm_latency(
                         llm_backend, time.monotonic() - _llm_req_start_mono, _llm_req_failed)
 
@@ -4635,12 +4722,21 @@ def _warning(key: str, limit, observed, unit: str) -> dict:
     return {"key": key, "limit": limit, "observed": observed, "unit": unit}
 
 
-# ⛔ A WARNING MUST BE ABLE TO CLEAR, so neither of the two below is read off a
-# cumulative counter. A `shed_503_total > 0` warning raised once would stay
-# raised until the process restarted, and an alert that never clears is an alert
-# an operator learns to close. Both take the DELTA since the previous health
-# build (the TTL bounds how often that is), which falls back to zero on its own
-# as soon as the condition stops.
+# ⛔ A WARNING MUST BE ABLE TO CLEAR, so `_gateway_shed_rate` below is not read
+# off a cumulative counter. A `shed_503_total > 0` warning raised once would
+# stay raised until the process restarted, and an alert that never clears is
+# an alert an operator learns to close. It takes the DELTA since the previous
+# health build (the TTL bounds how often that is), which falls back to zero
+# on its own as soon as the condition stops.
+#
+# D1 (OBS round): `token_verify_failed`'s warning USED to share this
+# health-build-delta pattern via `_delta_per_min` below — it no longer does
+# (see `_token_verify_failure_rate`'s docstring for why that reading was
+# poll-cadence-dependent, not a true rate). `_delta_per_min` now has no
+# caller left (left in place, unmodified — out of this round's scope);
+# `_rate_marks` still backs `_gateway_shed_rate`'s "shed" key, untouched
+# (HANDOFF note: `_gateway_shed_rate`'s own cadence sensitivity is out of
+# this round's scope too).
 _rate_marks: dict[str, tuple[int, float]] = {}
 
 
@@ -4681,12 +4777,42 @@ def _gateway_shed_rate() -> int:
         return 0
 
 
-def _token_verify_failure_rate() -> float | None:
-    """token_verify_failed per minute since the previous health build."""
+def _token_verify_failure_rate(now: float | None = None) -> float | None:
+    """D1: the COUNT of token_verify_failed events in a true 60 s monotonic
+    window — replaces the old `_delta_per_min` extrapolation, which divided
+    the lifetime counter's delta by the gap between health-cache BUILDS
+    (HEALTH_CACHE_TTL_S), not by a fixed window. That made the "reading"
+    entirely poll-cadence-dependent: one event read ~24/min at the 3 s TTL
+    default and ~0.1/min under 600 s polling of the same single event —
+    the poll cadence WAS the number, never the actual rate.
+
+    Walks a synchronous snapshot of the coordinator's fixed-256 ring
+    (`telemetry_token_verify_ring()`, appended with `time.monotonic()` at
+    both bump sites) and counts entries within 60.0 seconds of `now`. No
+    await anywhere in the walk.
+
+    `now` is injectable — tests pass an explicit monotonic float to control
+    which ring entries fall inside the window, rather than patching
+    `datetime` (the ring never reads wall-clock time, so patching
+    `datetime` would not move it at all). Production callers always pass
+    None and get the live `time.monotonic()`.
+
+    Saturates at the ring's fixed 256-entry cap: a 60 s flood of more than
+    256 events reads exactly 256, not the true rate — documented, not a
+    bug (see coordinator._token_verify_failure_ring's declaration and
+    HANDOFF.md). The warning still fires at a saturated reading; only the
+    unbounded lifetime total remains at credentials.token_verify_failed.
+
+    Returns 0.0 (never None) when the ring is empty — unlike the old
+    "None on the very first call" semantics, an honest window has nothing
+    to distinguish "never happened" from "not yet warmed up"; a genuinely
+    empty 60 s window IS zero events.
+    """
     try:
-        return _delta_per_min(
-            "token_verify_failed",
-            telemetry_credential_counters().get("token_verify_failed", 0))
+        if now is None:
+            now = time.monotonic()
+        return float(sum(1 for ts in telemetry_token_verify_ring()
+                          if now - ts <= 60.0))
     except Exception:
         return None
 
@@ -4909,7 +5035,6 @@ def _config_snapshot() -> dict:
             "fail_threshold": LLM_FAIL_THRESHOLD,
             "fail_window_s": LLM_FAIL_WINDOW,
             "cooldown_s": LLM_COOLDOWN,
-            "max_tries": LLM_MAX_TRIES,
         },
         "llm_affinity": {
             "prefix_chars": AFFINITY_PREFIX_CHARS,

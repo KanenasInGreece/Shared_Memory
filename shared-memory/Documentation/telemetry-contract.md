@@ -3,7 +3,7 @@
 
 # The Telemetry Contract
 
-Contract version **0.9.87**. Every key the gateway emits on `GET /health` and `GET /memory/telemetry`, what it means, what it is measured in, when it arrived, and where it is going.
+Contract version **0.9.88**. Every key the gateway emits on `GET /health` and `GET /memory/telemetry`, what it means, what it is measured in, when it arrived, and where it is going.
 
 ## The roles
 
@@ -14,6 +14,17 @@ Contract version **0.9.87**. Every key the gateway emits on `GET /health` and `G
 `GET /memory/telemetry` is **the numbers**: counters, gauges, percentiles and censuses, with the limit stated next to the number it bounds. Bounded cost per request — the whole payload is cached for `TELEMETRY_CACHE_S`, and the unbounded insight walk is computed by the refresher, not per request.
 
 The logs are the final word on *what happened at 03:12*: every dependency state transition and every warning raised or cleared writes one line named after the key that changed (the **log twin** column). Never a line per poll.
+
+## Warning keys
+
+`warnings[].key` (CG, OBS round) is one of this enumerated set — never a free string. Each is produced by exactly one `_warning(...)` call site in `hive_mind_proxy.py`'s health-build function; the log line it writes when raised or cleared is `health.warning.<key>`.
+
+- `encoder_embedder_projected_ms`
+- `encoder_reranker_projected_ms`
+- `gateway_shed_503_total`
+- `outbox_oldest_pending_age_s`
+- `rem_dead_lettered`
+- `token_verify_failed_per_min`
 
 ## HTTP status codes — unchanged by this release
 
@@ -38,6 +49,9 @@ A key whose **value** changed meaning while its **name** stayed. Enumerated beca
 | health | `dependencies.llm_pool.state (legacy-CSV population)` | 0.9.81 | `ok` for a live legacy `LLM_BACKENDS` CSV (or the bare `LLM_DEFAULT_TARGET` fallback) serving role-less traffic — a descriptor-less fleet was eligible for everything (I-5a) | `degraded` for the same population — a descriptor-less fleet is now eligible for NOTHING under default-deny, surfaced by the widened `_all_roles_ineligible` trigger; measured: `test_declared_fleet_healthy_still_reads_ok_unchanged` flips ok→degraded for exactly this shape | a consumer that treated a live legacy-CSV install as healthy-by-construction must now read `reason` — it names the fix (declare `LLM_BACKENDS_JSON` explicitly) rather than the install being silently fine |
 | health | `dependencies.rem_daemon.state / dependencies.nrem_daemon.state` | 0.9.81 | the 0.9.79 `degraded` reason (no backend counts toward /pool/status free_slots) fired only for a genuinely partial-role or private_ok=false-only configuration — a deliberate, already-narrow population | the SAME reason string now also fires for every UNDECLARED fleet (legacy CSV, bare `LLM_DEFAULT_TARGET`, or an explicitly-declared-but-never-opted-in JSON fleet) — W4's default-deny flip means none of them count a free dream slot any more either, widening the population this reason composes for without changing the reason's own wording | a consumer alerting on rem_daemon/nrem_daemon `degraded` will now see this reason far more often post-upgrade — it is the expected, honest surfacing of a fleet that was silently never dreaming before, not a regression |
 | health | `dependencies.llm_pool.reason` | 0.9.81 | the config-empty reason and `_all_roles_ineligible`'s reason each named only the bare fact (no backend declared / configured but ineligible), with no remedy | both reason strings, when a legacy declaration key (`LLM_BACKENDS` CSV or bare `LLM_DEFAULT_TARGET`) is present, APPEND a remedy clause naming `check_config.py` and "declare LLM_BACKENDS_JSON explicitly" (§6.5, decision:1824) — deliberately NOT `migrate_env.py`, whose same-generation planning gate (§6.4) means it would correctly no-op for this population at runtime | a consumer doing exact-string matching on either reason must now match a PREFIX, not the whole string — the remedy clause is additive text, appended, never a replacement of the original fact |
+| health | `warnings[] (key=token_verify_failed_per_min)` | 0.9.88 | a counter delta extrapolated over the gap between health-cache BUILDS (HEALTH_CACHE_TTL_S) — poll-cadence-dependent: one event read ~24/min at the 3 s TTL default and ~0.1/min under 600 s polling of the exact same single event | the count of token_verify_failed events in a true 60 s monotonic window, capped at 256 (the coordinator ring's fixed bound — a flood inside one 60 s window reads exactly 256, not the true rate; the warning still fires at a saturated reading) | a consumer alerting on this warning's `observed` value now reads an honest per-minute count instead of a number that moved with how often something else polled /health; the warning key name and the `> TOKEN_VERIFY_WARN_PER_MIN` comparison, including its threshold-0 semantics, are unchanged |
+| telemetry | `gateway.requests_total` | 0.9.88 | counted only AUTHENTICATED, handler-reached requests — the gateway's own 401/403/503 responses (load-shed, role denial, backup-quiesce) and all auth-off traffic never reached the single `_record_gateway_request` call site | counts every request entering the gateway, at every exit the middleware can take — exactly one `_record_gateway_request` per request | expect this counter to STEP UP on deploy — health polls and previously-invisible gateway-issued 401/403/503 now count. Magnitude is unmeasured; observe post-deploy rather than predicting |
+| telemetry | `gateway.by_status.*` | 0.9.88 | only the authenticated, handler-reached path's own status was ever counted — a gateway-issued 401/403/503 (load-shed, role denial, backup-quiesce) was invisible here | every exit the middleware can take is counted, so `by_status.401` now includes protected-path bearer failures, `by_status.403` includes role denials, and `by_status.503` now includes load-shed and backup-quiesce alongside pool-saturated — `shed_503_total` is therefore only `<= by_status.503` from now on, no longer equal-by-construction on the shed class alone | a consumer that treated `shed_503_total == by_status.503` as an invariant must drop that assumption; a 401 from a protected path now shows up here AND in the D1 rate window AND in `credentials.token_verify_failed` — same event, three surfaces. The v0.9.87 stale-token-monitor `/health` case is unaffected here: it serves 200, so it moves only the D1 window and `requests_total`/`by_status.2xx`, never `by_status.401` |
 
 ## Removed outright in 0.9.74
 
@@ -50,9 +64,18 @@ Not moved — **removed**. Each had no writer and had therefore read `0` since i
 | telemetry | `entity_graph.alias_components` | read Entity.alias_component, which the retired gds.wcc caller was the only writer of |
 | telemetry | `entity_graph.largest_alias_component` | same retired gds.wcc stamp |
 
+## Removed outright in 0.9.88
+
+Not moved — **removed**. Each had no writer.
+
+| endpoint | key | why |
+|---|---|---|
+| health | `config.llm_pool_tuning.max_tries` | no writer — LLM_MAX_TRIES was read by nothing but this render; the comments beside it promised cross-backend failover the pool never implemented |
+| telemetry | `config.llm_pool_tuning.max_tries` | same dead LLM_MAX_TRIES constant, dual-emitted copy |
+
 ## Dual-emit drop target
 
-`removed_in: 0.9.88 (targeted)` marks a key moved off `/health` and dual-emitted since v0.9.74. The drop is **gated on the monitor-contract step landing first** (Group 3 — the monitor must consume the replacement keys before the originals can go); `0.9.88` names only the earliest release it could still happen in, **not a commitment**.
+`removed_in: 0.9.89 (targeted)` marks a key moved off `/health` and dual-emitted since v0.9.74. The drop is **gated on the monitor-contract step landing first** (Group 3 — the monitor must consume the replacement keys before the originals can go); `0.9.89` names only the earliest release it could still happen in, **not a commitment**.
 
 ## `GET /health`
 
@@ -97,7 +120,7 @@ Paths are relative to the response object.
 | key | type | unit | since | moved to | removed in | log twin | notes |
 |---|---|---|---|---|---|---|---|
 | `warnings[]` | list | — | 0.9.74 | — | — | — | One entry per limit crossing. The THRESHOLD lives server-side so every consumer sees the same verdict — the monitor stops deriving health from telemetry numbers client-side. |
-| `warnings[].key` | str | — | 0.9.74 | — | — | `health.warning.<key>` | — |
+| `warnings[].key` | str | — | 0.9.74 | — | — | `health.warning.<key>` | one of WARNING_KEYS — see that constant's docstring |
 | `warnings[].limit` | int/float | — | 0.9.74 | — | — | — | — |
 | `warnings[].observed` | int/float | — | 0.9.74 | — | — | — | — |
 | `warnings[].unit` | str | — | 0.9.74 | — | — | — | — |
@@ -107,35 +130,35 @@ Paths are relative to the response object.
 | key | type | unit | since | moved to | removed in | log twin | notes |
 |---|---|---|---|---|---|---|---|
 | `capacity.derived.client_ceiling_s` | float/null | _s | <=0.9.73 | — | — | — | — |
-| `capacity.derived.payload_basis` | str | — | <=0.9.73 | `telemetry:capacity.derived.payload_basis` | 0.9.88 (targeted) | — | — |
-| `capacity.derived.payload_basis_sample_count` | int | — | <=0.9.73 | `telemetry:capacity.derived.payload_basis_sample_count` | 0.9.88 (targeted) | — | — |
-| `capacity.derived.payload_max_chars_measured` | int/null | _chars | <=0.9.73 | `telemetry:capacity.derived.payload_max_chars_measured` | 0.9.88 (targeted) | — | — |
-| `capacity.derived.payload_mean_chars_measured` | int/float/null | _chars | <=0.9.73 | `telemetry:capacity.derived.payload_mean_chars_measured` | 0.9.88 (targeted) | — | — |
-| `capacity.derived.queue_bound` | int/null | — | <=0.9.73 | `telemetry:capacity.derived.queue_bound` | 0.9.88 (targeted) | — | — |
-| `capacity.derived.recommended_reranker_mem_limit_bytes` | int/null | _bytes | <=0.9.73 | `telemetry:capacity.derived.recommended_reranker_mem_limit_bytes` | 0.9.88 (targeted) | — | — |
+| `capacity.derived.payload_basis` | str | — | <=0.9.73 | `telemetry:capacity.derived.payload_basis` | 0.9.89 (targeted) | — | — |
+| `capacity.derived.payload_basis_sample_count` | int | — | <=0.9.73 | `telemetry:capacity.derived.payload_basis_sample_count` | 0.9.89 (targeted) | — | — |
+| `capacity.derived.payload_max_chars_measured` | int/null | _chars | <=0.9.73 | `telemetry:capacity.derived.payload_max_chars_measured` | 0.9.89 (targeted) | — | — |
+| `capacity.derived.payload_mean_chars_measured` | int/float/null | _chars | <=0.9.73 | `telemetry:capacity.derived.payload_mean_chars_measured` | 0.9.89 (targeted) | — | — |
+| `capacity.derived.queue_bound` | int/null | — | <=0.9.73 | `telemetry:capacity.derived.queue_bound` | 0.9.89 (targeted) | — | — |
+| `capacity.derived.recommended_reranker_mem_limit_bytes` | int/null | _bytes | <=0.9.73 | `telemetry:capacity.derived.recommended_reranker_mem_limit_bytes` | 0.9.89 (targeted) | — | — |
 | `capacity.derived.s_max_measured_s` | float/null | _s | <=0.9.73 | — | — | — | — |
-| `capacity.derived.s_mean_measured_s` | float/null | _s | <=0.9.73 | `telemetry:capacity.derived.s_mean_measured_s` | 0.9.88 (targeted) | — | — |
+| `capacity.derived.s_mean_measured_s` | float/null | _s | <=0.9.73 | `telemetry:capacity.derived.s_mean_measured_s` | 0.9.89 (targeted) | — | — |
 | `capacity.derived.s_mean_s` | float/null | _s | <=0.9.73 | — | — | — | — |
-| `capacity.derived.single_search_exceeds_wait` | bool | — | <=0.9.73 | `telemetry:capacity.derived.single_search_exceeds_wait` | 0.9.88 (targeted) | — | — |
-| `capacity.derived.tolerable_wait_s` | float/null | _s | <=0.9.73 | `telemetry:capacity.derived.tolerable_wait_s` | 0.9.88 (targeted) | — | — |
-| `capacity.fingerprint.encoder_config.cpu_encoder_replicas` | str/int/null | — | <=0.9.73 | `telemetry:capacity.fingerprint.encoder_config.cpu_encoder_replicas` | 0.9.88 (targeted) | — | — |
-| `capacity.fingerprint.encoder_config.embedder_url` | str | — | <=0.9.73 | `telemetry:capacity.fingerprint.encoder_config.embedder_url` | 0.9.88 (targeted) | — | — |
-| `capacity.fingerprint.encoder_config.gpu_encoder_replicas` | str/int/null | — | <=0.9.73 | `telemetry:capacity.fingerprint.encoder_config.gpu_encoder_replicas` | 0.9.88 (targeted) | — | — |
-| `capacity.fingerprint.encoder_config.rerank_max_doc_chars` | int | _chars | <=0.9.73 | `telemetry:capacity.fingerprint.encoder_config.rerank_max_doc_chars` | 0.9.88 (targeted) | — | — |
-| `capacity.fingerprint.encoder_config.reranker_url` | str | — | <=0.9.73 | `telemetry:capacity.fingerprint.encoder_config.reranker_url` | 0.9.88 (targeted) | — | — |
-| `capacity.fingerprint.encoder_config.search_candidate_floor` | int | — | <=0.9.73 | `telemetry:capacity.fingerprint.encoder_config.search_candidate_floor` | 0.9.88 (targeted) | — | — |
-| `capacity.fingerprint.hardware.gpu_present` | bool | — | <=0.9.73 | `telemetry:capacity.fingerprint.hardware.gpu_present` | 0.9.88 (targeted) | — | — |
-| `capacity.fingerprint.hardware.mem_total_bytes` | int | _bytes | <=0.9.73 | `telemetry:capacity.fingerprint.hardware.mem_total_bytes` | 0.9.88 (targeted) | — | — |
-| `capacity.fingerprint.hardware.nproc` | int | — | <=0.9.73 | `telemetry:capacity.fingerprint.hardware.nproc` | 0.9.88 (targeted) | — | — |
-| `capacity.probe.embedder_chars_per_s` | int/float/null | — | <=0.9.73 | `telemetry:capacity.probe.embedder_chars_per_s` | 0.9.88 (targeted) | — | — |
-| `capacity.probe.embedder_measured_at` | str/null | — | <=0.9.73 | `telemetry:capacity.probe.embedder_measured_at` | 0.9.88 (targeted) | — | — |
+| `capacity.derived.single_search_exceeds_wait` | bool | — | <=0.9.73 | `telemetry:capacity.derived.single_search_exceeds_wait` | 0.9.89 (targeted) | — | — |
+| `capacity.derived.tolerable_wait_s` | float/null | _s | <=0.9.73 | `telemetry:capacity.derived.tolerable_wait_s` | 0.9.89 (targeted) | — | — |
+| `capacity.fingerprint.encoder_config.cpu_encoder_replicas` | str/int/null | — | <=0.9.73 | `telemetry:capacity.fingerprint.encoder_config.cpu_encoder_replicas` | 0.9.89 (targeted) | — | — |
+| `capacity.fingerprint.encoder_config.embedder_url` | str | — | <=0.9.73 | `telemetry:capacity.fingerprint.encoder_config.embedder_url` | 0.9.89 (targeted) | — | — |
+| `capacity.fingerprint.encoder_config.gpu_encoder_replicas` | str/int/null | — | <=0.9.73 | `telemetry:capacity.fingerprint.encoder_config.gpu_encoder_replicas` | 0.9.89 (targeted) | — | — |
+| `capacity.fingerprint.encoder_config.rerank_max_doc_chars` | int | _chars | <=0.9.73 | `telemetry:capacity.fingerprint.encoder_config.rerank_max_doc_chars` | 0.9.89 (targeted) | — | — |
+| `capacity.fingerprint.encoder_config.reranker_url` | str | — | <=0.9.73 | `telemetry:capacity.fingerprint.encoder_config.reranker_url` | 0.9.89 (targeted) | — | — |
+| `capacity.fingerprint.encoder_config.search_candidate_floor` | int | — | <=0.9.73 | `telemetry:capacity.fingerprint.encoder_config.search_candidate_floor` | 0.9.89 (targeted) | — | — |
+| `capacity.fingerprint.hardware.gpu_present` | bool | — | <=0.9.73 | `telemetry:capacity.fingerprint.hardware.gpu_present` | 0.9.89 (targeted) | — | — |
+| `capacity.fingerprint.hardware.mem_total_bytes` | int | _bytes | <=0.9.73 | `telemetry:capacity.fingerprint.hardware.mem_total_bytes` | 0.9.89 (targeted) | — | — |
+| `capacity.fingerprint.hardware.nproc` | int | — | <=0.9.73 | `telemetry:capacity.fingerprint.hardware.nproc` | 0.9.89 (targeted) | — | — |
+| `capacity.probe.embedder_chars_per_s` | int/float/null | — | <=0.9.73 | `telemetry:capacity.probe.embedder_chars_per_s` | 0.9.89 (targeted) | — | — |
+| `capacity.probe.embedder_measured_at` | str/null | — | <=0.9.73 | `telemetry:capacity.probe.embedder_measured_at` | 0.9.89 (targeted) | — | — |
 | `capacity.probe.probe_stale` | bool | — | <=0.9.73 | — | — | — | — |
-| `capacity.probe.probed_at` | str/null | — | <=0.9.73 | `telemetry:capacity.probe.probed_at` | 0.9.88 (targeted) | — | — |
-| `capacity.probe.reranker_chars_per_s` | int/float/null | — | <=0.9.73 | `telemetry:capacity.probe.reranker_chars_per_s` | 0.9.88 (targeted) | — | — |
-| `capacity.probe.reranker_measured_at` | str/null | — | <=0.9.73 | `telemetry:capacity.probe.reranker_measured_at` | 0.9.88 (targeted) | — | — |
-| `capacity.probe.reranker_status` | str/null | — | <=0.9.73 | `telemetry:capacity.probe.reranker_status` | 0.9.88 (targeted) | — | — |
+| `capacity.probe.probed_at` | str/null | — | <=0.9.73 | `telemetry:capacity.probe.probed_at` | 0.9.89 (targeted) | — | — |
+| `capacity.probe.reranker_chars_per_s` | int/float/null | — | <=0.9.73 | `telemetry:capacity.probe.reranker_chars_per_s` | 0.9.89 (targeted) | — | — |
+| `capacity.probe.reranker_measured_at` | str/null | — | <=0.9.73 | `telemetry:capacity.probe.reranker_measured_at` | 0.9.89 (targeted) | — | — |
+| `capacity.probe.reranker_status` | str/null | — | <=0.9.73 | `telemetry:capacity.probe.reranker_status` | 0.9.89 (targeted) | — | — |
 | `capacity.timestamp` | str | — | <=0.9.73 | — | — | — | — |
-| `capacity.trigger` | str | — | <=0.9.73 | `telemetry:capacity.trigger` | 0.9.88 (targeted) | — | — |
+| `capacity.trigger` | str | — | <=0.9.73 | `telemetry:capacity.trigger` | 0.9.89 (targeted) | — | — |
 
 ### encoders
 
@@ -154,7 +177,7 @@ Paths are relative to the response object.
 | `backend_capability.gateway_host_load1` | float/null | — | <=0.9.73 | — | — | — | — |
 | `backend_capability.probed_at` | str/null | — | <=0.9.73 | — | — | — | — |
 | `backend_capability.status` | str/null | — | <=0.9.73 | — | — | — | — |
-| `config.embed_max_chars` | int | _chars | <=0.9.73 | `telemetry:config.embed_max_chars` | 0.9.88 (targeted) | — | — |
+| `config.embed_max_chars` | int | _chars | <=0.9.73 | `telemetry:config.embed_max_chars` | 0.9.89 (targeted) | — | — |
 | `embedder` | str | — | <=0.9.73 | — | — | — | ok \| timeout \| down \| http_<code> |
 | `reranker` | str | — | <=0.9.73 | — | — | — | ok \| timeout \| down \| http_<code> |
 
@@ -162,80 +185,79 @@ Paths are relative to the response object.
 
 | key | type | unit | since | moved to | removed in | log twin | notes |
 |---|---|---|---|---|---|---|---|
-| `pgvector.iterative_scan` | bool | — | <=0.9.73 | `telemetry:postgres.pgvector.iterative_scan` | 0.9.88 (targeted) | — | — |
-| `pgvector.version` | str/null | — | <=0.9.73 | `telemetry:postgres.pgvector.version` | 0.9.88 (targeted) | — | — |
+| `pgvector.iterative_scan` | bool | — | <=0.9.73 | `telemetry:postgres.pgvector.iterative_scan` | 0.9.89 (targeted) | — | — |
+| `pgvector.version` | str/null | — | <=0.9.73 | `telemetry:postgres.pgvector.version` | 0.9.89 (targeted) | — | — |
 
 ### llm
 
 | key | type | unit | since | moved to | removed in | log twin | notes |
 |---|---|---|---|---|---|---|---|
-| `config.llm_affinity.max_inflight` | int | — | <=0.9.73 | `telemetry:config.llm_affinity.max_inflight` | 0.9.88 (targeted) | — | — |
-| `config.llm_affinity.prefix_chars` | int | _chars | <=0.9.73 | `telemetry:config.llm_affinity.prefix_chars` | 0.9.88 (targeted) | — | — |
-| `config.llm_affinity.ttl_s` | float/int | _s | <=0.9.73 | `telemetry:config.llm_affinity.ttl_s` | 0.9.88 (targeted) | — | — |
-| `config.llm_backends[]` | list | — | <=0.9.73 | `telemetry:config.llm_backends` | 0.9.88 (targeted) | — | — |
-| `config.llm_backends[].max_inflight` | int/null | — | <=0.9.73 | `telemetry:config.llm_backends[].max_inflight` | 0.9.88 (targeted) | — | — |
-| `config.llm_backends[].model` | str/null | — | <=0.9.73 | `telemetry:config.llm_backends[].model` | 0.9.88 (targeted) | — | — |
-| `config.llm_backends[].n_ctx` | int/null | — | <=0.9.73 | `telemetry:config.llm_backends[].n_ctx` | 0.9.88 (targeted) | — | — |
-| `config.llm_backends[].price_per_mtok_in` | float/null | — | <=0.9.73 | `telemetry:config.llm_backends[].price_per_mtok_in` | 0.9.88 (targeted) | — | — |
-| `config.llm_backends[].price_per_mtok_out` | float/null | — | <=0.9.73 | `telemetry:config.llm_backends[].price_per_mtok_out` | 0.9.88 (targeted) | — | — |
-| `config.llm_backends[].private_ok` | bool | — | <=0.9.73 | `telemetry:config.llm_backends[].private_ok` | 0.9.88 (targeted) | — | — |
-| `config.llm_backends[].roles` | list/null | — | <=0.9.73 | `telemetry:config.llm_backends[].roles` | 0.9.88 (targeted) | — | — |
-| `config.llm_backends[].url` | str | — | <=0.9.73 | `telemetry:config.llm_backends[].url` | 0.9.88 (targeted) | — | — |
-| `config.llm_backends[].weight` | float | — | <=0.9.73 | `telemetry:config.llm_backends[].weight` | 0.9.88 (targeted) | — | — |
-| `config.llm_pool_tuning.cooldown_s` | float/int | _s | <=0.9.73 | `telemetry:config.llm_pool_tuning.cooldown_s` | 0.9.88 (targeted) | — | — |
-| `config.llm_pool_tuning.fail_threshold` | int | — | <=0.9.73 | `telemetry:config.llm_pool_tuning.fail_threshold` | 0.9.88 (targeted) | — | — |
-| `config.llm_pool_tuning.fail_window_s` | float/int | _s | <=0.9.73 | `telemetry:config.llm_pool_tuning.fail_window_s` | 0.9.88 (targeted) | — | — |
-| `config.llm_pool_tuning.max_tries` | int | — | <=0.9.73 | `telemetry:config.llm_pool_tuning.max_tries` | 0.9.88 (targeted) | — | — |
+| `config.llm_affinity.max_inflight` | int | — | <=0.9.73 | `telemetry:config.llm_affinity.max_inflight` | 0.9.89 (targeted) | — | — |
+| `config.llm_affinity.prefix_chars` | int | _chars | <=0.9.73 | `telemetry:config.llm_affinity.prefix_chars` | 0.9.89 (targeted) | — | — |
+| `config.llm_affinity.ttl_s` | float/int | _s | <=0.9.73 | `telemetry:config.llm_affinity.ttl_s` | 0.9.89 (targeted) | — | — |
+| `config.llm_backends[]` | list | — | <=0.9.73 | `telemetry:config.llm_backends` | 0.9.89 (targeted) | — | — |
+| `config.llm_backends[].max_inflight` | int/null | — | <=0.9.73 | `telemetry:config.llm_backends[].max_inflight` | 0.9.89 (targeted) | — | — |
+| `config.llm_backends[].model` | str/null | — | <=0.9.73 | `telemetry:config.llm_backends[].model` | 0.9.89 (targeted) | — | — |
+| `config.llm_backends[].n_ctx` | int/null | — | <=0.9.73 | `telemetry:config.llm_backends[].n_ctx` | 0.9.89 (targeted) | — | — |
+| `config.llm_backends[].price_per_mtok_in` | float/null | — | <=0.9.73 | `telemetry:config.llm_backends[].price_per_mtok_in` | 0.9.89 (targeted) | — | — |
+| `config.llm_backends[].price_per_mtok_out` | float/null | — | <=0.9.73 | `telemetry:config.llm_backends[].price_per_mtok_out` | 0.9.89 (targeted) | — | — |
+| `config.llm_backends[].private_ok` | bool | — | <=0.9.73 | `telemetry:config.llm_backends[].private_ok` | 0.9.89 (targeted) | — | — |
+| `config.llm_backends[].roles` | list/null | — | <=0.9.73 | `telemetry:config.llm_backends[].roles` | 0.9.89 (targeted) | — | — |
+| `config.llm_backends[].url` | str | — | <=0.9.73 | `telemetry:config.llm_backends[].url` | 0.9.89 (targeted) | — | — |
+| `config.llm_backends[].weight` | float | — | <=0.9.73 | `telemetry:config.llm_backends[].weight` | 0.9.89 (targeted) | — | — |
+| `config.llm_pool_tuning.cooldown_s` | float/int | _s | <=0.9.73 | `telemetry:config.llm_pool_tuning.cooldown_s` | 0.9.89 (targeted) | — | — |
+| `config.llm_pool_tuning.fail_threshold` | int | — | <=0.9.73 | `telemetry:config.llm_pool_tuning.fail_threshold` | 0.9.89 (targeted) | — | — |
+| `config.llm_pool_tuning.fail_window_s` | float/int | _s | <=0.9.73 | `telemetry:config.llm_pool_tuning.fail_window_s` | 0.9.89 (targeted) | — | — |
 | `consolidation.gpu_probe.consecutive_hangs` | int | — | <=0.9.73 | — | — | — | — |
 | `consolidation.gpu_probe.leaked_children` | int | — | <=0.9.73 | — | — | — | — |
 | `consolidation.gpu_probe.state` | str | — | <=0.9.73 | — | — | — | — |
 | `consolidation.inference_busy` | str | — | <=0.9.73 | — | — | — | the top-level inference_busy, inside the cached snapshot |
-| `gpu_probe.consecutive_hangs` | int | — | <=0.9.73 | `telemetry:gpu_probe.consecutive_hangs` | 0.9.88 (targeted) | — | — |
-| `gpu_probe.leaked_children` | int | — | <=0.9.73 | `telemetry:gpu_probe.leaked_children` | 0.9.88 (targeted) | — | — |
-| `gpu_probe.state` | str | — | <=0.9.73 | `telemetry:gpu_probe.state` | 0.9.88 (targeted) | — | — |
+| `gpu_probe.consecutive_hangs` | int | — | <=0.9.73 | `telemetry:gpu_probe.consecutive_hangs` | 0.9.89 (targeted) | — | — |
+| `gpu_probe.leaked_children` | int | — | <=0.9.73 | `telemetry:gpu_probe.leaked_children` | 0.9.89 (targeted) | — | — |
+| `gpu_probe.state` | str | — | <=0.9.73 | `telemetry:gpu_probe.state` | 0.9.89 (targeted) | — | — |
 | `inference_busy` | str | — | <=0.9.73 | — | — | — | busy \| idle \| unknown |
 | `llm` | str | — | <=0.9.73 | — | — | — | ok \| down — ok iff ANY backend answered |
-| `llm_affinity.hit_rate` | float/null | — | <=0.9.73 | `telemetry:llm.affinity.hit_rate` | 0.9.88 (targeted) | — | — |
-| `llm_affinity.hits` | int | — | <=0.9.73 | `telemetry:llm.affinity.hits` | 0.9.88 (targeted) | — | — |
-| `llm_affinity.hot_prefixes` | dict | — | <=0.9.73 | `telemetry:llm.affinity.hot_prefixes` | 0.9.88 (targeted) | — | empty when no prefix is hot |
-| `llm_affinity.hot_prefixes.*.backend` | str | — | <=0.9.73 | `telemetry:llm.affinity.hot_prefixes.*.backend` | 0.9.88 (targeted) | — | — |
-| `llm_affinity.hot_prefixes.*.hits` | int | — | <=0.9.73 | `telemetry:llm.affinity.hot_prefixes.*.hits` | 0.9.88 (targeted) | — | — |
-| `llm_affinity.misses` | int | — | <=0.9.73 | `telemetry:llm.affinity.misses` | 0.9.88 (targeted) | — | — |
+| `llm_affinity.hit_rate` | float/null | — | <=0.9.73 | `telemetry:llm.affinity.hit_rate` | 0.9.89 (targeted) | — | — |
+| `llm_affinity.hits` | int | — | <=0.9.73 | `telemetry:llm.affinity.hits` | 0.9.89 (targeted) | — | — |
+| `llm_affinity.hot_prefixes` | dict | — | <=0.9.73 | `telemetry:llm.affinity.hot_prefixes` | 0.9.89 (targeted) | — | empty when no prefix is hot |
+| `llm_affinity.hot_prefixes.*.backend` | str | — | <=0.9.73 | `telemetry:llm.affinity.hot_prefixes.*.backend` | 0.9.89 (targeted) | — | — |
+| `llm_affinity.hot_prefixes.*.hits` | int | — | <=0.9.73 | `telemetry:llm.affinity.hot_prefixes.*.hits` | 0.9.89 (targeted) | — | — |
+| `llm_affinity.misses` | int | — | <=0.9.73 | `telemetry:llm.affinity.misses` | 0.9.89 (targeted) | — | — |
 | `llm_backends.*` | str | — | <=0.9.73 | — | — | — | per-backend enum: ok \| timeout \| down \| http_<code> |
-| `llm_latency.*.latency_last_ts` | str/null | — | <=0.9.73 | `telemetry:llm.latency.*.latency_last_ts` | 0.9.88 (targeted) | — | — |
-| `llm_latency.*.latency_max_s` | float | _s | <=0.9.73 | `telemetry:llm.latency.*.latency_max_s` | 0.9.88 (targeted) | — | — |
-| `llm_latency.*.latency_sum_s` | float | _s | <=0.9.73 | `telemetry:llm.latency.*.latency_sum_s` | 0.9.88 (targeted) | — | — |
-| `llm_latency.*.requests_failed_total` | int | _total | <=0.9.73 | `telemetry:llm.latency.*.requests_failed_total` | 0.9.88 (targeted) | — | — |
-| `llm_latency.*.requests_total` | int | _total | <=0.9.73 | `telemetry:llm.latency.*.requests_total` | 0.9.88 (targeted) | — | — |
-| `llm_oldest_inflight_age_s` | float | _s | <=0.9.73 | `telemetry:llm.oldest_inflight_age_s` | 0.9.88 (targeted) | — | — |
-| `llm_pool.*.cooldown` | float | _s | <=0.9.73 | `telemetry:llm.pool.*.cooldown` | 0.9.88 (targeted) | — | — |
-| `llm_pool.*.fails` | int | — | <=0.9.73 | `telemetry:llm.pool.*.fails` | 0.9.88 (targeted) | — | — |
-| `llm_pool.*.inflight` | int | — | <=0.9.73 | `telemetry:llm.pool.*.inflight` | 0.9.88 (targeted) | — | — |
-| `llm_pool.*.reserved` | bool | — | <=0.9.73 | `telemetry:llm.pool.*.reserved` | 0.9.88 (targeted) | — | — |
-| `llm_pool.*.routed` | int | — | <=0.9.73 | `telemetry:llm.pool.*.routed` | 0.9.88 (targeted) | — | — |
-| `llm_pool.*.routed_pct` | float | _pct | <=0.9.73 | `telemetry:llm.pool.*.routed_pct` | 0.9.88 (targeted) | — | — |
-| `llm_pool.*.weight` | float | — | <=0.9.73 | `telemetry:llm.pool.*.weight` | 0.9.88 (targeted) | — | — |
-| `llm_reserved[]` | list | — | <=0.9.73 | `telemetry:llm.reserved` | 0.9.88 (targeted) | — | — |
-| `llm_routing.routed_role_extract` | int | — | <=0.9.73 | `telemetry:llm.routing.routed_role_extract` | 0.9.88 (targeted) | — | — |
-| `llm_routing.routed_role_extract_last_ts` | str/null | — | <=0.9.73 | `telemetry:llm.routing.routed_role_extract_last_ts` | 0.9.88 (targeted) | — | — |
-| `llm_routing.routed_role_judge` | int | — | <=0.9.73 | `telemetry:llm.routing.routed_role_judge` | 0.9.88 (targeted) | — | — |
-| `llm_routing.routed_role_judge_last_ts` | str/null | — | <=0.9.73 | `telemetry:llm.routing.routed_role_judge_last_ts` | 0.9.88 (targeted) | — | — |
-| `llm_routing.routing_backend_at_capacity` | int | — | <=0.9.73 | `telemetry:llm.routing.routing_backend_at_capacity` | 0.9.88 (targeted) | — | — |
-| `llm_routing.routing_backend_at_capacity_last_ts` | str/null | — | <=0.9.73 | `telemetry:llm.routing.routing_backend_at_capacity_last_ts` | 0.9.88 (targeted) | — | — |
-| `llm_routing.routing_fit_rejected` | int | — | <=0.9.73 | `telemetry:llm.routing.routing_fit_rejected` | 0.9.88 (targeted) | — | — |
-| `llm_routing.routing_fit_rejected_last_ts` | str/null | — | <=0.9.73 | `telemetry:llm.routing.routing_fit_rejected_last_ts` | 0.9.88 (targeted) | — | — |
-| `llm_routing.routing_no_eligible_backend` | int | — | <=0.9.73 | `telemetry:llm.routing.routing_no_eligible_backend` | 0.9.88 (targeted) | — | — |
-| `llm_routing.routing_no_eligible_backend_last_ts` | str/null | — | <=0.9.73 | `telemetry:llm.routing.routing_no_eligible_backend_last_ts` | 0.9.88 (targeted) | — | — |
-| `llm_suspect_wedged[]` | list | — | <=0.9.73 | `telemetry:llm.suspect_wedged` | 0.9.88 (targeted) | — | — |
-| `llm_token_usage.*.tokens_completion_total` | int | _total | <=0.9.73 | `telemetry:llm.token_usage.*.tokens_completion_total` | 0.9.88 (targeted) | — | — |
-| `llm_token_usage.*.tokens_last_ts` | str/null | — | <=0.9.73 | `telemetry:llm.token_usage.*.tokens_last_ts` | 0.9.88 (targeted) | — | — |
-| `llm_token_usage.*.tokens_prompt_total` | int | _total | <=0.9.73 | `telemetry:llm.token_usage.*.tokens_prompt_total` | 0.9.88 (targeted) | — | — |
+| `llm_latency.*.latency_last_ts` | str/null | — | <=0.9.73 | `telemetry:llm.latency.*.latency_last_ts` | 0.9.89 (targeted) | — | — |
+| `llm_latency.*.latency_max_s` | float | _s | <=0.9.73 | `telemetry:llm.latency.*.latency_max_s` | 0.9.89 (targeted) | — | — |
+| `llm_latency.*.latency_sum_s` | float | _s | <=0.9.73 | `telemetry:llm.latency.*.latency_sum_s` | 0.9.89 (targeted) | — | — |
+| `llm_latency.*.requests_failed_total` | int | _total | <=0.9.73 | `telemetry:llm.latency.*.requests_failed_total` | 0.9.89 (targeted) | — | — |
+| `llm_latency.*.requests_total` | int | _total | <=0.9.73 | `telemetry:llm.latency.*.requests_total` | 0.9.89 (targeted) | — | — |
+| `llm_oldest_inflight_age_s` | float | _s | <=0.9.73 | `telemetry:llm.oldest_inflight_age_s` | 0.9.89 (targeted) | — | — |
+| `llm_pool.*.cooldown` | float | _s | <=0.9.73 | `telemetry:llm.pool.*.cooldown` | 0.9.89 (targeted) | — | — |
+| `llm_pool.*.fails` | int | — | <=0.9.73 | `telemetry:llm.pool.*.fails` | 0.9.89 (targeted) | — | — |
+| `llm_pool.*.inflight` | int | — | <=0.9.73 | `telemetry:llm.pool.*.inflight` | 0.9.89 (targeted) | — | — |
+| `llm_pool.*.reserved` | bool | — | <=0.9.73 | `telemetry:llm.pool.*.reserved` | 0.9.89 (targeted) | — | — |
+| `llm_pool.*.routed` | int | — | <=0.9.73 | `telemetry:llm.pool.*.routed` | 0.9.89 (targeted) | — | — |
+| `llm_pool.*.routed_pct` | float | _pct | <=0.9.73 | `telemetry:llm.pool.*.routed_pct` | 0.9.89 (targeted) | — | — |
+| `llm_pool.*.weight` | float | — | <=0.9.73 | `telemetry:llm.pool.*.weight` | 0.9.89 (targeted) | — | — |
+| `llm_reserved[]` | list | — | <=0.9.73 | `telemetry:llm.reserved` | 0.9.89 (targeted) | — | — |
+| `llm_routing.routed_role_extract` | int | — | <=0.9.73 | `telemetry:llm.routing.routed_role_extract` | 0.9.89 (targeted) | — | — |
+| `llm_routing.routed_role_extract_last_ts` | str/null | — | <=0.9.73 | `telemetry:llm.routing.routed_role_extract_last_ts` | 0.9.89 (targeted) | — | — |
+| `llm_routing.routed_role_judge` | int | — | <=0.9.73 | `telemetry:llm.routing.routed_role_judge` | 0.9.89 (targeted) | — | — |
+| `llm_routing.routed_role_judge_last_ts` | str/null | — | <=0.9.73 | `telemetry:llm.routing.routed_role_judge_last_ts` | 0.9.89 (targeted) | — | — |
+| `llm_routing.routing_backend_at_capacity` | int | — | <=0.9.73 | `telemetry:llm.routing.routing_backend_at_capacity` | 0.9.89 (targeted) | — | — |
+| `llm_routing.routing_backend_at_capacity_last_ts` | str/null | — | <=0.9.73 | `telemetry:llm.routing.routing_backend_at_capacity_last_ts` | 0.9.89 (targeted) | — | — |
+| `llm_routing.routing_fit_rejected` | int | — | <=0.9.73 | `telemetry:llm.routing.routing_fit_rejected` | 0.9.89 (targeted) | — | — |
+| `llm_routing.routing_fit_rejected_last_ts` | str/null | — | <=0.9.73 | `telemetry:llm.routing.routing_fit_rejected_last_ts` | 0.9.89 (targeted) | — | — |
+| `llm_routing.routing_no_eligible_backend` | int | — | <=0.9.73 | `telemetry:llm.routing.routing_no_eligible_backend` | 0.9.89 (targeted) | — | — |
+| `llm_routing.routing_no_eligible_backend_last_ts` | str/null | — | <=0.9.73 | `telemetry:llm.routing.routing_no_eligible_backend_last_ts` | 0.9.89 (targeted) | — | — |
+| `llm_suspect_wedged[]` | list | — | <=0.9.73 | `telemetry:llm.suspect_wedged` | 0.9.89 (targeted) | — | — |
+| `llm_token_usage.*.tokens_completion_total` | int | _total | <=0.9.73 | `telemetry:llm.token_usage.*.tokens_completion_total` | 0.9.89 (targeted) | — | — |
+| `llm_token_usage.*.tokens_last_ts` | str/null | — | <=0.9.73 | `telemetry:llm.token_usage.*.tokens_last_ts` | 0.9.89 (targeted) | — | — |
+| `llm_token_usage.*.tokens_prompt_total` | int | _total | <=0.9.73 | `telemetry:llm.token_usage.*.tokens_prompt_total` | 0.9.89 (targeted) | — | — |
 
 ### rem
 
 | key | type | unit | since | moved to | removed in | log twin | notes |
 |---|---|---|---|---|---|---|---|
-| `rem_daemon` | str | — | <=0.9.73 | `health:rem_daemon_process` | 0.9.88 (targeted) | — | the REM daemon's PID check under its pre-0.9.74 name |
+| `rem_daemon` | str | — | <=0.9.73 | `health:rem_daemon_process` | 0.9.89 (targeted) | — | the REM daemon's PID check under its pre-0.9.74 name |
 | `rem_daemon_process` | str | — | 0.9.74 | — | — | — | running \| stopped — a PID check, nothing more |
 
 ### nrem/consolidation
@@ -248,7 +270,7 @@ Paths are relative to the response object.
 | `consolidation.last_success_cycle_type` | str/null | — | <=0.9.73 | — | — | — | — |
 | `consolidation.stalled` | bool | — | <=0.9.73 | — | — | — | — |
 | `consolidation.stalled_types[]` | list | — | <=0.9.73 | — | — | — | — |
-| `daemon` | str | — | <=0.9.73 | `health:nrem_daemon_process` | 0.9.88 (targeted) | — | the NREM daemon's PID check under its pre-0.9.74 name |
+| `daemon` | str | — | <=0.9.73 | `health:nrem_daemon_process` | 0.9.89 (targeted) | — | the NREM daemon's PID check under its pre-0.9.74 name |
 | `nrem_daemon_process` | str | — | 0.9.74 | — | — | — | running \| stopped — a PID check, nothing more |
 
 ### axes/registry
@@ -266,24 +288,24 @@ Paths are relative to the response object.
 | `consolidation.project_identity.nodes` | int | — | <=0.9.73 | — | — | — | — |
 | `consolidation.project_identity.unidentified` | int | — | <=0.9.73 | — | — | — | — |
 | `consolidation.project_identity.unregistered` | int | — | <=0.9.73 | — | — | — | — |
-| `domain_identity.complete` | bool | — | <=0.9.73 | `telemetry:axes.domain_identity.complete` | 0.9.88 (targeted) | — | — |
-| `domain_identity.mismatched` | int | — | <=0.9.73 | `telemetry:axes.domain_identity.mismatched` | 0.9.88 (targeted) | — | — |
-| `domain_identity.nodes` | int | — | <=0.9.73 | `telemetry:axes.domain_identity.nodes` | 0.9.88 (targeted) | — | — |
-| `domain_identity.registry_rows` | int | — | <=0.9.73 | `telemetry:axes.domain_identity.registry_rows` | 0.9.88 (targeted) | — | — |
-| `domain_identity.unattached` | int | — | <=0.9.73 | `telemetry:axes.domain_identity.unattached` | 0.9.88 (targeted) | — | — |
-| `domain_identity.unregistered` | int | — | <=0.9.73 | `telemetry:axes.domain_identity.unregistered` | 0.9.88 (targeted) | — | — |
-| `project_identity.complete` | bool | — | <=0.9.73 | `telemetry:axes.project_identity.complete` | 0.9.88 (targeted) | — | — |
-| `project_identity.mismatched` | int | — | <=0.9.73 | `telemetry:axes.project_identity.mismatched` | 0.9.88 (targeted) | — | — |
-| `project_identity.nodes` | int | — | <=0.9.73 | `telemetry:axes.project_identity.nodes` | 0.9.88 (targeted) | — | — |
-| `project_identity.unidentified` | int | — | <=0.9.73 | `telemetry:axes.project_identity.unidentified` | 0.9.88 (targeted) | — | — |
-| `project_identity.unregistered` | int | — | <=0.9.73 | `telemetry:axes.project_identity.unregistered` | 0.9.88 (targeted) | — | — |
+| `domain_identity.complete` | bool | — | <=0.9.73 | `telemetry:axes.domain_identity.complete` | 0.9.89 (targeted) | — | — |
+| `domain_identity.mismatched` | int | — | <=0.9.73 | `telemetry:axes.domain_identity.mismatched` | 0.9.89 (targeted) | — | — |
+| `domain_identity.nodes` | int | — | <=0.9.73 | `telemetry:axes.domain_identity.nodes` | 0.9.89 (targeted) | — | — |
+| `domain_identity.registry_rows` | int | — | <=0.9.73 | `telemetry:axes.domain_identity.registry_rows` | 0.9.89 (targeted) | — | — |
+| `domain_identity.unattached` | int | — | <=0.9.73 | `telemetry:axes.domain_identity.unattached` | 0.9.89 (targeted) | — | — |
+| `domain_identity.unregistered` | int | — | <=0.9.73 | `telemetry:axes.domain_identity.unregistered` | 0.9.89 (targeted) | — | — |
+| `project_identity.complete` | bool | — | <=0.9.73 | `telemetry:axes.project_identity.complete` | 0.9.89 (targeted) | — | — |
+| `project_identity.mismatched` | int | — | <=0.9.73 | `telemetry:axes.project_identity.mismatched` | 0.9.89 (targeted) | — | — |
+| `project_identity.nodes` | int | — | <=0.9.73 | `telemetry:axes.project_identity.nodes` | 0.9.89 (targeted) | — | — |
+| `project_identity.unidentified` | int | — | <=0.9.73 | `telemetry:axes.project_identity.unidentified` | 0.9.89 (targeted) | — | — |
+| `project_identity.unregistered` | int | — | <=0.9.73 | `telemetry:axes.project_identity.unregistered` | 0.9.89 (targeted) | — | — |
 
 ### credentials
 
 | key | type | unit | since | moved to | removed in | log twin | notes |
 |---|---|---|---|---|---|---|---|
-| `config.allow_unauthenticated_provider_keys` | bool | — | <=0.9.73 | `telemetry:config.allow_unauthenticated_provider_keys` | 0.9.88 (targeted) | — | present ONLY while the S-05 override is actually in effect |
-| `config.llm_backends[].has_credential` | bool | — | <=0.9.73 | `telemetry:config.llm_backends[].has_credential` | 0.9.88 (targeted) | — | — |
+| `config.allow_unauthenticated_provider_keys` | bool | — | <=0.9.73 | `telemetry:config.allow_unauthenticated_provider_keys` | 0.9.89 (targeted) | — | present ONLY while the S-05 override is actually in effect |
+| `config.llm_backends[].has_credential` | bool | — | <=0.9.73 | `telemetry:config.llm_backends[].has_credential` | 0.9.89 (targeted) | — | — |
 
 ### versions
 
@@ -297,7 +319,7 @@ Paths are relative to the response object.
 | key | type | unit | since | moved to | removed in | log twin | notes |
 |---|---|---|---|---|---|---|---|
 | `consolidation.graph_invalid_nodes` | int/null | — | <=0.9.73 | — | — | — | — |
-| `graph_invalid_nodes` | int/null | — | <=0.9.73 | `telemetry:graph_integrity.invalid_nodes` | 0.9.88 (targeted) | — | — |
+| `graph_invalid_nodes` | int/null | — | <=0.9.73 | `telemetry:graph_integrity.invalid_nodes` | 0.9.89 (targeted) | — | — |
 
 ## `GET /memory/telemetry`
 
@@ -357,16 +379,16 @@ The envelope is `{"status": "success", "telemetry": {…}}`; paths below are rel
 | `encoders.embed.last_payload_chars` | int/null | _chars | 0.9.74 | — | — | — | — |
 | `encoders.embed.max_ms` | float/null | _ms | 0.9.74 | — | — | — | — |
 | `encoders.embed.p50_ms` | float/null | _ms | 0.9.74 | — | — | — | — |
-| `encoders.embed.p95_ms` | float/null | _ms | 0.9.74 | — | — | `health.warning.encoder_p95_ms` | — |
+| `encoders.embed.p95_ms` | float/null | _ms | 0.9.74 | — | — | — | NOT the field `encoder_embedder_projected_ms` observes — that warning compares backend_capability.embedder.projected_full_payload_s against encoders.limit_ms, never this p95 ring. No `log=` here: the wildcarded backend_capability.*.projected_full_payload_s entry cannot carry a single per-encoder log string, so there is no field this p95 can correctly point at (QA fix round, finding 3). |
 | `encoders.embed.window` | int | — | 0.9.74 | — | — | — | observations the percentiles were computed over — NOT the ring's capacity. p95 over 3 calls is not a p95. |
-| `encoders.limit_ms` | float/null | _ms | 0.9.74 | — | — | — | ENCODER_LATENCY_WARN_MS — the limit the p95s above are compared against; null means it is derived per-encoder from backend_capability.ceiling_s rather than pinned by env. |
+| `encoders.limit_ms` | float/null | _ms | 0.9.74 | — | — | — | ENCODER_LATENCY_WARN_MS — the limit backend_capability.*.projected_full_payload_s (NOT the p95s above) is compared against, per encoder, to raise encoder_{embedder,reranker}_projected_ms; null means it is derived per-encoder from backend_capability.*.ceiling_s rather than pinned by env (QA fix round, finding 3: this note previously named the p95s). |
 | `encoders.rerank.calls` | int | — | 0.9.74 | — | — | — | — |
 | `encoders.rerank.errors` | int | — | 0.9.74 | — | — | — | — |
 | `encoders.rerank.last_ms` | float/null | _ms | 0.9.74 | — | — | — | — |
 | `encoders.rerank.last_payload_chars` | int/null | _chars | 0.9.74 | — | — | — | — |
 | `encoders.rerank.max_ms` | float/null | _ms | 0.9.74 | — | — | — | — |
 | `encoders.rerank.p50_ms` | float/null | _ms | 0.9.74 | — | — | — | — |
-| `encoders.rerank.p95_ms` | float/null | _ms | 0.9.74 | — | — | `health.warning.encoder_p95_ms` | — |
+| `encoders.rerank.p95_ms` | float/null | _ms | 0.9.74 | — | — | — | NOT the field `encoder_reranker_projected_ms` observes — same reasoning as encoders.embed.p95_ms's note: the warning compares backend_capability.reranker.projected_full_payload_s against encoders.limit_ms, and the wildcarded capability field cannot carry a per-encoder `log=` either. No `log=` here (QA fix round, finding 3). |
 | `encoders.rerank.window` | int | — | 0.9.74 | — | — | — | — |
 | `rerank_fallbacks_last_ts` | str/null | — | <=0.9.73 | — | — | — | — |
 | `rerank_fallbacks_total` | int | _total | <=0.9.73 | — | — | — | — |
@@ -386,13 +408,14 @@ The envelope is `{"status": "success", "telemetry": {…}}`; paths below are rel
 | `gateway.by_status.4xx` | int | — | 0.9.74 | — | — | — | — |
 | `gateway.by_status.503` | int | — | 0.9.74 | — | — | — | — |
 | `gateway.by_status.5xx` | int | — | 0.9.74 | — | — | — | — |
+| `gateway.client_disconnects_total` | int | _total | 0.9.88 | — | — | — | D9 (OBS round): a CALLER of this gateway aborted an LLM-proxy request — before response headers could be sent, or partway through the streamed body. ⛔ NEVER conditional, 0 when none, same contract as shed_503_total: incremented from hive_mind_proxy.py's dispatch loop, never a verdict on any backend — neither _llm_mark_ok nor _llm_mark_fail fires for it, and its duration is excluded from the latency ring entirely (a client hang-up is not a service time) |
 | `gateway.inflight` | int | — | 0.9.74 | — | — | — | — |
 | `gateway.inflight_max` | int | — | 0.9.74 | — | — | — | GATEWAY_INFLIGHT_MAX; 0 = valve disabled |
 | `gateway.latency_p50_ms` | float/null | _ms | 0.9.74 | — | — | — | — |
 | `gateway.latency_p95_ms` | float/null | _ms | 0.9.74 | — | — | — | — |
 | `gateway.latency_window` | int | — | 0.9.74 | — | — | — | — |
 | `gateway.requests_total` | int | _total | 0.9.74 | — | — | — | — |
-| `gateway.shed_503_total` | int | _total | 0.9.74 | — | — | `health.warning.pool_shedding` | — |
+| `gateway.shed_503_total` | int | _total | 0.9.74 | — | — | `health.warning.gateway_shed_503_total` | — |
 
 ### outbox
 
@@ -407,12 +430,12 @@ The envelope is `{"status": "success", "telemetry": {…}}`; paths below are rel
 | `outbox.error` | str | — | 0.9.74 | — | — | — | present only when this section's own query failed |
 | `outbox.failed` | int | — | 0.9.74 | — | — | `health.outbox` | ⛔ ALWAYS PRESENT, 0 when zero. The pre-0.9.74 `postgres.outbox` census omitted the key entirely at zero, so absence and zero were indistinguishable to every consumer. |
 | `outbox.oldest_failed_age_s` | int/null | _s | 0.9.74 | — | — | — | — |
-| `outbox.oldest_pending_age_s` | int/null | _s | 0.9.74 | — | — | `health.warning.outbox_age` | — |
+| `outbox.oldest_pending_age_s` | int/null | _s | 0.9.74 | — | — | `health.warning.outbox_oldest_pending_age_s` | — |
 | `outbox.pending` | int | — | 0.9.74 | — | — | — | — |
 | `outbox.rem_reviewed` | int | — | 0.9.74 | — | — | — | — |
-| `postgres.outbox` | dict | — | <=0.9.73 | `telemetry:outbox` | 0.9.88 (targeted) | — | emitted as an empty dict when the outbox is empty |
-| `postgres.outbox.*` | int | — | <=0.9.73 | `telemetry:outbox` | 0.9.88 (targeted) | — | the status census; a status with zero rows was OMITTED, which is why it moved |
-| `postgres.outbox_failed_oldest_age_seconds` | int/null | _seconds | <=0.9.73 | `telemetry:outbox.oldest_failed_age_s` | 0.9.88 (targeted) | — | — |
+| `postgres.outbox` | dict | — | <=0.9.73 | `telemetry:outbox` | 0.9.89 (targeted) | — | emitted as an empty dict when the outbox is empty |
+| `postgres.outbox.*` | int | — | <=0.9.73 | `telemetry:outbox` | 0.9.89 (targeted) | — | the status census; a status with zero rows was OMITTED, which is why it moved |
+| `postgres.outbox_failed_oldest_age_seconds` | int/null | _seconds | <=0.9.73 | `telemetry:outbox.oldest_failed_age_s` | 0.9.89 (targeted) | — | — |
 
 ### postgres
 
@@ -465,7 +488,6 @@ The envelope is `{"status": "success", "telemetry": {…}}`; paths below are rel
 | `config.llm_pool_tuning.cooldown_s` | float/int | _s | 0.9.74 | — | — | — | — |
 | `config.llm_pool_tuning.fail_threshold` | int | — | 0.9.74 | — | — | — | — |
 | `config.llm_pool_tuning.fail_window_s` | float/int | _s | 0.9.74 | — | — | — | — |
-| `config.llm_pool_tuning.max_tries` | int | — | 0.9.74 | — | — | — | — |
 | `gpu_probe` | null | — | 0.9.74 | — | — | — | null until the first probe |
 | `gpu_probe.consecutive_hangs` | int | — | 0.9.74 | — | — | — | — |
 | `gpu_probe.leaked_children` | int | — | 0.9.74 | — | — | — | — |
@@ -515,11 +537,11 @@ The envelope is `{"status": "success", "telemetry": {…}}`; paths below are rel
 | `llm.token_usage.*.tokens_completion_total` | int | _total | 0.9.74 | — | — | — | — |
 | `llm.token_usage.*.tokens_last_ts` | str/null | — | 0.9.74 | — | — | — | — |
 | `llm.token_usage.*.tokens_prompt_total` | int | _total | 0.9.74 | — | — | — | — |
-| `llm_faults` | dict | — | <=0.9.73 | `telemetry:llm.faults` | 0.9.88 (targeted) | — | empty until a fault occurs |
-| `llm_faults.*.gateway.count` | int | — | <=0.9.73 | `telemetry:llm.faults.*.gateway.count` | 0.9.88 (targeted) | — | — |
-| `llm_faults.*.gateway.last` | str/null | — | <=0.9.73 | `telemetry:llm.faults.*.gateway.last` | 0.9.88 (targeted) | — | — |
-| `llm_faults.*.llm.transient.count` | int | — | <=0.9.73 | `telemetry:llm.faults.*.llm.transient.count` | 0.9.88 (targeted) | — | — |
-| `llm_faults.*.llm.transient.last` | str/null | — | <=0.9.73 | `telemetry:llm.faults.*.llm.transient.last` | 0.9.88 (targeted) | — | — |
+| `llm_faults` | dict | — | <=0.9.73 | `telemetry:llm.faults` | 0.9.89 (targeted) | — | empty until a fault occurs |
+| `llm_faults.*.gateway.count` | int | — | <=0.9.73 | `telemetry:llm.faults.*.gateway.count` | 0.9.89 (targeted) | — | — |
+| `llm_faults.*.gateway.last` | str/null | — | <=0.9.73 | `telemetry:llm.faults.*.gateway.last` | 0.9.89 (targeted) | — | — |
+| `llm_faults.*.llm.transient.count` | int | — | <=0.9.73 | `telemetry:llm.faults.*.llm.transient.count` | 0.9.89 (targeted) | — | — |
+| `llm_faults.*.llm.transient.last` | str/null | — | <=0.9.73 | `telemetry:llm.faults.*.llm.transient.last` | 0.9.89 (targeted) | — | — |
 
 ### rem
 
@@ -542,11 +564,11 @@ The envelope is `{"status": "success", "telemetry": {…}}`; paths below are rel
 | `latency.rem_ms.note` | str | — | <=0.9.73 | — | — | — | — |
 | `neo4j.decisions_rem_pending` | int | — | <=0.9.73 | — | — | — | — |
 | `neo4j.facts_rem_pending` | int | — | <=0.9.73 | — | — | — | — |
-| `neo4j.rem_dead_lettered` | int | — | <=0.9.73 | `telemetry:rem.dead_lettered` | 0.9.88 (targeted) | — | — |
-| `neo4j.rem_failing` | int | — | <=0.9.73 | `telemetry:rem.failing` | 0.9.88 (targeted) | — | — |
-| `neo4j.rem_max_attempts` | int | — | <=0.9.73 | `telemetry:rem.max_attempts` | 0.9.88 (targeted) | — | — |
-| `neo4j.rem_passed_over_total` | int | _total | <=0.9.73 | `telemetry:rem.passed_over` | 0.9.88 (targeted) | — | — |
-| `neo4j.rem_starved_pending` | int | — | <=0.9.73 | `telemetry:rem.starved_pending` | 0.9.88 (targeted) | — | — |
+| `neo4j.rem_dead_lettered` | int | — | <=0.9.73 | `telemetry:rem.dead_lettered` | 0.9.89 (targeted) | — | — |
+| `neo4j.rem_failing` | int | — | <=0.9.73 | `telemetry:rem.failing` | 0.9.89 (targeted) | — | — |
+| `neo4j.rem_max_attempts` | int | — | <=0.9.73 | `telemetry:rem.max_attempts` | 0.9.89 (targeted) | — | — |
+| `neo4j.rem_passed_over_total` | int | _total | <=0.9.73 | `telemetry:rem.passed_over` | 0.9.89 (targeted) | — | — |
+| `neo4j.rem_starved_pending` | int | — | <=0.9.73 | `telemetry:rem.starved_pending` | 0.9.89 (targeted) | — | — |
 | `rem.dead_lettered` | int | — | 0.9.74 | — | — | `health.rem_daemon` | — |
 | `rem.degeneration_firings` | int/null | — | 0.9.74 | — | — | — | ⚠ ALWAYS NULL AT 0.9.74, and null is the honest value. REM runs in a SEPARATE PROCESS (rem_loop.py); its anti-degeneration detector writes a log line and nothing durable, so the gateway cannot see it. Reporting 0 would claim it never fired. A durable counter is owed. |
 | `rem.error` | str | — | 0.9.74 | — | — | — | present only when this section's own query failed |
@@ -647,7 +669,7 @@ The envelope is `{"status": "success", "telemetry": {…}}`; paths below are rel
 | `axes.project_identity.unidentified` | int | — | 0.9.74 | — | — | — | — |
 | `axes.project_identity.unregistered` | int | — | 0.9.74 | — | — | — | — |
 | `axis_registry_read_failures_last_ts` | str/null | — | <=0.9.73 | — | — | — | — |
-| `axis_registry_read_failures_total` | int | _total | <=0.9.73 | `telemetry:registry.read_failures_total` | 0.9.88 (targeted) | — | — |
+| `axis_registry_read_failures_total` | int | _total | <=0.9.73 | `telemetry:registry.read_failures_total` | 0.9.89 (targeted) | — | — |
 | `breakdown.domains[]` | list | — | <=0.9.73 | — | — | — | ⚠ MEANING CHANGED IN 0.9.74 — see _meaning_changes. Before 0.9.74 this carried the PROJECT distribution; it now carries the DOMAIN distribution from metadata->'domains'. The project distribution is breakdown.projects. |
 | `breakdown.domains[].count` | int | — | <=0.9.73 | — | — | — | — |
 | `breakdown.domains[].key` | str | — | <=0.9.73 | — | — | — | — |
@@ -660,7 +682,7 @@ The envelope is `{"status": "success", "telemetry": {…}}`; paths below are rel
 | `registry.as_of` | str/null | — | 0.9.74 | — | — | — | when the census last SUCCEEDED. null before the first success |
 | `registry.census_failures_total` | int | _total | 0.9.74 | — | — | `health.registry` | failures of the row-count query behind registry.*. Deliberately SEPARATE from read_failures_total: a failed census means these numbers are stale, a failed axis read means a SEARCH silently answered from the literal string — same subsystem, different incidents |
 | `registry.domains` | int | — | 0.9.74 | — | — | — | rows in `project_domains`. A domain is (project_id, name), so the same NAME under two projects is two rows — they are different sections |
-| `registry.error` | str | — | 0.9.74 | — | — | — | present only when this section's own query failed |
+| `registry.error` | str | — | 0.9.74 | — | — | — | two different producers, same key, never both at once: _registry_telemetry() (coordinator.py) sets it while the LAST CENSUS attempt failed — the counts beside it are the last good ones; the try/except wrapping that call's OWN invocation sets it instead, replacing the whole registry.* section with just {"error": ...}, when the section-query call itself raises (a bug in _registry_telemetry, not a failed census) |
 | `registry.projects` | int | — | 0.9.74 | — | — | — | rows in `projects`. ⛔ NEVER NULL: on a failed census the LAST GOOD value is served with `as_of` and `error` beside it, because a null would make a failed query look like a deployment with no projects |
 | `registry.read_failures_total` | int | _total | 0.9.74 | — | — | `health.registry` | the SEARCH path: a filter that could not be resolved |
 | `registry.refusals.axis_conflict` | int | — | 0.9.74 | — | — | — | — |
@@ -683,13 +705,13 @@ The envelope is `{"status": "success", "telemetry": {…}}`; paths below are rel
 | `credentials.credentialed_route_denied_last_ts` | str/null | — | <=0.9.73 | — | — | — | — |
 | `credentials.daemon_tokens_issued` | int | — | <=0.9.73 | — | — | — | — |
 | `credentials.daemon_tokens_issued_last_ts` | str/null | — | <=0.9.73 | — | — | — | — |
-| `credentials.token_verify_failed` | int | — | <=0.9.73 | — | — | `health.warning.token_verify_failed` | — |
+| `credentials.token_verify_failed` | int | — | <=0.9.73 | — | — | `health.warning.token_verify_failed_per_min` | — |
 | `credentials.token_verify_failed_last_ts` | str/null | — | <=0.9.73 | — | — | — | — |
 | `credentials.token_verify_warn_per_min` | int/float | — | 0.9.74 | — | — | — | TOKEN_VERIFY_WARN_PER_MIN — the limit the warning is raised at |
 | `llm.faults.*.llm.credential.count` | int | — | 0.9.74 | — | — | — | — |
 | `llm.faults.*.llm.credential.last` | str/null | — | 0.9.74 | — | — | — | — |
-| `llm_faults.*.llm.credential.count` | int | — | <=0.9.73 | `telemetry:llm.faults.*.llm.credential.count` | 0.9.88 (targeted) | — | — |
-| `llm_faults.*.llm.credential.last` | str/null | — | <=0.9.73 | `telemetry:llm.faults.*.llm.credential.last` | 0.9.88 (targeted) | — | — |
+| `llm_faults.*.llm.credential.count` | int | — | <=0.9.73 | `telemetry:llm.faults.*.llm.credential.count` | 0.9.89 (targeted) | — | — |
+| `llm_faults.*.llm.credential.last` | str/null | — | <=0.9.73 | `telemetry:llm.faults.*.llm.credential.last` | 0.9.89 (targeted) | — | — |
 
 ### versions
 

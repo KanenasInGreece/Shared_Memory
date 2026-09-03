@@ -62,7 +62,9 @@ __all__ = [
     "INTRODUCED_0_9_74",
     "INTRODUCED_0_9_79",
     "INTRODUCED_0_9_81",
+    "INTRODUCED_0_9_88",
     "DUAL_EMIT_DROP_TARGET",
+    "WARNING_KEYS",
     "CATEGORIES",
     "HEALTH",
     "TELEMETRY",
@@ -85,7 +87,7 @@ __all__ = [
 #: coordinator.py's FRAMEWORK_VERSION et al. until the merger's own version-
 #: bump step (which those four files stay reserved for) catches up to it at
 #: release time — that gap is the check doing its job, not a build defect.
-VERSION = "0.9.87"
+VERSION = "0.9.88"
 
 
 def _version_tuple(v: str) -> tuple:
@@ -180,6 +182,15 @@ INTRODUCED_0_9_79 = "0.9.79"
 #: same carve-out INTRODUCED_0_9_79 got — so no later release can silently
 #: re-date them.
 INTRODUCED_0_9_81 = "0.9.81"
+
+#: Same pattern, this OBS round (R-A, W6): keys genuinely NEW this cycle
+#: (D9's `gateway.client_disconnects_total`) are stamped with THIS frozen
+#: constant rather than bare `VERSION`, so a later release's version bump
+#: cannot silently re-date them. At the pin-bump the merger freezes this
+#: into the real ship version if it differs (renaming the constant to match,
+#: same move `INTRODUCED_0_9_79`/`INTRODUCED_0_9_81` got at their releases) —
+#: not this build step's job.
+INTRODUCED_0_9_88 = "0.9.88"
 #: The release the dual-emitted /health copies TARGET being dropped in — a
 #: TARGET, never a commitment (fix round item 1 on decision:1832): the drop
 #: is GATED on the monitor-contract step (Group 3 — the monitor must consume
@@ -196,7 +207,28 @@ INTRODUCED_0_9_81 = "0.9.81"
 #: can never silently fall behind the release that is naming it. Whoever ships
 #: the removal — gated on the monitor-contract step actually landing —
 #: updates this alongside it.
-DUAL_EMIT_DROP_TARGET = "0.9.88"
+DUAL_EMIT_DROP_TARGET = "0.9.89"
+
+#: CG (OBS round) — the enumerated `warnings[].key` vocabulary. Before this,
+#: `warnings[].key` was a free `str` (see the entry below): a renamed or
+#: added warning key was invisible to every guard, and three existing
+#: `log="health.warning.*"` annotations elsewhere in this file (fixed in the
+#: same change) named keys NO producer ever emitted. Re-derived from the six
+#: `_warning(...)` call sites in `hive_mind_proxy.py`'s health-build function
+#: — never hand-maintained independently of them — and pinned by an AST/
+#: source walk in `tests/test_obs_cg_warning_keys.py` in both directions:
+#: every literal `_warning(` first-arg (the encoder pair's f-string expands
+#: via its `("embedder", "reranker")` loop) is a member of this set, and
+#: every member of this set has a producer. Rendered into the generated doc
+#: by `render_markdown()` below.
+WARNING_KEYS: frozenset[str] = frozenset({
+    "encoder_embedder_projected_ms",
+    "encoder_reranker_projected_ms",
+    "outbox_oldest_pending_age_s",
+    "rem_dead_lettered",
+    "gateway_shed_503_total",
+    "token_verify_failed_per_min",
+})
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -290,7 +322,8 @@ HEALTH: dict[str, dict] = {
         "consumer sees the same verdict — the monitor stops deriving health from "
         "telemetry numbers client-side.")),
     "warnings[].key": _k("str", "warnings", since=INTRODUCED_0_9_74,
-                         log="health.warning.<key>"),
+                         log="health.warning.<key>",
+                         note="one of WARNING_KEYS — see that constant's docstring"),
     "warnings[].limit": _k("int|float", "warnings", since=INTRODUCED_0_9_74),
     "warnings[].observed": _k("int|float", "warnings", since=INTRODUCED_0_9_74),
     "warnings[].unit": _k("str", "warnings", since=INTRODUCED_0_9_74),
@@ -565,9 +598,6 @@ HEALTH: dict[str, dict] = {
     "config.llm_pool_tuning.cooldown_s": _k(
         "float|int", "llm", unit="_s",
         moved_to="telemetry:config.llm_pool_tuning.cooldown_s", removed_in=DUAL_EMIT_DROP_TARGET),
-    "config.llm_pool_tuning.max_tries": _k(
-        "int", "llm", moved_to="telemetry:config.llm_pool_tuning.max_tries",
-        removed_in=DUAL_EMIT_DROP_TARGET),
     "config.llm_affinity.prefix_chars": _k(
         "int", "llm", unit="_chars",
         moved_to="telemetry:config.llm_affinity.prefix_chars", removed_in=DUAL_EMIT_DROP_TARGET),
@@ -691,7 +721,13 @@ TELEMETRY: dict[str, dict] = {
     "encoders.embed.errors": _k("int", "encoders", since=INTRODUCED_0_9_74),
     "encoders.embed.p50_ms": _k("float|null", "encoders", unit="_ms", since=INTRODUCED_0_9_74),
     "encoders.embed.p95_ms": _k("float|null", "encoders", unit="_ms", since=INTRODUCED_0_9_74,
-                                log="health.warning.encoder_p95_ms"),
+                                note=(
+        "NOT the field `encoder_embedder_projected_ms` observes — that warning "
+        "compares backend_capability.embedder.projected_full_payload_s against "
+        "encoders.limit_ms, never this p95 ring. No `log=` here: the wildcarded "
+        "backend_capability.*.projected_full_payload_s entry cannot carry a "
+        "single per-encoder log string, so there is no field this p95 can "
+        "correctly point at (QA fix round, finding 3).")),
     "encoders.embed.max_ms": _k("float|null", "encoders", unit="_ms", since=INTRODUCED_0_9_74),
     "encoders.embed.last_ms": _k("float|null", "encoders", unit="_ms", since=INTRODUCED_0_9_74),
     "encoders.embed.last_payload_chars": _k("int|null", "encoders", unit="_chars",
@@ -703,16 +739,24 @@ TELEMETRY: dict[str, dict] = {
     "encoders.rerank.errors": _k("int", "encoders", since=INTRODUCED_0_9_74),
     "encoders.rerank.p50_ms": _k("float|null", "encoders", unit="_ms", since=INTRODUCED_0_9_74),
     "encoders.rerank.p95_ms": _k("float|null", "encoders", unit="_ms", since=INTRODUCED_0_9_74,
-                                 log="health.warning.encoder_p95_ms"),
+                                 note=(
+        "NOT the field `encoder_reranker_projected_ms` observes — same "
+        "reasoning as encoders.embed.p95_ms's note: the warning compares "
+        "backend_capability.reranker.projected_full_payload_s against "
+        "encoders.limit_ms, and the wildcarded capability field cannot carry "
+        "a per-encoder `log=` either. No `log=` here (QA fix round, finding 3).")),
     "encoders.rerank.max_ms": _k("float|null", "encoders", unit="_ms", since=INTRODUCED_0_9_74),
     "encoders.rerank.last_ms": _k("float|null", "encoders", unit="_ms", since=INTRODUCED_0_9_74),
     "encoders.rerank.last_payload_chars": _k("int|null", "encoders", unit="_chars",
                                              since=INTRODUCED_0_9_74),
     "encoders.rerank.window": _k("int", "encoders", since=INTRODUCED_0_9_74),
     "encoders.limit_ms": _k("float|null", "encoders", unit="_ms", since=INTRODUCED_0_9_74, note=(
-        "ENCODER_LATENCY_WARN_MS — the limit the p95s above are compared against; "
-        "null means it is derived per-encoder from backend_capability.ceiling_s "
-        "rather than pinned by env.")),
+        "ENCODER_LATENCY_WARN_MS — the limit "
+        "backend_capability.*.projected_full_payload_s (NOT the p95s above) is "
+        "compared against, per encoder, to raise "
+        "encoder_{embedder,reranker}_projected_ms; null means it is derived "
+        "per-encoder from backend_capability.*.ceiling_s rather than pinned by "
+        "env (QA fix round, finding 3: this note previously named the p95s).")),
 
     # ── gateway (NEW, 0.9.74) ───────────────────────────────────────────────
     "gateway.requests_total": _k("int", "gateway", unit="_total", since=INTRODUCED_0_9_74),
@@ -730,7 +774,17 @@ TELEMETRY: dict[str, dict] = {
     "gateway.inflight_max": _k("int", "gateway", since=INTRODUCED_0_9_74,
                                note="GATEWAY_INFLIGHT_MAX; 0 = valve disabled"),
     "gateway.shed_503_total": _k("int", "gateway", unit="_total", since=INTRODUCED_0_9_74,
-                                 log="health.warning.pool_shedding"),
+                                 log="health.warning.gateway_shed_503_total"),
+    "gateway.client_disconnects_total": _k(
+        "int", "gateway", unit="_total", since=INTRODUCED_0_9_88, note=(
+            "D9 (OBS round): a CALLER of this gateway aborted an LLM-proxy "
+            "request — before response headers could be sent, or partway "
+            "through the streamed body. ⛔ NEVER conditional, 0 when none, "
+            "same contract as shed_503_total: incremented from "
+            "hive_mind_proxy.py's dispatch loop, never a verdict on any "
+            "backend — neither _llm_mark_ok nor _llm_mark_fail fires for it, "
+            "and its duration is excluded from the latency ring entirely "
+            "(a client hang-up is not a service time)")),
 
     # ── outbox (NEW section, 0.9.74) ────────────────────────────────────────
     "outbox.pending": _k("int", "outbox", since=INTRODUCED_0_9_74),
@@ -742,7 +796,7 @@ TELEMETRY: dict[str, dict] = {
     "outbox.rem_reviewed": _k("int", "outbox", since=INTRODUCED_0_9_74),
     "outbox.oldest_failed_age_s": _k("int|null", "outbox", unit="_s", since=INTRODUCED_0_9_74),
     "outbox.oldest_pending_age_s": _k("int|null", "outbox", unit="_s", since=INTRODUCED_0_9_74,
-                                      log="health.warning.outbox_age"),
+                                      log="health.warning.outbox_oldest_pending_age_s"),
     "outbox.apply_latency_p50_s": _k("float|null", "outbox", unit="_s", since=INTRODUCED_0_9_74),
     "outbox.apply_latency_p95_s": _k("float|null", "outbox", unit="_s", since=INTRODUCED_0_9_74),
     "outbox.apply_latency_window": _k("int", "outbox", since=INTRODUCED_0_9_74),
@@ -851,8 +905,13 @@ TELEMETRY: dict[str, dict] = {
     "registry.as_of": _k("str|null", "axes/registry", since=INTRODUCED_0_9_74, note=(
         "when the census last SUCCEEDED. null before the first success")),
     "registry.error": _k("str", "axes/registry", since=INTRODUCED_0_9_74, note=(
-        "present only while the last census attempt failed; the counts beside "
-        "it are the last good ones")),
+        "two different producers, same key, never both at once: "
+        "_registry_telemetry() (coordinator.py) sets it while the LAST CENSUS "
+        "attempt failed — the counts beside it are the last good ones; the "
+        "try/except wrapping that call's OWN invocation sets it instead, "
+        "replacing the whole registry.* section with just {\"error\": ...}, "
+        "when the section-query call itself raises (a bug in "
+        "_registry_telemetry, not a failed census)")),
     "registry.census_failures_total": _k(
         "int", "axes/registry", unit="_total", since=INTRODUCED_0_9_74, log="health.registry",
         note=("failures of the row-count query behind registry.*. Deliberately "
@@ -878,8 +937,6 @@ TELEMETRY: dict[str, dict] = {
         "aggregates the domain-naming refusals: domain_unnameable, "
         "domain_spelling_variant, domain_confusable, domain_unknown, "
         "domain_without_project, domain_not_allowed_on_judgement")),
-    "registry.error": _k("str", "axes/registry", since=INTRODUCED_0_9_74,
-                         note="present only when this section's own query failed"),
 
     # ── clients (NEW, 0.9.74) ───────────────────────────────────────────────
     "clients.versions_seen": _k("dict", "versions", since=INTRODUCED_0_9_74,
@@ -1020,7 +1077,6 @@ TELEMETRY: dict[str, dict] = {
     "config.llm_pool_tuning.fail_threshold": _k("int", "llm", since=INTRODUCED_0_9_74),
     "config.llm_pool_tuning.fail_window_s": _k("float|int", "llm", unit="_s", since=INTRODUCED_0_9_74),
     "config.llm_pool_tuning.cooldown_s": _k("float|int", "llm", unit="_s", since=INTRODUCED_0_9_74),
-    "config.llm_pool_tuning.max_tries": _k("int", "llm", since=INTRODUCED_0_9_74),
     "config.llm_affinity.prefix_chars": _k("int", "llm", unit="_chars", since=INTRODUCED_0_9_74),
     "config.llm_affinity.ttl_s": _k("float|int", "llm", unit="_s", since=INTRODUCED_0_9_74),
     "config.llm_affinity.max_inflight": _k("int", "llm", since=INTRODUCED_0_9_74),
@@ -1259,7 +1315,7 @@ TELEMETRY: dict[str, dict] = {
 
     # ── credentials ─────────────────────────────────────────────────────────
     "credentials.token_verify_failed": _k("int", "credentials",
-                                          log="health.warning.token_verify_failed"),
+                                          log="health.warning.token_verify_failed_per_min"),
     "credentials.token_verify_failed_last_ts": _k("str|null", "credentials"),
     "credentials.daemon_tokens_issued": _k("int", "credentials"),
     "credentials.daemon_tokens_issued_last_ts": _k("str|null", "credentials"),
@@ -1480,6 +1536,76 @@ MEANING_CHANGES: tuple[dict, ...] = (
                    "replacement of the original fact"),
         "shape_changed": False,
     },
+    # ── OBS round D1 (2026-09, ruling R-A) — pinned to the bare `VERSION`
+    # constant: this build has not shipped yet, so there is no frozen stamp
+    # to name (same practice the W2/W4 entries above followed at THEIR
+    # authorship time, before the merger's version-bump froze them into
+    # INTRODUCED_0_9_79 / INTRODUCED_0_9_81). At release the merger freezes
+    # these into a new INTRODUCED_0_9_8x constant the same way.
+    {
+        "endpoint": "health",
+        "path": "warnings[] (key=token_verify_failed_per_min)",
+        "in_version": INTRODUCED_0_9_88,
+        "was": ("a counter delta extrapolated over the gap between health-"
+                "cache BUILDS (HEALTH_CACHE_TTL_S) — poll-cadence-dependent: "
+                "one event read ~24/min at the 3 s TTL default and ~0.1/min "
+                "under 600 s polling of the exact same single event"),
+        "now": ("the count of token_verify_failed events in a true 60 s "
+                "monotonic window, capped at 256 (the coordinator ring's "
+                "fixed bound — a flood inside one 60 s window reads exactly "
+                "256, not the true rate; the warning still fires at a "
+                "saturated reading)"),
+        "action": ("a consumer alerting on this warning's `observed` value "
+                   "now reads an honest per-minute count instead of a "
+                   "number that moved with how often something else polled "
+                   "/health; the warning key name and the "
+                   "`> TOKEN_VERIFY_WARN_PER_MIN` comparison, including its "
+                   "threshold-0 semantics, are unchanged"),
+        "shape_changed": False,
+    },
+    # ── OBS round D2 (2026-09, ruling R-A) — same not-yet-shipped pinning
+    # practice as D1's entry above.
+    {
+        "endpoint": "telemetry",
+        "path": "gateway.requests_total",
+        "in_version": INTRODUCED_0_9_88,
+        "was": ("counted only AUTHENTICATED, handler-reached requests — the "
+                "gateway's own 401/403/503 responses (load-shed, role "
+                "denial, backup-quiesce) and all auth-off traffic never "
+                "reached the single `_record_gateway_request` call site"),
+        "now": ("counts every request entering the gateway, at every exit "
+                "the middleware can take — exactly one "
+                "`_record_gateway_request` per request"),
+        "action": ("expect this counter to STEP UP on deploy — health "
+                   "polls and previously-invisible gateway-issued "
+                   "401/403/503 now count. Magnitude is unmeasured; observe "
+                   "post-deploy rather than predicting"),
+        "shape_changed": False,
+    },
+    {
+        "endpoint": "telemetry",
+        "path": "gateway.by_status.*",
+        "in_version": INTRODUCED_0_9_88,
+        "was": ("only the authenticated, handler-reached path's own status "
+                "was ever counted — a gateway-issued 401/403/503 (load-shed, "
+                "role denial, backup-quiesce) was invisible here"),
+        "now": ("every exit the middleware can take is counted, so "
+                "`by_status.401` now includes protected-path bearer "
+                "failures, `by_status.403` includes role denials, and "
+                "`by_status.503` now includes load-shed and backup-quiesce "
+                "alongside pool-saturated — `shed_503_total` is therefore "
+                "only `<= by_status.503` from now on, no longer equal-by-"
+                "construction on the shed class alone"),
+        "action": ("a consumer that treated `shed_503_total == by_status."
+                   "503` as an invariant must drop that assumption; a "
+                   "401 from a protected path now shows up here AND in the "
+                   "D1 rate window AND in `credentials.token_verify_failed` "
+                   "— same event, three surfaces. The v0.9.87 stale-token-"
+                   "monitor `/health` case is unaffected here: it serves "
+                   "200, so it moves only the D1 window and "
+                   "`requests_total`/`by_status.2xx`, never `by_status.401`"),
+        "shape_changed": False,
+    },
 )
 
 #: Keys REMOVED outright in 0.9.74 (not moved) — each had no writer and had
@@ -1496,6 +1622,21 @@ REMOVED_IN_0_9_74: tuple[dict, ...] = (
                "was the only writer of"},
     {"endpoint": "telemetry", "path": "entity_graph.largest_alias_component",
      "reason": "same retired gds.wcc stamp"},
+)
+
+#: Keys REMOVED outright in 0.9.88 (S12, OBS round; R-B) — same shape and same
+#: reason class as REMOVED_IN_0_9_74: no writer. `LLM_MAX_TRIES` was read by
+#: nothing but this render itself — no retry loop ever consulted it — and the
+#: comments beside it promised cross-backend failover this pool never had (the
+#: real retry is same-target, buffered-body-gated; a genuine failure 503s the
+#: caller rather than hopping to a different backend).
+REMOVED_IN_0_9_88: tuple[dict, ...] = (
+    {"endpoint": "health", "path": "config.llm_pool_tuning.max_tries",
+     "reason": "no writer — LLM_MAX_TRIES was read by nothing but this "
+               "render; the comments beside it promised cross-backend "
+               "failover the pool never implemented"},
+    {"endpoint": "telemetry", "path": "config.llm_pool_tuning.max_tries",
+     "reason": "same dead LLM_MAX_TRIES constant, dual-emitted copy"},
 )
 
 
@@ -1840,6 +1981,16 @@ def render_markdown() -> str:
       "state transition and every warning raised or cleared writes one line named "
       "after the key that changed (the **log twin** column). Never a line per poll.")
     a("")
+    a("## Warning keys")
+    a("")
+    a("`warnings[].key` (CG, OBS round) is one of this enumerated set — never a "
+      "free string. Each is produced by exactly one `_warning(...)` call site in "
+      "`hive_mind_proxy.py`'s health-build function; the log line it writes when "
+      "raised or cleared is `health.warning.<key>`.")
+    a("")
+    for key in sorted(WARNING_KEYS):
+        a(f"- `{key}`")
+    a("")
     a("## HTTP status codes — unchanged by this release")
     a("")
     a("`/health` returns **503 if and only if the embedder or the reranker is down**. "
@@ -1872,6 +2023,15 @@ def render_markdown() -> str:
     a("| endpoint | key | why |")
     a("|---|---|---|")
     for rm in REMOVED_IN_0_9_74:
+        a(f"| {rm['endpoint']} | `{rm['path']}` | {rm['reason']} |")
+    a("")
+    a("## Removed outright in 0.9.88")
+    a("")
+    a("Not moved — **removed**. Each had no writer.")
+    a("")
+    a("| endpoint | key | why |")
+    a("|---|---|---|")
+    for rm in REMOVED_IN_0_9_88:
         a(f"| {rm['endpoint']} | `{rm['path']}` | {rm['reason']} |")
     a("")
     a("## Dual-emit drop target")
