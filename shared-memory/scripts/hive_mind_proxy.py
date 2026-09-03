@@ -192,7 +192,15 @@ DEFAULT_TARGET = os.environ.get("LLM_DEFAULT_TARGET", FRAMEWORK_DEFAULTS["LLM_DE
 # free-est capable card. NOT least-response-time (long completions make latency
 # meaningless), NOT a gateway queue (forward-and-absorb into llama.cpp's own slot
 # queue keeps the gateway stateless). A backend that fails twice in a window is put
-# in cooldown; requests retry on the next-best backend — one card always serves.
+# in cooldown and EXCLUDED FROM SELECTION until it elapses — but this is
+# per-BACKEND health bookkeeping for the NEXT request's routing decision, not a
+# per-REQUEST retry (S12, OBS round — LLM_MAX_TRIES/"max_tries" promised
+# cross-backend failover this pool never had, and has been removed): a request
+# that fails against the backend it was routed to gets that backend's own 503,
+# not a silent hop to a different card. The one retry that DOES exist is
+# same-target only — a buffered-body request may be replayed once on a fresh
+# connection to the SAME backend after a connection-reuse race (see
+# `have_buffered_body`/`max_attempts` below, in the dispatch loop).
 #
 # LLM_BACKENDS_JSON is the preferred form when any backend needs its own
 # credential (a paid cloud API, e.g. DeepSeek/xAI) or its own model id — the
@@ -828,11 +836,18 @@ def _apply_backend_body_overrides(body: bytes, model: "str | None",
 
 # Failure/cooldown (advisor spec): N fails within a window → cooldown; re-probed
 # (a normal request) after it elapses. A success clears the fail streak.
+# ⛔ S12 (OBS round): this is PER-BACKEND bookkeeping that changes future
+# ROUTING, never a per-request retry. `LLM_MAX_TRIES` used to exist here,
+# read by nothing but the /memory/telemetry render — no code path ever
+# consulted it. The real retry is same-target and buffered-body-gated (see
+# `have_buffered_body`/`max_attempts` in the dispatch loop below): a
+# connection-reuse race may replay ONE buffered request on a fresh
+# connection to the SAME backend. A genuine failure — connect refusal,
+# timeout, a client abort — 503s (or its own status) straight to the
+# caller; it is never silently re-routed to a different backend.
 LLM_FAIL_THRESHOLD = int(os.environ.get("LLM_FAIL_THRESHOLD", "2"))
 LLM_FAIL_WINDOW = float(os.environ.get("LLM_FAIL_WINDOW", "60"))
 LLM_COOLDOWN = float(os.environ.get("LLM_COOLDOWN", "300"))
-# Per-request retries across backends on a connect failure (transparent to client).
-LLM_MAX_TRIES = int(os.environ.get("LLM_MAX_TRIES", "2")) + 1
 
 # ── Fit check (A-1/A-2/N-1/N-3, Model_Attributes_Routing_Plan_2026-08-18) ────
 # est_prompt_tokens = body_chars / CHARS_PER_TOKEN_RATIO, computed GATEWAY-side
@@ -4949,7 +4964,6 @@ def _config_snapshot() -> dict:
             "fail_threshold": LLM_FAIL_THRESHOLD,
             "fail_window_s": LLM_FAIL_WINDOW,
             "cooldown_s": LLM_COOLDOWN,
-            "max_tries": LLM_MAX_TRIES,
         },
         "llm_affinity": {
             "prefix_chars": AFFINITY_PREFIX_CHARS,

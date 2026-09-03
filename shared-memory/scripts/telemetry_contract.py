@@ -62,6 +62,7 @@ __all__ = [
     "INTRODUCED_0_9_74",
     "INTRODUCED_0_9_79",
     "INTRODUCED_0_9_81",
+    "INTRODUCED_0_9_88",
     "DUAL_EMIT_DROP_TARGET",
     "CATEGORIES",
     "HEALTH",
@@ -180,6 +181,15 @@ INTRODUCED_0_9_79 = "0.9.79"
 #: same carve-out INTRODUCED_0_9_79 got — so no later release can silently
 #: re-date them.
 INTRODUCED_0_9_81 = "0.9.81"
+
+#: Same pattern, this OBS round (R-A, W6): keys genuinely NEW this cycle
+#: (D9's `gateway.client_disconnects_total`) are stamped with THIS frozen
+#: constant rather than bare `VERSION`, so a later release's version bump
+#: cannot silently re-date them. At the pin-bump the merger freezes this
+#: into the real ship version if it differs (renaming the constant to match,
+#: same move `INTRODUCED_0_9_79`/`INTRODUCED_0_9_81` got at their releases) —
+#: not this build step's job.
+INTRODUCED_0_9_88 = "0.9.88"
 #: The release the dual-emitted /health copies TARGET being dropped in — a
 #: TARGET, never a commitment (fix round item 1 on decision:1832): the drop
 #: is GATED on the monitor-contract step (Group 3 — the monitor must consume
@@ -565,9 +575,6 @@ HEALTH: dict[str, dict] = {
     "config.llm_pool_tuning.cooldown_s": _k(
         "float|int", "llm", unit="_s",
         moved_to="telemetry:config.llm_pool_tuning.cooldown_s", removed_in=DUAL_EMIT_DROP_TARGET),
-    "config.llm_pool_tuning.max_tries": _k(
-        "int", "llm", moved_to="telemetry:config.llm_pool_tuning.max_tries",
-        removed_in=DUAL_EMIT_DROP_TARGET),
     "config.llm_affinity.prefix_chars": _k(
         "int", "llm", unit="_chars",
         moved_to="telemetry:config.llm_affinity.prefix_chars", removed_in=DUAL_EMIT_DROP_TARGET),
@@ -1023,7 +1030,6 @@ TELEMETRY: dict[str, dict] = {
     "config.llm_pool_tuning.fail_threshold": _k("int", "llm", since=INTRODUCED_0_9_74),
     "config.llm_pool_tuning.fail_window_s": _k("float|int", "llm", unit="_s", since=INTRODUCED_0_9_74),
     "config.llm_pool_tuning.cooldown_s": _k("float|int", "llm", unit="_s", since=INTRODUCED_0_9_74),
-    "config.llm_pool_tuning.max_tries": _k("int", "llm", since=INTRODUCED_0_9_74),
     "config.llm_affinity.prefix_chars": _k("int", "llm", unit="_chars", since=INTRODUCED_0_9_74),
     "config.llm_affinity.ttl_s": _k("float|int", "llm", unit="_s", since=INTRODUCED_0_9_74),
     "config.llm_affinity.max_inflight": _k("int", "llm", since=INTRODUCED_0_9_74),
@@ -1571,6 +1577,21 @@ REMOVED_IN_0_9_74: tuple[dict, ...] = (
      "reason": "same retired gds.wcc stamp"},
 )
 
+#: Keys REMOVED outright in 0.9.88 (S12, OBS round; R-B) — same shape and same
+#: reason class as REMOVED_IN_0_9_74: no writer. `LLM_MAX_TRIES` was read by
+#: nothing but this render itself — no retry loop ever consulted it — and the
+#: comments beside it promised cross-backend failover this pool never had (the
+#: real retry is same-target, buffered-body-gated; a genuine failure 503s the
+#: caller rather than hopping to a different backend).
+REMOVED_IN_0_9_88: tuple[dict, ...] = (
+    {"endpoint": "health", "path": "config.llm_pool_tuning.max_tries",
+     "reason": "no writer — LLM_MAX_TRIES was read by nothing but this "
+               "render; the comments beside it promised cross-backend "
+               "failover the pool never implemented"},
+    {"endpoint": "telemetry", "path": "config.llm_pool_tuning.max_tries",
+     "reason": "same dead LLM_MAX_TRIES constant, dual-emitted copy"},
+)
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # CONDITIONAL KEYS — the exemption list for the "every documented key is
@@ -1945,6 +1966,15 @@ def render_markdown() -> str:
     a("| endpoint | key | why |")
     a("|---|---|---|")
     for rm in REMOVED_IN_0_9_74:
+        a(f"| {rm['endpoint']} | `{rm['path']}` | {rm['reason']} |")
+    a("")
+    a("## Removed outright in 0.9.88")
+    a("")
+    a("Not moved — **removed**. Each had no writer.")
+    a("")
+    a("| endpoint | key | why |")
+    a("|---|---|---|")
+    for rm in REMOVED_IN_0_9_88:
         a(f"| {rm['endpoint']} | `{rm['path']}` | {rm['reason']} |")
     a("")
     a("## Dual-emit drop target")
