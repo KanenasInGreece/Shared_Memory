@@ -27,9 +27,27 @@ discrepancy from the brief's own count.)
 THE FIX
 -------
 `telemetry_contract.WARNING_KEYS` — the enumerated, re-derived set of the six
-real `_warning(...)` first-argument literals. All five stale `log=`
-annotations renamed to the string their OWN field's producer actually emits.
-`WARNING_KEYS` is rendered into the generated doc.
+real `_warning(...)` first-argument literals. Three of the five stale `log=`
+annotations were renamed to the string their OWN field's producer actually
+emits. `WARNING_KEYS` is rendered into the generated doc.
+
+QA FIX ROUND (finding 3) — the encoder pair's `log=` was dropped, not renamed
+-----------------------------------------------------------------------------
+The first pass renamed `encoders.embed.p95_ms`/`encoders.rerank.p95_ms`'s
+`log=` to the real key names (`encoder_{embedder,reranker}_projected_ms`),
+which made the STRING real but left it pointing at the WRONG QUANTITY: that
+warning compares `backend_capability.<name>.projected_full_payload_s`
+against `encoders.limit_ms`, never the p95 ring — a different wrong answer,
+not a right one (QA measured this; the CG guard cannot see it, because it
+checks membership in `WARNING_KEYS`, never attribution to the right field).
+The field that DOES carry the observed value,
+`backend_capability.*.projected_full_payload_s`, is WILDCARDED — one contract
+entry standing for both `embedder` and `reranker` — and `log=` is a single
+string, so it cannot correctly name either backend's specific warning key
+without being wrong for the other. No field in the contract can carry a
+correct per-encoder `log=` for this pair, so the fix round dropped `log=`
+from both p95 rows entirely (per the brief's own stated fallback) and
+corrected `encoders.limit_ms`'s note, which had the same "the p95s" claim.
 
 THIS FILE
 ---------
@@ -224,21 +242,31 @@ def test_no_log_annotation_names_a_key_without_a_producer():
     assert not bad, f"log= annotations naming a non-existent warning key: {bad}"
 
 
-def test_the_five_previously_stale_annotations_are_now_correct():
-    """Direct pin on the exact fields Opus flagged (plus the one Opus's
-    count missed) — the four stale STRINGS Opus found map to correct
-    per-field values now, not just "some" real key."""
+def test_the_three_renamed_annotations_are_now_correct():
+    """Direct pin on three of the five fields Opus flagged — these three
+    STRINGS map to correct per-field values now, not just "some" real key."""
     assert tc.HEALTH.get("encoders.embed.p95_ms") is None  # lives in TELEMETRY only
-    assert tc.TELEMETRY["encoders.embed.p95_ms"]["log"] == \
-        "health.warning.encoder_embedder_projected_ms"
-    assert tc.TELEMETRY["encoders.rerank.p95_ms"]["log"] == \
-        "health.warning.encoder_reranker_projected_ms"
     assert tc.TELEMETRY["gateway.shed_503_total"]["log"] == \
         "health.warning.gateway_shed_503_total"
     assert tc.TELEMETRY["outbox.oldest_pending_age_s"]["log"] == \
         "health.warning.outbox_oldest_pending_age_s"
     assert tc.TELEMETRY["credentials.token_verify_failed"]["log"] == \
         "health.warning.token_verify_failed_per_min"
+
+
+def test_the_encoder_p95_pair_has_no_log_annotation():
+    """QA fix round, finding 3: renaming the encoder pair's `log=` to the
+    real producer key made the STRING real but left it naming the WRONG
+    QUANTITY (the warning observes `projected_full_payload_s`, never the
+    p95 ring) — and no field in the contract can carry a correct per-encoder
+    `log=` for it, because the field that DOES carry the right quantity
+    (`backend_capability.*.projected_full_payload_s`) is wildcarded across
+    both encoders while `log=` is a single string. Dropped, not renamed
+    again — pin the absence so a future "helpful" re-add of the old wrong
+    string is caught."""
+    assert tc.TELEMETRY["encoders.embed.p95_ms"]["log"] is None
+    assert tc.TELEMETRY["encoders.rerank.p95_ms"]["log"] is None
+    assert tc.HEALTH["backend_capability.*.projected_full_payload_s"]["log"] is None
 
 
 # ═══════════════════════════════════════════════════════════════════════════

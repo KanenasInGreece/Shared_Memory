@@ -379,16 +379,16 @@ The envelope is `{"status": "success", "telemetry": {…}}`; paths below are rel
 | `encoders.embed.last_payload_chars` | int/null | _chars | 0.9.74 | — | — | — | — |
 | `encoders.embed.max_ms` | float/null | _ms | 0.9.74 | — | — | — | — |
 | `encoders.embed.p50_ms` | float/null | _ms | 0.9.74 | — | — | — | — |
-| `encoders.embed.p95_ms` | float/null | _ms | 0.9.74 | — | — | `health.warning.encoder_embedder_projected_ms` | — |
+| `encoders.embed.p95_ms` | float/null | _ms | 0.9.74 | — | — | — | NOT the field `encoder_embedder_projected_ms` observes — that warning compares backend_capability.embedder.projected_full_payload_s against encoders.limit_ms, never this p95 ring. No `log=` here: the wildcarded backend_capability.*.projected_full_payload_s entry cannot carry a single per-encoder log string, so there is no field this p95 can correctly point at (QA fix round, finding 3). |
 | `encoders.embed.window` | int | — | 0.9.74 | — | — | — | observations the percentiles were computed over — NOT the ring's capacity. p95 over 3 calls is not a p95. |
-| `encoders.limit_ms` | float/null | _ms | 0.9.74 | — | — | — | ENCODER_LATENCY_WARN_MS — the limit the p95s above are compared against; null means it is derived per-encoder from backend_capability.ceiling_s rather than pinned by env. |
+| `encoders.limit_ms` | float/null | _ms | 0.9.74 | — | — | — | ENCODER_LATENCY_WARN_MS — the limit backend_capability.*.projected_full_payload_s (NOT the p95s above) is compared against, per encoder, to raise encoder_{embedder,reranker}_projected_ms; null means it is derived per-encoder from backend_capability.*.ceiling_s rather than pinned by env (QA fix round, finding 3: this note previously named the p95s). |
 | `encoders.rerank.calls` | int | — | 0.9.74 | — | — | — | — |
 | `encoders.rerank.errors` | int | — | 0.9.74 | — | — | — | — |
 | `encoders.rerank.last_ms` | float/null | _ms | 0.9.74 | — | — | — | — |
 | `encoders.rerank.last_payload_chars` | int/null | _chars | 0.9.74 | — | — | — | — |
 | `encoders.rerank.max_ms` | float/null | _ms | 0.9.74 | — | — | — | — |
 | `encoders.rerank.p50_ms` | float/null | _ms | 0.9.74 | — | — | — | — |
-| `encoders.rerank.p95_ms` | float/null | _ms | 0.9.74 | — | — | `health.warning.encoder_reranker_projected_ms` | — |
+| `encoders.rerank.p95_ms` | float/null | _ms | 0.9.74 | — | — | — | NOT the field `encoder_reranker_projected_ms` observes — same reasoning as encoders.embed.p95_ms's note: the warning compares backend_capability.reranker.projected_full_payload_s against encoders.limit_ms, and the wildcarded capability field cannot carry a per-encoder `log=` either. No `log=` here (QA fix round, finding 3). |
 | `encoders.rerank.window` | int | — | 0.9.74 | — | — | — | — |
 | `rerank_fallbacks_last_ts` | str/null | — | <=0.9.73 | — | — | — | — |
 | `rerank_fallbacks_total` | int | _total | <=0.9.73 | — | — | — | — |

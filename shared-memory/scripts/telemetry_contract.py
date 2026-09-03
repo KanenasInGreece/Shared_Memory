@@ -721,7 +721,13 @@ TELEMETRY: dict[str, dict] = {
     "encoders.embed.errors": _k("int", "encoders", since=INTRODUCED_0_9_74),
     "encoders.embed.p50_ms": _k("float|null", "encoders", unit="_ms", since=INTRODUCED_0_9_74),
     "encoders.embed.p95_ms": _k("float|null", "encoders", unit="_ms", since=INTRODUCED_0_9_74,
-                                log="health.warning.encoder_embedder_projected_ms"),
+                                note=(
+        "NOT the field `encoder_embedder_projected_ms` observes — that warning "
+        "compares backend_capability.embedder.projected_full_payload_s against "
+        "encoders.limit_ms, never this p95 ring. No `log=` here: the wildcarded "
+        "backend_capability.*.projected_full_payload_s entry cannot carry a "
+        "single per-encoder log string, so there is no field this p95 can "
+        "correctly point at (QA fix round, finding 3).")),
     "encoders.embed.max_ms": _k("float|null", "encoders", unit="_ms", since=INTRODUCED_0_9_74),
     "encoders.embed.last_ms": _k("float|null", "encoders", unit="_ms", since=INTRODUCED_0_9_74),
     "encoders.embed.last_payload_chars": _k("int|null", "encoders", unit="_chars",
@@ -733,16 +739,24 @@ TELEMETRY: dict[str, dict] = {
     "encoders.rerank.errors": _k("int", "encoders", since=INTRODUCED_0_9_74),
     "encoders.rerank.p50_ms": _k("float|null", "encoders", unit="_ms", since=INTRODUCED_0_9_74),
     "encoders.rerank.p95_ms": _k("float|null", "encoders", unit="_ms", since=INTRODUCED_0_9_74,
-                                 log="health.warning.encoder_reranker_projected_ms"),
+                                 note=(
+        "NOT the field `encoder_reranker_projected_ms` observes — same "
+        "reasoning as encoders.embed.p95_ms's note: the warning compares "
+        "backend_capability.reranker.projected_full_payload_s against "
+        "encoders.limit_ms, and the wildcarded capability field cannot carry "
+        "a per-encoder `log=` either. No `log=` here (QA fix round, finding 3).")),
     "encoders.rerank.max_ms": _k("float|null", "encoders", unit="_ms", since=INTRODUCED_0_9_74),
     "encoders.rerank.last_ms": _k("float|null", "encoders", unit="_ms", since=INTRODUCED_0_9_74),
     "encoders.rerank.last_payload_chars": _k("int|null", "encoders", unit="_chars",
                                              since=INTRODUCED_0_9_74),
     "encoders.rerank.window": _k("int", "encoders", since=INTRODUCED_0_9_74),
     "encoders.limit_ms": _k("float|null", "encoders", unit="_ms", since=INTRODUCED_0_9_74, note=(
-        "ENCODER_LATENCY_WARN_MS — the limit the p95s above are compared against; "
-        "null means it is derived per-encoder from backend_capability.ceiling_s "
-        "rather than pinned by env.")),
+        "ENCODER_LATENCY_WARN_MS — the limit "
+        "backend_capability.*.projected_full_payload_s (NOT the p95s above) is "
+        "compared against, per encoder, to raise "
+        "encoder_{embedder,reranker}_projected_ms; null means it is derived "
+        "per-encoder from backend_capability.*.ceiling_s rather than pinned by "
+        "env (QA fix round, finding 3: this note previously named the p95s).")),
 
     # ── gateway (NEW, 0.9.74) ───────────────────────────────────────────────
     "gateway.requests_total": _k("int", "gateway", unit="_total", since=INTRODUCED_0_9_74),
