@@ -426,6 +426,31 @@ def test_every_main_route_registration_has_a_counterpart_in_each_test_mirror(pat
         f"attach_coordinator and set_known_routes. Mirror it exactly.")
 
 
+def test_main_binds_the_encoder_paths_to_the_dedicated_handler():
+    """⛔ THE ONE BINDING THAT MUST NEVER HAPPEN, pinned separately.
+
+    The mirror assertion above compares (verb, path) only — handlers there
+    legitimately differ, because the mirrors use sentinels. So it cannot see
+    `add_post("/v1/embeddings", proxy.handle_proxy)`, which would 405 every
+    legitimate encoder call (the guard returns 405 for ANY known key,
+    security fix A1) and which the whole mocked suite would report green.
+    Source-level, because main() cannot be executed in a unit test."""
+    # Comment lines stripped: the window carries a ⛔ comment naming
+    # handle_proxy precisely to warn against it, and a substring check that
+    # counted the warning as the defect would be an instrument that can only
+    # fail (fact:1321).
+    window = "\n".join(ln for ln in _main_registration_window().split("\n")
+                       if not ln.lstrip().startswith("#"))
+    for encoder_path in ("/v1/embeddings", "/v1/reranking"):
+        assert f'add_post("{encoder_path}", proxy.handle_encoder)' in window, (
+            f"main() must register {encoder_path} to proxy.handle_encoder — "
+            f"binding it to handle_proxy, or wrapping it in _route_guard, "
+            f"turns every legitimate POST into a 405")
+    assert "handle_proxy" not in window, (
+        "handle_proxy appears in main()'s registration window; it belongs to "
+        "the catch-all, which is registered after set_known_routes")
+
+
 # ══════════════════════════════════════════════════════════════════════════
 # S13 / S16f — which headers cross the gateway
 # ══════════════════════════════════════════════════════════════════════════
