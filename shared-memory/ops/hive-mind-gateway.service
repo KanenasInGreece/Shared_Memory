@@ -63,7 +63,7 @@ LimitCORE=0
 # XDG_RUNTIME_DIR is unset — neither is under %h, but `full` only makes
 # /usr, /boot, /efi and /etc read-only; it never touches /tmp, /run or
 # $XDG_RUNTIME_DIR, so this write is unaffected either way. `strict` stays
-# FORBIDDEN — it would make %h itself read-only. See S2_eps_HANDOFF.md §5/§9
+# FORBIDDEN — it would make %h itself read-only. See ops/README.md (Hardening)
 # for the write-path-outside-%h observation this directive does not resolve.
 ProtectSystem=full
 

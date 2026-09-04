@@ -125,7 +125,7 @@ risk by it either way):
   path (the `--state` file, the rotated `*-audit.jsonl` files, and their
   `.gz` siblings) is under `%h`.
 
-See the HYG round's ε-lane handoff (`S2_eps_HANDOFF.md` §5/§9) for the full
+See the v0.9.89 CHANGELOG entry for the full
 detail and the ruling that resolved this.
 
 ### Audit-log rotation

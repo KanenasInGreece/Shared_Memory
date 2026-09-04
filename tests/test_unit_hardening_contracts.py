@@ -30,6 +30,7 @@ Scope, per the ε-lane brief:
     /tmp) — those remain recorded findings in the handoff, not code changes.
 """
 import os
+import pytest
 
 _ROOT = os.path.join(os.path.dirname(__file__), "..")
 _OPS = os.path.join(_ROOT, "shared-memory", "ops")
@@ -138,3 +139,26 @@ def test_logrotate_unit_pins_protectsystem_full():
     unit's own comment and README.md's Hardening section. Unlike the other
     two units, this one has no write-path-outside-%h finding at all."""
     assert "ProtectSystem=full" in _lines(_LOGROTATE_UNIT)
+
+
+# ── Forbidden directives — ABSENT, pinned (step-2 review F2) ─────────────────
+#
+# The ruling forbids `PrivateTmp` in every unit and reserves `RestrictAddressFamilies`
+# for the merger's test-host drop-in trial; neither may appear as a directive. And
+# `LimitCORE=0` is only a fix while it is the ONLY LimitCORE line — a later
+# `LimitCORE=infinity` would win and the `in` assertions above would stay green.
+
+def _directive_lines(lines: list[str], name: str) -> list[str]:
+    return [l.strip() for l in lines if l.strip().startswith(f"{name}=")]
+
+
+@pytest.mark.parametrize("unit", [_GATEWAY_UNIT, _BACKUP_UNIT, _LOGROTATE_UNIT])
+def test_unit_has_no_privatetmp_and_no_restrictaddressfamilies_directive(unit):
+    lines = _lines(unit)
+    assert _directive_lines(lines, "PrivateTmp") == [], unit
+    assert _directive_lines(lines, "RestrictAddressFamilies") == [], unit
+
+
+@pytest.mark.parametrize("unit", [_GATEWAY_UNIT, _BACKUP_UNIT, _LOGROTATE_UNIT])
+def test_unit_has_exactly_one_limitcore_line_and_it_is_zero(unit):
+    assert _directive_lines(_lines(unit), "LimitCORE") == ["LimitCORE=0"], unit

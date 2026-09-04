@@ -30,7 +30,6 @@ import pytest
 
 _HERE = os.path.dirname(__file__)
 _MEMORY_BRIDGE_PATH = os.path.join(_HERE, "..", "shared-memory", "scripts", "memory_bridge.py")
-_SECURE_ENV_PATH = os.path.join(_HERE, "..", "shared-memory", "scripts", "secure_env.py")
 _VECTOR_SKILL_PATH = os.path.join(_HERE, "..", "mcp", "vector-skill.py")
 
 import sys  # noqa: E402
