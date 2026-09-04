@@ -2137,21 +2137,34 @@ class AsyncHiveMindProxy:
         # uncredentialed one, and the post-selection S-04 check below
         # still guards the credentialed choice.
         #
-        # R-B (HYG round): compare the FORWARDED form. `request.path` is
-        # percent-DECODED, while what goes on the wire is `str(request
-        # .rel_url)` — so `/v1/chat/completio%6es` read as the allowed route
-        # here and was then signed and sent as the ENCODED spelling, a
-        # different path to the provider. `rel_url.path_safe` is the same
-        # string aiohttp's own router matches on, so the gate and the wire can
-        # no longer disagree.
+        # R-B (HYG round): THE GATE COMPARES THE RAW REQUEST-TARGET PATH — the
+        # exact string `_upstream_url` puts on the wire. `request.path` is
+        # percent-DECODED, so `/v1%2fchat/completions` and
+        # `/v1/chat/completio%6es` both READ as the allowed route here while
+        # something else entirely was signed and sent to the provider: the
+        # check and the forward were looking at different strings, which is
+        # security fix A1's shape on the credentialed path.
         #
-        # A QUERY STRING on a credentialed route is denied outright: the
-        # forward carries it verbatim, no framework caller sends one, and
-        # `?key=…` is a real provider idiom — an unexamined query is a way to
-        # steer a signed request that a (method, path) allowlist cannot see.
-        # The credentialed_route_denied population widens under an unchanged
-        # name (CHANGELOG line owed, Group 3).
-        _route = (request.method, request.rel_url.path_safe.rstrip("/") or "/")
+        # ⛔ NOT `path_safe`. That is the ROUTER-matched form, and yarl decodes
+        # every escape in it except %2F and %25 (measured, and its own
+        # docstring says so) — it would close the encoded-slash family and
+        # leave `%6e` reading as the allowed route. `raw_path` is the request
+        # target verbatim, minus the query, which is the string this gate is
+        # actually about.
+        #
+        # The rule, stated plainly: a caller that percent-encodes an allowed
+        # path is REFUSED. No framework caller encodes anything — both clients
+        # and both daemons send literal paths — so the only traffic this turns
+        # away is traffic spelling a framework endpoint in a way the framework
+        # never does.
+        #
+        # A QUERY STRING on a credentialed route is denied outright for the
+        # same reason: the forward carries it verbatim, no framework caller
+        # sends one, and `?key=…` is a real provider idiom — an unexamined
+        # query steers a signed request past a (method, path) allowlist that
+        # cannot see it. The credentialed_route_denied population widens under
+        # an unchanged name (CHANGELOG line owed, Group 3).
+        _route = (request.method, request.rel_url.raw_path.rstrip("/") or "/")
         if ((_route not in CREDENTIALED_BACKEND_ALLOWED_ROUTES
              or request.rel_url.query_string)
                 and all(LLM_BACKEND_TOKENS.get(b) is not None for b in eligible_pre)):
@@ -2288,13 +2301,14 @@ class AsyncHiveMindProxy:
                 # credentialed backend. Checked before Authorization is
                 # attached (below) and before any upstream call, so a
                 # rejected request never gets near the key.
-                # R-B (HYG round): the FORWARDED form, and a query denies —
-                # same rule and same reasons as the R-4 pre-dispatch gate
-                # above. This gate is the one that fires when the eligible set
-                # was MIXED, so R-4's `all(...)` was false and selection
+                # R-B (HYG round): the RAW request-target path, and a query
+                # denies — same rule and same reasons as the R-4 pre-dispatch
+                # gate above (⛔ `raw_path`, never `path_safe`: see there).
+                # This gate is the one that fires when the eligible set was
+                # MIXED, so R-4's `all(...)` was false and selection
                 # nevertheless landed on the credentialed member; each gate
                 # therefore needs its own fleet shape to be pinned at all.
-                route = (request.method, request.rel_url.path_safe.rstrip("/") or "/")
+                route = (request.method, request.rel_url.raw_path.rstrip("/") or "/")
                 if (route not in CREDENTIALED_BACKEND_ALLOWED_ROUTES
                         or request.rel_url.query_string):
                     record_credentialed_route_denied(

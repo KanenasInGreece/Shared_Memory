@@ -214,31 +214,36 @@ def _forbid_selection(monkeypatch, g):
             "R-4 (pre-dispatch) must deny before backend selection is reached")
     monkeypatch.setattr(g, "_select_llm_backend", _never)
 
-@pytest.mark.parametrize("spelling", ["/v1%2fchat/completions", "/v1/chat%2fcompletions"])
-def test_r4_denies_an_encoded_slash_spelling_of_an_allowed_route(monkeypatch, spelling):
-    """`/v1%2fchat/completions` DECODES to the allowed route, so the old
-    `request.path` compare approved it — and then forwarded the ENCODED
-    spelling, signed with the provider key, to a path the allowlist never
-    saw. Same shape as security fix A1's `/pool%2fstatus`: the string that is
-    CHECKED and the string that is SENT were different strings.
+@pytest.mark.parametrize("spelling", [
+    "/v1%2fchat/completions",       # encoded slash, leading segment
+    "/v1/chat%2fcompletions",       # encoded slash, inner segment
+    "/v1/chat/completio%6es",       # encoded ordinary letter ('n')
+])
+def test_r4_denies_a_percent_encoded_spelling_of_an_allowed_route(monkeypatch, spelling):
+    """THE RULE: this gate compares the RAW request-target path — the exact
+    string `_upstream_url` forwards — so a caller that percent-encodes an
+    allowed path is REFUSED. No framework caller encodes anything, so the
+    only traffic this turns away spells a framework endpoint in a way the
+    framework never does.
 
-    ⚠ SCOPE, MEASURED (yarl 1.24.5): `path_safe` is the decoded path with
-    `%2F` and `%25` left encoded — see its own docstring. It therefore closes
-    the encoded-SLASH family and nothing else. `/v1/chat/completio%6es`
-    normalises to the allowed route in `path_safe` exactly as it does in
-    `path`, so it still passes this gate and is still forwarded in its
-    encoded spelling. That residue is REPORTED, not silently pinned here:
-    denying it needs `str(request.rel_url)` (or `raw_path`), which is a
-    different comparison from the one R-B ruled, and therefore the operator's
-    to rule on."""
+    Each spelling here DECODES to `/v1/chat/completions`, which is why the
+    old `request.path` compare approved all three and then signed and sent
+    the encoded form to the provider — the string that was CHECKED and the
+    string that was SENT were different strings, security fix A1's shape on
+    the credentialed path.
+
+    ⚠ `raw_path`, never `path_safe` (measured, yarl 1.24.5, and stated in its
+    own docstring): `path_safe` is the ROUTER-matched form and decodes every
+    escape except `%2F` and `%25`, so it would catch the first two spellings
+    and let `%6e` through reading as the allowed route."""
     g = _load_credentialed_gateway(monkeypatch)
     _forbid_selection(monkeypatch, g)
     proxy = g.AsyncHiveMindProxy()
     proxy.session = _MustNotCallSession()
     resp = asyncio.run(proxy.handle_proxy(_req("POST", spelling)))
     assert resp.status == 403, (
-        "R-4 (pre-dispatch) must deny the encoded-slash spelling — it is not "
-        "the string that gets forwarded")
+        "R-4 (pre-dispatch) must deny the percent-encoded spelling — it is "
+        "not the string that gets forwarded")
     assert "framework endpoints" in json.loads(resp.body.decode())["error"]
 
 
@@ -309,13 +314,21 @@ def test_mixed_fleet_sanity_r4_does_not_fire(monkeypatch):
     assert session.captured_headers["Authorization"] == "Bearer sk-allowlist-test"
 
 
-def test_s04_denies_an_encoded_slash_spelling_of_an_allowed_route(monkeypatch):
+@pytest.mark.parametrize("spelling", [
+    "/v1%2fchat/completions",
+    "/v1/chat%2fcompletions",
+    "/v1/chat/completio%6es",
+])
+def test_s04_denies_a_percent_encoded_spelling_of_an_allowed_route(monkeypatch, spelling):
+    """The same rule at the other gate. Pinned separately and on the MIXED
+    fleet because R-4 never runs here — the two gates cannot be pinned by one
+    test (ADV2-11), in either direction."""
     g = _load_mixed_fleet(monkeypatch)
     proxy = g.AsyncHiveMindProxy()
     proxy.session = _MustNotCallSession()
-    resp = asyncio.run(proxy.handle_proxy(_req("POST", "/v1%2fchat/completions")))
+    resp = asyncio.run(proxy.handle_proxy(_req("POST", spelling)))
     assert resp.status == 403, (
-        "S-04 (post-selection) must deny the encoded-slash spelling — on a "
+        "S-04 (post-selection) must deny the percent-encoded spelling — on a "
         "mixed fleet it is the only gate between this request and the key")
 
 
