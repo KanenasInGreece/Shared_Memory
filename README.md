@@ -1354,12 +1354,21 @@ statement, not a permanent one.
   claimed by the client — and can be told to require it for writes. What is still ahead is
   proof-of-possession keys over the network, and the audit trail promoted to a durable,
   non-repudiable record behind them.
+- **Retrieval is measured at the floor, not yet at the ceiling.** Asked for a record by a
+  verbatim fragment of itself, the live corpus returns it in the top ten 93% of the time from its
+  opening lines and 85% from its middle, at rank one a little over half the time; when it misses,
+  what wins is a neighbour on the same subject in the same project, not a stranger. Every result of
+  a project, domain or date filter satisfied the filter, no superseded record came back for its own
+  text, and every result carried a qualified reference — 1,200 results across 120 queries, all
+  through the reranked path, half a second each. What has no number yet is relevance on open
+  questions: whether the best answer to a question nobody has phrased before is the one that comes
+  back. That needs judged queries, and has not been run.
 
 
 ## 26. Direction
 
 Proof-of-possession authentication · durable audit · ingestion sanitisation and a counterfactual
-check before synthesis commits · retrieval-quality measurement.
+check before synthesis commits · retrieval relevance on judged open questions.
 History lives in the [CHANGELOG](CHANGELOG.md), not here.
 
 ## 27. References
