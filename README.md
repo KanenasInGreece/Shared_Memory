@@ -402,9 +402,9 @@ as your user.
 
 ### Steps
 
-A fresh gateway host goes from clone to running with three helper scripts in
-`shared-memory/scripts/` — `preflight.sh`, `init_db.sh`, `bootstrap_tokens.sh`. Each is
-idempotent and safe to re-run.
+A fresh gateway host goes from clone to running with five helper scripts in
+`shared-memory/scripts/` — `install_framework.sh`, `preflight.sh`, `init_db.sh`,
+`bootstrap_tokens.sh`, `postflight.sh`. Each is idempotent and safe to re-run.
 
 1. **Get the code, set DB passwords and host paths, raise OS limits.** Clone the repo; run
    `bash shared-memory/scripts/install_framework.sh` ([§15](#15-the-stack-docker-compose)) — it
@@ -459,7 +459,8 @@ idempotent and safe to re-run.
    install the `systemd --user` unit in [`shared-memory/ops/`](shared-memory/ops/).
 
 9. **Verify the install.** Back on the gateway host:
-   `export AGENT_TOKEN=...` (any token from step 6), then
+   export `AGENT_TOKEN` by reading it out of a write-capable agent's skill `.env` from step 6 (the
+   `AGENT_ENV` + `sed` idiom at the top of `postflight.md` — never a pasted export), then
    `bash shared-memory/scripts/postflight.sh` — eight assertions that prove the stack end to
    end, from health payload shapes to a canary save traced into both stores, a real completion
    driven through the reasoning backend, and a baseline JSON of this hardware's save/search
@@ -1283,7 +1284,7 @@ All tests are fully mocked — no live database or gateway required. From the pr
 ```bash
 uv run --with pytest --with pytest-asyncio --with fastmcp \
        --with psycopg2-binary --with httpx --with neo4j \
-       --with asyncpg --with aiohttp --with json-repair --with numpy \
+       --with asyncpg --with aiohttp --with json-repair \
        pytest tests/ -v
 ```
 
