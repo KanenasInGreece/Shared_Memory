@@ -120,6 +120,7 @@ def test_get_to_credentialed_backend_403s_before_any_upstream_call(monkeypatch):
     g = _load_credentialed_gateway(monkeypatch)
     proxy = g.AsyncHiveMindProxy()
     proxy.session = _MustNotCallSession()
+    _forbid_selection(monkeypatch, g)
     resp = asyncio.run(proxy.handle_proxy(_req("GET", "/v1/chat/completions")))
     assert resp.status == 403
     body = json.loads(resp.body.decode())
@@ -197,6 +198,22 @@ def test_denied_route_bumps_credential_counter_and_writes_audit_line(monkeypatch
 
 # ── Set 1: the ALL-CREDENTIALED fleet → R-4 is the gate ──────────────────────
 
+def _forbid_selection(monkeypatch, g):
+    """Make backend SELECTION fatal, so only a PRE-DISPATCH denial can pass.
+
+    ⚠ MEASURED, and the reason this exists (fact:1321 — check the instrument).
+    Without it these tests are a false green: restore `request.path` at R-4
+    and the request simply falls through to selection, where S-04 — still
+    comparing the forwarded form — issues the same 403. The status assertion
+    cannot tell the two gates apart, so a mutation of the gate the test NAMES
+    leaves it passing. R-4 returns before `_select_llm_backend` is ever
+    called, so a selector that raises is what makes "denied at R-4" observable
+    rather than assumed."""
+    def _never(*a, **k):
+        raise AssertionError(
+            "R-4 (pre-dispatch) must deny before backend selection is reached")
+    monkeypatch.setattr(g, "_select_llm_backend", _never)
+
 @pytest.mark.parametrize("spelling", ["/v1%2fchat/completions", "/v1/chat%2fcompletions"])
 def test_r4_denies_an_encoded_slash_spelling_of_an_allowed_route(monkeypatch, spelling):
     """`/v1%2fchat/completions` DECODES to the allowed route, so the old
@@ -215,6 +232,7 @@ def test_r4_denies_an_encoded_slash_spelling_of_an_allowed_route(monkeypatch, sp
     different comparison from the one R-B ruled, and therefore the operator's
     to rule on."""
     g = _load_credentialed_gateway(monkeypatch)
+    _forbid_selection(monkeypatch, g)
     proxy = g.AsyncHiveMindProxy()
     proxy.session = _MustNotCallSession()
     resp = asyncio.run(proxy.handle_proxy(_req("POST", spelling)))
@@ -229,6 +247,7 @@ def test_r4_denies_a_query_string_on_an_allowed_credentialed_route(monkeypatch):
     is forwarded verbatim, so a `?key=…`-style parameter would steer a signed
     request past a check that cannot see it. No framework caller sends one."""
     g = _load_credentialed_gateway(monkeypatch)
+    _forbid_selection(monkeypatch, g)
     proxy = g.AsyncHiveMindProxy()
     proxy.session = _MustNotCallSession()
     resp = asyncio.run(proxy.handle_proxy(_req("POST", "/v1/chat/completions?x=y")))
