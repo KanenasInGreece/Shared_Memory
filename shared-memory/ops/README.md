@@ -95,29 +95,38 @@ analysing it — `coredumpctl` retains its own copy under
 `/var/lib/systemd/coredump` (or the journal, if configured to store there);
 clear that too, not just whatever working directory it landed in.
 
-`ProtectSystem=full` (read-only `/usr`, `/boot`, `/etc` for the unit — it does
-not touch `/home`, `/run` or `/tmp`) is applied only where every write path of
-the unit was confirmed under `%h`:
+`ProtectSystem=full` (read-only `/usr`, `/boot`, `/efi`, `/etc` for the
+unit — it never touches `/home`, `/run` or `/tmp`, so it says nothing about
+what an app writes anywhere in those trees) is applied to **all three**
+units:
 
-- **`shared-memory-logrotate.service`** — carries it. Its `ExecStart` writes
-  only `%h/.shared-memory/logrotate.state`, and the files it rotates
-  (`%h/.shared-memory/logs/*-audit.jsonl` and the `.gz` siblings `compress`
-  writes alongside them) are all under `%h` too.
-- **`hive-mind-gateway.service`** — does **not** carry it. The default
-  `GATEWAY_UDS_PATH` (`_default_uds_path()` in `hive_mind_proxy.py`) is
+```ini
+ProtectSystem=full
+```
+
+`ProtectSystem=strict` stays FORBIDDEN on every unit here — it would mount the
+entire filesystem read-only, including `%h`, breaking each unit's own state
+writes (the gateway's logs and UDS socket, the backup's dump output, the
+logrotate state file).
+
+Two of the three units have a write path that lands outside `%h` by default,
+recorded here as an observation, not a reason to withhold the directive
+(`full` doesn't reach either path, so neither is actually protected or put at
+risk by it either way):
+
+- **`hive-mind-gateway.service`** — the default `GATEWAY_UDS_PATH`
+  (`_default_uds_path()` in `hive_mind_proxy.py`) is
   `$XDG_RUNTIME_DIR/shared-memory-gw.sock`, falling back to `/tmp` when
   `XDG_RUNTIME_DIR` is unset — neither is under `%h`.
-- **`shared-memory-backup.service`** — does **not** carry it either.
-  `backup.sh`'s `init_secrets_dir()` creates a `mktemp -d` directory (default
-  location `/tmp`) to hold the curl auth header and the Postgres/Neo4j
-  `--env-file`s for the run's duration.
+- **`shared-memory-backup.service`** — `backup.sh`'s `init_secrets_dir()`
+  creates a `mktemp -d` directory (default location `/tmp`) to hold the curl
+  auth header and the Postgres/Neo4j `--env-file`s for the run's duration.
+- **`shared-memory-logrotate.service`** has no such exception — every write
+  path (the `--state` file, the rotated `*-audit.jsonl` files, and their
+  `.gz` siblings) is under `%h`.
 
-Both withheld units carry an inline comment saying so. Because
-`ProtectSystem=full` only restricts `/usr`/`/boot`/`/etc`, neither omission is
-actually load-bearing against the writes above — but the directive was added
-only where the write-path check this round required could be confirmed
-clean, not waved through; see the HYG round's ε-lane handoff for the full
-detail.
+See the HYG round's ε-lane handoff (`S2_eps_HANDOFF.md` §5/§9) for the full
+detail and the ruling that resolved this.
 
 ### Audit-log rotation
 

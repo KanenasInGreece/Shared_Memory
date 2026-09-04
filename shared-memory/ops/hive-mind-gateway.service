@@ -57,15 +57,15 @@ LimitCORE=0
 # hides $HOME entirely and would break WorkingDirectory itself. Revisit if a
 # future release moves state to a fixed, non-$HOME path this unit can pin.
 #
-# ProtectSystem=full (HYG round) was evaluated and left OUT of THIS unit: its
-# default AF_UNIX listener path (_default_uds_path() in hive_mind_proxy.py) is
+# ProtectSystem=full (HYG round, ruling applied): the default AF_UNIX
+# listener path (_default_uds_path() in hive_mind_proxy.py) is
 # $XDG_RUNTIME_DIR/shared-memory-gw.sock, falling back to /tmp when
-# XDG_RUNTIME_DIR is unset — neither is under %h. ProtectSystem=full itself
-# only makes /usr, /boot and /etc read-only (it does not touch /run or /tmp),
-# so this write is not actually at risk from it — but the write-path-under-%h
-# precondition this round required before adding the directive does not hold
-# here, so the directive is withheld and the finding is recorded rather than
-# the check being waved through. See S2_eps_HANDOFF.md §5.
+# XDG_RUNTIME_DIR is unset — neither is under %h, but `full` only makes
+# /usr, /boot, /efi and /etc read-only; it never touches /tmp, /run or
+# $XDG_RUNTIME_DIR, so this write is unaffected either way. `strict` stays
+# FORBIDDEN — it would make %h itself read-only. See S2_eps_HANDOFF.md §5/§9
+# for the write-path-outside-%h observation this directive does not resolve.
+ProtectSystem=full
 
 # LoadCredential= example (SEC-06, PR A4; corrected fix round 1, R3, Opus
 # review, verified against `man systemd.exec` and `systemd-path` on the

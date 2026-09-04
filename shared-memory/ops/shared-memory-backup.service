@@ -27,11 +27,12 @@ NoNewPrivileges=yes
 # ops/README.md's "Hardening" section for the temporary lift procedure.
 LimitCORE=0
 
-# ProtectSystem=full (HYG round) was evaluated and left OUT of THIS unit:
-# backup.sh's init_secrets_dir() (ops/backup.sh) calls `mktemp -d` to hold the
-# curl auth header and the Postgres/Neo4j --env-files for docker exec — that
-# directory is under /tmp (or $TMPDIR) by default, not under %h. As with the
-# gateway unit, ProtectSystem=full only makes /usr, /boot and /etc read-only
-# and would not actually block this write, but the write-path-under-%h
-# precondition this round required does not hold, so the directive is
-# withheld and the finding is recorded. See S2_eps_HANDOFF.md §5.
+# ProtectSystem=full (HYG round, ruling applied): backup.sh's
+# init_secrets_dir() calls `mktemp -d` to hold the curl auth header and the
+# Postgres/Neo4j --env-files for docker exec — that directory is under /tmp
+# (or $TMPDIR) by default, not under %h, but `full` only makes /usr, /boot,
+# /efi and /etc read-only; it never touches /tmp, /run or $XDG_RUNTIME_DIR,
+# so this write is unaffected either way. `strict` stays FORBIDDEN — it
+# would make %h itself read-only. See S2_eps_HANDOFF.md §5/§9 for the
+# write-path-outside-%h observation this directive does not resolve.
+ProtectSystem=full

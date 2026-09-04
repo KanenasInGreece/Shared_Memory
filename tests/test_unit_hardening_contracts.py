@@ -21,14 +21,13 @@ Scope, per the ε-lane brief:
     other two units already carry.
   - ProtectHome ABSENT from all three units (deliberately, per each unit's
     own comment — ruled out, never revisit via an env override).
-  - ProtectSystem=full: present ONLY where this build's write-path-under-%h
-    check (see the ε-lane handoff §5) came back clean. That is
-    shared-memory-logrotate.service alone — hive-mind-gateway.service and
-    shared-memory-backup.service each have a confirmed write path outside
-    %h (the gateway's default AF_UNIX socket under $XDG_RUNTIME_DIR/tmp; the
-    backup unit's mktemp -d secrets directory under /tmp) and so do NOT
-    carry the directive in this build, by the brief's own conditional rule,
-    not by an improvised deviation from it.
+  - ProtectSystem=full: present in ALL THREE units (operator ruling, HYG
+    round — see the ε-lane handoff §9). `full` only makes /usr, /boot, /efi
+    and /etc read-only; it never touches /tmp, /run or $XDG_RUNTIME_DIR, so
+    it neither protects nor is put at risk by the two write-paths-outside-%h
+    the ε-lane build found (the gateway's default AF_UNIX socket under
+    $XDG_RUNTIME_DIR/tmp; the backup unit's mktemp -d secrets directory under
+    /tmp) — those remain recorded findings in the handoff, not code changes.
 """
 import os
 
@@ -112,28 +111,30 @@ def test_logrotate_unit_has_no_protecthome_directive():
     assert _no_protecthome_directive(_lines(_LOGROTATE_UNIT))
 
 
-# ── ProtectSystem=full — logrotate only, per this build's write-path check ──
+# ── ProtectSystem=full — all three units (operator ruling, HYG round §9) ────
+#
+# `full` makes only /usr, /boot, /efi and /etc read-only for the unit — it
+# never touches /tmp, /run or $XDG_RUNTIME_DIR (systemd.exec(5)). Two of
+# these three units have a write path outside %h (recorded as a finding in
+# the ε-lane handoff §5/§9, not resolved by this directive either way):
+# hive-mind-gateway.service's default AF_UNIX socket path
+# ($XDG_RUNTIME_DIR/shared-memory-gw.sock, falling back to /tmp) and
+# shared-memory-backup.service's backup.sh init_secrets_dir() mktemp -d
+# directory (default /tmp). Neither write path is under /usr, /boot, /efi or
+# /etc, so `full` is harmless to add regardless of the %h finding — the
+# operator ruled it onto all three units on that basis.
+
+def test_gateway_unit_pins_protectsystem_full():
+    assert "ProtectSystem=full" in _lines(_GATEWAY_UNIT)
+
+
+def test_backup_unit_pins_protectsystem_full():
+    assert "ProtectSystem=full" in _lines(_BACKUP_UNIT)
+
 
 def test_logrotate_unit_pins_protectsystem_full():
     """Every write path of this unit is confirmed under %h (the --state
     file, the rotated *-audit.jsonl files, and their .gz siblings) — see the
-    unit's own comment and README.md's Hardening section."""
+    unit's own comment and README.md's Hardening section. Unlike the other
+    two units, this one has no write-path-outside-%h finding at all."""
     assert "ProtectSystem=full" in _lines(_LOGROTATE_UNIT)
-
-
-def test_gateway_unit_does_not_pin_protectsystem_full():
-    """FINDING (ε-lane handoff §5): the gateway's default AF_UNIX socket path
-    ($XDG_RUNTIME_DIR/shared-memory-gw.sock, falling back to /tmp) is outside
-    %h, so this build withholds the directive here per the brief's own
-    conditional rule rather than adding it against a failed precondition.
-    Pinned explicitly (not merely un-asserted) so a future change adding the
-    directive back is a deliberate edit to this test, not a silent drift."""
-    assert "ProtectSystem=full" not in _lines(_GATEWAY_UNIT)
-
-
-def test_backup_unit_does_not_pin_protectsystem_full():
-    """FINDING (ε-lane handoff §5): backup.sh's init_secrets_dir() writes a
-    mktemp -d secrets directory outside %h (default /tmp), so this build
-    withholds the directive here too, for the same conditional reason as the
-    gateway unit."""
-    assert "ProtectSystem=full" not in _lines(_BACKUP_UNIT)
