@@ -6,6 +6,8 @@ import json
 import os
 import sys
 
+from yarl import URL
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "shared-memory", "scripts"))
 
 
@@ -86,8 +88,10 @@ class _BoomSession:
 
 class _FakeReq:
     method = "POST"
-    path = "/v1/chat/completions"        # not in ROUTING_MAP → the LLM pool branch
-    rel_url = "/v1/chat/completions"
+    path = "/v1/chat/completions"        # the catch-all → the LLM pool branch
+    # T-1 (HYG round): a REAL yarl.URL — the credentialed-route gates read
+    # rel_url.path_safe / .query_string, the values actually forwarded.
+    rel_url = URL("/v1/chat/completions", encoded=True)
     headers = {}
     can_read_body = True
     async def read(self):
@@ -181,8 +185,8 @@ def test_embed_body_buffered_under_cap_is_retry_eligible(monkeypatch):
 
     class _EmbedReq:
         method = "POST"
-        path = "/v1/embeddings"           # IS in ROUTING_MAP -> not the LLM branch
-        rel_url = "/v1/embeddings"
+        path = "/v1/embeddings"           # its own registered route -> handle_encoder
+        rel_url = URL("/v1/embeddings", encoded=True)
         headers = {}
         can_read_body = True
         content_length = 40               # small, well under EMBED_RERANK_BUFFER_CAP
@@ -192,7 +196,10 @@ def test_embed_body_buffered_under_cap_is_retry_eligible(monkeypatch):
     proxy = g.AsyncHiveMindProxy()
     session = _ResetOnceThenBoomSession(g.ClientConnectionResetError, g.ClientError)
     proxy.session = session
-    resp = asyncio.run(proxy.handle_proxy(_EmbedReq()))
+    # R-A (HYG round): the encoder path is served by its OWN handler now, so
+    # the retry pin follows it there — driving it through handle_proxy would
+    # exercise the LLM pool, not the embedder.
+    resp = asyncio.run(proxy.handle_encoder(_EmbedReq()))
 
     assert session.calls == 2             # the embeddings leg also got the retry
     assert resp.status == 503

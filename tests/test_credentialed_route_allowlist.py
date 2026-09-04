@@ -16,6 +16,7 @@ import os
 import sys
 
 import pytest
+from yarl import URL
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "shared-memory", "scripts"))
 
@@ -57,13 +58,24 @@ class _HeaderCaptureSession:
         raise RuntimeError("capture-only session — no real upstream call")
 
 
-def _req(method: str, path: str):
+def _req(method: str, raw: str):
+    """`raw` is the request target EXACTLY as it would arrive on the wire —
+    percent-encoding and query string included.
+
+    T-1 (HYG round): `rel_url` is a REAL `yarl.URL(raw, encoded=True)`, because
+    both gates now read `rel_url.path_safe` and `rel_url.query_string` — the
+    values that are actually forwarded. `path` is the URL's DECODED `.path`,
+    which is what production gives it, so it NEVER contains '?': a stub that
+    put the query in `path` would produce a 403 that looks like the R-B query
+    denial but is really an allowlist miss on a path no caller ever sends
+    (ADV2-11)."""
     class _Req:
         pass
     r = _Req()
     r.method = method
-    r.path = path
-    r.rel_url = path
+    rel = URL(raw, encoded=True)
+    r.rel_url = rel
+    r.path = rel.path
     r.headers = {}
     r.can_read_body = True
 
@@ -168,6 +180,151 @@ def test_denied_route_bumps_credential_counter_and_writes_audit_line(monkeypatch
     assert '"method":"DELETE"' in content
     assert '"path":"/v1/models"' in content
     assert "sk-allowlist-test" not in content
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# R-B (HYG round) — the gate compares the FORWARDED form, and a query denies
+#
+# ⚠ THERE ARE TWO GATES AND ONE TEST CANNOT PIN BOTH (ADV2-11). R-4 (the
+# pre-dispatch gate) short-circuits with 403 whenever EVERY eligible backend
+# is credentialed, which is exactly the fleet `_load_credentialed_gateway`
+# builds — so on that fleet S-04 is never reached, and mutating S-04 alone
+# leaves every test above green. S-04 only fires when the eligible set was
+# MIXED (R-4's `all(...)` false) and selection nevertheless landed on the
+# credentialed member. Each set below therefore builds the fleet shape that
+# reaches ITS gate, and names the gate in the assertion message.
+# ══════════════════════════════════════════════════════════════════════════
+
+# ── Set 1: the ALL-CREDENTIALED fleet → R-4 is the gate ──────────────────────
+
+@pytest.mark.parametrize("spelling", ["/v1%2fchat/completions", "/v1/chat%2fcompletions"])
+def test_r4_denies_an_encoded_slash_spelling_of_an_allowed_route(monkeypatch, spelling):
+    """`/v1%2fchat/completions` DECODES to the allowed route, so the old
+    `request.path` compare approved it — and then forwarded the ENCODED
+    spelling, signed with the provider key, to a path the allowlist never
+    saw. Same shape as security fix A1's `/pool%2fstatus`: the string that is
+    CHECKED and the string that is SENT were different strings.
+
+    ⚠ SCOPE, MEASURED (yarl 1.24.5): `path_safe` is the decoded path with
+    `%2F` and `%25` left encoded — see its own docstring. It therefore closes
+    the encoded-SLASH family and nothing else. `/v1/chat/completio%6es`
+    normalises to the allowed route in `path_safe` exactly as it does in
+    `path`, so it still passes this gate and is still forwarded in its
+    encoded spelling. That residue is REPORTED, not silently pinned here:
+    denying it needs `str(request.rel_url)` (or `raw_path`), which is a
+    different comparison from the one R-B ruled, and therefore the operator's
+    to rule on."""
+    g = _load_credentialed_gateway(monkeypatch)
+    proxy = g.AsyncHiveMindProxy()
+    proxy.session = _MustNotCallSession()
+    resp = asyncio.run(proxy.handle_proxy(_req("POST", spelling)))
+    assert resp.status == 403, (
+        "R-4 (pre-dispatch) must deny the encoded-slash spelling — it is not "
+        "the string that gets forwarded")
+    assert "framework endpoints" in json.loads(resp.body.decode())["error"]
+
+
+def test_r4_denies_a_query_string_on_an_allowed_credentialed_route(monkeypatch):
+    """R-B. The path IS on the allowlist; the query is not examined by it and
+    is forwarded verbatim, so a `?key=…`-style parameter would steer a signed
+    request past a check that cannot see it. No framework caller sends one."""
+    g = _load_credentialed_gateway(monkeypatch)
+    proxy = g.AsyncHiveMindProxy()
+    proxy.session = _MustNotCallSession()
+    resp = asyncio.run(proxy.handle_proxy(_req("POST", "/v1/chat/completions?x=y")))
+    assert resp.status == 403, "R-4 (pre-dispatch) must deny a query on a credentialed route"
+
+
+def test_r4_still_allows_the_plain_spelling(monkeypatch):
+    """The counterweight, as a VALUE: the ordinary framework call must still
+    reach the upstream with its key. A gate that denied everything would pass
+    both tests above."""
+    g = _load_credentialed_gateway(monkeypatch)
+    proxy = g.AsyncHiveMindProxy()
+    session = _HeaderCaptureSession()
+    proxy.session = session
+    resp = asyncio.run(proxy.handle_proxy(_req("POST", "/v1/chat/completions")))
+    assert resp.status != 403
+    assert session.captured_headers["Authorization"] == "Bearer sk-allowlist-test"
+
+
+# ── Set 2: the MIXED fleet → S-04 is the gate ────────────────────────────────
+
+_CREDENTIALED_URL = "https://api.deepseek.com/v1"
+
+
+def _load_mixed_fleet(monkeypatch):
+    """One uncredentialed local backend + one credentialed cloud backend, with
+    SELECTION FORCED onto the credentialed member.
+
+    R-4's `all(...)` is False on this fleet, so it falls through; the forced
+    selection is what makes S-04 — and only S-04 — the gate that answers.
+    `_select_llm_backend` is monkeypatched rather than left to least-busy
+    ordering so the test cannot pass for the wrong reason on a different
+    iteration order."""
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-allowlist-test")
+    monkeypatch.delenv("LLM_BACKENDS", raising=False)
+    monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
+        {"url": "http://local:5000", "private_ok": True},
+        {"url": _CREDENTIALED_URL, "token_env": "DEEPSEEK_API_KEY",
+         "model": "deepseek-chat", "private_ok": True},
+    ]))
+    import hive_mind_proxy as g
+    importlib.reload(g)
+    monkeypatch.setattr(g, "_select_llm_backend",
+                        lambda *a, **k: _CREDENTIALED_URL)
+    return g
+
+
+def test_mixed_fleet_sanity_r4_does_not_fire(monkeypatch):
+    """Instrument check (fact:1321): prove the fleet really does fall through
+    R-4, so the two S-04 tests below are pinning the gate they name. An
+    allowed route on this fleet reaches the upstream with the provider key —
+    which it could not do if R-4 had answered."""
+    g = _load_mixed_fleet(monkeypatch)
+    proxy = g.AsyncHiveMindProxy()
+    session = _HeaderCaptureSession()
+    proxy.session = session
+    resp = asyncio.run(proxy.handle_proxy(_req("POST", "/v1/chat/completions")))
+    assert resp.status != 403
+    assert session.captured_headers["Authorization"] == "Bearer sk-allowlist-test"
+
+
+def test_s04_denies_an_encoded_slash_spelling_of_an_allowed_route(monkeypatch):
+    g = _load_mixed_fleet(monkeypatch)
+    proxy = g.AsyncHiveMindProxy()
+    proxy.session = _MustNotCallSession()
+    resp = asyncio.run(proxy.handle_proxy(_req("POST", "/v1%2fchat/completions")))
+    assert resp.status == 403, (
+        "S-04 (post-selection) must deny the encoded-slash spelling — on a "
+        "mixed fleet it is the only gate between this request and the key")
+
+
+def test_s04_denies_a_query_string_on_an_allowed_credentialed_route(monkeypatch):
+    g = _load_mixed_fleet(monkeypatch)
+    proxy = g.AsyncHiveMindProxy()
+    proxy.session = _MustNotCallSession()
+    resp = asyncio.run(proxy.handle_proxy(_req("POST", "/v1/chat/completions?x=y")))
+    assert resp.status == 403, (
+        "S-04 (post-selection) must deny a query on a credentialed route")
+
+
+def test_an_uncredentialed_backend_still_accepts_a_query(monkeypatch):
+    """R-B binds the CREDENTIALED branch only (ADV2-8). A local backend with
+    no key keeps today's full pass-through, query and all — the same
+    boundary the rest of this file draws."""
+    monkeypatch.delenv("LLM_BACKENDS", raising=False)
+    monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps(
+        [{"url": "http://a:5000", "private_ok": True}]))
+    import hive_mind_proxy as g
+    importlib.reload(g)
+
+    proxy = g.AsyncHiveMindProxy()
+    session = _HeaderCaptureSession()
+    proxy.session = session
+    resp = asyncio.run(proxy.handle_proxy(_req("POST", "/v1/chat/completions?x=y")))
+    assert resp.status != 403
+    assert session.captured_headers is not None
 
 
 # ── Mutation check target ────────────────────────────────────────────────────

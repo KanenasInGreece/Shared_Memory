@@ -149,6 +149,36 @@ ROUTING_MAP = {
     "/v1/embeddings": EMBEDDER_URL,
     "/v1/reranking":  RERANKER_URL,
 }
+
+
+def _encoder_near_miss(path: str) -> "str | None":
+    """R-A' (HYG round): the registered encoder path `path` is a near-miss OF —
+    it starts with that path but is not equal to it — or None.
+
+    Pure and total so a mutation check can bite it. `path` is the DECODED
+    request path, which is what makes this cover the traversal spellings:
+    `/v1/embeddings/../x` and `/v1/embeddings/..%2fx` both decode to something
+    still under the encoder path, while `/v1/embeddingsX` and
+    `/v1/embeddings/anything` are the plain suffix forms.
+
+    Why it has to exist. Until the encoder paths were registered, handle_proxy
+    prefix-matched them with startswith() and forwarded every one of those
+    spellings to the embedder. Registration moves the exact path to
+    handle_encoder and leaves the near-misses falling through the catch-all to
+    the reasoning-LLM POOL — a mistyped framework call silently answered by a
+    chat model, which is exactly the defect fact:1535 exists for. So the
+    near-misses become 404s in _route_guard's own voice instead.
+
+    The exact spelling never reaches this: it is a registered route. A
+    trailing-slash or %2f spelling never reaches it either — those are known
+    keys and _route_guard, which runs first, answers them (404 and 405
+    respectively). This function is only for the shapes no branch of the guard
+    can see, because they resemble a route without being one."""
+    for encoder_path in ROUTING_MAP:
+        if path != encoder_path and path.startswith(encoder_path):
+            return encoder_path
+    return None
+
 # S-04 (Critical, Credential_Custody_Plan PR A5): the catch-all route forwards
 # request.rel_url VERBATIM to whatever backend gets selected, and a backend
 # configured with token_env has the provider key attached — so before this
@@ -160,6 +190,15 @@ ROUTING_MAP = {
 # is the exact, closed set of endpoints the framework itself ever calls.
 CREDENTIALED_BACKEND_ALLOWED_ROUTES = frozenset({
     ("POST", "/v1/chat/completions"),
+    # ⚠ The two encoder entries are UNREACHABLE BY BRANCH STRUCTURE, and kept
+    # anyway rather than deleted silently. /v1/embeddings and /v1/reranking are
+    # served by handle_encoder, which forwards with `llm_backend` None — the
+    # credentialed gates below both live on the POOL path and neither one can
+    # see an encoder request. They would become live the day an encoder was
+    # ever routed through the backend pool (a credentialed remote embedder,
+    # say), and on that day the allowlist has to already contain them: this set
+    # is the closed list of endpoints the framework itself calls, and removing
+    # a name from it is a decision about what MAY be signed, not tidying.
     ("POST", "/v1/embeddings"),
     ("POST", "/v1/reranking"),
 })
@@ -1547,6 +1586,48 @@ HOP_BY_HOP = frozenset({
     "te", "trailers", "transfer-encoding", "upgrade", "content-length",
 })
 
+# --------------------------------------------------------------------------- #
+# S13 (R-C) — headers that describe OUR CALLER and must not reach a backend.
+# A DENYLIST, deliberately: an allowlist at a proxy boundary breaks the next
+# provider-specific header somebody legitimately sends, silently and remotely.
+# Cookie is here because a gateway token is the only credential this hop has;
+# the X-Forwarded-* / X-Real-IP family because a backend has no business
+# learning our caller's network position, and a client-supplied value there is
+# unverified anyway. `Referer` and `User-Agent` are deliberately NOT here —
+# R-C left them, and tests/test_gateway_edge_hygiene.py pins that so a later
+# change to an allowlist cannot narrow the request surface unremarked.
+# --------------------------------------------------------------------------- #
+CLIENT_ORIGIN_HEADERS = frozenset({
+    "cookie", "x-forwarded-for", "x-forwarded-proto", "x-forwarded-host",
+    "x-real-ip",
+})
+
+# --------------------------------------------------------------------------- #
+# S16f (R-C') — response headers a backend must not be able to plant on our
+# caller through us. `Set-Cookie` only: the CORS `Access-Control-*` family was
+# DEFERRED to the small-rulings bundle because the monitor's dependency on it
+# is unverified, and `Server` is not stripped here — it is OVERWRITTEN for
+# every response by _set_server_header (S16e), refusals included, so that the
+# header cannot distinguish which path answered.
+# --------------------------------------------------------------------------- #
+UPSTREAM_ONLY_RESPONSE_HEADERS = frozenset({"set-cookie"})
+
+GATEWAY_SERVER_HEADER = "shared-memory-gateway"
+
+
+async def _set_server_header(request, response) -> None:
+    """S16e — stamp the gateway's own `Server` on EVERY response.
+
+    aiohttp 3.14.3 has no `server_header` parameter (measured), and the header
+    is `setdefault`-ed at response-prepare time, so an `on_response_prepare`
+    handler is the single mechanism that covers both kinds of reply: a
+    gateway-generated one (`/health` is unauthenticated on the shipped default
+    and used to disclose `Python/3.14 aiohttp/3.14.3` to anyone) and a proxied
+    one (which otherwise relays whatever the backend calls itself). One
+    identity on the wire, so the header never tells a caller which path
+    answered."""
+    response.headers["Server"] = GATEWAY_SERVER_HEADER
+
 
 def _scrub_url_credentials(text: str) -> str:
     """Security review O-6 — see log_hygiene.scrub_url_credentials (shared with
@@ -1760,7 +1841,16 @@ class AsyncHiveMindProxy:
         value. Treating the X-SM- namespace (and the RFC 6750 challenge
         header, so a client can't be confused about which side of the
         credential boundary wants a token) as gateway-owned means any such
-        header on the wire is always one the gateway put there."""
+        header on the wire is always one the gateway put there.
+
+        ⚠ `strip_gateway_namespace` is also the DIRECTION discriminator (it is
+        True at exactly one call site, the response direction, and False at
+        exactly one, the request direction — enforced by there being only
+        those two). S13/S16f hang the two direction-specific denylists off it:
+        CLIENT_ORIGIN_HEADERS on the request direction,
+        UPSTREAM_ONLY_RESPONSE_HEADERS on the response direction. Kept a
+        DENYLIST and a plain dict (R-C, R-D): an allowlist here would silently
+        break the next provider-specific header a caller legitimately sends."""
         result = {
             k: v for k, v in headers.items()
             if k.lower() not in HOP_BY_HOP and k.lower() not in ("host", "authorization")
@@ -1768,7 +1858,14 @@ class AsyncHiveMindProxy:
         if strip_gateway_namespace:
             result = {
                 k: v for k, v in result.items()
-                if not k.lower().startswith("x-sm-") and k.lower() != "www-authenticate"
+                if not k.lower().startswith("x-sm-")
+                and k.lower() != "www-authenticate"
+                and k.lower() not in UPSTREAM_ONLY_RESPONSE_HEADERS
+            }
+        else:
+            result = {
+                k: v for k, v in result.items()
+                if k.lower() not in CLIENT_ORIGIN_HEADERS
             }
         return result
 
@@ -1922,9 +2019,32 @@ class AsyncHiveMindProxy:
         if guard_response is not None:
             return guard_response
 
-        # Route on path: embeddings/reranking have fixed targets; everything else
-        # is a reasoning-LLM request, dispatched through the backend POOL so the
-        # gateway owns parallelisation. The optional X-SM-LLM-Role header is set
+        # R-A' (HYG round): the encoder paths are REGISTERED routes now, so
+        # anything that merely LOOKS like one — a suffix, an extra segment, a
+        # traversal spelling — reaches this catch-all instead of the encoder.
+        # Before registration those spellings were prefix-matched and forwarded
+        # to the encoder; after it they would fall through to the reasoning-LLM
+        # pool, which is the fact:1535 defect wearing a different hat. Refuse
+        # them in _route_guard's own voice, right after the guard itself, so a
+        # near-miss of a gateway-owned route answers the same way wherever it
+        # is spelled. Runs AFTER the guard: a known key (including the
+        # trailing-slash and %2f spellings) is the guard's to answer.
+        encoder_near_miss = _encoder_near_miss(request.path)
+        if encoder_near_miss is not None:
+            return web.json_response(
+                {"error": f"No such framework route: {request.path}. The "
+                          f"framework registers {encoder_near_miss} exactly — this "
+                          f"is a near-miss spelling of a gateway route, "
+                          f"not a passthrough path. The request was NOT "
+                          f"forwarded to any LLM backend — correct the "
+                          f"path and retry."},
+                status=404,
+                headers={"X-SM-Fault-Origin": "gateway"},
+            )
+
+        # Every request that reaches this catch-all is a reasoning-LLM request,
+        # dispatched through the backend POOL so the gateway owns
+        # parallelisation. The optional X-SM-LLM-Role header is set
         # ONLY by framework components (e.g. the v0.6.1 judge) — never by clients.
         # S-14: backend steering is a daemon/admin capability — every X-SM-LLM-*
         # header a non-steering caller sent is dropped from the view used below
@@ -1932,130 +2052,216 @@ class AsyncHiveMindProxy:
         # down), before either the role signal or the routing decision is read.
         steer_headers = (request.headers if _may_steer_llm(request)
                           else _strip_llm_steering_headers(request.headers))
+        # The encoder paths are their OWN registered routes (handle_encoder)
+        # since the HYG round — handle_proxy is now unambiguously the
+        # reasoning-LLM path, so there is no target to pick before the pool
+        # selection below. The prefix loop that used to stand here was a
+        # startswith() over the DECODED path: it forwarded /v1/embeddingsX and
+        # /v1/embeddings/../x to the encoder, and it ran on a path aiohttp had
+        # never routed there. Deleted, not narrowed (R-A).
         llm_backend: str | None = None
-        target_base: str | None = None
         llm_body: bytes | None = None
-        for prefix, target in ROUTING_MAP.items():
-            if request.path.startswith(prefix):
-                target_base = target
-                break
-        if target_base is None:
-            # Reasoning-LLM request → buffer the body so we can compute the
-            # cache-affinity key (bounded chat payload; buffering cost negligible),
-            # then dispatch cache-affinity-first. The key is computed as late as
-            # possible, just before selection, so nothing mutates the prompt after.
-            llm_body = await request.read() if request.can_read_body else b""
-            # A-3: parse the body ONCE — affinity, fit (est_prompt_tokens is a
-            # pure char count, no parse needed; effective_max_tokens reads the
-            # parsed struct), and the post-selection override rewrite all read
-            # this SAME struct; never a second json.loads of the same body.
-            body_obj = _parse_json_body(llm_body)
-            role = steer_headers.get("X-SM-LLM-Role", "").strip().lower()
-            affinity_key = _affinity_key_from_obj(body_obj)
-            est_prompt_tokens = (len(llm_body) / CHARS_PER_TOKEN_RATIO
-                                 if CHARS_PER_TOKEN_RATIO > 0 else 0.0)
-            effective_max_tokens = _extract_effective_max_tokens(body_obj)
+        # Reasoning-LLM request → buffer the body so we can compute the
+        # cache-affinity key (bounded chat payload; buffering cost negligible),
+        # then dispatch cache-affinity-first. The key is computed as late as
+        # possible, just before selection, so nothing mutates the prompt after.
+        llm_body = await request.read() if request.can_read_body else b""
+        # A-3: parse the body ONCE — affinity, fit (est_prompt_tokens is a
+        # pure char count, no parse needed; effective_max_tokens reads the
+        # parsed struct), and the post-selection override rewrite all read
+        # this SAME struct; never a second json.loads of the same body.
+        body_obj = _parse_json_body(llm_body)
+        role = steer_headers.get("X-SM-LLM-Role", "").strip().lower()
+        affinity_key = _affinity_key_from_obj(body_obj)
+        est_prompt_tokens = (len(llm_body) / CHARS_PER_TOKEN_RATIO
+                             if CHARS_PER_TOKEN_RATIO > 0 else 0.0)
+        effective_max_tokens = _extract_effective_max_tokens(body_obj)
 
-            # Eligibility is a HARD PRE-FILTER (P-1 Critical): computed BEFORE
-            # any affinity/health/cooldown/reserved/cap logic runs. Empty →
-            # 422, PRE-DISPATCH (I-8b: no inflight accounting has happened
-            # yet, this return is well before the try: block that reserves a
-            # slot) — never silently widens, never falls back to an
-            # ineligible backend, never queues.
-            if role and role not in ROUTING_ROLE_NAMES:
-                _warn_unknown_role_once(role)
-            eligible_pre = _eligible_backends(role, est_prompt_tokens, effective_max_tokens)
-            if not eligible_pre:
-                constraint = _classify_no_eligible_constraint(
-                    role, est_prompt_tokens, effective_max_tokens)
-                _record_no_eligible_backend(constraint)
-                refusal_body = {"error": "no_eligible_backend",
-                                "constraint": constraint, "role": role or None}
-                # Ruling C(α)/E(α2) (§5): additive `declaration` key — never
-                # touches the `constraint` vocabulary or either daemon's
-                # three-keys-only parse (rem_loop.py:161-ish,
-                # consolidation_loop.py:833-ish both `.get` three keys).
-                declaration = _declaration_gap()
-                if declaration is not None:
-                    refusal_body["declaration"] = declaration
-                    log.warning(
-                        "no_eligible_backend refusal carries declaration=%s "
-                        "(role=%s, constraint=%s) — remedy: %s",
-                        declaration, role or "(role-less)", constraint,
-                        _DECLARATION_GAP_REMEDY.get(declaration, "declare explicitly"))
-                if constraint == "fit":
-                    # R-5 disposition (decision:1357): retry-without-charge
-                    # STANDS as ruled (F-1: a config gap is not a record
-                    # defect) — observability is the mitigation. The refusal
-                    # names the estimate that failed so an operator can
-                    # retune LLM_CHARS_PER_TOKEN_RATIO / FIT_MARGIN / n_ctx
-                    # against real traffic.
-                    refusal_body["est_prompt_tokens"] = int(est_prompt_tokens)
-                    refusal_body["effective_max_tokens"] = int(effective_max_tokens)
-                    # FR-2 (delta re-review): the daemons' refusal handling
-                    # reads only {error, constraint, role}, so the estimate
-                    # fields alone reach no operator — this journal line is
-                    # where the retune signal actually lands.
-                    log.warning(
-                        "fit-rejected: est_prompt_tokens=%d + max_tokens=%d "
-                        "fits no declared n_ctx (role=%s) — if this request "
-                        "is legitimately sized, retune LLM_CHARS_PER_TOKEN_"
-                        "RATIO / FIT_MARGIN or raise the backend's n_ctx.",
-                        int(est_prompt_tokens), int(effective_max_tokens),
-                        role or "none")
-                return web.json_response(
-                    refusal_body,
-                    status=422, headers={"X-SM-Fault-Origin": "gateway"},
-                )
+        # Eligibility is a HARD PRE-FILTER (P-1 Critical): computed BEFORE
+        # any affinity/health/cooldown/reserved/cap logic runs. Empty →
+        # 422, PRE-DISPATCH (I-8b: no inflight accounting has happened
+        # yet, this return is well before the try: block that reserves a
+        # slot) — never silently widens, never falls back to an
+        # ineligible backend, never queues.
+        if role and role not in ROUTING_ROLE_NAMES:
+            _warn_unknown_role_once(role)
+        eligible_pre = _eligible_backends(role, est_prompt_tokens, effective_max_tokens)
+        if not eligible_pre:
+            constraint = _classify_no_eligible_constraint(
+                role, est_prompt_tokens, effective_max_tokens)
+            _record_no_eligible_backend(constraint)
+            refusal_body = {"error": "no_eligible_backend",
+                            "constraint": constraint, "role": role or None}
+            # Ruling C(α)/E(α2) (§5): additive `declaration` key — never
+            # touches the `constraint` vocabulary or either daemon's
+            # three-keys-only parse (rem_loop.py:161-ish,
+            # consolidation_loop.py:833-ish both `.get` three keys).
+            declaration = _declaration_gap()
+            if declaration is not None:
+                refusal_body["declaration"] = declaration
+                log.warning(
+                    "no_eligible_backend refusal carries declaration=%s "
+                    "(role=%s, constraint=%s) — remedy: %s",
+                    declaration, role or "(role-less)", constraint,
+                    _DECLARATION_GAP_REMEDY.get(declaration, "declare explicitly"))
+            if constraint == "fit":
+                # R-5 disposition (decision:1357): retry-without-charge
+                # STANDS as ruled (F-1: a config gap is not a record
+                # defect) — observability is the mitigation. The refusal
+                # names the estimate that failed so an operator can
+                # retune LLM_CHARS_PER_TOKEN_RATIO / FIT_MARGIN / n_ctx
+                # against real traffic.
+                refusal_body["est_prompt_tokens"] = int(est_prompt_tokens)
+                refusal_body["effective_max_tokens"] = int(effective_max_tokens)
+                # FR-2 (delta re-review): the daemons' refusal handling
+                # reads only {error, constraint, role}, so the estimate
+                # fields alone reach no operator — this journal line is
+                # where the retune signal actually lands.
+                log.warning(
+                    "fit-rejected: est_prompt_tokens=%d + max_tokens=%d "
+                    "fits no declared n_ctx (role=%s) — if this request "
+                    "is legitimately sized, retune LLM_CHARS_PER_TOKEN_"
+                    "RATIO / FIT_MARGIN or raise the backend's n_ctx.",
+                    int(est_prompt_tokens), int(effective_max_tokens),
+                    role or "none")
+            return web.json_response(
+                refusal_body,
+                status=422, headers={"X-SM-Fault-Origin": "gateway"},
+            )
 
-            # R-4 (decision:1357): a request that can ONLY land on a
-            # credentialed backend but is not on the S-04 allowlist is DOOMED
-            # — deny it here, BEFORE it can hold a capacity-wait slot for the
-            # full window. A mixed eligible set (any uncredentialed member)
-            # falls through: selection may legitimately pick the
-            # uncredentialed one, and the post-selection S-04 check below
-            # still guards the credentialed choice.
-            _route = (request.method, request.path.rstrip("/") or "/")
-            if (_route not in CREDENTIALED_BACKEND_ALLOWED_ROUTES
-                    and all(LLM_BACKEND_TOKENS.get(b) is not None for b in eligible_pre)):
-                record_credentialed_route_denied(
-                    eligible_pre[0], request.method, request.path,
-                    agent_name=_safe_agent_name(request),
-                    request_id=_safe_request_id(request),
-                )
-                return web.json_response(
-                    {"error": "credentialed backends accept only framework endpoints"},
-                    status=403, headers={"X-SM-Fault-Origin": "gateway"},
-                )
+        # R-4 (decision:1357): a request that can ONLY land on a
+        # credentialed backend but is not on the S-04 allowlist is DOOMED
+        # — deny it here, BEFORE it can hold a capacity-wait slot for the
+        # full window. A mixed eligible set (any uncredentialed member)
+        # falls through: selection may legitimately pick the
+        # uncredentialed one, and the post-selection S-04 check below
+        # still guards the credentialed choice.
+        #
+        # R-B (HYG round): compare the FORWARDED form. `request.path` is
+        # percent-DECODED, while what goes on the wire is `str(request
+        # .rel_url)` — so `/v1/chat/completio%6es` read as the allowed route
+        # here and was then signed and sent as the ENCODED spelling, a
+        # different path to the provider. `rel_url.path_safe` is the same
+        # string aiohttp's own router matches on, so the gate and the wire can
+        # no longer disagree.
+        #
+        # A QUERY STRING on a credentialed route is denied outright: the
+        # forward carries it verbatim, no framework caller sends one, and
+        # `?key=…` is a real provider idiom — an unexamined query is a way to
+        # steer a signed request that a (method, path) allowlist cannot see.
+        # The credentialed_route_denied population widens under an unchanged
+        # name (CHANGELOG line owed, Group 3).
+        _route = (request.method, request.rel_url.path_safe.rstrip("/") or "/")
+        if ((_route not in CREDENTIALED_BACKEND_ALLOWED_ROUTES
+             or request.rel_url.query_string)
+                and all(LLM_BACKEND_TOKENS.get(b) is not None for b in eligible_pre)):
+            record_credentialed_route_denied(
+                eligible_pre[0], request.method, request.path,
+                agent_name=_safe_agent_name(request),
+                request_id=_safe_request_id(request),
+            )
+            return web.json_response(
+                {"error": "credentialed backends accept only framework endpoints"},
+                status=403, headers={"X-SM-Fault-Origin": "gateway"},
+            )
 
-            # At least one backend IS eligible — fast path first; only if
-            # every eligible backend is AT its max_inflight cap right now do
-            # we join the (waiter-capped, R-4) bounded wait on it (I-8: the
-            # cap never widens eligibility, so selection never picks an
-            # over-cap backend to avoid waiting) rather than refusing or
-            # overriding the cap. All pre-dispatch: no inflight accounting yet.
-            llm_backend = _select_llm_backend(
+        # At least one backend IS eligible — fast path first; only if
+        # every eligible backend is AT its max_inflight cap right now do
+        # we join the (waiter-capped, R-4) bounded wait on it (I-8: the
+        # cap never widens eligibility, so selection never picks an
+        # over-cap backend to avoid waiting) rather than refusing or
+        # overriding the cap. All pre-dispatch: no inflight accounting yet.
+        llm_backend = _select_llm_backend(
+            role, affinity_key, est_prompt_tokens, effective_max_tokens)
+        if llm_backend is None:
+            llm_backend = await _wait_for_capacity_slot(
                 role, affinity_key, est_prompt_tokens, effective_max_tokens)
-            if llm_backend is None:
-                llm_backend = await _wait_for_capacity_slot(
-                    role, affinity_key, est_prompt_tokens, effective_max_tokens)
-            if llm_backend is None:
-                _record_backend_at_capacity()
-                return web.json_response(
-                    {"error": "backend_at_capacity"}, status=503,
-                    headers={"X-SM-Fault-Origin": "gateway"},
-                )
-            target_base = llm_backend
+        if llm_backend is None:
+            _record_backend_at_capacity()
+            return web.json_response(
+                {"error": "backend_at_capacity"}, status=503,
+                headers={"X-SM-Fault-Origin": "gateway"},
+            )
+        target_base = llm_backend
 
-            # Per-backend body rewrites (LLM_BACKENDS_JSON "model" +
-            # "extra_body") — a cloud endpoint needs its real model id, not the
-            # local "local-model" every caller sends by default, and its
-            # provider-specific switches (e.g. thinking disabled) that no
-            # caller knows to send. See _apply_backend_body_overrides.
-            llm_body = _apply_backend_body_overrides(
-                llm_body, LLM_BACKEND_MODELS.get(llm_backend),
-                LLM_BACKEND_EXTRAS.get(llm_backend), _body_obj=body_obj)
+        # Per-backend body rewrites (LLM_BACKENDS_JSON "model" +
+        # "extra_body") — a cloud endpoint needs its real model id, not the
+        # local "local-model" every caller sends by default, and its
+        # provider-specific switches (e.g. thinking disabled) that no
+        # caller knows to send. See _apply_backend_body_overrides.
+        llm_body = _apply_backend_body_overrides(
+            llm_body, LLM_BACKEND_MODELS.get(llm_backend),
+            LLM_BACKEND_EXTRAS.get(llm_backend), _body_obj=body_obj)
 
+        return await self._forward_upstream(
+            request,
+            target_base=target_base,
+            llm_backend=llm_backend,
+            llm_body=llm_body,
+            body_obj=body_obj,
+            role=role,
+            steer_headers=steer_headers,
+        )
+
+    async def handle_encoder(self, request: web.Request) -> web.StreamResponse:
+        """The embedder/reranker forward — a REAL route, not a prefix guess.
+
+        Registered in main() as POST /v1/embeddings and POST /v1/reranking
+        immediately before set_known_routes(), so aiohttp's own router decides
+        what reaches here: an exact match on rel_url.path_safe and nothing
+        else. Every near spelling (trailing slash, %2f, a suffix, a traversal)
+        falls to the catch-all and is refused there — by _route_guard for a
+        known key, by _encoder_near_miss for a prefix hit.
+
+        NEVER bind this path to handle_proxy and never wrap this handler in
+        _route_guard: the guard returns 405 for ANY known key including an
+        allowed method (load-bearing for security fix A1), so a registered
+        encoder route routed through it would 405 every legitimate POST.
+
+        No credential is ever attached on this path — `llm_backend` stays None,
+        which is what gates the backend_token block in _forward_upstream. The
+        encoders are framework-local; a provider key has no business here.
+
+        Steering headers are passed through unfiltered on purpose: the S-14
+        gate exists to decide who may STEER the LLM POOL, and there is no pool
+        decision on this path. _forward_upstream strips every X-SM-LLM-* header
+        before the upstream forward regardless of who sent it (P-6), so what
+        reaches the encoder is identical either way."""
+        # Exact key: this handler is only ever reached through its own
+        # registration, and aiohttp's PlainResource matches on
+        # rel_url.path_safe (pinned in tests/test_auth_exemption_route_
+        # resolution.py against aiohttp's own source), which is the same
+        # string ROUTING_MAP is keyed by.
+        target_base = ROUTING_MAP[request.rel_url.path_safe]
+        return await self._forward_upstream(
+            request,
+            target_base=target_base,
+            steer_headers=request.headers,
+        )
+
+    async def _forward_upstream(
+        self,
+        request: web.Request,
+        *,
+        target_base: str,
+        llm_backend: "str | None" = None,
+        llm_body: "bytes | None" = None,
+        body_obj: "dict | None" = None,
+        role: str = "",
+        steer_headers=None,
+    ) -> web.StreamResponse:
+        """The shared upstream forward: build the URL and headers, stream or
+        buffer the body, relay the response, and account for it.
+
+        Extracted verbatim from handle_proxy when the encoder paths became
+        real routes (HYG round, R-A) — one forward path, two entry points, so
+        the header filtering, the retry, the disconnect handling and the
+        telemetry can never drift apart between them. `llm_backend` None is
+        the encoder shape: no credential, no pool accounting, no latency
+        record — exactly what the embedder/reranker path did before, when it
+        was the `target_base is not None` branch of handle_proxy."""
+        if steer_headers is None:
+            steer_headers = request.headers
         target_url = _upstream_url(target_base, request.rel_url)
         log.debug("→ %s %s", request.method, target_url)
 
@@ -2082,8 +2288,15 @@ class AsyncHiveMindProxy:
                 # credentialed backend. Checked before Authorization is
                 # attached (below) and before any upstream call, so a
                 # rejected request never gets near the key.
-                route = (request.method, request.path.rstrip("/") or "/")
-                if route not in CREDENTIALED_BACKEND_ALLOWED_ROUTES:
+                # R-B (HYG round): the FORWARDED form, and a query denies —
+                # same rule and same reasons as the R-4 pre-dispatch gate
+                # above. This gate is the one that fires when the eligible set
+                # was MIXED, so R-4's `all(...)` was false and selection
+                # nevertheless landed on the credentialed member; each gate
+                # therefore needs its own fleet shape to be pinned at all.
+                route = (request.method, request.rel_url.path_safe.rstrip("/") or "/")
+                if (route not in CREDENTIALED_BACKEND_ALLOWED_ROUTES
+                        or request.rel_url.query_string):
                     record_credentialed_route_denied(
                         llm_backend, request.method, request.path,
                         agent_name=_safe_agent_name(request),
@@ -6080,11 +6293,26 @@ async def main() -> None:
     # (this module imports it), and the coordinator has no other way to reach
     # them. Set before any request can be served.
     coordinator.telemetry_extras_provider = telemetry_extras
+    # S16e (HYG round): one `Server` identity on every response — gateway-
+    # generated and proxied alike. Registered on the APP so it cannot be
+    # forgotten on a new handler; see _set_server_header for why this is the
+    # only mechanism aiohttp 3.14.3 offers.
+    app.on_response_prepare.append(_set_server_header)
 
     # Coordinator routes and health endpoint before the catch-all proxy route.
     attach_coordinator(app, coordinator)
     app.router.add_get("/health", handle_health)
     app.router.add_get("/pool/status", handle_pool_status)
+    # R-A (HYG round): the encoder paths are REAL routes with their own
+    # handler, registered here — before set_known_routes() — so they land in
+    # the route snapshot and the guard can answer for their near spellings.
+    # ⛔ NEVER bind these to proxy.handle_proxy and never wrap them in
+    # _route_guard: the guard returns 405 for ANY known key including an
+    # allowed method (load-bearing for security fix A1), so either shape would
+    # 405 every legitimate POST /v1/embeddings — an outage the whole mocked
+    # suite reports green, because nothing but a real router can see it.
+    app.router.add_post("/v1/embeddings", proxy.handle_encoder)
+    app.router.add_post("/v1/reranking", proxy.handle_encoder)
     # fact:1535 route-guard: snapshot the known framework routes from the
     # router itself, AFTER every real route above is registered and BEFORE
     # the catch-all below — see set_known_routes()'s docstring for why the
