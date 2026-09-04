@@ -23,6 +23,7 @@ import os
 import sys
 
 import pytest
+from yarl import URL
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "shared-memory", "scripts"))
 
@@ -262,7 +263,7 @@ def test_config_snapshot_scrubs_a_directly_seeded_credentialed_backend(monkeypat
 class _FakeReq:
     method = "POST"
     path = "/v1/chat/completions"
-    rel_url = "/v1/chat/completions"
+    rel_url = URL("/v1/chat/completions", encoded=True)
     headers = {}
     can_read_body = True
 

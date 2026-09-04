@@ -15,6 +15,7 @@ import importlib
 import json
 import os
 import sys
+from yarl import URL
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "shared-memory", "scripts"))
 
@@ -63,7 +64,9 @@ def _req(headers: dict, body: bytes):
     r = _Req()
     r.method = "POST"
     r.path = "/v1/chat/completions"
-    r.rel_url = "/v1/chat/completions"
+    # T-1 (HYG round): a REAL yarl.URL — the credentialed-route gates read
+    # rel_url.raw_path / .query_string, the values actually forwarded.
+    r.rel_url = URL("/v1/chat/completions", encoded=True)
     r.headers = headers
     r.can_read_body = True
 

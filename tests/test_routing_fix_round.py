@@ -19,6 +19,7 @@ import os
 import sys
 
 import pytest
+from yarl import URL
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "shared-memory", "scripts"))
 
@@ -48,8 +49,13 @@ def _req(headers: dict, body: bytes, method: str = "POST",
         pass
     r = _Req()
     r.method = method
-    r.path = path
-    r.rel_url = path
+    # T-1 (HYG round): a REAL yarl.URL — the credentialed-route gates read
+    # rel_url.raw_path / .query_string, the values actually forwarded.
+    # `path` is the URL's DECODED .path, exactly the split production has,
+    # so it never contains '?'.
+    _rel = URL(path, encoded=True)
+    r.path = _rel.path
+    r.rel_url = _rel
     r.headers = headers
     r.can_read_body = True
 
