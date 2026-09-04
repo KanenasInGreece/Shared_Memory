@@ -110,6 +110,12 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
     stream=sys.stderr,
 )
+# D6 (HYG round): hive_mind_proxy.py never imports httpx; coordinator.py does
+# and runs in THIS process under THIS root config, so an INFO root level turns
+# every coordinator httpx call into a journal line. WARNING silences the
+# per-request chatter without hiding a real client failure. The aiohttp access
+# log remains the per-request record.
+logging.getLogger("httpx").setLevel(logging.WARNING)
 log = logging.getLogger("hive-proxy")
 
 # --------------------------------------------------------------------------- #
