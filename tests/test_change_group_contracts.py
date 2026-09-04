@@ -633,12 +633,20 @@ _CLI_ACTIONS = {
     "supersede", "review-hold", "query", "save_decision", "save_retrospective",
 }
 
-# The subset the top-level usage line names. `--version`/`-v`/`health` are
-# aliases the usage line deliberately folds away; everything else must appear.
-_CLI_ACTIONS_IN_USAGE = {
-    "--version", "doctor", "status", "graph", "query", "search", "save",
-    "save_decision", "save_retrospective",
-}
+# The subset the top-level usage line names. `version`/`-v`/`health` are
+# aliases the usage line deliberately folds away (`--version` is the spelling
+# it keeps; `doctor` is the one it keeps for the health check) — a LITERAL
+# (fact:1309: a literal on at least one side of a derived equality), not
+# itself derived from anything, since it encodes an editorial choice about
+# which alias each usage line prefers, not a fact the dispatch set implies.
+_USAGE_ALIASES = {"version", "-v", "health"}
+
+# D7 (HYG round): derived, not a second hand-maintained literal — a usage
+# line names every dispatched action except the aliases folded away above.
+# Before this fix _CLI_ACTIONS_IN_USAGE was its own literal that had drifted
+# from _CLI_ACTIONS (missing lineage/supersede/review-hold); deriving it
+# makes that drift impossible to reintroduce silently.
+_CLI_ACTIONS_IN_USAGE = _CLI_ACTIONS - _USAGE_ALIASES
 
 
 def _cli_dispatch_actions(src: str) -> set:
@@ -668,7 +676,10 @@ def test_both_client_copies_dispatch_exactly_the_pinned_cli_actions():
 def test_the_usage_line_names_every_action_it_claims_and_no_other():
     """GROUP 1. The usage string is the only place a user learns what the client
     can do. A command listed there but not dispatched is a dead end; one
-    dispatched but unlisted is unreachable in practice."""
+    dispatched but unlisted is unreachable in practice. D7: the `Unknown
+    action:` fallback string is the SECOND place a user learns the surface —
+    reached after a typo, when the top-level usage has already scrolled off
+    — and must name the same set, or the two disagree about what exists."""
     for rel in (("shared-memory", "scripts", "memory_bridge.py"),
                 ("shared-memory-skill", "shared-memory", "scripts", "memory_bridge.py")):
         src = _read(*rel)
@@ -683,6 +694,15 @@ def test_the_usage_line_names_every_action_it_claims_and_no_other():
         assert not unknown, (
             f"{'/'.join(rel)} usage line advertises {sorted(unknown)}, which "
             "`main()` does not dispatch — a user reading it hits 'Unknown action'."
+        )
+
+        m2 = re.search(r'Unknown action: \{action\}\. Use ([^"]+)"', src)
+        assert m2, f"{'/'.join(rel)}: the 'Unknown action:' fallback string vanished"
+        fallback_listed = set(m2.group(1).split("|"))
+        assert fallback_listed == _CLI_ACTIONS_IN_USAGE, (
+            f"{'/'.join(rel)} 'Unknown action:' fallback lists "
+            f"{sorted(fallback_listed)}, pinned {sorted(_CLI_ACTIONS_IN_USAGE)} "
+            "— it must name the same set as the top-level usage line."
         )
 
 

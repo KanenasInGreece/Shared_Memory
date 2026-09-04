@@ -110,6 +110,23 @@ def _strip_export_prefix(key: str) -> str:
     return s
 
 
+def _strip_balanced_quotes(value: str) -> str:
+    """S16g (HYG round, R-G'): a `.env` VALUE wrapped in ONE balanced pair of
+    surrounding quotes — `"v"` or `'v'` — has that pair stripped; everything
+    else (an unbalanced leading quote with no matching trailing one, a bare
+    quote embedded in the value, mismatched quote characters, or no quotes
+    at all) is kept VERBATIM. Same rule, independently duplicated in
+    secure_env.py and memory_bridge.py's manual fallback parsers — none of
+    the three may import from another (Group 1: the client/server surface
+    split). Applies only to the MANUAL fallback parser below
+    (_load_env_manually); the dotenv_values() path further down (used when
+    python-dotenv is installed) applies that library's own quote handling
+    instead."""
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in ('"', "'"):
+        return value[1:-1]
+    return value
+
+
 def _looks_like_server_env(path: str) -> bool:
     """True when this .env is the FRAMEWORK's, not a client's. Best-effort: an
     unreadable file is not treated as a server env, since the only cost of trying
@@ -236,7 +253,7 @@ def _load_env_manually(path: str) -> None:
                 # nor _is_client_secret_key's exact-name list, exporting
                 # the registry straight into os.environ.
                 key = _strip_export_prefix(key).strip()
-                val = val.strip()
+                val = _strip_balanced_quotes(val.strip())
                 if not key:
                     continue
                 # SEC round HIGH-1 + HIGH-2 (2026-09-01, gemini), H-1
