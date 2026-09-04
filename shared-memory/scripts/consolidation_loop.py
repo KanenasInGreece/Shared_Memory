@@ -835,6 +835,12 @@ def _routing_refusal(resp) -> dict | None:
 
 
 logging.basicConfig(level=logging.INFO)
+# D6 (HYG round): consolidation_loop.py imports httpx and runs under THIS
+# process's own root config, so an INFO root level turns every httpx call
+# into a journal line. WARNING silences the per-request chatter without
+# hiding a real client failure. The aiohttp access log remains the
+# per-request record.
+logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger("ConsolidationDaemon")
 
 
