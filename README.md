@@ -1195,12 +1195,15 @@ The identity is the token: the graph knows which machine contributed which fact.
 
 The MCP surface is the second front door to the same gateway: any MCP host can mount the memory
 this way, and the connector is client-deployable like the CLI skill — install a copy where the
-MCP host runs, give it a token and a route to the gateway. LM Studio and a coding agent
-(opencode, read-only role) are the examples we have exercised end to end, not defaults the
-surface assumes. The connector lives in the
+MCP host runs, give it a token and a route to the gateway. LM Studio, a coding agent
+(opencode, read-only role) and GitHub Copilot in VS Code (read-only, both of its config
+surfaces) are the examples we have exercised end to end, not defaults the surface assumes. The
+connector lives in the
 [`mcp/`](mcp/) folder — server, system prompt and config template together, with its own
 [`mcp/README.md`](mcp/README.md) covering what it exposes, how it deploys and how it
-authenticates.
+authenticates. The Copilot walkthrough — two config files with different keys, where the token
+lives on each, and the one trap that cost us the first run — has its own page:
+[`Documentation/vscode-copilot-mcp.md`](shared-memory/Documentation/vscode-copilot-mcp.md).
 
 Coding agents that speak MCP — opencode is the one running here — mount the same connector
 without any `mcp.json`: register it as a local MCP server in the agent's own config, and keep
