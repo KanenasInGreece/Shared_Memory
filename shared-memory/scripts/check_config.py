@@ -210,8 +210,19 @@ ENV_ROW_ORDER = ("EMBEDDER_URL", "RERANKER_URL", "LLM_DEFAULT_TARGET", "LLM_BACK
 
 _SAFE_TO_SHOW_MESSAGE = (ImportError, ModuleNotFoundError)
 _PHASE_A_EXCEPTION_HINT = "inspect shared-memory/.env for a malformed or unreadable line"
-_PHASE_B_EXCEPTION_HINT = ("inspect LLM_BACKENDS_JSON, or run with the daemon's dependencies "
-                           "(aiohttp/asyncpg/httpx/neo4j) installed")
+# H3 (HYG round S2): names the measured-common cause alongside the two that
+# were already here -- a malformed EMBEDDER_URL/RERANKER_URL (not a valid
+# http:// or https:// URL) fails coordinator._encoder_url()'s own
+# import-time validation, and hive_mind_proxy.py imports coordinator before
+# anything else, so THAT failure is what most often lands here. Worded to
+# avoid two exact substrings other tests pin as ABSENT from this hint:
+# "has no attribute" (AttributeError's own message) and "must be an http(s)
+# URL" (_encoder_url's own message) -- see tests/test_check_config.py near
+# :208 and :227.
+_PHASE_B_EXCEPTION_HINT = ("inspect LLM_BACKENDS_JSON, or EMBEDDER_URL/RERANKER_URL (each must "
+                           "be a valid http:// or https:// URL -- a malformed one fails "
+                           "coordinator's own import-time validation), or run with the daemon's "
+                           "dependencies (aiohttp/asyncpg/httpx/neo4j) installed")
 
 
 def _render_exception(exc: BaseException, hint: str) -> str:
