@@ -14,6 +14,7 @@ import importlib
 import json
 import os
 import sys
+from yarl import URL
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "shared-memory", "scripts"))
 
@@ -34,7 +35,7 @@ class _CaptureSession:
 class _Req:
     method = "POST"
     path = "/v1/chat/completions"        # not in ROUTING_MAP -> the LLM pool branch
-    rel_url = "/v1/chat/completions"
+    rel_url = URL("/v1/chat/completions", encoded=True)
     headers = {"Authorization": "Bearer client-gateway-token"}
     can_read_body = True
 

@@ -56,6 +56,78 @@ journalctl --user -u hive-mind-gateway.service -f
 `Restart=on-failure` brings it back after a genuine crash; the `enable-linger`
 step is what makes it survive logout and reboot.
 
+### Hardening (`LimitCORE`, `ProtectSystem`)
+
+All three units in this directory (`hive-mind-gateway.service`,
+`shared-memory-backup.service`, `shared-memory-logrotate.service`) ship
+`LimitCORE=0` unconditionally. A crash — SIGABRT, a segfault, or the SIGABRT
+Fedora's `10-timeout-abort.conf` drop-in raises when a stop runs past its
+timeout — must never write a core dump, because a core file captures every
+secret the crashing process had loaded into memory (`PG_PASSWORD`,
+`NEO4J_PASSWORD`, `BACKUP_ADMIN_TOKEN`, any `LLM_BACKENDS_JSON` API key) in
+plaintext, from the process's own environment and heap. This closes a real
+incident: the gateway unit had inherited `LimitCORE=infinity`, and 231 core
+dumps had accumulated on this workstation before the retention policy
+vacuumed them.
+
+**Diagnosing a native crash (temporary lift only — never leave this on):**
+
+```bash
+systemctl --user edit <unit>          # opens a drop-in editor
+```
+
+```ini
+[Service]
+LimitCORE=infinity
+```
+
+```bash
+systemctl --user daemon-reload
+systemctl --user restart <unit>
+# reproduce the crash, then inspect the core (coredumpctl list, coredumpctl gdb <pid>)
+```
+
+Then **remove the drop-in** (`systemctl --user edit <unit>` again, delete the
+override block, save empty — or `systemctl --user revert <unit>`) and
+`daemon-reload`. A core file written while the lift is active holds every
+secret the process had loaded and **must be deleted** once you are done
+analysing it — `coredumpctl` retains its own copy under
+`/var/lib/systemd/coredump` (or the journal, if configured to store there);
+clear that too, not just whatever working directory it landed in.
+
+`ProtectSystem=full` (read-only `/usr`, `/boot`, `/efi`, `/etc` for the
+unit — it never touches `/home`, `/run` or `/tmp`, so it says nothing about
+what an app writes anywhere in those trees) is applied to **all three**
+units:
+
+```ini
+ProtectSystem=full
+```
+
+`ProtectSystem=strict` stays FORBIDDEN on every unit here — it would mount the
+entire filesystem read-only, including `%h`, breaking each unit's own state
+writes (the gateway's logs and UDS socket, the backup's dump output, the
+logrotate state file).
+
+Two of the three units have a write path that lands outside `%h` by default,
+recorded here as an observation, not a reason to withhold the directive
+(`full` doesn't reach either path, so neither is actually protected or put at
+risk by it either way):
+
+- **`hive-mind-gateway.service`** — the default `GATEWAY_UDS_PATH`
+  (`_default_uds_path()` in `hive_mind_proxy.py`) is
+  `$XDG_RUNTIME_DIR/shared-memory-gw.sock`, falling back to `/tmp` when
+  `XDG_RUNTIME_DIR` is unset — neither is under `%h`.
+- **`shared-memory-backup.service`** — `backup.sh`'s `init_secrets_dir()`
+  creates a `mktemp -d` directory (default location `/tmp`) to hold the curl
+  auth header and the Postgres/Neo4j `--env-file`s for the run's duration.
+- **`shared-memory-logrotate.service`** has no such exception — every write
+  path (the `--state` file, the rotated `*-audit.jsonl` files, and their
+  `.gz` siblings) is under `%h`.
+
+See the v0.9.89 CHANGELOG entry for the full
+detail and the ruling that resolved this.
+
 ### Audit-log rotation
 
 `shared-memory-logrotate.{service,timer}` + `shared-memory.logrotate` (install steps

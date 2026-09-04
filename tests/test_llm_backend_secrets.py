@@ -10,6 +10,7 @@ import os
 import sys
 
 import pytest
+from yarl import URL
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "shared-memory", "scripts"))
 
@@ -32,7 +33,7 @@ class _HeaderCaptureSession:
 class _Req:
     method = "POST"
     path = "/v1/chat/completions"        # not in ROUTING_MAP -> the LLM pool branch
-    rel_url = "/v1/chat/completions"
+    rel_url = URL("/v1/chat/completions", encoded=True)
     headers = {"Authorization": "Bearer client-gateway-token"}
     can_read_body = True
 
@@ -368,6 +369,15 @@ def test_token_never_leaks_into_client_visible_error_response(monkeypatch):
 
 
 def test_embedder_target_never_gets_authorization_either(monkeypatch):
+    """R-A (HYG round): driven through handle_ENCODER, not handle_proxy.
+
+    The prefix loop that used to route /v1/embeddings inside handle_proxy is
+    GONE — the path is its own registered route now. Left on handle_proxy this
+    test would still pass, but only because an embed request would fall into
+    the reasoning-LLM pool and land on an UNCREDENTIALED local backend, which
+    attaches no Authorization for reasons that have nothing to do with the
+    embedder. That is a false green: it would assert the property while
+    exercising the wrong path."""
     monkeypatch.delenv("LLM_BACKENDS_JSON", raising=False)
     monkeypatch.setenv("LLM_BACKENDS", "http://a:5000")
     import hive_mind_proxy as g
@@ -375,8 +385,8 @@ def test_embedder_target_never_gets_authorization_either(monkeypatch):
 
     class _EmbedReq:
         method = "POST"
-        path = "/v1/embeddings"           # IS in ROUTING_MAP -> not the LLM branch
-        rel_url = "/v1/embeddings"
+        path = "/v1/embeddings"           # its own registered route -> handle_encoder
+        rel_url = URL("/v1/embeddings", encoded=True)
         headers = {"Authorization": "Bearer client-gateway-token"}
         can_read_body = True
         content_length = 40
@@ -387,7 +397,7 @@ def test_embedder_target_never_gets_authorization_either(monkeypatch):
     proxy = g.AsyncHiveMindProxy()
     session = _HeaderCaptureSession()
     proxy.session = session
-    asyncio.run(proxy.handle_proxy(_EmbedReq()))
+    asyncio.run(proxy.handle_encoder(_EmbedReq()))
 
     assert "Authorization" not in (session.captured_headers or {})
 

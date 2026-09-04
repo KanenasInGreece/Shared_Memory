@@ -35,6 +35,9 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "shared-memory"
 from aiohttp import web  # noqa: E402
 
 
+from yarl import URL
+
+
 # ── test doubles ──────────────────────────────────────────────────────────────
 
 class _FakeReq:
@@ -42,8 +45,10 @@ class _FakeReq:
     test_pool_status.py — no mapping interface, proving the request["backend"]
     stash is truly best-effort and never breaks a caller that lacks one."""
     method = "POST"
-    path = "/v1/chat/completions"        # not in ROUTING_MAP -> the LLM pool branch
-    rel_url = "/v1/chat/completions"
+    path = "/v1/chat/completions"        # the catch-all -> the LLM pool branch
+    # T-1 (HYG round): a REAL yarl.URL — the credentialed-route gates read
+    # rel_url.raw_path / .query_string (ruling 2: the wire path, not path_safe).
+    rel_url = URL("/v1/chat/completions", encoded=True)
     headers = {}
     can_read_body = True
 
@@ -58,7 +63,7 @@ class _DictReq(dict):
     request_id stash actually lands somewhere a reader could retrieve it."""
     method = "POST"
     path = "/v1/chat/completions"
-    rel_url = "/v1/chat/completions"
+    rel_url = URL("/v1/chat/completions", encoded=True)
     headers = {}
     can_read_body = True
 
@@ -254,8 +259,8 @@ def test_embedding_route_fault_also_gets_upstream_origin_header(monkeypatch):
 
     class _EmbedReq:
         method = "POST"
-        path = "/v1/embeddings"           # IS in ROUTING_MAP -> not the LLM branch
-        rel_url = "/v1/embeddings"
+        path = "/v1/embeddings"           # its own registered route -> handle_encoder
+        rel_url = URL("/v1/embeddings", encoded=True)
         headers = {}
         can_read_body = True
         content_length = 40
@@ -265,7 +270,8 @@ def test_embedding_route_fault_also_gets_upstream_origin_header(monkeypatch):
 
     proxy = g.AsyncHiveMindProxy()
     proxy.session = _StatusBodySession(500, b'{"error":"embedder down"}')
-    resp = asyncio.run(proxy.handle_proxy(_EmbedReq()))
+    # R-A (HYG round): the encoder path has its own handler now.
+    resp = asyncio.run(proxy.handle_encoder(_EmbedReq()))
 
     assert resp.status == 500
     assert written["headers"]["X-SM-Fault-Origin"] == "upstream"

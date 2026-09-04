@@ -80,6 +80,11 @@ import types
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
+# Imported, never spelled as a string: this is the class aiohttp 3.14.3
+# actually exports (`aiohttp.web_exceptions.NotAppKeyWarning`, re-exported
+# from `aiohttp.web`) — verified by import, so a rename upstream fails loudly
+# here instead of leaving a filter that quietly matches nothing.
+from aiohttp.web import NotAppKeyWarning
 from unittest.mock import AsyncMock, patch
 from yarl import URL
 
@@ -87,6 +92,23 @@ REPO_ROOT = os.path.normpath(os.path.join(os.path.dirname(__file__), ".."))
 SCRIPTS_DIR = os.path.join(REPO_ROOT, "shared-memory", "scripts")
 if SCRIPTS_DIR not in sys.path:
     sys.path.insert(0, SCRIPTS_DIR)
+
+# D8b / R-I (HYG round) — the three NotAppKeyWarnings this module raises are
+# EXPLAINED, not chased. aiohttp 3.14 asks for `web.RequestKey` instances
+# instead of plain string keys in `request[...]`; the gateway writes
+# `request["authenticated_agent"]`, `request["principal"]` and
+# `request["request_id"]` in coordinator.auth_middleware, and the proxy writes
+# `request["backend"]` / `request["key_attached"]`. Converting them is a
+# DEPENDENCY-CURRENCY item (decision:1586), deferred and recorded in
+# THIRD_PARTY.md's aiohttp row: 10 production and 12 test sites, spanning the
+# auth middleware and the person-identity plumbing — a security surface that
+# does not move as a side effect of a log-hygiene round. The filter is scoped
+# to THIS module (never a global `filterwarnings` in a config file) and the
+# class is imported rather than spelled as a string, so a rename in a future
+# aiohttp is an ImportError here rather than a filter that silently stops
+# matching. ⭐ When the conversion ships, this pin flips to "error".
+pytestmark = pytest.mark.filterwarnings(
+    f"ignore::{NotAppKeyWarning.__module__}.{NotAppKeyWarning.__qualname__}")
 
 
 # ── Harness ───────────────────────────────────────────────────────────────────
@@ -135,8 +157,15 @@ def _build_gateway_app(c, g):
     middleware and the real route guard.
 
     Deliberately mirrors hive_mind_proxy.main():
-      attach_coordinator → /health → /pool/status → set_known_routes →
+      attach_coordinator → /health → /pool/status → /v1/embeddings →
+      /v1/reranking → set_known_routes →
       require_unprotected_paths_are_plain_routes → catch-all.
+
+    ⚠ HAND-WRITTEN MIRROR. Kept honest by test_gateway_edge_hygiene.py::
+    test_every_main_route_registration_has_a_counterpart_in_each_test_mirror
+    — a route main() registers and this helper does not would make every
+    refusal assertion below run against a route table the gateway does not
+    have, and pass.
     """
     app = web.Application(middlewares=[c.auth_middleware])
     g.attach_coordinator(app, AsyncMock())
@@ -144,6 +173,11 @@ def _build_gateway_app(c, g):
     app.router.add_get("/pool/status", _sentinel_pool_status)
 
     proxy = g.AsyncHiveMindProxy()
+    # R-A (HYG round): registered before the snapshot, exactly as main() does,
+    # so /v1/embeddings is a KNOWN key here too — which is what makes
+    # `/v1/embeddings/` a guard near-miss rather than a passthrough.
+    app.router.add_post("/v1/embeddings", proxy.handle_encoder)
+    app.router.add_post("/v1/reranking", proxy.handle_encoder)
     proxy.set_known_routes(app.router)
     c.require_unprotected_paths_are_plain_routes(app.router)
 
@@ -571,7 +605,8 @@ def test_startup_assertion_refuses_an_exempt_path_no_route_owns():
 def test_main_calls_the_startup_assertion_next_to_set_known_routes():
     """The assertion is only worth anything if the gateway entrypoint runs
     it. Source-level, because main() cannot be executed in a unit test."""
-    src = open(os.path.join(SCRIPTS_DIR, "hive_mind_proxy.py"), encoding="utf-8").read()
+    with open(os.path.join(SCRIPTS_DIR, "hive_mind_proxy.py"), encoding="utf-8") as fh:
+        src = fh.read()
     assert "require_unprotected_paths_are_plain_routes(app.router)" in src, (
         "hive_mind_proxy.main() must run the _UNPROTECTED_PATHS startup "
         "assertion — an invariant nothing checks is an intention"
@@ -677,7 +712,8 @@ def test_the_deleted_canonical_limb_is_gone_and_stays_gone():
         "Reintroducing it adds a second opinion about what /health means, "
         "which is the defect class A1 belongs to."
     )
-    src = open(os.path.join(SCRIPTS_DIR, "coordinator.py"), encoding="utf-8").read()
+    with open(os.path.join(SCRIPTS_DIR, "coordinator.py"), encoding="utf-8") as fh:
+        src = fh.read()
     exemption = src[src.index("_router_match_path(request) in _UNPROTECTED_PATHS")
                     - 400:src.index("_router_match_path(request) in _UNPROTECTED_PATHS") + 200]
     assert "request.path in _UNPROTECTED_PATHS" not in src, (
@@ -695,7 +731,8 @@ def test_the_deleted_canonical_limb_is_gone_and_stays_gone():
 # ══════════════════════════════════════════════════════════════════════════
 
 def test_route_guard_is_the_first_statement_of_handle_proxy():
-    src = open(os.path.join(SCRIPTS_DIR, "hive_mind_proxy.py"), encoding="utf-8").read()
+    with open(os.path.join(SCRIPTS_DIR, "hive_mind_proxy.py"), encoding="utf-8") as fh:
+        src = fh.read()
     tree = ast.parse(src)
     fn = None
     for node in ast.walk(tree):

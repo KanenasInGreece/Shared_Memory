@@ -18,3 +18,21 @@ ExecStart=/usr/bin/env bash shared-memory/ops/backup.sh
 # gateway unit — BACKUP_DIR defaults to ~/.shared-memory/backups, under $HOME.
 UMask=0077
 NoNewPrivileges=yes
+
+# S16 (HYG round) — LimitCORE=0: same reasoning as hive-mind-gateway.service,
+# and more pointed here — backup.sh's init_secrets_dir() writes the curl auth
+# bearer token and BOTH database passwords to plaintext files (mode 600) for
+# the run's duration; a core dump of this process would capture them from its
+# own environment/heap even faster than from a .env read. See
+# ops/README.md's "Hardening" section for the temporary lift procedure.
+LimitCORE=0
+
+# ProtectSystem=full (HYG round, ruling applied): backup.sh's
+# init_secrets_dir() calls `mktemp -d` to hold the curl auth header and the
+# Postgres/Neo4j --env-files for docker exec — that directory is under /tmp
+# (or $TMPDIR) by default, not under %h, but `full` only makes /usr, /boot,
+# /efi and /etc read-only; it never touches /tmp, /run or $XDG_RUNTIME_DIR,
+# so this write is unaffected either way. `strict` stays FORBIDDEN — it
+# would make %h itself read-only. See ops/README.md (Hardening) for the
+# write-path-outside-%h observation this directive does not resolve.
+ProtectSystem=full

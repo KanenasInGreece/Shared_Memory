@@ -22,6 +22,7 @@ import importlib
 import json
 import os
 import sys
+from yarl import URL
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "shared-memory", "scripts"))
 
@@ -36,7 +37,7 @@ class _FakeReq:
     pool branch and sets llm_backend."""
     method = "POST"
     path = "/v1/chat/completions"
-    rel_url = "/v1/chat/completions"
+    rel_url = URL("/v1/chat/completions", encoded=True)
     headers = {}
     can_read_body = True
 
@@ -50,7 +51,7 @@ class _StreamReq:
     untouched."""
     method = "POST"
     path = "/v1/chat/completions"
-    rel_url = "/v1/chat/completions"
+    rel_url = URL("/v1/chat/completions", encoded=True)
     headers = {}
     can_read_body = True
 
@@ -59,11 +60,12 @@ class _StreamReq:
 
 
 class _EmbedReq:
-    """Mirrors test_llm_fault_origin.py's _EmbedReq — path IS in ROUTING_MAP,
-    so llm_backend stays None throughout: the non-pool-route case."""
+    """Mirrors test_llm_fault_origin.py's _EmbedReq — its own registered route,
+    served by handle_encoder, so llm_backend stays None throughout: the
+    non-pool-route case."""
     method = "POST"
     path = "/v1/embeddings"
-    rel_url = "/v1/embeddings"
+    rel_url = URL("/v1/embeddings", encoded=True)
     headers = {}
     can_read_body = True
     content_length = 40
@@ -446,14 +448,20 @@ def test_latency_counters_on_gateway_connection_failure(monkeypatch):
 def test_non_pool_route_records_no_latency(monkeypatch):
     """Embeddings/reranking never set llm_backend — the latency instrument
     must stay entirely untouched for them (requests_total for the one
-    configured LLM backend stays 0, since no LLM-pool request was made)."""
+    configured LLM backend stays 0, since no LLM-pool request was made).
+
+    R-A (HYG round): driven through handle_ENCODER. The prefix loop that used
+    to route /v1/embeddings inside handle_proxy is GONE — the path is its own
+    registered route now, and an embed request sent to handle_proxy would go
+    down the LLM-POOL path instead, which is exactly the case this test
+    asserts cannot happen."""
     g = _fresh(monkeypatch)
     _patch_stream_response(monkeypatch)
     b = "http://a:5000"
 
     proxy = g.AsyncHiveMindProxy()
     proxy.session = _StatusBodySession(200, b'{"result":"ok"}')
-    resp = asyncio.run(proxy.handle_proxy(_EmbedReq()))
+    resp = asyncio.run(proxy.handle_encoder(_EmbedReq()))
 
     assert resp.status == 200
     assert g._llm_requests_total[b] == 0

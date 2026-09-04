@@ -53,6 +53,7 @@ import time
 import pytest
 from aiohttp import web
 from aiohttp.client_exceptions import ClientConnectionResetError, ServerDisconnectedError
+from yarl import URL
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "shared-memory", "scripts"))
 
@@ -62,7 +63,9 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "shared-memory"
 class _Req:
     method = "POST"
     path = "/v1/chat/completions"        # not in ROUTING_MAP -> the LLM pool branch
-    rel_url = "/v1/chat/completions"
+    # T-1 (HYG round): a REAL yarl.URL — the credentialed-route gates read
+    # rel_url.raw_path / .query_string, the values actually forwarded.
+    rel_url = URL("/v1/chat/completions", encoded=True)
     headers = {}
     can_read_body = True
 

@@ -189,6 +189,15 @@ def test_role_config_error_leads_to_exit_1_would_refuse_to_start(tmp_path):
     assert proc.returncode == 1, proc.stdout + proc.stderr
     assert "WOULD REFUSE TO START" in proc.stdout
     assert "Traceback" not in proc.stderr
+    # H2 (HYG round S2): the false-comfort line -- "the gateway would boot
+    # on the legacy fallback" (LLM_POOL_FALLBACK_REASON's own wording) --
+    # must never appear alongside a genuine exit-1 refusal. By construction
+    # (hive_mind_proxy._load_llm_backends(): an entry with a bad `roles`
+    # value is still ADDED to the returned pool, so `if urls:` is true and
+    # LLM_POOL_FALLBACK_REASON is never set for this fixture) the two do not
+    # co-occur today -- this pins that outcome so a future change to either
+    # side cannot silently reintroduce the false comfort.
+    assert "would boot" not in proc.stdout.lower()
 
 
 def test_malformed_llm_backends_json_array_of_strings_is_exit_2_no_traceback(tmp_path):
@@ -226,6 +235,29 @@ def test_import_crash_bare_host_port_embedder_url_still_prints_phase_a_and_exit_
     assert "ValueError" in proc.stdout
     assert "must be an http(s) URL" not in proc.stdout  # _encoder_url's own message, never shown
     assert "Traceback" not in proc.stderr
+
+
+# ── H3 (HYG round S2) — the Phase-B import-failure hint names a bad
+#    EMBEDDER_URL/RERANKER_URL as a cause, scoped to the "UNAVAILABLE --
+#    import failed:" line ONLY. Phase A's own row already prints
+#    "EMBEDDER_URL" unconditionally (see the crash test above), so a naive
+#    whole-stdout assertion would pass without the hint wording ever
+#    changing -- this isolates the one line the fix actually touches. ──────
+
+def test_phase_b_import_failure_hint_names_the_bad_encoder_url_cause(tmp_path):
+    proc = _run(env_overrides={"SECURE_ENV_FILE": "", "EMBEDDER_URL": "embedder.internal:8070"},
+                tmp_path=tmp_path)
+    assert proc.returncode == 2, proc.stdout + proc.stderr
+    unavailable_lines = [line for line in proc.stdout.splitlines()
+                          if "UNAVAILABLE — import failed:" in line]
+    assert unavailable_lines, proc.stdout
+    line = unavailable_lines[0]
+    assert "EMBEDDER_URL" in line
+    assert "RERANKER_URL" in line
+    # The two absence assertions other tests pin (near :208 and :227 in this
+    # file) must stay green -- checked here too, scoped to this same line.
+    assert "has no attribute" not in line
+    assert "must be an http(s) URL" not in line
 
 
 def test_valid_config_with_a_local_backend_is_exit_0(tmp_path):
@@ -607,6 +639,22 @@ def test_userinfo_credential_username_never_reaches_check_config_output(tmp_path
     assert "svc:" not in full_output
     assert "s3cr3t-userinfo-pw" not in full_output
     assert "Traceback" not in full_output
+
+
+# ── H1 (HYG round S2, ruling R-H: TEST ONLY, no code change) — every key
+#    check_config.py's own ENV_ROW_ORDER names must carry both 'idiom' and
+#    'default' in FRAMEWORK_DEFAULTS. _idiom_for()'s own docstring says a
+#    KeyError on a row missing either is a genuine bug in ENV_ROW_ORDER, not
+#    a condition to paper over -- this test pins that every row today
+#    actually satisfies the precondition the render loop assumes, without
+#    moving that loop inside the try (the module docstring says loud is
+#    intended). ─────────────────────────────────────────────────────────────
+
+def test_every_env_row_order_key_carries_an_idiom_and_a_default():
+    for key in check_config.ENV_ROW_ORDER:
+        row = framework_defaults.FRAMEWORK_DEFAULTS[key]
+        assert "idiom" in row, f"{key} row is missing 'idiom'"
+        assert "default" in row, f"{key} row is missing 'default'"
 
 
 # ── QA Q1 / fold-round item 4 — PROXY_BIND's idiom now lives in the D1

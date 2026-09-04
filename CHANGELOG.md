@@ -5,6 +5,83 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.9.89] — 2026-09-05
+
+### The hygiene round — the gateway's edge says what it does
+
+The embedder and reranker paths were never routes. For as long as the gateway has existed,
+`POST /v1/embeddings` reached the encoder because a `startswith()` inside the catch-all handler
+guessed at it — which meant `/v1/embeddings/`, `/v1/embeddingsX` and `/v1/embeddings/../x` reached
+it too, and had the exact path ever been registered, every one of those spellings would have fallen
+through to the reasoning-LLM pool and been answered by a chat model. They are real routes now, with
+their own handler, and aiohttp's router decides what reaches them. Everything that merely resembles
+one is refused in the route guard's own voice: a trailing slash, a suffix or a traversal spelling is
+**404**, an encoded-slash spelling is **405**, a wrong method is **405 with `Allow: POST`**, and none
+of them is forwarded anywhere. This is client-visible: `POST /v1/embeddings/` used to work and no
+longer does.
+
+The credentialed-backend gates compared one string and forwarded another. Both gates read the
+percent-decoded `request.path`, so `/v1%2fchat/completions` and `/v1/chat/completio%6es` read as the
+allowed route, passed, and were then signed with the provider key and sent in their encoded form —
+security fix A1's shape, one layer down. Both gates now compare the raw request-target path as it
+arrived on the wire, and a query string on a credentialed route is refused outright: a percent-encoded
+spelling of a framework endpoint, or any `?key=` idiom, is **403** before a token is attached. No
+framework caller encodes a path or sends a query, so no framework traffic changes; the
+`credentialed_route_denied` counter's population widens under an unchanged name. The audit line for
+such a denial now records the raw spelling and a `?<query-redacted>` marker, never the query value —
+before, a `%6e` denial was logged as a refusal of the allowed route, which no operator could explain.
+Two spellings are recorded as known-remaining and await a ruling rather than an improvisation: a
+trailing slash on a credentialed route is still tolerated by the gate and forwarded with the slash
+(the sweep's bounded residue), and an encoded spelling of the exact encoder path (`/v1/embedding%73`)
+is matched by the router and forwarded to the encoder with its encoded wire path, which decodes to the
+same endpoint and can reach no other.
+
+Headers, both directions. A backend no longer learns who our caller is: `Cookie`, `X-Forwarded-For`,
+`X-Forwarded-Proto`, `X-Forwarded-Host` and `X-Real-IP` are stripped on the way up; `Referer` and
+`User-Agent` deliberately are not, and a test pins the denylist so a later allowlist cannot narrow the
+surface unremarked. A backend can no longer plant a cookie on our caller through us: `Set-Cookie` is
+stripped on the way down. Every response — a refusal, a health reply, a relayed stream — now carries
+`Server: shared-memory-gateway`; `/health` used to announce the Python and aiohttp versions to any
+anonymous caller, and a proxied response used to relay whatever the backend called itself. Exactly one
+`Authorization` header ever reaches a credentialed upstream, pinned as a count.
+
+Quieter journals. The `httpx` logger sits at WARNING in the gateway process and in both daemons
+(five thousand of seven thousand journal lines a day were its per-request INFO echoes, most of them
+the daemons polling `/pool/status`); the aiohttp access log is now the only per-request record of
+those calls, and a real client failure still logs. `memory_bridge.py`'s usage line names all twelve
+actions — `lineage`, `supersede` and `review-hold` had been missing since they shipped. A `.env`
+value wrapped in one balanced pair of surrounding quotes is now read without the quotes by the
+gateway parser and by both clients alike; a value previously read *with* its quotes is now read
+without them, the gateway notes the key (never the value) when it strips a pair, and an unbalanced or
+embedded quote is kept verbatim. The `<KEY>_FILE` secret-file path strips only trailing newlines and
+never quotes — a recorded inconsistency, not changed here.
+
+The units. All three systemd user units carry `LimitCORE=0`: the gateway inherited
+`LimitCORE=infinity`, and a distribution drop-in turns a slow drain into an abort with a core dump
+that holds every secret the process loaded — two hundred and thirty-one such dumps had been written
+on one host before retention removed them. `ProtectSystem=full` joins it in all three (it makes
+`/usr`, `/boot` and `/etc` read-only and touches nothing under the home directory or `/tmp`);
+`ops/README.md` documents the temporary lift for a native-crash diagnosis and says plainly that a core
+written under it holds secrets. The gateway unit's `Documentation=` now points at the project.
+`THIRD_PARTY.md`'s aiohttp row records that the `web.RequestKey` conversion is deferred as a
+dependency-currency item; the test-side pin flips to `error` when it ships. `check_config` can no
+longer print its "would boot" line beside a role error, its Phase-B import-failure hint names a bad
+encoder URL as a cause, and every env row is pinned to carry an idiom and a default.
+
+Contract mechanics: `DUAL_EMIT_DROP_TARGET` moves to `0.9.90` — the dual-emit window is extended by
+one release so the monitor can move to the new key homes first; `removed_in` on the dual-emitted keys
+follows it in the regenerated `telemetry-contract.md`.
+
+Chain: an evidence sweep that corrected two of the brief's premises before design; two adversarial
+reviews of the brief (both found the same Critical — the encoder routes needed a dedicated handler,
+never the catch-all, because the route guard returns 405 for any known key by design); an operator
+ruling on the compared form (`raw_path`, not `path_safe`, after the builder measured that `path_safe`
+decodes every escape but `%2F`); a reviewer-class build of step 1 with its own mutation table; QA,
+security and adversarial reviews on three seats, all converging on the same three Required findings;
+one fix round; four parallel step-2 lanes on disjoint files; a combined QA-plus-security review of the
+merged range; and every review, ruling and fix left as a record in the corpus. One ruled review seat
+returned no deliverable (an expired provider key) and is recorded as the gap it was.
+
 ## [0.9.88] — 2026-09-03
 
 ### The observability round — meters that tell the truth

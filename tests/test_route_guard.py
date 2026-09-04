@@ -28,6 +28,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import make_mocked_request
+from yarl import URL
 
 REPO_ROOT = os.path.normpath(os.path.join(os.path.dirname(__file__), ".."))
 SCRIPTS_DIR = os.path.join(REPO_ROOT, "shared-memory", "scripts")
@@ -57,14 +58,24 @@ def _fresh_gateway(monkeypatch):
 def _req(method: str, path: str, headers: dict | None = None, body: bytes = b""):
     """Same shape as tests/test_routing_fix_round.py's `_req` — a dict
     subclass so request['authenticated_agent']-style reads default to None.
-    `content_length` is needed by the ROUTING_MAP (embeddings/reranking)
-    buffering branch in handle_proxy, which the guard's no-op tests exercise."""
+    `content_length` is needed by the small-body buffering branch in
+    _forward_upstream, which the guard's no-op tests exercise.
+
+    T-1 (HYG round): `rel_url` is a REAL `yarl.URL`, not a string. The
+    credentialed-route gates read `rel_url.raw_path` (ruling 2) and `rel_url
+    .query_string` — the values that are actually forwarded — so a string
+    stub would AttributeError, and a stub whose `.path` carried a query
+    string would make a false 403 that looks like a query denial but is
+    really an allowlist miss. `encoded=True` keeps a percent-encoded
+    spelling verbatim; `path` is the DECODED `.path`, exactly the split
+    production has, and therefore never contains '?'."""
     class _Req(dict):
         pass
     r = _Req()
     r.method = method
-    r.path = path
-    r.rel_url = path
+    rel = URL(path, encoded=True)
+    r.rel_url = rel
+    r.path = rel.path
     r.headers = headers or {}
     r.can_read_body = True
     r.content_length = len(body)
@@ -75,13 +86,20 @@ def _req(method: str, path: str, headers: dict | None = None, body: bytes = b"")
     return r
 
 
-def _build_real_gateway_app(g) -> web.Application:
+def _build_real_gateway_app(g, proxy=None) -> web.Application:
     """The gateway's actual registered route set (attach_coordinator +
-    /health + /pool/status), EXCLUDING the catch-all — exactly what
-    set_known_routes() is meant to see, and exactly what main() builds
-    before adding the catch-all route. `coordinator` is a MagicMock: attach()
-    only needs the handler ATTRIBUTES to exist for registration, it never
-    calls them."""
+    /health + /pool/status + the two encoder routes), EXCLUDING the catch-all
+    — exactly what set_known_routes() is meant to see, and exactly what main()
+    builds before adding the catch-all route. `coordinator` is a MagicMock:
+    attach() only needs the handler ATTRIBUTES to exist for registration, it
+    never calls them.
+
+    ⚠ This is a HAND-WRITTEN MIRROR of main()'s registration window. It is
+    kept honest by test_gateway_edge_hygiene.py::
+    test_every_main_route_registration_has_a_counterpart_in_each_test_mirror,
+    which reads both sources — a route added to main() and not here would
+    otherwise make every test in this file assert against a route table the
+    gateway does not have."""
     app = web.Application()
     # AsyncMock, not MagicMock: attach() registers coordinator.handle_* as
     # aiohttp route handlers, and aiohttp warns ("bare functions are
@@ -92,12 +110,16 @@ def _build_real_gateway_app(g) -> web.Application:
     g.attach_coordinator(app, mock_coordinator)
     app.router.add_get("/health", g.handle_health)
     app.router.add_get("/pool/status", g.handle_pool_status)
+    if proxy is None:
+        proxy = g.AsyncHiveMindProxy()
+    app.router.add_post("/v1/embeddings", proxy.handle_encoder)
+    app.router.add_post("/v1/reranking", proxy.handle_encoder)
     return app
 
 
 def _build_proxy_with_known_routes(g, *, with_catchall: bool = False):
-    app = _build_real_gateway_app(g)
     proxy = g.AsyncHiveMindProxy()
+    app = _build_real_gateway_app(g, proxy)
     if with_catchall:
         # Deliberately the WORST-CASE order: the catch-all is already
         # registered when the snapshot is taken. set_known_routes() must be
@@ -187,15 +209,21 @@ class _CapturingSession:
 
 
 def test_v1_embeddings_still_dispatches_unchanged(monkeypatch):
-    """A non-framework path (ROUTING_MAP passthrough) must reach exactly the
-    same upstream-call attempt as before the guard existed — the guard is a
-    pure no-op here, guard field populated exactly as it is in production."""
+    """The encoder forward must reach exactly the same upstream-call attempt
+    as before the guard existed.
+
+    Re-pointed in the HYG round (R-A): /v1/embeddings is a REGISTERED route
+    with its own handler now, so the thing to prove is that the DEDICATED
+    handler still builds the same embedder URL — sending it through
+    handle_proxy would prove nothing about the route the gateway actually
+    serves. Registration itself is proved through a real router in
+    tests/test_gateway_edge_hygiene.py; this keeps the pin on the forward."""
     g = _fresh_gateway(monkeypatch)
     _, proxy = _build_proxy_with_known_routes(g)
     session = _CapturingSession()
     proxy.session = session
-    resp = asyncio.run(proxy.handle_proxy(_req("POST", "/v1/embeddings")))
-    assert session.captured is not None, "guard intercepted a non-framework path"
+    resp = asyncio.run(proxy.handle_encoder(_req("POST", "/v1/embeddings")))
+    assert session.captured is not None, "the encoder handler never dispatched"
     assert session.captured[1].startswith(g.EMBEDDER_URL)
     assert resp.status not in (404, 405)
 
@@ -250,7 +278,7 @@ def test_catchall_excluded_from_known_routes(monkeypatch):
     # still dispatches, and the guard still refuses what it should.
     session = _CapturingSession()
     proxy.session = session
-    asyncio.run(proxy.handle_proxy(_req("POST", "/v1/embeddings")))
+    asyncio.run(proxy.handle_encoder(_req("POST", "/v1/embeddings")))
     assert session.captured is not None
     resp = asyncio.run(proxy.handle_proxy(_req("GET", "/memory/save")))
     assert resp.status == 405 and resp.headers["Allow"] == "POST"
@@ -413,6 +441,12 @@ _REGISTERED_ROUTES = {
     ("POST", "/admin/backup"),
     ("GET",  "/health"),
     ("GET",  "/pool/status"),
+    # R-A (HYG round): the encoder paths stopped being a startswith() guess
+    # inside handle_proxy and became registered routes with their own handler.
+    # They appear here for the same reason every other route does — a surface
+    # a token can reach, and one aiohttp's router now owns exclusively.
+    ("POST", "/v1/embeddings"),
+    ("POST", "/v1/reranking"),
 }
 
 
