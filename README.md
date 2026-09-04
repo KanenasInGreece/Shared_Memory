@@ -103,7 +103,7 @@ turns saved facts into shared knowledge.
 
 > **The fast path — hand it to an agent.** Open your coding agent (Claude Code, Codex CLI,
 > Antigravity CLI, Grok, opencode …) at the repo root and say: *"Read `AGENTS.md` and set up the
-> framework."* Part 1 of [`AGENTS.md`](AGENTS.md) interviews you for the required choices — data
+> framework."* Phase 0 of [`AGENTS.md`](AGENTS.md) interviews you for the required choices — data
 > folders, model files, your reasoning-LLM address and port, if local, or the URL of your provider, if online LLM is used.
 > You decide which agents get tokens to use the framework— then the agent drives the same
 > steps 1–10 below for you: writing `.env` from the template, minting tokens,
@@ -133,7 +133,7 @@ daemons never run from a skill directory. Daemon and **schema** changes reach a 
 `git` on the gateway host — never through a skill download. The operations runbook lives in
 [`shared-memory/Documentation/server-setup.md`](shared-memory/Documentation/server-setup.md).
 Steps 1–4 and 6–8 below are operations (gateway host); steps 5 and 10 are usage (any agent);
-step 9 — the postflight verification — runs on the gateway host again, with any minted token.
+step 9 — the postflight verification — runs on the gateway host again, with any minted write-capable token.
 
 **Version contract:** client and gateway are decoupled and may drift, so compatibility is
 enforced by an `api_version` exchanged on `GET /health`. Run `memory_bridge.py doctor` to check
@@ -249,16 +249,16 @@ for an AMD card or a CPU-only host.
 ⚠ **`nvtop` counts only the GPU work it is allowed to see.** It reads each GPU-holding process's
 `/proc/<pid>/fdinfo`, and a container's processes run as root by default — so `nvtop` run as your
 user reports the vLLM encoders at 0% while the card is saturated (power draw 35 W idle to ~200 W
-under load). Measured: the same load reads 99% when `nvtop` runs as root. The dreaming daemons read
+under load). Measured: the same load reads 99% when `nvtop` runs as root. The gateway's GPU-busy telemetry reads
 that figure through `gpu_load.py`, so an inference server in a container on a gated card is
-invisible to them. Grant `nvtop` the capabilities its README prescribes
+invisible to it. Grant `nvtop` the capabilities its README prescribes
 (`setcap cap_dac_read_search,cap_sys_ptrace,cap_perfmon+ep "$(command -v nvtop)"` — all three;
 nvtop's own README names only `cap_perfmon`, which is not enough, because listing another user's
 `/proc/<pid>/fd` is a permission check that `cap_dac_read_search` satisfies), re-applied after every
 package update, and confirm with `nvtop -s` under load. Two things about the *gateway's* copy of that
 reading: a unit with `NoNewPrivileges=yes` makes the kernel ignore file capabilities on anything it
 spawns, and a `systemd --user` unit cannot grant them itself (`AmbientCapabilities=` fails with
-`218/CAPABILITIES` — measured). So under a hardened user unit the reading reaches the daemons only if
+`218/CAPABILITIES` — measured). So under a hardened user unit the reading reaches the gateway only if
 the containers run as the gateway's user (`--user`, plus the `render`/`video` groups), which is the
 cleaner fix in any case.
 
@@ -394,8 +394,8 @@ minutes, zero failures. On the 8 GB tier a 7–8B model is the practical pick. M
 graph quality — see
 [*GraphRAG's Hidden Cost*](https://www.linkedin.com/pulse/graphrags-hidden-cost-youre-always-paying-question-when-motsenigos-w81pc/).
 
-**Optional — [`nvtop`](https://github.com/Syllo/nvtop):** if installed, the dreaming daemons
-yield while your GPU is busy, so consolidation never competes with active inference. It only sees
+**Optional — [`nvtop`](https://github.com/Syllo/nvtop):** if installed, the gateway reports
+whether your GPU is busy on `/health` — a reading for you, not a gate the dreaming daemons wait on. It only sees
 GPU work from processes it may inspect: an inference server in a container (root by default) reads
 as idle unless `nvtop` carries `cap_dac_read_search,cap_sys_ptrace,cap_perfmon` or the container runs
 as your user.
@@ -445,14 +445,17 @@ idempotent and safe to re-run.
    stored forever** ([§19](#19-tokens-and-agents)). One distinct token per
    agent — never shared.
 
-7. **Start the reasoning LLM** on `:5000` — LM Studio or any OpenAI-compatible server
+7. **Start the reasoning LLM** on `:5000` — LM Studio or any OpenAI-compatible server — and
+   declare it in `LLM_BACKENDS_JSON` (step 1's installer offers `ops/install_llm_backends.sh` for
+   exactly this); an undeclared backend serves nothing
    ([§17](#17-inference-the-encoders-and-the-reasoning-llm)).
 
 8. **Start the gateway.**
    `uv run --with aiohttp --with asyncpg --with neo4j --with httpx --with json-repair python shared-memory/scripts/hive_mind_proxy.py 8888`
    — this also launches the REM and NREM daemons ([§18](#18-the-gateway)). Verify:
-   `curl http://localhost:8888/health` should report `"status":"ok"`, `"auth_required":true` and
-   `"embedder":"ok"` before you save anything. For a gateway that survives logout and reboot,
+   `curl http://localhost:8888/health` should report `"status":"ok"` before you save anything — once
+   tokens exist (step 6) the anonymous reply carries only `status`, `version` and `api_version`; the
+   fuller report needs a token, which step 9's postflight uses. For a gateway that survives logout and reboot,
    install the `systemd --user` unit in [`shared-memory/ops/`](shared-memory/ops/).
 
 9. **Verify the install.** Back on the gateway host:
@@ -489,8 +492,8 @@ Neo4j plugins, and the reranker dial, which is tuning after the install is prove
 |---|---|---|
 | **`preflight.sh` fails on "docker not found"** (Fedora, RHEL) | The distribution ships podman; the helper scripts call the docker CLI. | Install Docker Engine + Compose v2 from Docker's own instructions (§14); preflight names the packages. The `podman-docker` shim is a path we expect to work but have not run end to end. |
 | **The skill "works for me" but not for the agent** — it answers from memory or saves nothing, with no error | `uv` was installed the upstream way, so it lives in `$HOME/.local/bin` and is only on the PATH when your shell profile loads; an agent spawning a profile-free shell cannot see it. This is the normal outcome of a correct install, not a misconfiguration. | Symlink `uv` onto the system PATH (`sudo ln -s "$(command -v uv)" /usr/local/bin/uv`) or set PATH in that agent's own configuration. Preflight warns about exactly this. |
-| **Neo4j crash-loops: "/import is not accessible"** | The container steps down to uid 7474 and cannot write — or, on a modern Fedora, cannot even traverse a `0700` home directory to reach — its mounted dirs. | `install_framework.sh` chowns the four dirs and preflight verifies them; by hand: `sudo chown -R 7474:7474 $NEO4J_HOST_DIR/{data,logs,import,plugins}` (§14). |
-| **Neo4j crash-loops: "neo4j/… is invalid"** | The password contains `/` (base64 output does), which `NEO4J_AUTH=neo4j/<password>` cannot carry. | Generate hex (`openssl rand -hex 20`), update `.env`, recreate the container. The installer's prompts accept hex only and refuse an empty entry. |
+| **Neo4j crash-loops: "/import is not accessible"** | The container steps down to uid 7474 and cannot write — or, on a modern Fedora, cannot even traverse a `0700` home directory to reach — its mounted dirs. | `install_framework.sh` chowns `import` and `plugins` (the image fixes `data` and `logs` itself) and preflight verifies them; by hand: `sudo chown -R 7474:7474 $NEO4J_HOST_DIR/{data,logs,import,plugins}` (§14). |
+| **Neo4j crash-loops: "neo4j/… is invalid"** | The password contains `/` (base64 output does), which `NEO4J_AUTH=neo4j/<password>` cannot carry. | Generate hex (`openssl rand -hex 20`), update `.env`, recreate the container. The installer's prompts refuse a Neo4j password containing `/` and refuse an empty (or 8-character-or-shorter) entry. |
 | **Neo4j: "Invalid memory configuration — exceeds physical memory"** | Host RAM is below the shipped heap + pagecache (~8 GB is the no-override floor). | Set the small-host preset (`NEO4J_HEAP_INITIAL/MAX`, `NEO4J_PAGECACHE`) from `.env.example`; preflight's RAM check tells you which tier you are on. |
 | **Neo4j does not come up on first boot, no network** | `NEO4J_PLUGINS` fetches APOC and Graph Data Science at container start — first boot needs internet, and a crash-loop refetches on every retry. | Give the host a route out for the first start, or pre-place the plugin jars in `plugins/`. |
 | **401 Unauthorized** | `AGENT_TOKEN` missing from the agent's skill `.env`, or minted after the gateway last started — the registry is read at startup. A **re-minted** token is a third case: rotating an identity replaces its registered digest, so a client still holding the previous token now fails auth on **every** request, reads included, until it re-reads the file. | `doctor` names which side is at fault. Restart the gateway after minting (`bootstrap_tokens.sh` says so). A client reads its token once at startup, so after a re-mint make it re-read: respawn the memory **MCP server** — a full host restart, or disabling then re-enabling just that server where the host supports per-server reload (§19, §21) — or restart a long-running CLI agent; a one-shot CLI invocation already picks it up on its next run. |
@@ -598,7 +601,7 @@ why-to loop, and it is a query you should run before touching anything with hist
 
 ```bash
 memory_bridge.py query why-to-check --title "queue"
-# → the decision, its rating, the verdict's evidence — or "no retrospective yet"
+# → the decision, its rating, the verdict's notes — or an empty list if no retrospective exists yet
 ```
 
 ## 7. Fresh over stale: supersession
@@ -643,7 +646,7 @@ and it is rebuilt in place as the section grows or its facts retire.
 
 **Insight summaries — the causal chain.** Where decisions and their retrospectives cluster, the
 framework distils the chain: each decision's title verbatim with a line of its rationale, each
-verdict rendered under the decision it judged, and one closing paragraph naming the principle
+verdict rendered pointing at the decision it judged, and one closing paragraph naming the principle
 the chain demonstrates, with its limits. The structure is built by the system — record
 identities survive by construction; the language model is asked only to compress the reasoning
 and state the principle. An insight is the framework's highest claim — *these decisions, tested
@@ -723,7 +726,7 @@ versions?*
 > grounding link typed by role and marked operator-asserted or system-defaulted. Forward: dated
 > outcomes, and the facts that measured each. Facts carry their sources, and the source sets the
 > weight, so the strength of a chain is visible, not just its existence. Summaries and insights
-> list exactly the records they were built from, and one call walks the full lineage.
+> list exactly the records they were built from, and one call walks a record's lineage from save to fold.
 > *Open edges:* a source citation is free text, so page-level granularity is a convention; the
 > reverse index from a fact to every decision it later influenced is only as complete as the
 > grounding people recorded.
@@ -739,7 +742,7 @@ its evidence, and the fact that started it, none of which it witnessed. A month 
 retrospective lands: the queue held under load, *validated*, grounded in the load-test results.
 In idle time the framework folds the section's facts into its index card, and the tested chain
 into an insight stating the principle. A year later the constraint changes; a new decision
-supersedes the old; its retrospective marks the reversal; the insight retires and is rebuilt
+replaces the old; a retrospective marks the reversal; the insight retires and is rebuilt
 without the overturned claim — and every step of that history stays walkable, source by source,
 verdict by verdict.
 
@@ -802,7 +805,7 @@ verifies it; by hand it is
 
 ## 15. The stack: Docker Compose
 
-`shared-memory/ops/postgres_neo4j_limits.yaml` defines four services: **postgres** (pgvector, pinned
+`shared-memory/ops/postgres_neo4j_limits.yaml` defines six services, four of them on by default: **postgres** (pgvector, pinned
 `0.8.6-pg17`), **neo4j** (pinned `5.26.30-community`, with APOC + the required GDS plugin), and the two
 llama.cpp inference containers —
 **retriever-api** (BGE-M3 embedder, `:8070`) and **reranker-api** (BGE-Reranker-v2-m3, `:8071`).
@@ -1017,7 +1020,7 @@ smaller card, a big-context model on another machine, a paid cloud API kept for 
 local cards can't hold — each is useful, and each breaks the assumption that any backend can
 take any job. The `.env` lets you say so per backend, in `LLM_BACKENDS_JSON`:
 
-- **`roles`** — which dreaming functions this backend may serve (`extract`, `verify`,
+- **`roles`** — which dreaming functions this backend may serve (`extract`,
   `judge`). Leave it out and the backend serves nothing until you also declare
   `private_ok: true` — saying what a backend is for is now part of declaring it.
 - **`n_ctx`** — the model's usable context. Declared, it lets the gateway keep a job that
@@ -1053,7 +1056,7 @@ Three properties hold however you configure it:
 
 One consequence deserves its own sentence: a fleet whose *only* members are external
 providers with a full `roles` list is a fleet where the dreaming runs — and bills —
-externally. That is not a trap; it is exactly what listing all three roles asks for.
+externally. That is not a trap; it is exactly what listing both roles asks for.
 The knobs state your policy; they do not second-guess it.
 
 The authenticated `/health` payload counts tokens and request latency per backend (with a
@@ -1103,8 +1106,9 @@ watchdogs.
 ```bash
 uv run --with aiohttp --with asyncpg --with neo4j --with httpx --with json-repair \
   python shared-memory/scripts/hive_mind_proxy.py 8888
-curl http://localhost:8888/health
+curl -H "Authorization: Bearer $AGENT_TOKEN" http://localhost:8888/health
 # {"status":"ok","embedder":"ok","reranker":"ok","llm":"ok","daemon":"running","rem_daemon":"running","auth_required":true}
+# without a token, an auth-configured gateway answers only {"status","version","api_version"}
 ```
 
 Run it supervised: a terminal-launched gateway dies with the login session. The `systemd --user`
@@ -1144,7 +1148,7 @@ confines the companion dashboard to reading; a `backup:admin` token is confined 
 The dreaming daemons authenticate the same way — enrichment never claims ownership of the facts
 it enriches.
 
-Installing a client is copying two files into the agent's skills directory:
+Installing a client is copying the skill package (every file `MANIFEST.txt` lists) into the agent's skills directory:
 
 | Agent | Skill directory | Invocation |
 |---|---|---|
@@ -1175,7 +1179,7 @@ uv run --with httpx python ~/.claude/skills/shared-memory/scripts/memory_bridge.
 
 The complete client contract — every command, field, and refusal, with the reasoning behind each
 — is [`shared-memory/SKILL.md`](shared-memory/SKILL.md). Keep installed skills current with
-`update_skill.sh` (fetches fresh copies, never touches your `.env`).
+`update_skill.sh` (fetches fresh copies, never overwrites your `.env` — new keys are appended, existing ones left alone).
 
 ## 20. Remote clients
 
@@ -1195,18 +1199,21 @@ The identity is the token: the graph knows which machine contributed which fact.
 
 The MCP surface is the second front door to the same gateway: any MCP host can mount the memory
 this way, and the connector is client-deployable like the CLI skill — install a copy where the
-MCP host runs, give it a token and a route to the gateway. LM Studio and a coding agent
-(opencode, read-only role) are the examples we have exercised end to end, not defaults the
-surface assumes. The connector lives in the
+MCP host runs, give it a token and a route to the gateway. LM Studio, a coding agent
+(opencode, read-only role) and GitHub Copilot in VS Code (read-only, both of its config
+surfaces) are the examples we have exercised end to end, not defaults the surface assumes. The
+connector lives in the
 [`mcp/`](mcp/) folder — server, system prompt and config template together, with its own
 [`mcp/README.md`](mcp/README.md) covering what it exposes, how it deploys and how it
-authenticates.
+authenticates. The Copilot walkthrough — two config files with different keys, where the token
+lives on each, and the one trap that cost us the first run — has its own page:
+[`Documentation/vscode-copilot-mcp.md`](shared-memory/Documentation/vscode-copilot-mcp.md).
 
 Coding agents that speak MCP — opencode is the one running here — mount the same connector
 without any `mcp.json`: register it as a local MCP server in the agent's own config, and keep
 the token out of that config entirely by pointing `VECTOR_SKILL_ENV` at a client-only `.env`
 that holds nothing but this agent's `AGENT_TOKEN`. Mint that token with the additive path
-(`bootstrap_tokens.sh --add <name> --install-path <dir>/.env`, `--role read` if the agent
+(`bootstrap_tokens.sh --add <name> --mcp --install-path <dir>/.env`, `--role read` if the agent
 should only ever search) and the file lands at mode 600 without the value passing through
 anyone's hands. The shape, in opencode's `opencode.jsonc`:
 
@@ -1224,10 +1231,12 @@ anyone's hands. The shape, in opencode's `opencode.jsonc`:
 }
 ```
 
-Give the agent the search-first conduct from [`mcp/system-prompt.md`](mcp/system-prompt.md) in
-whatever instruction file it reads — that file is the MCP counterpart of the CLI skill's
-constitution snippet, and the tool names it teaches (`hybrid_search_and_rerank`,
-`graph_query`) are exactly what the server exposes.
+Give the agent the search-first conduct from
+[`mcp/CONSTITUTION_SNIPPET_MCP.md`](mcp/CONSTITUTION_SNIPPET_MCP.md) in whatever instruction
+file it reads — that file is the MCP counterpart of the CLI skill's constitution snippet
+(`mcp/system-prompt.md` carries the same rules for an LLM server configured by a system
+prompt), and the tool names it teaches (`hybrid_search_and_rerank`, `graph_query`) are exactly
+what the server exposes.
 
 Register `mcp/vector-skill.py` in `mcp.json` with the coordinator URL and the `lm_studio` token in
 the `env` block — the token is not optional; without it every call 401s. Restart LM Studio
@@ -1246,8 +1255,8 @@ Do **not** register a direct database MCP server alongside it — for either sto
 SQL connection bypasses read authorization, locking, atomicity and deduplication; it can read
 every private record and write rows invisible to search. `rag-orchestrator` already covers
 retrieval and writes through the authorized path; a database MCP adds no capability, only an
-unguarded route to the same data. Web search is a pluggable second MCP slot (Tavily and Brave
-examples ship in `mcp/mcp.json`).
+unguarded route to the same data. Web search is a pluggable second MCP slot (a Tavily
+example ships in `mcp/mcp.json`).
 
 ## 22. Backups and restore
 
@@ -1265,7 +1274,7 @@ bash shared-memory/ops/restore.sh             # ground-up restore (bring stores 
 
 Schedule it with cron or the shipped `systemd --user` timer. The admin token it needs is
 confined to `/admin/*` — it cannot read or write memory. Policy — schedule, retention,
-destination, encryption — is yours, set in `.env`.
+destination, encryption — is yours; retention and destination are set in `.env`.
 
 ## 23. Testing
 
@@ -1349,7 +1358,7 @@ statement, not a permanent one.
 ## 26. Direction
 
 Proof-of-possession authentication · durable audit · ingestion sanitisation and a counterfactual
-check before synthesis commits · the curated entity gate · retrieval-quality measurement.
+check before synthesis commits · retrieval-quality measurement.
 History lives in the [CHANGELOG](CHANGELOG.md), not here.
 
 ## 27. References
