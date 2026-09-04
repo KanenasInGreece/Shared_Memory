@@ -1,6 +1,6 @@
 [Unit]
 Description=Shared Memory Hive-Mind Gateway (coordinator + consolidation + REM daemons)
-Documentation=https://github.com/YOUR_GITHUB_USER/shared-memory
+Documentation=https://github.com/KanenasInGreece/Shared_Memory
 # Best-effort ordering: the coordinator itself waits up to PG_STARTUP_WAIT_S
 # (default 60s, .env-overridable) for Postgres to start accepting connections
 # before giving up and exiting, so a boot-order race becomes a bounded retry
@@ -39,6 +39,16 @@ UMask=0077
 # refuses to gain any it does not already have.
 NoNewPrivileges=yes
 
+# S16 (HYG round) — LimitCORE=0: a crash (SIGABRT, a segfault, or the SIGABRT
+# Fedora's 10-timeout-abort.conf drop-in raises when a stop runs past its
+# timeout) must never write a core dump — a core file holds every secret this
+# process loaded from shared-memory/.env (PG_PASSWORD, NEO4J_PASSWORD, any
+# LLM_BACKENDS_JSON API key) in plaintext. This unit had inherited
+# LimitCORE=infinity; 231 such dumps had accumulated on this workstation
+# before the retention policy vacuumed them. See ops/README.md's "Hardening"
+# section for the temporary, deliberate lift used to diagnose a native crash.
+LimitCORE=0
+
 # ProtectHome (read-only or tmpfs) was evaluated and left OUT: WorkingDirectory
 # is a checkout under $HOME (deployer-chosen path, so it cannot be named as a
 # ReadWritePaths= exception here), and the audit/REM/telemetry logs default to
@@ -46,6 +56,16 @@ NoNewPrivileges=yes
 # ProtectHome=read-only would make the log directory unwritable; ProtectHome=yes
 # hides $HOME entirely and would break WorkingDirectory itself. Revisit if a
 # future release moves state to a fixed, non-$HOME path this unit can pin.
+#
+# ProtectSystem=full (HYG round, ruling applied): the default AF_UNIX
+# listener path (_default_uds_path() in hive_mind_proxy.py) is
+# $XDG_RUNTIME_DIR/shared-memory-gw.sock, falling back to /tmp when
+# XDG_RUNTIME_DIR is unset — neither is under %h, but `full` only makes
+# /usr, /boot, /efi and /etc read-only; it never touches /tmp, /run or
+# $XDG_RUNTIME_DIR, so this write is unaffected either way. `strict` stays
+# FORBIDDEN — it would make %h itself read-only. See S2_eps_HANDOFF.md §5/§9
+# for the write-path-outside-%h observation this directive does not resolve.
+ProtectSystem=full
 
 # LoadCredential= example (SEC-06, PR A4; corrected fix round 1, R3, Opus
 # review, verified against `man systemd.exec` and `systemd-path` on the
