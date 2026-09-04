@@ -1659,6 +1659,35 @@ def _safe_agent_name(request) -> "str | None":
         return None
 
 
+# QA-1 (HYG round, fix round): the marker a credential-audit line carries in
+# place of a query string. The MARKER, never the value — `?key=…` is a real
+# provider idiom, so the very thing that makes a query worth denying is the
+# thing that must not be written into a log an operator (or a future reader of
+# this repo's audit trail) will page through.
+QUERY_REDACTED_MARKER = "?<query-redacted>"
+
+
+def _audited_route_spelling(rel_url) -> str:
+    """The request target as the credential-audit line must record it: the RAW
+    path, plus a marker when a query string was present.
+
+    QA-1. Both credentialed gates (R-4 pre-dispatch, S-04 post-selection) deny
+    on `rel_url.raw_path` and on the mere PRESENCE of a query, so the audit
+    line has to carry those same two facts or it cannot explain the refusal it
+    is recording. `request.path` — what both sites passed before — is
+    percent-DECODED, which made a `/v1/chat/completio%6es` denial read as
+    `path=/v1/chat/completions`, i.e. the ALLOWED route, and made a query
+    denial indistinguishable from a plain-path one. An operator reading the log
+    could not tell why the framework's own endpoint had been refused.
+
+    ⛔ The query VALUE is never returned. The marker says a query was there and
+    nothing else about it."""
+    spelling = rel_url.raw_path
+    if rel_url.query_string:
+        spelling += QUERY_REDACTED_MARKER
+    return spelling
+
+
 def _safe_resolve_identity(request) -> "str | None":
     """resolve_identity(), tolerant of a lightweight/missing request double
     — handle_health/handle_pool_status are unit-tested by calling the
@@ -2137,13 +2166,30 @@ class AsyncHiveMindProxy:
         # uncredentialed one, and the post-selection S-04 check below
         # still guards the credentialed choice.
         #
-        # R-B (HYG round): THE GATE COMPARES THE RAW REQUEST-TARGET PATH — the
-        # exact string `_upstream_url` puts on the wire. `request.path` is
+        # R-B (HYG round): THE GATE COMPARES THE RAW REQUEST-TARGET PATH —
+        # `rel_url.raw_path`, the path as it arrived on the wire, tolerating
+        # only TRAILING SLASHES via the `rstrip` below. `request.path` is
         # percent-DECODED, so `/v1%2fchat/completions` and
         # `/v1/chat/completio%6es` both READ as the allowed route here while
         # something else entirely was signed and sent to the provider: the
         # check and the forward were looking at different strings, which is
         # security fix A1's shape on the credentialed path.
+        #
+        # ⚠ COMPARED IS NOT IDENTICAL TO FORWARDED, and the gap is named
+        # (QA-3/ADV-1, HYG review round). `_upstream_url` forwards
+        # `str(rel_url)`; this gate compares the request-target PATH. Two known
+        # differences, neither a provider-visible bypass:
+        #   · a TRAILING SLASH — `/v1/chat/completions/` is rstrip-normalised
+        #     here and forwarded WITH its slash. That is the security sweep's
+        #     known-remaining residue, and it is bounded: the host comes from
+        #     config, only trailing slashes are tolerated, no traversal or
+        #     encoded segment survives the compare. Dropping the `rstrip` (so
+        #     the compared form IS the forwarded form) is a PARKED OPERATOR
+        #     RULING — ⛔ do not remove it on your own initiative.
+        #   · a FRAGMENT — never on an HTTP request-target at all, so a
+        #     conforming client cannot express one; yarl drops it from
+        #     `raw_path_qs`.
+        # The QUERY is not in that gap: it is denied outright, below.
         #
         # ⛔ NOT `path_safe`. That is the ROUTER-matched form, and yarl decodes
         # every escape in it except %2F and %25 (measured, and its own
@@ -2169,7 +2215,8 @@ class AsyncHiveMindProxy:
              or request.rel_url.query_string)
                 and all(LLM_BACKEND_TOKENS.get(b) is not None for b in eligible_pre)):
             record_credentialed_route_denied(
-                eligible_pre[0], request.method, request.path,
+                eligible_pre[0], request.method,
+                _audited_route_spelling(request.rel_url),  # QA-1: RAW path + query marker
                 agent_name=_safe_agent_name(request),
                 request_id=_safe_request_id(request),
             )
@@ -2304,6 +2351,9 @@ class AsyncHiveMindProxy:
                 # R-B (HYG round): the RAW request-target path, and a query
                 # denies — same rule and same reasons as the R-4 pre-dispatch
                 # gate above (⛔ `raw_path`, never `path_safe`: see there).
+                # The compared-vs-forwarded gap (trailing slashes tolerated by
+                # the rstrip; a fragment never on the wire) is named there too
+                # (QA-3/ADV-1) — dropping the rstrip is a PARKED operator ruling.
                 # This gate is the one that fires when the eligible set was
                 # MIXED, so R-4's `all(...)` was false and selection
                 # nevertheless landed on the credentialed member; each gate
@@ -2312,7 +2362,8 @@ class AsyncHiveMindProxy:
                 if (route not in CREDENTIALED_BACKEND_ALLOWED_ROUTES
                         or request.rel_url.query_string):
                     record_credentialed_route_denied(
-                        llm_backend, request.method, request.path,
+                        llm_backend, request.method,
+                        _audited_route_spelling(request.rel_url),  # QA-1: RAW path + query marker
                         agent_name=_safe_agent_name(request),
                         request_id=_safe_request_id(request),
                     )

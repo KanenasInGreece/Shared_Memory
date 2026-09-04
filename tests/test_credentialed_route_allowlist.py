@@ -63,8 +63,8 @@ def _req(method: str, raw: str):
     percent-encoding and query string included.
 
     T-1 (HYG round): `rel_url` is a REAL `yarl.URL(raw, encoded=True)`, because
-    both gates now read `rel_url.path_safe` and `rel_url.query_string` — the
-    values that are actually forwarded. `path` is the URL's DECODED `.path`,
+    both gates now read `rel_url.raw_path` (ruling 2 — the request-target
+    path as it arrived on the wire) and `rel_url.query_string`. `path` is the URL's DECODED `.path`,
     which is what production gives it, so it NEVER contains '?': a stub that
     put the query in `path` would produce a 403 that looks like the R-B query
     denial but is really an allowlist miss on a path no caller ever sends
@@ -357,6 +357,77 @@ def test_an_uncredentialed_backend_still_accepts_a_query(monkeypatch):
     resp = asyncio.run(proxy.handle_proxy(_req("POST", "/v1/chat/completions?x=y")))
     assert resp.status != 403
     assert session.captured_headers is not None
+
+
+# ── QA-1 (HYG fix round): the audit line must explain the denial it records ──
+#
+# Both gates deny on the RAW spelling and on the presence of a query, so the
+# credential-audit line has to carry those same two facts. Before the fix both
+# sites passed the DECODED `request.path`: a `%6e` denial was audited as
+# `path=/v1/chat/completions` — the ALLOWED route — and a query denial was
+# indistinguishable from a plain one. The query VALUE is never written (a
+# `?key=…` query is a provider idiom); only the marker is.
+
+def _audit_lines(log_path):
+    import coordinator
+    asyncio.run(coordinator._credential_audit_writer.flush())
+    return log_path.read_text()
+
+
+def _reload_for_audit(monkeypatch, tmp_path):
+    log_path = tmp_path / "credential-audit.jsonl"
+    monkeypatch.setenv("CREDENTIAL_AUDIT_LOG_PATH", str(log_path))
+    import coordinator
+    importlib.reload(coordinator)
+    return log_path
+
+
+@pytest.mark.parametrize("spelling,must_contain,must_not_contain", [
+    ("/v1/chat/completio%6es", "completio%6es", '"path":"/v1/chat/completions"'),
+    ("/v1/chat/completions?x=y", "?<query-redacted>", "x=y"),
+])
+def test_r4_audit_line_carries_the_raw_spelling_never_the_decoded_route_or_the_query_value(
+        monkeypatch, tmp_path, spelling, must_contain, must_not_contain):
+    log_path = _reload_for_audit(monkeypatch, tmp_path)
+    g = _load_credentialed_gateway(monkeypatch)
+    _forbid_selection(monkeypatch, g)
+    proxy = g.AsyncHiveMindProxy()
+    proxy.session = _MustNotCallSession()
+    resp = asyncio.run(proxy.handle_proxy(_req("POST", spelling)))
+    assert resp.status == 403
+    content = _audit_lines(log_path)
+    assert '"event":"credentialed_route_denied"' in content
+    assert must_contain in content, content
+    assert must_not_contain not in content, content
+    assert "sk-allowlist-test" not in content
+
+
+@pytest.mark.parametrize("spelling,must_contain,must_not_contain", [
+    ("/v1/chat/completio%6es", "completio%6es", '"path":"/v1/chat/completions"'),
+    ("/v1/chat/completions?x=y", "?<query-redacted>", "x=y"),
+])
+def test_s04_audit_line_carries_the_raw_spelling_never_the_decoded_route_or_the_query_value(
+        monkeypatch, tmp_path, spelling, must_contain, must_not_contain):
+    log_path = _reload_for_audit(monkeypatch, tmp_path)
+    g = _load_mixed_fleet(monkeypatch)
+    proxy = g.AsyncHiveMindProxy()
+    proxy.session = _MustNotCallSession()
+    resp = asyncio.run(proxy.handle_proxy(_req("POST", spelling)))
+    assert resp.status == 403
+    content = _audit_lines(log_path)
+    assert '"event":"credentialed_route_denied"' in content
+    assert must_contain in content, content
+    assert must_not_contain not in content, content
+    assert "sk-allowlist-test" not in content
+
+
+def test_audited_route_spelling_is_pure_and_never_carries_the_query_value():
+    """The helper on its own, as VALUES (fact:1309)."""
+    import hive_mind_proxy as g
+    assert g._audited_route_spelling(URL("/v1/chat/completions", encoded=True)) == "/v1/chat/completions"
+    assert g._audited_route_spelling(URL("/v1/chat/completio%6es", encoded=True)) == "/v1/chat/completio%6es"
+    assert g._audited_route_spelling(URL("/v1/chat/completions?key=SECRET", encoded=True)) == "/v1/chat/completions?<query-redacted>"
+    assert g._audited_route_spelling(URL("/v1/chat/completions?", encoded=True)) == "/v1/chat/completions"
 
 
 # ── Mutation check target ────────────────────────────────────────────────────

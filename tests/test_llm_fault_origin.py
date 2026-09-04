@@ -47,7 +47,7 @@ class _FakeReq:
     method = "POST"
     path = "/v1/chat/completions"        # the catch-all -> the LLM pool branch
     # T-1 (HYG round): a REAL yarl.URL — the credentialed-route gates read
-    # rel_url.path_safe / .query_string, the values actually forwarded.
+    # rel_url.raw_path / .query_string (ruling 2: the wire path, not path_safe).
     rel_url = URL("/v1/chat/completions", encoded=True)
     headers = {}
     can_read_body = True

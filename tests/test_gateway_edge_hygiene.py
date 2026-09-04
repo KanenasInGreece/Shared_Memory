@@ -539,7 +539,11 @@ def test_health_reports_the_gateways_own_server_header(monkeypatch):
     """/health is unauthenticated on the shipped default, and it used to
     answer `Python/3.14 aiohttp/3.14.3` — a free version-disclosure to any
     anonymous caller. aiohttp 3.14.3 has no `server_header` parameter
-    (measured), so the single mechanism is an on_response_prepare handler."""
+    (measured), so the single mechanism is an on_response_prepare handler.
+
+    ⚠ The `AsyncMock` coordinator answers this /health with a 500 (QA-7) —
+    the HEADER is what is under test here, and proving it on an error response
+    is the useful half: the stamp must not depend on the handler succeeding."""
     c, g = _load_gateway(monkeypatch)
     proxy = g.AsyncHiveMindProxy()
     app = _build_app_like_main(c, g, proxy)
@@ -548,13 +552,76 @@ def test_health_reports_the_gateways_own_server_header(monkeypatch):
         f"got Server={headers.get('Server')!r} on /health")
 
 
-def test_a_proxied_response_does_not_relay_the_upstream_server_header(monkeypatch):
-    """The other half: a refusal and a relayed response must carry the same
-    identity, or the header itself tells a caller which path answered."""
+def test_a_gateway_refusal_carries_the_gateway_server_header(monkeypatch):
+    """A refusal (405 from the guard) carries the same identity as a relayed
+    response — the header must not tell a caller which path answered. The
+    RELAY half is the next test; this one is only the refusal."""
     (status, headers, _), _ = _probe_with(
         monkeypatch, _MustNotCallSession(), "GET", "/v1/embeddings")
     assert status == 405
     assert headers.get("Server") == "shared-memory-gateway"
+
+
+class _RelayChunks:
+    def __init__(self, body):
+        self._body = body
+
+    async def iter_any(self):
+        yield self._body
+
+
+class _RelayResp:
+    def __init__(self, status, headers, body):
+        self.status = status
+        self.headers = headers
+        self.content = _RelayChunks(body)
+
+
+class _RelayCM:
+    def __init__(self, resp):
+        self._resp = resp
+
+    async def __aenter__(self):
+        return self._resp
+
+    async def __aexit__(self, *a):
+        return False
+
+
+class _RelayUpstreamSession:
+    """A REAL relay: `.request()` returns an async context manager yielding an
+    upstream response with status, headers and a streamable body — the surface
+    `_forward_upstream` actually consumes (`status`, `headers.get`,
+    `content.iter_any()`). Unlike `_CapturingSession` this lets the proxy build
+    and `prepare()` its `StreamResponse`, which is the only way the
+    response-direction header filtering and the `on_response_prepare` stamp
+    are ever exercised (QA-2 / SEC-1: the previous test named a proxied
+    response and probed a 405)."""
+    closed = False
+
+    def __init__(self, headers, body=b'{"ok": true}', status=200):
+        self._headers, self._body, self._status = headers, body, status
+
+    def request(self, *a, **kw):
+        return _RelayCM(_RelayResp(self._status, dict(self._headers), self._body))
+
+
+def test_a_relayed_upstream_response_carries_the_gateway_server_and_no_set_cookie(monkeypatch):
+    """QA-2 + SEC-1, pinned on the RELAY path. The upstream announces itself
+    as `llama.cpp` and tries to plant a cookie; the client must see neither."""
+    session = _RelayUpstreamSession({
+        "Server": "llama.cpp",
+        "Set-Cookie": "sid=planted",
+        "Content-Type": "application/json",
+    })
+    (status, headers, body), _ = _probe_with(monkeypatch, session, "POST", "/v1/embeddings")
+    assert status == 200, (status, body)
+    assert body == b'{"ok": true}'
+    lowered = {k.lower(): v for k, v in headers.items()}
+    assert lowered.get("server") == "shared-memory-gateway", headers
+    assert "set-cookie" not in lowered, headers
+    assert "llama.cpp" not in " ".join(f"{k}={v}" for k, v in headers.items())
+    assert lowered.get("content-type") == "application/json"
 
 
 def test_main_registers_the_server_header_handler(monkeypatch):

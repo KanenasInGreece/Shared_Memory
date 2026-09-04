@@ -62,7 +62,7 @@ def _req(method: str, path: str, headers: dict | None = None, body: bytes = b"")
     _forward_upstream, which the guard's no-op tests exercise.
 
     T-1 (HYG round): `rel_url` is a REAL `yarl.URL`, not a string. The
-    credentialed-route gates read `rel_url.path_safe` and `rel_url
+    credentialed-route gates read `rel_url.raw_path` (ruling 2) and `rel_url
     .query_string` — the values that are actually forwarded — so a string
     stub would AttributeError, and a stub whose `.path` carried a query
     string would make a false 403 that looks like a query denial but is
