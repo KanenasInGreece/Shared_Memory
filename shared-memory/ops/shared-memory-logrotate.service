@@ -15,3 +15,17 @@ ExecStart=/usr/bin/logrotate --state %h/.shared-memory/logrotate.state %h/.confi
 # that mode is decided. ProtectHome is not evaluated here — logrotate's whole
 # job is writing under $HOME (%h), so it is obviously incompatible.
 NoNewPrivileges=yes
+
+# S16 (HYG round) — LimitCORE=0: same reasoning as hive-mind-gateway.service.
+# logrotate itself loads no framework secret, but the directive is applied
+# unconditionally across all three units as defense in depth. See
+# ops/README.md's "Hardening" section for the temporary lift procedure.
+LimitCORE=0
+
+# ProtectSystem=full (HYG round): every write path of THIS unit is confirmed
+# under %h — the --state file (%h/.shared-memory/logrotate.state above), the
+# rotated files themselves (%h/.shared-memory/logs/*-audit.jsonl, per
+# shared-memory.logrotate's __SM_LOG_DIR__ substitution), and their .gz
+# siblings logrotate's own `compress` writes alongside them. /usr, /boot and
+# /etc are read-only for this unit from here on.
+ProtectSystem=full
