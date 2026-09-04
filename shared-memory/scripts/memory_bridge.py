@@ -173,6 +173,22 @@ def _strip_export_prefix(key: str) -> str:
     return s
 
 
+def _strip_balanced_quotes(value: str) -> str:
+    """S16g (HYG round, R-G'): a `.env` VALUE wrapped in ONE balanced pair of
+    surrounding quotes — `"v"` or `'v'` — has that pair stripped; everything
+    else (an unbalanced leading quote with no matching trailing one, a bare
+    quote embedded in the value, mismatched quote characters, or no quotes
+    at all) is kept VERBATIM. Same rule, independently duplicated in
+    secure_env.py and mcp/vector-skill.py's manual fallback parsers — none of
+    the three may import from another (Group 1: the client/server surface
+    split). Applies only to the MANUAL fallback parser below; the
+    dotenv_values() path above (used when python-dotenv is installed)
+    applies that library's own quote handling instead."""
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in ('"', "'"):
+        return value[1:-1]
+    return value
+
+
 def _is_client_secret_key(name: str) -> bool:
     """True if `name` must never be exported into this client's own
     os.environ (mirrors secure_env.is_secret_key(), narrowed to what this
@@ -246,7 +262,7 @@ except ImportError:
                     # diversion nor _is_client_secret_key's exact-name list,
                     # exporting the registry straight into os.environ.
                     _k = _strip_export_prefix(_k).strip()
-                    _v = _v.strip()
+                    _v = _strip_balanced_quotes(_v.strip())
                     if not _k:
                         continue
                     # D.3: key_norm computed ONCE, used for BOTH checks —
@@ -1967,7 +1983,7 @@ def _build_query(template: str, args) -> str:
 async def main() -> None:
     if len(sys.argv) < 2:
         print(json.dumps({
-            "error": "Usage: python memory_bridge.py [--version|doctor|status|graph|query|search|save|save_decision|save_retrospective] ..."
+            "error": "Usage: python memory_bridge.py [--version|doctor|status|graph|query|search|save|save_decision|save_retrospective|lineage|supersede|review-hold] ..."
         }))
         sys.exit(1)
 
@@ -2277,7 +2293,7 @@ async def main() -> None:
             indent=2,
         ))
     else:
-        print(json.dumps({"error": f"Unknown action: {action}. Use graph|query|search|save|save_decision|save_retrospective"}))
+        print(json.dumps({"error": f"Unknown action: {action}. Use --version|doctor|status|graph|query|search|save|save_decision|save_retrospective|lineage|supersede|review-hold"}))
 
 
 if __name__ == "__main__":

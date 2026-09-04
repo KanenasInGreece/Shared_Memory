@@ -240,6 +240,24 @@ def _strip_export_prefix(key: str) -> str:
     return s
 
 
+def _strip_balanced_quotes(value: str) -> str:
+    """S16g (HYG round, R-G'): a `.env` VALUE wrapped in ONE balanced pair of
+    surrounding quotes — `"v"` or `'v'` — has that pair stripped; everything
+    else (an unbalanced leading quote with no matching trailing one, a bare
+    quote embedded in the value, mismatched quote characters, or no quotes
+    at all) is kept VERBATIM. Applied identically here, in memory_bridge.py's
+    manual fallback parser, and in mcp/vector-skill.py's manual fallback
+    parser — three independent copies of the same rule, since none of the
+    three may import from another (Group 1: the client/server surface
+    split). Does NOT apply to _read_secret_file()'s `<KEY>_FILE` /
+    $CREDENTIALS_DIRECTORY path (~line 460 above) — that reads a mounted
+    secret FILE, not a `.env` line, and strips only trailing CR/LF, never
+    quotes or spaces; a recorded inconsistency, not fixed by this round."""
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in ('"', "'"):
+        return value[1:-1]
+    return value
+
+
 def is_secret_key(name: str) -> bool:
     """True if `name` must never be exported to os.environ or forwarded into
     a child process environment — the known-config allowlist (checked first,
@@ -839,7 +857,16 @@ def load_split_env() -> None:
             key = _strip_export_prefix(key).strip()
             if not key:
                 continue
-            raw_pairs.append((key, val.strip()))
+            val = val.strip()
+            unquoted_val = _strip_balanced_quotes(val)
+            if unquoted_val != val:
+                print(
+                    f"[secure_env] NOTE: {key}'s value in {env_path} was "
+                    f"wrapped in a balanced surrounding quote pair — the "
+                    f"pair is stripped; the value is used without it.",
+                    file=sys.stderr,
+                )
+            raw_pairs.append((key, unquoted_val))
 
     # F6: collapse to canonical keys ONCE, before anything else reads
     # `file_values` — deterministically LAST-DEFINITION-WINS (file order),
