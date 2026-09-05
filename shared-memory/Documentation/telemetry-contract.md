@@ -178,6 +178,11 @@ Each key below was moved to a new home and served from both places while consume
 | `GET /health` | `project_identity.unidentified` | `telemetry:axes.project_identity.unidentified` |
 | `GET /health` | `project_identity.unregistered` | `telemetry:axes.project_identity.unregistered` |
 | `GET /health` | `rem_daemon` | `health:rem_daemon_process` |
+
+### Dropped in 0.9.91
+
+| endpoint | old key | read instead |
+|---|---|---|
 | `GET /memory/telemetry` | `axis_registry_read_failures_total` | `telemetry:registry.read_failures_total` |
 | `GET /memory/telemetry` | `llm_faults` | `telemetry:llm.faults` |
 | `GET /memory/telemetry` | `llm_faults.*.gateway.count` | `telemetry:llm.faults.*.gateway.count` |
@@ -551,9 +556,9 @@ The envelope is `{"status": "success", "telemetry": {…}}`; paths below are rel
 | `outbox.oldest_pending_age_s` | int/null | _s | 0.9.74 | — | — | `health.warning.outbox_oldest_pending_age_s` | — |
 | `outbox.pending` | int | — | 0.9.74 | — | — | — | — |
 | `outbox.rem_reviewed` | int | — | 0.9.74 | — | — | — | — |
-| `postgres.outbox` | dict | — | <=0.9.73 | `telemetry:outbox` | 0.9.90 | — | emitted as an empty dict when the outbox is empty |
-| `postgres.outbox.*` | int | — | <=0.9.73 | `telemetry:outbox` | 0.9.90 | — | the status census; a status with zero rows was OMITTED, which is why it moved |
-| `postgres.outbox_failed_oldest_age_seconds` | int/null | _seconds | <=0.9.73 | `telemetry:outbox.oldest_failed_age_s` | 0.9.90 | — | — |
+| `postgres.outbox` | dict | — | <=0.9.73 | `telemetry:outbox` | 0.9.91 | — | emitted as an empty dict when the outbox is empty |
+| `postgres.outbox.*` | int | — | <=0.9.73 | `telemetry:outbox` | 0.9.91 | — | the status census; a status with zero rows was OMITTED, which is why it moved |
+| `postgres.outbox_failed_oldest_age_seconds` | int/null | _seconds | <=0.9.73 | `telemetry:outbox.oldest_failed_age_s` | 0.9.91 | — | — |
 
 ### postgres
 
@@ -655,11 +660,11 @@ The envelope is `{"status": "success", "telemetry": {…}}`; paths below are rel
 | `llm.token_usage.*.tokens_completion_total` | int | _total | 0.9.74 | — | — | — | — |
 | `llm.token_usage.*.tokens_last_ts` | str/null | — | 0.9.74 | — | — | — | — |
 | `llm.token_usage.*.tokens_prompt_total` | int | _total | 0.9.74 | — | — | — | — |
-| `llm_faults` | dict | — | <=0.9.73 | `telemetry:llm.faults` | 0.9.90 | — | empty until a fault occurs |
-| `llm_faults.*.gateway.count` | int | — | <=0.9.73 | `telemetry:llm.faults.*.gateway.count` | 0.9.90 | — | — |
-| `llm_faults.*.gateway.last` | str/null | — | <=0.9.73 | `telemetry:llm.faults.*.gateway.last` | 0.9.90 | — | — |
-| `llm_faults.*.llm.transient.count` | int | — | <=0.9.73 | `telemetry:llm.faults.*.llm.transient.count` | 0.9.90 | — | — |
-| `llm_faults.*.llm.transient.last` | str/null | — | <=0.9.73 | `telemetry:llm.faults.*.llm.transient.last` | 0.9.90 | — | — |
+| `llm_faults` | dict | — | <=0.9.73 | `telemetry:llm.faults` | 0.9.91 | — | empty until a fault occurs |
+| `llm_faults.*.gateway.count` | int | — | <=0.9.73 | `telemetry:llm.faults.*.gateway.count` | 0.9.91 | — | — |
+| `llm_faults.*.gateway.last` | str/null | — | <=0.9.73 | `telemetry:llm.faults.*.gateway.last` | 0.9.91 | — | — |
+| `llm_faults.*.llm.transient.count` | int | — | <=0.9.73 | `telemetry:llm.faults.*.llm.transient.count` | 0.9.91 | — | — |
+| `llm_faults.*.llm.transient.last` | str/null | — | <=0.9.73 | `telemetry:llm.faults.*.llm.transient.last` | 0.9.91 | — | — |
 
 ### rem
 
@@ -682,11 +687,11 @@ The envelope is `{"status": "success", "telemetry": {…}}`; paths below are rel
 | `latency.rem_ms.note` | str | — | <=0.9.73 | — | — | — | — |
 | `neo4j.decisions_rem_pending` | int | — | <=0.9.73 | — | — | — | — |
 | `neo4j.facts_rem_pending` | int | — | <=0.9.73 | — | — | — | — |
-| `neo4j.rem_dead_lettered` | int | — | <=0.9.73 | `telemetry:rem.dead_lettered` | 0.9.90 | — | — |
-| `neo4j.rem_failing` | int | — | <=0.9.73 | `telemetry:rem.failing` | 0.9.90 | — | — |
-| `neo4j.rem_max_attempts` | int | — | <=0.9.73 | `telemetry:rem.max_attempts` | 0.9.90 | — | — |
-| `neo4j.rem_passed_over_total` | int | _total | <=0.9.73 | `telemetry:rem.passed_over` | 0.9.90 | — | — |
-| `neo4j.rem_starved_pending` | int | — | <=0.9.73 | `telemetry:rem.starved_pending` | 0.9.90 | — | — |
+| `neo4j.rem_dead_lettered` | int | — | <=0.9.73 | `telemetry:rem.dead_lettered` | 0.9.91 | — | — |
+| `neo4j.rem_failing` | int | — | <=0.9.73 | `telemetry:rem.failing` | 0.9.91 | — | — |
+| `neo4j.rem_max_attempts` | int | — | <=0.9.73 | `telemetry:rem.max_attempts` | 0.9.91 | — | — |
+| `neo4j.rem_passed_over_total` | int | _total | <=0.9.73 | `telemetry:rem.passed_over` | 0.9.91 | — | — |
+| `neo4j.rem_starved_pending` | int | — | <=0.9.73 | `telemetry:rem.starved_pending` | 0.9.91 | — | — |
 | `rem.dead_lettered` | int | — | 0.9.74 | — | — | `health.rem_daemon` | — |
 | `rem.degeneration_firings` | int/null | — | 0.9.74 | — | — | — | ⚠ ALWAYS NULL AT 0.9.74, and null is the honest value. REM runs in a SEPARATE PROCESS (rem_loop.py); its anti-degeneration detector writes a log line and nothing durable, so the gateway cannot see it. Reporting 0 would claim it never fired. A durable counter is owed. |
 | `rem.error` | str | — | 0.9.74 | — | — | — | present only when this section's own query failed |
@@ -787,7 +792,7 @@ The envelope is `{"status": "success", "telemetry": {…}}`; paths below are rel
 | `axes.project_identity.unidentified` | int | — | 0.9.74 | — | — | — | — |
 | `axes.project_identity.unregistered` | int | — | 0.9.74 | — | — | — | — |
 | `axis_registry_read_failures_last_ts` | str/null | — | <=0.9.73 | — | — | — | — |
-| `axis_registry_read_failures_total` | int | _total | <=0.9.73 | `telemetry:registry.read_failures_total` | 0.9.90 | — | — |
+| `axis_registry_read_failures_total` | int | _total | <=0.9.73 | `telemetry:registry.read_failures_total` | 0.9.91 | — | — |
 | `breakdown.domains[]` | list | — | <=0.9.73 | — | — | — | ⚠ MEANING CHANGED IN 0.9.74 — see _meaning_changes. Before 0.9.74 this carried the PROJECT distribution; it now carries the DOMAIN distribution from metadata->'domains'. The project distribution is breakdown.projects. |
 | `breakdown.domains[].count` | int | — | <=0.9.73 | — | — | — | — |
 | `breakdown.domains[].key` | str | — | <=0.9.73 | — | — | — | — |
@@ -828,8 +833,8 @@ The envelope is `{"status": "success", "telemetry": {…}}`; paths below are rel
 | `credentials.token_verify_warn_per_min` | int/float | — | 0.9.74 | — | — | — | TOKEN_VERIFY_WARN_PER_MIN — the limit the warning is raised at |
 | `llm.faults.*.llm.credential.count` | int | — | 0.9.74 | — | — | — | — |
 | `llm.faults.*.llm.credential.last` | str/null | — | 0.9.74 | — | — | — | — |
-| `llm_faults.*.llm.credential.count` | int | — | <=0.9.73 | `telemetry:llm.faults.*.llm.credential.count` | 0.9.90 | — | — |
-| `llm_faults.*.llm.credential.last` | str/null | — | <=0.9.73 | `telemetry:llm.faults.*.llm.credential.last` | 0.9.90 | — | — |
+| `llm_faults.*.llm.credential.count` | int | — | <=0.9.73 | `telemetry:llm.faults.*.llm.credential.count` | 0.9.91 | — | — |
+| `llm_faults.*.llm.credential.last` | str/null | — | <=0.9.73 | `telemetry:llm.faults.*.llm.credential.last` | 0.9.91 | — | — |
 
 ### versions
 

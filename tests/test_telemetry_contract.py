@@ -50,6 +50,17 @@ def at_the_drop_release(monkeypatch):
 
 
 @pytest.fixture
+def at_the_telemetry_drop_release(monkeypatch):
+    """The release the 16 telemetry-side copies stop being served in — one
+    later than the /health drop, because the monitor of record (0.9.30) still
+    read them at their old homes when 0.9.90 shipped (fact:1989). At this
+    stamp every copy of both drops is gone, so it is the fixture for the
+    strip's full shape."""
+    monkeypatch.setattr(tc, "VERSION", tc.TELEMETRY_DUAL_EMIT_DROP_TARGET)
+    return tc.TELEMETRY_DUAL_EMIT_DROP_TARGET
+
+
+@pytest.fixture
 def before_the_drop_release(monkeypatch):
     """The release before it — every copy is still served."""
     monkeypatch.setattr(tc, "VERSION", "0.9.89")
@@ -1017,6 +1028,7 @@ def test_the_first_drop_stamp_is_frozen():
     copies; a constant that drifts with VERSION would re-write that answer for
     every already-shipped row in the generated document."""
     assert tc.DUAL_EMIT_DROP_TARGET == "0.9.90"
+    assert tc.TELEMETRY_DUAL_EMIT_DROP_TARGET == "0.9.91"
 
 
 def test_a_row_past_its_removed_in_is_dropped_and_a_future_one_is_not(
@@ -1144,7 +1156,7 @@ def test_a_partially_dropped_family_that_is_not_a_dict_is_left_alone(
 
 
 def test_the_telemetry_sections_keep_everything_that_was_not_stamped(
-        at_the_drop_release):
+        at_the_telemetry_drop_release):
     snap = {
         "postgres": {"technical_docs": 171, "pool_size": 3,
                      "outbox": {"applied": 10},
@@ -1190,7 +1202,7 @@ def test_the_anonymous_three_keys_are_never_dropped(at_the_drop_release):
 
 
 def test_a_wildcard_row_never_takes_a_documented_sibling_with_it(
-        at_the_drop_release, monkeypatch):
+        at_the_telemetry_drop_release, monkeypatch):
     """`postgres.outbox.*` is stamped and has no unstamped sibling today. The
     rule is what keeps that a fact about the data rather than luck: a key the
     wildcard covers goes, a key a surviving row names by hand stays."""
@@ -1243,12 +1255,22 @@ def test_the_dropped_row_counts_are_what_this_release_ships(at_the_drop_release)
     moved would leave that loop rather than fail it — silently proving nothing.
     The counts are what makes a changed stamp visible."""
     assert len(tc.dropped_paths(tc.HEALTH)) == 97
+    assert len(tc.dropped_paths(tc.TELEMETRY)) == 0  # 16 rows wait for 0.9.91 (monitor gate, fact:1989)
+
+
+def test_the_dropped_row_counts_at_the_telemetry_drop_release(at_the_telemetry_drop_release):
+    """One release later the telemetry-side copies go too — and the /health
+    count is unchanged, because a stamp already reached stays reached."""
+    assert len(tc.dropped_paths(tc.HEALTH)) == 97
     assert len(tc.dropped_paths(tc.TELEMETRY)) == 16
 
 
-def test_no_dropped_path_is_served_on_either_endpoint(gateway, at_the_drop_release):
+def test_no_dropped_path_is_served_on_either_endpoint(gateway, at_the_telemetry_drop_release):
     """Both directions, on the served bodies: every dropped copy is gone, and
-    every new home a fully-populated payload owes is there to read instead."""
+    every new home a fully-populated payload owes is there to read instead.
+    Pinned at the LATER stamp, where both drops have happened, so the
+    telemetry boundary is proved too (at 0.9.90 alone it would strip nothing
+    and the test would prove only /health)."""
     g = gateway
     auth_body = _served_health(g)
     coordinator_obj, telemetry_body = _served_telemetry(g)

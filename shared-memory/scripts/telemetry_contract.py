@@ -207,6 +207,12 @@ INTRODUCED_0_9_88 = "0.9.88"
 #: own literal version string, never a re-dating of this one
 #: (test_the_first_drop_stamp_is_frozen pins the literal).
 DUAL_EMIT_DROP_TARGET = "0.9.90"
+#: The telemetry-side copies (the 16 rows under `GET /memory/telemetry` that
+#: moved at v0.9.74) are served one release longer: the consumer of record,
+#: shared-memory-monitor 0.9.30, still reads them at their old homes (its own
+#: record, fact:1989, lists each read and its new home). Frozen like the stamp
+#: above; a stamp is honoured exactly when its release arrives.
+TELEMETRY_DUAL_EMIT_DROP_TARGET = "0.9.91"
 
 #: CG (OBS round) — the enumerated `warnings[].key` vocabulary. Before this,
 #: `warnings[].key` was a free `str` (see the entry below): a renamed or
@@ -809,15 +815,15 @@ TELEMETRY: dict[str, dict] = {
     "postgres.technical_docs": _k("int", "postgres"),
     "postgres.technical_docs_superseded": _k("int", "postgres"),
     "postgres.outbox.*": _k("int", "outbox", moved_to="telemetry:outbox",
-                            removed_in=DUAL_EMIT_DROP_TARGET, note=(
+                            removed_in=TELEMETRY_DUAL_EMIT_DROP_TARGET, note=(
                                 "the status census; a status with zero rows was "
                                 "OMITTED, which is why it moved")),
     "postgres.outbox": _k("dict", "outbox", moved_to="telemetry:outbox",
-                          removed_in=DUAL_EMIT_DROP_TARGET,
+                          removed_in=TELEMETRY_DUAL_EMIT_DROP_TARGET,
                           note="emitted as an empty dict when the outbox is empty"),
     "postgres.outbox_failed_oldest_age_seconds": _k(
         "int|null", "outbox", unit="_seconds",
-        moved_to="telemetry:outbox.oldest_failed_age_s", removed_in=DUAL_EMIT_DROP_TARGET),
+        moved_to="telemetry:outbox.oldest_failed_age_s", removed_in=TELEMETRY_DUAL_EMIT_DROP_TARGET),
     "postgres.community_summaries.total": _k("int", "postgres"),
     "postgres.community_summaries.superseded": _k("int", "postgres"),
     "postgres.community_summaries.insight": _k("int", "insight"),
@@ -839,17 +845,17 @@ TELEMETRY: dict[str, dict] = {
     "neo4j.decisions_total": _k("int", "neo4j"),
     "neo4j.decisions_rem_pending": _k("int", "rem"),
     "neo4j.rem_dead_lettered": _k("int", "rem", moved_to="telemetry:rem.dead_lettered",
-                                  removed_in=DUAL_EMIT_DROP_TARGET),
+                                  removed_in=TELEMETRY_DUAL_EMIT_DROP_TARGET),
     "neo4j.rem_failing": _k("int", "rem", moved_to="telemetry:rem.failing",
-                            removed_in=DUAL_EMIT_DROP_TARGET),
+                            removed_in=TELEMETRY_DUAL_EMIT_DROP_TARGET),
     "neo4j.rem_max_attempts": _k("int", "rem", moved_to="telemetry:rem.max_attempts",
-                                 removed_in=DUAL_EMIT_DROP_TARGET),
+                                 removed_in=TELEMETRY_DUAL_EMIT_DROP_TARGET),
     "neo4j.rem_passed_over_total": _k("int", "rem", unit="_total",
                                       moved_to="telemetry:rem.passed_over",
-                                      removed_in=DUAL_EMIT_DROP_TARGET),
+                                      removed_in=TELEMETRY_DUAL_EMIT_DROP_TARGET),
     "neo4j.rem_starved_pending": _k("int", "rem",
                                     moved_to="telemetry:rem.starved_pending",
-                                    removed_in=DUAL_EMIT_DROP_TARGET),
+                                    removed_in=TELEMETRY_DUAL_EMIT_DROP_TARGET),
     "neo4j.query_p50_ms": _k("float|null", "neo4j", unit="_ms", since=INTRODUCED_0_9_74, note=(
         "over BOTH Neo4j callers — the /memory/graph route and the outbox "
         "apply — so the write path that actually blocks the pipeline is in "
@@ -996,26 +1002,26 @@ TELEMETRY: dict[str, dict] = {
     "llm.faults.*.llm.credential.last": _k("str|null", "credentials", since=INTRODUCED_0_9_74),
     "llm.faults.*.llm.transient.count": _k("int", "llm", since=INTRODUCED_0_9_74),
     "llm.faults.*.llm.transient.last": _k("str|null", "llm", since=INTRODUCED_0_9_74),
-    "llm_faults": _k("dict", "llm", moved_to="telemetry:llm.faults", removed_in=DUAL_EMIT_DROP_TARGET,
+    "llm_faults": _k("dict", "llm", moved_to="telemetry:llm.faults", removed_in=TELEMETRY_DUAL_EMIT_DROP_TARGET,
                      note="empty until a fault occurs"),
     "llm_faults.*.gateway.count": _k("int", "llm",
                                      moved_to="telemetry:llm.faults.*.gateway.count",
-                                     removed_in=DUAL_EMIT_DROP_TARGET),
+                                     removed_in=TELEMETRY_DUAL_EMIT_DROP_TARGET),
     "llm_faults.*.gateway.last": _k("str|null", "llm",
                                     moved_to="telemetry:llm.faults.*.gateway.last",
-                                    removed_in=DUAL_EMIT_DROP_TARGET),
+                                    removed_in=TELEMETRY_DUAL_EMIT_DROP_TARGET),
     "llm_faults.*.llm.credential.count": _k(
         "int", "credentials",
-        moved_to="telemetry:llm.faults.*.llm.credential.count", removed_in=DUAL_EMIT_DROP_TARGET),
+        moved_to="telemetry:llm.faults.*.llm.credential.count", removed_in=TELEMETRY_DUAL_EMIT_DROP_TARGET),
     "llm_faults.*.llm.credential.last": _k(
         "str|null", "credentials",
-        moved_to="telemetry:llm.faults.*.llm.credential.last", removed_in=DUAL_EMIT_DROP_TARGET),
+        moved_to="telemetry:llm.faults.*.llm.credential.last", removed_in=TELEMETRY_DUAL_EMIT_DROP_TARGET),
     "llm_faults.*.llm.transient.count": _k(
         "int", "llm", moved_to="telemetry:llm.faults.*.llm.transient.count",
-        removed_in=DUAL_EMIT_DROP_TARGET),
+        removed_in=TELEMETRY_DUAL_EMIT_DROP_TARGET),
     "llm_faults.*.llm.transient.last": _k(
         "str|null", "llm", moved_to="telemetry:llm.faults.*.llm.transient.last",
-        removed_in=DUAL_EMIT_DROP_TARGET),
+        removed_in=TELEMETRY_DUAL_EMIT_DROP_TARGET),
 
     # ── gpu_probe / capacity / config / axes (moved off /health) ────────────
     "gpu_probe.state": _k("str", "llm", since=INTRODUCED_0_9_74),
@@ -1309,7 +1315,7 @@ TELEMETRY: dict[str, dict] = {
     # ── axes registry read failures (flat) ──────────────────────────────────
     "axis_registry_read_failures_total": _k(
         "int", "axes/registry", unit="_total",
-        moved_to="telemetry:registry.read_failures_total", removed_in=DUAL_EMIT_DROP_TARGET),
+        moved_to="telemetry:registry.read_failures_total", removed_in=TELEMETRY_DUAL_EMIT_DROP_TARGET),
     "axis_registry_read_failures_last_ts": _k("str|null", "axes/registry"),
 
     # ── credentials ─────────────────────────────────────────────────────────

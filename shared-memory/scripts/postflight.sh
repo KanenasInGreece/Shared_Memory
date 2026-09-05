@@ -873,6 +873,10 @@ print(("Shared Memory install-verification realistic canary " + marker + " — "
     # request lives. No token means no fetch, and the verdict says UNDERIVABLE.
     if [[ -n "${AGENT_TOKEN:-}" ]]; then
         telemetry_full="$(curl -s --compressed --max-time 15 -K - "$GATEWAY_URL/memory/telemetry" <<< "header = \"Authorization: Bearer $AGENT_TOKEN\"" || true)"
+    elif [[ "$auth_on" != "1" ]]; then
+        # Auth-off install: the numbers endpoint is served anonymously, exactly
+        # as /health is above — so the verdict renders in both modes.
+        telemetry_full="$(curl -s --compressed --max-time 15 "$GATEWAY_URL/memory/telemetry" || true)"
     fi
 
     base_file="$HOME/.shared-memory/postflight/baseline-$(date -u +%Y%m%dT%H%M%SZ).json"
@@ -1018,7 +1022,7 @@ exceeds, tolerable = d.get("single_search_exceeds_wait"), d.get("tolerable_wait_
 print("UNDERIVABLE" if s is None or n is None else f"{s}|{n}|{exceeds}|{tolerable}")
 ' 2>/dev/null)"
     if [[ -z "$cap_fields" || "$cap_fields" == "UNDERIVABLE" ]]; then
-        warn "Capacity verdict not derivable — the gateway has not published a capacity record yet (fresh install, first probe still in flight), or no AGENT_TOKEN was set to read /memory/telemetry with; informational, never a gate"
+        warn "Capacity verdict not derivable — the gateway has not published a capacity record yet (fresh install, first probe still in flight), or auth is on and no AGENT_TOKEN was set to read /memory/telemetry with; informational, never a gate"
     else
         # M6 (fix round): this is the RERANK-STAGE worst-case projection
         # (the probe's fixed 20-doc model, see hive_mind_proxy.py's own

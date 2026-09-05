@@ -5,6 +5,45 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.9.90] — 2026-09-06
+
+### Follow-up to the hygiene round — four small closures
+
+**The credentialed-backend gates compare the exact request path.** Both gates now check the raw
+request-target path as it arrived, with nothing stripped, against the allowlist, so the string that
+is checked is the string that is forwarded. `POST /v1/chat/completions/` on a credentialed backend
+answers **403**; local backends are unchanged. The `credentialed_route_denied` counter now also
+counts trailing-slash spellings, under its existing name.
+
+**The embedder and reranker routes accept their literal spelling only.** A percent-encoded spelling
+of the exact path, such as `/v1/embedding%73` or `/v1/rerankin%67`, answers **404** in the same voice
+as every other near-miss and is not forwarded. This is consistency: every gateway edge now applies
+one rule to a spelling.
+
+**Both clients read their `.env` with one parser, the framework's own.** `memory_bridge.py` and
+`mcp/vector-skill.py` no longer import `python-dotenv`; the parser that was the fallback is now the
+only path, the same one the gateway uses for its own `.env`. A value is read verbatim to the end of
+its line: an inline `# comment` after a value is part of the value, a line with an unbalanced quote
+is kept as written and the next line is read normally. `export ` prefixes, a BOM, comment lines and
+one balanced pair of surrounding quotes are handled as before. The documented `uv run` lines drop
+`--with python-dotenv`; `requirements.txt` and `THIRD_PARTY.md` list what is imported.
+
+**The shipped gateway unit restricts socket families.** `hive-mind-gateway.service` carries
+`RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK`, the four the gateway, its daemons and
+the nvtop probe use, after a 30-hour trial on a test host. Installed units are copies written by
+`install_service.sh`; `ops/README.md` says how a directive change reaches a running install: re-run
+the installer, restart the unit, check `inference_busy` on `/health`.
+
+**The dual-emitted copies are no longer served.** Every key that moved home in v0.9.74 was served at
+both homes until now. From this release the contract decides what each endpoint serves: a key stamped
+`removed_in` at or before the running version is stripped at the response boundary, on both
+endpoints, and its new home carries it. Contract delta: moves completed 97 on `GET /health`; additions 0; removals 0;
+meaning changes 0. The 16 moved keys under `GET /memory/telemetry` are served one release longer,
+stamped `removed_in: 0.9.91`, because the monitor of record (0.9.30) still reads them at their old
+homes. `telemetry-contract.md` carries the old-to-new map for every moved key.
+
+---
+
 ## [0.9.89] — 2026-09-05
 
 ### The hygiene round — the gateway's edge says what it does

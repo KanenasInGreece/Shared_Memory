@@ -153,7 +153,7 @@ def _load_memory_bridge_from_unpinned(skill_dir: str, shutil, uuid):
     return mod
 
 
-def test_dotenv_scope_stray_home_level_env_is_not_picked_up(tmp_path, monkeypatch):
+def test_env_scope_stray_home_level_env_is_not_picked_up(tmp_path, monkeypatch):
     """A .env ABOVE the skill root (the $HOME-walk find_dotenv() used to
     reach) must be invisible -- S-18's whole point."""
     monkeypatch.delenv("AGENT_TOKEN", raising=False)
@@ -167,7 +167,7 @@ def test_dotenv_scope_stray_home_level_env_is_not_picked_up(tmp_path, monkeypatc
     assert os.environ.get("AGENT_TOKEN") != "tok_from_stray_home_env"
 
 
-def test_dotenv_scope_skill_root_env_is_picked_up(tmp_path, monkeypatch):
+def test_env_scope_skill_root_env_is_picked_up(tmp_path, monkeypatch):
     # A real AGENT_TOKEN sitting in this SESSION's os.environ (e.g. a
     # pre-existing, unrelated script's own naive env loader having already
     # run at collection time) must not shadow the value this test is
@@ -186,7 +186,7 @@ def test_dotenv_scope_skill_root_env_is_picked_up(tmp_path, monkeypatch):
     assert mod._request_headers().get("Authorization") == "Bearer tok_from_skill_root"
 
 
-def test_dotenv_scope_scripts_adjacent_env_is_picked_up(tmp_path, monkeypatch):
+def test_env_scope_scripts_adjacent_env_is_picked_up(tmp_path, monkeypatch):
     """The other documented candidate: an .env living beside memory_bridge.py
     itself (scripts/.env), not just the skill root."""
     monkeypatch.delenv("AGENT_TOKEN", raising=False)
@@ -200,7 +200,7 @@ def test_dotenv_scope_scripts_adjacent_env_is_picked_up(tmp_path, monkeypatch):
     assert mod._AGENT_TOKEN_FROM_FILE == "tok_from_scripts_dir"
 
 
-def test_dotenv_load_never_exports_agent_token_to_os_environ(tmp_path, monkeypatch):
+def test_env_load_never_exports_agent_token_to_os_environ(tmp_path, monkeypatch):
     """The core A1-deferred fix: AGENT_TOKEN sourced from the .env file must
     never land in this process's own os.environ, even though it IS used for
     this client's own outbound requests."""
@@ -218,7 +218,7 @@ def test_dotenv_load_never_exports_agent_token_to_os_environ(tmp_path, monkeypat
     assert mod.COORDINATOR_BASE == "http://example.invalid:9999"
 
 
-def test_dotenv_load_never_exports_gateway_secrets_to_os_environ(tmp_path, monkeypatch):
+def test_env_load_never_exports_gateway_secrets_to_os_environ(tmp_path, monkeypatch):
     """Required fix (A2 security review, finding 7): candidate 2 (the skill
     root .env) IS the gateway .env when this client is invoked from the
     repo root in admin mode -- so PG_PASSWORD/NEO4J_PASSWORD/AGENT_TOKENS/
@@ -245,7 +245,7 @@ def test_dotenv_load_never_exports_gateway_secrets_to_os_environ(tmp_path, monke
     assert mod.COORDINATOR_BASE == "http://example.invalid:9999"
 
 
-def test_dotenv_scope_operator_export_still_wins_over_file(tmp_path, monkeypatch):
+def test_env_scope_operator_export_still_wins_over_file(tmp_path, monkeypatch):
     """An operator's own real `export AGENT_TOKEN=...` (or a test's
     monkeypatch.setenv) must still take precedence over the file value --
     the client never becomes LESS configurable than before."""
