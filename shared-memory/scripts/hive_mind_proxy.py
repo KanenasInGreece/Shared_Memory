@@ -2166,51 +2166,38 @@ class AsyncHiveMindProxy:
         # uncredentialed one, and the post-selection S-04 check below
         # still guards the credentialed choice.
         #
-        # R-B (HYG round): THE GATE COMPARES THE RAW REQUEST-TARGET PATH —
-        # `rel_url.raw_path`, the path as it arrived on the wire, tolerating
-        # only TRAILING SLASHES via the `rstrip` below. `request.path` is
-        # percent-DECODED, so `/v1%2fchat/completions` and
-        # `/v1/chat/completio%6es` both READ as the allowed route here while
-        # something else entirely was signed and sent to the provider: the
-        # check and the forward were looking at different strings, which is
-        # security fix A1's shape on the credentialed path.
+        # R-B: THE GATE COMPARES THE RAW REQUEST-TARGET PATH, EXACTLY —
+        # `rel_url.raw_path`, the path as it arrived on the wire, against the
+        # allowlist. `_upstream_url` forwards `str(rel_url)`, so the string
+        # compared here IS the string signed and sent to the provider. No
+        # spelling is normalised.
         #
-        # ⚠ COMPARED IS NOT IDENTICAL TO FORWARDED, and the gap is named
-        # (QA-3/ADV-1, HYG review round). `_upstream_url` forwards
-        # `str(rel_url)`; this gate compares the request-target PATH. Two known
-        # differences, neither a provider-visible bypass:
-        #   · a TRAILING SLASH — `/v1/chat/completions/` is rstrip-normalised
-        #     here and forwarded WITH its slash. That is the security sweep's
-        #     known-remaining residue, and it is bounded: the host comes from
-        #     config, only trailing slashes are tolerated, no traversal or
-        #     encoded segment survives the compare. Dropping the `rstrip` (so
-        #     the compared form IS the forwarded form) is a PARKED OPERATOR
-        #     RULING — ⛔ do not remove it on your own initiative.
-        #   · a FRAGMENT — never on an HTTP request-target at all, so a
-        #     conforming client cannot express one; yarl drops it from
-        #     `raw_path_qs`.
-        # The QUERY is not in that gap: it is denied outright, below.
+        # ⛔ NOT `request.path` and ⛔ NOT `path_safe`. Both are percent-DECODED
+        # (`path_safe` keeps only %2F and %25, measured — its own docstring says
+        # so), so `/v1%2fchat/completions` and `/v1/chat/completio%6es` would
+        # READ as the allowed route here while something else entirely went to
+        # the provider. `raw_path` is the request target verbatim, minus the
+        # query, which is the string this gate is actually about.
         #
-        # ⛔ NOT `path_safe`. That is the ROUTER-matched form, and yarl decodes
-        # every escape in it except %2F and %25 (measured, and its own
-        # docstring says so) — it would close the encoded-slash family and
-        # leave `%6e` reading as the allowed route. `raw_path` is the request
-        # target verbatim, minus the query, which is the string this gate is
-        # actually about.
+        # A FRAGMENT is never on an HTTP request-target at all, so a conforming
+        # client cannot express one; yarl drops it from `raw_path_qs`. An HTTP
+        # request-target path is never empty either, so the compare needs no
+        # empty-path fallback.
         #
-        # The rule, stated plainly: a caller that percent-encodes an allowed
-        # path is REFUSED. No framework caller encodes anything — both clients
-        # and both daemons send literal paths — so the only traffic this turns
-        # away is traffic spelling a framework endpoint in a way the framework
-        # never does.
+        # The rule, stated plainly: a caller that spells an allowed path any way
+        # other than the exact way is REFUSED. No framework caller encodes
+        # anything or appends a trailing slash — both clients and both daemons
+        # send literal paths — so the only traffic this turns away is traffic
+        # spelling a framework endpoint in a way the framework never does.
         #
         # A QUERY STRING on a credentialed route is denied outright for the
         # same reason: the forward carries it verbatim, no framework caller
         # sends one, and `?key=…` is a real provider idiom — an unexamined
         # query steers a signed request past a (method, path) allowlist that
         # cannot see it. The credentialed_route_denied population widens under
-        # an unchanged name (CHANGELOG line owed, Group 3).
-        _route = (request.method, request.rel_url.raw_path.rstrip("/") or "/")
+        # an unchanged name (CHANGELOG line owed, Group 3) — trailing-slash
+        # spellings now join the same counter.
+        _route = (request.method, request.rel_url.raw_path)
         if ((_route not in CREDENTIALED_BACKEND_ALLOWED_ROUTES
              or request.rel_url.query_string)
                 and all(LLM_BACKEND_TOKENS.get(b) is not None for b in eligible_pre)):
@@ -2348,17 +2335,15 @@ class AsyncHiveMindProxy:
                 # credentialed backend. Checked before Authorization is
                 # attached (below) and before any upstream call, so a
                 # rejected request never gets near the key.
-                # R-B (HYG round): the RAW request-target path, and a query
+                # R-B: the RAW request-target path compared exactly, and a query
                 # denies — same rule and same reasons as the R-4 pre-dispatch
-                # gate above (⛔ `raw_path`, never `path_safe`: see there).
-                # The compared-vs-forwarded gap (trailing slashes tolerated by
-                # the rstrip; a fragment never on the wire) is named there too
-                # (QA-3/ADV-1) — dropping the rstrip is a PARKED operator ruling.
-                # This gate is the one that fires when the eligible set was
-                # MIXED, so R-4's `all(...)` was false and selection
+                # gate above (⛔ `raw_path`, never `path_safe`: see there). The
+                # compared string is the forwarded string; no spelling is
+                # normalised. This gate is the one that fires when the eligible
+                # set was MIXED, so R-4's `all(...)` was false and selection
                 # nevertheless landed on the credentialed member; each gate
                 # therefore needs its own fleet shape to be pinned at all.
-                route = (request.method, request.rel_url.raw_path.rstrip("/") or "/")
+                route = (request.method, request.rel_url.raw_path)
                 if (route not in CREDENTIALED_BACKEND_ALLOWED_ROUTES
                         or request.rel_url.query_string):
                     record_credentialed_route_denied(

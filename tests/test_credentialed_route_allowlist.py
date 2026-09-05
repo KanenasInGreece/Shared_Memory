@@ -247,6 +247,26 @@ def test_r4_denies_a_percent_encoded_spelling_of_an_allowed_route(monkeypatch, s
     assert "framework endpoints" in json.loads(resp.body.decode())["error"]
 
 
+def test_r4_denies_a_trailing_slash_spelling_of_an_allowed_route(monkeypatch):
+    """THE SAME RULE, the unencoded case: `/v1/chat/completions/` is not the
+    allowed route, so it is REFUSED. The gate compares the raw request-target
+    path exactly, and that is the string `_upstream_url` forwards — a slash
+    tolerated here would be signed and sent to the provider with its slash.
+
+    `_forbid_selection` is mandatory (see its docstring): without it a
+    restored `rstrip` at R-4 falls through to selection, where S-04 answers
+    the same 403 and the status assertion cannot tell the gates apart."""
+    g = _load_credentialed_gateway(monkeypatch)
+    _forbid_selection(monkeypatch, g)
+    proxy = g.AsyncHiveMindProxy()
+    proxy.session = _MustNotCallSession()
+    resp = asyncio.run(proxy.handle_proxy(_req("POST", "/v1/chat/completions/")))
+    assert resp.status == 403, (
+        "R-4 (pre-dispatch) must deny the trailing-slash spelling — it is not "
+        "the string that gets forwarded")
+    assert "framework endpoints" in json.loads(resp.body.decode())["error"]
+
+
 def test_r4_denies_a_query_string_on_an_allowed_credentialed_route(monkeypatch):
     """R-B. The path IS on the allowlist; the query is not examined by it and
     is forwarded verbatim, so a `?key=…`-style parameter would steer a signed
@@ -332,6 +352,18 @@ def test_s04_denies_a_percent_encoded_spelling_of_an_allowed_route(monkeypatch, 
         "mixed fleet it is the only gate between this request and the key")
 
 
+def test_s04_denies_a_trailing_slash_spelling_of_an_allowed_route(monkeypatch):
+    """The same unencoded case at the other gate, on the MIXED fleet where
+    S-04 is the only thing between this request and the provider key."""
+    g = _load_mixed_fleet(monkeypatch)
+    proxy = g.AsyncHiveMindProxy()
+    proxy.session = _MustNotCallSession()
+    resp = asyncio.run(proxy.handle_proxy(_req("POST", "/v1/chat/completions/")))
+    assert resp.status == 403, (
+        "S-04 (post-selection) must deny the trailing-slash spelling — on a "
+        "mixed fleet it is the only gate between this request and the key")
+
+
 def test_s04_denies_a_query_string_on_an_allowed_credentialed_route(monkeypatch):
     g = _load_mixed_fleet(monkeypatch)
     proxy = g.AsyncHiveMindProxy()
@@ -385,6 +417,7 @@ def _reload_for_audit(monkeypatch, tmp_path):
 @pytest.mark.parametrize("spelling,must_contain,must_not_contain", [
     ("/v1/chat/completio%6es", "completio%6es", '"path":"/v1/chat/completions"'),
     ("/v1/chat/completions?x=y", "?<query-redacted>", "x=y"),
+    ("/v1/chat/completions/", "completions/", '"path":"/v1/chat/completions"'),
 ])
 def test_r4_audit_line_carries_the_raw_spelling_never_the_decoded_route_or_the_query_value(
         monkeypatch, tmp_path, spelling, must_contain, must_not_contain):
@@ -405,6 +438,7 @@ def test_r4_audit_line_carries_the_raw_spelling_never_the_decoded_route_or_the_q
 @pytest.mark.parametrize("spelling,must_contain,must_not_contain", [
     ("/v1/chat/completio%6es", "completio%6es", '"path":"/v1/chat/completions"'),
     ("/v1/chat/completions?x=y", "?<query-redacted>", "x=y"),
+    ("/v1/chat/completions/", "completions/", '"path":"/v1/chat/completions"'),
 ])
 def test_s04_audit_line_carries_the_raw_spelling_never_the_decoded_route_or_the_query_value(
         monkeypatch, tmp_path, spelling, must_contain, must_not_contain):
