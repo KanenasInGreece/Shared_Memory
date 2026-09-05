@@ -88,6 +88,10 @@ from project_alias import ALIAS_RESOLVE_SQL, ACTIVE_ALIASES_SQL
 from secure_env import get_secret
 from framework_defaults import FRAMEWORK_DEFAULTS
 from telemetry_instruments import LatencyRing, Counter, safe
+# THE CONTRACT DECIDES WHAT /memory/telemetry SERVES: a key whose `removed_in`
+# this release has reached comes off the response in handle_telemetry. A leaf
+# module — its only import is `__future__.annotations`.
+from telemetry_contract import TELEMETRY as TELEMETRY_CONTRACT, strip_dropped
 
 log = logging.getLogger("coordinator")
 
@@ -9464,7 +9468,12 @@ class MemoryCoordinator:
         actually built, and `timestamp` when it was served.
         """
         snap = await self._telemetry_cached()
-        return web.json_response({"status": "success", "telemetry": snap})
+        # THE DROP, at the response boundary. ⛔ Never on `snap` itself — it is
+        # the TTL cache, shared by every caller inside the window; strip_dropped
+        # returns a fresh object and leaves it whole.
+        return web.json_response(
+            {"status": "success",
+             "telemetry": strip_dropped(snap, TELEMETRY_CONTRACT)})
 
     async def _telemetry_cached(self) -> dict:
         """TTL cache + single-flight around ``_build_telemetry``.

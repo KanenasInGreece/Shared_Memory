@@ -1201,6 +1201,132 @@ def test_a_wildcard_row_never_takes_a_documented_sibling_with_it(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# THE WIRING — asserted against what the HANDLERS serve
+#
+# ⛔ NOT against strip_dropped's own output, and not against _build_health_checks:
+# a strip that is written correctly and called from neither endpoint would pass
+# both of those. The only thing that proves the drop reaches a client is the
+# response body, so these tests drive handle_health and handle_telemetry
+# end-to-end and read what came back.
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _served_health(g, *, authenticated=True):
+    """The body `GET /health` actually returns."""
+    proxy = g.AsyncHiveMindProxy()
+    proxy.session = _OkSession()
+    req = MagicMock()
+    req.headers = ({"Authorization": "Bearer tok_contract_test"}
+                   if authenticated else {})
+    req.app = {"proxy": proxy, "coordinator": _StubCoordinator()}
+    resp = asyncio.run(g.handle_health(req))
+    return json.loads(resp.body.decode())
+
+
+def _served_telemetry(g):
+    """The `telemetry` object `GET /memory/telemetry` actually returns, and the
+    coordinator that served it (so the CACHE can be inspected afterwards)."""
+    c = _stub_telemetry_coordinator(g)
+
+    async def _run():
+        await c._refresh_registry_census()
+        resp = await c.handle_telemetry(MagicMock())
+        return json.loads(resp.text)["telemetry"]
+
+    return c, asyncio.run(_run())
+
+
+def test_the_dropped_row_counts_are_what_this_release_ships(at_the_drop_release):
+    """The absence check below iterates `dropped_paths`, so a row whose stamp
+    moved would leave that loop rather than fail it — silently proving nothing.
+    The counts are what makes a changed stamp visible."""
+    assert len(tc.dropped_paths(tc.HEALTH)) == 97
+    assert len(tc.dropped_paths(tc.TELEMETRY)) == 16
+
+
+def test_no_dropped_path_is_served_on_either_endpoint(gateway, at_the_drop_release):
+    """Both directions, on the served bodies: every dropped copy is gone, and
+    every new home a fully-populated payload owes is there to read instead."""
+    g = gateway
+    auth_body = _served_health(g)
+    coordinator_obj, telemetry_body = _served_telemetry(g)
+    emitted = {
+        "health": tc.canonical_paths(auth_body, tc.HEALTH),
+        "telemetry": tc.canonical_paths(telemetry_body, tc.TELEMETRY),
+    }
+    required = {
+        "health": tc.required_paths(tc.HEALTH, "health"),
+        "telemetry": tc.required_paths(tc.TELEMETRY, "telemetry"),
+    }
+
+    for endpoint, body in (("health", auth_body), ("telemetry", telemetry_body)):
+        contract = tc.HEALTH if endpoint == "health" else tc.TELEMETRY
+        still_served = [p for p in tc.dropped_paths(contract)
+                        if p in tc.canonical_paths(body, contract)
+                        or p in body]
+        assert not still_served, (
+            f"/{endpoint} still serves paths this release dropped: {still_served}")
+
+    checked = 0
+    for contract in (tc.HEALTH, tc.TELEMETRY):
+        for path, spec in contract.items():
+            if not tc.is_dropped(spec):
+                continue
+            endpoint, _, target = spec["moved_to"].partition(":")
+            target = target.replace("[]", "")
+            if target.endswith(".*"):
+                target = target[:-2]
+            if target not in required[endpoint]:
+                continue
+            checked += 1
+            assert target in emitted[endpoint], (
+                f"{path} was dropped but its new home {endpoint}:{target} is "
+                "not served — the move lost the value rather than relocating it")
+    assert checked >= 40, (
+        f"only {checked} new homes were checkable — the PRESENT half has gone "
+        "vacuous")
+
+    # ⛔ THE STATE IS NOT STRIPPED, only the response. telemetry_extras() reads
+    # the /health cache to BUILD the new homes, and the telemetry cache is
+    # shared by every caller inside its TTL window.
+    assert "llm_pool" in g._health_cache["checks"]
+    assert "llm_faults" in coordinator_obj._telemetry_cache["snap"]
+
+
+def test_an_auth_off_install_serves_the_same_shape(gateway, at_the_drop_release,
+                                                   monkeypatch):
+    """An install with no tokens serves the full payload to everyone. That is
+    the same payload, so it is the same drop — one shape for both auth states."""
+    g = gateway
+    monkeypatch.setattr(g, "AUTH_CONFIGURED_AT_STARTUP", False)
+    body = _served_health(g, authenticated=False)
+    assert body["status"] == "ok", "the auth-off path served the slimmed payload"
+    still_served = [p for p in tc.dropped_paths(tc.HEALTH) if p in body]
+    assert not still_served, (
+        f"an auth-off install still serves dropped paths: {still_served}")
+
+
+def test_the_anonymous_payload_is_untouched_by_the_drop(gateway,
+                                                        at_the_drop_release):
+    """S-10's three keys are unstamped and returned before the strip is reached
+    — an anonymous caller sees exactly what it saw before."""
+    body = _served_health(gateway, authenticated=False)
+    assert set(body) == set(tc.ANONYMOUS_HEALTH_KEYS)
+
+
+def test_the_copies_are_still_served_a_release_before_the_drop(
+        gateway, before_the_drop_release):
+    """The other side of the predicate, through the handlers: on the release
+    before the stamp the old homes are all still on the wire."""
+    body = _served_health(gateway)
+    for old in ("daemon", "rem_daemon", "llm_pool", "llm_affinity", "config",
+                "capacity", "project_identity", "gpu_probe", "pgvector"):
+        assert old in body, f"{old} left the payload a release early"
+    _, telemetry_body = _served_telemetry(gateway)
+    assert "llm_faults" in telemetry_body
+    assert "rem_dead_lettered" in telemetry_body["neo4j"]
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # THE CLIENT SIDE (Group 1) — a write-side change is half a fix
 # ══════════════════════════════════════════════════════════════════════════════
 

@@ -40,6 +40,10 @@ from framework_defaults import FRAMEWORK_DEFAULTS  # noqa: E402
 # lookup, which cannot see read_only_agents() and would report a confined
 # identity as write-capable.
 from agent_roles import effective_role  # noqa: E402
+# THE CONTRACT DECIDES WHAT /health SERVES: a key whose `removed_in` this
+# release has reached comes off the response in handle_health. A leaf module —
+# its only import is `__future__.annotations` — so it cannot cycle back here.
+from telemetry_contract import HEALTH as HEALTH_CONTRACT, strip_dropped  # noqa: E402
 # M9 (fix round): _chmod_created_ancestors is a private log_hygiene member --
 # the only thing this module needs from it that has no public equivalent
 # (secure_path's own dir-hardening is entangled with its append-mode open,
@@ -5914,7 +5918,16 @@ async def handle_health(request: web.Request) -> web.Response:
         # because a response cannot see the difference.
         checks = {**checks, "agent": identity,
                   "role": _health_role_for(identity)}
-    return web.json_response(checks, status=status_code)
+    # THE DROP, at the response boundary: the copies this release stopped
+    # serving come off HERE, on a fresh object, for the same reason the
+    # identity keys go on a copy. ⛔ Never off `_health_cache["checks"]` —
+    # telemetry_extras() reads the cached llm_oldest_inflight_age_s and
+    # llm_suspect_wedged to BUILD the new homes, so stripping the cache would
+    # blank the very keys this drop points readers at. Applied on both paths
+    # that reach here, so an auth-off install and an authenticated caller see
+    # one shape; the anonymous three-key payload returned above is untouched.
+    return web.json_response(strip_dropped(checks, HEALTH_CONTRACT),
+                             status=status_code)
 
 
 # --------------------------------------------------------------------------- #
