@@ -47,7 +47,12 @@ so a container that can be empty is documented as well as its ``*`` children.
 ── LIFECYCLE FIELDS ────────────────────────────────────────────────────────────
 ``moved_to``   — this key is emitted from its NEW home as well as here; read the
                  new path, not this one.
-``removed_in`` — the release that stops emitting this key here.
+``removed_in`` — the release that stops serving this key here. ``is_dropped``
+                 compares it against ``VERSION``, and ``strip_dropped`` removes
+                 the dropped copies from the response at the two endpoint
+                 boundaries — so a checkout at any tag serves exactly what that
+                 release's contract says, and the row stays here as the
+                 old→new map for whoever reads the document afterwards.
 ``since``      — the release the key first appeared in. ``BASELINE`` means
                  "present at the v0.9.73 baseline, earlier introduction not
                  established" — stated rather than guessed (fact:1338: a number
@@ -72,6 +77,9 @@ __all__ = [
     "ANONYMOUS_HEALTH_KEYS",
     "walk_payload",
     "canonical_paths",
+    "is_dropped",
+    "dropped_paths",
+    "strip_dropped",
     "render_markdown",
     "type_matches",
 ]
@@ -191,22 +199,13 @@ INTRODUCED_0_9_81 = "0.9.81"
 #: same move `INTRODUCED_0_9_79`/`INTRODUCED_0_9_81` got at their releases) —
 #: not this build step's job.
 INTRODUCED_0_9_88 = "0.9.88"
-#: The release the dual-emitted /health copies TARGET being dropped in — a
-#: TARGET, never a commitment (fix round item 1 on decision:1832): the drop
-#: is GATED on the monitor-contract step (Group 3 — the monitor must consume
-#: the replacement keys before the originals can go), which has not landed.
-#: See coverage ledger row 11 (dual-emit drop, gated on the monitor-contract
-#: step) — NOT the CHANGELOG, which narrates releases after the fact and is
-#: not where a still-pending obligation is tracked. ⚠ CORRECTED (D4,
-#: decision:1832): the code constant sat at "0.9.75" — its ORIGINAL,
-#: never-updated value — through three releases of CHANGELOG prose saying
-#: otherwise (0.9.75 moved the drop to 0.9.76; 0.9.76 moved it again, undated,
-#: because that release became the A1 security fix instead). This names the
-#: EARLIEST release it can still land in, mutation-checked against VERSION
-#: (test_dual_emit_drop_target_is_strictly_after_this_release) so the target
-#: can never silently fall behind the release that is naming it. Whoever ships
-#: the removal — gated on the monitor-contract step actually landing —
-#: updates this alongside it.
+#: The FROZEN stamp of the first drop: the release from which the dual-emitted
+#: copies moved off `/health` at v0.9.74 stop being SERVED. Every row carrying
+#: it keeps its `moved_to`, so the document still renders the old→new map after
+#: the copies are gone. Frozen exactly like INTRODUCED_0_9_74 and its
+#: successors — a later release that drops a further batch of copies gets its
+#: own literal version string, never a re-dating of this one
+#: (test_the_first_drop_stamp_is_frozen pins the literal).
 DUAL_EMIT_DROP_TARGET = "0.9.90"
 
 #: CG (OBS round) — the enumerated `warnings[].key` vocabulary. Before this,
@@ -1803,8 +1802,15 @@ CONDITIONAL: frozenset = frozenset({
 
 
 def required_paths(contract: dict, endpoint: str) -> set:
-    """Documented paths that a fully-populated payload MUST emit."""
-    return {p for p in contract if f"{endpoint}:{p}" not in CONDITIONAL}
+    """Documented paths that a fully-populated payload MUST emit.
+
+    A row whose ``removed_in`` this release has reached is no longer served
+    (``is_dropped``), so it is not required either — the row stays in the dict
+    as the old→new map, and ``strip_dropped`` is what actually takes it off the
+    wire.
+    """
+    return {p for p, s in contract.items()
+            if f"{endpoint}:{p}" not in CONDITIONAL and not is_dropped(s)}
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1904,6 +1910,101 @@ def canonical_paths(payload: dict, contract: dict) -> set[str]:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# Dropping the copies a release stops serving
+#
+# THE CONTRACT DECIDES WHAT IS SERVED. `is_dropped` is the predicate, and the
+# two response boundaries (`hive_mind_proxy.handle_health`,
+# `coordinator.handle_telemetry`) call `strip_dropped` on a COPY of what they
+# are about to serve. Nothing internal changes: every emitter still runs, every
+# cache still holds the full shape, and the values derived from it —
+# `dependencies.*`, `warnings[]`, `status`, and the new homes that
+# `telemetry_extras()` builds by reading the /health cache — are untouched.
+# ═══════════════════════════════════════════════════════════════════════════════
+def is_dropped(spec: dict) -> bool:
+    """True iff this release has reached the row's ``removed_in``.
+
+    Keyed on ``VERSION`` rather than on a single named stamp, so a checkout at
+    any tag serves what THAT release's contract says: 0.9.89 serves the
+    dual-emitted copies, 0.9.90 and later do not, with no code difference
+    between the two trees. Compared as version TUPLES — a string compare would
+    rank "0.9.9" ahead of "0.9.10".
+    """
+    removed_in = spec.get("removed_in")
+    return (removed_in is not None
+            and _version_tuple(removed_in) <= _version_tuple(VERSION))
+
+
+def _payload_path(contract_path: str) -> str:
+    """A contract path as it is spelled in a PAYLOAD: ``x[]`` is the list key
+    ``x``, and a ``*`` segment stays a wildcard for the dynamic map it names."""
+    return contract_path.replace("[]", "")
+
+
+def dropped_paths(contract: dict) -> list[str]:
+    """Every path this release no longer serves, spelled as the payload spells
+    it. A ``family.*`` row stays a wildcard: it names every key under
+    ``family`` that no surviving row names by hand, so a later stamp on one
+    dynamic map can never take a documented sibling with it.
+    """
+    return sorted(_payload_path(p) for p, s in contract.items() if is_dropped(s))
+
+
+def _match(node: dict, key: str) -> dict | None:
+    """The trie child a payload key resolves to — its own name first, the
+    dynamic-map wildcard second, and None when the trie says nothing about it.
+    """
+    if key in node:
+        return node[key]
+    return node.get("*")
+
+
+def _prune(value: dict, dropped: dict, kept: dict) -> dict:
+    """One level of the strip, as a FRESH dict.
+
+    ⛔ NEVER IN PLACE. `capacity_snapshot()` returns a shallow copy whose
+    `derived`/`probe`/`fingerprint` sub-dicts are the module cache itself, and
+    `telemetry_extras()` serves those same objects — pruning them where they
+    lie would blank the new homes and the process-lifetime record. A subtree
+    nothing is removed from is reused by reference; every edited path is rebuilt.
+
+    Two clauses, because nine of the eleven `/health` families are documented
+    only through their dotted children and several are served as `None` before
+    their first probe:
+
+      (a) a key with NO surviving row under it goes, whatever it is serving —
+          a dict, an empty dict, a list or `None`;
+      (b) a key with survivors left keeps them — its dropped leaves are removed
+          from a fresh copy when it is a dict, and it is left exactly as it is
+          when it is not (`capacity` is `null` until the first derivation, and
+          both clients guard on that).
+    """
+    out: dict = {}
+    for key, sub in value.items():
+        dropped_here = _match(dropped, key)
+        if dropped_here is None:
+            out[key] = sub
+            continue
+        kept_here = _match(kept, key)
+        if kept_here is None:
+            continue
+        out[key] = _prune(sub, dropped_here, kept_here) if isinstance(sub, dict) else sub
+    return out
+
+
+def strip_dropped(payload: dict, contract: dict) -> dict:
+    """``payload`` without the copies this release stopped serving.
+
+    Returns a new object and never mutates the input; a documented path the
+    payload does not carry is simply absent, not an error.
+    """
+    if not isinstance(payload, dict):
+        return payload
+    dropped = _trie(dropped_paths(contract))
+    kept = _trie(_payload_path(p) for p, s in contract.items() if not is_dropped(s))
+    return _prune(payload, dropped, kept)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # Rendering the document
 # ═══════════════════════════════════════════════════════════════════════════════
 _RULE_OF_THUMB = (
@@ -1915,8 +2016,12 @@ _RULE_OF_THUMB = (
 def _rows(contract: dict, endpoint: str) -> list[str]:
     lines = []
     for cat in CATEGORIES:
+        # A dropped row is off the wire, so it is off the LIVE table — its
+        # old→new mapping is rendered once, in "Dual-emitted copies dropped".
+        # Filtered before the emptiness check, so a category whose every row
+        # has gone loses its heading too rather than printing an empty table.
         entries = [(p, s) for p, s in sorted(contract.items())
-                   if s["category"] == cat]
+                   if s["category"] == cat and not is_dropped(s)]
         if not entries:
             continue
         lines.append("")
@@ -1926,15 +2031,9 @@ def _rows(contract: dict, endpoint: str) -> list[str]:
         lines.append("|---|---|---|---|---|---|---|---|")
         for path, spec in entries:
             note = (spec["note"] or "").replace("|", "\\|").replace("\n", " ")
-            removed_in = spec["removed_in"]
-            # Fix round item 1b (decision:1832): DUAL_EMIT_DROP_TARGET is a
-            # TARGET, never a commitment — render it distinctly so a reader
-            # does not mistake "removed in" for a scheduled date the way the
-            # bare version string invited before.
-            if removed_in == DUAL_EMIT_DROP_TARGET:
-                removed_in_cell = f"{removed_in} (targeted)"
-            else:
-                removed_in_cell = removed_in or "—"
+            # A row still in a live table has not been reached by its stamp
+            # yet, so the cell states the release that will stop serving it.
+            removed_in_cell = spec["removed_in"] or "—"
             lines.append(
                 f"| `{path}` | {'/'.join(spec['types'])} | {spec['unit'] or '—'} "
                 f"| {spec['since']} | {'`' + spec['moved_to'] + '`' if spec['moved_to'] else '—'} "
@@ -2034,14 +2133,26 @@ def render_markdown() -> str:
     for rm in REMOVED_IN_0_9_88:
         a(f"| {rm['endpoint']} | `{rm['path']}` | {rm['reason']} |")
     a("")
-    a("## Dual-emit drop target")
+    a("## Dual-emitted copies dropped")
     a("")
-    a(f"`removed_in: {DUAL_EMIT_DROP_TARGET} (targeted)` marks a key moved off `/health` "
-      "and dual-emitted since v0.9.74. The drop is **gated on the monitor-contract step "
-      "landing first** (Group 3 — the monitor must consume the replacement keys before "
-      f"the originals can go); `{DUAL_EMIT_DROP_TARGET}` names only the earliest release "
-      "it could still happen in, **not a commitment**.")
+    a("Each key below was moved to a new home and served from both places while "
+      "consumers migrated; from the release its table names, only the new path is "
+      "served. This is the map — read the right-hand column.")
     a("")
+    stamped = [(endpoint, path, spec)
+               for endpoint, contract in (("health", HEALTH), ("telemetry", TELEMETRY))
+               for path, spec in sorted(contract.items()) if spec["removed_in"]]
+    for stamp in sorted({spec["removed_in"] for _, _, spec in stamped},
+                        key=_version_tuple):
+        a(f"### Dropped in {stamp}")
+        a("")
+        a("| endpoint | old key | read instead |")
+        a("|---|---|---|")
+        for endpoint, path, spec in stamped:
+            if spec["removed_in"] == stamp:
+                a(f"| `GET /{'health' if endpoint == 'health' else 'memory/telemetry'}` "
+                  f"| `{path}` | `{spec['moved_to']}` |")
+        a("")
     a("## `GET /health`")
     a("")
     a("Paths are relative to the response object.")

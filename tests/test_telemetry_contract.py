@@ -33,6 +33,30 @@ from telemetry_instruments import LatencyRing, Counter, percentile  # noqa: E402
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# WHICH RELEASE THE CONTRACT IS SPEAKING FOR
+#
+# `is_dropped` compares a row's `removed_in` against `telemetry_contract.VERSION`,
+# so the RELEASE is an input to every question about the drop. These two fixtures
+# state it, rather than letting a test inherit whichever release this checkout
+# happens to be — which is also what lets the drop be proven on a tree whose own
+# version does not serve it yet.
+# ══════════════════════════════════════════════════════════════════════════════
+
+@pytest.fixture
+def at_the_drop_release(monkeypatch):
+    """The release the dual-emitted copies stop being served in."""
+    monkeypatch.setattr(tc, "VERSION", tc.DUAL_EMIT_DROP_TARGET)
+    return tc.DUAL_EMIT_DROP_TARGET
+
+
+@pytest.fixture
+def before_the_drop_release(monkeypatch):
+    """The release before it — every copy is still served."""
+    monkeypatch.setattr(tc, "VERSION", "0.9.89")
+    return "0.9.89"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # The pure primitives
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -984,13 +1008,196 @@ def test_the_w2_entries_are_pinned_to_a_frozen_stamp_not_the_live_version():
         "INTRODUCED_0_9_79 stamp")
 
 
-def test_dual_emit_drop_target_is_strictly_after_this_release():
-    """Fix round item 1c (decision:1832): the target cannot name a release
-    that has already happened — DUAL_EMIT_DROP_TARGET must be STRICTLY
-    greater than VERSION, compared as a version TUPLE (a string compare
-    would rank "0.9.9" ahead of "0.9.10")."""
-    assert (tc._version_tuple(tc.DUAL_EMIT_DROP_TARGET)
-            > tc._version_tuple(tc.VERSION))
+def test_the_first_drop_stamp_is_frozen():
+    """decision:1832 item 1c, kept: the stamp names ONE release and cannot
+    re-date itself. Its whole job is to say which release stopped serving the
+    copies; a constant that drifts with VERSION would re-write that answer for
+    every already-shipped row in the generated document."""
+    assert tc.DUAL_EMIT_DROP_TARGET == "0.9.90"
+
+
+def test_a_row_past_its_removed_in_is_dropped_and_a_future_one_is_not(
+        at_the_drop_release, monkeypatch):
+    """THE PREDICATE, both directions, against the real contract. At the drop
+    release none of the stamped rows is required of a payload any more; at the
+    release before it, every one of them still is."""
+    for contract, endpoint in ((tc.HEALTH, "health"), (tc.TELEMETRY, "telemetry")):
+        required = tc.required_paths(contract, endpoint)
+        still_required = [p for p in tc.dropped_paths(contract) if p in required]
+        assert not still_required, (
+            f"{endpoint} still demands paths this release no longer serves: "
+            f"{still_required}")
+
+    monkeypatch.setattr(tc, "VERSION", "0.9.89")
+    for contract, endpoint in ((tc.HEALTH, "health"), (tc.TELEMETRY, "telemetry")):
+        assert not tc.dropped_paths(contract), (
+            f"{endpoint} drops a row a release before its removed_in")
+        required = tc.required_paths(contract, endpoint)
+        stamped = [p for p, s in contract.items()
+                   if s["removed_in"] and f"{endpoint}:{p}" not in tc.CONDITIONAL]
+        missing = [p for p in stamped if p not in required]
+        assert not missing, (
+            f"{endpoint} stopped requiring {missing} a release early")
+
+
+def test_version_comparison_is_numeric_not_lexical(monkeypatch):
+    """"0.9.9" sorts AFTER "0.9.10" as a string, which would drop a row ten
+    releases before its time. The predicate compares tuples."""
+    monkeypatch.setattr(tc, "VERSION", "0.9.10")
+    assert tc.is_dropped({"removed_in": "0.9.10"}) is True
+    assert tc.is_dropped({"removed_in": "0.9.9"}) is True
+    assert tc.is_dropped({"removed_in": "0.9.11"}) is False
+    assert tc.is_dropped({"removed_in": None}) is False
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# strip_dropped — the copies come off the RESPONSE, never off the state
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _sample_health() -> dict:
+    """A /health body in the shape the gateway serves it, carrying one member
+    of each family the strip has to reason about."""
+    return {
+        "status": "ok", "version": "0.9.90", "api_version": "1",
+        "capacity": {
+            "timestamp": "2026-09-06T00:00:00+00:00",
+            "trigger": "probe",
+            "fingerprint": {"hardware": {"nproc": 8, "mem_total_bytes": 1,
+                                         "gpu_present": True}},
+            "probe": {"probe_stale": False, "probed_at": "2026-09-06T00:00:00+00:00"},
+            "derived": {"s_mean_s": 1.0, "client_ceiling_s": 2.0,
+                        "s_max_measured_s": 3.0, "queue_bound": 4,
+                        "tolerable_wait_s": 5.0},
+        },
+        "config": {"embed_max_chars": 8000},
+        "llm_affinity": {"hits": 1, "misses": 2, "hit_rate": 0.33,
+                         "hot_prefixes": []},
+        "llm_pool": {"http://a:5000": {"weight": 1}},
+        "daemon": "running",
+        "nrem_daemon_process": "running",
+        "dependencies": {"postgres": {"state": "ok"}},
+    }
+
+
+def test_strip_dropped_returns_a_new_object_and_leaves_the_input_alone(
+        at_the_drop_release):
+    """⛔ THE STATE IS SHARED. `capacity_snapshot()` hands out a shallow copy
+    whose sub-dicts ARE the module cache, and `telemetry_extras()` serves those
+    same objects as the new homes — a strip that pruned in place would blank
+    them and the process-lifetime record with them."""
+    payload = _sample_health()
+    original = json.loads(json.dumps(payload))
+    capacity_before = payload["capacity"]
+    derived_before = payload["capacity"]["derived"]
+
+    stripped = tc.strip_dropped(payload, tc.HEALTH)
+
+    assert stripped is not payload
+    assert payload == original, "strip_dropped mutated its input"
+    assert payload["capacity"] is capacity_before
+    assert payload["capacity"]["derived"] is derived_before
+    assert stripped["capacity"] is not capacity_before
+    assert stripped["capacity"]["derived"] is not derived_before
+
+
+def test_a_partially_dropped_family_keeps_exactly_its_survivors(
+        at_the_drop_release):
+    """`capacity` is the one /health family with rows on both sides of the
+    stamp: the five survivors are what `postflight.sh`'s verdict, the MCP
+    server's ceiling and the client's search sizing all read."""
+    stripped = tc.strip_dropped(_sample_health(), tc.HEALTH)
+    assert set(stripped["capacity"]) == {"timestamp", "probe", "derived"}
+    assert stripped["capacity"]["probe"] == {"probe_stale": False}
+    assert set(stripped["capacity"]["derived"]) == {
+        "s_mean_s", "client_ceiling_s", "s_max_measured_s"}
+
+
+def test_a_wholly_dropped_family_goes_whatever_it_is_serving(at_the_drop_release):
+    """Clause (a). Nine /health families are documented only through their
+    dotted children, and four of them are served as `null` before their first
+    probe — a rule that only removed an emptied DICT would leave those on the
+    wire as `null`, undocumented."""
+    payload = _sample_health()
+    payload["gpu_probe"] = None
+    payload["project_identity"] = None
+    payload["llm_reserved"] = []
+    stripped = tc.strip_dropped(payload, tc.HEALTH)
+    for gone in ("config", "llm_affinity", "llm_pool", "daemon",
+                 "gpu_probe", "project_identity", "llm_reserved"):
+        assert gone not in stripped, f"{gone} is still served"
+
+
+def test_a_partially_dropped_family_that_is_not_a_dict_is_left_alone(
+        at_the_drop_release):
+    """Clause (b) on a non-dict. `capacity` is `null` until the first
+    derivation and both front doors guard on exactly that — serving it as
+    anything else, or removing it, is a different absence from the one they
+    were written against."""
+    payload = _sample_health()
+    payload["capacity"] = None
+    stripped = tc.strip_dropped(payload, tc.HEALTH)
+    assert "capacity" in stripped
+    assert stripped["capacity"] is None
+
+
+def test_the_telemetry_sections_keep_everything_that_was_not_stamped(
+        at_the_drop_release):
+    snap = {
+        "postgres": {"technical_docs": 171, "pool_size": 3,
+                     "outbox": {"applied": 10},
+                     "outbox_failed_oldest_age_seconds": None},
+        "neo4j": {"facts_total": 2, "rem_dead_lettered": 3, "rem_failing": 1},
+        "llm_faults": {"http://a:5000": {"gateway": {"count": 0, "last": None}}},
+        "axis_registry_read_failures_total": 0,
+        "outbox": {"pending": 1, "applied": 10},
+        "rem": {"dead_lettered": 3},
+    }
+    stripped = tc.strip_dropped(snap, tc.TELEMETRY)
+    assert set(stripped["postgres"]) == {"technical_docs", "pool_size"}
+    assert set(stripped["neo4j"]) == {"facts_total"}
+    assert "llm_faults" not in stripped
+    assert "axis_registry_read_failures_total" not in stripped
+    assert stripped["outbox"] == {"pending": 1, "applied": 10}
+    assert stripped["rem"] == {"dead_lettered": 3}
+
+
+def test_a_documented_path_the_payload_never_carried_is_tolerated(
+        at_the_drop_release):
+    """A section that failed, an install with no LLM pool, a probe that has not
+    run — the strip describes what to remove, it does not require it."""
+    assert tc.strip_dropped({"status": "ok"}, tc.HEALTH) == {"status": "ok"}
+    assert tc.strip_dropped({}, tc.TELEMETRY) == {}
+
+
+def test_an_undocumented_key_is_never_stripped(at_the_drop_release):
+    """The contract says what goes, and only that. A key it does not document
+    is a defect for the two-way pin to name, never something the strip removes
+    on the way out."""
+    stripped = tc.strip_dropped({"a_key_nobody_documented": 1}, tc.HEALTH)
+    assert stripped == {"a_key_nobody_documented": 1}
+
+
+def test_the_anonymous_three_keys_are_never_dropped(at_the_drop_release):
+    """S-10's slimmed payload is the one shape an unauthenticated caller sees;
+    a drop that reached into it would take the whole endpoint down for every
+    anonymous consumer."""
+    dropped = tc.dropped_paths(tc.HEALTH)
+    for key in tc.ANONYMOUS_HEALTH_KEYS:
+        assert key not in dropped
+
+
+def test_a_wildcard_row_never_takes_a_documented_sibling_with_it(
+        at_the_drop_release, monkeypatch):
+    """`postgres.outbox.*` is stamped and has no unstamped sibling today. The
+    rule is what keeps that a fact about the data rather than luck: a key the
+    wildcard covers goes, a key a surviving row names by hand stays."""
+    contract = dict(tc.TELEMETRY)
+    contract["postgres.outbox.kept"] = tc._k("int", "outbox")
+    snap = {"postgres": {"outbox": {"applied": 10, "kept": 1},
+                         "technical_docs": 171}}
+    stripped = tc.strip_dropped(snap, contract)
+    assert stripped["postgres"]["outbox"] == {"kept": 1}
+    assert stripped["postgres"]["technical_docs"] == 171
 
 
 # ══════════════════════════════════════════════════════════════════════════════
