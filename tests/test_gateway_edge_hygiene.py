@@ -230,6 +230,27 @@ def test_trailing_slash_encoder_spelling_is_404_not_forwarded(monkeypatch):
     assert b"registers /v1/embeddings exactly" in body
 
 
+@pytest.mark.parametrize("spelling", ["/v1/embedding%73", "/v1/rerankin%67"])
+def test_percent_encoded_encoder_spelling_is_404_never_forwarded(monkeypatch, spelling):
+    """CLIENT-VISIBLE CHANGE (CHANGELOG line owed): aiohttp matches on
+    `rel_url.path_safe`, which decodes `%73` to `s`, so these spellings DO
+    reach `handle_encoder` — and were forwarded with the encoded path on the
+    wire. The handler now compares the raw wire path against the router's
+    match, so the encoder edge applies the same rule as the credentialed
+    gates: what is compared is what would be forwarded.
+
+    `_probe` builds the URL with `encoded=True`, so the percent arrives
+    verbatim. The exact spelling is still forwarded and served — proved by
+    `test_post_to_an_encoder_path_reaches_the_encoder_backend` above, which
+    this test deliberately does not duplicate."""
+    (status, headers, body), _ = _probe_with(
+        monkeypatch, _MustNotCallSession(), "POST", spelling)
+    assert status == 404, f"{spelling} → {status} {body!r}"
+    assert headers.get("X-SM-Fault-Origin") == "gateway"
+    assert b"encoded spelling" in body
+    assert b"NOT forwarded" in body
+
+
 @pytest.mark.parametrize("spelling", ["/v1%2fembeddings", "/v1%2Fembeddings"])
 def test_encoded_slash_encoder_spelling_is_405_never_the_encoder(monkeypatch, spelling):
     """A1 containment, now covering the encoder names too: aiohttp matched on

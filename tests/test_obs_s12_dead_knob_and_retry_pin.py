@@ -121,10 +121,11 @@ def test_removed_in_0_9_88_renders_into_the_generated_doc():
 
 
 def test_required_paths_never_demand_the_removed_key():
-    """`required_paths()` ignores `removed_in` entirely (R-B's own warning) —
-    the only way a removed key stays out of the "every documented key is
-    emitted" check is for it to be gone from the dict outright, which the
-    prior test already pins; this test pins the CONSEQUENCE directly."""
+    """A key REMOVED OUTRIGHT leaves the dict, so it can never be required
+    again whatever a release stamp says — a different mechanism from the
+    dual-emitted copies, which keep their rows as the old→new map and are
+    excluded by `is_dropped`. The prior test pins the removal; this pins the
+    consequence directly."""
     tc = _tc()
     assert "config.llm_pool_tuning.max_tries" not in tc.required_paths(tc.HEALTH, "health")
     assert "config.llm_pool_tuning.max_tries" not in tc.required_paths(tc.TELEMETRY, "telemetry")

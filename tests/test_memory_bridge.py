@@ -153,7 +153,7 @@ def _load_memory_bridge_from_unpinned(skill_dir: str, shutil, uuid):
     return mod
 
 
-def test_dotenv_scope_stray_home_level_env_is_not_picked_up(tmp_path, monkeypatch):
+def test_env_scope_stray_home_level_env_is_not_picked_up(tmp_path, monkeypatch):
     """A .env ABOVE the skill root (the $HOME-walk find_dotenv() used to
     reach) must be invisible -- S-18's whole point."""
     monkeypatch.delenv("AGENT_TOKEN", raising=False)
@@ -167,7 +167,7 @@ def test_dotenv_scope_stray_home_level_env_is_not_picked_up(tmp_path, monkeypatc
     assert os.environ.get("AGENT_TOKEN") != "tok_from_stray_home_env"
 
 
-def test_dotenv_scope_skill_root_env_is_picked_up(tmp_path, monkeypatch):
+def test_env_scope_skill_root_env_is_picked_up(tmp_path, monkeypatch):
     # A real AGENT_TOKEN sitting in this SESSION's os.environ (e.g. a
     # pre-existing, unrelated script's own naive env loader having already
     # run at collection time) must not shadow the value this test is
@@ -186,7 +186,7 @@ def test_dotenv_scope_skill_root_env_is_picked_up(tmp_path, monkeypatch):
     assert mod._request_headers().get("Authorization") == "Bearer tok_from_skill_root"
 
 
-def test_dotenv_scope_scripts_adjacent_env_is_picked_up(tmp_path, monkeypatch):
+def test_env_scope_scripts_adjacent_env_is_picked_up(tmp_path, monkeypatch):
     """The other documented candidate: an .env living beside memory_bridge.py
     itself (scripts/.env), not just the skill root."""
     monkeypatch.delenv("AGENT_TOKEN", raising=False)
@@ -200,7 +200,7 @@ def test_dotenv_scope_scripts_adjacent_env_is_picked_up(tmp_path, monkeypatch):
     assert mod._AGENT_TOKEN_FROM_FILE == "tok_from_scripts_dir"
 
 
-def test_dotenv_load_never_exports_agent_token_to_os_environ(tmp_path, monkeypatch):
+def test_env_load_never_exports_agent_token_to_os_environ(tmp_path, monkeypatch):
     """The core A1-deferred fix: AGENT_TOKEN sourced from the .env file must
     never land in this process's own os.environ, even though it IS used for
     this client's own outbound requests."""
@@ -218,7 +218,7 @@ def test_dotenv_load_never_exports_agent_token_to_os_environ(tmp_path, monkeypat
     assert mod.COORDINATOR_BASE == "http://example.invalid:9999"
 
 
-def test_dotenv_load_never_exports_gateway_secrets_to_os_environ(tmp_path, monkeypatch):
+def test_env_load_never_exports_gateway_secrets_to_os_environ(tmp_path, monkeypatch):
     """Required fix (A2 security review, finding 7): candidate 2 (the skill
     root .env) IS the gateway .env when this client is invoked from the
     repo root in admin mode -- so PG_PASSWORD/NEO4J_PASSWORD/AGENT_TOKENS/
@@ -245,7 +245,7 @@ def test_dotenv_load_never_exports_gateway_secrets_to_os_environ(tmp_path, monke
     assert mod.COORDINATOR_BASE == "http://example.invalid:9999"
 
 
-def test_dotenv_scope_operator_export_still_wins_over_file(tmp_path, monkeypatch):
+def test_env_scope_operator_export_still_wins_over_file(tmp_path, monkeypatch):
     """An operator's own real `export AGENT_TOKEN=...` (or a test's
     monkeypatch.setenv) must still take precedence over the file value --
     the client never becomes LESS configurable than before."""
@@ -332,8 +332,12 @@ def test_format_status_renders_sections():
             "timestamp": "2026-06-09T20:00:00+00:00",
             "postgres": {
                 "technical_docs": 171,
-                "outbox": {"applied": 10, "rem_reviewed": 3},
                 "community_summaries": {"total": 2, "superseded": 0, "insight": 0},
+            },
+            "outbox": {
+                "pending": 2, "applied": 10, "rem_reviewed": 3, "failed": 0,
+                "drain_rate_per_min": 1.5, "oldest_pending_age_s": 4,
+                "apply_latency_p50_s": 0.1, "age_limit_s": 900,
             },
             "neo4j": {
                 "facts_total": 97, "facts_rem_pending": 1, "facts_unconsolidated": 20,
@@ -343,9 +347,52 @@ def test_format_status_renders_sections():
     }
     out = memory_bridge.format_status(payload)
     assert "technical_docs:      171" in out
-    assert "applied" in out and "rem_reviewed" in out
+    # ⛔ THE RENDERED TEXT, not "the fields are in there somewhere". The outbox
+    # is a twelve-key section and this line is a four-count census: pinning the
+    # string is what stops a rewrite quietly dumping the whole section, and what
+    # makes a count that stopped being rendered fail here.
+    assert ("  outbox:              "
+            "{'pending': 2, 'applied': 10, 'rem_reviewed': 3, 'failed': 0}") in out
+    assert "drain_rate_per_min" not in out
     assert "decisions: 75 total" in out
     assert "REM pending 71" in out
+
+
+def test_format_status_omits_an_outbox_count_the_gateway_did_not_report():
+    """MUTATION TARGET: absence is not zero. A gateway that reported no
+    `failed` count has not reported zero failures, and printing one would
+    invent a measurement."""
+    out = memory_bridge.format_status({
+        "status": "success",
+        "telemetry": {"outbox": {"pending": 2, "applied": 10}, "postgres": {}},
+    })
+    assert "  outbox:              {'pending': 2, 'applied': 10}" in out
+
+
+def test_format_status_renders_the_rem_section_from_its_own_home():
+    """REM is its own telemetry section with its own error branch — a failed
+    graph census must not take the enrichment verdict down with it."""
+    out = memory_bridge.format_status({
+        "status": "success",
+        "telemetry": {
+            "neo4j": {"error": "connection refused"},
+            "rem": {"dead_lettered": 3, "failing": 9, "max_attempts": 5,
+                    "passed_over": 12, "starved_pending": 3},
+        },
+    })
+    assert "neo4j: ERROR connection refused" in out
+    assert "9 retrying | 3 DEAD-LETTERED at 5 attempts" in out
+    assert "operator reset needed" in out
+    assert "REM fairness: 12 passed-over event(s) | 3 record(s)" in out
+
+
+def test_format_status_reports_a_failed_rem_section_as_its_own_error():
+    out = memory_bridge.format_status({
+        "status": "success",
+        "telemetry": {"rem": {"error": "timeout"}, "neo4j": {"facts_total": 2}},
+    })
+    assert "rem: ERROR timeout" in out
+    assert "facts:     2 total" in out
 
 
 def test_format_status_passes_through_errors():
@@ -471,7 +518,7 @@ def test_format_status_flags_dropped_audit_lines_as_an_incomplete_trail():
 
 def test_format_status_renders_llm_credential_faults_and_says_fix_the_key():
     out = _status({
-        "llm_faults": {
+        "llm": {"faults": {
             "http://backend:5000": {
                 "gateway": {"count": 0, "last": None},
                 "llm": {
@@ -480,7 +527,7 @@ def test_format_status_renders_llm_credential_faults_and_says_fix_the_key():
                     "transient": {"count": 0, "last": None},
                 },
             },
-        },
+        }},
     })
     assert "http://backend:5000" in out
     assert "credential 4" in out
@@ -491,7 +538,7 @@ def test_format_status_does_not_say_fix_the_key_for_transient_only_faults():
     """The credential/transient split is the whole point of the taxonomy:
     transient retries on its own and must not be dressed as operator work."""
     out = _status({
-        "llm_faults": {
+        "llm": {"faults": {
             "http://backend:5000": {
                 "gateway": {"count": 0, "last": None},
                 "llm": {
@@ -500,7 +547,7 @@ def test_format_status_does_not_say_fix_the_key_for_transient_only_faults():
                                   "last": {"ts": "2026-08-16T10:00:00+00:00", "status": 429}},
                 },
             },
-        },
+        }},
     })
     assert "transient 9" in out
     assert "fix the key" not in out
@@ -533,7 +580,7 @@ def test_format_status_survives_a_malformed_llm_faults_payload():  # review C1
         {"b": "entirely-wrong"},
         {"b": {"gateway": {"count": 1, "last": {"ts": 12345}}}},
     ):
-        out = _status({"llm_faults": broken})   # must not raise
+        out = _status({"llm": {"faults": broken}})   # must not raise
         assert isinstance(out, str)
 
 

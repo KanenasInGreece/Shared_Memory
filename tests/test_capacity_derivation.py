@@ -555,8 +555,10 @@ def test_capacity_key_reflects_a_stored_record(monkeypatch, tmp_path):
     req.headers = {"Authorization": "Bearer tok_cap_test2"}
     req.app = {"proxy": proxy}
     body = json.loads(asyncio.run(g.handle_health(req)).body.decode())
-    assert body["capacity"]["trigger"] == "first_derivation"
+    # `/health` keeps the sizing a client sets its own timeouts from; the whole
+    # record — trigger, fingerprint, measured probe — is on `/memory/telemetry`.
     assert body["capacity"]["derived"]["s_mean_s"] == 10.0
+    assert g.capacity_snapshot()["trigger"] == "first_derivation"
 
 
 def test_single_search_exceeds_wait_flag(monkeypatch, tmp_path):

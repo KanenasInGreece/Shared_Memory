@@ -262,7 +262,7 @@ def _load_gateway_auth_off(monkeypatch):
     return g, coordinator
 
 
-def test_health_carries_pgvector_with_both_fields_when_enabled(monkeypatch):
+def test_the_pgvector_probe_result_carries_both_fields_when_enabled(monkeypatch):
     g, coordinator_mod = _load_gateway_auth_off(monkeypatch)
     assert g.AUTH_CONFIGURED_AT_STARTUP is False
 
@@ -275,11 +275,16 @@ def test_health_carries_pgvector_with_both_fields_when_enabled(monkeypatch):
     req = _health_request()
     req.app = {"proxy": proxy, "coordinator": c}
 
-    body = json.loads(asyncio.run(g.handle_health(req)).body.decode())
-    assert body["pgvector"] == {"version": "0.8.2", "iterative_scan": True}
+    checks = asyncio.run(g._build_health_checks(proxy, c))
+    assert checks["pgvector"] == {"version": "0.8.2", "iterative_scan": True}
+    # The copy is BUILT here and no longer SERVED — the probe's result is a
+    # Postgres fact, and `/memory/telemetry` → `postgres.pgvector` is where a
+    # reader finds it now.
+    checks = asyncio.run(g._build_health_checks(proxy, None))
+    assert "pgvector" not in checks
 
 
-def test_health_carries_pgvector_disabled_below_the_floor(monkeypatch):
+def test_the_pgvector_probe_result_reads_disabled_below_the_floor(monkeypatch):
     g, coordinator_mod = _load_gateway_auth_off(monkeypatch)
 
     c = coordinator_mod.MemoryCoordinator()
@@ -291,11 +296,11 @@ def test_health_carries_pgvector_disabled_below_the_floor(monkeypatch):
     req = _health_request()
     req.app = {"proxy": proxy, "coordinator": c}
 
-    body = json.loads(asyncio.run(g.handle_health(req)).body.decode())
-    assert body["pgvector"] == {"version": "0.7.4", "iterative_scan": False}
+    checks = asyncio.run(g._build_health_checks(proxy, c))
+    assert checks["pgvector"] == {"version": "0.7.4", "iterative_scan": False}
 
 
-def test_health_pgvector_null_version_reads_as_disabled(monkeypatch):
+def test_a_null_pgvector_version_reads_as_disabled(monkeypatch):
     """The probe-failed / extension-unreadable case — None is the coordinator
     __init__ default before start() ever runs a probe."""
     g, coordinator_mod = _load_gateway_auth_off(monkeypatch)
@@ -309,14 +314,14 @@ def test_health_pgvector_null_version_reads_as_disabled(monkeypatch):
     req = _health_request()
     req.app = {"proxy": proxy, "coordinator": c}
 
-    body = json.loads(asyncio.run(g.handle_health(req)).body.decode())
-    assert body["pgvector"] == {"version": None, "iterative_scan": False}
+    checks = asyncio.run(g._build_health_checks(proxy, c))
+    assert checks["pgvector"] == {"version": None, "iterative_scan": False}
 
 
-def test_health_without_a_coordinator_carries_no_pgvector_key(monkeypatch):
-    """The key lives inside `if coordinator is not None:` — a caller with no
+def test_without_a_coordinator_there_is_no_pgvector_key(monkeypatch):
+    """The key lives inside `if coordinator is not None:` — a probe with no
     coordinator attached (today's shape for some test harnesses) must not
-    see a fabricated pgvector block."""
+    fabricate a pgvector block."""
     g, _coordinator_mod = _load_gateway_auth_off(monkeypatch)
 
     proxy = g.AsyncHiveMindProxy()

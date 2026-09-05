@@ -67,6 +67,18 @@ LimitCORE=0
 # for the write-path-outside-%h observation this directive does not resolve.
 ProtectSystem=full
 
+# RestrictAddressFamilies: every socket family this unit's processes use is
+# traced, and the set is closed to those four. AF_UNIX — the UDS listener,
+# asyncio socketpairs, journald. AF_INET/AF_INET6 — the aiohttp server and
+# client, asyncpg, the neo4j driver, httpx to the encoders. AF_NETLINK —
+# glibc's getaddrinfo interface enumeration, and nvtop's device enumeration
+# behind gpu_load.py. Nothing under shared-memory/scripts/ opens AF_PACKET,
+# AF_ALG or AF_VSOCK. Run as a drop-in on the test host from 2026-09-04
+# before shipping here: health ok, search served, zero restarts, and the
+# nvtop probe reporting gpu_probe.state = ok with inference_busy reading a
+# real value rather than `unknown`.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+
 # LoadCredential= example (SEC-06, PR A4; corrected fix round 1, R3, Opus
 # review, verified against `man systemd.exec` and `systemd-path` on the
 # reference host) — uncomment to deliver a secret without ever touching

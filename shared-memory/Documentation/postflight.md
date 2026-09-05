@@ -121,7 +121,7 @@ and this rule disagree, the script is the defect (fix-round ruling `decision:143
 **In CANARY MODE (below), behavior is unchanged.**
 
 **Check.** Save a canary record through the gateway (via
-`uv run --with httpx --with python-dotenv python shared-memory/scripts/memory_bridge.py save ...`
+`uv run --with httpx python shared-memory/scripts/memory_bridge.py save ...`
 with `AGENT_TOKEN` exported), then verify it in the stores:
 
 - **(a) Embedding dimension EQUALS 1024** — the value is asserted, not an equality between two
@@ -256,9 +256,12 @@ which mode produced it.
 **In CANARY MODE**, behavior is unchanged: time three operations — a short save (~160 chars, A4's
 canary), a realistic save (~3.5 KB), and a search — and write a baseline JSON to
 `~/.shared-memory/postflight/baseline-<UTC ISO8601>.json` containing: the three timings, the
-`/health` `backend_capability` block, a hardware fingerprint (thread count via `nproc`,
-`MemTotal`, the `lspci` VGA line always, plus an `nvtop` presence boolean), framework version and
-date. Save contents are unique per run (a timestamp is embedded) so SHA-256 idempotency never
+`/health` `backend_capability` block, the `/health` `capacity` block and the whole
+`/memory/telemetry` `capacity` record beside it (`capacity_telemetry` — the fingerprint and the
+measured probe are what make a baseline comparable across hardware, and they live on the numbers
+endpoint), a hardware fingerprint (thread count via `nproc`, `MemTotal`, the `lspci` VGA line
+always, plus an `nvtop` presence boolean), framework version and date. `capacity_telemetry` is
+`null` when no `AGENT_TOKEN` was available to read the numbers endpoint with. Save contents are unique per run (a timestamp is embedded) so SHA-256 idempotency never
 short-circuits the timing. **Measurement honesty:** the `uv` environment is warmed *untimed*
 before the first timed operation (on a fresh host uv's resolution would otherwise dominate the
 number); each timing window contains exactly one save; a timed-out operation records `null`,
@@ -278,6 +281,10 @@ wildly different pool sizes as if they were the same measurement. `corpus_size` 
 both postflight modes and, like every other A6 field, never affects the exit code. A printed
 summary line states the same scope and count alongside "A6 baseline written: …".
 
+The capacity verdict section below reads `capacity.derived` from `/memory/telemetry`, and says
+UNDERIVABLE when no `AGENT_TOKEN` is set to fetch it with, exactly as it does before the gateway
+has derived its first record.
+
 ⚠ **Related trap, deliberately not reproduced here:** the capacity verdict section below prints a
 worst-case rerank-stage projection (typically tens of seconds) beside the search timing measured
 above (typically ~1 s). Those are two different quantities — a fixed 20-document worst-case model
@@ -293,7 +300,7 @@ constant is the framework's known monitor-class defect — canary-mode `search` 
 project-filtered search for a unique marker; re-baseline's phrase search is unfiltered and
 whole-corpus, a different workload). A5's summary-search timing instead lands under its **own**
 key, `search_rebaseline` — `null` in canary mode, populated in re-baseline mode. Everything else —
-`backend_capability`, `capacity`, `hardware`, `framework_version`, `date` — is unchanged,
+`backend_capability`, `capacity`, `capacity_telemetry`, `hardware`, `framework_version`, `date` — is unchanged,
 read-only, and rendered identically to canary mode; **the capacity verdict section (below the JSON
 write) is untouched by mode.**
 
@@ -349,7 +356,7 @@ achieving nothing. A8 exists specifically to close that hole.
 authenticated (or, on an auth-off install, anonymous) `/health` payload — never by re-parsing
 `LLM_BACKENDS` / `LLM_BACKENDS_JSON` / `LLM_DEFAULT_TARGET` in bash (same reasoning as A3:
 postflight never duplicates the gateway's own resolution logic, it asks and trusts the answer).
-⚠ **Do not confuse this with `/health`'s `config.llm_backends`** — that is the *configured* list,
+⚠ **Do not confuse this with `/memory/telemetry`'s `config.llm_backends`** — that is the *configured* list,
 and `hive_mind_proxy.py`'s `_load_llm_backends()` **never returns it empty**: an unset
 `LLM_BACKENDS`/`LLM_BACKENDS_JSON` falls back to a single-entry list built from
 `LLM_DEFAULT_TARGET`, itself defaulting to `http://localhost:5000`. A fix-round build keyed A8 on

@@ -141,22 +141,38 @@ def test_logrotate_unit_pins_protectsystem_full():
     assert "ProtectSystem=full" in _lines(_LOGROTATE_UNIT)
 
 
-# ── Forbidden directives — ABSENT, pinned (step-2 review F2) ─────────────────
+# ── Directive pins: what is forbidden, and what is fixed at a VALUE ─────────
 #
-# The ruling forbids `PrivateTmp` in every unit and reserves `RestrictAddressFamilies`
-# for the merger's test-host drop-in trial; neither may appear as a directive. And
-# `LimitCORE=0` is only a fix while it is the ONLY LimitCORE line — a later
-# `LimitCORE=infinity` would win and the `in` assertions above would stay green.
+# `PrivateTmp` is forbidden in every unit. `RestrictAddressFamilies` belongs to
+# the gateway alone, at one exact value — the four families its processes were
+# traced to use — and stays absent from the backup and logrotate units, which
+# have no such trace behind them. And `LimitCORE=0` is only a fix while it is
+# the ONLY LimitCORE line — a later `LimitCORE=infinity` would win and the `in`
+# assertions above would stay green.
 
 def _directive_lines(lines: list[str], name: str) -> list[str]:
     return [l.strip() for l in lines if l.strip().startswith(f"{name}=")]
 
 
 @pytest.mark.parametrize("unit", [_GATEWAY_UNIT, _BACKUP_UNIT, _LOGROTATE_UNIT])
-def test_unit_has_no_privatetmp_and_no_restrictaddressfamilies_directive(unit):
-    lines = _lines(unit)
-    assert _directive_lines(lines, "PrivateTmp") == [], unit
-    assert _directive_lines(lines, "RestrictAddressFamilies") == [], unit
+def test_no_unit_has_a_privatetmp_directive(unit):
+    assert _directive_lines(_lines(unit), "PrivateTmp") == [], unit
+
+
+@pytest.mark.parametrize("unit", [_BACKUP_UNIT, _LOGROTATE_UNIT])
+def test_backup_and_logrotate_units_have_no_restrictaddressfamilies_directive(unit):
+    assert _directive_lines(_lines(unit), "RestrictAddressFamilies") == [], unit
+
+
+def test_gateway_unit_restricts_address_families_to_the_four_it_uses():
+    """Asserted as a VALUE, not as presence (fact:1309): a second line, a
+    reordering, or a widened set is a different security posture and must
+    fail here. AF_NETLINK is load-bearing — without it getaddrinfo cannot
+    enumerate interfaces and nvtop cannot enumerate devices, which latches
+    GPU-aware dreaming off until the gateway is restarted."""
+    assert _directive_lines(_lines(_GATEWAY_UNIT), "RestrictAddressFamilies") == [
+        "RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK"
+    ]
 
 
 @pytest.mark.parametrize("unit", [_GATEWAY_UNIT, _BACKUP_UNIT, _LOGROTATE_UNIT])

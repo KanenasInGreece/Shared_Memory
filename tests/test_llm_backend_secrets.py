@@ -312,13 +312,19 @@ def test_health_config_shows_bool_and_model_for_authenticated_caller_never_the_t
         req.app = {"proxy": proxy}
 
         body = json.loads(asyncio.run(g.handle_health(req)).body.decode())
-        by_url = {e["url"]: e for e in body["config"]["llm_backends"]}
+        # ⛔ THE ASSERTION MOVES WITH THE KEY, IT IS NEVER DROPPED. The
+        # configured roster is served from `/memory/telemetry` → `config`, and
+        # `telemetry_extras()` is what builds it — so that is where the
+        # has_credential/model contract is pinned now.
+        cfg = g.telemetry_extras()["config"]
+        by_url = {e["url"]: e for e in cfg["llm_backends"]}
         assert by_url["https://api.deepseek.com/v1"]["has_credential"] is True
         assert by_url["https://api.deepseek.com/v1"]["model"] == "deepseek-chat"
         assert by_url["http://localhost:5000"]["has_credential"] is False
         assert by_url["http://localhost:5000"]["model"] is None
-        # The raw secret must never appear anywhere in the response, authenticated or not.
+        # The raw secret must never appear in either payload, authenticated or not.
         assert "sk-should-never-leak" not in json.dumps(body)
+        assert "sk-should-never-leak" not in json.dumps(cfg)
     finally:
         coordinator._AGENT_TOKENS.clear()
 

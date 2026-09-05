@@ -35,7 +35,7 @@ from datetime import datetime
 
 import httpx
 
-VERSION = "0.9.89"
+VERSION = "0.9.90"
 # Wire contract this client was built against. Must match the gateway's
 # api_version (reported by GET /health). Bump only on breaking protocol changes.
 # v4 (project registry): a fact save without a REGISTERED metadata.project is
@@ -57,16 +57,15 @@ CLIENT_VERSION_HEADER = "X-SM-Api-Version"
 # before 0.9.74 nothing on either side recorded the caller's build.
 CLIENT_BUILD_HEADER = "X-Shared-Memory-Client"
 
-# Skill-directory-scoped dotenv search (S-18, Credential_Custody_Plan
+# Skill-directory-scoped `.env` search (S-18, Credential_Custody_Plan
 # PR A2) — exactly two candidates, in order, first definition wins:
 #   1. script-adjacent .env — scripts/.env, co-located with this file
 #   2. skill root .env — ../.env from here, e.g.
 #      ~/.gemini/skills/shared-memory/.env (the documented install location)
-# NEVER a parent-directory walk. python-dotenv's find_dotenv(usecwd=False)
-# used to walk from this file up toward $HOME looking for the first ".env"
-# it found anywhere on the way, so a stray $HOME/.env (some other tool's,
-# or a leftover from a different agent's install) could silently supply
-# AGENT_TOKEN/COORDINATOR_URL before this skill's own .env was ever
+# NEVER a parent-directory walk: a walk from this file up toward $HOME takes
+# the first ".env" it finds anywhere on the way, so a stray $HOME/.env (some
+# other tool's, or a leftover from a different agent's install) could silently
+# supply AGENT_TOKEN/COORDINATOR_URL before this skill's own .env was ever
 # consulted. Always invoke memory_bridge.py by absolute path so __file__
 # resolves correctly (e.g. ~/.gemini/skills/shared-memory/scripts/).
 _ENV_CANDIDATES = [
@@ -160,10 +159,7 @@ _EXPORT_PREFIX_RE = re.compile(r"^export\s+", re.IGNORECASE)
 def _strip_export_prefix(key: str) -> str:
     """Fix round F5 (SEC1 HIGH-3 + MED-5): strip an optional leading shell
     `export ` keyword (case-insensitive) from a raw .env line's key text,
-    at parse time, in the MANUAL fallback parser only (the dotenv_values()
-    path already strips a lowercase "export " natively and silently drops
-    an uppercase "EXPORT " line entirely — neither reaches this function).
-    Mirrors secure_env._strip_export_prefix() exactly."""
+    at parse time. Mirrors secure_env._strip_export_prefix() exactly."""
     s = key
     while s and (s[0].isspace() or s[0] == "﻿"):
         s = s[1:]
@@ -179,11 +175,8 @@ def _strip_balanced_quotes(value: str) -> str:
     else (an unbalanced leading quote with no matching trailing one, a bare
     quote embedded in the value, mismatched quote characters, or no quotes
     at all) is kept VERBATIM. Same rule, independently duplicated in
-    secure_env.py and mcp/vector-skill.py's manual fallback parsers — none of
-    the three may import from another (Group 1: the client/server surface
-    split). Applies only to the MANUAL fallback parser below; the
-    dotenv_values() path above (used when python-dotenv is installed)
-    applies that library's own quote handling instead."""
+    secure_env.py and mcp/vector-skill.py — none of the three may import from
+    another (Group 1: the client/server surface split)."""
     if len(value) >= 2 and value[0] == value[-1] and value[0] in ('"', "'"):
         return value[1:-1]
     return value
@@ -210,78 +203,66 @@ def _is_client_secret_key(name: str) -> bool:
     return key_norm.endswith(_CLIENT_SECRET_SUFFIXES)
 
 
-try:
-    from dotenv import dotenv_values  # parses without touching os.environ
-    for _env in _ENV_CANDIDATES:
-        if not (_env and os.path.exists(_env)):
-            continue
-        for _k, _v in dotenv_values(_env).items():
-            if _v is None or not _k:
-                continue
-            # D.3 (SEC round, ADV1-1/H-1 twin fix — mirrors mcp/vector-
-            # skill.py:221-237 exactly): key_norm is computed ONCE per key
-            # and used for BOTH the AGENT_TOKEN diversion check AND the
-            # _is_client_secret_key() call. Before this fix the two checks
-            # normalised differently (one case-sensitive, one upper-cased),
-            # which is a REGRESSION in the SAFER direction only by accident
-            # — a lowercase `agent_token=` or a BOM-prefixed key could slip
-            # past one check but not the other, in either order. `_k` —
-            # never `_k_norm` — is still what gets exported when the key
-            # isn't filtered: this only changes what counts as
-            # secret/AGENT_TOKEN, never the exported name's casing.
-            _k_norm = _client_key_norm(_k)
-            if _k_norm == "AGENT_TOKEN":
-                if not _AGENT_TOKEN_FROM_FILE:
-                    _AGENT_TOKEN_FROM_FILE = _v.strip()
-                continue
-            if _is_client_secret_key(_k_norm):
-                continue
-            os.environ.setdefault(_k, _v)
-except ImportError:
-    # python-dotenv not installed — manually parse skill-adjacent .env files
-    # so config/token are found when running bare `python` or `uv run --with httpx`.
-    def _read_env_file(path: str) -> None:
-        global _AGENT_TOKEN_FROM_FILE
-        try:
-            # utf-8-sig (D.3, ADV1-20): aligns this fallback parser's file
-            # encoding with mcp/vector-skill.py's own manual parser — a file
-            # saved as UTF-8-with-BOM otherwise decodes a leading U+FEFF onto
-            # the FIRST key, which the per-key .lstrip("﻿") below also
-            # catches (belt and braces) but should not have to rely on alone.
-            with open(path, encoding="utf-8-sig") as _f:
-                for _line in _f:
-                    _line = _line.strip()
-                    if not _line or _line.startswith("#") or "=" not in _line:
-                        continue
-                    _k, _, _v = _line.partition("=")
-                    # F5 (SEC1 HIGH-3/MED-5): strip an optional leading
-                    # "export "/"EXPORT " prefix before classification —
-                    # without this, the stored key for an "export
-                    # AGENT_TOKENS=..." line was the literal "export
-                    # AGENT_TOKENS", matching neither the AGENT_TOKEN
-                    # diversion nor _is_client_secret_key's exact-name list,
-                    # exporting the registry straight into os.environ.
-                    _k = _strip_export_prefix(_k).strip()
-                    _v = _strip_balanced_quotes(_v.strip())
-                    if not _k:
-                        continue
-                    # D.3: key_norm computed ONCE, used for BOTH checks —
-                    # see the dotenv_values() branch above for the full
-                    # rationale (identical fix, same shape, mirrors
-                    # mcp/vector-skill.py's _load_env_manually exactly).
-                    _k_norm = _client_key_norm(_k)
-                    if _k_norm == "AGENT_TOKEN":
-                        if not _AGENT_TOKEN_FROM_FILE:
-                            _AGENT_TOKEN_FROM_FILE = _v
-                        continue
-                    if _is_client_secret_key(_k_norm):
-                        continue
-                    if _k not in os.environ:   # first definition wins
-                        os.environ[_k] = _v
-        except OSError:
-            pass
-    for _env in _ENV_CANDIDATES:
-        _read_env_file(_env)
+def _read_env_file(path: str) -> None:
+    """Parse one skill-scoped `.env` into this client's config.
+
+    The ONE parser this client has — the same rules the gateway applies to its
+    own env (secure_env.py), duplicated rather than imported because this
+    client ships alone (Group 1: the client/server surface split). A VALUE is
+    read verbatim to the end of its line: an inline `# comment` after a value
+    is part of the value, and a line with an unbalanced quote is kept as
+    written and never swallows the next line. Multi-line values, `${VAR}`
+    interpolation and `\\n` escapes are not a form any shipped or minted `.env`
+    uses and are not supported."""
+    global _AGENT_TOKEN_FROM_FILE
+    try:
+        # utf-8-sig (D.3, ADV1-20): aligns this parser's file encoding with
+        # mcp/vector-skill.py's own — a file saved as UTF-8-with-BOM otherwise
+        # decodes a leading U+FEFF onto the FIRST key, which the per-key
+        # normalisation below also catches (belt and braces) but should not
+        # have to rely on alone.
+        with open(path, encoding="utf-8-sig") as _f:
+            for _line in _f:
+                _line = _line.strip()
+                if not _line or _line.startswith("#") or "=" not in _line:
+                    continue
+                _k, _, _v = _line.partition("=")
+                # F5 (SEC1 HIGH-3/MED-5): strip an optional leading
+                # "export "/"EXPORT " prefix before classification —
+                # without this, the stored key for an "export
+                # AGENT_TOKENS=..." line was the literal "export
+                # AGENT_TOKENS", matching neither the AGENT_TOKEN
+                # diversion nor _is_client_secret_key's exact-name list,
+                # exporting the registry straight into os.environ.
+                _k = _strip_export_prefix(_k).strip()
+                _v = _strip_balanced_quotes(_v.strip())
+                if not _k:
+                    continue
+                # D.3 (SEC round, ADV1-1/H-1 twin fix — mirrors
+                # mcp/vector-skill.py's _load_env_manually exactly): key_norm
+                # is computed ONCE per key and used for BOTH the AGENT_TOKEN
+                # diversion check AND the _is_client_secret_key() call. Two
+                # checks that normalise differently (one case-sensitive, one
+                # upper-cased) let a lowercase `agent_token=` or a
+                # BOM-prefixed key slip past one but not the other, in either
+                # order. `_k` — never `_k_norm` — is what gets exported when
+                # the key isn't filtered: this only changes what counts as
+                # secret/AGENT_TOKEN, never the exported name's casing.
+                _k_norm = _client_key_norm(_k)
+                if _k_norm == "AGENT_TOKEN":
+                    if not _AGENT_TOKEN_FROM_FILE:
+                        _AGENT_TOKEN_FROM_FILE = _v
+                    continue
+                if _is_client_secret_key(_k_norm):
+                    continue
+                if _k not in os.environ:   # first definition wins
+                    os.environ[_k] = _v
+    except OSError:
+        pass
+
+
+for _env in _ENV_CANDIDATES:
+    _read_env_file(_env)
 
 COORDINATOR_BASE = os.environ.get("COORDINATOR_URL", "http://localhost:8888")
 AGENT_ID         = os.environ.get("AGENT_ID", "memory_bridge")
@@ -1443,7 +1424,15 @@ def format_status(payload: dict, health: dict | None = None) -> str:
         _sup = pg.get('technical_docs_superseded', 0)
         lines.append(f"  technical_docs:      {pg.get('technical_docs','?')}"
                      + (f" (superseded {_sup})" if _sup else ""))
-        lines.append(f"  outbox:              {pg.get('outbox', {})}")
+        # The outbox is its own telemetry section, and a 12-key section is a
+        # dump, not a status line — so this renders the same four-count census
+        # the line has always shown. A count the gateway did not report is
+        # omitted rather than printed as 0: absence is not zero.
+        _ob = t.get("outbox")
+        _ob = _ob if isinstance(_ob, dict) else {}
+        _census = {k: _ob[k] for k in ("pending", "applied", "rem_reviewed", "failed")
+                   if _ob.get(k) is not None}
+        lines.append(f"  outbox:              {_census}")
         lines.append(f"  community_summaries: {cs.get('total','?')} "
                      f"(superseded {cs.get('superseded',0)}, insight {cs.get('insight',0)})")
     if "error" in nj:
@@ -1454,22 +1443,29 @@ def format_status(payload: dict, health: dict | None = None) -> str:
                      f"unconsolidated {nj.get('facts_unconsolidated','?')}")
         lines.append(f"  decisions: {nj.get('decisions_total','?')} total | "
                      f"REM pending {nj.get('decisions_rem_pending','?')}")
+    # REM is its own section, computed independently of the graph census above,
+    # so it carries its own error branch — a failed Neo4j query must not take
+    # the enrichment verdict down with it, and vice versa.
+    rem = t.get("rem", {})
+    if "error" in rem:
+        lines.append(f"  rem: ERROR {rem['error']}")
+    else:
         # Enrichment health: a record at the attempt cap is still counted as
         # "REM pending" but has been dropped from REM's queue — without this
         # line a dead-lettered backlog is indistinguishable from a waiting one.
-        _dead = nj.get("rem_dead_lettered", 0) or 0
-        _failing = nj.get("rem_failing", 0) or 0
+        _dead = rem.get("dead_lettered", 0) or 0
+        _failing = rem.get("failing", 0) or 0
         if _dead or _failing:
             _warn = "  ⚠ operator reset needed" if _dead else ""
             lines.append(f"  REM enrichment: {_failing} retrying | "
-                         f"{_dead} DEAD-LETTERED at {nj.get('rem_max_attempts','?')} "
+                         f"{_dead} DEAD-LETTERED at {rem.get('max_attempts','?')} "
                          f"attempts{_warn}")
         # Fairness gauge (decision 890, STEP 3) — ships dormant (both read 0
         # until the solo backlog is large enough to re-exercise the
         # batch-vs-solo yield path); only printed once either climbs above 0,
         # matching the enrichment-health line's pattern above.
-        _passed_over = nj.get("rem_passed_over_total", 0) or 0
-        _starved = nj.get("rem_starved_pending", 0) or 0
+        _passed_over = rem.get("passed_over", 0) or 0
+        _starved = rem.get("starved_pending", 0) or 0
         if _passed_over or _starved:
             lines.append(f"  REM fairness: {_passed_over} passed-over event(s) | "
                          f"{_starved} record(s) at/above starvation threshold")
@@ -1618,7 +1614,8 @@ def format_status(payload: dict, health: dict | None = None) -> str:
     # Per-backend credential/transient faults (PR A3). `credential` is the
     # fix-the-key signal (401/403/quota); `transient` retries on its own, so it
     # is reported but not flagged.
-    lf = t.get("llm_faults", {})
+    _llm_section = t.get("llm")
+    lf = _llm_section.get("faults", {}) if isinstance(_llm_section, dict) else {}
     if isinstance(lf, dict):
         for backend, f in sorted(lf.items()):
             if not isinstance(f, dict):

@@ -94,12 +94,77 @@ Not using `request.path` is the load-bearing detail rather than a stylistic one.
 
 **What this was not.** This was never an open proxy *on an install that has configured authentication*. With `AGENT_TOKENS` set, `/health/x`, `/healthz`, `/xhealth`, `//health`, `/Health` and every other spelling that is not a trailing-slash form of an owned route were, and remain, 401; the exposure was confined to those two endpoints' slash spellings. **On the shipped default, where `AGENT_TOKENS` is unset, all of those spellings are anonymously forwarded to the LLM backend** — as is every other unregistered path, because an auth-off gateway is an open LLM proxy by design. That is not changed by this fix and is not a defect; it is the reason `AGENT_TOKENS` exists. What the fix changes on such an install is that the two *owned* endpoints' slash spellings are now refused by the gateway instead of proxied.
 
-**What is not fixed.** This does not close the wider *normalise-here, forward-verbatim* class it is an instance of. Three sites still consult a policy table on a normalised path and then act on the un-normalised one, and they are **known-remaining and deferred**:
+**What is not fixed.** This does not close the wider *normalise-here, forward-verbatim* class it is an instance of. Two sites still consult a policy table on a normalised path and then act on the un-normalised one, and they are **known-remaining and deferred**; a third was closed in v0.9.90:
 
-- **`hive_mind_proxy.py` `handle_proxy` — the credentialed-backend route allowlist. This one is LIVE**, not latent: `CREDENTIALED_BACKEND_ALLOWED_ROUTES` is matched on `request.path.rstrip("/")`, while the request is forwarded with `_upstream_url(target_base, request.rel_url)` — the un-normalised spelling. So `POST /v1/chat/completions/` is allowlisted by its normalised form and sent upstream as `/v1/chat/completions/`, with the configured provider key attached. It is bounded: it requires a valid gateway token, `rstrip` removes only trailing slashes so no traversal can be rstripped into an allowlisted route, and `_upstream_url` appends to the configured backend base so the host is never attacker-influenced. The realistic worst case is a provider 404 that consumed a pool slot with the key attached. It is deferred rather than closed.
+- **`hive_mind_proxy.py` — the credentialed-backend route allowlist. ✅ Closed in v0.9.90:** both gates compare the raw request-target path exactly, so the checked string is the forwarded string; a trailing-slash spelling is 403.
 - **`coordinator.py` `_read_role_permits`** and **the role/quiesce/principal route tuple in `auth_middleware`.** These two are latent: they are closed today only because every route they gate sits under a reserved path prefix that `_route_guard` already refuses. That is a property of today's route table, not a guarantee — adding an unprefixed gated route would reopen the class there.
 
 **Observability.** The fix closes the LLM-pool slot and the backend disclosure. It does not close the audit gap for *anonymous* traffic: a refused anonymous request still produces no audit line and does not move the gateway request counters, in either auth state, because the refusal is raised before the middleware's audit block (and on an auth-off install the middleware returns before it entirely). Authenticated near-misses are audited and counted. The in-flight counter does move, so the capacity valve sees this traffic.
+
+### Credentialed-backend gates tolerated a trailing slash ✅ Fixed (v0.9.90)
+
+**Issue.** Both gates that decide whether a request may carry a provider key compared the request path
+with trailing slashes stripped, then forwarded the path unstripped. `POST /v1/chat/completions/` passed
+the allowlist and was signed with the provider key and sent with its slash.
+
+**Confirmed.** `hive_mind_proxy.py:2213` and `:2361` (the `rstrip("/")`), `:2325` (the forward of
+`str(rel_url)`); named by all three v0.9.89 reviews and parked in `decision:1959`; the security sweep's
+last known residue on this path (`decision:1819`).
+
+**Done.** Both gates compare the raw request-target path exactly. The trailing-slash spelling is 403
+at either gate, pinned by one test per gate with backend selection made fatal so each test proves its
+own gate. The audit line records the slash spelling as sent.
+
+### Encoder routes served a percent-encoded spelling — not an exposure ✅ Closed (v0.9.90)
+
+**Issue.** aiohttp matches a route on the decoded path, so `/v1/embedding%73` reached the embedder
+handler and was forwarded with its encoded wire path. No credential is attached on this path and no
+other endpoint is reachable through it; the encoder edge and the credentialed gates applied different
+rules to the same class of spelling.
+
+**Confirmed.** Probe on the test host, 2026-09-06: `POST /v1/embedding%73` answered exactly like
+`/v1/embeddings`; `/v1/embeddings/` answered 404. Reviewed as QA-4 in v0.9.89 (`fact:1956`).
+
+**Done.** The handler refuses a request whose raw wire path differs from the router's matched path,
+404 in the near-miss voice, pinned by a test that also proves the upstream is never called. One rule
+now holds at every gateway edge.
+
+### Two `.env` parsers in the clients, tests covering one ✅ Fixed (v0.9.90)
+
+**Issue.** Both clients parsed their `.env` with `python-dotenv` when it was installed, which every
+documented invocation ensured, and with the framework's own parser otherwise. The quoting tests
+added in v0.9.89 forced the fallback, so the parser that actually ran was the one not tested.
+`python-dotenv` drops a line with an unbalanced quote and can swallow the next quoted line, which
+for `AGENT_TOKEN` means a silent 401.
+
+**Confirmed.** `memory_bridge.py:213-240`, `mcp/vector-skill.py:314-337`; measured by the v0.9.89
+step-2 review (`fact:1968`); the suite installs `python-dotenv` transitively through fastmcp.
+
+**Done.** Both clients use the framework parser only, the same semantics as the gateway's
+`secure_env.py`: a value is read verbatim to the end of its line. A test with `python-dotenv`
+installed pins the unbalanced-quote line, the following line and an inline comment, by value. A
+static pin refuses any `dotenv` import in either client.
+
+### Gateway unit — socket families restricted (v0.9.90)
+
+`RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK` (v0.9.90) limits the gateway and its
+spawned daemons to the four socket families they use; trialled 30 hours on a test host with the
+nvtop probe healthy under it.
+
+### `llm_faults` at its old telemetry home is keyed by raw backend URL ⏳ Closes at its stamp (v0.9.91)
+
+**Issue.** `/memory/telemetry` serves the per-backend fault counters twice: at `llm.faults`, where
+every backend-URL key is scrubbed of credentials before rendering, and at the pre-0.9.74 home
+`llm_faults`, where the counters are served as held, keyed by the raw configured URL.
+
+**Confirmed.** `coordinator.py:9806` (unscrubbed) against `hive_mind_proxy.py:5367` (scrubbed).
+Not a live exposure on an install that boots: a backend URL carrying userinfo is refused at start
+since v0.9.87 and a query string is scrubbed at ingest, so the raw key holds no secret. Defence in
+depth only.
+
+**Done.** The contract decides what is served from v0.9.90; the old home is stamped
+`removed_in: 0.9.91` (its consumer of record still reads it there) and stops being served at that
+release. Read `llm.faults`.
 
 ### Agent authentication — implemented (v0.3.5)
 

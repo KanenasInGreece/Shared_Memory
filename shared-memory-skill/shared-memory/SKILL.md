@@ -161,13 +161,13 @@ Search the shared memory with semantic similarity, reranking, and Neo4j relation
 - **Trigger:** Before working on a topic that may have prior context — search first.
 - **CLI:**
   ```
-  uv run --with httpx --with python-dotenv python ~/.gemini/skills/shared-memory/scripts/memory_bridge.py search "<query>" 5
+  uv run --with httpx python ~/.gemini/skills/shared-memory/scripts/memory_bridge.py search "<query>" 5
   ```
 - **MCP (LM Studio):** Use the `hybrid_search_and_rerank` tool from the `rag-orchestrator` MCP server.
 
 **⭐ A named place or time is a FILTER, not query text.** When the operator names WHERE (project/domain) or WHEN (since), pass it as a filter and keep the query text for the WHAT — folding a project name into the query text instead ranks records that merely *mention* it above records that *belong* to it, and the genuinely relevant records can fall below the `limit` cut on their weakest signal. Filters restrict the candidate set the reranker scores; they never widen it and never fall back to unfiltered on an empty match. `--project NAME` restricts to records belonging to that project; `--domain NAME` (repeatable — OR semantics, any match qualifies) restricts to those SECTIONS; `--since ISO_DATE` restricts to records created at/after it (`2026-08-01` or `2026-08-01T00:00:00`). All three optional, additive, combinable. An unregistered project/domain name is **not refused** here (the read path never blocks on registry state) — it simply matches nothing. **`--domain` is capped at 16 entries per search** — the gateway is the enforcement point (over the cap returns 400 `filters_invalid`), this is a client-side heads-up, not a client-side check.
   ```
-  uv run --with httpx --with python-dotenv python ~/.gemini/skills/shared-memory/scripts/memory_bridge.py search "<query>" 5 --project myproject --domain operations --since 2026-08-01
+  uv run --with httpx python ~/.gemini/skills/shared-memory/scripts/memory_bridge.py search "<query>" 5 --project myproject --domain operations --since 2026-08-01
   ```
 
 Returns: Tier 1 semantic hits and Tier 3 narratives **ranked together on one scale**, plus Neo4j relational expansion. No tier holds a reserved position — a community summary or insight appears where its relevance to *your query* puts it, which may be first, last, or not at all.
@@ -194,7 +194,7 @@ Commit findings, decisions, and technical facts to long-term shared memory.
   The gateway stamps `source` with the authenticated token identity (`lm_studio`); any client value is overridden. For decisions, pass the loaded model name in `assisted_by` to record which model assisted.
 - **CLI (other agents):**
   ```
-  uv run --with httpx --with python-dotenv python ~/.gemini/skills/shared-memory/scripts/memory_bridge.py save "<content>" \
+  uv run --with httpx python ~/.gemini/skills/shared-memory/scripts/memory_bridge.py save "<content>" \
     '{"source":"<agent_name>","entities":["EntityA","EntityB"]}'
   ```
 
@@ -277,22 +277,22 @@ Query the knowledge graph for structural and provenance context.
 **Named shortcuts** (no Cypher required):
 - **Trigger:** Run `why-to-check` before starting work on any area with prior decisions.
   ```
-  uv run --with httpx --with python-dotenv python ~/.gemini/skills/shared-memory/scripts/memory_bridge.py query why-to-check --title "outbox"
-  uv run --with httpx --with python-dotenv python ~/.gemini/skills/shared-memory/scripts/memory_bridge.py query who-decided --project shared_memory
-  uv run --with httpx --with python-dotenv python ~/.gemini/skills/shared-memory/scripts/memory_bridge.py query retrospectives --rating validated
-  uv run --with httpx --with python-dotenv python ~/.gemini/skills/shared-memory/scripts/memory_bridge.py query agent-decisions --assisted-by claude
+  uv run --with httpx python ~/.gemini/skills/shared-memory/scripts/memory_bridge.py query why-to-check --title "outbox"
+  uv run --with httpx python ~/.gemini/skills/shared-memory/scripts/memory_bridge.py query who-decided --project shared_memory
+  uv run --with httpx python ~/.gemini/skills/shared-memory/scripts/memory_bridge.py query retrospectives --rating validated
+  uv run --with httpx python ~/.gemini/skills/shared-memory/scripts/memory_bridge.py query agent-decisions --assisted-by claude
   ```
 
 **Raw Cypher** (multi-hop paths, cross-entity queries, anything the shortcuts don't cover):
   ```
-  uv run --with httpx --with python-dotenv python ~/.gemini/skills/shared-memory/scripts/memory_bridge.py graph "<cypher_query>"
+  uv run --with httpx python ~/.gemini/skills/shared-memory/scripts/memory_bridge.py graph "<cypher_query>"
   ```
   Read-only enforced: `CREATE`, `DELETE`, `DETACH DELETE`, `SET`, `MERGE`, `CALL`, `LOAD CSV`, `DROP` are blocked.
   **A Cypher the database itself refuses — a syntax error, an unknown function, a type error — comes back as 400 `cypher_rejected` carrying Neo4j's own message, not as a 500.** It is your query to fix; re-sending it unchanged will never succeed. A 500 `query failed` means the gateway or Neo4j is the problem, and retrying is reasonable.
 
 **Record lineage** — *"what happened to this record?"*:
 ```
-uv run --with httpx --with python-dotenv python ~/.gemini/skills/shared-memory/scripts/memory_bridge.py lineage <pg_id|type:id>
+uv run --with httpx python ~/.gemini/skills/shared-memory/scripts/memory_bridge.py lineage <pg_id|type:id>
 ```
 Returns record state (type / created_at / superseded / grounded_in), its live dream-cycle stamps (applied → rem_reviewed → consolidated), and what it consolidated **into** — which summary/insight (the form), the fact→summary latency, the producing cycle, and that cycle's duration. All joined gateway-side.
 
@@ -303,7 +303,7 @@ Record architectural or design decisions with full PROV-O provenance — who dec
 - **Trigger:** When a significant architectural, design, or process decision is made.
 - **CLI shortcut (Phase B — recommended):**
   ```
-  uv run --with httpx --with python-dotenv python ~/.gemini/skills/shared-memory/scripts/memory_bridge.py save_decision \
+  uv run --with httpx python ~/.gemini/skills/shared-memory/scripts/memory_bridge.py save_decision \
     --title "Add consolidation daemon" \
     --decided-by "Xenofon" \
     --project "shared_memory" \
@@ -334,7 +334,7 @@ Record architectural or design decisions with full PROV-O provenance — who dec
 
 **Query decisions later:**
 ```
-uv run --with httpx --with python-dotenv python ~/.gemini/skills/shared-memory/scripts/memory_bridge.py graph \
+uv run --with httpx python ~/.gemini/skills/shared-memory/scripts/memory_bridge.py graph \
   "MATCH (h:Human)-[:WAS_ATTRIBUTED_TO]-(d:Decision)-[:PROJECT_OF]->(p:Project)
    OPTIONAL MATCH (d)-[:WAS_ASSISTED_BY]->(ai:AIAgent)
    WHERE toLower(d.title) CONTAINS 'consolidat'
@@ -349,7 +349,7 @@ After a decision has been acted on, close the Why-To loop with `save_retrospecti
 
 **CLI (Claude Code, Antigravity CLI, Codex CLI):**
 ```
-uv run --with httpx --with python-dotenv python ~/.gemini/skills/shared-memory/scripts/memory_bridge.py save_retrospective \
+uv run --with httpx python ~/.gemini/skills/shared-memory/scripts/memory_bridge.py save_retrospective \
   --pg-id 42 \
   --rating "validated" \
   --notes "Outbox-as-WAL held under concurrent load; no orphaned rows in 30-day prod run." \
@@ -368,7 +368,7 @@ uv run --with httpx --with python-dotenv python ~/.gemini/skills/shared-memory/s
 
 **Why-To loop query** — prefer the `why-to-check` shortcut above; this is the raw form it runs:
 ```
-uv run --with httpx --with python-dotenv python ~/.gemini/skills/shared-memory/scripts/memory_bridge.py graph \
+uv run --with httpx python ~/.gemini/skills/shared-memory/scripts/memory_bridge.py graph \
   "MATCH (d:Decision)-[o:HAD_OUTCOME]->(r:Retrospective)
    WHERE toLower(d.title) CONTAINS 'outbox'
    RETURN d.title, r.rating, r.content, o.date ORDER BY o.date DESC LIMIT 1"
@@ -568,7 +568,7 @@ an agent — a separate, later invocation of `generate_tokens.py` (with or witho
 a free peek at the one already registered. Each agent uses its own distinct
 token; never share tokens across agents.
 
-The dotenv search for CLI agents is scoped to exactly this skill directory (first
+The `.env` search for CLI agents is scoped to exactly this skill directory (first
 match wins, never a parent-directory walk up toward `$HOME`):
 1. `scripts/.env` — co-located with `memory_bridge.py` (requires absolute-path invocation — see path note above)
 2. `~/.{agent}/skills/shared-memory/.env` — the skill root, one level up from `scripts/`
@@ -611,7 +611,7 @@ minting all live in **[Documentation/server-setup.md](Documentation/server-setup
 ```bash
 # Liveness (anonymous — status/version/api_version only, v0.9.9 S-10):
 curl http://localhost:8888/health
-# → {"status":"ok","api_version":4,"version":"0.9.89"}
+# → {"status":"ok","api_version":4,"version":"0.9.90"}
 
 # Liveness + API contract check (this client vs the gateway):
 python ~/.claude/skills/shared-memory/scripts/memory_bridge.py doctor
@@ -621,8 +621,8 @@ python ~/.claude/skills/shared-memory/scripts/memory_bridge.py doctor
 `status: ok` means embedder and reranker are reachable; HTTP 503 means the
 save/search path is degraded. `doctor` additionally compares `api_version` —
 exit 0 when compatible, exit 1 (with a fix hint) otherwise. The daemon status,
-backend roster and per-backend pool detail (`daemon`, `rem_daemon`, `config`,
-`llm_pool`, …) require a valid agent bearer token — pass
+backend roster and dependency detail (`dependencies`, `rem_daemon_process`,
+`nrem_daemon_process`, `llm_backends`, …) require a valid agent bearer token — pass
 `-H "Authorization: Bearer $AGENT_TOKEN"` to see them; that operational
 detail is not disclosed to an unauthenticated caller.
 
@@ -681,7 +681,7 @@ carries the domain one; the project distribution is `breakdown.projects`),
 `telemetry.inference_busy` — the inference/GPU-busy signal (tri-state
 `"busy"|"idle"|"unknown"`, also top-level on `GET /health`; `"unknown"` means
 nvtop is absent or `SLOT_AWARE=0`, or the probe disabled itself after repeated
-hangs (see the raw `GET /health` key `gpu_probe`), never reported as a false `"idle"`; distinct
+hangs (see the raw `GET /memory/telemetry` key `gpu_probe`), never reported as a false `"idle"`; distinct
 from `health.llm`, which is pure `:5000` reachability), and
 `telemetry.consolidation` — the dream-cycle liveness/coverage signal:
 per cycle type the last fold outcome, a `stalled` verdict, consecutive failures,
@@ -700,7 +700,7 @@ must be running — see [Documentation/server-setup.md](Documentation/server-set
 
 ## Reference
 
-- **Version:** `python ~/.gemini/skills/shared-memory/scripts/memory_bridge.py --version` → `{"version": "0.9.89", "api_version": 4, "tool": "shared-memory-framework"}`
+- **Version:** `python ~/.gemini/skills/shared-memory/scripts/memory_bridge.py --version` → `{"version": "0.9.90", "api_version": 4, "tool": "shared-memory-framework"}`
 
 ### Updating This Skill
 

@@ -140,9 +140,10 @@ def test_authenticated_caller_gets_the_full_byte_compatible_payload(monkeypatch)
     body = json.loads(asyncio.run(g.handle_health(req)).body.decode())
     # Today's full shape, unchanged (same field set the pre-S-10 handler
     # produced): liveness + daemon/rem_daemon + config + auth_* + backup_*.
-    for field in ("status", "version", "api_version", "daemon", "rem_daemon",
-                   "auth_required", "auth_scheme", "backup_in_progress",
-                   "config", "embedder", "reranker", "llm", "backend_capability"):
+    for field in ("status", "version", "api_version", "nrem_daemon_process",
+                   "rem_daemon_process", "auth_required", "auth_scheme",
+                   "backup_in_progress", "dependencies", "embedder", "reranker",
+                   "llm", "backend_capability"):
         assert field in body, f"authenticated payload missing {field!r}"
 
 
@@ -219,7 +220,8 @@ def test_auth_off_install_gets_full_payload_with_no_token_presented(monkeypatch)
     req.app = {"proxy": proxy}
 
     body = json.loads(asyncio.run(g.handle_health(req)).body.decode())
-    assert "daemon" in body and "config" in body and "backup_in_progress" in body
+    assert ("nrem_daemon_process" in body and "dependencies" in body
+            and "backup_in_progress" in body)
     assert set(body.keys()) != {"status", "version", "api_version"}
 
 
@@ -236,7 +238,7 @@ def test_auth_off_install_full_payload_even_with_a_presented_token(monkeypatch):
     req.app = {"proxy": proxy}
 
     body = json.loads(asyncio.run(g.handle_health(req)).body.decode())
-    assert "daemon" in body and "config" in body
+    assert "nrem_daemon_process" in body and "dependencies" in body
 
 
 # ── S-11: TTL cache on the fan-out ───────────────────────────────────────────
@@ -286,7 +288,7 @@ def test_anonymous_and_authenticated_callers_share_the_cache(monkeypatch):
         "reuse the SAME cached probe the anonymous caller triggered"
     )
     # And still gets the full shape despite the underlying probe being shared.
-    assert "config" in body
+    assert "dependencies" in body
 
 
 def test_cache_expires_after_ttl(monkeypatch):
@@ -533,8 +535,8 @@ def test_an_auth_off_install_is_told_NEITHER_and_keeps_its_full_payload(monkeypa
     assert "agent" not in body
     assert "role" not in body
     # Still the full payload for everyone, exactly as before.
-    for field in ("status", "version", "api_version", "daemon", "config",
-                  "embedder", "reranker", "llm"):
+    for field in ("status", "version", "api_version", "nrem_daemon_process",
+                  "dependencies", "embedder", "reranker", "llm"):
         assert field in body, f"auth-off payload lost {field!r}"
 
 
