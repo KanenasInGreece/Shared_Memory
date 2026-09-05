@@ -56,7 +56,7 @@ journalctl --user -u hive-mind-gateway.service -f
 `Restart=on-failure` brings it back after a genuine crash; the `enable-linger`
 step is what makes it survive logout and reboot.
 
-### Hardening (`LimitCORE`, `ProtectSystem`)
+### Hardening (`LimitCORE`, `ProtectSystem`, `RestrictAddressFamilies`)
 
 All three units in this directory (`hive-mind-gateway.service`,
 `shared-memory-backup.service`, `shared-memory-logrotate.service`) ship
@@ -127,6 +127,28 @@ risk by it either way):
 
 See the v0.9.89 CHANGELOG entry for the full
 detail and the ruling that resolved this.
+
+`RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK` is applied to
+**`hive-mind-gateway.service` only**. Those are the four families its
+processes were traced to use: `AF_UNIX` for the UDS listener, asyncio
+socketpairs and journald; `AF_INET`/`AF_INET6` for the aiohttp server and
+client, asyncpg, the neo4j driver and httpx to the encoders; `AF_NETLINK` for
+glibc's `getaddrinfo` interface enumeration and for `nvtop`'s device
+enumeration behind `gpu_load.py`. The backup and logrotate units carry no such
+line — the trace that justifies a value covers the gateway only.
+
+The unit under `~/.config/systemd/user/` is a **copy** written by
+`install_service.sh`, not a link to this directory: the installer substitutes
+the repo path, the repo URL, the resolved `uv` path and `Environment=PATH`,
+then runs `daemon-reload` and `enable --now`. `update_framework.sh` never
+touches it. So after a release that changes a directive, re-run
+`install_service.sh` (its own `daemon-reload` picks the new file up), then
+`systemctl --user restart hive-mind-gateway.service` — `enable --now` does not
+restart a unit that is already active — and then check `/health` shows
+`inference_busy` as something other than `unknown`, which is what proves the
+`AF_NETLINK` consumer still works. A hand edit to the installed copy (an
+uncommented `LoadCredential=` line, for example) is overwritten by that re-run
+and has to be re-applied.
 
 ### Audit-log rotation
 
