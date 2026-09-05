@@ -548,9 +548,12 @@ def test_a_never_probed_dependency_reads_unknown_and_never_elevates(gateway):
     assert checks["status"] == "ok", "unknown must not elevate the overall status"
 
 
-def test_the_old_key_names_are_still_emitted_this_release(gateway):
-    """ADDITIVE RELEASE. Every key that existed at v0.9.73 keeps being emitted
-    so the monitor migrates without a flag day; 0.9.75 drops the copies."""
+def test_the_probe_still_builds_every_old_key_name(gateway):
+    """⛔ THE BUILDER IS NOT THE WIRE, and this is the builder. Whether a copy
+    is SERVED is the contract's call (see the drop tests below); whether it is
+    still COMPUTED is load-bearing regardless, because `telemetry_extras()`
+    reads the /health cache to construct the new homes — an emitter deleted
+    here blanks the very key the move points readers at."""
     payload = _health_payload(gateway)
     for old in ("daemon", "rem_daemon", "llm_pool", "llm_affinity", "llm_routing",
                 "llm_token_usage", "llm_latency", "config", "capacity",

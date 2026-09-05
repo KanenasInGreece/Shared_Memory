@@ -365,6 +365,7 @@ gateway_down=0
 token_missing=0
 anon_health="$(curl -s --compressed --max-time 15 "$GATEWAY_URL/health" || true)"
 health_full=""   # the full-shape payload (authenticated, or anonymous on auth-off) — A6 reads it
+telemetry_full=""   # the numbers endpoint — A6's baseline and the capacity verdict read it
 
 if [[ -z "$anon_health" ]]; then
     bad A1 "gateway did not answer at $GATEWAY_URL/health — is hive-mind-gateway.service running?"
@@ -392,7 +393,7 @@ try:
     d = json.load(sys.stdin)
 except Exception:
     print("UNPARSEABLE"); sys.exit(0)
-print(",".join(k for k in ("daemon", "backend_capability", "config") if k not in d))
+print(",".join(k for k in ("nrem_daemon_process", "backend_capability", "dependencies") if k not in d))
 ' )"
             if [[ -z "$missing" ]]; then
                 ok "A1 authenticated payload carries the full shape"
@@ -437,7 +438,7 @@ try:
     d = json.load(sys.stdin)
 except Exception:
     print("UNPARSEABLE"); sys.exit(0)
-print(",".join(k for k in ("daemon", "backend_capability", "config") if k not in d))
+print(",".join(k for k in ("nrem_daemon_process", "backend_capability", "dependencies") if k not in d))
 ' )"
         if [[ -z "$missing" ]]; then
             ok "A1 auth-off install: full /health payload served anonymously — the correct result for this mode"
@@ -864,6 +865,16 @@ print(("Shared Memory install-verification realistic canary " + marker + " — "
         fi
     fi
 
+    # The capacity record and its derived fields live on /memory/telemetry —
+    # /health carries the sizing a client needs and nothing more. Fetched once,
+    # here, because both readers below want it: the baseline record and the
+    # plain-language verdict. Token via curl config on stdin, not argv, exactly
+    # like the /health fetch in A1 — argv is world-readable in /proc while the
+    # request lives. No token means no fetch, and the verdict says UNDERIVABLE.
+    if [[ -n "${AGENT_TOKEN:-}" ]]; then
+        telemetry_full="$(curl -s --compressed --max-time 15 -K - "$GATEWAY_URL/memory/telemetry" <<< "header = \"Authorization: Bearer $AGENT_TOKEN\"" || true)"
+    fi
+
     base_file="$HOME/.shared-memory/postflight/baseline-$(date -u +%Y%m%dT%H%M%SZ).json"
     # >>> A6_BASELINE_WRITER (tests/test_postflight_a8.py extracts this block
     # VERBATIM and runs it standalone via subprocess with fixture argv/
@@ -875,11 +886,15 @@ print(("Shared Memory install-verification realistic canary " + marker + " — "
     written="$(printf '%s' "${health_full:-$anon_health}" | python3 -c '
 import datetime, json, os, shutil, subprocess, sys
 (path, short_ms, big_ms, search_ms, search_rebaseline_ms, fw, mode,
- corpus_scope, corpus_technical_docs, corpus_summaries) = sys.argv[1:11]
+ corpus_scope, corpus_technical_docs, corpus_summaries, telemetry_raw) = sys.argv[1:12]
 try:
     h = json.load(sys.stdin)
 except Exception:
     h = {}
+try:
+    t = (json.loads(telemetry_raw) or {}).get("telemetry") or {}
+except Exception:
+    t = {}
 
 def secs(ms):
     try:
@@ -941,13 +956,17 @@ doc = {
     },
     "backend_capability": h.get("backend_capability"),
     # R0-I (decision:1424), trigger "manual": the current CAPACITY record the
-    # gateway already derived and stored, fetched verbatim off the
-    # authenticated /health payload -- no re-derivation happens in bash. None
-    # when the gateway has not derived one yet (fresh install, first probe
-    # still in flight) or when only the anonymous payload was available.
-    # Rendered identically in both modes -- the capacity verdict section
-    # below is untouched by mode (WP-R4).
+    # gateway already derived and stored, fetched verbatim -- no re-derivation
+    # happens in bash. /health carries the sizing a client needs to set its own
+    # timeouts; /memory/telemetry carries the whole record, fingerprint and
+    # measured probe included, which is what makes a baseline comparable across
+    # hardware. None when the gateway has not derived one yet (fresh install,
+    # first probe still in flight) or when the payload was not available --
+    # anonymous for capacity, no token for capacity_telemetry. Rendered
+    # identically in both modes: the capacity verdict below is untouched by
+    # mode (WP-R4).
     "capacity": h.get("capacity"),
+    "capacity_telemetry": t.get("capacity"),
     "hardware": hw,
     # D22: the pool the timings above were measured against -- see the bash
     # comment just above this python block for the scope reasoning. A small
@@ -974,7 +993,7 @@ with open(path, "w") as f:
     json.dump(doc, f, indent=2)
 print(path)
 ' "$base_file" "${short_ms:-}" "${big_ms:-}" "${search_ms:-}" "${search_rebaseline_ms:-}" "${checkout_fw:-}" "$POSTFLIGHT_MODE" \
-        "$corpus_scope" "${corpus_technical_docs:-}" "${live_summary_count:-}")"
+        "$corpus_scope" "${corpus_technical_docs:-}" "${live_summary_count:-}" "${telemetry_full:-}")"
     # <<< A6_BASELINE_WRITER
     if [[ -n "$written" ]]; then
         ok "A6 baseline written: $written"
@@ -984,13 +1003,14 @@ print(path)
     fi
 
     # Plain-language capacity verdict (fact:1425 A1 / decision:1424) — rendered
-    # strictly from the record the gateway already published on /health; no
-    # measurement or derivation happens here. Informational only: nothing in
-    # this section may affect the exit code.
-    cap_fields="$(printf '%s' "${health_full:-}" | python3 -c '
+    # strictly from the record the gateway already published on
+    # /memory/telemetry; no measurement or derivation happens here.
+    # Informational only: nothing in this section may affect the exit code.
+    cap_fields="$(printf '%s' "${telemetry_full:-}" | python3 -c '
 import json, sys
 try:
-    d = ((json.load(sys.stdin) or {}).get("capacity") or {}).get("derived") or {}
+    t = (json.load(sys.stdin) or {}).get("telemetry") or {}
+    d = (t.get("capacity") or {}).get("derived") or {}
 except Exception:
     d = {}
 s, n = d.get("s_mean_s"), d.get("queue_bound")
@@ -998,7 +1018,7 @@ exceeds, tolerable = d.get("single_search_exceeds_wait"), d.get("tolerable_wait_
 print("UNDERIVABLE" if s is None or n is None else f"{s}|{n}|{exceeds}|{tolerable}")
 ' 2>/dev/null)"
     if [[ -z "$cap_fields" || "$cap_fields" == "UNDERIVABLE" ]]; then
-        warn "Capacity verdict not derivable — the gateway has not published a capacity record yet (fresh install, first probe still in flight, or anonymous-only health); informational, never a gate"
+        warn "Capacity verdict not derivable — the gateway has not published a capacity record yet (fresh install, first probe still in flight), or no AGENT_TOKEN was set to read /memory/telemetry with; informational, never a gate"
     else
         # M6 (fix round): this is the RERANK-STAGE worst-case projection
         # (the probe's fixed 20-doc model, see hive_mind_proxy.py's own

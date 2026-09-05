@@ -495,8 +495,8 @@ curl above:
   Once a specific credential exists (a Phase 6 `--reveal`, or after Phase 8 mints a
   local agent), confirm THAT credential actually authenticates:
   `curl -s -H "Authorization: Bearer <token>" http://localhost:8888/health` must come back with
-  `"auth_required":true` plus the full payload (`"embedder":"ok"`, `"daemon":"running"`,
-  `"rem_daemon":"running"`; `"llm":"down"` only blocks dreaming, not saves/search — check the
+  `"auth_required":true` plus the full payload (`"embedder":"ok"`, `"nrem_daemon_process":"running"`,
+  `"rem_daemon_process":"running"`; `"llm":"down"` only blocks dreaming, not saves/search — check the
   reasoning LLM from Q3). If nothing has been minted yet at this point in the sequence, note that
   and come back to this authenticated check after Phase 8. ⚠ **If Q3's backends have not been
   configured yet at this point in the sequence, expect `dependencies.llm_pool.state:"degraded"`**
@@ -915,7 +915,7 @@ uv run --with httpx python <skill-dir>/scripts/memory_bridge.py status   # telem
 
 ⚠ **Every `/health` read below this point means the AUTHENTICATED payload** (any minted agent
 token; S-10 slims the anonymous shape to `status`/`version`/`api_version`). A triage that reads
-`consolidation`, `stalled_types`, backend names, `project_identity` or `domain_identity` from a
+`consolidation`, `stalled_types` or backend names from a
 bare curl on an auth-configured install sees none of them — that is the missing token, not a
 broken gateway. `memory_bridge.py status` sends its own token and is unaffected.
 
@@ -1099,11 +1099,11 @@ and cannot reach Neo4j, so this stamps the nodes. It is idempotent and read-only
 it on every upgrade, exactly like the Neo4j constraint check, and for the same reason. **Skipping it
 does not break writes**: records still save, still search, still enrich. What stops is *cross-project
 synthesis* — the gate fails closed on a node with no identity — which presents as a system with nothing
-to fold rather than as an error. Authenticated `GET /health` → `project_identity` is where that
-state is visible (`complete: false` with an `unidentified` count).
+to fold rather than as an error. Authenticated `GET /memory/telemetry` → `axes.project_identity` is
+where that state is visible (`complete: false` with an `unidentified` count).
 
-⚠ **The domain axis has the same shape and one extra number.** Authenticated `GET /health` → `domain_identity`
-reports `unregistered` / `mismatched` between the registry and the graph, plus **`unattached`** — a
+⚠ **The domain axis has the same shape and one extra number.** Authenticated `GET /memory/telemetry` →
+`axes.domain_identity` reports `unregistered` / `mismatched` between the registry and the graph, plus **`unattached`** — a
 `:Domain` node with no `PROJECT_OF` edge, i.e. a section belonging to no project. That last one is
 reported for a walk that does not exist yet: cross-project and cross-domain synthesis will traverse
 `(:Domain)-[:PROJECT_OF]->(:Project)`, and a section missing that edge would silently drop out of it,

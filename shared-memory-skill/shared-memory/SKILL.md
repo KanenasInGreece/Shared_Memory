@@ -621,8 +621,8 @@ python ~/.claude/skills/shared-memory/scripts/memory_bridge.py doctor
 `status: ok` means embedder and reranker are reachable; HTTP 503 means the
 save/search path is degraded. `doctor` additionally compares `api_version` —
 exit 0 when compatible, exit 1 (with a fix hint) otherwise. The daemon status,
-backend roster and per-backend pool detail (`daemon`, `rem_daemon`, `config`,
-`llm_pool`, …) require a valid agent bearer token — pass
+backend roster and dependency detail (`dependencies`, `rem_daemon_process`,
+`nrem_daemon_process`, `llm_backends`, …) require a valid agent bearer token — pass
 `-H "Authorization: Bearer $AGENT_TOKEN"` to see them; that operational
 detail is not disclosed to an unauthenticated caller.
 
@@ -681,7 +681,7 @@ carries the domain one; the project distribution is `breakdown.projects`),
 `telemetry.inference_busy` — the inference/GPU-busy signal (tri-state
 `"busy"|"idle"|"unknown"`, also top-level on `GET /health`; `"unknown"` means
 nvtop is absent or `SLOT_AWARE=0`, or the probe disabled itself after repeated
-hangs (see the raw `GET /health` key `gpu_probe`), never reported as a false `"idle"`; distinct
+hangs (see the raw `GET /memory/telemetry` key `gpu_probe`), never reported as a false `"idle"`; distinct
 from `health.llm`, which is pure `:5000` reachability), and
 `telemetry.consolidation` — the dream-cycle liveness/coverage signal:
 per cycle type the last fold outcome, a `stalled` verdict, consecutive failures,

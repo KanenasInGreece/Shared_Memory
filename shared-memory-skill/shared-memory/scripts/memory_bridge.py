@@ -1424,7 +1424,15 @@ def format_status(payload: dict, health: dict | None = None) -> str:
         _sup = pg.get('technical_docs_superseded', 0)
         lines.append(f"  technical_docs:      {pg.get('technical_docs','?')}"
                      + (f" (superseded {_sup})" if _sup else ""))
-        lines.append(f"  outbox:              {pg.get('outbox', {})}")
+        # The outbox is its own telemetry section, and a 12-key section is a
+        # dump, not a status line — so this renders the same four-count census
+        # the line has always shown. A count the gateway did not report is
+        # omitted rather than printed as 0: absence is not zero.
+        _ob = t.get("outbox")
+        _ob = _ob if isinstance(_ob, dict) else {}
+        _census = {k: _ob[k] for k in ("pending", "applied", "rem_reviewed", "failed")
+                   if _ob.get(k) is not None}
+        lines.append(f"  outbox:              {_census}")
         lines.append(f"  community_summaries: {cs.get('total','?')} "
                      f"(superseded {cs.get('superseded',0)}, insight {cs.get('insight',0)})")
     if "error" in nj:
@@ -1435,22 +1443,29 @@ def format_status(payload: dict, health: dict | None = None) -> str:
                      f"unconsolidated {nj.get('facts_unconsolidated','?')}")
         lines.append(f"  decisions: {nj.get('decisions_total','?')} total | "
                      f"REM pending {nj.get('decisions_rem_pending','?')}")
+    # REM is its own section, computed independently of the graph census above,
+    # so it carries its own error branch — a failed Neo4j query must not take
+    # the enrichment verdict down with it, and vice versa.
+    rem = t.get("rem", {})
+    if "error" in rem:
+        lines.append(f"  rem: ERROR {rem['error']}")
+    else:
         # Enrichment health: a record at the attempt cap is still counted as
         # "REM pending" but has been dropped from REM's queue — without this
         # line a dead-lettered backlog is indistinguishable from a waiting one.
-        _dead = nj.get("rem_dead_lettered", 0) or 0
-        _failing = nj.get("rem_failing", 0) or 0
+        _dead = rem.get("dead_lettered", 0) or 0
+        _failing = rem.get("failing", 0) or 0
         if _dead or _failing:
             _warn = "  ⚠ operator reset needed" if _dead else ""
             lines.append(f"  REM enrichment: {_failing} retrying | "
-                         f"{_dead} DEAD-LETTERED at {nj.get('rem_max_attempts','?')} "
+                         f"{_dead} DEAD-LETTERED at {rem.get('max_attempts','?')} "
                          f"attempts{_warn}")
         # Fairness gauge (decision 890, STEP 3) — ships dormant (both read 0
         # until the solo backlog is large enough to re-exercise the
         # batch-vs-solo yield path); only printed once either climbs above 0,
         # matching the enrichment-health line's pattern above.
-        _passed_over = nj.get("rem_passed_over_total", 0) or 0
-        _starved = nj.get("rem_starved_pending", 0) or 0
+        _passed_over = rem.get("passed_over", 0) or 0
+        _starved = rem.get("starved_pending", 0) or 0
         if _passed_over or _starved:
             lines.append(f"  REM fairness: {_passed_over} passed-over event(s) | "
                          f"{_starved} record(s) at/above starvation threshold")
@@ -1599,7 +1614,8 @@ def format_status(payload: dict, health: dict | None = None) -> str:
     # Per-backend credential/transient faults (PR A3). `credential` is the
     # fix-the-key signal (401/403/quota); `transient` retries on its own, so it
     # is reported but not flagged.
-    lf = t.get("llm_faults", {})
+    _llm_section = t.get("llm")
+    lf = _llm_section.get("faults", {}) if isinstance(_llm_section, dict) else {}
     if isinstance(lf, dict):
         for backend, f in sorted(lf.items()):
             if not isinstance(f, dict):

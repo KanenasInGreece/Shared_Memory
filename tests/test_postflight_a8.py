@@ -786,13 +786,15 @@ def test_a8_exercises_the_real_proxy_path_not_a_bare_probe():
 
 def run_a6_baseline_writer(tmp_path, *, health_full="{}", mode="install",
                             corpus_scope="project:install-verification",
-                            corpus_technical_docs="1", live_summary_count=""):
+                            corpus_technical_docs="1", live_summary_count="",
+                            telemetry_full=""):
     source = _extract_marked_block("# >>> A6_BASELINE_WRITER", "# <<< A6_BASELINE_WRITER")
     base_file = tmp_path / "baseline.json"
     lines = [
         "set -uo pipefail",
         f"health_full={shlex.quote(health_full)}",
         f"anon_health={shlex.quote(health_full)}",
+        f"telemetry_full={shlex.quote(telemetry_full)}",
         f"base_file={shlex.quote(str(base_file))}",
         'short_ms=""', 'big_ms=""', 'search_ms=""', 'search_rebaseline_ms=""',
         'checkout_fw="9.9.9"',
@@ -809,10 +811,66 @@ def run_a6_baseline_writer(tmp_path, *, health_full="{}", mode="install",
     return result, base_file
 
 
+def test_the_a1_shape_check_names_only_keys_the_gateway_keeps_serving():
+    """⛔ POSTFLIGHT IS THE DEPLOY GATE. A1 proves authentication by requiring a
+    handful of `/health` keys — so a key the contract has scheduled for removal
+    would make every install fail the gate on the release it goes, from a script
+    nobody thought to re-read. The list is checked against the contract rather
+    than against a memory of what `/health` used to carry."""
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]
+                           / "shared-memory" / "scripts"))
+    import telemetry_contract as tc
+
+    calls = re.findall(r"k for k in \(([^)]*)\) if k not in d",
+                       POSTFLIGHT.read_text())
+    assert len(calls) == 2, (
+        "expected A1's shape check in both the authenticated and the auth-off "
+        f"branch, found {len(calls)}")
+    for call in calls:
+        keys = re.findall(r'"([^"]+)"', call)
+        assert keys, f"A1 shape check names no keys: {call!r}"
+        for key in keys:
+            rows = [p for p in tc.HEALTH if p == key or p.startswith(key + ".")]
+            assert rows, f"A1 requires {key!r}, which /health does not document"
+            stamped = sorted(p for p in rows if tc.HEALTH[p]["removed_in"])
+            assert not stamped, (
+                f"A1 requires {key!r}, and the contract stops serving "
+                f"{stamped} — the gate would fail on every install")
+
+
 def test_a6_baseline_writer_markers_present_exactly_once():
     text = POSTFLIGHT.read_text()
     assert text.count("# >>> A6_BASELINE_WRITER") == 1
     assert text.count("# <<< A6_BASELINE_WRITER") == 1
+
+
+def test_a6_baseline_records_the_capacity_record_from_the_numbers_endpoint(tmp_path):
+    """The whole capacity record — fingerprint and measured probe — is what makes
+    one baseline comparable with another, and it lives on `/memory/telemetry`.
+    `/health` keeps only the sizing a client needs, so the baseline carries
+    both blocks rather than assuming one contains the other."""
+    result, base_file = run_a6_baseline_writer(
+        tmp_path,
+        health_full=json.dumps({"capacity": {"derived": {"s_mean_s": 1.0}}}),
+        telemetry_full=json.dumps({"status": "success", "telemetry": {
+            "capacity": {"trigger": "probe",
+                         "fingerprint": {"hardware": {"nproc": 8}},
+                         "derived": {"s_mean_s": 1.0, "queue_bound": 4}}}}),
+    )
+    assert result.returncode == 0, result.stderr
+    doc = json.loads(base_file.read_text())
+    assert doc["capacity"] == {"derived": {"s_mean_s": 1.0}}
+    assert doc["capacity_telemetry"]["trigger"] == "probe"
+    assert doc["capacity_telemetry"]["fingerprint"]["hardware"]["nproc"] == 8
+
+
+def test_a6_baseline_records_no_capacity_record_without_a_token(tmp_path):
+    """⛔ ABSENT, NOT INVENTED. No token means the numbers endpoint was never
+    fetched — the field says so rather than reporting an empty record."""
+    result, base_file = run_a6_baseline_writer(tmp_path, telemetry_full="")
+    assert result.returncode == 0, result.stderr
+    assert json.loads(base_file.read_text())["capacity_telemetry"] is None
 
 
 def test_a6_baseline_states_corpus_size_canary_mode(tmp_path):

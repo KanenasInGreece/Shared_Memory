@@ -2809,7 +2809,7 @@ class ConsolidationDaemon:
                     "No grounded (project, domain) group meets density_threshold=%d "
                     "among the current backlog of %d rem_reviewed fact(s). NREM waits "
                     "for a Decision/Retrospective to GROUND_IN enough facts of one "
-                    "registered section — check 'rem_daemon' in /health for REM "
+                    "registered section — check 'rem_daemon_process' in /health for REM "
                     "enrichment progress.",
                     DENSITY_THRESHOLD, len(ids_to_process),
                 )

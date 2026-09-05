@@ -432,8 +432,9 @@ a new axis, the identity defect migration 027 removed.
 `scripts/reconcile_project_identity.py --apply`, which is part of the documented
 upgrade path and is idempotent. Until it has run, the fold gate declines to count
 an unidentified project toward its "≥ 2 distinct projects" rule — it fails
-closed — and `GET /health` → `project_identity` reports the outstanding count so
-an incomplete upgrade is visible rather than presenting as a quiet corpus.
+closed — and `GET /memory/telemetry` → `axes.project_identity` reports the
+outstanding count so an incomplete upgrade is visible rather than presenting as a
+quiet corpus.
 
 ### One normalised key per axis — `normalized_key` (migration 035)
 

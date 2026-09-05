@@ -1912,22 +1912,31 @@ async def test_handle_telemetry_rolls_up_postgres_and_neo4j():
     t = json.loads(resp.text)["telemetry"]
     assert t["postgres"]["technical_docs"] == 171
     assert t["postgres"]["technical_docs_superseded"] == 4
-    assert t["postgres"]["outbox"] == {"applied": 10, "rem_reviewed": 3}
     assert t["postgres"]["community_summaries"]["insight"] == 0
     assert t["neo4j"]["facts_total"] == 109
     assert t["neo4j"]["facts_rem_pending"] == 1       # the 12 superseded-pending facts are excluded
     assert t["neo4j"]["facts_unconsolidated"] == 0   # only rem=True & con=False counts; here 96 are consolidated
     assert t["neo4j"]["decisions_total"] == 77
     assert t["neo4j"]["decisions_rem_pending"] == 71  # the 2 superseded-pending decisions are excluded
+
+    # ⚠ THE ARITHMETIC, READ OFF THE BUILDER. The outbox census and the REM
+    # backlog gauges are served from their own sections, which this fixture's
+    # mocks do not stand up (`_outbox_telemetry` and `_rem_telemetry` degrade to
+    # their error branch here) — the served payloads of both are pinned in
+    # tests/test_telemetry_contract.py against the full fakes. What this
+    # fixture reaches, and what is asserted here, is the rollup the queries
+    # above feed: the status census and the attempt/passed-over distribution.
+    built = c._telemetry_cache["snap"]
+    assert built["postgres"]["outbox"] == {"applied": 10, "rem_reviewed": 3}
     # F5: records REM has given up on are visible, not just silently absent
     # from its queue while still counted as "pending".
-    assert t["neo4j"]["rem_dead_lettered"] == 3
-    assert t["neo4j"]["rem_failing"] == 9
-    assert t["neo4j"]["rem_max_attempts"] == 5
+    assert built["neo4j"]["rem_dead_lettered"] == 3
+    assert built["neo4j"]["rem_failing"] == 9
+    assert built["neo4j"]["rem_max_attempts"] == 5
     # STEP 3 (decision 890) — fairness gauge: total = sum(n*p), starved = rows
     # at/above REM_STARVED_THRESHOLD (default 3).
-    assert t["neo4j"]["rem_passed_over_total"] == 60 * 0 + 9 * 1 + 3 * 3
-    assert t["neo4j"]["rem_starved_pending"] == 3
+    assert built["neo4j"]["rem_passed_over_total"] == 60 * 0 + 9 * 1 + 3 * 3
+    assert built["neo4j"]["rem_starved_pending"] == 3
 
 
 @pytest.mark.asyncio
