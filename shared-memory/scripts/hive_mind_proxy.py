@@ -2273,7 +2273,23 @@ class AsyncHiveMindProxy:
         gate exists to decide who may STEER the LLM POOL, and there is no pool
         decision on this path. _forward_upstream strips every X-SM-LLM-* header
         before the upstream forward regardless of who sent it (P-6), so what
-        reaches the encoder is identical either way."""
+        reaches the encoder is identical either way.
+
+        The raw wire path must EQUAL the router's match: aiohttp matches on the
+        percent-decoded `path_safe`, so `/v1/embedding%73` would otherwise land
+        here and be forwarded with its encoded spelling — the same rule the
+        credentialed gates apply, so every gateway edge compares what it
+        forwards. This handler is reachable only through its own two
+        registrations, so the `path_safe` echoed in that refusal is always one
+        of the two framework literals, never caller text."""
+        if request.rel_url.raw_path != request.rel_url.path_safe:
+            return web.json_response(
+                {"error": f"No such framework route: {request.rel_url.raw_path}. The framework "
+                          f"registers {request.rel_url.path_safe} exactly — this is an encoded "
+                          f"spelling of a gateway route, not a passthrough path. The request "
+                          f"was NOT forwarded to any backend — correct the path and retry."},
+                status=404, headers={"X-SM-Fault-Origin": "gateway"})
+
         # Exact key: this handler is only ever reached through its own
         # registration, and aiohttp's PlainResource matches on
         # rel_url.path_safe (pinned in tests/test_auth_exemption_route_
