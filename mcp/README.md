@@ -123,7 +123,7 @@ Then register it with the host — the **walled copy's** path, never the repo's:
 "shared-memory": {
   "type": "local",
   "command": ["/home/you/.local/bin/uv", "run", "--with", "fastmcp", "--with", "httpx",
-              "--with", "python-dotenv", "python",
+              "python",
               "/home/you/.config/<host>/shared-memory-mcp/vector-skill.py"],
   "environment": {
     "COORDINATOR_URL": "http://localhost:8888",

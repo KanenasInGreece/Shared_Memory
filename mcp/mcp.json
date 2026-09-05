@@ -19,8 +19,6 @@
         "fastmcp",
         "--with",
         "httpx",
-        "--with",
-        "python-dotenv",
         "python",
         "/path/to/your/shared_mem/mcp/vector-skill.py"
       ],

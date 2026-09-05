@@ -62,7 +62,7 @@ never holds the value:
   "servers": {
     "shared-memory": {
       "command": "uv",
-      "args": ["run", "--with", "fastmcp", "--with", "httpx", "--with", "python-dotenv",
+      "args": ["run", "--with", "fastmcp", "--with", "httpx",
                "python", "/path/to/shared-memory-GitHub/mcp/vector-skill.py"],
       "env": {
         "COORDINATOR_URL": "http://localhost:8888",
@@ -130,7 +130,7 @@ bash shared-memory/scripts/sync_skills.sh
   "mcpServers": {
     "shared-memory": {
       "command": "uv",
-      "args": ["run", "--with", "fastmcp", "--with", "httpx", "--with", "python-dotenv",
+      "args": ["run", "--with", "fastmcp", "--with", "httpx",
                "python", "/home/you/.copilot/shared-memory-mcp/vector-skill.py"],
       "cwd": "/home/you/.copilot/shared-memory-mcp",
       "env": { "COORDINATOR_URL": "http://localhost:8888" }

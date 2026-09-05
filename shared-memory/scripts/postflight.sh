@@ -324,7 +324,7 @@ now_ms() { local t=$EPOCHREALTIME; echo $(( ${t%.*} * 1000 + 10#${t#*.} / 1000 )
 # Exactly ONE save per call, so a timing window never contains two.
 CANARY_META='{"project": "install-verification", "new_project": true}'
 do_save() {  # do_save <content>  — prints the bridge's JSON reply
-    timeout "$CLIENT_TIMEOUT" uv run --with httpx --with python-dotenv \
+    timeout "$CLIENT_TIMEOUT" uv run --with httpx \
             python "$BRIDGE" save "$1" "$CANARY_META" 2>/dev/null
 }
 
@@ -520,7 +520,7 @@ else
     # Warm the uv environment UNTIMED first: on a fresh host the first
     # `uv run` resolves and downloads packages, which would otherwise dominate
     # A6's short-save number — the baseline must time the framework, not uv.
-    uv run --with httpx --with python-dotenv python "$BRIDGE" --version >/dev/null 2>&1
+    uv run --with httpx python "$BRIDGE" --version >/dev/null 2>&1
 
     # Unique per run (timestamp embedded) so SHA-256 idempotency never
     # short-circuits — this save also provides A6's short-save timing.
@@ -668,7 +668,7 @@ print(json.dumps(d[$cand_idx - 1]))
                     probe_last_was_catchall=0
                     continue
                 fi
-                cand_search_out="$(timeout "$CLIENT_TIMEOUT" uv run --with httpx --with python-dotenv \
+                cand_search_out="$(timeout "$CLIENT_TIMEOUT" uv run --with httpx \
                         python "$BRIDGE" search "$cand_phrase" 20 2>/dev/null)"
                 # C2 (decision:1435): the coordinator keyword-fallback shape
                 # (served when the embedder is unreachable) omits the
@@ -762,7 +762,7 @@ elif [[ ! "$pg_id" =~ ^[0-9]+$ ]]; then
     bad A5 "skipped — no canary to search for (A4 save failed)"
 else
     t0="$(now_ms)"
-    search_out="$(timeout "$CLIENT_TIMEOUT" uv run --with httpx --with python-dotenv \
+    search_out="$(timeout "$CLIENT_TIMEOUT" uv run --with httpx \
             python "$BRIDGE" search "Shared Memory install-verification canary ${marker}" 5 \
             --project install-verification 2>/dev/null)"
     t1="$(now_ms)"

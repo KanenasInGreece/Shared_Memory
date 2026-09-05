@@ -792,21 +792,15 @@ def test_manual_env_parser_loads_token_without_dotenv(tmp_path, monkeypatch):
     Probe key renamed PROBE_ONLY_KEY -> PROBE_ONLY_VALUE (MCPW-R2-C5 delta
     D1): the ported _CLIENT_SECRET_SUFFIXES now contains "_KEY", so the old
     name was itself secret-shaped and this test would pin the filter working
-    (correctly) rather than what it always meant to pin (the manual parser
-    loads a benign value without dotenv installed).
+    (correctly) rather than what it always meant to pin (the parser loads a
+    benign value).
 
-    QA build review HIGH-1 (2026-09-01, opus): python-dotenv is
-    TRANSITIVELY installed via fastmcp in this suite, so T1/T5 (which spawn
-    a real subprocess) always take the dotenv_values() branch and never
-    exercise _load_env_manually's own guards. This is the ONLY test in the
-    suite that calls _load_env_manually directly — and it used to assert
+    QA build review HIGH-1 (2026-09-01, opus): this test used to assert
     solely on the benign PROBE_ONLY_VALUE, even though its own fixture
     already wrote AGENT_TOKEN=tok_manual_parse and nothing ever checked it.
     Proven by the reviewer: deleting BOTH the AGENT_TOKEN diversion and the
     secret-key skip from _load_env_manually left the FULL SUITE GREEN. The
-    three assertions below close that hole — this is now the sole place I6'
-    is pinned on the manual-fallback path, so do not remove them even if
-    T1/T5 gain their own no-dotenv coverage later."""
+    three assertions below close that hole — keep them."""
     vs = load_vector_skill()
     env = tmp_path / ".env"
     env.write_text("AGENT_TOKEN=tok_manual_parse\n# comment\nBADLINE\n")

@@ -121,7 +121,7 @@ and this rule disagree, the script is the defect (fix-round ruling `decision:143
 **In CANARY MODE (below), behavior is unchanged.**
 
 **Check.** Save a canary record through the gateway (via
-`uv run --with httpx --with python-dotenv python shared-memory/scripts/memory_bridge.py save ...`
+`uv run --with httpx python shared-memory/scripts/memory_bridge.py save ...`
 with `AGENT_TOKEN` exported), then verify it in the stores:
 
 - **(a) Embedding dimension EQUALS 1024** — the value is asserted, not an equality between two

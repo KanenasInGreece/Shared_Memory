@@ -630,9 +630,9 @@ skill dir, `$HOME`) the save is refused with `project_required`:
 
 ```bash
 cd <repo-or-any-project-root>
-uv run --with httpx --with python-dotenv python <skill-dir>/scripts/memory_bridge.py doctor
-uv run --with httpx --with python-dotenv python <skill-dir>/scripts/memory_bridge.py save "install smoke test" '{"source":"<agent>","entities":["SetupTest"],"new_entities":["SetupTest"],"new_project":true}'
-uv run --with httpx --with python-dotenv python <skill-dir>/scripts/memory_bridge.py search "install smoke test" 3
+uv run --with httpx python <skill-dir>/scripts/memory_bridge.py doctor
+uv run --with httpx python <skill-dir>/scripts/memory_bridge.py save "install smoke test" '{"source":"<agent>","entities":["SetupTest"],"new_entities":["SetupTest"],"new_project":true}'
+uv run --with httpx python <skill-dir>/scripts/memory_bridge.py search "install smoke test" 3
 ```
 
 Two flags are needed exactly once, for the same reason: a fresh corpus has no registered
@@ -910,7 +910,7 @@ curl -s -H "Authorization: Bearer $AGENT_TOKEN" http://localhost:8888/health \
 docker compose -f shared-memory/ops/postgres_neo4j_limits.yaml --env-file shared-memory/.env ps
 systemctl --user status hive-mind-gateway.service
 journalctl --user -u hive-mind-gateway.service -n 50   # daemon logs
-uv run --with httpx --with python-dotenv python <skill-dir>/scripts/memory_bridge.py status   # telemetry
+uv run --with httpx python <skill-dir>/scripts/memory_bridge.py status   # telemetry
 ```
 
 ⚠ **Every `/health` read below this point means the AUTHENTICATED payload** (any minted agent

@@ -192,28 +192,28 @@ def test_vector_skill_mirror_agrees_with_memory_bridge_mirror():
     assert set(vector_skill._CLIENT_SECRET_SUFFIXES) == set(memory_bridge._CLIENT_SECRET_SUFFIXES)
 
 
-# ── MCPW-R2-C5 SEC round (F3): filter-bypass fix at the CALL SITES ─────────
+# ── MCPW-R2-C5 SEC round (F3): filter-bypass fix at the LOADER CALL SITE ──
 # SEC build review HIGH-1 (case sensitivity) + HIGH-2 (BOM) (2026-09-01,
 # gemini): _is_client_secret_key is an exact-match-then-suffix predicate, so
 # `pg_conn` (lowercase) or a BOM-prefixed `PG_CONN`/`AGENT_TOKEN` sailed past
 # both the AGENT_TOKEN divert and the secret check and landed straight in
-# os.environ. Fixed at the two LOADER CALL SITES in mcp/vector-skill.py
-# (both the dotenv_values() loop and _load_env_manually), never inside
-# _is_client_secret_key itself — it stays a byte-identical mirror of
-# memory_bridge's, pinned above; the ruling was explicit that mirror parity
-# must not drift. These pins therefore run the fix THROUGH THE LOADER, not
-# against the bare predicate (which cannot see case/BOM handling that lives
-# one level up the call stack) — the SEC reviewer's own finding 6 was that
-# predicate-only pins can pass while the loader still leaks.
+# os.environ. Each client has ONE loader — mcp/vector-skill.py's
+# _load_env_manually, memory_bridge.py's _read_env_file — and the fix lives
+# at that call site, never inside _is_client_secret_key itself, which stays a
+# byte-identical mirror of its twin, pinned above; the ruling was explicit
+# that mirror parity must not drift. These pins therefore run the fix THROUGH
+# THE LOADER, not against the bare predicate (which cannot see case/BOM
+# handling that lives one level up the call stack) — the SEC reviewer's own
+# finding 6 was that predicate-only pins can pass while the loader still
+# leaks.
 #
-# The BOM-prefixed keys are placed AFTER a first, neutral line: dotenv_values
-# (and Python's `utf-8-sig` codec, used by _load_env_manually) only strip a
-# BOM that sits at byte offset 0 of the FILE — i.e. only the very first key
-# would be auto-cleaned "for free". Placing the BOM-carrying keys later in
-# the file (measured, both loaders confirmed to still see the raw
-# character there) is what actually exercises the call-site .lstrip("﻿")
-# fix rather than accidentally relying on a library that already handles the
-# leading-byte case.
+# The BOM-prefixed keys are placed AFTER a first, neutral line: Python's
+# `utf-8-sig` codec, which both loaders open the file with, strips only a BOM
+# sitting at byte offset 0 of the FILE — i.e. only the very first key would be
+# auto-cleaned "for free". Placing the BOM-carrying keys later in the file
+# (measured, both loaders confirmed to still see the raw character there) is
+# what actually exercises the call-site BOM normalisation rather than
+# accidentally relying on the codec's leading-byte handling.
 _BOM = "\ufeff"
 
 
@@ -243,10 +243,10 @@ _BYPASS_ENV_KEYS = ("PROBE_FIRST_LINE", "AGENT_TOKEN", f"{_BOM}AGENT_TOKEN",
 
 
 def test_manual_parser_filters_lowercase_and_bom_prefixed_secrets(tmp_path, monkeypatch):
-    """Through _load_env_manually (the no-dotenv fallback path) — the second
-    of the two call sites the ruling requires fixed. Mutation check: removing
-    the `.upper()` from this loop's `_is_client_secret_key(key_norm.upper())`
-    call makes the lowercase `pg_conn` pin below die (recorded in HANDOFF).
+    """Through _load_env_manually, this door's one parser. Mutation check:
+    removing the `.upper()` from this loop's
+    `_is_client_secret_key(key_norm.upper())` call makes the lowercase
+    `pg_conn` pin below die (recorded in HANDOFF).
 
     H-1 follow-up: also pins the lowercase `agent_token=` line is never
     exported under either casing — this fixture's own precedence rules
@@ -285,51 +285,12 @@ def test_manual_parser_filters_lowercase_and_bom_prefixed_secrets(tmp_path, monk
             os.environ.pop(key, None)
 
 
-def test_dotenv_values_path_filters_lowercase_and_bom_prefixed_secrets(tmp_path, monkeypatch):
-    """Through the dotenv_values() primary path — the branch actually taken
-    at real import time in THIS suite, since python-dotenv is transitively
-    installed via fastmcp (QA build review MED-1, 2026-09-01). Mutation
-    check: removing the `.upper()` from this loop's
-    `_is_client_secret_key(_k_norm.upper())` call makes the lowercase
-    `pg_conn` pin below die.
-
-    H-1 follow-up: also pins the lowercase `agent_token=` line is never
-    exported under either casing (diversion-when-first is separate, below)."""
-    for key in _BYPASS_ENV_KEYS:
-        monkeypatch.delenv(key, raising=False)
-    env_file = tmp_path / "bypass.env"
-    _write_bypass_fixture(env_file)
-    monkeypatch.setenv("VECTOR_SKILL_ENV", str(env_file))
-    try:
-        fresh = _load_vector_skill()
-        assert "pg_conn" not in os.environ, "lowercase pg_conn leaked past the filter"
-        assert "PG_CONN" not in os.environ, "BOM-prefixed PG_CONN leaked under its bare name"
-        assert f"{_BOM}PG_CONN" not in os.environ, "BOM-prefixed PG_CONN leaked under its raw key"
-        assert fresh._AGENT_TOKEN_FROM_FILE == "tok_bom_prefixed", (
-            "the BOM-prefixed AGENT_TOKEN was not diverted to the private variable"
-        )
-        assert "AGENT_TOKEN" not in os.environ
-        assert f"{_BOM}AGENT_TOKEN" not in os.environ
-        assert "agent_token" not in os.environ, (
-            "H-1: a lowercase agent_token= line leaked the bearer into os.environ"
-        )
-        assert os.environ.get("probe_lower") == "benign_val", (
-            "a benign lowercase key must still export under its ORIGINAL name — "
-            "normalization is for filtering only, never for the exported name"
-        )
-    finally:
-        # Direct os.environ.pop, not monkeypatch.delenv — see the sibling
-        # test above (same reason, same measured behaviour).
-        for key in _BYPASS_ENV_KEYS:
-            os.environ.pop(key, None)
-
-
 # ── H-1 (2026-09-01 follow-up, blocking): diversion-when-first, minimal ────
 # fixtures. The shared bypass fixture above already carries a HIGHER-
 # precedence token (the BOM-prefixed AGENT_TOKEN, first in the file), so it
 # cannot deterministically prove a lowercase agent_token= line diverts —
 # first-definition-wins means the earlier line always claims
-# _AGENT_TOKEN_FROM_FILE first. These two tests use a fixture with ONLY a
+# _AGENT_TOKEN_FROM_FILE first. The diversion tests use a fixture with ONLY a
 # lowercase token line (plus one benign key) so the diversion assertion is
 # unambiguous.
 
@@ -368,35 +329,12 @@ def test_manual_parser_diverts_lowercase_agent_token_when_first(tmp_path, monkey
             os.environ.pop(key, None)
 
 
-def test_dotenv_values_path_diverts_lowercase_agent_token_when_first(tmp_path, monkeypatch):
-    """H-1, dotenv_values() twin of the test above — same fixture, same
-    assertions, through the branch actually taken at real import time in
-    this suite (python-dotenv transitively installed via fastmcp)."""
-    for key in _LOWERCASE_TOKEN_ONLY_KEYS:
-        monkeypatch.delenv(key, raising=False)
-    env_file = tmp_path / "lower_token.env"
-    _write_lowercase_token_only_fixture(env_file)
-    monkeypatch.setenv("VECTOR_SKILL_ENV", str(env_file))
-    try:
-        fresh = _load_vector_skill()
-        assert fresh._AGENT_TOKEN_FROM_FILE == "tok_lower_variant", (
-            "H-1: the lowercase agent_token= line was not diverted when it "
-            "was the only token line present"
-        )
-        assert "agent_token" not in os.environ
-        assert "AGENT_TOKEN" not in os.environ
-        assert os.environ.get("probe_lower") == "benign_val"
-    finally:
-        for key in _LOWERCASE_TOKEN_ONLY_KEYS:
-            os.environ.pop(key, None)
-
-
 # ── D.3 (SEC round, ADV1-1): the CLI door's own call-site normalisation ────
-# memory_bridge.py never had vector-skill.py's case/BOM fix at its two
-# loader call sites (the dotenv_values() branch and the manual-parse
-# fallback) until this round — these pins run the fix THROUGH THE LOADER,
-# through a fresh module import from a controlled tmp skill tree (the same
-# helper test_memory_bridge.py's own S-18 tests use), never against the bare
+# memory_bridge.py never had vector-skill.py's case/BOM fix at its loader
+# call site until that round — these pins run the fix THROUGH THE LOADER
+# (_read_env_file, reached by importing the client), through a fresh module
+# import from a controlled tmp skill tree (the same helper
+# test_memory_bridge.py's own S-18 tests use), never against the bare
 # predicate alone (predicate-only pins cannot see loader-level case/BOM
 # handling).
 
@@ -423,12 +361,11 @@ def _load_memory_bridge_from_skill_dir(skill_dir):
     return mod
 
 
-def test_memory_bridge_dotenv_path_filters_lowercase_and_bom_prefixed_secrets(tmp_path, monkeypatch):
-    """Through the dotenv_values() primary path -- the branch actually taken
-    at real import time (python-dotenv is transitively installed via
-    fastmcp). Mutation check: removing the key_norm computation and reverting
-    to the two separate `.upper()` calls the fix replaced makes the
-    lowercase `pg_conn` / BOM-prefixed pins below die (recorded in HANDOFF)."""
+def test_memory_bridge_loader_filters_lowercase_and_bom_prefixed_secrets(tmp_path, monkeypatch):
+    """Through _read_env_file, the client's one parser, reached by importing
+    the client the way a real invocation does. Mutation check: removing the
+    key_norm computation and reverting to two separate `.upper()` calls makes
+    the lowercase `pg_conn` / BOM-prefixed pins below die."""
     for key in _BYPASS_ENV_KEYS:
         monkeypatch.delenv(key, raising=False)
     _pin = os.environ.pop("SECURE_ENV_FILE", None)
@@ -459,7 +396,7 @@ def test_memory_bridge_dotenv_path_filters_lowercase_and_bom_prefixed_secrets(tm
             os.environ["SECURE_ENV_FILE"] = _pin
 
 
-def test_memory_bridge_dotenv_path_diverts_lowercase_agent_token_when_first(tmp_path, monkeypatch):
+def test_memory_bridge_loader_diverts_lowercase_agent_token_when_first(tmp_path, monkeypatch):
     """H-1 twin: a lowercase agent_token= line, as the ONLY token line in
     the file, must be diverted -- not exported under any casing."""
     for key in _LOWERCASE_TOKEN_ONLY_KEYS:

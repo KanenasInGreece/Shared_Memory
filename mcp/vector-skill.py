@@ -96,11 +96,8 @@ _EXPORT_PREFIX_RE = re.compile(r"^export\s+", re.IGNORECASE)
 
 def _strip_export_prefix(key: str) -> str:
     """Fix round F5: strip an optional leading shell `export ` keyword
-    (case-insensitive) from a raw .env line's key text, at parse time, in
-    the MANUAL fallback parser (_load_env_manually) only — the dotenv_
-    values() path already strips a lowercase "export " natively and
-    silently drops an uppercase "EXPORT " line entirely (neither reaches
-    this function). Mirrors secure_env._strip_export_prefix() exactly."""
+    (case-insensitive) from a raw .env line's key text, at parse time.
+    Mirrors secure_env._strip_export_prefix() exactly."""
     s = key
     while s and (s[0].isspace() or s[0] == "﻿"):
         s = s[1:]
@@ -116,12 +113,8 @@ def _strip_balanced_quotes(value: str) -> str:
     else (an unbalanced leading quote with no matching trailing one, a bare
     quote embedded in the value, mismatched quote characters, or no quotes
     at all) is kept VERBATIM. Same rule, independently duplicated in
-    secure_env.py and memory_bridge.py's manual fallback parsers — none of
-    the three may import from another (Group 1: the client/server surface
-    split). Applies only to the MANUAL fallback parser below
-    (_load_env_manually); the dotenv_values() path further down (used when
-    python-dotenv is installed) applies that library's own quote handling
-    instead."""
+    secure_env.py and memory_bridge.py — none of the three may import from
+    another (Group 1: the client/server surface split)."""
     if len(value) >= 2 and value[0] == value[-1] and value[0] in ('"', "'"):
         return value[1:-1]
     return value
@@ -129,8 +122,8 @@ def _strip_balanced_quotes(value: str) -> str:
 
 def _looks_like_server_env(path: str) -> bool:
     """True when this .env is the FRAMEWORK's, not a client's. Best-effort: an
-    unreadable file is not treated as a server env, since the only cost of trying
-    to load it is dotenv's own failure."""
+    unreadable file is not treated as a server env, since the only cost of
+    trying to load it is the parser's own failure to read it."""
     try:
         with open(path, "r", encoding="utf-8", errors="replace") as fh:
             for line in fh:
@@ -224,14 +217,21 @@ _ENV_PATH = os.environ.get("VECTOR_SKILL_ENV", "").strip() or os.path.join(
 
 
 def _load_env_manually(path: str) -> None:
-    """Fallback parser for when python-dotenv is absent. An env loader must
-    NEVER silently no-op because its parser dependency is missing — that class
-    once made two verifiers report a CREDENTIALS error for a missing
-    DEPENDENCY. Same structure as memory_bridge.py's manual fallback: strip,
+    """The ONE parser this client has for its `.env`.
+
+    An env loader must NEVER silently no-op because a parser dependency is
+    missing — that class once made two verifiers report a CREDENTIALS error
+    for a missing DEPENDENCY — so this door parses the file itself. Same
+    structure and same rules as memory_bridge.py's `_read_env_file`: strip,
     skip comments/no-`=` lines, divert AGENT_TOKEN to _AGENT_TOKEN_FROM_FILE
     (never exported), skip any secret-shaped key (never exported either), and
     first-definition-wins for everything else — real env vars still win
-    because they were already set before this ever runs."""
+    because they were already set before this ever runs. A VALUE is read
+    verbatim to the end of its line: an inline `# comment` after a value is
+    part of the value, and a line with an unbalanced quote is kept as written
+    and never swallows the next line. Multi-line values, `${VAR}`
+    interpolation and `\\n` escapes are not a form any shipped or minted
+    `.env` uses and are not supported."""
     global _AGENT_TOKEN_FROM_FILE
     try:
         # utf-8-sig: a file saved as UTF-8-with-BOM has its first three bytes
@@ -299,7 +299,7 @@ def _load_env_manually(path: str) -> None:
                 if key not in os.environ:   # first definition wins
                     os.environ[key] = val
     except OSError:
-        pass  # absent file = rely on externally-set env vars, same as dotenv
+        pass  # absent file = rely on externally-set env vars
 
 
 if os.path.isfile(_ENV_PATH) and _looks_like_server_env(_ENV_PATH):
@@ -311,34 +311,7 @@ if os.path.isfile(_ENV_PATH) and _looks_like_server_env(_ENV_PATH):
         "optionally COORDINATOR_URL / AGENT_ID), set VECTOR_SKILL_ENV to that "
         "file, or inject AGENT_TOKEN via the MCP host's own env block.\n")
 else:
-    try:
-        from dotenv import dotenv_values  # parses without touching os.environ
-        if os.path.isfile(_ENV_PATH):
-            for _k, _v in dotenv_values(_ENV_PATH).items():
-                if _v is None or not _k:
-                    continue
-                # SEC round HIGH-1 + HIGH-2 (2026-09-01, gemini), H-1
-                # follow-up fix — same rationale AND same shape as
-                # _load_env_manually above: _k_norm is uppercased ONCE and
-                # used for BOTH the AGENT_TOKEN comparison and the
-                # predicate call, so a lowercase `agent_token=` cannot slip
-                # through the case-sensitive-vs-normalized mismatch that
-                # made the first pass's two separate `.upper()` calls a
-                # regression (see the detailed note above). `_k` — never
-                # `_k_norm` — is still what gets exported.
-                _k_norm = _client_key_norm(_k)
-                if _k_norm == "AGENT_TOKEN":
-                    if not _AGENT_TOKEN_FROM_FILE:
-                        _AGENT_TOKEN_FROM_FILE = _v.strip()
-                    continue
-                if _is_client_secret_key(_k_norm):
-                    continue
-                os.environ.setdefault(_k, _v)
-    except ImportError:
-        # python-dotenv not installed — manually parse the client .env so
-        # config/token are found when running bare `python` or
-        # `uv run --with httpx`.
-        _load_env_manually(_ENV_PATH)
+    _load_env_manually(_ENV_PATH)
 
 # Configure logging to stderr for MCP visibility
 logging.basicConfig(level=logging.INFO)

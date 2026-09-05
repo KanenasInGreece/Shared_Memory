@@ -22,7 +22,7 @@ metadata at that date, not recalled.
 | `neo4j` Python driver | resolved by `uv` | Apache-2.0 AND Python-2.0 | imported library |
 | `asyncpg`, `fastmcp` | resolved by `uv` | Apache-2.0 | imported libraries |
 | `aiohttp` | resolved by `uv` | Apache-2.0 AND MIT | imported library; the `web.RequestKey` conversion for `NotAppKeyWarning` (10 production + 12 test sites — the auth middleware and person identity; the three warning sites are `coordinator.py:2263`, `:2268`, `:2337`) is **deferred** as a dependency-currency item under `decision:1586`; `tests/test_auth_exemption_route_resolution.py`'s module-scoped `filterwarnings` pin flips from ignore to `error` when the conversion ships |
-| `httpx`, `python-dotenv` | resolved by `uv` | BSD-3-Clause | imported libraries |
+| `httpx` | resolved by `uv` | BSD-3-Clause | imported libraries |
 | `numpy` | resolved by `uv` | BSD-3-Clause AND 0BSD AND MIT AND Zlib AND CC0-1.0 | imported library |
 | `json-repair` | resolved by `uv` | MIT | imported library |
 | `psycopg2-binary` | resolved by `uv` | LGPL with exceptions (PyPI metadata) | imported library, used unmodified and dynamically, within its linking exception |
