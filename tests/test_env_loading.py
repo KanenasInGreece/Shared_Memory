@@ -29,6 +29,19 @@ sys.path.insert(0, _MIGRATIONS)
 
 VERIFIERS = ["verify_schema_init", "verify_neo4j_init"]
 
+# Every module in the tree that parses the framework .env with
+# `key, _, val = line.partition("=")`. The two verifiers plus the two migration
+# tools; all four import from shared-memory/migrations with no side effects.
+# The two verifiers point at the tmp tree through `HERE`, the other two through
+# `MIGRATIONS_DIR`.
+LOADERS = VERIFIERS + ["apply", "generate_schema_init"]
+_TMP_DIR_ATTR = {
+    "verify_schema_init": "HERE",
+    "verify_neo4j_init": "HERE",
+    "apply": "MIGRATIONS_DIR",
+    "generate_schema_init": "MIGRATIONS_DIR",
+}
+
 
 @pytest.fixture
 def no_dotenv(monkeypatch):
@@ -113,3 +126,41 @@ def test_a_missing_env_file_is_not_an_error(module_name, no_dotenv, monkeypatch,
     mod = importlib.import_module(module_name)
     monkeypatch.setattr(mod, "HERE", tmp_path / "nowhere" / "migrations")
     mod._load_env()   # must not raise
+
+
+@pytest.mark.parametrize("module_name", LOADERS)
+def test_a_pasted_banner_line_is_skipped_not_fatal(module_name, monkeypatch, tmp_path):
+    """A line with an EMPTY KEY must be skipped, and the loader must keep going.
+
+    Measured (fact:2002): the block generate_tokens.py printed was pasted into
+    the framework .env, leaving lines like `=== Gateway .env — ... ===`. Those
+    are non-blank, do not start with `#`, and DO contain `=`, so they reach
+    `line.partition("=")` with an empty key — and
+    `os.environ.setdefault("", ...)` raises `OSError: [Errno 22] Invalid
+    argument`. update_framework.sh runs apply.py before its restart, so the
+    update stopped there (fact:1997).
+
+    THE ORDERING IS THE PROOF: `SM_TEST_KEY` is written AFTER the banner, so a
+    loader that merely `return`s or `break`s on the bad line would leave it
+    unset. Only `continue` gets it into the environment.
+    """
+    mod = importlib.import_module(module_name)
+    (tmp_path / "shared-memory").mkdir()
+    (tmp_path / "shared-memory" / ".env").write_text(
+        "=== Gateway .env — add this line (digest form; safe to print/paste) ===\n"
+        "SM_TEST_KEY=value\n"
+        "=\n"
+        "# comment\n"
+    )
+    monkeypatch.setattr(
+        mod, _TMP_DIR_ATTR[module_name], tmp_path / "shared-memory" / "migrations",
+    )
+    monkeypatch.delenv("SM_TEST_KEY", raising=False)
+
+    try:
+        mod._load_env()   # must not raise OSError
+        assert os.environ.get("SM_TEST_KEY") == "value", (
+            "the key defined AFTER the banner never reached the environment — "
+            "the loader stopped at the bad line instead of skipping it")
+    finally:
+        os.environ.pop("SM_TEST_KEY", None)
