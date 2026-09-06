@@ -102,9 +102,18 @@ def _fake_docker(tmp_path):
     yield str(path)
 
 
+#: The shape drain_outbox reads: the single telemetry.outbox.pending, which the
+#: coordinator builds as pending + in_progress. The dual-emitted
+#: telemetry.postgres.outbox.{pending,in_progress} copies leave the served body
+#: at 0.9.91, and the old read defaulted BOTH to 0 when they went missing —
+#: printing "✓ outbox drained" on the first poll, unconditionally.
+_TELEMETRY_DRAINED = {"telemetry": {"outbox": {"pending": 0}}}
+
+
 class _QuiesceStubHandler(http.server.BaseHTTPRequestHandler):
     quiesce_status = 200
     resume_calls = 0
+    telemetry_body = _TELEMETRY_DRAINED
 
     def do_POST(self):
         length = int(self.headers.get("Content-Length", 0))
@@ -121,22 +130,21 @@ class _QuiesceStubHandler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
 
     def do_GET(self):
-        # GET /memory/telemetry -- drain_outbox polls this once.
+        # GET /memory/telemetry -- drain_outbox polls this each round.
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.end_headers()
-        self.wfile.write(json.dumps(
-            {"telemetry": {"postgres": {"outbox": {"pending": 0, "in_progress": 0}}}}
-        ).encode())
+        self.wfile.write(json.dumps(type(self).telemetry_body).encode())
 
     def log_message(self, *args, **kwargs):
         pass
 
 
 @contextlib.contextmanager
-def _stub_gateway(quiesce_status=200):
+def _stub_gateway(quiesce_status=200, telemetry_body=None):
     handler_cls = type("Handler", (_QuiesceStubHandler,), {
         "quiesce_status": quiesce_status, "resume_calls": 0,
+        "telemetry_body": _TELEMETRY_DRAINED if telemetry_body is None else telemetry_body,
     })
     server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler_cls)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -208,6 +216,55 @@ def test_manifest_records_quiesced_full_on_200(tmp_path):
     assert manifest["quiesced"] is True
     assert manifest["quiesce_mode"] == "full"
     assert handler_cls.resume_calls == 1  # released the fence
+
+
+def test_drain_reports_drained_when_the_outbox_pending_key_says_zero(tmp_path):
+    """The happy path, read from the key drain_outbox actually gates on."""
+    with _fake_docker(tmp_path) as docker_path, \
+            _stub_gateway(200, {"telemetry": {"outbox": {"pending": 0}}}) as (url, _h):
+        result, _ = _run_backup_sh(
+            tmp_path, docker_path,
+            {"BACKUP_ADMIN_TOKEN": "tok", "GATEWAY_URL": url,
+             "BACKUP_DRAIN_MAX_SECONDS": "2", "BACKUP_DRAIN_POLL_SECONDS": "1"},
+        )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "outbox drained" in result.stdout, result.stdout
+
+
+def test_drain_does_not_report_drained_while_the_outbox_still_has_work(tmp_path):
+    """pending: 3 must never read as drained — it is the whole point of the gate."""
+    with _fake_docker(tmp_path) as docker_path, \
+            _stub_gateway(200, {"telemetry": {"outbox": {"pending": 3}}}) as (url, _h):
+        result, _ = _run_backup_sh(
+            tmp_path, docker_path,
+            {"BACKUP_ADMIN_TOKEN": "tok", "GATEWAY_URL": url,
+             "BACKUP_DRAIN_MAX_SECONDS": "2", "BACKUP_DRAIN_POLL_SECONDS": "1"},
+        )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "outbox drained" not in result.stdout, result.stdout
+    assert "not fully drained" in result.stdout, result.stdout
+
+
+def test_drain_says_the_key_is_absent_instead_of_claiming_drained(tmp_path):
+    """THE regression this file exists for at 0.9.91.
+
+    With the old `${pend:-0}` / `${prog:-0}` defaults, a served body carrying no
+    outbox key at all made both reads default to 0 and the FIRST poll print
+    "✓ outbox drained" — a snapshot taken with Neo4j arbitrarily behind
+    Postgres, under a green line. An absent key means the gate cannot answer:
+    name the key, keep polling, fall through to the best-effort timeout.
+    """
+    with _fake_docker(tmp_path) as docker_path, \
+            _stub_gateway(200, {"telemetry": {"rem": {}}}) as (url, _h):
+        result, _ = _run_backup_sh(
+            tmp_path, docker_path,
+            {"BACKUP_ADMIN_TOKEN": "tok", "GATEWAY_URL": url,
+             "BACKUP_DRAIN_MAX_SECONDS": "2", "BACKUP_DRAIN_POLL_SECONDS": "1"},
+        )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "outbox drained" not in result.stdout, result.stdout
+    assert "telemetry.outbox.pending absent" in result.stdout, result.stdout
+    assert "not fully drained" in result.stdout, result.stdout
 
 
 def test_manifest_records_quiesced_timeout_on_202(tmp_path):

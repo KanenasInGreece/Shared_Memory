@@ -271,16 +271,32 @@ resume() {
   QUIESCED=0
 }
 
-# Wait until the outbox is empty (pending==0 && in_progress==0) so Neo4j is caught
-# up with Postgres before the snapshot. Best-effort: proceeds on timeout.
+# Wait until the outbox is empty so Neo4j is caught up with Postgres before the
+# snapshot. The gate is the single `telemetry.outbox.pending`, which the
+# coordinator builds as pending + in_progress — there is no `outbox.in_progress`
+# key to read alongside it.
+#
+# ⛔ NO `:-0` DEFAULT ON THIS READ. It used to read the dual-emitted
+# telemetry.postgres.outbox.{pending,in_progress} with `${pend:-0}` / `${prog:-0}`,
+# so once those copies were dropped from the served body json_get returned empty,
+# both defaulted to 0, and the very first poll printed "✓ outbox drained"
+# unconditionally — a snapshot taken with Neo4j arbitrarily behind Postgres,
+# under a green line. An ABSENT key means the gate cannot answer: say so and keep
+# polling to the timeout (best-effort, as below), never "drained".
 drain_outbox() {
-  local waited=0 pend prog
+  local waited=0 pend warned=0
   while (( waited < BACKUP_DRAIN_MAX_SECONDS )); do
     local tel; tel="$(dcurl "$GATEWAY_URL/memory/telemetry" \
       -H "@$_AUTH_HEADER_FILE")" || break
-    pend="$(json_get telemetry.postgres.outbox.pending     <<<"$tel")"; pend="${pend:-0}"
-    prog="$(json_get telemetry.postgres.outbox.in_progress <<<"$tel")"; prog="${prog:-0}"
-    [[ "$pend" == "0" && "$prog" == "0" ]] && { grn "  ✓ outbox drained"; return 0; }
+    pend="$(json_get telemetry.outbox.pending <<<"$tel")"
+    if [[ -z "$pend" ]]; then
+      if (( warned == 0 )); then
+        warned=1
+        ylw "  ! telemetry.outbox.pending absent from $GATEWAY_URL/memory/telemetry — cannot tell whether the outbox is drained; polling on"
+      fi
+    elif [[ "$pend" == "0" ]]; then
+      grn "  ✓ outbox drained"; return 0
+    fi
     sleep "$BACKUP_DRAIN_POLL_SECONDS"; waited=$(( waited + BACKUP_DRAIN_POLL_SECONDS ))
   done
   ylw "  ! outbox not fully drained after ${BACKUP_DRAIN_MAX_SECONDS}s — proceeding (restore self-heals on replay)"
