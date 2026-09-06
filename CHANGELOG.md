@@ -5,6 +5,38 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.9.91] — 2026-09-06
+
+### The token script's output pastes, the loaders tolerate a pasted banner, the last dual-emitted copies leave
+
+**Every line `generate_tokens.py` prints on a mint, `--add` or `--remint` run pastes into an env
+file.** A line is blank, a `KEY=VALUE` line, or begins with `#`: the banners, the per-agent report and
+the explanatory blocks are comment lines, and the `AGENT_TOKENS=`, `AGENT_ROLES=` and `AGENT_INSTALLS=`
+lines are unchanged. `bootstrap_tokens.sh` selects those three lines and the `PARTIAL FAILURE` marker
+exactly as before. `--reveal`, `--digest` and `--convert-digests` output is not paste-safe and is
+meant to be read, not pasted.
+
+**The migration tools tolerate a line with an empty key.** `migrations/apply.py`, `verify_schema_init.py`,
+`verify_neo4j_init.py` and `generate_schema_init.py` skip a line such as `=== banner ===` the way the
+gateway's own loader does, and continue with the lines after it. `update_framework.sh` runs `apply.py`
+before its restart, so an env file carrying a pasted banner no longer stops the update there.
+
+**The dual-emitted copies under `GET /memory/telemetry` are no longer served.** The 16 keys stamped
+`removed_in: 0.9.91` — `postgres.outbox` and its census, `postgres.outbox_failed_oldest_age_seconds`,
+`neo4j.rem_dead_lettered`, `neo4j.rem_failing`, `neo4j.rem_max_attempts`, `neo4j.rem_passed_over_total`,
+`neo4j.rem_starved_pending`, `llm_faults` and its leaves, `axis_registry_read_failures_total` — are
+read at their new homes: `outbox`, `outbox.oldest_failed_age_s`, `rem.dead_lettered`, `rem.failing`,
+`rem.max_attempts`, `rem.passed_over`, `rem.starved_pending`, `llm.faults`, `registry.read_failures_total`.
+`telemetry-contract.md` carries the old-to-new map. Contract delta: moves completed 16 on
+`GET /memory/telemetry`; additions 0; removals 0; `GET /health` unchanged.
+
+**`ops/backup.sh` reads its drain gate from `telemetry.outbox.pending`.** The coordinator builds that
+key as pending plus in-progress, so it is the one value the gate needs. When the key is absent from the
+served body the script says so once and keeps polling to its timeout; it reports the outbox drained only
+when the key reads zero.
+
+---
+
 ## [0.9.90] — 2026-09-06
 
 ### Follow-up to the hygiene round — four small closures
