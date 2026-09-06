@@ -179,6 +179,8 @@ v0.9.91. Read `llm.faults`.
 
 **Read-only roles (`AGENT_ROLES`).** A registered token can be confined to read-only access with `AGENT_ROLES=name:read` in the gateway `.env`. A `read` token may reach only `GET /health`, `GET /memory/telemetry`, and `POST /memory/graph` (read-only-Cypher-guarded); `save`, `retrospective`, `search`, and the proxy passthrough return **403**. Roles only narrow access — the token must still be registered in `AGENT_TOKENS`; unset/`name:full` keeps full read/write. This lets read-only ops clients (e.g. the companion Shared Memory Monitor) hold a dedicated, non-write-capable identity rather than borrowing a full-access agent token — so a leaked monitor token cannot write to memory, and agent-token rotation cannot break telemetry.
 
+**Admin role (`AGENT_ROLES=backup:admin`).** An `admin` token is confined to `/admin/*` and can reach nothing else: `POST /admin/backup` (quiesce and resume) and, since v0.9.92, the read-only `GET /admin/outbox`, the outbox census the backup drain gate polls. That read is served live on every call, not from the telemetry cache, so a leaked admin token can repeat it at will — accepted (ruled 2026-09-06): the same token can already quiesce the gateway, shedding every client write for up to `BACKUP_QUIESCE_MAX_SECONDS`, which is the larger exposure by far; the census is one aggregate over a table the consolidation daemon keeps pruned. An admin token still cannot read or write memory records.
+
 **Token rotation** requires: edit gateway `.env`, restart gateway, update agent `.env` files (CLI agents take effect on next invocation; LM Studio requires full restart).
 
 ### Credential-use audit trail (PR A3, v0.9.4)

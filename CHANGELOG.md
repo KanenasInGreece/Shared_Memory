@@ -5,6 +5,34 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.9.92] — 2026-09-06
+
+### The backup drain gate reads a route its own token may reach, and its tests refuse the wrong one
+
+**`GET /admin/outbox` serves the outbox census to an admin-role token.** The backup's `backup:admin`
+token is confined to `/admin/*`, so the drain gate's polls of `GET /memory/telemetry` were refused
+with 403 on every quiesced backup this framework has taken; before 0.9.91 the script read that
+refusal as zero and printed `✓ outbox drained` on the first poll, and since 0.9.91 it said it could
+not tell and waited its full `BACKUP_DRAIN_MAX_SECONDS`. The new route answers the six census keys
+of `telemetry.outbox` — `pending`, `applied`, `failed`, `rem_reviewed`, `oldest_failed_age_s`,
+`oldest_pending_age_s`, with `pending` folding rows a worker has picked up — computed by the one
+function the telemetry payload also uses. It is read live on every call, not from the telemetry
+snapshot that may be up to `TELEMETRY_CACHE_S` old, because a drain gate must not declare drained
+from a stale reading. A census failure answers 503 with the exception class name only. The route
+registers no HEAD companion, so there is no method on it outside the auth table. The admin role
+gains exactly this read; `SECURITY.md` says so.
+
+**`ops/backup.sh` polls `GET /admin/outbox` and prints the gateway's refusal once.** A quiesced
+backup on a healthy gateway now reports `✓ outbox drained` within its first polls instead of waiting
+two minutes. When the key is absent — a gateway that predates this release answers the admin token
+403 — the script prints the gateway's own message once, with control characters stripped, and polls
+to its timeout as before. The drain tests' stub gateway now answers only `/admin/outbox` and refuses
+every other path with the real confinement body, so a script polling the wrong route fails the suite;
+a served `telemetry.outbox.pending` is pinned by value with a non-zero in-progress count, which no
+test did before.
+
+---
+
 ## [0.9.91] — 2026-09-06
 
 ### The token script's output pastes, the loaders tolerate a pasted banner, the last dual-emitted copies leave

@@ -158,7 +158,7 @@ def _short(value: Any, cap: int = 200) -> str:
 # ships with the skill) and this coordinator. Bump it ONLY when the request or
 # response shape, auth scheme, or routes change in a way that breaks older clients.
 # Client and server build-versions are allowed to drift; their API_VERSION must agree.
-FRAMEWORK_VERSION = "0.9.91"
+FRAMEWORK_VERSION = "0.9.92"
 # v2 (retro-as-record): /memory/retrospective now creates a full record (own
 # pg_id, embedding, Retrospective node) and accepts rating enum + grounding —
 # the response shape changed (returns the retro's own pg_id).
@@ -575,9 +575,14 @@ _WRITE_ROUTES: set[tuple[str, str]] = {
 
 # Admin-only routes — reachable ONLY by an "admin"-role token, which in turn can
 # reach nothing else (least privilege: a leaked backup token can only pause/resume
-# backups). Backup quiesce/resume is the first such route.
+# backups and read the outbox census). Backup quiesce/resume is the first such
+# route. The second is the outbox census the backup drain gate needs (v0.9.92,
+# fact:2022): the admin token is confined to /admin/*, so a drain gate that
+# polled /memory/telemetry was 403'd on every poll and could only ever time
+# out — this route is read-only and lets that gate actually read live.
 _ADMIN_ROUTES: set[tuple[str, str]] = {
     ("POST", "/admin/backup"),
+    ("GET", "/admin/outbox"),
 }
 
 # When set, write routes require a kernel-attested principal — i.e. the client must
@@ -3284,6 +3289,23 @@ async def _connect_with_startup_wait(factory, deadline: float):
                 "Postgres not ready yet (attempt %d) — retrying in %.1fs: %s",
                 attempt, sleep_s, exc)
             await asyncio.sleep(sleep_s)
+
+
+def _outbox_public_view(census: dict) -> dict:
+    """The six census-derived keys of `_outbox_telemetry`'s payload, in the
+    SAME order and by the SAME fold — `pending` is census pending + in_progress
+    (v0.9.92). One owner of this shape: `_outbox_telemetry` splices it back
+    in with the four latency-derived keys, and `handle_admin_outbox` serves it
+    directly — dereference the rest rather than writing a second copy
+    (decision:1032)."""
+    return {
+        "pending": census["pending"] + census["in_progress"],
+        "applied": census["applied"],
+        "failed": census["failed"],
+        "rem_reviewed": census["rem_reviewed"],
+        "oldest_failed_age_s": census["oldest_failed_age_s"],
+        "oldest_pending_age_s": census["oldest_pending_age_s"],
+    }
 
 
 # ── Coordinator ───────────────────────────────────────────────────────────────
@@ -11052,12 +11074,7 @@ class MemoryCoordinator:
             return round(float(v), 3) if v is not None else None
 
         return {
-            "pending": census["pending"] + census["in_progress"],
-            "applied": census["applied"],
-            "failed": census["failed"],
-            "rem_reviewed": census["rem_reviewed"],
-            "oldest_failed_age_s": census["oldest_failed_age_s"],
-            "oldest_pending_age_s": census["oldest_pending_age_s"],
+            **_outbox_public_view(census),
             "apply_latency_p50_s": _r(lat["p50"]),
             "apply_latency_p95_s": _r(lat["p95"]),
             "apply_latency_window": lat["n"],
@@ -11509,6 +11526,26 @@ class MemoryCoordinator:
             status=400,
         )
 
+    # ── GET /admin/outbox (the backup drain gate's read) ───────────────────────
+
+    async def handle_admin_outbox(self, request: web.Request) -> web.Response:
+        """GET /admin/outbox — the outbox census for the backup drain gate (admin-role only).
+        Same six keys and values as telemetry.outbox, through _outbox_public_view, served behind
+        the prefix an admin token may reach. Read LIVE on purpose — no TELEMETRY_CACHE_S, no
+        strip_dropped — because a drain gate must not declare drained from a stale snapshot.
+
+        O12: no handler-side `_record_gateway_request` call on the 503 path below —
+        this handler RETURNS the error response rather than raising, so
+        `auth_middleware`'s own `finally` (status = resp.status) already records
+        it once; a second call here would double-count."""
+        try:
+            census = await self._outbox_census()
+        except Exception as exc:
+            return web.json_response(
+                {"status": "error", "message": f"outbox census unavailable: {type(exc).__name__}"},
+                status=503)
+        return web.json_response({"status": "success", "outbox": _outbox_public_view(census)})
+
     async def _begin_quiesce(self, max_seconds: float) -> bool:
         """Shed client writes now; acquire the exclusive backup advisory lock to
         fence the REM/NREM daemons. Returns True once the lock is held (daemons
@@ -11611,3 +11648,4 @@ def attach(app: web.Application, coordinator: MemoryCoordinator) -> None:
     app.router.add_get( "/memory/status/{pg_id}", coordinator.handle_status)
     app.router.add_get( "/memory/telemetry",       coordinator.handle_telemetry)
     app.router.add_post("/admin/backup",           coordinator.handle_backup)
+    app.router.add_get( "/admin/outbox",           coordinator.handle_admin_outbox, allow_head=False)

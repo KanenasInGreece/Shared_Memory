@@ -695,7 +695,13 @@ _PER_TYPE_ROLLUP = {
 _PG_PLAN = {
     "fetchrow": [
         ("FILTER (WHERE status='pending')", _FakeRow(
-            pending=1, in_progress=0, applied=4, failed=0, rem_reviewed=2,
+            # R3, fact:1309: in_progress is NON-ZERO on purpose -- an equality
+            # between two expressions (served pending == census pending) is
+            # only half a guard when in_progress is 0, because "forgot to add
+            # in_progress" and "added it correctly" produce the same served
+            # value. pending=1 + in_progress=3 pins the served
+            # telemetry.outbox.pending at 4, the SUM, not the bare count.
+            pending=1, in_progress=3, applied=4, failed=0, rem_reviewed=2,
             oldest_failed_age_s=None, oldest_pending_age_s=12)),
         ("applied_at - created_at", _FakeRow(
             n=4, p50=1.5, p95=2.5, applied_last_min=2)),
@@ -891,6 +897,43 @@ def test_outbox_failed_is_present_even_when_it_is_zero(gateway):
     assert section["apply_latency_p50_s"] is None
     # The limit travels with the number it bounds.
     assert section["age_limit_s"] == co.OUTBOX_AGE_WARN_S
+
+
+def test_outbox_pending_folds_in_progress_in_the_served_telemetry(gateway):
+    """R3, fact:1309: the VALUE, not just that the key moved. `_PG_PLAN`'s
+    outbox census row carries pending=1 alongside a NON-ZERO in_progress=3;
+    the served telemetry.outbox.pending must be the SUM (4)."""
+    payload = _telemetry_payload(gateway)
+    assert payload["outbox"]["pending"] == 4
+
+
+def test_admin_outbox_view_is_the_telemetry_outbox_view(gateway):
+    """v0.9.92, G-2: `_outbox_public_view` must be BYTE-FOR-VALUE identical to
+    the first six keys of `_outbox_telemetry`'s served payload -- compared as
+    the six SHARED keys, never the whole ten-key dict (the four latency-
+    derived keys are `_outbox_telemetry`-only and have no place in the
+    admin-route view)."""
+    import coordinator as co
+    c = co.MemoryCoordinator()
+
+    census = {"pending": 2, "in_progress": 1, "applied": 5, "failed": 0,
+              "rem_reviewed": 7, "oldest_failed_age_s": 1.5,
+              "oldest_pending_age_s": 0.5}
+    c._outbox_census = AsyncMock(return_value=census)
+    conn = AsyncMock()
+    conn.fetchrow = AsyncMock(return_value={"n": 0, "p50": None, "p95": None,
+                                            "applied_last_min": 0})
+    c._acquire = MagicMock(return_value=_async_ctx(conn))
+
+    telemetry_section = asyncio.run(c._outbox_telemetry())
+    view = co._outbox_public_view(census)
+
+    shared_keys = ("pending", "applied", "failed", "rem_reviewed",
+                   "oldest_failed_age_s", "oldest_pending_age_s")
+    assert set(view) == set(shared_keys)
+    for key in shared_keys:
+        assert view[key] == telemetry_section[key], key
+    assert view["pending"] == 3  # 2 pending + 1 in_progress -- the fold, by value
 
 
 def test_the_nrem_walk_is_served_from_the_refresher_not_the_request(gateway):

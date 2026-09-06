@@ -63,9 +63,10 @@ leak between tests or from any other file's `sys.modules['coordinator']`.
 """
 import asyncio
 import importlib.util
+import json
 import os
 import sys
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from aiohttp import web
@@ -370,6 +371,68 @@ def test_admin_token_confined_403_counted(monkeypatch):
     assert _counters(mod)["requests_total"] == 1
     assert mod._gateway_by_status["403"] == 1
     assert _ring_window(mod) == 0
+
+
+def test_admin_outbox_serves_the_census_to_an_admin_token(monkeypatch):
+    """v0.9.92, A: the real handler (not _ok_handler) behind the real
+    auth_middleware, over the real route. This is the test that would have
+    caught fact:2022 in advance (R5): an admin token reaching GET
+    /admin/outbox and getting the six-key census view back, `pending` folding
+    `in_progress`, the other five passed through by VALUE."""
+    mod = load_coordinator(monkeypatch, "backup:tok_b", agent_roles="backup:admin")
+    coord = mod.MemoryCoordinator()
+    coord._outbox_census = AsyncMock(return_value={
+        "pending": 2, "in_progress": 1, "applied": 5, "failed": 0,
+        "rem_reviewed": 7, "oldest_failed_age_s": 1.5, "oldest_pending_age_s": 0.5,
+    })
+    app = _build_app(mod, [("GET", "/admin/outbox", coord.handle_admin_outbox)])
+
+    status, _, body = _run(_probe(app, "GET", "/admin/outbox", token="tok_b"))
+
+    assert status == 200
+    payload = json.loads(body)
+    outbox = payload["outbox"]
+    assert outbox["pending"] == 3  # 2 pending + 1 in_progress -- the fold
+    assert outbox == {
+        "pending": 3, "applied": 5, "failed": 0, "rem_reviewed": 7,
+        "oldest_failed_age_s": 1.5, "oldest_pending_age_s": 0.5,
+    }
+    assert len(outbox) == 6
+
+
+def test_admin_outbox_403_for_full_token_is_counted(monkeypatch):
+    """v0.9.92, R14: a full-role token hitting the new admin-only route is
+    refused before the handler, and counted like every other early exit."""
+    mod = load_coordinator(monkeypatch, "claude:tok_abc")  # default role = full
+    app = _build_app(mod, [("GET", "/admin/outbox", _ok_handler)])
+
+    status, _, _ = _run(_probe(app, "GET", "/admin/outbox", token="tok_abc"))
+
+    assert status == 403
+    assert _counters(mod)["requests_total"] == 1
+    assert mod._gateway_by_status["403"] == 1
+    assert _ring_window(mod) == 0
+
+
+def test_admin_outbox_503_carries_only_the_exception_class_and_is_counted_once(monkeypatch):
+    """QA R1: the 503 path of handle_admin_outbox had no test at any layer.
+    The brief requires the body carry the exception CLASS name only, never
+    its text (a DB error string can name hosts) -- and that the middleware's
+    own finally is what counts the 503, not a handler-side call (O12). Both
+    are measured here, not reasoned. Mutation-checked: swapping the handler's
+    `{type(exc).__name__}` for `{exc}` leaves the middle assertion the only
+    one that fails."""
+    mod = load_coordinator(monkeypatch, "backup:tok_b", agent_roles="backup:admin")
+    coord = mod.MemoryCoordinator()
+    coord._outbox_census = AsyncMock(side_effect=RuntimeError(
+        "connection to host db.internal.example:5432 failed: password authentication failed"))
+    app = _build_app(mod, [("GET", "/admin/outbox", coord.handle_admin_outbox)])
+    status, _, body = _run(_probe(app, "GET", "/admin/outbox", token="tok_b"))
+    assert status == 503
+    assert json.loads(body)["message"] == "outbox census unavailable: RuntimeError"
+    assert "db.internal.example" not in body.decode()   # never the exception TEXT
+    assert _counters(mod)["requests_total"] == 1        # O12: not double-counted
+    assert mod._gateway_by_status["503"] == 1
 
 
 def test_backup_quiesce_503_counted(monkeypatch):

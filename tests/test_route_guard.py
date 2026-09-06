@@ -439,6 +439,7 @@ _REGISTERED_ROUTES = {
     ("GET",  "/memory/status/{pg_id}"),
     ("GET",  "/memory/telemetry"),
     ("POST", "/admin/backup"),
+    ("GET",  "/admin/outbox"),
     ("GET",  "/health"),
     ("GET",  "/pool/status"),
     # R-A (HYG round): the encoder paths stopped being a startswith() guess
@@ -475,4 +476,22 @@ def test_the_gateway_registers_exactly_this_route_set(monkeypatch):
         "Adding a route means an auth-table entry and a client that calls it; "
         "removing one means a client command that starts 404-ing. Update this "
         "set deliberately, never to make the test pass."
+    )
+
+
+def test_head_admin_outbox_is_not_a_registered_surface(monkeypatch):
+    """QA R3: allow_head=False on /admin/outbox is an auth-boundary guard,
+    not a cosmetic flag. Without it, aiohttp's free HEAD companion would be a
+    registered surface no auth table covers (_ADMIN_ROUTES has no HEAD
+    entry), so the middleware's else arm would let a full-role, non-admin
+    token through to the handler while refusing the admin token that
+    legitimately owns the route -- _registered_route_set() deliberately
+    excludes HEAD, so nothing else in this file can catch its absence.
+    Mutation: setting allow_head=True (or aiohttp's default) on the
+    registration in coordinator.py's attach() makes this test fail."""
+    g = _fresh_gateway(monkeypatch)
+    app = _build_real_gateway_app(g)
+    assert not any(
+        route.method == "HEAD" and route.resource.canonical == "/admin/outbox"
+        for route in app.router.routes()
     )
