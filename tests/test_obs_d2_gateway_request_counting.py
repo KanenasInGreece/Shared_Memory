@@ -63,9 +63,10 @@ leak between tests or from any other file's `sys.modules['coordinator']`.
 """
 import asyncio
 import importlib.util
+import json
 import os
 import sys
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from aiohttp import web
@@ -365,6 +366,47 @@ def test_admin_token_confined_403_counted(monkeypatch):
     app = _build_app(mod, [("POST", "/memory/save", _ok_handler)])
 
     status, _, _ = _run(_probe(app, "POST", "/memory/save", token="tok_b"))
+
+    assert status == 403
+    assert _counters(mod)["requests_total"] == 1
+    assert mod._gateway_by_status["403"] == 1
+    assert _ring_window(mod) == 0
+
+
+def test_admin_outbox_serves_the_census_to_an_admin_token(monkeypatch):
+    """v0.9.92, A: the real handler (not _ok_handler) behind the real
+    auth_middleware, over the real route. This is the test that would have
+    caught fact:2022 in advance (R5): an admin token reaching GET
+    /admin/outbox and getting the six-key census view back, `pending` folding
+    `in_progress`, the other five passed through by VALUE."""
+    mod = load_coordinator(monkeypatch, "backup:tok_b", agent_roles="backup:admin")
+    coord = mod.MemoryCoordinator()
+    coord._outbox_census = AsyncMock(return_value={
+        "pending": 2, "in_progress": 1, "applied": 5, "failed": 0,
+        "rem_reviewed": 7, "oldest_failed_age_s": 1.5, "oldest_pending_age_s": 0.5,
+    })
+    app = _build_app(mod, [("GET", "/admin/outbox", coord.handle_admin_outbox)])
+
+    status, _, body = _run(_probe(app, "GET", "/admin/outbox", token="tok_b"))
+
+    assert status == 200
+    payload = json.loads(body)
+    outbox = payload["outbox"]
+    assert outbox["pending"] == 3  # 2 pending + 1 in_progress -- the fold
+    assert outbox == {
+        "pending": 3, "applied": 5, "failed": 0, "rem_reviewed": 7,
+        "oldest_failed_age_s": 1.5, "oldest_pending_age_s": 0.5,
+    }
+    assert len(outbox) == 6
+
+
+def test_admin_outbox_403_for_full_token_is_counted(monkeypatch):
+    """v0.9.92, R14: a full-role token hitting the new admin-only route is
+    refused before the handler, and counted like every other early exit."""
+    mod = load_coordinator(monkeypatch, "claude:tok_abc")  # default role = full
+    app = _build_app(mod, [("GET", "/admin/outbox", _ok_handler)])
+
+    status, _, _ = _run(_probe(app, "GET", "/admin/outbox", token="tok_abc"))
 
     assert status == 403
     assert _counters(mod)["requests_total"] == 1

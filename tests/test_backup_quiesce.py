@@ -134,6 +134,18 @@ async def test_quiesced_allows_telemetry_read():
 
 
 @pytest.mark.asyncio
+async def test_quiesced_allows_admin_outbox_read():
+    """v0.9.92, R6: NEW INVARIANT — the drain gate's own route is never shed
+    by the quiesce it polls during. An admin token, quiesce active, GET
+    /admin/outbox passes through (200 from the noop handler, not 503)."""
+    mod = load_coordinator("backup:tok_b", agent_roles="backup:admin")
+    mod._backup_quiesce = True
+    req = _make_request("/admin/outbox", auth_header="Bearer tok_b", method="GET")
+    resp = await mod.auth_middleware(req, _noop_handler)
+    assert resp.status == 200
+
+
+@pytest.mark.asyncio
 async def test_not_quiesced_allows_save():
     mod = load_coordinator("claude:tok_abc")
     assert mod._backup_quiesce is False
@@ -168,6 +180,23 @@ async def test_admin_route_admin_token_passes():
     req = _make_request("/admin/backup", auth_header="Bearer tok_b")
     resp = await mod.auth_middleware(req, _noop_handler)
     assert resp.status == 200
+
+
+@pytest.mark.asyncio
+async def test_admin_outbox_is_admin_only():
+    """v0.9.92: mirrors test_admin_route_requires_admin_role_full_denied — a
+    build that registers GET /admin/outbox but forgets to add it to
+    _ADMIN_ROUTES would let a full token reach it (200 instead of 403)."""
+    from aiohttp.web_exceptions import HTTPForbidden
+    mod = load_coordinator("claude:tok_abc")  # default role = full
+    req = _make_request("/admin/outbox", auth_header="Bearer tok_abc", method="GET")
+    with pytest.raises(HTTPForbidden):
+        await mod.auth_middleware(req, _noop_handler)
+
+    mod2 = load_coordinator("monitor:tok_m", agent_roles="monitor:read")
+    req2 = _make_request("/admin/outbox", auth_header="Bearer tok_m", method="GET")
+    with pytest.raises(HTTPForbidden):
+        await mod2.auth_middleware(req2, _noop_handler)
 
 
 @pytest.mark.asyncio

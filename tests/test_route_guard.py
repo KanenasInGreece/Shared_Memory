@@ -439,6 +439,7 @@ _REGISTERED_ROUTES = {
     ("GET",  "/memory/status/{pg_id}"),
     ("GET",  "/memory/telemetry"),
     ("POST", "/admin/backup"),
+    ("GET",  "/admin/outbox"),
     ("GET",  "/health"),
     ("GET",  "/pool/status"),
     # R-A (HYG round): the encoder paths stopped being a startswith() guess
