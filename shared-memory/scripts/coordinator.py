@@ -575,11 +575,11 @@ _WRITE_ROUTES: set[tuple[str, str]] = {
 
 # Admin-only routes — reachable ONLY by an "admin"-role token, which in turn can
 # reach nothing else (least privilege: a leaked backup token can only pause/resume
-# backups). Backup quiesce/resume is the first such route. The second is the
-# outbox census the backup drain gate needs (v0.9.92, fact:2022): the admin
-# token is confined to /admin/*, so a drain gate that polled /memory/telemetry
-# was 403'd on every poll and could only ever time out — this route is
-# read-only and lets that gate actually read live.
+# backups and read the outbox census). Backup quiesce/resume is the first such
+# route. The second is the outbox census the backup drain gate needs (v0.9.92,
+# fact:2022): the admin token is confined to /admin/*, so a drain gate that
+# polled /memory/telemetry was 403'd on every poll and could only ever time
+# out — this route is read-only and lets that gate actually read live.
 _ADMIN_ROUTES: set[tuple[str, str]] = {
     ("POST", "/admin/backup"),
     ("GET", "/admin/outbox"),

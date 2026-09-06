@@ -312,6 +312,7 @@ drain_outbox() {
         ylw "  ! outbox.pending absent from $GATEWAY_URL/admin/outbox — cannot tell whether the outbox is drained; polling on"
         local msg; msg="$(json_get message <<<"$tel")"
         [[ -z "$msg" ]] && msg="$(json_get error <<<"$tel")"
+        msg="${msg//[[:cntrl:]]/}"
         [[ -n "$msg" ]] && ylw "    $msg"
       fi
     elif [[ "$pend" == "0" ]]; then

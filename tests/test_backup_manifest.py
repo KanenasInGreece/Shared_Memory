@@ -127,6 +127,16 @@ class _QuiesceStubHandler(http.server.BaseHTTPRequestHandler):
     # /admin/outbox to _ADMIN_ROUTES): the admin token is confined off THIS
     # route too, so every GET -- /admin/outbox included -- gets the same 403.
     confine_admin_outbox = False
+    # Every GET path this stub was asked for, in order -- reset per
+    # _stub_gateway() context. Lets a test assert the drain gate actually
+    # polled /admin/outbox rather than inferring the route from a 403
+    # side-effect (a pre-0.9.92 gate polling /memory/telemetry would also
+    # see a 403 body, so the status code alone cannot prove which route).
+    seen_get_paths: list = []
+    # Override for the 403 body's `message`, when confine_admin_outbox is set
+    # -- lets a test hand back an attacker-controlled string (e.g. terminal
+    # escape sequences) without changing the default confinement text.
+    confinement_body = _ADMIN_CONFINEMENT_BODY
 
     def do_POST(self):
         length = int(self.headers.get("Content-Length", 0))
@@ -148,6 +158,7 @@ class _QuiesceStubHandler(http.server.BaseHTTPRequestHandler):
         # /memory/telemetry drain poll) must answer the gateway's real 403
         # confinement body, so a build that still polls the wrong route fails
         # this stub exactly the way it fails a real gateway.
+        type(self).seen_get_paths.append(self.path)
         if self.path == "/admin/outbox" and not type(self).confine_admin_outbox:
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -157,18 +168,21 @@ class _QuiesceStubHandler(http.server.BaseHTTPRequestHandler):
             self.send_response(403)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
-            self.wfile.write(json.dumps(_ADMIN_CONFINEMENT_BODY).encode())
+            self.wfile.write(json.dumps(type(self).confinement_body).encode())
 
     def log_message(self, *args, **kwargs):
         pass
 
 
 @contextlib.contextmanager
-def _stub_gateway(quiesce_status=200, outbox_body=None, confine_admin_outbox=False):
+def _stub_gateway(quiesce_status=200, outbox_body=None, confine_admin_outbox=False,
+                   confinement_body=None):
     handler_cls = type("Handler", (_QuiesceStubHandler,), {
         "quiesce_status": quiesce_status, "resume_calls": 0,
         "outbox_body": _OUTBOX_DRAINED if outbox_body is None else outbox_body,
         "confine_admin_outbox": confine_admin_outbox,
+        "seen_get_paths": [],
+        "confinement_body": _ADMIN_CONFINEMENT_BODY if confinement_body is None else confinement_body,
     })
     server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler_cls)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -233,7 +247,8 @@ def test_manifest_records_quiesced_full_on_200(tmp_path):
     with _fake_docker(tmp_path) as docker_path, _stub_gateway(200) as (url, handler_cls):
         result, backup_dir = _run_backup_sh(
             tmp_path, docker_path,
-            {"BACKUP_ADMIN_TOKEN": "tok", "GATEWAY_URL": url},
+            {"BACKUP_ADMIN_TOKEN": "tok", "GATEWAY_URL": url,
+             "BACKUP_DRAIN_MAX_SECONDS": "2", "BACKUP_DRAIN_POLL_SECONDS": "1"},
         )
     assert result.returncode == 0, result.stdout + result.stderr
     manifest = _latest_manifest(backup_dir)
@@ -258,7 +273,7 @@ def test_drain_reports_drained_when_the_outbox_pending_key_says_zero(tmp_path):
 def test_drain_does_not_report_drained_while_the_outbox_still_has_work(tmp_path):
     """pending: 3 must never read as drained — it is the whole point of the gate."""
     with _fake_docker(tmp_path) as docker_path, \
-            _stub_gateway(200, {"status": "success", "outbox": {"pending": 3}}) as (url, _h):
+            _stub_gateway(200, {"status": "success", "outbox": {"pending": 3}}) as (url, h):
         result, _ = _run_backup_sh(
             tmp_path, docker_path,
             {"BACKUP_ADMIN_TOKEN": "tok", "GATEWAY_URL": url,
@@ -267,6 +282,7 @@ def test_drain_does_not_report_drained_while_the_outbox_still_has_work(tmp_path)
     assert result.returncode == 0, result.stdout + result.stderr
     assert "outbox drained" not in result.stdout, result.stdout
     assert "not fully drained" in result.stdout, result.stdout
+    assert "/admin/outbox" in h.seen_get_paths, h.seen_get_paths
 
 
 def test_drain_says_the_key_is_absent_instead_of_claiming_drained(tmp_path):
@@ -279,7 +295,7 @@ def test_drain_says_the_key_is_absent_instead_of_claiming_drained(tmp_path):
     name the key, keep polling, fall through to the best-effort timeout.
     """
     with _fake_docker(tmp_path) as docker_path, \
-            _stub_gateway(200, {"status": "success", "outbox": {}}) as (url, _h):
+            _stub_gateway(200, {"status": "success", "outbox": {}}) as (url, h):
         result, _ = _run_backup_sh(
             tmp_path, docker_path,
             {"BACKUP_ADMIN_TOKEN": "tok", "GATEWAY_URL": url,
@@ -287,8 +303,9 @@ def test_drain_says_the_key_is_absent_instead_of_claiming_drained(tmp_path):
         )
     assert result.returncode == 0, result.stdout + result.stderr
     assert "outbox drained" not in result.stdout, result.stdout
-    assert "outbox.pending absent" in result.stdout, result.stdout
+    assert f"outbox.pending absent from {url}/admin/outbox" in result.stdout, result.stdout
     assert "not fully drained" in result.stdout, result.stdout
+    assert "/admin/outbox" in h.seen_get_paths, h.seen_get_paths
 
 
 def test_drain_reports_drained_only_through_the_admin_route(tmp_path):
@@ -300,7 +317,7 @@ def test_drain_reports_drained_only_through_the_admin_route(tmp_path):
     printing "outbox drained") and passes once drain_outbox reads
     /admin/outbox instead."""
     with _fake_docker(tmp_path) as docker_path, \
-            _stub_gateway(200, {"status": "success", "outbox": {"pending": 0}}) as (url, _h):
+            _stub_gateway(200, {"status": "success", "outbox": {"pending": 0}}) as (url, h):
         result, _ = _run_backup_sh(
             tmp_path, docker_path,
             {"BACKUP_ADMIN_TOKEN": "tok", "GATEWAY_URL": url,
@@ -308,6 +325,8 @@ def test_drain_reports_drained_only_through_the_admin_route(tmp_path):
         )
     assert result.returncode == 0, result.stdout + result.stderr
     assert "outbox drained" in result.stdout, result.stdout
+    assert "/admin/outbox" in h.seen_get_paths, h.seen_get_paths
+    assert not any(p.startswith("/memory/") for p in h.seen_get_paths), h.seen_get_paths
 
 
 def test_drain_prints_the_gateway_refusal_once_on_403(tmp_path):
@@ -317,7 +336,7 @@ def test_drain_prints_the_gateway_refusal_once_on_403(tmp_path):
     wrong role" from "route present, key absent", then fall through to the
     timeout without ever claiming drained."""
     with _fake_docker(tmp_path) as docker_path, \
-            _stub_gateway(200, confine_admin_outbox=True) as (url, _h):
+            _stub_gateway(200, confine_admin_outbox=True) as (url, h):
         result, _ = _run_backup_sh(
             tmp_path, docker_path,
             {"BACKUP_ADMIN_TOKEN": "tok", "GATEWAY_URL": url,
@@ -325,15 +344,47 @@ def test_drain_prints_the_gateway_refusal_once_on_403(tmp_path):
         )
     assert result.returncode == 0, result.stdout + result.stderr
     assert "outbox drained" not in result.stdout, result.stdout
+    assert "outbox.pending absent" in result.stdout, result.stdout
     assert result.stdout.count("Admin token is confined to /admin/* routes") == 1, result.stdout
     assert "not fully drained" in result.stdout, result.stdout
+    assert "/admin/outbox" in h.seen_get_paths, h.seen_get_paths
+
+
+def test_drain_strips_control_characters_from_the_gateway_message(tmp_path):
+    """SEC S-1: the gateway's `message`/`error` text reaches the operator's
+    terminal verbatim (fact:1499 -- both bodies are framework text, never a
+    secret, but nothing upstream of drain_outbox constrains their BYTES). A
+    spoofed or MITM'd endpoint could answer 403 on /admin/outbox with ANSI
+    escape sequences -- a screen clear, a terminal-title spoof -- that the
+    operator's emulator would interpret. drain_outbox must strip control
+    characters before printing the line: the human text survives, ESC
+    (\\x1b) does not."""
+    poisoned_msg = "clear\x1b[2Jtitle\x1b]0;PWNED\x07 the human text"
+    with _fake_docker(tmp_path) as docker_path, \
+            _stub_gateway(200, confine_admin_outbox=True,
+                          confinement_body={"status": "error", "message": poisoned_msg}) as (url, h):
+        result, _ = _run_backup_sh(
+            tmp_path, docker_path,
+            {"BACKUP_ADMIN_TOKEN": "tok", "GATEWAY_URL": url,
+             "BACKUP_DRAIN_MAX_SECONDS": "2", "BACKUP_DRAIN_POLL_SECONDS": "1"},
+        )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "the human text" in result.stdout, result.stdout
+    # The script's OWN ylw/grn color codes are legitimate ANSI and stay --
+    # only the ATTACKER-SUPPLIED escape sequences must be gone from the
+    # printed message line.
+    assert "\x1b[2J" not in result.stdout, repr(result.stdout)
+    assert "\x1b]0;PWNED" not in result.stdout, repr(result.stdout)
+    assert "\x07" not in result.stdout, repr(result.stdout)
+    assert "/admin/outbox" in h.seen_get_paths, h.seen_get_paths
 
 
 def test_manifest_records_quiesced_timeout_on_202(tmp_path):
     with _fake_docker(tmp_path) as docker_path, _stub_gateway(202) as (url, handler_cls):
         result, backup_dir = _run_backup_sh(
             tmp_path, docker_path,
-            {"BACKUP_ADMIN_TOKEN": "tok", "GATEWAY_URL": url},
+            {"BACKUP_ADMIN_TOKEN": "tok", "GATEWAY_URL": url,
+             "BACKUP_DRAIN_MAX_SECONDS": "2", "BACKUP_DRAIN_POLL_SECONDS": "1"},
         )
     assert result.returncode == 0, result.stdout + result.stderr
     manifest = _latest_manifest(backup_dir)

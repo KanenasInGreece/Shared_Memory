@@ -1145,7 +1145,8 @@ nothing is printed here to save. A REMOTE agent's token needs `--reveal <name>` 
 invocation (a later, separate run is a full rotation). One token per agent, never shared —
 the gateway stamps every record's `source` from the token, and that stamp is the only thing that
 distinguishes one origin from another. Roles can narrow a token: `AGENT_ROLES=monitor:read`
-confines the companion dashboard to reading; a `backup:admin` token is confined to `/admin/*`.
+confines the companion dashboard to reading; a `backup:admin` token is confined to `/admin/*`
+(quiesce and the outbox drain census at `GET /admin/outbox`).
 The dreaming daemons authenticate the same way — enrichment never claims ownership of the facts
 it enriches.
 
@@ -1274,8 +1275,9 @@ bash shared-memory/ops/restore.sh             # ground-up restore (bring stores 
 ```
 
 Schedule it with cron or the shipped `systemd --user` timer. The admin token it needs is
-confined to `/admin/*` — it cannot read or write memory. Policy — schedule, retention,
-destination, encryption — is yours; retention and destination are set in `.env`.
+confined to `/admin/*` — it can read the outbox drain census at `GET /admin/outbox`, never
+memory records. Policy — schedule, retention, destination, encryption — is yours; retention
+and destination are set in `.env`.
 
 ## 23. Testing
 

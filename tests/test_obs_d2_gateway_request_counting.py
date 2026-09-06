@@ -414,6 +414,27 @@ def test_admin_outbox_403_for_full_token_is_counted(monkeypatch):
     assert _ring_window(mod) == 0
 
 
+def test_admin_outbox_503_carries_only_the_exception_class_and_is_counted_once(monkeypatch):
+    """QA R1: the 503 path of handle_admin_outbox had no test at any layer.
+    The brief requires the body carry the exception CLASS name only, never
+    its text (a DB error string can name hosts) -- and that the middleware's
+    own finally is what counts the 503, not a handler-side call (O12). Both
+    are measured here, not reasoned. Mutation-checked: swapping the handler's
+    `{type(exc).__name__}` for `{exc}` leaves the middle assertion the only
+    one that fails."""
+    mod = load_coordinator(monkeypatch, "backup:tok_b", agent_roles="backup:admin")
+    coord = mod.MemoryCoordinator()
+    coord._outbox_census = AsyncMock(side_effect=RuntimeError(
+        "connection to host db.internal.example:5432 failed: password authentication failed"))
+    app = _build_app(mod, [("GET", "/admin/outbox", coord.handle_admin_outbox)])
+    status, _, body = _run(_probe(app, "GET", "/admin/outbox", token="tok_b"))
+    assert status == 503
+    assert json.loads(body)["message"] == "outbox census unavailable: RuntimeError"
+    assert "db.internal.example" not in body.decode()   # never the exception TEXT
+    assert _counters(mod)["requests_total"] == 1        # O12: not double-counted
+    assert mod._gateway_by_status["503"] == 1
+
+
 def test_backup_quiesce_503_counted(monkeypatch):
     """H: a write route while a backup quiesce is active — this is the OTHER
     source of by_status.503 alongside the shed valve (see MEANING_CHANGES:
