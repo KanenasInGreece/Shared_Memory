@@ -849,7 +849,11 @@ def mint(
         elif a in existing_entries:
             final_entries[a] = existing_entries[a]
 
-    print("=== Gateway .env — add this line (digest form; safe to print/paste) ===")
+    # Every line printed from here on is blank, a KEY=VALUE line, or starts with
+    # "# " — so the whole block pastes into an env file as-is. bootstrap_tokens.sh
+    # selects ^AGENT_TOKENS=, ^AGENT_INSTALLS= and ^AGENT_ROLES=, none of which the
+    # prefix touches.
+    print("# === Gateway .env — add this line (digest form; safe to print/paste) ===")
     print("AGENT_TOKENS=" + ",".join(final_entries.values()))
     print()
     # ⛔ MERGE, NEVER REBUILD. This line used to be generated from the roster
@@ -865,20 +869,22 @@ def mint(
     for _a in read_only_agents():
         _merged_roles.setdefault(_a, "read")
     _merged_roles = enforce_roster(_merged_roles)
-    print("=== Gateway .env — merged roles (read-only roster + what you declared) ===")
+    print("# === Gateway .env — merged roles (read-only roster + what you declared) ===")
     print("AGENT_ROLES=" + ",".join(f"{n}:{r}" for n, r in _merged_roles.items()))
     print("# read-role agents may reach only GET /health, GET /memory/telemetry,")
     print("# and POST /memory/graph (read-only Cypher). All other routes → 403.")
     print()
-    print("=== Gateway .env — install-path registry (sync exactly what's registered) ===")
+    print("# === Gateway .env — install-path registry (sync exactly what's registered) ===")
     print("AGENT_INSTALLS=" + _format_agent_installs(persisted_installs))
     print()
 
-    print("=== Per-agent tokens — written through, never printed ===")
+    print("# === Per-agent tokens — written through, never printed ===")
     for line in lines:
-        print(line)
+        # ONE prefix site covers all four report shapes built above (REFUSED,
+        # REMOTE, UNDELIVERABLE, written-through).
+        print("# " + line)
     print()
-    print("Each agent must use its own distinct token — never share tokens across agents.")
+    print("# Each agent must use its own distinct token — never share tokens across agents.")
     # An undelivered credential is the kind of thing that must not be findable
     # only by reading twenty lines of per-agent report. Absence from this block
     # is what "every agent can authenticate" looks like.
@@ -886,30 +892,32 @@ def mint(
                     if installs.get(a) is None and a not in (revealing or [])]
     if _undelivered:
         print()
-        print("⛔ REGISTERED BUT UNDELIVERABLE — these agents have a digest in")
-        print("   AGENT_TOKENS and NO WAY TO OBTAIN THEIR TOKEN:")
+        print("# ⛔ REGISTERED BUT UNDELIVERABLE — these agents have a digest in")
+        print("#    AGENT_TOKENS and NO WAY TO OBTAIN THEIR TOKEN:")
         for a in _undelivered:
-            print(f"     {a}")
+            print(f"#      {a}")
         print()
-        print("   They will authenticate against nothing. The .env will show them")
-        print("   as provisioned, which is the misleading part. Fix now with")
-        print("   (operator-run — NEVER through an agent, a transcript stores it forever):")
+        print("#    They will authenticate against nothing. The .env will show them")
+        print("#    as provisioned, which is the misleading part. Fix now with")
+        print("#    (operator-run — NEVER through an agent, a transcript stores it forever):")
         for a in _undelivered:
-            print(f"     generate_tokens.py --remint {a} --reveal {a}")
-        print("   (--remint re-mints ONE agent; it never touches anyone else.)")
+            print(f"#      generate_tokens.py --remint {a} --reveal {a}")
+        print("#    (--remint re-mints ONE agent; it never touches anyone else.)")
         print()
 
 
     if failures:
         print()
-        print("⚠ PARTIAL FAILURE — the following agent(s) were NOT updated this mint:")
+        # ⛔ bootstrap_tokens.sh greps for the literal "PARTIAL FAILURE" (unanchored)
+        # to produce exit 2 — the "# " prefix keeps that marker intact; never reword it.
+        print("# ⚠ PARTIAL FAILURE — the following agent(s) were NOT updated this mint:")
         for name, reason in failures:
             carried = " (existing token preserved, nothing revoked)" if name in existing_entries else " (never registered -- nothing to carry forward)"
-            print(f"  {name:15}  {reason}{carried}")
-        print("  The AGENT_TOKENS line above is still SAFE to apply as printed -- it")
-        print("  never drops a working credential, it only omits one that was never")
-        print("  delivered. Fix the underlying issue for the affected agent(s) and")
-        print("  re-run (bulk, or --add for just that one).")
+            print(f"#   {name:15}  {reason}{carried}")
+        print("#   The AGENT_TOKENS line above is still SAFE to apply as printed -- it")
+        print("#   never drops a working credential, it only omits one that was never")
+        print("#   delivered. Fix the underlying issue for the affected agent(s) and")
+        print("#   re-run (bulk, or --add for just that one).")
 
     return tokens, digests, failures
 
@@ -1143,7 +1151,10 @@ def add_agent(
     merged_entries = dict(existing_entries)
     merged_entries[name] = f"{name}:sha256:{digest}"
 
-    print("=== Gateway .env — merged AGENT_TOKENS= line (write this in place) ===")
+    # As in the bulk mint: every line below is blank, KEY=VALUE, or "# "-prefixed,
+    # so the whole block pastes into an env file. bootstrap_tokens.sh's
+    # ^AGENT_TOKENS= / ^AGENT_INSTALLS= / ^AGENT_ROLES= selectors are untouched.
+    print("# === Gateway .env — merged AGENT_TOKENS= line (write this in place) ===")
     print("AGENT_TOKENS=" + ",".join(merged_entries.values()))
 
     if effective_role is not None:
@@ -1157,7 +1168,7 @@ def add_agent(
         # file. The gateway confines it regardless, but the .env should not lie.
         merged_roles = enforce_roster(merged_roles)
         print()
-        print("=== Gateway .env — merged AGENT_ROLES= line (write this in place) ===")
+        print("# === Gateway .env — merged AGENT_ROLES= line (write this in place) ===")
         print("AGENT_ROLES=" + ",".join(f"{n}:{r}" for n, r in merged_roles.items()))
         if effective_role == "read":
             print(f"# {name} is a READ-ONLY identity: GET /health, GET /memory/telemetry")
@@ -1167,15 +1178,15 @@ def add_agent(
         merged_installs = dict(installs)
         merged_installs[name] = (install_kind, install_path)
         print()
-        print("=== Gateway .env — merged AGENT_INSTALLS= line (write this in place) ===")
+        print("# === Gateway .env — merged AGENT_INSTALLS= line (write this in place) ===")
         print("AGENT_INSTALLS=" + _format_agent_installs(merged_installs))
         print()
         _kind_note = "" if install_kind == DEFAULT_INSTALL_KIND else f"  [{install_kind}]"
-        print(f"  {name:15}  written → {install_path}  (mode 600){_kind_note}")
+        print(f"#   {name:15}  written → {install_path}  (mode 600){_kind_note}")
         if install_kind == "mcp":
-            print("  Registered as an MCP install: sync_skills.sh delivers the CONNECTOR")
-            print("  package here (vector-skill.py, CONSTITUTION_SNIPPET_MCP.md,")
-            print("  system-prompt.md) and never the CLI skill package.")
+            print("#   Registered as an MCP install: sync_skills.sh delivers the CONNECTOR")
+            print("#   package here (vector-skill.py, CONSTITUTION_SNIPPET_MCP.md,")
+            print("#   system-prompt.md) and never the CLI skill package.")
         # L2 — a token is read from this file ONCE, at import (both
         # vector-skill.py's _AGENT_TOKEN_FROM_FILE and memory_bridge.py's
         # own load populate it at load time), so a re-mint rotates the
@@ -1191,29 +1202,29 @@ def add_agent(
             # below always had -- a fresh --add --mcp install has nothing
             # running yet to respawn, so an unconditional "Respawn ..."
             # overclaimed on the common first-install path.
-            print("⚠ If this agent's memory MCP server is already running, respawn it so")
-            print("  it re-reads the rotated token — a full host restart works, or a")
-            print("  per-server reload/disable-enable if your host offers one; until then")
-            print("  it keeps the old token.")
+            print("# ⚠ If this agent's memory MCP server is already running, respawn it so")
+            print("#   it re-reads the rotated token — a full host restart works, or a")
+            print("#   per-server reload/disable-enable if your host offers one; until then")
+            print("#   it keeps the old token.")
         else:
-            print("⚠ If this agent's process is already running, restart it so it")
-            print("  re-reads the token — it keeps presenting the previous one until")
-            print("  then, and every request (reads included) will fail auth.")
+            print("# ⚠ If this agent's process is already running, restart it so it")
+            print("#   re-reads the token — it keeps presenting the previous one until")
+            print("#   then, and every request (reads included) will fail auth.")
     else:
         print()
-        print(f"  {name:15}  REMOTE / no install path given.")
-        print("                   Prefer the write-through form when this agent HAS a")
-        print("                   local directory — it never prints the token:")
-        print(f"                     generate_tokens.py --remint {name} --install-path <dir>/.env")
-        print("                   Otherwise an OPERATOR must reveal it, in their OWN")
-        print("                   terminal — never through an agent, whose transcript")
-        print("                   turns \"shown once\" into \"stored forever\":")
+        print(f"#   {name:15}  REMOTE / no install path given.")
+        print("#                    Prefer the write-through form when this agent HAS a")
+        print("#                    local directory — it never prints the token:")
+        print(f"#                      generate_tokens.py --remint {name} --install-path <dir>/.env")
+        print("#                    Otherwise an OPERATOR must reveal it, in their OWN")
+        print("#                    terminal — never through an agent, whose transcript")
+        print("#                    turns \"shown once\" into \"stored forever\":")
         # ⛔ This used to say "--add {name} --reveal {name}". By the time this
         # line prints, {name} IS already registered (this mint just added or
         # re-issued it) — a subsequent --add of the same name hits the
         # already-registered refusal above (line ~851) instead of revealing
         # anything. --remint is the one that re-issues an EXISTING name.
-        print(f"                   generate_tokens.py --remint {name} --reveal {name}")
+        print(f"#                    generate_tokens.py --remint {name} --reveal {name}")
 
     return 0, token
 
