@@ -102,18 +102,31 @@ def _fake_docker(tmp_path):
     yield str(path)
 
 
-#: The shape drain_outbox reads: the single telemetry.outbox.pending, which the
-#: coordinator builds as pending + in_progress. The dual-emitted
-#: telemetry.postgres.outbox.{pending,in_progress} copies leave the served body
-#: at 0.9.91, and the old read defaulted BOTH to 0 when they went missing —
-#: printing "✓ outbox drained" on the first poll, unconditionally.
-_TELEMETRY_DRAINED = {"telemetry": {"outbox": {"pending": 0}}}
+#: The shape drain_outbox reads: the single outbox.pending on GET /admin/outbox
+#: (v0.9.92) — the admin token is confined to /admin/*, so this is the ONLY
+#: route the backup token can poll for the drain count; the coordinator builds
+#: `pending` as census pending + in_progress.
+_OUTBOX_DRAINED = {"status": "success", "outbox": {"pending": 0}}
+
+#: The gateway's real 403 body for an admin token outside /admin/* (v0.9.92,
+#: coordinator.py `_error_body` via auth_middleware) -- this is what EVERY
+#: non-/admin/outbox GET must answer now that the admin token cannot reach
+#: /memory/telemetry at all (fact:2022).
+_ADMIN_CONFINEMENT_BODY = {
+    "status": "error",
+    "message": "Admin token is confined to /admin/* routes. The credential is "
+                "VALID — use a write-capable agent token for this route.",
+}
 
 
 class _QuiesceStubHandler(http.server.BaseHTTPRequestHandler):
     quiesce_status = 200
     resume_calls = 0
-    telemetry_body = _TELEMETRY_DRAINED
+    outbox_body = _OUTBOX_DRAINED
+    # Simulates a pre-0.9.92 gateway (or a build that forgot to add
+    # /admin/outbox to _ADMIN_ROUTES): the admin token is confined off THIS
+    # route too, so every GET -- /admin/outbox included -- gets the same 403.
+    confine_admin_outbox = False
 
     def do_POST(self):
         length = int(self.headers.get("Content-Length", 0))
@@ -130,21 +143,32 @@ class _QuiesceStubHandler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
 
     def do_GET(self):
-        # GET /memory/telemetry -- drain_outbox polls this each round.
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        self.end_headers()
-        self.wfile.write(json.dumps(type(self).telemetry_body).encode())
+        # BRANCH ON PATH (v0.9.92): the admin token this script carries can
+        # reach ONLY /admin/outbox -- every other GET (including the old
+        # /memory/telemetry drain poll) must answer the gateway's real 403
+        # confinement body, so a build that still polls the wrong route fails
+        # this stub exactly the way it fails a real gateway.
+        if self.path == "/admin/outbox" and not type(self).confine_admin_outbox:
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps(type(self).outbox_body).encode())
+        else:
+            self.send_response(403)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps(_ADMIN_CONFINEMENT_BODY).encode())
 
     def log_message(self, *args, **kwargs):
         pass
 
 
 @contextlib.contextmanager
-def _stub_gateway(quiesce_status=200, telemetry_body=None):
+def _stub_gateway(quiesce_status=200, outbox_body=None, confine_admin_outbox=False):
     handler_cls = type("Handler", (_QuiesceStubHandler,), {
         "quiesce_status": quiesce_status, "resume_calls": 0,
-        "telemetry_body": _TELEMETRY_DRAINED if telemetry_body is None else telemetry_body,
+        "outbox_body": _OUTBOX_DRAINED if outbox_body is None else outbox_body,
+        "confine_admin_outbox": confine_admin_outbox,
     })
     server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler_cls)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -221,7 +245,7 @@ def test_manifest_records_quiesced_full_on_200(tmp_path):
 def test_drain_reports_drained_when_the_outbox_pending_key_says_zero(tmp_path):
     """The happy path, read from the key drain_outbox actually gates on."""
     with _fake_docker(tmp_path) as docker_path, \
-            _stub_gateway(200, {"telemetry": {"outbox": {"pending": 0}}}) as (url, _h):
+            _stub_gateway(200, {"status": "success", "outbox": {"pending": 0}}) as (url, _h):
         result, _ = _run_backup_sh(
             tmp_path, docker_path,
             {"BACKUP_ADMIN_TOKEN": "tok", "GATEWAY_URL": url,
@@ -234,7 +258,7 @@ def test_drain_reports_drained_when_the_outbox_pending_key_says_zero(tmp_path):
 def test_drain_does_not_report_drained_while_the_outbox_still_has_work(tmp_path):
     """pending: 3 must never read as drained — it is the whole point of the gate."""
     with _fake_docker(tmp_path) as docker_path, \
-            _stub_gateway(200, {"telemetry": {"outbox": {"pending": 3}}}) as (url, _h):
+            _stub_gateway(200, {"status": "success", "outbox": {"pending": 3}}) as (url, _h):
         result, _ = _run_backup_sh(
             tmp_path, docker_path,
             {"BACKUP_ADMIN_TOKEN": "tok", "GATEWAY_URL": url,
@@ -255,7 +279,7 @@ def test_drain_says_the_key_is_absent_instead_of_claiming_drained(tmp_path):
     name the key, keep polling, fall through to the best-effort timeout.
     """
     with _fake_docker(tmp_path) as docker_path, \
-            _stub_gateway(200, {"telemetry": {"rem": {}}}) as (url, _h):
+            _stub_gateway(200, {"status": "success", "outbox": {}}) as (url, _h):
         result, _ = _run_backup_sh(
             tmp_path, docker_path,
             {"BACKUP_ADMIN_TOKEN": "tok", "GATEWAY_URL": url,
@@ -263,7 +287,45 @@ def test_drain_says_the_key_is_absent_instead_of_claiming_drained(tmp_path):
         )
     assert result.returncode == 0, result.stdout + result.stderr
     assert "outbox drained" not in result.stdout, result.stdout
-    assert "telemetry.outbox.pending absent" in result.stdout, result.stdout
+    assert "outbox.pending absent" in result.stdout, result.stdout
+    assert "not fully drained" in result.stdout, result.stdout
+
+
+def test_drain_reports_drained_only_through_the_admin_route(tmp_path):
+    """⭐ The regression this release exists for. The stub refuses EVERY GET
+    that is not /admin/outbox with the gateway's real 403 confinement body —
+    exactly what a real gateway does to an admin token today. This test FAILS
+    at ceff79a (the gate polls /memory/telemetry, which the stub now 403s,
+    so it never sees pending:0 and falls through to the timeout instead of
+    printing "outbox drained") and passes once drain_outbox reads
+    /admin/outbox instead."""
+    with _fake_docker(tmp_path) as docker_path, \
+            _stub_gateway(200, {"status": "success", "outbox": {"pending": 0}}) as (url, _h):
+        result, _ = _run_backup_sh(
+            tmp_path, docker_path,
+            {"BACKUP_ADMIN_TOKEN": "tok", "GATEWAY_URL": url,
+             "BACKUP_DRAIN_MAX_SECONDS": "2", "BACKUP_DRAIN_POLL_SECONDS": "1"},
+        )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "outbox drained" in result.stdout, result.stdout
+
+
+def test_drain_prints_the_gateway_refusal_once_on_403(tmp_path):
+    """C2: a pre-0.9.92 gateway (or a build that forgot _ADMIN_ROUTES) answers
+    403 on /admin/outbox too -- the gate must print the gateway's own refusal
+    ONCE (not once per poll) so an operator can tell "pre-0.9.92 gateway /
+    wrong role" from "route present, key absent", then fall through to the
+    timeout without ever claiming drained."""
+    with _fake_docker(tmp_path) as docker_path, \
+            _stub_gateway(200, confine_admin_outbox=True) as (url, _h):
+        result, _ = _run_backup_sh(
+            tmp_path, docker_path,
+            {"BACKUP_ADMIN_TOKEN": "tok", "GATEWAY_URL": url,
+             "BACKUP_DRAIN_MAX_SECONDS": "2", "BACKUP_DRAIN_POLL_SECONDS": "1"},
+        )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "outbox drained" not in result.stdout, result.stdout
+    assert result.stdout.count("Admin token is confined to /admin/* routes") == 1, result.stdout
     assert "not fully drained" in result.stdout, result.stdout
 
 

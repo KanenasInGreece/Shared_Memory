@@ -447,8 +447,9 @@ Disaster Recovery](../../README.md#20-backups--disaster-recovery).
 Before dumping, `backup.sh` quiesces the gateway over `POST /admin/backup`
 (needs a `backup:admin` token — see `.env.example`): client writes shed
 (`503 + Retry-After`), the REM/NREM daemons are fenced by a Postgres advisory
-lock, and the outbox drains. A `trap` resumes on any exit; the gateway's TTL
-auto-resumes if the script dies.
+lock, and the outbox drains. The drain gate polls `GET /admin/outbox` with the
+same admin token, live, until `pending` is 0 or the timeout. A `trap` resumes
+on any exit; the gateway's TTL auto-resumes if the script dies.
 
 ```bash
 bash shared-memory/ops/backup.sh             # full quiesced backup

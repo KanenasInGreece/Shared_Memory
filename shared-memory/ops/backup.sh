@@ -272,9 +272,13 @@ resume() {
 }
 
 # Wait until the outbox is empty so Neo4j is caught up with Postgres before the
-# snapshot. The gate is the single `telemetry.outbox.pending`, which the
-# coordinator builds as pending + in_progress — there is no `outbox.in_progress`
-# key to read alongside it.
+# snapshot. The gate reads GET /admin/outbox (v0.9.92), not /memory/telemetry —
+# the backup token is confined to /admin/* (auth_middleware refuses an
+# admin-role token on any route outside it), so a gate that polled telemetry
+# was 403'd on every single poll and could only ever run out the timeout.
+# The served key is the single `outbox.pending`, which the coordinator builds
+# as census pending + in_progress — there is no `outbox.in_progress` key to
+# read alongside it.
 #
 # ⛔ NO `:-0` DEFAULT ON THIS READ. It used to read the dual-emitted
 # telemetry.postgres.outbox.{pending,in_progress} with `${pend:-0}` / `${prog:-0}`,
@@ -283,16 +287,32 @@ resume() {
 # unconditionally — a snapshot taken with Neo4j arbitrarily behind Postgres,
 # under a green line. An ABSENT key means the gate cannot answer: say so and keep
 # polling to the timeout (best-effort, as below), never "drained".
+#
+# On a pre-0.9.92 gateway (or a build that forgot to register the route as
+# admin-only) GET /admin/outbox itself answers 403 with the confinement
+# message — `outbox.pending` is then just as absent as it would be from any
+# other malformed body, but printing the gateway's own refusal text (once)
+# lets an operator tell "pre-0.9.92 gateway / wrong role" apart from "route
+# present, key absent" at a glance. `dcurl` is `curl -s --max-time 15` with no
+# `-f`, so it exits 0 on 403/404 (`|| break` fires only on a transport
+# failure) and `json_get` on either error shape below yields '' for a missing
+# key — that is the whole mechanism, no special-casing of the status code
+# needed. The coordinator's own refusals key their text `message`
+# (coordinator.py `_error_body`); the proxy's route guard keys it `error`
+# (hive_mind_proxy.py) — read whichever is present.
 drain_outbox() {
   local waited=0 pend warned=0
   while (( waited < BACKUP_DRAIN_MAX_SECONDS )); do
-    local tel; tel="$(dcurl "$GATEWAY_URL/memory/telemetry" \
+    local tel; tel="$(dcurl "$GATEWAY_URL/admin/outbox" \
       -H "@$_AUTH_HEADER_FILE")" || break
-    pend="$(json_get telemetry.outbox.pending <<<"$tel")"
+    pend="$(json_get outbox.pending <<<"$tel")"
     if [[ -z "$pend" ]]; then
       if (( warned == 0 )); then
         warned=1
-        ylw "  ! telemetry.outbox.pending absent from $GATEWAY_URL/memory/telemetry — cannot tell whether the outbox is drained; polling on"
+        ylw "  ! outbox.pending absent from $GATEWAY_URL/admin/outbox — cannot tell whether the outbox is drained; polling on"
+        local msg; msg="$(json_get message <<<"$tel")"
+        [[ -z "$msg" ]] && msg="$(json_get error <<<"$tel")"
+        [[ -n "$msg" ]] && ylw "    $msg"
       fi
     elif [[ "$pend" == "0" ]]; then
       grn "  ✓ outbox drained"; return 0
