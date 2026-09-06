@@ -15,6 +15,7 @@ import hashlib
 import importlib.util
 import io
 import os
+import re
 import stat
 import sys
 
@@ -52,6 +53,28 @@ def _capture(fn, *a, **kw):
     with contextlib.redirect_stdout(buf):
         result = fn(*a, **kw)
     return result, buf.getvalue()
+
+
+def _assert_every_line_pastes(out: str) -> None:
+    """Every line a SUCCESSFUL mint / --add / --remint run prints must be blank,
+    a KEY=VALUE line, or a comment — i.e. the whole printed block pastes into an
+    env file unchanged.
+
+    Measured (fact:2002): pasting the printed block into the gateway .env left
+    three lines beginning with "=", i.e. an EMPTY KEY, and
+    os.environ.setdefault("", ...) raises OSError [Errno 22] in every loader
+    that does not skip it. --reveal / --digest / --convert-digests output is
+    deliberately NOT run through this helper: it is not paste-safe, and a
+    revealed token must never reach an env file this way.
+    """
+    for line in out.splitlines():
+        if not line.strip():
+            continue
+        if re.match(r"^[A-Z_][A-Z0-9_]*=", line) or line.startswith("#"):
+            continue
+        raise AssertionError(
+            "line does not paste into an env file (not blank, not KEY=VALUE, "
+            f"not a comment): {line!r}")
 
 
 # ── mint(): write-through + nothing-on-stdout ────────────────────────────────
@@ -536,8 +559,11 @@ def test_mint_infers_nothing_once_a_registry_is_present(tmp_path):
     (_tokens, _digests, _failures), out = _capture(gt.mint, env_path=str(env_path))
 
     assert not (claude_dir / ".env").exists(), "a present registry must never fall back to guessing"
-    claude_report_line = next(l for l in out.splitlines() if l.strip().startswith("claude"))
-    assert "REMOTE" in claude_report_line
+    # Selected on CONTENT, not on the line's leading characters: since 0.9.91
+    # every per-agent report line is "# "-prefixed so the printed block pastes
+    # into an env file, and startswith("claude") matched nothing.
+    claude_report_lines = [l for l in out.splitlines() if "claude" in l and "REMOTE" in l]
+    assert len(claude_report_lines) == 1, claude_report_lines
 
 
 def _capture_err(fn, *a, **kw):
@@ -1579,3 +1605,75 @@ def test_bulk_mint_does_not_warn_undeliverable_for_a_remote_agent_with_reveal(tm
     )
 
     assert "UNDELIVERABLE" not in out
+
+
+# ── v0.9.91 · every printed line of a successful run pastes into an env file ──
+#
+# fact:2002 — the printed block was pasted into the gateway .env and left three
+# lines beginning with "=" (an empty key). secure_env.py skips them so the
+# gateway booted; migrations/apply.py died with OSError [Errno 22], which is
+# where update_framework.sh stopped. Item B fixes the loaders; these four tests
+# fix the source, one per output path.
+
+def test_every_printed_line_of_a_bulk_mint_pastes_into_an_env(tmp_path):
+    """Bulk mint with a POPULATED registry of tmp_path files — the only
+    arrangement that exercises the written-through report shape (an empty
+    LOCAL_SKILL_ENV_PATHS makes every agent undeliverable instead)."""
+    gt = load_generate_tokens()
+    claude_dir = tmp_path / "claude_skill"
+    claude_dir.mkdir()
+    gt.LOCAL_SKILL_ENV_PATHS = {"claude": str(claude_dir / ".env")}
+
+    (_tokens, _digests, failures), out = _capture(gt.mint)
+
+    assert failures == [], failures
+    _assert_every_line_pastes(out)
+    # The line the operator actually needs is still there, unprefixed.
+    assert any(l.startswith("AGENT_TOKENS=") for l in out.splitlines())
+
+
+def test_every_printed_line_of_an_add_mint_pastes_into_an_env(tmp_path):
+    """--add WITH an install path: the write-through branch, its per-agent
+    report line and the respawn/restart reminder."""
+    gt = load_generate_tokens()
+    gt.LOCAL_SKILL_ENV_PATHS = {}
+    env_path = tmp_path / ".env"
+    existing_digest = _digest("tok_existing_claude")
+    env_path.write_text(f"AGENT_TOKENS=claude:sha256:{existing_digest}\n")
+
+    codex_dir = tmp_path / "codex_skill"
+    codex_dir.mkdir()
+
+    (rc, token), out = _capture(
+        gt.add_agent, "codex", install_path=str(codex_dir / ".env"),
+        env_path=str(env_path),
+    )
+
+    assert rc == 0 and token is not None
+    _assert_every_line_pastes(out)
+
+
+def test_every_printed_line_of_a_remote_add_pastes_into_an_env(tmp_path):
+    """--add with NO install path: the remote block, eight print sites."""
+    gt = load_generate_tokens()
+    gt.LOCAL_SKILL_ENV_PATHS = {}
+    env_path = tmp_path / ".env"
+
+    (rc, _token), out = _capture(
+        gt.add_agent, "codex", install_path=None, env_path=str(env_path),
+    )
+
+    assert rc == 0
+    assert "REMOTE" in out, "the remote block must actually have been printed"
+    _assert_every_line_pastes(out)
+
+
+def test_the_undeliverable_block_pastes_into_an_env(tmp_path):
+    """The conditional undeliverable block on the bulk-mint path."""
+    gt = load_generate_tokens()
+    gt.LOCAL_SKILL_ENV_PATHS = {}
+
+    _result, out = _capture(gt.mint)
+
+    assert "REGISTERED BUT UNDELIVERABLE" in out, "the block must have printed"
+    _assert_every_line_pastes(out)

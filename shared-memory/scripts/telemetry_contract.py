@@ -95,7 +95,7 @@ __all__ = [
 #: coordinator.py's FRAMEWORK_VERSION et al. until the merger's own version-
 #: bump step (which those four files stay reserved for) catches up to it at
 #: release time — that gap is the check doing its job, not a build defect.
-VERSION = "0.9.90"
+VERSION = "0.9.91"
 
 
 def _version_tuple(v: str) -> tuple:

@@ -151,7 +151,7 @@ static pin refuses any `dotenv` import in either client.
 spawned daemons to the four socket families they use; trialled 30 hours on a test host with the
 nvtop probe healthy under it.
 
-### `llm_faults` at its old telemetry home is keyed by raw backend URL ⏳ Closes at its stamp (v0.9.91)
+### `llm_faults` at its old telemetry home is keyed by raw backend URL — closed in v0.9.91
 
 **Issue.** `/memory/telemetry` serves the per-backend fault counters twice: at `llm.faults`, where
 every backend-URL key is scrubbed of credentials before rendering, and at the pre-0.9.74 home
@@ -162,9 +162,9 @@ Not a live exposure on an install that boots: a backend URL carrying userinfo is
 since v0.9.87 and a query string is scrubbed at ingest, so the raw key holds no secret. Defence in
 depth only.
 
-**Done.** The contract decides what is served from v0.9.90; the old home is stamped
-`removed_in: 0.9.91` (its consumer of record still reads it there) and stops being served at that
-release. Read `llm.faults`.
+**Done.** The contract decides what is served from v0.9.90; the old home was stamped
+`removed_in: 0.9.91` while its consumer of record still read it there, and stopped being served in
+v0.9.91. Read `llm.faults`.
 
 ### Agent authentication — implemented (v0.3.5)
 

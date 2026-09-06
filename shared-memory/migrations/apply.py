@@ -98,7 +98,13 @@ def _load_env() -> None:
         if not line or line.startswith("#") or "=" not in line:
             continue
         key, _, val = line.partition("=")
-        os.environ.setdefault(key.strip(), val.strip())
+        key = key.strip()
+        if not key:
+            # A pasted banner line ("=== ... ===") has no key, and
+            # os.environ.setdefault("", ...) raises OSError [Errno 22].
+            # Skip it, exactly as secure_env.py's loader does.
+            continue
+        os.environ.setdefault(key, val.strip())
 
 
 def _pg_conn() -> str:
