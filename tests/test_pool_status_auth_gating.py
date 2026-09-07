@@ -113,7 +113,7 @@ def test_pool_has_free_slot_forwards_headers_to_the_gateway(monkeypatch):
             captured["headers"] = headers
             return _FakeResp()
 
-    monkeypatch.setattr(pool_status.httpx, "AsyncClient", lambda timeout, **_k: _FakeClient())
+    monkeypatch.setattr(pool_status.httpx, "AsyncClient", lambda timeout, trust_env, **_k: _FakeClient())
     result = asyncio.run(pool_status.pool_has_free_slot(headers={"Authorization": "Bearer daemon-tok"}))
     assert result is True
     assert captured["headers"] == {"Authorization": "Bearer daemon-tok"}
@@ -141,7 +141,7 @@ def test_pool_has_free_slot_defaults_to_empty_headers_when_omitted(monkeypatch):
             captured["headers"] = headers
             return _FakeResp()
 
-    monkeypatch.setattr(pool_status.httpx, "AsyncClient", lambda timeout, **_k: _FakeClient())
+    monkeypatch.setattr(pool_status.httpx, "AsyncClient", lambda timeout, trust_env, **_k: _FakeClient())
     asyncio.run(pool_status.pool_has_free_slot())
     assert captured["headers"] == {}
 

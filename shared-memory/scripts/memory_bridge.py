@@ -358,14 +358,14 @@ def _uds_path() -> str | None:
 def _async_client(timeout: float) -> "httpx.AsyncClient":
     uds = _uds_path()
     if uds:
-        return httpx.AsyncClient(timeout=timeout, transport=httpx.AsyncHTTPTransport(uds=uds), trust_env=False)
+        return httpx.AsyncClient(timeout=timeout, transport=httpx.AsyncHTTPTransport(uds=uds, trust_env=False), trust_env=False)
     return httpx.AsyncClient(timeout=timeout, trust_env=False)
 
 
 def _sync_client(timeout: float) -> "httpx.Client":
     uds = _uds_path()
     if uds:
-        return httpx.Client(timeout=timeout, transport=httpx.HTTPTransport(uds=uds), trust_env=False)
+        return httpx.Client(timeout=timeout, transport=httpx.HTTPTransport(uds=uds, trust_env=False), trust_env=False)
     return httpx.Client(timeout=timeout, trust_env=False)
 
 

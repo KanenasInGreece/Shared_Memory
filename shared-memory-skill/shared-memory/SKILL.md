@@ -541,7 +541,7 @@ Tool: review_hold
 Args: {"summary_id": 12, "pg_id": 43}
 ```
 
-The MCP surface mirrors the CLI except the named `query` shortcuts (`why-to-check`, `who-decided`, `retrospectives`, `agent-decisions`), which have no MCP twin — raw Cypher via `graph_query` is the MCP form; every other CLI action has a tool: `graph_query`, `record_lineage` (pass a qualified `ref`), `memory_telemetry` and `check_memory_health` (the `status` / `doctor` pair), and `archive_reasoning_trace`. Same auth, same qualified-ref rules, same operator-involvement expectations as the CLI forms.
+The MCP surface mirrors the CLI except the named `query` shortcuts (`why-to-check`, `who-decided`, `retrospectives`, `agent-decisions`), which have no MCP twin — raw Cypher via `graph_query` is the MCP form; every other CLI action has a tool: `record_lineage` (pass a qualified `ref`), `memory_telemetry` and `check_memory_health` (the `status` / `doctor` pair), and `archive_reasoning_trace`. Same auth, same qualified-ref rules, same operator-involvement expectations as the CLI forms.
 
 ---
 

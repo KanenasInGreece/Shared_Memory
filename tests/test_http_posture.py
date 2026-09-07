@@ -44,6 +44,7 @@ so they are deliberately two separate test functions, not one.
 import ast
 import importlib.util
 import os
+import subprocess
 import socket
 import sys
 import threading
@@ -155,6 +156,44 @@ def _httpx_constructor_calls():
     return calls
 
 
+def _httpx_transport_calls():
+    """[(path, lineno, attr, ast.Call node)] for every `httpx.HTTPTransport` /
+    `httpx.AsyncHTTPTransport` call in the walked trees. A transport built
+    separately carries its OWN trust_env (default True) and its own SSL
+    context: a Client's trust_env=False does not flow into it (SEC review,
+    measured at httpx 0.28.1)."""
+    calls = []
+    for path in _walked_py_files():
+        for node in ast.walk(_parse(path)):
+            if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                    and isinstance(node.func.value, ast.Name)
+                    and node.func.value.id == "httpx"
+                    and node.func.attr in ("HTTPTransport", "AsyncHTTPTransport")):
+                calls.append((path, node.lineno, node.func.attr, node))
+    return calls
+
+
+def test_census_transport_constructors_trust_env_false_and_count_is_4():
+    """The four UNIX-socket transports of the CLI factories (two per
+    `memory_bridge.py` copy) each pass a literal trust_env=False and carry no
+    escape-hatch keyword. Count pinned at 4 (a VALUE, `fact:1309`) — a fifth
+    transport updates this number in the same PR.
+
+    Mutation: remove `trust_env=False` from one `httpx.HTTPTransport(uds=uds, …)`
+    call and only this test dies; add `verify=…` or `proxy=…` to one and only
+    this test dies.
+    """
+    calls = _httpx_transport_calls()
+    assert len(calls) == 4, [(p, ln) for p, ln, _, _ in calls]
+    for path, lineno, attr, node in calls:
+        kw = {k.arg: k.value for k in node.keywords}
+        assert "trust_env" in kw, f"{path}:{lineno} {attr} has no trust_env"
+        assert isinstance(kw["trust_env"], ast.Constant) and kw["trust_env"].value is False, \
+            f"{path}:{lineno} {attr} trust_env is not a literal False"
+        for bad in ("proxy", "proxies", "mounts", "verify", "cert"):
+            assert bad not in kw, f"{path}:{lineno} {attr} carries escape-hatch keyword {bad}"
+
+
 def test_census_total_constructor_count_is_29():
     """The 29 sites `fact:2106`/`decision:2113` measured (12 in
     `coordinator.py`+daemons+CLI, 11 in `vector-skill.py`, 4 in the two
@@ -242,8 +281,8 @@ def test_census_import_spelling_and_file_set():
     plain `import httpx` — no `import httpx as h` (which would defeat the
     AST match keyed on the name `httpx` used by every assertion above) and
     no `from httpx import ...` (ditto, and also invisible to a `httpx.X`
-    attribute match). Tree guard: the set of files importing httpx repo-wide
-    (excluding `tests/` and `.claude/`) equals exactly the walked-tree set —
+    attribute match). Tree guard: the set of TRACKED files importing httpx repo-wide
+    (git ls-files, excluding `tests/`) equals exactly the walked-tree set —
     no ninth importer hiding outside the three walked roots.
 
     Mutation: aliasing any of the 8 known imports, or adding a 9th importer
@@ -273,29 +312,33 @@ def test_census_import_spelling_and_file_set():
     )
 
     repo_wide_importers = set()
-    for dirpath, dirnames, filenames in os.walk(REPO_ROOT):
-        rel_dir = os.path.relpath(dirpath, REPO_ROOT)
-        parts = [] if rel_dir == "." else rel_dir.split(os.sep)
-        if "tests" in parts or ".claude" in parts or ".git" in parts:
-            dirnames[:] = []
+    # TRACKED files only (`git ls-files`), never a filesystem walk: a walk counts
+    # gitignored trees — the operator's Local_Documentation/ probe scripts, a
+    # repo-local .venv/ full of httpx importers — and turns this test red on the
+    # very checkouts that run the documented suite (QA review, measured 24 vs 8
+    # in the main checkout). Same reasoning and fallback shape as
+    # tests/test_server_setup_doc_paths.py.
+    try:
+        proc = subprocess.run(["git", "ls-files", "*.py"], cwd=REPO_ROOT,
+                              capture_output=True, text=True, timeout=15)
+        tracked = proc.stdout.split() if proc.returncode == 0 else []
+    except (OSError, subprocess.SubprocessError):
+        tracked = []
+    if tracked:
+        candidates = [rel for rel in tracked if not rel.startswith("tests/")]
+    else:  # not a git checkout (an exported tree): the three walked roots only
+        candidates = [os.path.relpath(p, REPO_ROOT) for p in _walked_py_files()]
+    for rel in candidates:
+        path = os.path.join(REPO_ROOT, rel)
+        if not os.path.isfile(path):
             continue
-        dirnames[:] = [d for d in dirnames
-                        if d not in (".git", ".claude", "tests", "__pycache__")]
-        for fn in filenames:
-            if not fn.endswith(".py"):
-                continue
-            path = os.path.join(dirpath, fn)
-            for node in ast.walk(_parse(path)):
-                if isinstance(node, ast.Import):
-                    for alias in node.names:
-                        if alias.name == "httpx":
-                            repo_wide_importers.add(os.path.relpath(path, REPO_ROOT))
-                if isinstance(node, ast.ImportFrom) and node.module == "httpx":
-                    repo_wide_importers.add(os.path.relpath(path, REPO_ROOT))
-
+        for node in ast.walk(_parse(path)):
+            if isinstance(node, ast.Import) and any(a.name == "httpx" for a in node.names):
+                repo_wide_importers.add(rel)
+            if isinstance(node, ast.ImportFrom) and node.module == "httpx":
+                repo_wide_importers.add(rel)
     assert repo_wide_importers == set(_EXPECTED_HTTPX_IMPORTERS), (
-        f"repo-wide httpx importers (excl. tests/, .claude/) diverge from the "
-        f"walked-tree set: {sorted(repo_wide_importers)}"
+        f"tracked httpx importers outside tests/ changed: {sorted(repo_wide_importers)}"
     )
 
 
@@ -323,6 +366,28 @@ def test_census_aiohttp_clientsession_trust_env():
     assert "trust_env" in kw, "hive_mind_proxy.py's ClientSession(...) has no trust_env keyword"
     assert isinstance(kw["trust_env"], ast.Constant) and kw["trust_env"].value is False, (
         f"trust_env is not literally False (got {ast.dump(kw['trust_env'])})"
+    )
+
+    # QA F-2: the bare-name match above is shape-specific. Guard the two ways a
+    # second, unhardened session could slip past it: the attribute spelling
+    # `aiohttp.ClientSession(...)` anywhere in the walked trees (must be zero),
+    # and any OTHER walked file naming ClientSession at all (file-set pin).
+    attribute_calls, session_files = [], set()
+    for path in _walked_py_files():
+        rel = os.path.relpath(path, REPO_ROOT)
+        for n in ast.walk(_parse(path)):
+            if (isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+                    and isinstance(n.func.value, ast.Name)
+                    and n.func.value.id == "aiohttp" and n.func.attr == "ClientSession"):
+                attribute_calls.append(f"{rel}:{n.lineno}")
+            if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == "ClientSession":
+                session_files.add(rel)
+            if (isinstance(n, ast.ImportFrom) and n.module == "aiohttp"
+                    and any(a.name == "ClientSession" for a in n.names)):
+                session_files.add(rel)
+    assert attribute_calls == [], f"aiohttp.ClientSession(...) spelled as an attribute call: {attribute_calls}"
+    assert session_files == {"shared-memory/scripts/hive_mind_proxy.py"}, (
+        f"files naming ClientSession changed: {sorted(session_files)}"
     )
 
 
@@ -421,13 +486,13 @@ async def test_cli_real_search_action_trust_env_false(monkeypatch, tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_mcp_search_payload_trust_env_false():
+async def test_mcp_search_payload_trust_env_false(monkeypatch):
     """MCP surface: drives `_search_payload` (`mcp/vector-skill.py:889`, its
     httpx site at `:918`). Resets both health-probe caches first — a warm
     cache short-circuits `_fetch_health_blocks` and it constructs nothing,
     same reasoning as the CLI real-action test above."""
-    vector_skill._CAPABILITY_CACHE = {}
-    vector_skill._CAPACITY_CACHE = None
+    monkeypatch.setattr(vector_skill, "_CAPABILITY_CACHE", {})
+    monkeypatch.setattr(vector_skill, "_CAPACITY_CACHE", None)
     mock_response = MagicMock(status_code=200)
     mock_response.json.return_value = {"results": []}
     with patch.object(vector_skill.httpx, "AsyncClient") as mock_cls:
@@ -611,8 +676,11 @@ class _CountingServer:
 
 _GATEWAY_RESPONSE = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
 
-_PROXY_ENV_VARS = ("NO_PROXY", "no_proxy", "HTTPS_PROXY", "https_proxy",
-                    "ALL_PROXY", "all_proxy", "SSL_CERT_FILE", "SSL_CERT_DIR")
+_PROXY_ENV_VARS = (
+    "HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy",
+    "ALL_PROXY", "all_proxy", "NO_PROXY", "no_proxy",
+    "SSL_CERT_FILE", "SSL_CERT_DIR",
+)
 
 
 def test_environment_proxy_variables_ignored_with_trust_env_false(monkeypatch, tmp_path):
@@ -654,6 +722,8 @@ def test_environment_proxy_variables_ignored_with_trust_env_false(monkeypatch, t
         treated = memory_bridge._sync_client(5.0)
         try:
             treated.get(f"http://127.0.0.1:{gateway.port}/")
+        except httpx.TransportError as exc:  # the counters are the diagnostic, never the exception
+            pytest.fail(f"treatment GET failed: {exc!r}; proxy.hits={proxy.hits} gateway.hits={gateway.hits}")
         finally:
             treated.close()
 
