@@ -1846,6 +1846,8 @@ class AsyncHiveMindProxy:
             connector=connector,
             timeout=timeout,
             auto_decompress=False,
+            # already aiohttp's default; stated so .netrc credentials are never injected and the posture is visible in code
+            trust_env=False,
         )
         log.info("Connection pool ready (limit=200, limit_per_host=80)")
 

@@ -4138,7 +4138,7 @@ class MemoryCoordinator:
             return 0
 
         try:
-            async with httpx.AsyncClient(timeout=30.0) as client:
+            async with httpx.AsyncClient(timeout=30.0, trust_env=False) as client:
                 vectors = await self._embed_many([r["text"] for r in rows], client)
         except Exception as exc:
             await self._defer_pending_alternatives([r["id"] for r in rows], exc)
@@ -7268,7 +7268,7 @@ class MemoryCoordinator:
 
         # Embedding — hard mandate; no save without a vector
         try:
-            async with httpx.AsyncClient(timeout=30.0) as client:
+            async with httpx.AsyncClient(timeout=30.0, trust_env=False) as client:
                 embedding = await self._embed(content, client)
         except RuntimeError as exc:
             return web.json_response({"status": "error", "message": str(exc)}, status=503)
@@ -7838,7 +7838,7 @@ class MemoryCoordinator:
             f"retrospective:{pg_id}:{notes}".encode()
         ).hexdigest()
         try:
-            async with httpx.AsyncClient(timeout=30.0) as client:
+            async with httpx.AsyncClient(timeout=30.0, trust_env=False) as client:
                 embedding = await self._embed(notes, client)
         except RuntimeError as exc:
             return web.json_response({"status": "error", "message": str(exc)}, status=503)
@@ -8583,7 +8583,7 @@ class MemoryCoordinator:
         project_values, domain_values, filters_resolved = \
             await self._resolve_search_filters(project, domains_filter)
 
-        async with httpx.AsyncClient(timeout=30.0) as client:
+        async with httpx.AsyncClient(timeout=30.0, trust_env=False) as client:
             try:
                 q_vec = await self._embed(query, client)
             except RuntimeError:
