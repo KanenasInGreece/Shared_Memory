@@ -5,6 +5,29 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.9.93] — 2026-09-07
+
+### The insight scaffold's SLOT-distillate invariant gets its tests
+
+**Four pure tests pin invariant I2 of `_assemble_insight_content`** (`tests/test_consolidation_quality_l1.py`): the
+per-judgement SLOT distillates rendered into an insight scaffold are keyed only to the judgements actually in the
+fold. A `SLOT` marker the model emits for a pg_id that is not in the fold is never rendered; a judgement whose slot the
+model omitted renders an empty distillate and never borrows another judgement's text, in either direction (a
+decision may not wear a retrospective's distillate, nor the reverse). The `reversal_lines` channel and the
+`PRINCIPLE` paragraph are separate, explicitly-passed inputs and stay outside the invariant. The zero-padded marker
+case (`SLOT 010:` reads as slot 10) is recorded as a language-level normalisation, not a guard.
+
+**Why tests only.** The invariant already held by construction — the assembly loop iterates the fold's rows and looks
+slots up by row pg_id — so nothing in the daemon changes. What was missing was any test that would die if that
+construction were rewritten. Each test's docstring names the structural mutation that kills it, and the review measured
+them: a slot-driven loop kills three of the four tests, a borrow-fallback kills two, a one-directional borrow kills only
+the new decision-side test. No production file, no telemetry key, no schema and no client surface moves in this release;
+the version pins move so every install reports the release it runs.
+
+**Built by the local builder seat.** The test file was written by the Arc A770 builder seat (Qwen3.5-9B, fast profile)
+from a reviewed brief in under a minute, then reviewed by two model families and fixed by the merger. The
+`telemetry-contract.md` regeneration in this release changes only its version line.
+
 ## [0.9.92] — 2026-09-06
 
 ### The backup drain gate reads a route its own token may reach, and its tests refuse the wrong one
