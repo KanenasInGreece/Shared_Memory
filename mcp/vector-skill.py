@@ -492,7 +492,7 @@ async def _fetch_health_blocks() -> None:
         if _CAPABILITY_CACHE is not None:
             return   # a concurrent waiter already filled it while we queued
         try:
-            async with httpx.AsyncClient(timeout=HEALTH_PROBE_TIMEOUT_S) as client:
+            async with httpx.AsyncClient(timeout=HEALTH_PROBE_TIMEOUT_S, trust_env=False) as client:
                 health = _reply_json(await client.get(f"{COORDINATOR_BASE}/health",
                                                       headers=_auth_headers()),
                                      "_fetch_health_blocks")
@@ -916,7 +916,8 @@ async def _search_payload(query: str, limit: int = 5, project: str = "",
         body["since"] = since
     try:
         async with httpx.AsyncClient(
-            timeout=httpx.Timeout(ceiling, connect=5.0)
+            timeout=httpx.Timeout(ceiling, connect=5.0),
+            trust_env=False,
         ) as client:
             r = await client.post(
                 f"{COORDINATOR_BASE}/memory/search",
@@ -1089,7 +1090,7 @@ async def save_artifact(content: str, metadata_json: str = "{}") -> str:
     agent_id = AGENT_ID
 
     try:
-        async with httpx.AsyncClient(timeout=60.0) as client:
+        async with httpx.AsyncClient(timeout=60.0, trust_env=False) as client:
             r = await client.post(
                 f"{coordinator_url}/memory/save",
                 json={"content": content, "metadata": m_data, "agent_id": agent_id},
@@ -1358,7 +1359,7 @@ async def save_decision(
     agent_id = AGENT_ID
 
     try:
-        async with httpx.AsyncClient(timeout=60.0) as client:
+        async with httpx.AsyncClient(timeout=60.0, trust_env=False) as client:
             r = await client.post(
                 f"{coordinator_url}/memory/save",
                 json={"content": content, "metadata": metadata, "agent_id": agent_id},
@@ -1444,7 +1445,7 @@ async def save_retrospective(
         payload["elicited"] = True
 
     try:
-        async with httpx.AsyncClient(timeout=60.0) as client:
+        async with httpx.AsyncClient(timeout=60.0, trust_env=False) as client:
             r = await client.post(
                 f"{coordinator_url}/memory/retrospective",
                 json=payload,
@@ -1498,7 +1499,7 @@ async def supersede(pg_id: int, by: int = 0) -> str:
     if by and by > 0:
         payload["by"] = by
     try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
+        async with httpx.AsyncClient(timeout=30.0, trust_env=False) as client:
             r = await client.post(
                 f"{coordinator_url}/memory/supersede",
                 json=payload,
@@ -1535,7 +1536,7 @@ async def review_hold(summary_id: int, pg_id: int) -> str:
     """
     coordinator_url = COORDINATOR_BASE
     try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
+        async with httpx.AsyncClient(timeout=30.0, trust_env=False) as client:
             r = await client.post(
                 f"{coordinator_url}/memory/review_hold",
                 json={"summary_id": summary_id, "pg_id": pg_id},
@@ -1615,7 +1616,7 @@ async def check_memory_health() -> str:
     caller should learn.
     """
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
+        async with httpx.AsyncClient(timeout=10.0, trust_env=False) as client:
             resp = await client.get(f"{COORDINATOR_BASE}/health",
                                     headers=_auth_headers())
         payload = _reply_json(resp, "check_memory_health")
@@ -1661,7 +1662,7 @@ async def memory_telemetry() -> str:
     """
     coordinator_url = COORDINATOR_BASE
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
+        async with httpx.AsyncClient(timeout=10.0, trust_env=False) as client:
             resp = await client.get(
                 f"{coordinator_url}/memory/telemetry", headers=_auth_headers()
             )
@@ -1696,7 +1697,7 @@ async def record_lineage(ref: str) -> str:
         return ("Error: ref must be a bare id or type:id, where type is one of "
                 + ", ".join(RECORD_TYPES))
     try:
-        async with httpx.AsyncClient(timeout=CALL_TIMEOUT) as client:
+        async with httpx.AsyncClient(timeout=CALL_TIMEOUT, trust_env=False) as client:
             r = await client.get(f"{COORDINATOR_BASE}/memory/status/{ref}",
                                  headers=_auth_headers())
             return json.dumps(_reply_json(r, "record_lineage"), indent=2, default=str)
@@ -1716,7 +1717,7 @@ async def graph_query(cypher: str) -> str:
     would be advisory only.
     """
     try:
-        async with httpx.AsyncClient(timeout=CALL_TIMEOUT) as client:
+        async with httpx.AsyncClient(timeout=CALL_TIMEOUT, trust_env=False) as client:
             r = await client.post(f"{COORDINATOR_BASE}/memory/graph",
                                   json={"cypher": cypher, "params": {}},
                                   headers=_auth_headers())
