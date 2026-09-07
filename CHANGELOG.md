@@ -5,6 +5,45 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.9.94] — 2026-09-07
+
+### Framework HTTP clients no longer read proxy or CA settings from the environment
+
+**Every httpx client the framework constructs passes `trust_env=False`, and so do the CLI's UNIX-socket
+transports; the gateway's aiohttp session states the same.** Before this release, an `HTTP_PROXY`, `http_proxy`
+or `ALL_PROXY` visible to the gateway — including one line in `shared-memory/.env`, which is loaded into the
+environment before the coordinator imports — routed every save and search, record text included, through that
+proxy, silently, loopback included; `NO_PROXY` could not be relied on, because it matches the host string and
+the framework's own URLs mix `localhost` and `127.0.0.1`. Twenty-nine constructor sites across the coordinator,
+the two daemons, the pool-status helper, the retrospective-edge migration, both `memory_bridge.py` copies and
+the MCP client now carry the keyword, plus the four socket transports the CLI factories build, which carry
+their own `trust_env` and their own SSL context. The aiohttp path to LLM backends was already proxy-blind by
+library default and is unchanged in behaviour; the keyword is stated there so `.netrc` credentials are never
+injected and the posture is visible in code.
+
+**Two behaviour changes for an install that relied on the environment.** A remote CLI or MCP client whose
+`HTTP_PROXY` reached the gateway now connects direct: use an SSH tunnel, the UDS socket or a network allowlist.
+A private CA supplied through `SSL_CERT_FILE` or `SSL_CERT_DIR` is no longer honoured by these clients — and
+with `trust_env=False` httpx trusts only its bundled certifi store, never the OS store — so if `EMBEDDER_URL`,
+`RERANKER_URL`, `POOL_STATUS_URL` or `COORDINATOR_URL` points at an `https://` endpoint signed by such a CA,
+the gateway's own embedding call fails after this release and, under the hard embedding mandate, every save
+returns 503. Terminate TLS in front of the encoder so the URL is `http://`, or append the CA to that
+interpreter's certifi bundle. All-loopback installs, the shipped default, and a LAN embedder over plain http
+are unaffected. Not covered: `diagnostic_proxy.py`, `rerank_shim.py` and the backfill scripts, which use urllib
+and still honour the environment, and the shell `curl` lines in the ops scripts. No escape-hatch knob ships;
+one may be added later as an additive setting.
+
+**A census test pins the posture** (`tests/test_http_posture.py`, 16 tests). By AST it counts the 29 client
+constructors and the 4 transport constructors, requires a literal `trust_env=False` on each, forbids `proxy`,
+`proxies`, `mounts`, `verify` and `cert` beside it, rejects aliased or `from httpx import` spellings and any
+new file importing httpx (read from the tracked files, so a local scratch directory never turns it red), and
+checks the one aiohttp session in both spellings. Value tests drive the real entry points with the client class
+patched, forcing the TCP and socket branches explicitly because the gateway host has a live socket. An
+environment test stands up two local listeners, sets the proxy variables, and asserts by connection counters
+that the framework's client reaches the gateway and never the proxy while a `trust_env=True` control does the
+opposite. Both `SKILL.md` copies and `mcp/README.md` stop claiming MCP parity for the CLI's named `query`
+shortcuts, which have no MCP twin; `graph_query` is the MCP form.
+
 ## [0.9.93] — 2026-09-07
 
 ### The insight scaffold's SLOT-distillate invariant gets its tests
