@@ -192,7 +192,7 @@ def print_report(plan: list[dict]) -> None:
 
 def apply_plan(plan: list[dict], conn, driver) -> dict:
     converted = 0
-    with httpx.Client(timeout=60.0) as client:
+    with httpx.Client(timeout=60.0, trust_env=False) as client:
         for i, p in enumerate(plan, 1):
             notes = p["notes"] or ""
             if not notes.strip():

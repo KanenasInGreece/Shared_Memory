@@ -37,7 +37,7 @@ async def pool_has_free_slot(timeout: float = 3.0, headers: dict | None = None) 
     `headers` should carry the caller's own Authorization (see module
     docstring) — omitted only by a standalone/debug caller with no token."""
     try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
+        async with httpx.AsyncClient(timeout=timeout, trust_env=False) as client:
             r = await client.get(POOL_STATUS_URL, headers=headers or {})
             if r.status_code != 200:
                 return True

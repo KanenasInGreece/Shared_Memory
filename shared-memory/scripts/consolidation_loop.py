@@ -2577,7 +2577,7 @@ class ConsolidationDaemon:
             text = text[:EMBED_MAX_CHARS]
         ceiling = embed_ceiling(len(text))
         try:
-            async with httpx.AsyncClient(timeout=ceiling) as client:
+            async with httpx.AsyncClient(timeout=ceiling, trust_env=False) as client:
                 resp = await client.post(
                     RETRIEVER_URL,
                     headers=_auth_headers(),
@@ -2642,7 +2642,7 @@ class ConsolidationDaemon:
                   int(NREM_MAX_TOKENS_INSIGHT * NREM_TRUNCATION_RETRY_FACTOR)]
         _ceiling = adaptive_ceiling(len(prompt), units=units, max_tokens=bounds[-1])
         try:
-            async with httpx.AsyncClient(timeout=_ceiling) as client:
+            async with httpx.AsyncClient(timeout=_ceiling, trust_env=False) as client:
                 for i, max_tokens in enumerate(bounds):
                     resp = await _post_nrem(client, {
                         "model": LLM_MODEL,

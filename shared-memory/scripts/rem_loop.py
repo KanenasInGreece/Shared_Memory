@@ -1130,7 +1130,7 @@ class REMDaemon:
             nonlocal model
             _start = time.monotonic()
             try:
-                async with httpx.AsyncClient(timeout=_ceiling) as client:
+                async with httpx.AsyncClient(timeout=_ceiling, trust_env=False) as client:
                     resp = await client.post(
                         REASONER_URL,
                         headers={**_auth_headers(), "X-SM-LLM-Role": "extract"},
@@ -1338,7 +1338,7 @@ class REMDaemon:
         _start = time.monotonic()
         model = "local-model"
         try:
-            async with httpx.AsyncClient(timeout=_ceiling) as client:
+            async with httpx.AsyncClient(timeout=_ceiling, trust_env=False) as client:
                 resp = await client.post(
                     REASONER_URL, headers={**_auth_headers(), "X-SM-LLM-Role": "extract"},
                     json={"model": LLM_MODEL,
