@@ -35,7 +35,7 @@ from datetime import datetime
 
 import httpx
 
-VERSION = "0.9.93"
+VERSION = "0.9.94"
 # Wire contract this client was built against. Must match the gateway's
 # api_version (reported by GET /health). Bump only on breaking protocol changes.
 # v4 (project registry): a fact save without a REGISTERED metadata.project is
@@ -358,15 +358,15 @@ def _uds_path() -> str | None:
 def _async_client(timeout: float) -> "httpx.AsyncClient":
     uds = _uds_path()
     if uds:
-        return httpx.AsyncClient(timeout=timeout, transport=httpx.AsyncHTTPTransport(uds=uds))
-    return httpx.AsyncClient(timeout=timeout)
+        return httpx.AsyncClient(timeout=timeout, transport=httpx.AsyncHTTPTransport(uds=uds, trust_env=False), trust_env=False)
+    return httpx.AsyncClient(timeout=timeout, trust_env=False)
 
 
 def _sync_client(timeout: float) -> "httpx.Client":
     uds = _uds_path()
     if uds:
-        return httpx.Client(timeout=timeout, transport=httpx.HTTPTransport(uds=uds))
-    return httpx.Client(timeout=timeout)
+        return httpx.Client(timeout=timeout, transport=httpx.HTTPTransport(uds=uds, trust_env=False), trust_env=False)
+    return httpx.Client(timeout=timeout, trust_env=False)
 
 
 def search_ceiling(capability: dict | None, capacity: dict | None = None) -> float:
