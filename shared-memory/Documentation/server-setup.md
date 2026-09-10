@@ -17,7 +17,14 @@ the thin-client skill and point it at a running gateway. See [`../SKILL.md`](../
 | Runs on | every agent, every host (incl. remote) | the **one** gateway host |
 | Talks to DB/GPU? | No — HTTP to `:8888` only | Yes — owns Postgres, Neo4j, GPU |
 | Shipped by | `sync_skills.sh` | this repo, via `git` |
-| Upgraded by | re-sync the skill | `git pull` → `migrations/apply.py` → restart gateway |
+| Upgraded by | re-sync the skill | `bash shared-memory/scripts/update_framework.sh` (`--dry-run` first) |
+
+⛔ **The upgrade is one script, not three commands.** `update_framework.sh` is the procedure:
+it takes the backup that migration cannot undo, migrates `shared-memory/.env`, applies the
+Postgres migrations, applies the Neo4j constraints (**Neo4j has no migration ledger** — nothing
+else does this), reconciles the project identities, restarts, re-syncs the skills and runs the
+postflight. `git pull` → `apply.py` → restart skips four of those, silently, and the install
+looks fine until a constraint that was never created lets a duplicate through.
 
 **Installing the skill is not installing the framework.** The skill is a thin
 HTTP client; the daemons never run from a skill directory. A remote agent has no
@@ -53,8 +60,17 @@ cd shared-memory-GitHub
 #    crash-loops on "/import is not accessible" — see the troubleshooting
 #    table below).
 bash shared-memory/scripts/install_framework.sh
-#    Fill in when prompted: NEO4J_PASSWORD, PG_PASSWORD, TAVILY_API_KEY
-#    Optional: MEMORY_LOG_LEVEL, AUDIT_LOG_PATH, PROXY_BIND, WRITE_QUIESCE_SEC
+#    What it actually prompts for: the three host paths, the two encoder
+#    device answers and the render-node gid, then the Neo4j and Postgres
+#    passwords — and nothing else. On a FIRST install an empty password
+#    answer generates a strong value inside the script (never displayed,
+#    never logged); when an existing .env is being overwritten it re-prompts
+#    instead, because the databases already hold the old one.
+#    TAVILY_API_KEY is real but is NOT prompted for: it is edited into
+#    shared-memory/.env afterwards, and only if you use the web-search MCP.
+#    Same for the optional knobs — MEMORY_LOG_LEVEL, AUDIT_LOG_PATH,
+#    PROXY_BIND, WRITE_QUIESCE_SEC are template lines you uncomment, not
+#    questions the installer asks.
 
 # 3. Start the database + inference layer.
 docker compose -f shared-memory/ops/postgres_neo4j_limits.yaml --env-file shared-memory/.env up -d
@@ -69,11 +85,15 @@ bash shared-memory/scripts/init_db.sh
 #    straight into its skill .env (mode 600), nothing to copy by hand:
 bash shared-memory/scripts/bootstrap_tokens.sh
 #    A REMOTE agent (no local skill install found on this machine) needs an
-#    explicit, human-run reveal — pass --reveal on THIS SAME invocation
-#    (running generate_tokens.py again LATER, as a separate command, mints a
-#    FRESH set of tokens for every agent — a full rotation, not a free peek
-#    at the one you already have):
-#      uv run python shared-memory/scripts/generate_tokens.py --reveal <name>
+#    explicit reveal — pass --reveal on THIS SAME invocation (running the
+#    bootstrap again LATER, as a separate command, mints a FRESH set of
+#    tokens for every agent — a full rotation, not a free peek at the one
+#    you already have):
+#      bash shared-memory/scripts/bootstrap_tokens.sh --reveal <name>
+#    ⛔ --reveal PRINTS A LIVE TOKEN, so it is an OPERATOR-ONLY step: run it
+#    yourself, in your own terminal, never through an agent. A credential
+#    that passes through an agent is in a transcript, and a transcript is
+#    kept forever — which is exactly what "shown once" was meant to prevent.
 
 # 6. Start the gateway (also spawns the REM + NREM daemons). Dependencies
 #    are pinned to the tested versions (requirements-gateway.lock) — the
@@ -152,9 +172,10 @@ absence from it means full access; an agent is listed there only to *restrict* i
 
 1. Decide the role first, separately from minting — `AGENT_ROLES` absent = full; add
    `name:read` or `name:admin` to `shared-memory/.env` only to narrow it.
-2. Mint and deliver in one command:
-   - new agent: `generate_tokens.py --add <name> --mcp --install-path <connector-dir>/.env`
-   - re-issue an existing one: `generate_tokens.py --remint <name> --mcp --install-path <connector-dir>/.env`
+2. Mint and deliver in one command — through `bootstrap_tokens.sh`, the shipped wrapper,
+   never by invoking `generate_tokens.py` directly:
+   - new agent: `bash shared-memory/scripts/bootstrap_tokens.sh --add <name> --mcp --install-path <connector-dir>/.env`
+   - re-issue an existing one: `bash shared-memory/scripts/bootstrap_tokens.sh --remint <name> --mcp --install-path <connector-dir>/.env`
 3. Apply the printed `AGENT_TOKENS=` (and `AGENT_INSTALLS=`, and `AGENT_ROLES=` if a role
    changed) line(s) to the gateway `.env`.
 4. Restart the gateway so it picks up the new digest/role.
@@ -306,7 +327,11 @@ Two ways skew surfaces:
    coordinator logs a one-time warning naming the agent and the version gap.
 
 When you bump `API_VERSION`, bump it in **both** `coordinator.py` and
-`memory_bridge.py`, then `git pull` + restart the gateway and re-sync the skills.
+`memory_bridge.py`. Deploying that bump on a host is the ordinary upgrade, so it goes
+through `bash shared-memory/scripts/update_framework.sh` like any other — that is what
+restarts the gateway and re-syncs the skills in the right order (the sync runs *after* the
+restart, so it cannot compare a new client against the old gateway and print a false
+incompatibility).
 
 ---
 
