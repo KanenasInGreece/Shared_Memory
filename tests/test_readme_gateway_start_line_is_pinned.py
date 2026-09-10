@@ -24,10 +24,10 @@ placeholder (wrong) or force a special-case strip (fragile, hides drift on the
 part that actually matters). Both are checked against the same literal
 independently instead.
 
-MUTATION EVIDENCE (captured manually, see W7_RED_PROOF.txt / the build
-report): each of README's two gateway-start sites was mutated separately
-(one dependency flag changed) and this test caught each failure on its own —
-confirming the two sites are not aliased to a single pass/fail.
+MUTATION EVIDENCE (captured manually, recorded in the W7 build report): each
+of README's two gateway-start sites was mutated separately (one dependency flag
+changed) and this test caught each failure on its own — confirming the two
+sites are not aliased to a single pass/fail.
 """
 import os
 import re
@@ -39,8 +39,8 @@ GATEWAY_SERVICE = os.path.join(
     REPO_ROOT, "shared-memory", "ops", "hive-mind-gateway.service"
 )
 
-# The D1 exact replacement string -- used by both the proposal (see
-# W7_README_PROPOSALS.md) and this test, so they cannot disagree (brief D1).
+# The D1 exact replacement string -- the literal README must carry, kept here
+# so the documented line and this test cannot disagree (brief D1).
 PINNED_GATEWAY_LINE = (
     "uv run --no-project --with-requirements requirements-gateway.lock "
     "python shared-memory/scripts/hive_mind_proxy.py 8888"
