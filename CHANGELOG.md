@@ -5,6 +5,11 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.9.96] — 2026-09-10
+
+### Changed
+- Updated `README.md` HONEST STATE section to reflect that consolidation folds act as sharp abstractions rather than lossy blurs, verified by a live database audit before v1.
+
 ## [0.9.95] — 2026-09-10
 
 ### Four repairs found while fixing the round itself

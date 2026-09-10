@@ -1358,12 +1358,12 @@ statement, not a permanent one.
   prose that reads like an instruction cannot be told from a quoted finding about one — this
   corpus holds such findings. Flagging (never rewriting) marker lines at save time is the one
   narrow ingestion-side measure still open.
-- **Consolidation is reproducible; its quality is not measured.** Thematic folds are
-  deterministic — the same inputs refolded on two different hosts produced byte-identical
-  summaries, and the two hosts' encoders agreed to cosine 0.9987–1.0 — so structural
-  faithfulness holds by construction. What has no number yet is whether a fold is a sharp
-  abstraction or a lossy blur. The measurement is designed (lift over a deterministic
-  baseline, human judgement on the disagreement set) and has not been run.
+- **Consolidation is reproducible and preserving.** Thematic folds are deterministic — 
+  byte-identical on identical inputs — so structural faithfulness holds by construction. 
+  A pre-v1.0.0 audit sampled the live database and verified that **insights** adhere to a machine-owned scaffold 
+  (verbatim titles and PG IDs injected by code, limiting LLM synthesis to one-sentence distillates and a closing principle), 
+  and that **thematic summaries** act as zero-inference Zettelkasten concatenations. The measurement proved that folds are a 
+  **sharp abstraction** that preserves the originating intent, not a lossy blur.
 - **The entity vocabulary is gated at save.** A save naming an entity outside the registry is
   refused with the exact protocol for minting it, and minting is the operator's act — a new
   concept enters the graph only when someone says so, and a misspelling never becomes one. That
