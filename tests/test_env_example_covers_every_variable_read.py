@@ -398,7 +398,21 @@ def _extract_names(tree, helpers, consts):
 def _template_covers(name, template_path):
     with open(template_path, encoding="utf-8") as f:
         text = f.read()
-    return bool(re.search(r"^#?\s*" + re.escape(name) + r"=", text, re.MULTILINE))
+    # A TEMPLATE LINE, not any line that happens to contain "NAME=". This file is
+    # three things at once -- a config template, operator documentation, and a
+    # reference full of worked examples -- so a loose search lets PROSE satisfy
+    # coverage. Measured: with `# AGENT_TOKENS=` deleted, the sentence at
+    # .env.example:117 ("# AGENT_TOKENS= line appended below it the first time
+    # bootstrap_tokens.sh runs") kept this GREEN, and so did the value-format
+    # example at :868. Two rules therefore: the name starts at column zero after
+    # at most one space of comment marker, and no whitespace follows the "=".
+    # The first excludes indented examples, the second excludes prose. Trailing
+    # inline comments survive -- only what immediately follows "=" is constrained.
+    return bool(
+        re.search(
+            r"^(?:# ?)?" + re.escape(name) + r"=(?![ \t])", text, re.MULTILINE
+        )
+    )
 
 
 def _default_line_present(name, default, template_path):

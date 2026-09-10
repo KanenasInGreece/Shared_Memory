@@ -140,7 +140,7 @@ ask_secret() {  # prompt [mode] → echoes answer (input hidden), or exits 1
       ;;
   esac
   while :; do
-    if ! read -r -s -p "$1: " v; then
+    if ! IFS= read -r -s -p "$1: " v; then
       echo >&2
       echo "✗ $1: no more input on stdin — refusing to write a blank or unconfirmed password. Re-run this script from an interactive terminal (or a pipe that supplies a valid password) and answer the prompt." >&2
       return 1

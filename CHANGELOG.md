@@ -5,7 +5,36 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
-## [Unreleased]
+## [0.9.95] — 2026-09-10
+
+### Four repairs found while fixing the round itself
+
+**The environment-coverage gate could be satisfied by a sentence of English.** It decided whether a
+variable was templated by searching the whole of `shared-memory/.env.example` for `^#?\s*NAME=` — and
+that file is three things at once: a configuration template, operator documentation, and a reference
+full of worked examples. Measured: deleting the genuine `# AGENT_TOKENS=` placeholder left the suite
+GREEN, because a *sentence* elsewhere in the file reads `# AGENT_TOKENS= line appended below it the
+first time bootstrap_tokens.sh runs`. Rejecting whitespace after the `=` was not enough either, because
+a worked example of the value format is lexically identical to a placeholder. The rule is now structural
+— the name starts at column zero after at most one space of comment marker, and no whitespace follows
+the `=` — and the five placeholders that were written in an indented style are now at column zero like
+every other. Measured again after the change: no other name in either template changes status, and the
+deletion that used to pass now fails.
+
+**`SECURITY.md` named a Starlette version that is not the one that ships.** It said the resolved MCP
+environment uses Starlette 1.1.0; `requirements-mcp.lock` pins `starlette==1.6.0` and 1.6.0 is what a
+real resolution produces. Both are above the documented floor, so this was a stale claim rather than an
+exposure — but a security document naming the wrong version is worth exactly as much as a README that
+describes a prompt the installer does not have.
+
+**A typed password no longer loses its leading and trailing spaces.** `read -r -s -p` without `IFS=`
+strips them, so an operator whose password genuinely carries them would have written a stripped value
+to `.env` and then failed to authenticate against both stores, with nothing to point at the cause.
+
+**The sync helper now tells an existing operator that the spawn line changed.** `sync_skills.sh`
+delivers files; it has never edited a host configuration, and it never will. Without that sentence this
+release would have fixed only new installs, while everyone who had already registered the old
+`--with fastmcp --with httpx` arguments kept running them, unpinned, with nothing to say so.
 
 ### The MCP connector declares its own dependencies, and every documented spawn line changed
 
