@@ -1,0 +1,10 @@
+# MCP-process dependencies — the set mcp/vector-skill.py actually imports.
+# vector-skill.py's only third-party imports are fastmcp and httpx (verified,
+# W7 S6) — the connector talks to the gateway over HTTP, it never touches
+# Postgres/Neo4j directly, so this is deliberately narrower than
+# requirements.txt or requirements-gateway.txt.
+# Regenerate the pinned lock after editing (same form as requirements-gateway.lock):
+#   uv pip compile requirements-mcp.txt -o requirements-mcp.lock --generate-hashes
+
+fastmcp
+httpx

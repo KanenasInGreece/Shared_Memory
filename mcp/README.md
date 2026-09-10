@@ -122,8 +122,8 @@ Then register it with the host — the **walled copy's** path, never the repo's:
 ```jsonc
 "shared-memory": {
   "type": "local",
-  "command": ["/home/you/.local/bin/uv", "run", "--with", "fastmcp", "--with", "httpx",
-              "python",
+  "command": ["/home/you/.local/bin/uv", "run", "--no-project", "--with-requirements",
+              "requirements-mcp.lock", "python",
               "/home/you/.config/<host>/shared-memory-mcp/vector-skill.py"],
   "environment": {
     "COORDINATOR_URL": "http://localhost:8888",

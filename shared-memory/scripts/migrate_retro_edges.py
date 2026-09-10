@@ -68,7 +68,28 @@ _pg_pass   = secure_env.get_secret("PG_PASSWORD", "")
 PG_CONN    = secure_env.get_secret(
     "PG_CONN", f"postgresql://postgres:{_pg_pass}@localhost:5432/agent_data"
 )
-EMBED_URL = os.environ.get("EMBED_URL", "http://localhost:8888/v1/embeddings")
+# W7 round 2/3: EMBED_URL was this script's own private, undocumented knob
+# — the framework's real GATEWAY_URL was never read here at all, so an
+# operator pointing GATEWAY_URL at a non-default gateway got no effect on
+# this tool. GATEWAY_URL (already documented, shared-memory/.env.example)
+# is now the source of truth; EMBED_URL is a ONE-RELEASE deprecated
+# override, honoured with a warning, for anyone who already set it by hand
+# (secure_env.load_split_env() above means a hand-written EMBED_URL line in
+# shared-memory/.env WAS already honoured before this change — silently
+# dropping it could send this migrator at a different endpoint and write
+# wrong-model vectors).
+GATEWAY_URL = os.environ.get("GATEWAY_URL", "http://localhost:8888")
+_embed_url_override = os.environ.get("EMBED_URL")
+if _embed_url_override:
+    print(
+        "[migrate_retro_edges] WARNING: EMBED_URL is deprecated in favour of "
+        "GATEWAY_URL — using the EMBED_URL override for this run, but set "
+        "GATEWAY_URL instead going forward.",
+        file=sys.stderr,
+    )
+    EMBED_URL = _embed_url_override
+else:
+    EMBED_URL = GATEWAY_URL.rstrip("/") + "/v1/embeddings"
 _AGENT_TOKEN = secure_env.get_secret("AGENT_TOKEN", "").strip() or None
 BACKUP_ADVISORY_LOCK_KEY = int(os.environ.get("BACKUP_ADVISORY_LOCK_KEY", "8765309"))
 

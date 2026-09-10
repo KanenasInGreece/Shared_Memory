@@ -48,14 +48,43 @@ ask() {  # prompt default  → echoes answer (default if blank)
 # valid one — never a blank/short value silently written to .env (framework
 # fact:1499 CRITICAL 1: pressing Enter used to write NEO4J_PASSWORD= /
 # PG_PASSWORD= as literal empty strings, and the install still reported
-# success). "Valid" means strictly more than 8 characters; 8-or-fewer is
-# refused, including the empty string.
+# success).
 #
-# On a REAL answer being available — an interactive terminal, or a script
-# feeding scripted lines on a pipe — `read` succeeds and returns whatever it
-# got, so an invalid entry (empty or too short) loops back for another try:
-# this is the RE-PROMPT case, and covers both a human pressing Enter and an
-# automated caller feeding a too-short placeholder.
+# ⭐ W7 round 3 (fact:1499 class, on the PUBLISHED agent install path this
+# time): an EMPTY answer no longer re-prompts — it means "generate a strong
+# password INTERNALLY, right here, in this process" (python3's
+# secrets.token_hex(20), 40 hex characters — hex never contains '/', so it
+# also always clears the Neo4j no-slash check below for free). Before this,
+# AGENTS.md's Phase 1 had THE AGENT run `openssl rand -hex 20` in its OWN
+# shell and pipe the result in — the value then existed in the agent's shell
+# and its transcript, the exact fact:1499 class, on a path this framework
+# actively tells agents to drive. Generating it in here instead means no
+# agent shell and no agent transcript ever holds the plaintext, at any point.
+# This ALSO retires two smaller, related hazards for free: fact:1499
+# CRITICAL 1 itself (Enter used to write an empty password) is now
+# impossible by construction (empty means "generate", never "accept
+# blank"), and the desync where an empty piped line used to be REJECTED and
+# consumed the NEXT answer line off the pipe (silently shifting every answer
+# after it by one) cannot happen either, because empty is now a terminal,
+# valid answer rather than a rejected one.
+#
+# The generated value NEVER reaches any process's argv: python3's own argv
+# here is the literal, fixed script text `import secrets; print(...)` —
+# never the secret — and the value leaves python3 only via its STDOUT, which
+# this function's own `$(...)` command substitution captures into a shell
+# variable. It is never echoed, printed to a terminal, or logged — the ONLY
+# place it is ever written out is the single `printf '%s' "$v"` at the
+# bottom of this function, which is the SAME stdout-capture path a
+# human-typed password already used (pinned by
+# tests/test_install_framework_password_validation.py) — both call sites
+# capture it the same way — via command substitution — so nothing here is new exposure;
+# an UNCAPTURED call to this function would print the value to whatever
+# stdout is connected to, exactly as an uncaptured call already would have
+# for a human-typed one. The install may say THAT a password was generated
+# and WHERE it ends up (shared-memory/.env, mode 600) — never WHAT it is.
+#
+# A NON-EMPTY answer keeps today's behaviour exactly: strictly more than 8
+# characters is required, 8-or-fewer is refused and re-prompts.
 #
 # On EXHAUSTED input (stdin closed, or a pipe with no more lines left) `read`
 # itself fails — bash's own signal that there is no one left to answer. That
@@ -63,8 +92,8 @@ ask() {  # prompt default  → echoes answer (default if blank)
 # left ran the whole install silently on an empty/default password. Here it
 # is instead a hard, loud, nonzero-exit failure that names the step, rather
 # than a silent fall-through to the empty string.
-ask_secret() {  # prompt → echoes answer (input hidden), or exits 1
-  local v
+ask_secret() {  # prompt → echoes answer (input hidden; empty = generate), or exits 1
+  local v gen_rc
   while :; do
     if ! read -r -s -p "$1: " v; then
       echo >&2
@@ -72,6 +101,17 @@ ask_secret() {  # prompt → echoes answer (input hidden), or exits 1
       return 1
     fi
     echo >&2
+    if [ -z "$v" ]; then
+      gen_rc=0
+      v="$(python3 -c 'import secrets; print(secrets.token_hex(20))')" || gen_rc=$?
+      if [ "$gen_rc" -ne 0 ] || [ -z "$v" ]; then
+        echo "✗ ERROR: python3 failed while generating $1 (rc=$gen_rc) — refusing to continue. If python3 is missing or broken, run shared-memory/scripts/preflight.sh first; it diagnoses this directly and names the fix." >&2
+        return 1
+      fi
+      echo "  (empty answer — generated a strong password internally; not displayed, not logged)" >&2
+      printf '%s' "$v"
+      return 0
+    fi
     if [ "${#v}" -gt 8 ]; then
       printf '%s' "$v"
       return 0
