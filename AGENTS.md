@@ -14,7 +14,7 @@ Everything here runs on the **gateway host** — the one machine that owns the d
 
 ## Ground rules for the operating agent
 
-1. **Secrets never enter the conversation or git.** Generate passwords yourself — **hex only** (`openssl rand -hex 20` or Python `secrets.token_hex(20)`), never base64: base64 output contains `/`, which the compose file's `NEO4J_AUTH=neo4j/<password>` cannot carry — the container restart-loops on "… is invalid" (measured on a fresh install). Generate rather than asking the user to type them into chat. Write them only to the gitignored `shared-memory/.env` (`chmod 600`). Confirm with `git check-ignore shared-memory/.env` before moving on. Never commit `.env`, tokens, or anything under a user's home config.
+1. **Secrets never enter the conversation or git.** ⛔ **Never generate the two database passwords yourself** (fact:1499 class, W7 round 3) — that puts the value in your own shell and your own transcript. `install_framework.sh` (Phase 1 below) generates each one INTERNALLY, in its own process, whenever its password prompt is answered empty — pipe those two prompts empty and let it. Never ask the user to type a password into chat either. The script writes the result only to the gitignored `shared-memory/.env` (`chmod 600`); confirm with `git check-ignore shared-memory/.env` before moving on. Never commit `.env`, tokens, or anything under a user's home config.
    **This is stricter still for a reasoning-LLM backend's own API credential** (`LLM_BACKENDS_JSON`'s `token_env`, Q3/Phase 1 below) — that value is never written to *any* file at all, gitignored or not, including `shared-memory/.env` itself. Ask the user only for the **name** of an env var they'll export from their own encrypted secret store (`pass`, GPG-backed, or equivalent); never ask them to paste the literal key into chat or a file. If a `.env`/`LLM_BACKENDS_JSON` you're editing ever contains something that looks like a real key in a `token`/`api_key`/`secret` field rather than a `token_env` name, stop and fix it — the gateway itself refuses to load that backend (`hive_mind_proxy.py`, `_load_llm_backends`) and logs exactly why, but don't rely on that as the first line of defense.
 2. **Ask before destructive actions.** Token rotation (`bootstrap_tokens.sh --force`) invalidates every existing agent token; `ops/restore.sh` overwrites both databases; removing data dirs loses memory permanently. Get explicit confirmation each time.
 3. **Verify each phase before the next.** Every phase ends with a check command. Do not continue past a failing check — the Quick Start troubleshooting table (README) maps the first failures you'll hit.
@@ -124,16 +124,26 @@ than invoking it carries the identical risk and deserves the same treatment.
 terminal — feeding its answers as newline-delimited **stdin**, in the order it asks them, drives it
 exactly as a human would (`read`/`read -s` consume the next line from a pipe the same as from a tty;
 `-s` just can't visually hide it, which does not matter here since nothing sensitive is echoed back).
-Generate the two passwords yourself first (ground rule 1 — hex only, never base64: a `/` breaks the
-compose file's `NEO4J_AUTH=neo4j/<password>` parsing and the container restart-loops on "… is
-invalid", though the script itself also rejects one and re-prompts, so this is belt-and-suspenders).
-The script also refuses any password of 8 characters or fewer (including empty) and re-prompts —
-`openssl rand -hex 20` is always well over that, so this never bites the flow below — and if stdin
-runs out before a valid password is given (nothing left to feed it, not just a short answer) it fails
-loudly with a nonzero exit instead of writing a blank one.
+⛔ **Do NOT generate the two passwords yourself.** An earlier version of this phase had the agent run
+`openssl rand -hex 20` in its own shell and pipe the result in — the value then existed in the
+agent's own shell and its transcript, the exact fact:1499 class this framework exists to avoid,
+on the one install path that puts an agent in the loop. **Pipe the two password prompts EMPTY
+instead** — `install_framework.sh`'s own `ask_secret()` treats an empty answer as "generate a
+strong password internally" (python3's `secrets.token_hex(20)`, 40 hex characters — hex never
+contains `/`, so it also always clears the Neo4j `NEO4J_AUTH=neo4j/<password>` no-slash
+requirement for free) and returns it via the same stdout-capture contract as a typed one — no
+agent, human or script anywhere ever holds the plaintext value. The script also still refuses any
+NON-EMPTY password of 8 characters or fewer and re-prompts, and if stdin runs out before a valid
+password is given (nothing left to feed it, not just a short answer) it fails loudly with a
+nonzero exit instead of writing a blank one.
 **Skip this phase entirely if `shared-memory/.env` already exists** (resuming a stopped setup) —
 re-running the script would hit its own overwrite prompt instead of the directory prompts, which is
-not what a resume wants.
+not what a resume wants. ⛔ **And the two empty password answers below are FIRST-INSTALL answers.**
+Generating on an empty answer happens only when there was no `shared-memory/.env` to begin with:
+on the overwrite path the script re-prompts instead, because Postgres and Neo4j were already
+initialised with the old password and a freshly generated one would lock the operator out of both
+stores. Piped into an overwrite run, the empty line is not an answer — it re-prompts, consumes the
+next line of the pipe, and shifts every remaining answer by one.
 
 ```bash
 NEO4J_DIR=<from Q1>                      # e.g. $HOME/databases/neo4j
@@ -144,8 +154,6 @@ RER_DEV=<from Q3b, "cpu" or "gpu">       # blank/Enter also means "cpu"
 RENDER_GID=<from Q3b, only if either above is "gpu"> # blank/Enter accepts the
                                           # auto-detected value when the host
                                           # has one (stat -c '%g' /dev/dri/renderD128)
-NEO4J_PW="$(openssl rand -hex 20)"
-PG_PW="$(openssl rand -hex 20)"
 # 8 answers for the dirs/encoder-devices/render-gid/passwords, then "n" to
 # each of the two TRAILING prompts (systemd service install, LLM-backend
 # helper) — Phase 7 and the LLM_BACKENDS / LLM_BACKENDS_JSON edit below
@@ -155,9 +163,14 @@ PG_PW="$(openssl rand -hex 20)"
 # both blank) reproduces today's pair-wise-only behaviour exactly and writes
 # nothing extra to .env; RENDER_GID is asked either way too but only written
 # when a GPU was actually chosen for at least one encoder. printf is a shell
-# builtin, so none of this — including the passwords — ever appears on a
-# process's own argv.
-printf '%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\nn\nn\n' "$NEO4J_DIR" "$PG_DIR" "$MODELS_DIR" "$EMB_DEV" "$RER_DEV" "$RENDER_GID" "$NEO4J_PW" "$PG_PW" \
+# builtin, so none of this ever appears on a process's own argv.
+# ⛔ THE TWO PASSWORD ANSWERS ARE THE TWO EMPTY LINES BELOW, ON PURPOSE
+# (fact:1499 fix, W7 round 3) — install_framework.sh's own ask_secret()
+# generates each password INTERNALLY when its answer is empty, so this
+# agent never generates, holds, or pipes a plaintext password at all. Do
+# NOT replace either blank line with `$(openssl rand -hex 20)` or any other
+# generated value — that reintroduces the exact leak this fix retires.
+printf '%s\n%s\n%s\n%s\n%s\n%s\n\n\nn\nn\n' "$NEO4J_DIR" "$PG_DIR" "$MODELS_DIR" "$EMB_DEV" "$RER_DEV" "$RENDER_GID" \
   | bash shared-memory/scripts/install_framework.sh
 git check-ignore shared-memory/.env          # MUST print the path
 ```
@@ -1059,7 +1072,7 @@ always to update the CHECKOUT; the schema cannot be moved backwards.**
 |---|---|---|
 | 0 | capture pre-upgrade effective config (`migrate_env.py --capture-preimage`) | **upgrade path only**, immediately before the pull — the OLD checkout's own copy, so the pre/post equality below is a construction, not an assumption. Skippable with `--skip-env-migration` (skips this AND step 3) |
 | 1 | `git pull --ff-only` | skipped with `--from-restore`. Refuses a **detached HEAD** and refuses a tarball tree, rather than failing in a way that reads as broken tooling |
-| 2 | `ops/backup.sh` | migration is the one step nothing can undo. Uses the shipped script so it is the same artifact `restore.sh` can read |
+| 2 | `ops/backup.sh` | migration is the one step nothing can undo. Uses the shipped script so it is the same artifact `restore.sh` can read. Skippable with `--skip-backup` — ⛔ **never on a host holding the only copy of the data**; it asserts a current backup already exists by some other means |
 | 3 | migrate `.env` to explicit configuration (`migrate_env.py --apply`) | runs on **both** the upgrade and restore paths; uses step 0's pre-image when it ran, else self-captures with the current loader. See *Migrate `.env` to explicit LLM routing config* below |
 | 4 | `apply.py` | Postgres, ledger-driven, forward-only (exit 3 = database ahead) |
 | 5 | `verify_neo4j_init.py --apply` | **Neo4j has no ledger** — this is the graph's entire forward-migration |
@@ -1068,6 +1081,16 @@ always to update the CHECKOUT; the schema cannot be moved backwards.**
 | 8 | `backfill_domain_of.py --apply` | **after** the restart — see the guard below; **opt-in** via `--domain-backfill` (skipped by default; `--no-domain-backfill` is a one-release no-op) |
 | 9 | `sync_skills.sh` | after the restart, so it cannot print a false incompatibility warning |
 | 10 | `postflight.sh` | an update is not complete until this passes |
+
+⚠ **THE MCP SPAWN LINE CHANGED — step 9 delivers the new connector, it does NOT re-point your host.**
+`sync_skills.sh` copies files into an install directory; it never edits an MCP host's config, so a host
+registered before this release keeps launching the connector with the old `--with fastmcp --with httpx`
+arguments — unpinned, and one upstream release away from a dead server that reports nothing useful. The
+connector now carries its own PEP 723 inline dependency block, so the documented spawn is
+`uv run --no-project <the connector's path>` (an absolute `uv`, the walled copy's path where there is
+one). Edit every MCP host config that names `vector-skill.py`, then restart that host — an MCP server
+reads its command line and its environment once, at spawn. `sync_skills.sh` prints this reminder at the
+end of each MCP install it touches.
 
 ⚠ **Under `--from-restore`, steps 0 and 1 do not run at all** (no placeholder — the whole
 Step-0 block is skipped, exactly as before W3), so every step number above shifts down by 2 on

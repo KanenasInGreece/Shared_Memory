@@ -6,6 +6,15 @@
 # dirs docker-compose mounts. Idempotent-ish: refuses to clobber an existing
 # .env without confirmation. The CLIENT token is configured separately in each
 # agent's skill .env (shared-memory-skill/shared-memory/.env.example).
+#
+# Passwords: on a FIRST install (no shared-memory/.env yet) an empty answer to
+# either password prompt generates a strong value inside this script — it is
+# written to shared-memory/.env at mode 600 and never displayed or logged.
+# When an existing .env is being OVERWRITTEN, an empty answer re-prompts
+# instead: Postgres and Neo4j were already initialised with the old password
+# and a freshly generated one would lock you out of both. A typed password of
+# 8 characters or fewer is refused, and a Neo4j password containing '/' is
+# refused because NEO4J_AUTH=neo4j/<password> cannot carry it.
 set -euo pipefail
 
 # ⛔ RULING 4: every operator-facing script accepts -h/--help (prints its own
@@ -35,7 +44,13 @@ ENV_FILE="$FRAMEWORK_DIR/.env"
 [ -f "$EXAMPLE" ] || { echo "ERROR: missing $EXAMPLE" >&2; exit 1; }
 
 echo "── Shared Memory — framework first-install ──"
+# ⭐ WHICH PATH THIS RUN IS ON decides whether an empty password answer may
+# GENERATE (see ask_secret below). Captured here, once, from the state of the
+# file BEFORE anything is written — never re-derived later, when the .env may
+# already have been replaced.
+SECRET_MODE="first-install"
 if [ -f "$ENV_FILE" ]; then
+  SECRET_MODE="overwrite"
   read -r -p "shared-memory/.env already exists. Overwrite? [y/N] " yn
   [[ "${yn:-}" =~ ^[Yy]$ ]] || { echo "Aborted — existing .env kept."; exit 0; }
 fi
@@ -48,14 +63,46 @@ ask() {  # prompt default  → echoes answer (default if blank)
 # valid one — never a blank/short value silently written to .env (framework
 # fact:1499 CRITICAL 1: pressing Enter used to write NEO4J_PASSWORD= /
 # PG_PASSWORD= as literal empty strings, and the install still reported
-# success). "Valid" means strictly more than 8 characters; 8-or-fewer is
-# refused, including the empty string.
+# success).
 #
-# On a REAL answer being available — an interactive terminal, or a script
-# feeding scripted lines on a pipe — `read` succeeds and returns whatever it
-# got, so an invalid entry (empty or too short) loops back for another try:
-# this is the RE-PROMPT case, and covers both a human pressing Enter and an
-# automated caller feeding a too-short placeholder.
+# ⭐ W7 round 3 (fact:1499 class, on the PUBLISHED agent install path this
+# time): an EMPTY answer no longer re-prompts — it means "generate a strong
+# password INTERNALLY, right here, in this process" (python3's
+# secrets.token_hex(20), 40 hex characters — hex never contains '/', so it
+# also always clears the Neo4j no-slash check below for free). Before this,
+# AGENTS.md's Phase 1 had THE AGENT run `openssl rand -hex 20` in its OWN
+# shell and pipe the result in — the value then existed in the agent's shell
+# and its transcript, the exact fact:1499 class, on a path this framework
+# actively tells agents to drive. Generating it in here instead means no
+# agent shell and no agent transcript ever holds the plaintext, at any point.
+# This ALSO retires two smaller, related hazards for free: fact:1499
+# CRITICAL 1 itself (Enter used to write an empty password) is now
+# impossible by construction (empty means "generate", never "accept
+# blank"), and the desync where an empty piped line used to be REJECTED and
+# consumed the NEXT answer line off the pipe (silently shifting every answer
+# after it by one) cannot happen either, because empty is now a terminal,
+# valid answer rather than a rejected one. (Answers that ARE rejected — too
+# short, a '/' in the Neo4j password, surrounding whitespace — still
+# re-prompt and so still consume the next piped line; that is by design and
+# is why the documented printf supplies genuinely empty lines, not blanks.)
+#
+# The generated value NEVER reaches any process's argv: python3's own argv
+# here is the literal, fixed script text `import secrets; print(...)` —
+# never the secret — and the value leaves python3 only via its STDOUT, which
+# this function's own `$(...)` command substitution captures into a shell
+# variable. It is never echoed, printed to a terminal, or logged — the ONLY
+# place it is ever written out is the single `printf '%s' "$v"` at the
+# bottom of this function, which is the SAME stdout-capture path a
+# human-typed password already used (pinned by
+# tests/test_install_framework_password_validation.py) — both call sites
+# capture it the same way — via command substitution — so nothing here is new exposure;
+# an UNCAPTURED call to this function would print the value to whatever
+# stdout is connected to, exactly as an uncaptured call already would have
+# for a human-typed one. The install may say THAT a password was generated
+# and WHERE it ends up (shared-memory/.env, mode 600) — never WHAT it is.
+#
+# A NON-EMPTY answer keeps today's behaviour exactly: strictly more than 8
+# characters is required, 8-or-fewer is refused and re-prompts.
 #
 # On EXHAUSTED input (stdin closed, or a pipe with no more lines left) `read`
 # itself fails — bash's own signal that there is no one left to answer. That
@@ -63,15 +110,93 @@ ask() {  # prompt default  → echoes answer (default if blank)
 # left ran the whole install silently on an empty/default password. Here it
 # is instead a hard, loud, nonzero-exit failure that names the step, rather
 # than a silent fall-through to the empty string.
-ask_secret() {  # prompt → echoes answer (input hidden), or exits 1
-  local v
+ask_secret() {  # prompt [mode] → echoes answer (input hidden), or exits 1
+  # ⭐ W7/F7 — GENERATION IS FIRST-INSTALL-ONLY, AND THE MODE IS AN EXPLICIT
+  # PARAMETER, NEVER READ OFF THE DISK HERE. The second argument is
+  # "first-install" (an empty answer generates) or "overwrite" (an empty
+  # answer re-prompts, exactly as it did before this cycle). The caller
+  # captures it from the state of shared-memory/.env BEFORE writing anything.
+  #
+  # WHY IT MUST NOT BE DERIVED INSIDE THIS FUNCTION: the installer offers
+  # `Overwrite? [y/N]` on an existing .env, and an empty answer there would be
+  # a *successful* rotation to a value the operator is told is "not displayed,
+  # not logged" — while the already-initialised Postgres and Neo4j volumes
+  # still require the OLD passwords. Both stores would then refuse auth, with
+  # no way back to the value that would have worked. That footgun did not
+  # exist before this build, and it is what the mode parameter closes.
+  #
+  # WHY A PARAMETER AND NOT A READ OF $ENV_FILE: this block ships between the
+  # ASK_SECRET markers and is extracted and run STANDALONE by
+  # tests/test_install_framework_password_validation.py. A read of the live
+  # env path would break under `set -u` in that harness, and would make the
+  # result depend on whether the developer's own checkout happens to have a
+  # .env — turning the suite red on a machine that is merely already
+  # installed. The `${2:-first-install}` default keeps that standalone
+  # contract; both shipped call sites pass the mode explicitly.
+  local v gen_rc mode trimmed
+  mode="${2:-first-install}"
+  case "$mode" in
+    first-install|overwrite) ;;
+    *)
+      echo "✗ ERROR: ask_secret called with an unknown mode '$mode' (expected first-install or overwrite) — refusing to guess whether an empty answer may generate a password." >&2
+      return 1
+      ;;
+  esac
   while :; do
-    if ! read -r -s -p "$1: " v; then
+    if ! IFS= read -r -s -p "$1: " v; then
       echo >&2
       echo "✗ $1: no more input on stdin — refusing to write a blank or unconfirmed password. Re-run this script from an interactive terminal (or a pipe that supplies a valid password) and answer the prompt." >&2
       return 1
     fi
     echo >&2
+    if [ -z "$v" ]; then
+      if [ "$mode" != "first-install" ]; then
+        echo "  ✗ $1: this is an OVERWRITE of an existing shared-memory/.env, so an empty answer cannot generate a new password — the databases were initialised with the old one and would refuse it. Type the password those volumes already use (or delete the volumes and re-run as a first install)." >&2
+        continue
+      fi
+      gen_rc=0
+      # -I (isolated): no sitecustomize, no user site-packages, no PYTHONPATH
+      # — a generator that can be reached by anything on the box is not a
+      # generator. Its output is validated below, AFTER `$(...)` has stripped
+      # the trailing newline; validating before that strip would make a
+      # CORRECT generator fail its own check.
+      v="$(python3 -I -c 'import secrets; print(secrets.token_hex(20))')" || gen_rc=$?
+      if [ "$gen_rc" -ne 0 ] || [ -z "$v" ]; then
+        echo "✗ ERROR: python3 failed while generating $1 (rc=$gen_rc) — refusing to continue. If python3 is missing or broken, run shared-memory/scripts/preflight.sh first; it diagnoses this directly and names the fix." >&2
+        return 1
+      fi
+      # ⭐ W7/F9 — MEASURED: a `python3` earlier on PATH that prints a warning
+      # line before the hex returns rc 0 and hands back
+      # "WARNING_ON_STDOUT\n<hex>", which was ACCEPTED as the password and
+      # then broke the container's NEO4J_AUTH=neo4j/<password> parsing. A
+      # non-zero exit is not the only way a generator fails.
+      if [[ ! "$v" =~ ^[0-9a-f]{40}$ ]]; then
+        echo "✗ ERROR: python3 did not return a clean 40-character hex value while generating $1 — refusing to continue. Something on this host's python3 is writing to stdout before the value (a wrapper, a sitecustomize, a shell profile banner). Run shared-memory/scripts/preflight.sh; it diagnoses this directly and names the fix." >&2
+        return 1
+      fi
+      echo "  (empty answer — generated a strong password internally; not displayed, not logged)" >&2
+      printf '%s' "$v"
+      return 0
+    fi
+    # ⭐ W7 — SURROUNDING WHITESPACE IS REFUSED, NOT SILENTLY STRIPPED. The
+    # `IFS=` above stops `read` from trimming the answer, which is what an
+    # operator whose password genuinely ends in a space needs. But keeping the
+    # padding would hand the rest of the install a value its readers disagree
+    # about: `docker compose --env-file` and secure_env.py STRIP surrounding
+    # whitespace, while read_env() in init_db.sh, preflight.sh, postflight.sh
+    # and reconcile_stack.sh PRESERVE it. A padded password therefore
+    # initialises the stores under one value and is authenticated with another,
+    # and an all-whitespace answer of 9+ characters would pass the length rule
+    # below while rendering POSTGRES_PASSWORD empty and NEO4J_AUTH as `neo4j/`
+    # — with preflight still reporting the password "set" (measured). So this
+    # refuses it here, one keystroke from the fix, exactly as the '/' rule does
+    # for Neo4j. Empty never reaches this point: it is terminal above.
+    trimmed="${v#"${v%%[![:space:]]*}"}"
+    trimmed="${trimmed%"${trimmed##*[![:space:]]}"}"
+    if [ "$trimmed" != "$v" ]; then
+      echo "  ✗ $1 must not begin or end with spaces or tabs — parts of the install strip surrounding whitespace and parts keep it, so a padded password would initialise the databases under one value and be checked against another. Retype it without the padding." >&2
+      continue
+    fi
     if [ "${#v}" -gt 8 ]; then
       printf '%s' "$v"
       return 0
@@ -162,16 +287,28 @@ GPU_RENDER_GID="$(ask 'Render-node group id for the encoder GPU (only matters if
 # a '/'-delimited string — a password containing '/' silently breaks parsing
 # and the container restart-loops on "… is invalid" (measured on a fresh
 # install; base64 output is the classic source). Refuse it here, where it is
-# one keystroke to fix, instead of there. Hex never has this problem:
-#   openssl rand -hex 20
+# one keystroke to fix, instead of there.
+#
+# ⭐ W7/F10 — THE PROMPT TELLS THE TRUTH, AND IT DIFFERS BY PATH. It no longer
+# advertises a command for the operator to run in their own shell (that value
+# would live in their history and, on the agent install path, in a transcript
+# — fact:1499). On a FIRST install an empty answer generates internally; on an
+# OVERWRITE of an existing .env it re-prompts, because the databases were
+# already initialised with the old password. Saying "press Enter" on the
+# overwrite path would be an instruction that does not work.
+if [ "$SECRET_MODE" = "first-install" ]; then
+  _pw_hint="press Enter and a strong one is generated here — never displayed, never logged"
+else
+  _pw_hint="existing .env — type the password the databases were initialised with; Enter re-prompts"
+fi
 while :; do
-  NEO4J_PASSWORD="$(ask_secret 'Neo4j password (no "/" — hex is safest, e.g. openssl rand -hex 20)')"
+  NEO4J_PASSWORD="$(ask_secret "Neo4j password (no \"/\"; $_pw_hint)" "$SECRET_MODE")"
   case "$NEO4J_PASSWORD" in
     */*) echo "  ✗ contains '/' — breaks the container's NEO4J_AUTH parsing; pick another" >&2 ;;
     *)   break ;;
   esac
 done
-PG_PASSWORD="$(ask_secret 'Postgres password')"
+PG_PASSWORD="$(ask_secret "Postgres password ($_pw_hint)" "$SECRET_MODE")"
 # CPU thread budget for the two encoder containers, DERIVED from this host
 # rather than assumed: about half its threads plus one, so reranking cannot
 # starve Postgres, Neo4j, the gateway and the desktop. Portable across the

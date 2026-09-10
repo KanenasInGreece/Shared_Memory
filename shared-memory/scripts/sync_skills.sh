@@ -438,6 +438,11 @@ sync_mcp_install() {
   echo "       system-prompt.md into the model's system prompt."
   echo "     • Point the host's MCP config at $dir/vector-skill.py — an ABSOLUTE"
   echo "       uv path, since an MCP host spawns a non-login shell."
+  echo "     • ⚠ SPAWN LINE CHANGED: if your MCP host still holds the old"
+  echo "       '--with fastmcp --with httpx' args, re-point it at"
+  echo "       'uv run --no-project $dir/vector-skill.py' — the connector now"
+  echo "       declares its own pinned dependencies inline, and sync delivers"
+  echo "       files, it never edits a host config."
   echo "     • Restart BOTH the MCP host (it reads its env once, at spawn) and the"
   echo "       gateway if a token was minted since it started (auth is startup-frozen)."
   return 0

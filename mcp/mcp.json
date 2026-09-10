@@ -15,11 +15,7 @@
       "command": "uv",
       "args": [
         "run",
-        "--with",
-        "fastmcp",
-        "--with",
-        "httpx",
-        "python",
+        "--no-project",
         "/path/to/your/shared_mem/mcp/vector-skill.py"
       ],
       "env": {

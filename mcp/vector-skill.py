@@ -1,3 +1,21 @@
+# /// script
+# requires-python = ">=3.10"
+# dependencies = ["fastmcp==4.0.3", "httpx==0.28.1"]
+# ///
+#
+# PEP 723 inline metadata — the connector declares its OWN dependencies, so the
+# documented spawn line is `uv run --no-project <this file>` and nothing else.
+# The versions above are the ones `requirements-mcp.lock` pins (checked by
+# tests/test_mcp_spawn_lines_pinned.py); that lock stays in-tree as the hashed
+# audit artefact and the source these two pins are verified against.
+#
+# WHY NOT `--with-requirements requirements-mcp.lock`: that flag resolves the
+# lock RELATIVE TO THE SPAWNING PROCESS'S WORKING DIRECTORY, and an MCP host
+# spawns its stdio servers from a directory nobody documents — measured
+# `error: File not found`, exit 2. It is also a local dependency-hijack
+# surface: whoever can drop a `requirements-mcp.lock` into that directory
+# chooses what `uv` installs and executes. Inline metadata travels with the
+# script, so it cannot be aimed somewhere else.
 """
 Vector Skill — MCP server exposing the shared memory to an MCP host (LM Studio).
 
@@ -333,7 +351,7 @@ AGENT_ID = os.environ.get("AGENT_ID", "vector_skill")
 # submission is accepted in three forms: a proposal, new_project=true, or the
 # reserved sentinel general_discussion.
 API_VERSION = 4
-VERSION = "0.9.94"
+VERSION = "0.9.95"
 CLIENT_VERSION_HEADER = "X-SM-Api-Version"
 # This client's own FRAMEWORK VERSION, distinct from the wire API_VERSION: two
 # clients can speak api_version 4 while one of them is forty releases behind on

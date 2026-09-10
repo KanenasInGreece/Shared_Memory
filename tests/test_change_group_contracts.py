@@ -531,9 +531,20 @@ def test_agents_md_pipes_the_right_number_of_answers_into_install_framework():
         "regex, or Phase 1 has reverted to hand-mirroring the script again "
         "(the exact class the D11 fix this test guards exists to prevent)."
     )
-    piped = [t for t in m.group(1).split(r"\n") if t != ""]
-    piped_confirm_count = sum(1 for t in piped if t != "%s")
-    script_confirm_count = sum(1 for t in script_sequence if t == "confirm")
+    # W7 round 3 (fact:1499 fix): the two PASSWORD prompts are now piped
+    # EMPTY lines on purpose (install_framework.sh's ask_secret() generates
+    # each one internally when its answer is empty) -- an empty piped
+    # answer is now a legitimate, meaningful token, not noise. The raw
+    # format string always ends in a literal `\n`, which produces exactly
+    # one trailing empty split segment that is NOT a real answer line and
+    # must be dropped; every OTHER empty segment is a real (blank) answer
+    # and must be KEPT. Filtering every empty string unconditionally (the
+    # pre-round-3 code) silently swallowed those two slots and desynced
+    # every answer after them -- exactly the failure mode this test's own
+    # docstring warns about.
+    piped = m.group(1).split(r"\n")
+    if piped and piped[-1] == "":
+        piped = piped[:-1]
 
     assert len(piped) == len(script_sequence), (
         f"install_framework.sh's fresh-.env path now issues {len(script_sequence)} "
@@ -543,11 +554,43 @@ def test_agents_md_pipes_the_right_number_of_answers_into_install_framework():
         "its explanatory prose) to match, in the same order, or an answer will "
         "silently land in the wrong field."
     )
+
+    # Positional check, not just counts: a "value" prompt piped blank would
+    # silently accept that prompt's own default (wrong for a directory path);
+    # a "confirm" prompt must get a literal y/n; a "secret" prompt may get
+    # EITHER '%s' (a substituted variable) or an empty line (generate
+    # internally) -- both are valid answers to a password prompt now.
+    for i, (kind, tok) in enumerate(zip(script_sequence, piped)):
+        if kind == "confirm":
+            assert tok in ("y", "n"), (
+                f"prompt #{i + 1} in install_framework.sh is a y/n confirm, but "
+                f"AGENTS.md's Phase 1 printf line pipes {tok!r} into that slot "
+                "— expected a literal 'y' or 'n'."
+            )
+        elif kind == "value":
+            assert tok == "%s", (
+                f"prompt #{i + 1} in install_framework.sh is a plain value "
+                f"prompt (ask()), but AGENTS.md's Phase 1 printf line pipes "
+                f"{tok!r} into that slot — expected '%s' (a substituted "
+                "variable); an empty answer here would silently accept that "
+                "prompt's own default instead."
+            )
+        elif kind == "secret":
+            assert tok in ("%s", ""), (
+                f"prompt #{i + 1} in install_framework.sh is a password prompt "
+                f"(ask_secret()), but AGENTS.md's Phase 1 printf line pipes "
+                f"{tok!r} into that slot — expected '%s' or an empty line "
+                "(empty = ask_secret() generates the password internally, "
+                "W7 round 3, fact:1499)."
+            )
+
+    piped_confirm_count = sum(1 for t in piped if t not in ("%s", ""))
+    script_confirm_count = sum(1 for t in script_sequence if t == "confirm")
     assert piped_confirm_count == script_confirm_count, (
         f"install_framework.sh's fresh-.env path now asks {script_confirm_count} "
         f"y/n-style questions, but AGENTS.md's Phase 1 printf line pipes "
-        f"{piped_confirm_count} literal y/n answers ('y'/'n', not '%s') — update "
-        "AGENTS.md's Phase 1 piped-answer line to match."
+        f"{piped_confirm_count} literal y/n answers ('y'/'n', not '%s' or "
+        "empty) — update AGENTS.md's Phase 1 piped-answer line to match."
     )
 
 

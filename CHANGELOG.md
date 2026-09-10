@@ -5,6 +5,96 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.9.95] — 2026-09-10
+
+### Four repairs found while fixing the round itself
+
+**The environment-coverage gate could be satisfied by a sentence of English.** It decided whether a
+variable was templated by searching the whole of `shared-memory/.env.example` for `^#?\s*NAME=` — and
+that file is three things at once: a configuration template, operator documentation, and a reference
+full of worked examples. Measured: deleting the genuine `# AGENT_TOKENS=` placeholder left the suite
+GREEN, because a *sentence* elsewhere in the file reads `# AGENT_TOKENS= line appended below it the
+first time bootstrap_tokens.sh runs`. Rejecting whitespace after the `=` was not enough either, because
+a worked example of the value format is lexically identical to a placeholder. The rule is now structural
+— the name starts at column zero after at most one space of comment marker, and no whitespace follows
+the `=` — and the five placeholders that were written in an indented style are now at column zero like
+every other. Measured again after the change: no other name in either template changes status, and the
+deletion that used to pass now fails.
+
+**`SECURITY.md` named a Starlette version that is not the one that ships.** It said the resolved MCP
+environment uses Starlette 1.1.0; `requirements-mcp.lock` pins `starlette==1.6.0` and 1.6.0 is what a
+real resolution produces. Both are above the documented floor, so this was a stale claim rather than an
+exposure — but a security document naming the wrong version is worth exactly as much as a README that
+describes a prompt the installer does not have.
+
+**A typed password no longer loses its leading and trailing spaces — and padding is now refused rather
+than silently absorbed.** `read -r -s -p` without `IFS=` strips whitespace from both ends, so an operator
+whose password genuinely carries it wrote a different value than the one they typed. Adding `IFS=` alone
+would have opened something worse, and a review caught it before release: the readers of the resulting
+`.env` disagree about padding — `docker compose --env-file` and `secure_env.py` strip it while `read_env()`
+in `init_db.sh`, `preflight.sh`, `postflight.sh` and `reconcile_stack.sh` keep it — so a padded password
+would initialise the stores under one value and be authenticated with another; and an all-whitespace answer
+of nine characters or more cleared the length rule while rendering `POSTGRES_PASSWORD` empty and
+`NEO4J_AUTH` as `neo4j/`, with preflight still reporting the password set. Measured. The prompt therefore
+refuses surrounding whitespace outright, one keystroke from the fix, exactly as it already refuses a `/` in
+the Neo4j password. Interior spaces are untouched: a passphrase is a fine password.
+
+**The sync helper now tells an existing operator that the spawn line changed.** `sync_skills.sh`
+delivers files; it has never edited a host configuration, and it never will. Without that sentence this
+release would have fixed only new installs, while everyone who had already registered the old
+`--with fastmcp --with httpx` arguments kept running them, unpinned, with nothing to say so.
+
+### The MCP connector declares its own dependencies, and every documented spawn line changed
+
+**`mcp/vector-skill.py` now carries a PEP 723 inline metadata block naming `fastmcp` and `httpx` by exact
+version, and the documented spawn line everywhere is `uv run --no-project <the connector's path>`.** The
+form this replaces named `requirements-mcp.lock` through `--with-requirements`, which resolves relative to
+the *spawning process's* working directory — and no documented deployment spawns from the repository root,
+so the pinned line measured `error: File not found`, exit 2, on the walled install the docs recommend. It
+was also a local dependency-hijack surface: whoever could write a file of that name into the host's spawn
+directory chose what `uv` installed and executed. Inline metadata travels with the script, so it cannot be
+aimed elsewhere. `requirements-mcp.txt` and `requirements-mcp.lock` stay in the tree as the hashed audit
+artefact and as the source the two inline pins are checked against — a test asserts the versions agree, so
+they cannot drift apart silently.
+
+⚠ **AN EXISTING MCP HOST KEEPS RUNNING THE OLD LINE UNTIL YOU RE-POINT IT.** `sync_skills.sh` delivers
+files; it has never edited a host's configuration and does not start now. Every `mcp.json`,
+`opencode.jsonc`, `.vscode/mcp.json` or `~/.copilot/mcp-config.json` entry that spawns `vector-skill.py`
+with `--with fastmcp --with httpx` (or with `--with-requirements requirements-mcp.lock`) must be edited by
+hand to `uv run --no-project <path to vector-skill.py>`, and the host restarted — an MCP server reads its
+command line once, at spawn. Until then that host runs the connector against whatever `fastmcp` and
+`httpx` resolve to today, unpinned. The sync run now prints this reminder for each MCP install it touches.
+
+### Test coverage
+
+- The `.env.example` coverage gate now sees the reads it was blind to: env-helper call sites
+  (including membership-test helpers such as `secure_env.get_secret`), module-level string constants used
+  as keys, and string function defaults that are then read. Nine further framework knobs are templated with
+  the code's real defaults as a result.
+- The MCP spawn-site test discovers blocks by shape (`uv` together with `vector-skill.py`) rather than by
+  filename, so a new documented example cannot appear in a file the test never looks at.
+- `migrate_retro_edges.py`'s endpoint derivation from `GATEWAY_URL`, and the deprecated `EMBED_URL`
+  override with its stderr warning, are pinned by tests for the first time.
+
+### Installer
+
+- An empty answer to a database-password prompt generates a strong value **only on a first install**. On
+  the overwrite path — an existing `shared-memory/.env` the operator chose to replace — it re-prompts
+  instead, because the already-initialised Postgres and Neo4j volumes still require the old passwords and
+  a silently generated new one locks the operator out of both stores.
+- The generator runs `python3 -I` and its output is validated as exactly 40 hex characters. A `python3`
+  earlier on `PATH` that prints anything before the hex now aborts the install loudly instead of being
+  accepted as the password.
+
+### Documentation
+
+- `shared-memory/Documentation/server-setup.md`: the upgrade row, the prompt list, and the two token
+  sections now describe what the shipped scripts actually do — `bootstrap_tokens.sh` rather than
+  `generate_tokens.py`, `--reveal` named as an operator-only step, and the upgrade pointing at
+  `update_framework.sh` rather than a bare pull-and-restart.
+
+---
+
 ## [0.9.94] — 2026-09-07
 
 ### Framework HTTP clients no longer read proxy or CA settings from the environment

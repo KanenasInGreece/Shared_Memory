@@ -431,10 +431,13 @@ A fresh gateway host goes from clone to running with five helper scripts in
    > default schema uses BGE-M3 at 1024 dimensions; the dimension does not matter — consistency
    > does.
 
-5. **Install the skill into your agent.** The skill is a thin client — only `memory_bridge.py`
-   ships with it. Copy `SKILL.md` + `memory_bridge.py` into the agent's skills directory
-   ([§19](#19-tokens-and-agents); remote clients → [§20](#20-remote-clients)). Shortcut: tell
-   your agent — *"clone this repo and install the shared-memory skill per README §19."*
+5. **Install the skill into your agent.** The skill is a thin client — copy every file
+   `shared-memory-skill/shared-memory/MANIFEST.txt` lists (the authority on what ships;
+   currently `MANIFEST.txt`, `SKILL.md`, `CONSTITUTION_SNIPPET.md`, `.env.example`,
+   `scripts/memory_bridge.py`, `scripts/update_skill.sh`, `Documentation/schema.md`) into the
+   agent's skills directory ([§19](#19-tokens-and-agents); remote clients →
+   [§20](#20-remote-clients)). Shortcut: tell your agent — *"clone this repo and install the
+   shared-memory skill per README §19."*
 
 6. **Generate agent tokens.** `bash shared-memory/scripts/bootstrap_tokens.sh` mints one token
    per agent, appends `AGENT_TOKENS` (digest form) to the gateway `.env`, and writes each LOCAL
@@ -445,18 +448,31 @@ A fresh gateway host goes from clone to running with five helper scripts in
    stored forever** ([§19](#19-tokens-and-agents)). One distinct token per
    agent — never shared.
 
+   **Two things the mint can report instead of success, and their recoveries** (`AGENTS.md`
+   Phase 6/8 has the full detail): **`REFUSED`** — the named agent's skill directory does not
+   exist yet on this machine (nothing to fix here; Phase 8 mints it right after installing
+   that agent's package, or create the directory yourself and re-run with
+   `--add <name> --install-path <dir>`). **`UNDELIVERABLE`** — a remote agent was minted with
+   no local skill install found and `--reveal` was not passed on that same invocation; recover
+   with `generate_tokens.py --remint <name> --reveal <name>` **on one invocation, run by you in
+   your own terminal, never through an agent** (`--reveal` prints a live token).
+
 7. **Start the reasoning LLM** on `:5000` — LM Studio or any OpenAI-compatible server — and
    declare it in `LLM_BACKENDS_JSON` (step 1's installer offers `ops/install_llm_backends.sh` for
    exactly this); an undeclared backend serves nothing
    ([§17](#17-inference-the-encoders-and-the-reasoning-llm)).
 
 8. **Start the gateway.**
-   `uv run --with aiohttp --with asyncpg --with neo4j --with httpx --with json-repair python shared-memory/scripts/hive_mind_proxy.py 8888`
+   `uv run --no-project --with-requirements requirements-gateway.lock python shared-memory/scripts/hive_mind_proxy.py 8888`
    — this also launches the REM and NREM daemons ([§18](#18-the-gateway)). Verify:
    `curl http://localhost:8888/health` should report `"status":"ok"` before you save anything — once
    tokens exist (step 6) the anonymous reply carries only `status`, `version` and `api_version`; the
-   fuller report needs a token, which step 9's postflight uses. For a gateway that survives logout and reboot,
-   install the `systemd --user` unit in [`shared-memory/ops/`](shared-memory/ops/).
+   fuller report needs a token, which step 9's postflight uses. For a gateway that survives logout and
+   reboot, install it as a service instead:
+   `bash shared-memory/ops/install_service.sh` — substitutes this host's own resolved `uv` path into
+   the shipped `systemd --user` unit in [`shared-memory/ops/`](shared-memory/ops/); the unit's own
+   `ExecStart=/usr/bin/uv` is a PLACEHOLDER (a `203/EXEC` crash-loop, measured, if started as shipped)
+   and only this script fixes it.
 
 9. **Verify the install.** Back on the gateway host:
    export `AGENT_TOKEN` by reading it out of a write-capable agent's skill `.env` from step 6 (the
@@ -494,7 +510,7 @@ Neo4j plugins, and the reranker dial, which is tuning after the install is prove
 | **`preflight.sh` fails on "docker not found"** (Fedora, RHEL) | The distribution ships podman; the helper scripts call the docker CLI. | Install Docker Engine + Compose v2 from Docker's own instructions (§14); preflight names the packages. The `podman-docker` shim is a path we expect to work but have not run end to end. |
 | **The skill "works for me" but not for the agent** — it answers from memory or saves nothing, with no error | `uv` was installed the upstream way, so it lives in `$HOME/.local/bin` and is only on the PATH when your shell profile loads; an agent spawning a profile-free shell cannot see it. This is the normal outcome of a correct install, not a misconfiguration. | Symlink `uv` onto the system PATH (`sudo ln -s "$(command -v uv)" /usr/local/bin/uv`) or set PATH in that agent's own configuration. Preflight warns about exactly this. |
 | **Neo4j crash-loops: "/import is not accessible"** | The container steps down to uid 7474 and cannot write — or, on a modern Fedora, cannot even traverse a `0700` home directory to reach — its mounted dirs. | `install_framework.sh` chowns `import` and `plugins` (the image fixes `data` and `logs` itself) and preflight verifies them; by hand: `sudo chown -R 7474:7474 $NEO4J_HOST_DIR/{data,logs,import,plugins}` (§14). |
-| **Neo4j crash-loops: "neo4j/… is invalid"** | The password contains `/` (base64 output does), which `NEO4J_AUTH=neo4j/<password>` cannot carry. | Generate hex (`openssl rand -hex 20`), update `.env`, recreate the container. The installer's prompts refuse a Neo4j password containing `/` and refuse an empty (or 8-character-or-shorter) entry. |
+| **Neo4j crash-loops: "neo4j/… is invalid"** | The password contains `/` (base64 output does), which `NEO4J_AUTH=neo4j/<password>` cannot carry. | Generate hex (`openssl rand -hex 20`), update `.env`, recreate the container. The installer's prompts refuse a Neo4j password containing `/`, and refuse any typed password of 8 characters or fewer. An **empty** answer depends on which path you are on: on a **first install** it generates a strong hex password inside the script — never displayed, never logged, written straight to `shared-memory/.env` at mode 600 — while on an **overwrite** of an existing `.env` it re-prompts instead, because Postgres and Neo4j were already initialised with the old password and a new one would lock you out of both. |
 | **Neo4j: "Invalid memory configuration — exceeds physical memory"** | Host RAM is below the shipped heap + pagecache (~8 GB is the no-override floor). | Set the small-host preset (`NEO4J_HEAP_INITIAL/MAX`, `NEO4J_PAGECACHE`) from `.env.example`; preflight's RAM check tells you which tier you are on. |
 | **Neo4j does not come up on first boot, no network** | `NEO4J_PLUGINS` fetches APOC and Graph Data Science at container start — first boot needs internet, and a crash-loop refetches on every retry. | Give the host a route out for the first start, or pre-place the plugin jars in `plugins/`. |
 | **401 Unauthorized** | `AGENT_TOKEN` missing from the agent's skill `.env`, or minted after the gateway last started — the registry is read at startup. A **re-minted** token is a third case: rotating an identity replaces its registered digest, so a client still holding the previous token now fails auth on **every** request, reads included, until it re-reads the file. | `doctor` names which side is at fault. Restart the gateway after minting (`bootstrap_tokens.sh` says so). A client reads its token once at startup, so after a re-mint make it re-read: respawn the memory **MCP server** — a full host restart, or disabling then re-enabling just that server where the host supports per-server reload (§19, §21) — or restart a long-running CLI agent; a one-shot CLI invocation already picks it up on its next run. |
@@ -842,8 +858,13 @@ constraints. Upgrading an existing installation is one command — it takes a ba
 migrates both stores, restarts the gateway and proves the result:
 
 ```bash
+export AGENT_TOKEN=$(sed -n 's/^AGENT_TOKEN=//p' ~/.claude/skills/shared-memory/.env)  # or any write-capable agent's skill .env
 bash shared-memory/scripts/update_framework.sh          # --dry-run prints every step, runs nothing
 ```
+
+*(Without `AGENT_TOKEN` exported, postflight's A1/A5/A8 assertions SKIP and postflight exits 1 at
+the end of an otherwise-successful update — documented behaviour, not a bug, but the one-liner
+alone does not warn a reader it is about to happen.)*
 
 `apply.py` is the Postgres half of that, and it is worth knowing on its own, because the database
 is its own ledger: `schema_migrations` is a table *inside* the database, so it travels with a
@@ -1105,8 +1126,7 @@ locking, the outbox that keeps the two stores atomic) and supervises both dreami
 watchdogs.
 
 ```bash
-uv run --with aiohttp --with asyncpg --with neo4j --with httpx --with json-repair \
-  python shared-memory/scripts/hive_mind_proxy.py 8888
+uv run --no-project --with-requirements requirements-gateway.lock python shared-memory/scripts/hive_mind_proxy.py 8888
 curl -H "Authorization: Bearer $AGENT_TOKEN" http://localhost:8888/health
 # {"status":"ok","embedder":"ok","reranker":"ok","llm":"ok","daemon":"running","rem_daemon":"running","auth_required":true}
 # without a token, an auth-configured gateway answers only {"status","version","api_version"}
@@ -1223,8 +1243,7 @@ anyone's hands. The shape, in opencode's `opencode.jsonc`:
 "mcp": {
   "shared-memory": {
     "type": "local",
-    "command": ["uv", "run", "--with", "fastmcp", "--with", "httpx",
-                "--with", "python-dotenv", "python", "/path/to/mcp/vector-skill.py"],
+    "command": ["uv", "run", "--no-project", "/path/to/mcp/vector-skill.py"],
     "environment": {
       "COORDINATOR_URL": "http://localhost:8888",
       "VECTOR_SKILL_ENV": "/path/to/private/dir/.env"
@@ -1247,8 +1266,7 @@ completely after any token change (MCP servers read their environment once, at s
 ```json
 "rag-orchestrator": {
   "command": "uv",
-  "args": ["run", "--with", "fastmcp", "--with", "httpx", "--with", "python-dotenv",
-           "python", "/path/to/shared_mem/mcp/vector-skill.py"],
+  "args": ["run", "--no-project", "/path/to/shared_mem/mcp/vector-skill.py"],
   "env": { "COORDINATOR_URL": "http://localhost:8888", "AGENT_TOKEN": "YOUR_LM_STUDIO_TOKEN" }
 }
 ```

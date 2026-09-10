@@ -8,6 +8,15 @@
 #   bash shared-memory/scripts/update_framework.sh --dry-run    # print, run nothing
 #   bash shared-memory/scripts/update_framework.sh --domain-backfill  # also run step 8 (opt-in)
 #   bash shared-memory/scripts/update_framework.sh --skip-env-migration  # see below
+#   bash shared-memory/scripts/update_framework.sh --skip-backup  # see below
+#
+# ⛔ --skip-backup skips Step 2 (backup BEFORE migrating) and asserts you
+# already have a current one. NEVER pass it on a host holding the ONLY copy
+# of the data — it exists for the case where a backup was just taken by
+# another means (or --from-restore's own dump IS the safeguard set) and
+# re-running ops/backup.sh would only cost time. A failed backup with this
+# flag NOT set already refuses the migrate; this flag is for skipping the
+# attempt entirely, not for recovering from one that failed.
 #
 # ⛔ --no-domain-backfill is a ONE-RELEASE no-op, kept only so an existing
 # invocation does not break: the domain backfill is opt-in now (fact:1734 C(d))
