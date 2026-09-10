@@ -6,6 +6,15 @@
 # dirs docker-compose mounts. Idempotent-ish: refuses to clobber an existing
 # .env without confirmation. The CLIENT token is configured separately in each
 # agent's skill .env (shared-memory-skill/shared-memory/.env.example).
+#
+# Passwords: on a FIRST install (no shared-memory/.env yet) an empty answer to
+# either password prompt generates a strong value inside this script — it is
+# written to shared-memory/.env at mode 600 and never displayed or logged.
+# When an existing .env is being OVERWRITTEN, an empty answer re-prompts
+# instead: Postgres and Neo4j were already initialised with the old password
+# and a freshly generated one would lock you out of both. A typed password of
+# 8 characters or fewer is refused, and a Neo4j password containing '/' is
+# refused because NEO4J_AUTH=neo4j/<password> cannot carry it.
 set -euo pipefail
 
 # ⛔ RULING 4: every operator-facing script accepts -h/--help (prints its own
@@ -35,7 +44,13 @@ ENV_FILE="$FRAMEWORK_DIR/.env"
 [ -f "$EXAMPLE" ] || { echo "ERROR: missing $EXAMPLE" >&2; exit 1; }
 
 echo "── Shared Memory — framework first-install ──"
+# ⭐ WHICH PATH THIS RUN IS ON decides whether an empty password answer may
+# GENERATE (see ask_secret below). Captured here, once, from the state of the
+# file BEFORE anything is written — never re-derived later, when the .env may
+# already have been replaced.
+SECRET_MODE="first-install"
 if [ -f "$ENV_FILE" ]; then
+  SECRET_MODE="overwrite"
   read -r -p "shared-memory/.env already exists. Overwrite? [y/N] " yn
   [[ "${yn:-}" =~ ^[Yy]$ ]] || { echo "Aborted — existing .env kept."; exit 0; }
 fi
@@ -92,8 +107,38 @@ ask() {  # prompt default  → echoes answer (default if blank)
 # left ran the whole install silently on an empty/default password. Here it
 # is instead a hard, loud, nonzero-exit failure that names the step, rather
 # than a silent fall-through to the empty string.
-ask_secret() {  # prompt → echoes answer (input hidden; empty = generate), or exits 1
-  local v gen_rc
+ask_secret() {  # prompt [mode] → echoes answer (input hidden), or exits 1
+  # ⭐ W7/F7 — GENERATION IS FIRST-INSTALL-ONLY, AND THE MODE IS AN EXPLICIT
+  # PARAMETER, NEVER READ OFF THE DISK HERE. The second argument is
+  # "first-install" (an empty answer generates) or "overwrite" (an empty
+  # answer re-prompts, exactly as it did before this cycle). The caller
+  # captures it from the state of shared-memory/.env BEFORE writing anything.
+  #
+  # WHY IT MUST NOT BE DERIVED INSIDE THIS FUNCTION: the installer offers
+  # `Overwrite? [y/N]` on an existing .env, and an empty answer there would be
+  # a *successful* rotation to a value the operator is told is "not displayed,
+  # not logged" — while the already-initialised Postgres and Neo4j volumes
+  # still require the OLD passwords. Both stores would then refuse auth, with
+  # no way back to the value that would have worked. That footgun did not
+  # exist before this build, and it is what the mode parameter closes.
+  #
+  # WHY A PARAMETER AND NOT A READ OF $ENV_FILE: this block ships between the
+  # ASK_SECRET markers and is extracted and run STANDALONE by
+  # tests/test_install_framework_password_validation.py. A read of the live
+  # env path would break under `set -u` in that harness, and would make the
+  # result depend on whether the developer's own checkout happens to have a
+  # .env — turning the suite red on a machine that is merely already
+  # installed. The `${2:-first-install}` default keeps that standalone
+  # contract; both shipped call sites pass the mode explicitly.
+  local v gen_rc mode
+  mode="${2:-first-install}"
+  case "$mode" in
+    first-install|overwrite) ;;
+    *)
+      echo "✗ ERROR: ask_secret called with an unknown mode '$mode' (expected first-install or overwrite) — refusing to guess whether an empty answer may generate a password." >&2
+      return 1
+      ;;
+  esac
   while :; do
     if ! read -r -s -p "$1: " v; then
       echo >&2
@@ -102,10 +147,28 @@ ask_secret() {  # prompt → echoes answer (input hidden; empty = generate), or 
     fi
     echo >&2
     if [ -z "$v" ]; then
+      if [ "$mode" != "first-install" ]; then
+        echo "  ✗ $1: this is an OVERWRITE of an existing shared-memory/.env, so an empty answer cannot generate a new password — the databases were initialised with the old one and would refuse it. Type the password those volumes already use (or delete the volumes and re-run as a first install)." >&2
+        continue
+      fi
       gen_rc=0
-      v="$(python3 -c 'import secrets; print(secrets.token_hex(20))')" || gen_rc=$?
+      # -I (isolated): no sitecustomize, no user site-packages, no PYTHONPATH
+      # — a generator that can be reached by anything on the box is not a
+      # generator. Its output is validated below, AFTER `$(...)` has stripped
+      # the trailing newline; validating before that strip would make a
+      # CORRECT generator fail its own check.
+      v="$(python3 -I -c 'import secrets; print(secrets.token_hex(20))')" || gen_rc=$?
       if [ "$gen_rc" -ne 0 ] || [ -z "$v" ]; then
         echo "✗ ERROR: python3 failed while generating $1 (rc=$gen_rc) — refusing to continue. If python3 is missing or broken, run shared-memory/scripts/preflight.sh first; it diagnoses this directly and names the fix." >&2
+        return 1
+      fi
+      # ⭐ W7/F9 — MEASURED: a `python3` earlier on PATH that prints a warning
+      # line before the hex returns rc 0 and hands back
+      # "WARNING_ON_STDOUT\n<hex>", which was ACCEPTED as the password and
+      # then broke the container's NEO4J_AUTH=neo4j/<password> parsing. A
+      # non-zero exit is not the only way a generator fails.
+      if [[ ! "$v" =~ ^[0-9a-f]{40}$ ]]; then
+        echo "✗ ERROR: python3 did not return a clean 40-character hex value while generating $1 — refusing to continue. Something on this host's python3 is writing to stdout before the value (a wrapper, a sitecustomize, a shell profile banner). Run shared-memory/scripts/preflight.sh; it diagnoses this directly and names the fix." >&2
         return 1
       fi
       echo "  (empty answer — generated a strong password internally; not displayed, not logged)" >&2
@@ -202,16 +265,28 @@ GPU_RENDER_GID="$(ask 'Render-node group id for the encoder GPU (only matters if
 # a '/'-delimited string — a password containing '/' silently breaks parsing
 # and the container restart-loops on "… is invalid" (measured on a fresh
 # install; base64 output is the classic source). Refuse it here, where it is
-# one keystroke to fix, instead of there. Hex never has this problem:
-#   openssl rand -hex 20
+# one keystroke to fix, instead of there.
+#
+# ⭐ W7/F10 — THE PROMPT TELLS THE TRUTH, AND IT DIFFERS BY PATH. It no longer
+# advertises a command for the operator to run in their own shell (that value
+# would live in their history and, on the agent install path, in a transcript
+# — fact:1499). On a FIRST install an empty answer generates internally; on an
+# OVERWRITE of an existing .env it re-prompts, because the databases were
+# already initialised with the old password. Saying "press Enter" on the
+# overwrite path would be an instruction that does not work.
+if [ "$SECRET_MODE" = "first-install" ]; then
+  _pw_hint="press Enter and a strong one is generated here — never displayed, never logged"
+else
+  _pw_hint="existing .env — type the password the databases were initialised with; Enter re-prompts"
+fi
 while :; do
-  NEO4J_PASSWORD="$(ask_secret 'Neo4j password (no "/" — hex is safest, e.g. openssl rand -hex 20)')"
+  NEO4J_PASSWORD="$(ask_secret "Neo4j password (no \"/\"; $_pw_hint)" "$SECRET_MODE")"
   case "$NEO4J_PASSWORD" in
     */*) echo "  ✗ contains '/' — breaks the container's NEO4J_AUTH parsing; pick another" >&2 ;;
     *)   break ;;
   esac
 done
-PG_PASSWORD="$(ask_secret 'Postgres password')"
+PG_PASSWORD="$(ask_secret "Postgres password ($_pw_hint)" "$SECRET_MODE")"
 # CPU thread budget for the two encoder containers, DERIVED from this host
 # rather than assumed: about half its threads plus one, so reranking cannot
 # starve Postgres, Neo4j, the gateway and the desktop. Portable across the

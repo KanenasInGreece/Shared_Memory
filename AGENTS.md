@@ -138,7 +138,12 @@ password is given (nothing left to feed it, not just a short answer) it fails lo
 nonzero exit instead of writing a blank one.
 **Skip this phase entirely if `shared-memory/.env` already exists** (resuming a stopped setup) —
 re-running the script would hit its own overwrite prompt instead of the directory prompts, which is
-not what a resume wants.
+not what a resume wants. ⛔ **And the two empty password answers below are FIRST-INSTALL answers.**
+Generating on an empty answer happens only when there was no `shared-memory/.env` to begin with:
+on the overwrite path the script re-prompts instead, because Postgres and Neo4j were already
+initialised with the old password and a freshly generated one would lock the operator out of both
+stores. Piped into an overwrite run, the empty line is not an answer — it re-prompts, consumes the
+next line of the pipe, and shifts every remaining answer by one.
 
 ```bash
 NEO4J_DIR=<from Q1>                      # e.g. $HOME/databases/neo4j
