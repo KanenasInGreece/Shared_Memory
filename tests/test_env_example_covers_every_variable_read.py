@@ -1,6 +1,12 @@
-"""Every `os.environ` read in the framework's own scripts must be either
+"""Every environment variable the framework's own scripts read must be either
 TEMPLATED (a `KEY=` / `# KEY=` line in the right `.env.example`) or explicitly
 ALLOWLISTED by name with a falsifiable reason.
+
+⭐ WHAT THIS TEST CLAIMS, EXACTLY. Every `os.environ` read, env-HELPER call,
+module-level key constant and string function default **in the Python glob
+below** is templated or excused. Shell scripts, the compose file and the
+systemd units read names of their own; those are outside this mechanism and
+this test says nothing about them.
 
 WHY AST, NEVER A LINE REGEX. `memory_bridge.py` reads `PROJECT_ROOT_MARKERS`
 inside a multi-line `os.environ.get(` call (`:296-297`) — the exact variable
@@ -9,11 +15,60 @@ the v0.9.71 audit and the v1 re-audit both missed. A same-line regex matches
 green while missing precisely the variable this test exists to catch. AST
 parsing sees the call regardless of how the source wraps it.
 
+⭐ WHY DIRECT `os.environ` READS ARE NOT ENOUGH — the W7/F2 defect. Until this
+repair the extractor enumerated only `os.environ.get("LITERAL")`,
+`os.getenv("LITERAL")` and `os.environ["LITERAL"]`. That is not how this tree
+mostly reads configuration. **Measured twice, independently:** deleting
+`# POOL_MIN=2` from `shared-memory/.env.example` left the suite 4/4 GREEN,
+while deleting `# PG_HOST=localhost` correctly turned it red — a gate
+certifying an incomplete fix. Three further forms are therefore discovered:
+
+  1. **ENV-HELPER CALLS.** A helper is a function whose body reads one of its
+     own PARAMETERS through `os.environ.get(p)`, `os.getenv(p)`,
+     `os.environ[p]` **or `p in os.environ`**. That last form is not optional:
+     `secure_env.get_secret` (`secure_env.py:999-1000`) is a membership test
+     plus a subscript, and it is how this tree reads SECRETS — without it the
+     repair would miss the single most important helper in the repository.
+     Call sites are matched in BOTH bare (`get_secret("X")`) and attribute
+     (`secure_env.get_secret("X")`) form, and the string-literal argument in
+     the parameter's own position is collected.
+  2. **MODULE-LEVEL STRING CONSTANTS USED AS THE KEY** —
+     `os.environ.get(_ENV_ROSTER_VAR)` with
+     `_ENV_ROSTER_VAR = "SHARED_MEMORY_READ_ONLY_AGENTS"` (`agent_roles.py`).
+  3. **STRING FUNCTION DEFAULTS THAT ARE THEN READ** —
+     `def read_daemon_token_from_fd(env_var: str = "AGENT_TOKEN_FD")`, whose
+     every call site passes nothing, so the name exists only as a default.
+
+⛔ DISCOVERY IS ONE LEVEL DEEP, AND THAT LIMIT IS DELIBERATE AND STATED. A
+helper that reads a parameter is found; a helper that merely FORWARDS its
+parameter to another helper is not. No pair in the tree does that today, but
+the rule does not survive an obvious refactor (`def _cfg(name): return
+_env_int(name, 0)` would hide every one of its call sites again), and an
+undocumented limit is exactly how this class of defect recurs. If such a
+forwarding helper is ever added, extend `_discover_env_helpers` to iterate to
+a fixed point — do not allowlist the names it hides.
+
+⚠ THE CONSTANT MAP IS REPO-WIDE, NOT PER-FILE, so a constant defined in one
+module and imported into another still resolves. Two modules defining the SAME
+constant name with different values would make this over-collect — which fails
+LOUD (a template line is demanded for a name that is read somewhere), never
+silently, and no such collision exists today.
+
 WHY A FAIL-CLOSED GLOB, NEVER A HARD-CODED FILE LIST. A literal list of
 filenames proves nothing about the file nobody remembered to add — that is
 what happened to `apply.py` before this cycle (D5). `shared-memory/scripts/*.py`
 + `shared-memory/migrations/*.py`, every `.py` file in scope; `_EXCLUDE`
 below is the one place a file leaves that scope, and it must name a reason.
+
+⛔ WHY `mcp/vector-skill.py` IS NOT IN THE GLOB. `_collect()` splits CLIENT
+from FRAMEWORK on `basename == "memory_bridge.py"`. Globbing the MCP connector
+in would therefore dump its thirteen MCP-CLIENT variable names into the
+FRAMEWORK template's expected set and turn this gate red on names that must
+never appear in `shared-memory/.env.example`. The connector's own environment
+is documented in prose (`mcp/system-prompt.md`, `mcp/README.md`); it is parsed
+here for ONE narrow purpose only — `_OUT_OF_GLOB_READERS`, which keeps the
+allowlist's staleness check honest about a name like `VECTOR_SKILL_ENV` that
+is genuinely read, just not inside the glob.
 
 WHY BOTH `memory_bridge.py` COPIES. `shared-memory/scripts/memory_bridge.py`
 is the source of truth; `shared-memory-skill/shared-memory/scripts/memory_bridge.py`
@@ -34,20 +89,12 @@ glob is FRAMEWORK code — checked against the FRAMEWORK template
 "pass" because some unrelated framework knob happens to share a template file,
 or vice versa.
 
-⚠ MECHANICAL RESULT VS. THE W7 BRIEF (`Local_Documentation/ColdBriefs/
-W7_RULED_BRIEF_2026-09-10.md`, D4/D5): the brief names 4 client variables (2
-templated + 2 allowlisted) and 9 framework variables as the coverage gap.
-Running this exact mechanism against the WHOLE glob (not just memory_bridge.py
-and the eight D5 scripts) finds substantially more framework names absent from
-the template than D5 enumerated — e.g. `CREDENTIALS_DIRECTORY`, `HOME`, `PATH`,
-`MOCK_LLM`, `PG_CONN`, `REM_TEMPERATURE`/`NREM_TEMPERATURE`,
-`SMEM_ONTOLOGY_PATH`, `WRITE_QUIESCE_SEC`, and others — see
-`W7_SETS.md` and the build report for the full list and classification.
-RULING: per the brief's own instruction ("if it does not balance, stop and
-report — do not allowlist the remainder"), none of those extra names is
-allowlisted here without an operator decision on each. **This test is
-therefore RED after this PR's fix, on names outside the brief's stated
-scope** — that is a finding for the operator, not a defect in the test.
+⛔ THE BALANCE IS NOT NEGOTIABLE. Every name the mechanism finds and the
+templates do not carry is TEMPLATED, with the code's real default read out of
+the code. Allowlisting a knob to make this gate look complete is the one thing
+both adversarial reviews of the W7 proposal independently said must not be
+traded away: an allowlist entry means "templating this would be WRONG", never
+"templating this was work".
 """
 import ast
 import glob
@@ -76,6 +123,14 @@ _CLIENT_COPY = os.path.join(
     REPO_ROOT, "shared-memory-skill", "shared-memory", "scripts", "memory_bridge.py"
 )
 
+# Files that are OUT of the coverage glob (their variables belong to no
+# template this test owns) but ARE real readers — parsed only so the
+# allowlist's staleness check can tell "no longer read anywhere" from "read
+# somewhere this gate does not cover". See the docstring.
+_OUT_OF_GLOB_READERS = [
+    os.path.join(REPO_ROOT, "mcp", "vector-skill.py"),
+]
+
 # (name, reason) — reason states why templating would be WRONG, not merely
 # unnecessary (brief PART 3, T1).
 _ALLOWLIST: list[tuple[str, str]] = [
@@ -85,6 +140,25 @@ _ALLOWLIST: list[tuple[str, str]] = [
         "it SELECTS which file loads, so a value written into the file it would "
         "select is inert (D4). Set it in the shell or an MCP env block, never "
         "in the file it selects.",
+    ),
+    (
+        "VECTOR_SKILL_ENV",
+        "the MCP connector's twin of SECURE_ENV_FILE, and inert for the same "
+        "reason: mcp/vector-skill.py:215 reads it to CHOOSE which .env to load, "
+        "before loading one, so a line inside that file could never be seen. It "
+        "belongs in the MCP host's own env block (mcp/README.md documents it "
+        "there). Listed here rather than in a template because the connector is "
+        "deliberately outside this test's glob — see the module docstring.",
+    ),
+    (
+        "AGENT_TOKEN_FD",
+        "an internal parent-to-child handoff, not configuration: "
+        "hive_mind_proxy.py:2950 sets it on the environment of each daemon it "
+        "spawns, naming the read end of a pipe it just created "
+        "(secure_env.read_daemon_token_from_fd reads it back). A file-descriptor "
+        "number is meaningless outside that one process tree, so an "
+        "operator-written value could only ever point at the wrong fd — or at "
+        "someone else's.",
     ),
     (
         "AGENT_ID",
@@ -149,14 +223,14 @@ _ALLOWLIST_NAMES = {name for name, _ in _ALLOWLIST}
 # PG_PASSWORD into a DSN) — this public-mirror repo ships placeholder values
 # only, so the default-value assertion cannot apply to it. Presence is still
 # required and enforced; see test_this_prs_templated_keys_carry_the_codes_real_default's
-# docstring and W7_SETS.md for why this one key is presence-checked only.
+# docstring for why this one key is presence-checked only.
 _PRESENCE_ONLY_KEYS = {"PG_CONN"}
 
 
 def _iter_input_files():
     seen = set()
     for pattern in _GLOB_PATTERNS:
-        for path in glob.glob(pattern):
+        for path in sorted(glob.glob(pattern)):
             base = os.path.basename(path)
             if base in _EXCLUDE:
                 continue
@@ -179,34 +253,145 @@ def _is_os_environ_attr(node):
     )
 
 
-def _extract_names(path):
-    """AST-walk one file for os.environ.get(...), os.getenv(...), os.environ[...]
-    string-literal names. Never a line regex — see module docstring."""
-    with open(path, encoding="utf-8") as f:
-        src = f.read()
-    tree = ast.parse(src, filename=path)
-    names = set()
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
-            func = node.func
-            if func.attr == "get" and _is_os_environ_attr(func.value):
-                if node.args and isinstance(node.args[0], ast.Constant) and isinstance(
-                    node.args[0].value, str
-                ):
-                    names.add(node.args[0].value)
-            elif (
-                func.attr == "getenv"
-                and isinstance(func.value, ast.Name)
-                and func.value.id == "os"
+def _environ_key_expression(node):
+    """If `node` reads `os.environ` in any supported form, return the AST node
+    standing for the KEY; otherwise None.
+
+    Four forms, and the fourth is the one the pre-W7 extractor lacked:
+      os.environ.get(<key>)   os.getenv(<key>)
+      os.environ[<key>]       <key> in os.environ
+    """
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+        func = node.func
+        if func.attr == "get" and _is_os_environ_attr(func.value) and node.args:
+            return node.args[0]
+        if (
+            func.attr == "getenv"
+            and isinstance(func.value, ast.Name)
+            and func.value.id == "os"
+            and node.args
+        ):
+            return node.args[0]
+    if isinstance(node, ast.Subscript) and _is_os_environ_attr(node.value):
+        return node.slice
+    if (
+        isinstance(node, ast.Compare)
+        and len(node.ops) == 1
+        and isinstance(node.ops[0], ast.In)
+        and _is_os_environ_attr(node.comparators[0])
+    ):
+        return node.left
+    return None
+
+
+def _positional_params(func_node):
+    """(names, default-nodes) aligned by index, positional parameters only."""
+    args = func_node.args
+    names = [a.arg for a in list(args.posonlyargs) + list(args.args)]
+    defaults = [None] * (len(names) - len(args.defaults)) + list(args.defaults)
+    return names, defaults
+
+
+def _parse_all(paths):
+    trees = {}
+    for path in paths:
+        with open(path, encoding="utf-8") as f:
+            trees[path] = ast.parse(f.read(), filename=path)
+    return trees
+
+
+def _module_string_constants(trees):
+    """Repo-wide {NAME: "value"} for module-level string assignments."""
+    consts = {}
+    for tree in trees.values():
+        for node in tree.body:
+            if (
+                isinstance(node, ast.Assign)
+                and len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name)
+                and isinstance(node.value, ast.Constant)
+                and isinstance(node.value.value, str)
             ):
-                if node.args and isinstance(node.args[0], ast.Constant) and isinstance(
-                    node.args[0].value, str
-                ):
-                    names.add(node.args[0].value)
-        if isinstance(node, ast.Subscript) and _is_os_environ_attr(node.value):
-            sl = node.slice
-            if isinstance(sl, ast.Constant) and isinstance(sl.value, str):
-                names.add(sl.value)
+                consts[node.targets[0].id] = node.value.value
+    return consts
+
+
+def _discover_env_helpers(trees):
+    """{function name: (parameter index, parameter name, string default or None)}
+
+    ONE LEVEL DEEP by design — see the module docstring.
+    """
+    helpers = {}
+    for tree in trees.values():
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            names, defaults = _positional_params(node)
+            if not names:
+                continue
+            for child in ast.walk(node):
+                key = _environ_key_expression(child)
+                if isinstance(key, ast.Name) and key.id in names:
+                    index = names.index(key.id)
+                    default = defaults[index]
+                    literal = (
+                        default.value
+                        if isinstance(default, ast.Constant)
+                        and isinstance(default.value, str)
+                        and default.value
+                        else None
+                    )
+                    helpers[node.name] = (index, names[index], literal)
+                    break
+    return helpers
+
+
+def _called_function_name(call):
+    if isinstance(call.func, ast.Name):
+        return call.func.id
+    if isinstance(call.func, ast.Attribute):
+        return call.func.attr
+    return None
+
+
+def _extract_names(tree, helpers, consts):
+    """Every environment-variable NAME one parsed module reads — directly, via
+    an env-helper call site, via a module constant, or via a helper's own
+    string default."""
+    names = set()
+
+    def _resolve(node):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            return node.value
+        if isinstance(node, ast.Name) and node.id in consts:
+            return consts[node.id]
+        return None
+
+    for node in ast.walk(tree):
+        key = _environ_key_expression(node)
+        if key is not None:
+            resolved = _resolve(key)
+            if resolved:
+                names.add(resolved)
+        if isinstance(node, ast.Call):
+            fname = _called_function_name(node)
+            if fname in helpers:
+                index, param, default = helpers[fname]
+                arg = None
+                if len(node.args) > index:
+                    arg = node.args[index]
+                else:
+                    for kw in node.keywords:
+                        if kw.arg == param:
+                            arg = kw.value
+                            break
+                if arg is None:
+                    if default:
+                        names.add(default)
+                else:
+                    resolved = _resolve(arg)
+                    if resolved:
+                        names.add(resolved)
     return names
 
 
@@ -229,10 +414,15 @@ def _default_line_present(name, default, template_path):
 def _collect():
     """Returns (client_names, framework_names) -- the mechanical CATCH-SET,
     split by which template each file's variables are checked against."""
+    paths = list(_iter_input_files())
+    trees = _parse_all(paths)
+    consts = _module_string_constants(trees)
+    helpers = _discover_env_helpers(trees)
+
     client_names = set()
     framework_names = set()
-    for path in _iter_input_files():
-        names = _extract_names(path)
+    for path, tree in trees.items():
+        names = _extract_names(tree, helpers, consts)
         if os.path.basename(path) == "memory_bridge.py":
             client_names |= names
         else:
@@ -240,15 +430,54 @@ def _collect():
     return client_names, framework_names
 
 
+def _names_read_outside_the_glob():
+    """Names read by a real reader this gate deliberately does not template.
+    Used ONLY by the staleness check — never by the coverage assertion."""
+    existing = [p for p in _OUT_OF_GLOB_READERS if os.path.isfile(p)]
+    if not existing:
+        return set()
+    trees = _parse_all(existing)
+    consts = _module_string_constants(trees)
+    helpers = _discover_env_helpers(trees)
+    names = set()
+    for tree in trees.values():
+        names |= _extract_names(tree, helpers, consts)
+    return names
+
+
+def test_the_env_helper_discovery_actually_finds_the_helpers_this_tree_uses():
+    """The repair itself, asserted rather than assumed.
+
+    `get_secret` is the one that matters: it is a MEMBERSHIP TEST plus a
+    subscript (`if name in os.environ: return os.environ[name]`), the form the
+    pre-W7 extractor could not see, and it is how this tree reads secrets. If
+    this assertion ever fails, every `get_secret("...")` name has silently
+    dropped out of the catch-set again.
+    """
+    trees = _parse_all(list(_iter_input_files()))
+    helpers = _discover_env_helpers(trees)
+    for name in ("get_secret", "_env_int", "_env_float", "read_daemon_token_from_fd"):
+        assert name in helpers, (
+            f"{name} is an env helper in this tree but discovery did not find "
+            f"it — found {sorted(helpers)}"
+        )
+    assert helpers["read_daemon_token_from_fd"][2] == "AGENT_TOKEN_FD", (
+        "read_daemon_token_from_fd's env name exists only as a string default "
+        "(no call site passes one); discovery must carry that default"
+    )
+
+
 def test_the_allowlist_has_no_stale_entry():
-    """A name no longer read anywhere in the glob must be removed from the
-    allowlist — otherwise the list only ever grows and nobody can tell which
-    entries still matter (brief PART 3, T1)."""
+    """A name no longer read anywhere must be removed from the allowlist —
+    otherwise the list only ever grows and nobody can tell which entries still
+    matter (brief PART 3, T1). `_OUT_OF_GLOB_READERS` is consulted here and
+    ONLY here, so an entry excusing a name read by the MCP connector is not
+    reported as stale."""
     client_names, framework_names = _collect()
-    all_names = client_names | framework_names
+    all_names = client_names | framework_names | _names_read_outside_the_glob()
     stale = [name for name in _ALLOWLIST_NAMES if name not in all_names]
     assert not stale, (
-        f"allowlist entries no longer read anywhere in the glob: {stale} — "
+        f"allowlist entries no longer read anywhere: {stale} — "
         "remove them from _ALLOWLIST"
     )
 
@@ -315,8 +544,7 @@ def test_this_prs_templated_keys_carry_the_codes_real_default():
     # reasoning as SHARED_MEMORY_PROJECT above.
 
     # Round 2 (2026-09-10): the 15 further framework variables, each asserted
-    # by the CODE's real default, not a guess (round-2 ruling). See
-    # W7_SETS.md for the file:line each was read from.
+    # by the CODE's real default, not a guess (round-2 ruling).
     round_2_defaults = {
         "DOMAIN_CONFUSABLE_SIMILARITY": "0.6",
         "ENTITY_CONFUSABLE_SIMILARITY": "0.6",
@@ -344,6 +572,34 @@ def test_this_prs_templated_keys_carry_the_codes_real_default():
             f"{name}'s commented default line in the framework template does "
             f"not match the code default {default!r}"
         )
+
+    # Round 4 (W7/F2): the nine the repaired extractor uncovered -- every one
+    # of them reached only through an env-HELPER call or a module constant,
+    # which is why no earlier round saw them. Same rule: the CODE's default
+    # (coordinator.py:1053/1122/1123/1397/1402/2504/2511/2519), read out of the
+    # code, never retyped from a brief.
+    round_4_defaults = {
+        "ENTITY_NAME_MAX_LEN": "200",
+        "ENTITY_LIST_MAX_LEN": "50",
+        "ENTITY_PROPOSAL_LIMIT": "5",
+        "GRAPH_EXPANSION_LIMIT": "15",
+        "SEARCH_CANDIDATE_FLOOR": "20",
+        "SEARCH_DOMAINS_FILTER_CAP": "16",
+        # _env_float, so the default is 45.0 -- the literal the code carries,
+        # not the integer it would round to.
+        "BACKUP_DAEMON_DRAIN_TIMEOUT": "45.0",
+        "BACKUP_RETRY_AFTER": "30",
+    }
+    for name, default in round_4_defaults.items():
+        assert _default_line_present(name, default, _FRAMEWORK_TEMPLATE), (
+            f"{name}'s commented default line in the framework template does "
+            f"not match the code default {default!r}"
+        )
+    # SHARED_MEMORY_READ_ONLY_AGENTS' own code default is "" (agent_roles.py:64
+    # -- the built-in roster alone), so there is no literal to pin: presence +
+    # staying commented only, same as SHARED_MEMORY_PROJECT above.
+    assert _template_covers("SHARED_MEMORY_READ_ONLY_AGENTS", _FRAMEWORK_TEMPLATE)
+
     # SMEM_ONTOLOGY_PATH's own code default is COMPUTED, not a literal (unset
     # = try shared-memory/ontology.yaml, then a repo-root fallback) -- no
     # single string to pin, so it is checked for presence + staying commented
@@ -414,6 +670,15 @@ def test_templated_keys_stay_commented_not_live():
         "SMEM_ONTOLOGY_PATH",
         "EMBED_URL",
         "POOL_STATUS_URL",
+        "ENTITY_NAME_MAX_LEN",
+        "ENTITY_LIST_MAX_LEN",
+        "ENTITY_PROPOSAL_LIMIT",
+        "GRAPH_EXPANSION_LIMIT",
+        "SEARCH_CANDIDATE_FLOOR",
+        "SEARCH_DOMAINS_FILTER_CAP",
+        "BACKUP_DAEMON_DRAIN_TIMEOUT",
+        "BACKUP_RETRY_AFTER",
+        "SHARED_MEMORY_READ_ONLY_AGENTS",
     ):
         assert not re.search(
             r"^" + re.escape(name) + r"=", framework_text, re.MULTILINE
