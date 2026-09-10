@@ -395,3 +395,59 @@ def test_a_correct_generator_is_not_broken_by_the_validation(tmp_path):
     proc = _run("\n", mode="first-install", env=env)
     assert proc.returncode == 0, f"stderr={proc.stderr!r}"
     assert proc.stdout == "0123456789abcdef0123456789abcdef01234567"
+
+
+# ── Surrounding whitespace is REFUSED, not silently stripped (W7 fix round) ──
+#
+# `read` without `IFS=` strips leading and trailing whitespace, so an operator whose
+# password genuinely carries it wrote a DIFFERENT value than they typed. Adding
+# `IFS=` fixes that and, on its own, opens a worse hole: the readers of the
+# resulting .env disagree about padding -- `docker compose --env-file` and
+# secure_env.py strip it, while read_env() in init_db.sh, preflight.sh,
+# postflight.sh and reconcile_stack.sh keep it -- and an all-whitespace answer
+# of 9+ characters clears the length rule while rendering POSTGRES_PASSWORD
+# empty and NEO4J_AUTH as `neo4j/`, with preflight still reporting the password
+# "set" (measured 2026-09-10). The answer is to refuse padding at the prompt,
+# one keystroke from the fix, exactly as the '/' rule does for Neo4j. These
+# tests pin BOTH halves: nothing is stripped, and nothing padded is accepted.
+
+
+def test_an_all_whitespace_answer_is_refused_not_accepted_as_a_password():
+    """The measured regression this guard exists for: 9 spaces clears the
+    more-than-8-characters rule, so without the guard it becomes the password
+    -- and compose then renders an EMPTY POSTGRES_PASSWORD while preflight
+    reports it set."""
+    proc = _run("         \ngoodpassword123\n")
+    assert proc.returncode == 0
+    assert proc.stdout == "goodpassword123", (
+        f"an all-whitespace answer was not refused; got {proc.stdout!r}"
+    )
+    assert "must not begin or end with spaces" in proc.stderr
+
+
+def test_a_padded_answer_is_refused_rather_than_silently_trimmed():
+    """Refused, NOT trimmed. Trimming would be the pre-IFS behaviour under a
+    new name: the operator would still end up with a value they did not type."""
+    proc = _run(" abcdefghij \nfallbackpass99\n")
+    assert proc.returncode == 0
+    assert proc.stdout == "fallbackpass99", (
+        f"a padded answer was accepted or silently trimmed; got {proc.stdout!r}"
+    )
+    assert "abcdefghij" not in proc.stdout
+
+
+def test_interior_spaces_are_still_a_perfectly_good_password():
+    """The rule is about the EDGES. A passphrase with spaces inside it must
+    survive untouched -- this is the case `IFS=` was added to protect."""
+    proc = _run("correct horse battery staple\n")
+    assert proc.returncode == 0
+    assert proc.stdout == "correct horse battery staple"
+
+
+def test_an_empty_answer_still_generates_and_is_not_caught_by_the_whitespace_rule():
+    """Empty is terminal ABOVE the whitespace check, so the guard must not
+    change the generate path -- the one this cycle's credential fix rests on."""
+    proc = _run("\n")
+    assert proc.returncode == 0
+    assert re.fullmatch(r"[0-9a-f]{40}", proc.stdout)
+    assert "must not begin or end with spaces" not in proc.stderr

@@ -81,7 +81,10 @@ ask() {  # prompt default  → echoes answer (default if blank)
 # blank"), and the desync where an empty piped line used to be REJECTED and
 # consumed the NEXT answer line off the pipe (silently shifting every answer
 # after it by one) cannot happen either, because empty is now a terminal,
-# valid answer rather than a rejected one.
+# valid answer rather than a rejected one. (Answers that ARE rejected — too
+# short, a '/' in the Neo4j password, surrounding whitespace — still
+# re-prompt and so still consume the next piped line; that is by design and
+# is why the documented printf supplies genuinely empty lines, not blanks.)
 #
 # The generated value NEVER reaches any process's argv: python3's own argv
 # here is the literal, fixed script text `import secrets; print(...)` —
@@ -130,7 +133,7 @@ ask_secret() {  # prompt [mode] → echoes answer (input hidden), or exits 1
   # .env — turning the suite red on a machine that is merely already
   # installed. The `${2:-first-install}` default keeps that standalone
   # contract; both shipped call sites pass the mode explicitly.
-  local v gen_rc mode
+  local v gen_rc mode trimmed
   mode="${2:-first-install}"
   case "$mode" in
     first-install|overwrite) ;;
@@ -174,6 +177,25 @@ ask_secret() {  # prompt [mode] → echoes answer (input hidden), or exits 1
       echo "  (empty answer — generated a strong password internally; not displayed, not logged)" >&2
       printf '%s' "$v"
       return 0
+    fi
+    # ⭐ W7 — SURROUNDING WHITESPACE IS REFUSED, NOT SILENTLY STRIPPED. The
+    # `IFS=` above stops `read` from trimming the answer, which is what an
+    # operator whose password genuinely ends in a space needs. But keeping the
+    # padding would hand the rest of the install a value its readers disagree
+    # about: `docker compose --env-file` and secure_env.py STRIP surrounding
+    # whitespace, while read_env() in init_db.sh, preflight.sh, postflight.sh
+    # and reconcile_stack.sh PRESERVE it. A padded password therefore
+    # initialises the stores under one value and is authenticated with another,
+    # and an all-whitespace answer of 9+ characters would pass the length rule
+    # below while rendering POSTGRES_PASSWORD empty and NEO4J_AUTH as `neo4j/`
+    # — with preflight still reporting the password "set" (measured). So this
+    # refuses it here, one keystroke from the fix, exactly as the '/' rule does
+    # for Neo4j. Empty never reaches this point: it is terminal above.
+    trimmed="${v#"${v%%[![:space:]]*}"}"
+    trimmed="${trimmed%"${trimmed##*[![:space:]]}"}"
+    if [ "$trimmed" != "$v" ]; then
+      echo "  ✗ $1 must not begin or end with spaces or tabs — parts of the install strip surrounding whitespace and parts keep it, so a padded password would initialise the databases under one value and be checked against another. Retype it without the padding." >&2
+      continue
     fi
     if [ "${#v}" -gt 8 ]; then
       printf '%s' "$v"

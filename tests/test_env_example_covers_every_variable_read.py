@@ -408,6 +408,23 @@ def _template_covers(name, template_path):
     # at most one space of comment marker, and no whitespace follows the "=".
     # The first excludes indented examples, the second excludes prose. Trailing
     # inline comments survive -- only what immediately follows "=" is constrained.
+    #
+    # ⛔ WHAT THIS DOES NOT DO, stated because the first write-up of it
+    # overclaimed: it NARROWS the surface, it does not close the class. A
+    # sentence of prose that begins at column zero and happens to have no space
+    # after its "=" still satisfies this (verified: replacing the real
+    # `# AGENT_TOKENS=` line with such a sentence leaves the suite GREEN). The
+    # two instances that exist in the file today die because of how they happen
+    # to be written, not because the rule can tell a template line from an
+    # example of one. A regex over a file that is simultaneously a template,
+    # operator documentation and a worked-example reference cannot express
+    # "this is a template line"; closing it properly needs a machine-readable
+    # section or marker in .env.example, which is a post-v1 change.
+    #
+    # ⚠ LOAD-BEARING: the column-zero form of the five placeholders that were
+    # once indented (PG_PASSWORD_FILE and the four SHIM_* keys) is required by
+    # this rule. Re-indent any of them and this test goes RED with a message
+    # saying the name is "absent" while the line is plainly there.
     return bool(
         re.search(
             r"^(?:# ?)?" + re.escape(name) + r"=(?![ \t])", text, re.MULTILINE

@@ -27,9 +27,17 @@ real resolution produces. Both are above the documented floor, so this was a sta
 exposure — but a security document naming the wrong version is worth exactly as much as a README that
 describes a prompt the installer does not have.
 
-**A typed password no longer loses its leading and trailing spaces.** `read -r -s -p` without `IFS=`
-strips them, so an operator whose password genuinely carries them would have written a stripped value
-to `.env` and then failed to authenticate against both stores, with nothing to point at the cause.
+**A typed password no longer loses its leading and trailing spaces — and padding is now refused rather
+than silently absorbed.** `read -r -s -p` without `IFS=` strips whitespace from both ends, so an operator
+whose password genuinely carries it wrote a different value than the one they typed. Adding `IFS=` alone
+would have opened something worse, and a review caught it before release: the readers of the resulting
+`.env` disagree about padding — `docker compose --env-file` and `secure_env.py` strip it while `read_env()`
+in `init_db.sh`, `preflight.sh`, `postflight.sh` and `reconcile_stack.sh` keep it — so a padded password
+would initialise the stores under one value and be authenticated with another; and an all-whitespace answer
+of nine characters or more cleared the length rule while rendering `POSTGRES_PASSWORD` empty and
+`NEO4J_AUTH` as `neo4j/`, with preflight still reporting the password set. Measured. The prompt therefore
+refuses surrounding whitespace outright, one keystroke from the fix, exactly as it already refuses a `/` in
+the Neo4j password. Interior spaces are untouched: a passphrase is a fine password.
 
 **The sync helper now tells an existing operator that the spawn line changed.** `sync_skills.sh`
 delivers files; it has never edited a host configuration, and it never will. Without that sentence this
