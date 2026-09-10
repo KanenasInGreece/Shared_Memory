@@ -62,23 +62,49 @@ def test_skip_backup_actually_prints_via_the_help_flag():
     )
 
 
-def test_skip_backup_appears_in_agents_md_update_table():
+def _update_path_table_rows():
+    """The rows of AGENTS.md's numbered update-step table.
+
+    W7/F10-rest: the original assertion accepted `--skip-backup` ANYWHERE in
+    AGENTS.md, so a mention buried in unrelated prose — or left behind in a
+    section a reader following the update path never opens — would have kept
+    it green. D2 is specifically about the table a reader consults BEFORE
+    running the upgrade, so that is where it is now required. The table is
+    found by SHAPE (a numbered pipe-row naming ops/backup.sh), not by line
+    number, so ordinary edits above it cannot silently move the target.
+    """
     with open(AGENTS_MD, encoding="utf-8") as f:
-        text = f.read()
-    assert "--skip-backup" in text, (
-        "AGENTS.md does not mention --skip-backup anywhere (D2: the update "
-        "table at ~:1058-1070 omits it)"
+        lines = f.read().split("\n")
+    anchor = None
+    for i, line in enumerate(lines):
+        if line.startswith("|") and "ops/backup.sh" in line and "`" in line:
+            anchor = i
+            break
+    assert anchor is not None, (
+        "AGENTS.md no longer has an update-step table row for ops/backup.sh — "
+        "the update-path table this test is about has moved or been rewritten"
     )
-    # The safety condition must accompany the flag, not just the bare name --
-    # find the line(s) mentioning the flag and check the condition is nearby.
-    lines = text.split("\n")
-    flag_lines = [i for i, line in enumerate(lines) if "--skip-backup" in line]
-    assert flag_lines, "unreachable"
-    window = set()
-    for i in flag_lines:
-        window.update(range(max(0, i - 2), min(len(lines), i + 3)))
-    nearby_text = "\n".join(lines[i] for i in sorted(window))
-    assert "only copy" in nearby_text, (
-        "AGENTS.md mentions --skip-backup but not its safety condition "
-        "(never on a host holding the only copy of the data) near that mention"
+    start = anchor
+    while start > 0 and lines[start - 1].startswith("|"):
+        start -= 1
+    end = anchor
+    while end + 1 < len(lines) and lines[end + 1].startswith("|"):
+        end += 1
+    return lines[start : end + 1]
+
+
+def test_skip_backup_appears_in_agents_md_update_table():
+    rows = _update_path_table_rows()
+    table_text = "\n".join(rows)
+    assert "--skip-backup" in table_text, (
+        "AGENTS.md's update-step table does not mention --skip-backup (D2). A "
+        "mention elsewhere in the file does not count: this is the table a "
+        "reader consults before running the upgrade."
+    )
+    # The safety condition must accompany the flag, not just the bare name.
+    flag_rows = [row for row in rows if "--skip-backup" in row]
+    assert any("only copy" in row for row in flag_rows), (
+        "AGENTS.md's update table names --skip-backup but not its safety "
+        "condition (never on a host holding the only copy of the data) in the "
+        f"same row: {flag_rows!r}"
     )
