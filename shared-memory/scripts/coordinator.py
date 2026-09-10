@@ -3819,13 +3819,14 @@ class MemoryCoordinator:
         if not rows:
             return
         log.debug("outbox: draining %d row(s)", len(rows))
-        for row in rows:
-            # asyncpg returns JSONB as a string in some configurations;
-            # parse defensively rather than relying on codec registration.
-            params = row["cypher_params"]
-            if isinstance(params, str):
-                params = json.loads(params)
-            await self._apply_outbox_row(row["id"], row["pg_id"], params, row["retries"])
+        async with self._acquire() as conn:
+            for row in rows:
+                # asyncpg returns JSONB as a string in some configurations;
+                # parse defensively rather than relying on codec registration.
+                params = row["cypher_params"]
+                if isinstance(params, str):
+                    params = json.loads(params)
+                await self._apply_outbox_row(row["id"], row["pg_id"], params, row["retries"], conn=conn)
 
     @staticmethod
     def _gate_graph_entities(pg_id: int, raw: object) -> list[str]:
@@ -3848,7 +3849,7 @@ class MemoryCoordinator:
         return clean
 
     async def _apply_outbox_row(
-        self, outbox_id: int, pg_id: int, params: dict, retries: int
+        self, outbox_id: int, pg_id: int, params: dict, retries: int, conn=None
     ) -> None:
         # F6/F7: the outbox apply is the OTHER Neo4j caller, and B2 asked for
         # both. Timing only the graph route would have made `neo4j.query_p95_ms`
@@ -3978,7 +3979,13 @@ class MemoryCoordinator:
                         f" MERGE (new)-[:{ONT.supersedes}]->(old)",
                         old_id=supersedes, new_id=pg_id,
                     )
-            async with self._acquire() as conn:
+            if conn is None:
+                async with self._acquire() as c:
+                    await c.execute(
+                        "UPDATE neo4j_outbox SET status='applied', applied_at=now() WHERE id=$1",
+                        outbox_id,
+                    )
+            else:
                 await conn.execute(
                     "UPDATE neo4j_outbox SET status='applied', applied_at=now() WHERE id=$1",
                     outbox_id,

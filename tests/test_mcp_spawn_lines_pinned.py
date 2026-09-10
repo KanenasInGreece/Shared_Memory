@@ -65,7 +65,7 @@ _SKIP_DIRS = {
     "__pycache__",
     ".pytest_cache",
     "Local_Documentation",  # gitignored: this repo's transient working notes
-    "research",  # gitignored: local research scratch
+    "research", ".claude", ".gemini", ".codex", ".grok", "scratch",
 }
 
 # The documented sites this test expects to find. It is a FLOOR, not a
