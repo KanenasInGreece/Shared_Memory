@@ -1223,8 +1223,7 @@ anyone's hands. The shape, in opencode's `opencode.jsonc`:
 "mcp": {
   "shared-memory": {
     "type": "local",
-    "command": ["uv", "run", "--with", "fastmcp", "--with", "httpx",
-                "--with", "python-dotenv", "python", "/path/to/mcp/vector-skill.py"],
+    "command": ["uv", "run", "--no-project", "/path/to/mcp/vector-skill.py"],
     "environment": {
       "COORDINATOR_URL": "http://localhost:8888",
       "VECTOR_SKILL_ENV": "/path/to/private/dir/.env"
@@ -1247,8 +1246,7 @@ completely after any token change (MCP servers read their environment once, at s
 ```json
 "rag-orchestrator": {
   "command": "uv",
-  "args": ["run", "--with", "fastmcp", "--with", "httpx", "--with", "python-dotenv",
-           "python", "/path/to/shared_mem/mcp/vector-skill.py"],
+  "args": ["run", "--no-project", "/path/to/shared_mem/mcp/vector-skill.py"],
   "env": { "COORDINATOR_URL": "http://localhost:8888", "AGENT_TOKEN": "YOUR_LM_STUDIO_TOKEN" }
 }
 ```

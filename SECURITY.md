@@ -53,7 +53,7 @@ A crafted `Host` header containing `/`, `?`, or `#` causes Starlette to misparse
 
 **This project's exposure:**
 
-- `vector-skill.py` uses FastMCP over **stdio** — no HTTP listener is opened, so the attack surface does not exist at all. When LM Studio launches it via `uv run --with fastmcp`, the resolved environment uses Starlette 1.1.0 (patched).
+- `vector-skill.py` uses FastMCP over **stdio** — no HTTP listener is opened, so the attack surface does not exist at all. When LM Studio launches it via `uv run --no-project mcp/vector-skill.py` — the connector's PEP 723 inline metadata pins `fastmcp` and `httpx` by exact version — the resolved environment uses Starlette 1.1.0 (patched).
 - `hive_mind_proxy.py` uses **aiohttp**, which has a separate, unaffected HTTP parser.
 
 **Requirement added:** `starlette>=1.0.1` is now explicit in `requirements.txt` as a security floor, so that any future change to the MCP transport (e.g. switching to SSE or HTTP) cannot silently introduce a vulnerable Starlette version.

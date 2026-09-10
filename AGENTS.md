@@ -1077,6 +1077,16 @@ always to update the CHECKOUT; the schema cannot be moved backwards.**
 | 9 | `sync_skills.sh` | after the restart, so it cannot print a false incompatibility warning |
 | 10 | `postflight.sh` | an update is not complete until this passes |
 
+⚠ **THE MCP SPAWN LINE CHANGED — step 9 delivers the new connector, it does NOT re-point your host.**
+`sync_skills.sh` copies files into an install directory; it never edits an MCP host's config, so a host
+registered before this release keeps launching the connector with the old `--with fastmcp --with httpx`
+arguments — unpinned, and one upstream release away from a dead server that reports nothing useful. The
+connector now carries its own PEP 723 inline dependency block, so the documented spawn is
+`uv run --no-project <the connector's path>` (an absolute `uv`, the walled copy's path where there is
+one). Edit every MCP host config that names `vector-skill.py`, then restart that host — an MCP server
+reads its command line and its environment once, at spawn. `sync_skills.sh` prints this reminder at the
+end of each MCP install it touches.
+
 ⚠ **Under `--from-restore`, steps 0 and 1 do not run at all** (no placeholder — the whole
 Step-0 block is skipped, exactly as before W3), so every step number above shifts down by 2 on
 that path (step 3 becomes the first thing that runs; step 10 (`postflight.sh`) becomes step 8).
