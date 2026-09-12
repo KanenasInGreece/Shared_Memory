@@ -158,14 +158,23 @@ async def test_below_cap_health_still_passes():
 
 @pytest.mark.asyncio
 async def test_disabled_valve_never_sheds_anything():
-    """GATEWAY_INFLIGHT_MAX=0 (default) means the valve is off entirely --
-    unaffected by this reordering."""
+    """GATEWAY_INFLIGHT_MAX=0 means the valve is off entirely -- unaffected by
+    this reordering (the DEFAULT is 100, set by S10; see
+    test_gateway_inflight_max_defaults_to_100_not_disabled)."""
     mod = load_coordinator("claude:tok_abc", gateway_inflight_max="0")
     mod._inflight = 999999
     req = _make_request("/health")
     resp = await mod.auth_middleware(req, _noop_handler)
     assert resp.status == 200
     mod._inflight = 0
+
+
+def test_gateway_inflight_max_defaults_to_100_not_disabled():
+    """S10 (v0.9.97): the outer load-shed valve defaults to ON at 100 in-flight,
+    not OFF (0). A defaults regression that flipped the valve back to disabled
+    would silently re-open the saturation hole this whole file exists to close."""
+    mod = load_coordinator()   # env var unset -> the CODE default
+    assert mod.GATEWAY_INFLIGHT_MAX == 100
 
 
 @pytest.mark.asyncio

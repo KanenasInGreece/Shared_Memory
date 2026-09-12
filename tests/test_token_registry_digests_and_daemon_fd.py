@@ -467,6 +467,70 @@ async def test_start_rem_daemon_publishes_rem_proc_before_returning(monkeypatch)
 
 
 @pytest.mark.asyncio
+async def test_start_daemon_spawns_pinned_uv_command(monkeypatch):
+    """SEC-1: _start_daemon must spawn via uv with requirements-gateway.lock
+    and pinned psycopg2-binary==2.9.12."""
+    monkeypatch.delenv("AGENT_TOKENS", raising=False)
+    import coordinator
+    importlib.reload(coordinator)
+    import hive_mind_proxy as g
+    importlib.reload(g)
+
+    fake_proc = _FakeDaemonProc()
+    captured_argv = []
+
+    async def _fake_create_subprocess_exec(*a, **kw):
+        captured_argv.extend(a)
+        return fake_proc
+
+    monkeypatch.setattr(g, "_find_uv", lambda: "/usr/bin/uv")
+    monkeypatch.setattr(g.asyncio, "create_subprocess_exec", _fake_create_subprocess_exec)
+
+    await g._start_daemon()
+    assert captured_argv[0] == "/usr/bin/uv"
+    assert captured_argv[1] == "run"
+    assert captured_argv[2] == "--no-project"
+    assert captured_argv[3] == "--with-requirements"
+    assert captured_argv[4].endswith("requirements-gateway.lock")
+    assert captured_argv[5] == "--with"
+    assert captured_argv[6] == "psycopg2-binary==2.9.12"
+    assert captured_argv[7] == "python"
+    assert captured_argv[8].endswith("consolidation_loop.py")
+
+
+@pytest.mark.asyncio
+async def test_start_rem_daemon_spawns_pinned_uv_command(monkeypatch):
+    """SEC-1: _start_rem_daemon must spawn via uv with requirements-gateway.lock
+    and pinned psycopg2-binary==2.9.12."""
+    monkeypatch.delenv("AGENT_TOKENS", raising=False)
+    import coordinator
+    importlib.reload(coordinator)
+    import hive_mind_proxy as g
+    importlib.reload(g)
+
+    fake_proc = _FakeDaemonProc()
+    captured_argv = []
+
+    async def _fake_create_subprocess_exec(*a, **kw):
+        captured_argv.extend(a)
+        return fake_proc
+
+    monkeypatch.setattr(g, "_find_uv", lambda: "/usr/bin/uv")
+    monkeypatch.setattr(g.asyncio, "create_subprocess_exec", _fake_create_subprocess_exec)
+
+    await g._start_rem_daemon()
+    assert captured_argv[0] == "/usr/bin/uv"
+    assert captured_argv[1] == "run"
+    assert captured_argv[2] == "--no-project"
+    assert captured_argv[3] == "--with-requirements"
+    assert captured_argv[4].endswith("requirements-gateway.lock")
+    assert captured_argv[5] == "--with"
+    assert captured_argv[6] == "psycopg2-binary==2.9.12"
+    assert captured_argv[7] == "python"
+    assert captured_argv[8].endswith("rem_loop.py")
+
+
+@pytest.mark.asyncio
 async def test_watchdog_rem_daemon_clean_exit_leaves_no_live_digest(monkeypatch):
     """Parity with the consolidation watchdog above, for the REM daemon."""
     monkeypatch.delenv("AGENT_TOKENS", raising=False)

@@ -158,7 +158,7 @@ def _short(value: Any, cap: int = 200) -> str:
 # ships with the skill) and this coordinator. Bump it ONLY when the request or
 # response shape, auth scheme, or routes change in a way that breaks older clients.
 # Client and server build-versions are allowed to drift; their API_VERSION must agree.
-FRAMEWORK_VERSION = "0.9.96"
+FRAMEWORK_VERSION = "0.9.97"
 # v2 (retro-as-record): /memory/retrospective now creates a full record (own
 # pg_id, embedding, Retrospective node) and accepts rating enum + grounding —
 # the response shape changed (returns the retro's own pg_id).
@@ -2502,6 +2502,10 @@ from dream_telemetry import (EMBED_MAX_CHARS, EMBED_TIMEOUT_FLOOR_S,  # noqa: E4
 # MENTIONS, so the highest-signal context survives the cap — context without
 # relation properties is noise disguised as fact.
 GRAPH_EXPANSION_LIMIT = _env_int("GRAPH_EXPANSION_LIMIT", 15)
+
+# Row cap on read-only Cypher queries submitted to /memory/graph. Rejects
+# oversized result sets with HTTP 400 before serialization.
+GRAPH_QUERY_ROW_CAP = _env_int("GRAPH_QUERY_ROW_CAP", 10000)
 
 # Tier-1 candidates fetched for the reranker when the caller asks for few. A
 # FLOOR, not a cap: the effective pool is max(this, the caller's limit), so a
@@ -9234,7 +9238,7 @@ class MemoryCoordinator:
         try:
             async with self._neo4j.session(default_access_mode="READ") as session:
                 result  = await session.run(cypher, **params)
-                records = await result.data()
+                records = await result.fetch(GRAPH_QUERY_ROW_CAP + 1)
             safe(lambda: self._neo4j_ring.record((time.monotonic() - _t0) * 1000.0))
         except ClientError as exc:
             # A REJECTION IS THE CALLER'S, NOT OURS — counted separately from
@@ -9272,6 +9276,21 @@ class MemoryCoordinator:
                                  self._neo4j_tx_failures_total + 1))
             log.error("graph query error for cypher=%r: %s", cypher[:120], exc, exc_info=True)
             return web.json_response({"status": "error", "message": "query failed"}, status=500)
+
+        if len(records) > GRAPH_QUERY_ROW_CAP:
+            return web.json_response(
+                {
+                    "status": "error",
+                    "error": "graph_row_cap_exceeded",
+                    "message": f"query returned more than {GRAPH_QUERY_ROW_CAP} rows",
+                },
+                status=400,
+            )
+
+        records = [
+            r.data() if callable(getattr(r, "data", None)) and not isinstance(r, dict) else dict(r)
+            for r in records
+        ]
 
         # Serialization is a SEPARATE question from "did the query succeed" —
         # a Neo4j `DateTime`/`Date`/`Time` (or anything else `json.dumps`

@@ -192,7 +192,7 @@ paid cloud API. Each entry is a URL plus an optional `token_env` — the
 | `url` | string | *(required)* | The backend's base URL. Trailing `/` is stripped; a base ending in `/v1` is probed without doubling it. |
 | `token_env` | string | none | **Name** of the env var holding the API key — never the key itself. Resolved once at startup, sent as `Authorization` only to this backend. An unresolvable name excludes the backend (logged). |
 | `model` | string | none | Model id rewritten into every request body routed here — a cloud endpoint needs its real id, not the `local-model` clients send. |
-| `extra_body` | object | none | Merged into every chat payload routed here, overriding the caller's fields — provider-specific switches (e.g. disabling hybrid-model thinking). A non-object excludes the backend. |
+| `extra_body` | object | none | Merged into every chat payload routed here, overriding the caller's fields — provider-specific switches (e.g. disabling hybrid-model thinking) or as a spend ceiling (e.g. `{"max_tokens": 500}`). A non-object excludes the backend. |
 | `weight` | float | `1.0` | ⚠ Currently affects **no** live routing decision — dispatch is cache-affinity then least-in-flight. Stored and displayed only. |
 | `roles` | list | absent = serves all | Which dream functions this backend may serve: `extract` (REM's per-record summary call) or `judge` (NREM's insight fold) (`summarize` is reserved and refused). An explicit list is itself the per-function privacy opt-in; an **empty** list refuses startup. |
 | `n_ctx` | int ≥ 1 | absent = always fits | The model's usable context. When set, a request whose estimated size cannot fit is excluded here rather than sent and truncated. |

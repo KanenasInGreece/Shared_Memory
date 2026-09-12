@@ -87,6 +87,7 @@ from coordinator import (
     _parse_upstream_error_type,
     _decompress_prefix_for_parse,
     _decompress_full_for_usage,
+    _ERROR_BODY_PARSE_CAP,
     SUPPORTED_CONTENT_ENCODINGS,
     _short,
     # The telemetry contract's limits (v0.9.74) — imported rather than
@@ -1428,7 +1429,7 @@ def _record_backend_token_usage(backend: str, usage: dict) -> None:
         if touched:
             _llm_tokens_last_ts[backend] = datetime.now(timezone.utc).isoformat()
     except Exception as exc:
-        log.warning("token usage accounting failed for %s: %s", backend, exc)
+        log.warning("token usage accounting failed for %s: %s", scrub_url_credentials(backend), exc)
 
 
 def _record_llm_latency(backend: str, elapsed_s: float, failed: bool) -> None:
@@ -1444,7 +1445,7 @@ def _record_llm_latency(backend: str, elapsed_s: float, failed: bool) -> None:
         _llm_latency_max_s[backend] = max(_llm_latency_max_s.get(backend, 0.0), elapsed_s)
         _llm_latency_last_ts[backend] = datetime.now(timezone.utc).isoformat()
     except Exception as exc:
-        log.warning("latency accounting failed for %s: %s", backend, exc)
+        log.warning("latency accounting failed for %s: %s", scrub_url_credentials(backend), exc)
 
 
 def _llm_mark_fail(backend: str) -> None:
@@ -1457,7 +1458,7 @@ def _llm_mark_fail(backend: str) -> None:
     if len(fails) >= LLM_FAIL_THRESHOLD:
         _llm_unhealthy_until[backend] = now + LLM_COOLDOWN
         _llm_fail_times[backend] = []
-        log.warning("LLM backend %s in cooldown for %.0fs (%d fails)", backend, LLM_COOLDOWN, LLM_FAIL_THRESHOLD)
+        log.warning("LLM backend %s in cooldown for %.0fs (%d fails)", scrub_url_credentials(backend), LLM_COOLDOWN, LLM_FAIL_THRESHOLD)
 
 
 def _llm_mark_ok(backend: str) -> None:
@@ -2237,6 +2238,27 @@ class AsyncHiveMindProxy:
             )
         target_base = llm_backend
 
+        # S-04 (Critical, PR A5): a request about to carry a provider
+        # key may only be POST to a framework-owned endpoint — never
+        # an arbitrary method/path forwarded verbatim to a
+        # credentialed backend.
+        # ADV-3: Placed before S5 model-mismatch refusal so a denied
+        # route returns 403 (with auth audit) rather than 400.
+        if LLM_BACKEND_TOKENS.get(llm_backend) is not None:
+            route = (request.method, request.rel_url.raw_path)
+            if (route not in CREDENTIALED_BACKEND_ALLOWED_ROUTES
+                    or request.rel_url.query_string):
+                record_credentialed_route_denied(
+                    llm_backend, request.method,
+                    _audited_route_spelling(request.rel_url),  # QA-1: RAW path + query marker
+                    agent_name=_safe_agent_name(request),
+                    request_id=_safe_request_id(request),
+                )
+                return web.json_response(
+                    {"error": "credentialed backends accept only framework endpoints"},
+                    status=403, headers={"X-SM-Fault-Origin": "gateway"},
+                )
+
         # S5: credentialed backend serves only its declared `model` (refuse, not rewrite).
         # We check this here before _forward_upstream so no capacity slot is consumed.
         backend_model = LLM_BACKEND_MODELS.get(llm_backend)
@@ -2345,7 +2367,8 @@ class AsyncHiveMindProxy:
         if steer_headers is None:
             steer_headers = request.headers
         target_url = _upstream_url(target_base, request.rel_url)
-        log.debug("→ %s %s", request.method, target_url)
+        scrubbed_target_url = scrub_url_credentials(target_url)
+        log.debug("→ %s %s", request.method, scrubbed_target_url)
 
         # P-6 (Model_Attributes_Routing_Plan_2026-08-18): X-SM-LLM-* headers
         # are stripped before the upstream forward for EVERY caller, daemons
@@ -2505,20 +2528,27 @@ class AsyncHiveMindProxy:
                         # degrades (R-2 accepted cost, HANDOFF note).
                         if llm_backend is not None:
                             proxy_resp.headers["X-SM-LLM-Backend"] = scrub_url_credentials(llm_backend)
-                        # Client-facing standard messaging (PR A3): a fault status
+                        # Client-facing standard messaging (PR A3 / S8): a fault status
                         # from ANY upstream (LLM, embedder, reranker) is an upstream-
-                        # origin error — the body still passes through verbatim below,
-                        # unchanged. This header is additive and never set on success.
+                        # origin error. S8 replaces the verbatim provider body with a
+                        # TYPED refusal (below); the fault-origin header is additive
+                        # and never set on success.
                         if upstream.status >= 400:
-                            # S8: Typed refusal instead of verbatim provider >=400 bodies
-                            body_bytes = await upstream.read()
+                            # S8: Typed refusal instead of verbatim provider >=400 bodies.
+                            # ADV-5: the read is BOUNDED to _ERROR_BODY_PARSE_CAP — the
+                            # classification only ever needs a prefix, so the read is
+                            # size-bounded and an oversized ≥400 body is not buffered.
                             content_encoding = upstream.headers.get("Content-Encoding")
+                            try:
+                                body_bytes = await upstream.content.read(_ERROR_BODY_PARSE_CAP)
+                            except Exception:
+                                body_bytes = b""
                             try:
                                 error_type = _parse_upstream_error_type(
                                     _decompress_prefix_for_parse(body_bytes, content_encoding))
                             except Exception:
                                 error_type = "transient"
-                            
+
                             if llm_backend is not None:
                                 try:
                                     record_llm_upstream_fault(
@@ -2529,18 +2559,17 @@ class AsyncHiveMindProxy:
                                 except Exception as exc:
                                     log.warning(
                                         "credential-fault classification failed for %s: %s",
-                                        target_url, type(exc).__name__)
-                            
+                                        scrubbed_target_url, type(exc).__name__)
+
                             headers = {"X-SM-Fault-Origin": "upstream"}
                             if llm_backend is not None:
                                 headers["X-SM-LLM-Backend"] = scrub_url_credentials(llm_backend)
-                            
+
                             return web.json_response(
                                 {"error": "upstream_fault", "status": upstream.status, "type": error_type},
                                 status=upstream.status,
                                 headers=headers,
                             )
-                            
                         # D9 (OBS round): a NARROW except scoped to `prepare()`
                         # ONLY — the same classes the mid-stream write path
                         # below already catches, `(ConnectionResetError,
@@ -2575,24 +2604,14 @@ class AsyncHiveMindProxy:
                         except (ConnectionResetError, IOError) as e:
                             log.warning(
                                 "Client disconnected before response headers "
-                                "could be sent: %s — %s", target_url, e)
+                                "could be sent: %s — %s", scrubbed_target_url, e)
                             record_llm_client_disconnect()
                             _client_aborted = True
                             return proxy_resp
 
-                        # Best-effort credential-fault classification (PR A3): only for
-                        # the LLM pool (embeddings/reranking never carry a provider key)
-                        # and only on a fault status. Peeks the FIRST streamed chunk —
-                        # error bodies are small JSON that arrive in one chunk in
-                        # practice; classification never buffers or reorders anything,
-                        # so the passthrough below is untouched even when the peek
-                        # can't parse a split/foreign body (falls through to
-                        # "transient" — see _classify_llm_fault).
-                        fault_classified = llm_backend is None or upstream.status < 400
-                        # R-3: auto_decompress=False means a compressed error body
+                        # R-3: auto_decompress=False means a compressed response
                         # arrives as framing bytes, not JSON — read Content-Encoding
-                        # once so the peek below can decompress a bounded prefix
-                        # before parsing. The passthrough chunk itself is untouched.
+                        # once so the usage capture below can decompress it.
                         content_encoding = upstream.headers.get("Content-Encoding")
 
                         # Post-review addition A: accumulate the response body
@@ -2649,14 +2668,14 @@ class AsyncHiveMindProxy:
                             # (shutdown, timeout, framework teardown). It is NOT a disconnect
                             # signal. Must always be re-raised so the event loop can complete
                             # its cancellation sequence; swallowing it stalls graceful shutdown.
-                            log.warning("Handler task cancelled during stream: %s", target_url)
+                            log.warning("Handler task cancelled during stream: %s", scrubbed_target_url)
                             raise
 
                         except UPSTREAM_DISCONNECT as e:
                             # Upstream server dropped the connection mid-stream (clean close or
                             # abrupt reset). Response headers are already on the wire; log and
                             # return the partial response rather than attempting a new reply.
-                            log.warning("Upstream dropped connection mid-stream: %s — %s", target_url, e)
+                            log.warning("Upstream dropped connection mid-stream: %s — %s", scrubbed_target_url, e)
 
                         except (ConnectionResetError, IOError) as e:
                             # OS-level socket reset from the downstream client.
@@ -2671,27 +2690,9 @@ class AsyncHiveMindProxy:
                             # partial write is not "served": mark neither ok
                             # nor fail, so a genuinely flaky backend's streak
                             # survives an unrelated client hangup.
-                            log.warning("Client disconnected mid-stream: %s — %s", target_url, e)
+                            log.warning("Client disconnected mid-stream: %s — %s", scrubbed_target_url, e)
                             record_llm_client_disconnect()
                             _client_aborted = True
-
-                        # Fallback classification (PR A3): the loop above never ran its
-                        # body — an empty-bodied fault response, or a disconnect before
-                        # the first chunk arrived. Still worth recording: the status
-                        # alone is enough to classify 401/403, and an unparseable/absent
-                        # body classifies as transient either way.
-                        if not fault_classified:
-                            fault_classified = True
-                            try:
-                                record_llm_upstream_fault(
-                                    llm_backend, upstream.status, None,
-                                    credentialed=bool(backend_token),
-                                    request_id=_safe_request_id(request),
-                                )
-                            except Exception as exc:
-                                log.warning(
-                                    "credential-fault classification failed for %s: %s",
-                                    target_url, type(exc).__name__)
 
                         if usage_chunks:
                             try:
@@ -2755,7 +2756,7 @@ class AsyncHiveMindProxy:
                         log.warning(
                             "Stale connection to %s (%s) — retrying once on a fresh "
                             "connection before treating this as a backend failure.",
-                            target_url, e)
+                            scrubbed_target_url, e)
                         continue
                     raise
 
@@ -2773,7 +2774,7 @@ class AsyncHiveMindProxy:
             # does), and a real provider pattern puts a credential in a URL
             # (userinfo, or a `?key=...` query parameter). The client-visible
             # body below uses the exception's CLASS NAME only, never its text.
-            log.error("Upstream unreachable %s: %s", target_url,
+            log.error("Upstream unreachable %s: %s", scrubbed_target_url,
                       _short(_scrub_url_credentials(str(ce))))
             if llm_backend is not None:
                 _llm_mark_fail(llm_backend)
@@ -2791,7 +2792,7 @@ class AsyncHiveMindProxy:
 
         except asyncio.TimeoutError:
             # Connect timeout to upstream — correct status is 504, not 500.
-            log.warning("Upstream connect timeout: %s", target_url)
+            log.warning("Upstream connect timeout: %s", scrubbed_target_url)
             if llm_backend is not None:
                 _llm_mark_fail(llm_backend)
                 record_llm_gateway_fault(llm_backend, "TimeoutError",
@@ -2818,7 +2819,7 @@ class AsyncHiveMindProxy:
                 scrubbed_exc = type(e)(scrubbed_msg)
             except Exception:
                 scrubbed_exc = RuntimeError(scrubbed_msg)  # exotic __init__ signature — fall back
-            log.error("Unexpected proxy error for %s: %s", target_url, scrubbed_msg,
+            log.error("Unexpected proxy error for %s: %s", scrubbed_target_url, scrubbed_msg,
                       exc_info=(type(scrubbed_exc), scrubbed_exc, e.__traceback__))
             if llm_backend is not None:
                 record_llm_gateway_fault(llm_backend, type(e).__name__,
@@ -2998,6 +2999,14 @@ def _find_uv() -> "str | None":
     return None
 
 
+def _find_gateway_lock() -> str:
+    """Resolve the pinned requirements-gateway.lock for daemon spawns (SEC-1)."""
+    candidate = Path(__file__).resolve().parents[2] / "requirements-gateway.lock"
+    if candidate.is_file():
+        return str(candidate)
+    return "requirements-gateway.lock"
+
+
 async def _start_daemon() -> "asyncio.subprocess.Process | None":
     """Fix round finding 9 (QA LOW): `_daemon_proc` is published HERE,
     synchronously, the instant `create_subprocess_exec` returns — not left
@@ -3024,7 +3033,11 @@ async def _start_daemon() -> "asyncio.subprocess.Process | None":
     env, read_fd = _daemon_env_and_token_fd(_CONSOLIDATION_AGENT_NAME)
     try:
         proc = await asyncio.create_subprocess_exec(
-            sys.executable, str(daemon_path),
+            uv, "run",
+            "--no-project",
+            "--with-requirements", _find_gateway_lock(),
+            "--with", "psycopg2-binary==2.9.12",
+            "python", str(daemon_path),
             env=env,
             pass_fds=(read_fd,) if read_fd is not None else (),
         )
@@ -3059,7 +3072,11 @@ async def _start_rem_daemon() -> "asyncio.subprocess.Process | None":
     env, read_fd = _daemon_env_and_token_fd(_REM_DAEMON_AGENT_NAME)
     try:
         proc = await asyncio.create_subprocess_exec(
-            sys.executable, str(rem_path),
+            uv, "run",
+            "--no-project",
+            "--with-requirements", _find_gateway_lock(),
+            "--with", "psycopg2-binary==2.9.12",
+            "python", str(rem_path),
             env=env,
             pass_fds=(read_fd,) if read_fd is not None else (),
         )
@@ -4851,8 +4868,15 @@ def _llm_pool_dependency(backend_status: dict) -> dict:
     """
     if not backend_status:
         return _dep(_STATE_UNKNOWN, "no backend configured")
-    bad = sorted(b for b, s in backend_status.items() if s != "ok")
-    if len(bad) == len(backend_status):
+    # S7 (ADV-4): "unknown" is a per-backend state meaning the background probe
+    # daemon has not landed yet. A never-probed backend is not a down backend,
+    # and a pool nobody has probed reads unknown, never down — the "unknown
+    # never elevates" contract (decision:374 / fact:375).
+    probed = {b: s for b, s in backend_status.items() if s != "unknown"}
+    if not probed:
+        return _dep(_STATE_UNKNOWN, "not yet probed")
+    bad = sorted(b for b, s in probed.items() if s != "ok")
+    if len(bad) == len(probed):
         down_reasons: list = []
         if LLM_POOL_FALLBACK_REASON:
             # H2 (handback, decision:1832): the fleet was DECLARED and
@@ -4886,7 +4910,7 @@ def _llm_pool_dependency(backend_status: dict) -> dict:
             config_empty_reason = f"{config_empty_reason}; {_LLM_POOL_LEGACY_REMEDY}"
         reasons.append(config_empty_reason)
     if bad:
-        reasons.append(f"{len(bad)}/{len(backend_status)} backend(s) down")
+        reasons.append(f"{len(bad)}/{len(probed)} backend(s) down")
     ineligible_reason = _all_roles_ineligible()
     if ineligible_reason:
         reasons.append(ineligible_reason)
@@ -5552,7 +5576,15 @@ async def _build_health_checks(proxy: "AsyncHiveMindProxy", coordinator) -> dict
     # production with A fatal on userinfo, but guards a test-seeded/future
     # bypass from silently merging two distinct backends into one key.
     backend_status = _scrub_backend_keyed_dict(backend_status, context="/health backend_status")
-    checks["llm"] = "ok" if any(s == "ok" for s in backend_status.values()) else "down"
+    # S7 (ADV-4): "unknown" is a per-backend state meaning the background probe
+    # has not landed yet — never-probed is not down. "unknown" only ever
+    # appears while the probe daemon's first cycle is still pending.
+    if any(s == "ok" for s in backend_status.values()):
+        checks["llm"] = "ok"
+    elif backend_status and all(s == "unknown" for s in backend_status.values()):
+        checks["llm"] = "unknown"
+    else:
+        checks["llm"] = "down"
     # Wedge visibility: reachability alone reported "ok" through a GPU-driver
     # hang (the accept thread answers while the generation engine is dead).
     # Surface the oldest in-flight age; past the suspect threshold, verify the

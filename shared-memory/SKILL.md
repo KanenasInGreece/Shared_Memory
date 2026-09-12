@@ -288,7 +288,7 @@ Query the knowledge graph for structural and provenance context.
   uv run --with httpx python ~/.gemini/skills/shared-memory/scripts/memory_bridge.py graph "<cypher_query>"
   ```
   Read-only enforced: `CREATE`, `DELETE`, `DETACH DELETE`, `SET`, `MERGE`, `CALL`, `LOAD CSV`, `DROP` are blocked.
-  **A Cypher the database itself refuses — a syntax error, an unknown function, a type error — comes back as 400 `cypher_rejected` carrying Neo4j's own message, not as a 500.** It is your query to fix; re-sending it unchanged will never succeed. A 500 `query failed` means the gateway or Neo4j is the problem, and retrying is reasonable.
+  **A Cypher the database itself refuses — a syntax error, an unknown function, a type error — comes back as 400 `cypher_rejected` carrying Neo4j's own message, not as a 500.** It is your query to fix; re-sending it unchanged will never succeed. A 500 `query failed` means the gateway or Neo4j is the problem, and retrying is reasonable. A read-only Cypher returning more than `GRAPH_QUERY_ROW_CAP` rows (default 10000) is refused 400 `graph_row_cap_exceeded`; narrow the query or raise the cap.
 
 **Record lineage** — *"what happened to this record?"*:
 ```
@@ -611,7 +611,7 @@ minting all live in **[Documentation/server-setup.md](Documentation/server-setup
 ```bash
 # Liveness (anonymous — status/version/api_version only, v0.9.9 S-10):
 curl http://localhost:8888/health
-# → {"status":"ok","api_version":4,"version":"0.9.96"}
+# → {"status":"ok","api_version":4,"version":"0.9.97"}
 
 # Liveness + API contract check (this client vs the gateway):
 python ~/.claude/skills/shared-memory/scripts/memory_bridge.py doctor
@@ -700,7 +700,7 @@ must be running — see [Documentation/server-setup.md](Documentation/server-set
 
 ## Reference
 
-- **Version:** `python ~/.gemini/skills/shared-memory/scripts/memory_bridge.py --version` → `{"version": "0.9.96", "api_version": 4, "tool": "shared-memory-framework"}`
+- **Version:** `python ~/.gemini/skills/shared-memory/scripts/memory_bridge.py --version` → `{"version": "0.9.97", "api_version": 4, "tool": "shared-memory-framework"}`
 
 ### Updating This Skill
 

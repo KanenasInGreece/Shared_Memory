@@ -5,6 +5,18 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.9.97] — 2026-09-12
+
+### Security seam — the pre-v1 S-group
+- S7: the reasoning-LLM liveness probe moved to a background daemon off the request path; `/health` reads a never-probed backend as `unknown`, never `down`.
+- S8: an upstream ≥400 no longer passes the provider's body through verbatim — the gateway returns a typed `upstream_fault` refusal, and the error-body read is bounded.
+- S9: the dream daemons spawn via `uv run --no-project --with-requirements requirements-gateway.lock --with psycopg2-binary==2.9.12`, pinning psycopg2 in the spawn line (the bare `sys.executable` spawn had dropped it from the gateway lock).
+- S10: `GATEWAY_INFLIGHT_MAX` now defaults to 100 (was 0 = valve disabled).
+- S11: tokens minted from stdin enforce a 20-character floor.
+
+### Review fixes
+- Backend URLs scrubbed on the request-path log sites; the credentialed-route guard ordered ahead of the model-mismatch check; a row cap on read-only Cypher through `/memory/graph`; the env-coverage gate now enumerates `os.environ.setdefault` and `import os as` reads; test contracts pinned for S5/S7/S8/S10/S11.
+
 ## [0.9.96] — 2026-09-10
 
 ### Changed
@@ -8459,6 +8471,3 @@ Migration 006 adds the `superseded` column — the coordinator will fail to serv
 [0.2.7]: https://github.com/KanenasInGreece/Shared_Memory/releases/tag/v0.2.7
 [0.2.0]: https://github.com/KanenasInGreece/Shared_Memory/releases/tag/v0.2.0
 [0.1.0]: https://github.com/KanenasInGreece/Shared_Memory/releases/tag/v0.1.0
-
-## 0.9.97
-- Pre-v1 design minimums (S7, S8, S9, S10) implemented.

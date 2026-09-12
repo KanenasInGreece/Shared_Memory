@@ -366,12 +366,27 @@ def test_decompress_full_raises_over_cap_and_returns_under_cap(monkeypatch):
 def test_single_backend_health_sections_present(monkeypatch):
     """MUTATION TARGET: restore `if len(LLM_BACKENDS) > 1:` and this fails —
     a single-backend (cloud-only) fleet must show llm_backends/llm_pool/
-    llm_affinity in /health, not only multi-backend fleets."""
+    llm_affinity in /health, not only multi-backend fleets.
+
+    S7: the LLM probe now runs in the background daemon, so this drives one
+    probe cycle before reading /health (never-probed would read "unknown",
+    not the "ok" this test pins)."""
     g = _fresh(monkeypatch, backends="http://a:5000")
     proxy = g.AsyncHiveMindProxy()
     proxy.session = _FixedStatusSession(200)
 
-    checks = asyncio.run(g._build_health_checks(proxy, None))
+    async def _run():
+        stop = asyncio.Event()
+        task = asyncio.create_task(g._llm_probe_daemon(proxy, stop))
+        for _ in range(1000):
+            if g._llm_status_cache:
+                break
+            await asyncio.sleep(0.001)
+        stop.set()
+        await task
+        return await g._build_health_checks(proxy, None)
+
+    checks = asyncio.run(_run())
 
     assert checks.get("llm_backends") == {"http://a:5000": "ok"}
     assert "llm_pool" in checks and "http://a:5000" in checks["llm_pool"]

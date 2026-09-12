@@ -68,6 +68,7 @@ __all__ = [
     "INTRODUCED_0_9_79",
     "INTRODUCED_0_9_81",
     "INTRODUCED_0_9_88",
+    "INTRODUCED_0_9_97",
     "DUAL_EMIT_DROP_TARGET",
     "WARNING_KEYS",
     "CATEGORIES",
@@ -95,7 +96,7 @@ __all__ = [
 #: coordinator.py's FRAMEWORK_VERSION et al. until the merger's own version-
 #: bump step (which those four files stay reserved for) catches up to it at
 #: release time — that gap is the check doing its job, not a build defect.
-VERSION = "0.9.96"
+VERSION = "0.9.97"
 
 
 def _version_tuple(v: str) -> tuple:
@@ -199,6 +200,11 @@ INTRODUCED_0_9_81 = "0.9.81"
 #: same move `INTRODUCED_0_9_79`/`INTRODUCED_0_9_81` got at their releases) —
 #: not this build step's job.
 INTRODUCED_0_9_88 = "0.9.88"
+#: The 0.9.97 stamp: S7 moved the reasoning-LLM probe off the request path into
+#: a background daemon, so `unknown` became a per-backend enum value — never-
+#: probed, before the daemon's first cycle lands — on top of the existing
+#: ok/timeout/down/http_* set.
+INTRODUCED_0_9_97 = "0.9.97"
 #: The FROZEN stamp of the first drop: the release from which the dual-emitted
 #: copies moved off `/health` at v0.9.74 stop being SERVED. Every row carrying
 #: it keeps its `moved_to`, so the document still renders the old→new map after
@@ -446,9 +452,9 @@ HEALTH: dict[str, dict] = {
         removed_in=DUAL_EMIT_DROP_TARGET),
 
     # ── llm: the enum map stays (the monitor's tiles read it); detail moves ──
-    "llm": _k("str", "llm", note="ok | down — ok iff ANY backend answered"),
+    "llm": _k("str", "llm", note="ok | unknown | down — ok iff ANY backend answered; unknown while the background probe's first cycle is still pending"),
     "llm_backends.*": _k("str", "llm",
-                         note="per-backend enum: ok | timeout | down | http_<code>"),
+                         note="per-backend enum: ok | unknown | timeout | down | http_<code>"),
     "llm_reserved[]": _k("list", "llm", moved_to="telemetry:llm.reserved",
                          removed_in=DUAL_EMIT_DROP_TARGET),
     "llm_oldest_inflight_age_s": _k("float", "llm", unit="_s",
@@ -1609,6 +1615,22 @@ MEANING_CHANGES: tuple[dict, ...] = (
                    "monitor `/health` case is unaffected here: it serves "
                    "200, so it moves only the D1 window and "
                    "`requests_total`/`by_status.2xx`, never `by_status.401`"),
+        "shape_changed": False,
+    },
+    {
+        "endpoint": "health",
+        "path": "llm / llm_backends.*",
+        "in_version": INTRODUCED_0_9_97,
+        "was": ("the reasoning-LLM probe ran inline on the /health request "
+                "path, so a backend read ok, timeout, down or http_<code> "
+                "the moment /health answered"),
+        "now": ("the probe runs in a background daemon (S7); before its "
+                "first cycle lands a backend reads `unknown`, and the "
+                "top-level `llm` reads `unknown` rather than `down` (the "
+                "unknown-never-elevates contract)"),
+        "action": ("a consumer reading `llm`/`llm_backends.*` must accept "
+                   "`unknown` as 'not yet probed', never a failure; it "
+                   "clears within one probe cycle (~3 s) of gateway start"),
         "shape_changed": False,
     },
 )

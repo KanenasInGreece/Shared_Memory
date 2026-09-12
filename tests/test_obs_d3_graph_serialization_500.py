@@ -66,10 +66,11 @@ class _AsyncCtx:
 
 
 def _coord_with_records(records):
-    """A coordinator whose Neo4j session's `run().data()` returns `records`."""
+    """A coordinator whose Neo4j session's `run().fetch()` returns `records`."""
     c = MemoryCoordinator()
     result = MagicMock()
     result.data = AsyncMock(return_value=records)
+    result.fetch = AsyncMock(return_value=records)
     session = MagicMock()
     session.run = AsyncMock(return_value=result)
     neo4j = MagicMock()
