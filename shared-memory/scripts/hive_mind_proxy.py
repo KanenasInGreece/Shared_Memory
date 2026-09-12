@@ -2261,10 +2261,22 @@ class AsyncHiveMindProxy:
 
         # S5: credentialed backend serves only its declared `model` (refuse, not rewrite).
         # We check this here before _forward_upstream so no capacity slot is consumed.
+        #
+        # "local-model" is exempt: it is the framework's own default placeholder,
+        # sent by the dream daemons (rem_loop.py / consolidation_loop.py), the CLI
+        # clients and postflight A8, so it means "unspecified" — not a request for
+        # a specific model. It must proceed to the per-backend rewrite below
+        # (_apply_backend_body_overrides), which replaces it with the backend's
+        # declared model. Any OTHER caller-named model is still refused, preserving
+        # S5's intent.
+        #
+        # Known limitation (pre-existing, unchanged here): this gate only applies to
+        # a JSON-object body carrying a truthy `model` — an absent model, or a
+        # non-object body, is forwarded unchanged.
         backend_model = LLM_BACKEND_MODELS.get(llm_backend)
         if LLM_BACKEND_TOKENS.get(llm_backend) is not None and backend_model and isinstance(body_obj, dict):
             caller_model = body_obj.get("model")
-            if caller_model and caller_model != backend_model:
+            if caller_model and caller_model not in (backend_model, "local-model"):
                 return web.json_response(
                     {"error": "model_mismatch",
                      "detail": f"credentialed backend requires model '{backend_model}', but request specified '{caller_model}'"},

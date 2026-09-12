@@ -46,15 +46,21 @@ class _MustNotCallSession:
 
 
 class _HeaderCaptureSession:
-    """Records headers/body then aborts before any real network call —
-    mirrors the same-named class in test_llm_backend_secrets.py."""
+    """Records headers and the forwarded body then aborts before any real
+    network call — mirrors the same-named class in test_llm_backend_secrets.py.
+
+    `_forward_upstream` passes the (possibly rewritten) body as the `data=`
+    kwarg (the bytes returned by `_apply_backend_body_overrides`), so the body
+    capture reads `data` — not `json=`."""
     closed = False
 
     def __init__(self):
         self.captured_headers = None
+        self.captured_body = None
 
     def request(self, *a, **kw):
         self.captured_headers = kw.get("headers")
+        self.captured_body = kw.get("data")
         raise RuntimeError("capture-only session — no real upstream call")
 
 
@@ -139,19 +145,49 @@ def test_s5_model_mismatch_is_refused_before_any_upstream_call(monkeypatch):
     """S5 (v0.9.97): a credentialed backend serves only its declared `model`
     (refuse, not rewrite). A caller sending a different model gets 400
     model_mismatch before any upstream call — the mismatch is named, the key
-    is never consumed, and no capacity slot is taken."""
+    is never consumed, and no capacity slot is taken.
+
+    The mismatch value is a genuinely different model id ("other-model"), NOT
+    the framework's own "local-model" placeholder — that one is exempt since
+    v0.9.98 (see test_s5_local_model_default_reaches_a_credentialed_backend)."""
     g = _load_credentialed_gateway(monkeypatch)   # declares model "deepseek-chat"
     proxy = g.AsyncHiveMindProxy()
     proxy.session = _MustNotCallSession()
     resp = asyncio.run(proxy.handle_proxy(
-        _req("POST", "/v1/chat/completions", model="local-model")))
+        _req("POST", "/v1/chat/completions", model="other-model")))
     assert resp.status == 400
     body = json.loads(resp.body.decode())
     assert body["error"] == "model_mismatch"
     assert "deepseek-chat" in body["detail"]
-    assert "local-model" in body["detail"]
+    assert "other-model" in body["detail"]
     assert resp.headers.get("X-SM-Fault-Origin") == "gateway"
     assert "sk-allowlist-test" not in json.dumps(body)
+
+
+def test_s5_local_model_default_reaches_a_credentialed_backend(monkeypatch):
+    """S5 exemption (v0.9.98): "local-model" is the framework's own default
+    placeholder (sent by the dream daemons, CLI clients and postflight A8), so
+    it means "unspecified" — it must NOT be refused. The request reaches the
+    upstream and the per-backend rewrite replaces the placeholder with the
+    backend's declared model.
+
+    Mutation-proof: revert the exemption and this request gets 400 before any
+    upstream call, so `captured_body` stays None and the status assertion
+    fails. Weaken the gate to allow all models and the mismatch test above
+    (model="other-model") fails instead."""
+    g = _load_credentialed_gateway(monkeypatch)   # declares model "deepseek-chat"
+    proxy = g.AsyncHiveMindProxy()
+    session = _HeaderCaptureSession()
+    proxy.session = session
+    resp = asyncio.run(proxy.handle_proxy(
+        _req("POST", "/v1/chat/completions", model="local-model")))
+    # Reaching the capture session (which raises after recording) proves the
+    # request was NOT refused at the S5 gate: the capture session's RuntimeError
+    # is turned into HTTP 500 by handle_proxy's generic handler.
+    assert resp.status == 500
+    assert session.captured_body is not None
+    sent = json.loads(session.captured_body.decode())
+    assert sent["model"] == "deepseek-chat"
 
 
 def test_arbitrary_path_to_credentialed_backend_403s(monkeypatch):
