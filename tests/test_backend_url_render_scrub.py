@@ -461,6 +461,74 @@ def test_telemetry_extras_faults_scrubs_a_directly_seeded_credentialed_backend(m
     coordinator._llm_fault_counters.clear()
 
 
+# ── 8. SEC-3: Request-path target_url log scrubbing ────────────────────────
+
+def test_request_path_debug_log_scrubs_target_url(monkeypatch, caplog):
+    """SEC-3: request-path debug log '→ METHOD target_url' must scrub URL query credentials."""
+    monkeypatch.delenv("LLM_BACKENDS", raising=False)
+    query_url = f"http://a:5000?key={SECRET}"
+    monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([{"url": query_url, "private_ok": True}]))
+    g = _load()
+    importlib.reload(g)
+
+    _patch_stream_response(monkeypatch)
+    proxy = g.AsyncHiveMindProxy()
+    proxy.session = _OkSession()
+
+    with caplog.at_level(logging.DEBUG, logger="hive-proxy"):
+        asyncio.run(proxy.handle_proxy(_FakeReq()))
+
+    assert SECRET not in caplog.text
+    assert "http://a:5000" in caplog.text
+
+
+def test_request_path_upstream_unreachable_error_log_scrubs_target_url(monkeypatch, caplog):
+    """SEC-3: request-path ClientError log must scrub URL query credentials."""
+    monkeypatch.delenv("LLM_BACKENDS", raising=False)
+    query_url = f"http://a:5000?key={SECRET}"
+    monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([{"url": query_url, "private_ok": True}]))
+    g = _load()
+    importlib.reload(g)
+
+    class _ErrSession:
+        closed = False
+        def request(self, *a, **kw):
+            from aiohttp import ClientError
+            raise ClientError("connect failure")
+
+    proxy = g.AsyncHiveMindProxy()
+    proxy.session = _ErrSession()
+
+    with caplog.at_level(logging.ERROR, logger="hive-proxy"):
+        asyncio.run(proxy.handle_proxy(_FakeReq()))
+
+    assert SECRET not in caplog.text
+    assert "http://a:5000" in caplog.text
+
+
+def test_request_path_connect_timeout_log_scrubs_target_url(monkeypatch, caplog):
+    """SEC-3: request-path TimeoutError log must scrub URL query credentials."""
+    monkeypatch.delenv("LLM_BACKENDS", raising=False)
+    query_url = f"http://a:5000?key={SECRET}"
+    monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([{"url": query_url, "private_ok": True}]))
+    g = _load()
+    importlib.reload(g)
+
+    class _TimeoutSession:
+        closed = False
+        def request(self, *a, **kw):
+            raise asyncio.TimeoutError()
+
+    proxy = g.AsyncHiveMindProxy()
+    proxy.session = _TimeoutSession()
+
+    with caplog.at_level(logging.WARNING, logger="hive-proxy"):
+        asyncio.run(proxy.handle_proxy(_FakeReq()))
+
+    assert SECRET not in caplog.text
+    assert "http://a:5000" in caplog.text
+
+
 @pytest.fixture(autouse=True)
 def _restore_module(monkeypatch):
     """Same convention as tests/test_gateway_startup_journal_scrub.py's

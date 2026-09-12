@@ -37,8 +37,14 @@ async def run_test():
 
     # 1. Start the daemon in the background with Mock LLM enabled
     env = os.environ.copy()
-    env["MOCK_LLM"] = "1"
-    daemon_proc = subprocess.Popen(["uv", "run", "--with", "httpx", "--with", "psycopg2-binary", "--with", "neo4j", "python", "shared-memory/scripts/consolidation_loop.py"], env=env)
+    repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    lock_path = os.path.join(repo_root, "requirements-gateway.lock")
+    daemon_path = os.path.join(repo_root, "shared-memory", "scripts", "consolidation_loop.py")
+    daemon_proc = subprocess.Popen(
+        ["uv", "run", "--no-project", "--with-requirements", lock_path,
+         "--with", "psycopg2-binary==2.9.12", "python", daemon_path],
+        env=env,
+    )
     logger.info(f"Daemon started with PID {daemon_proc.pid} (MOCK_LLM=1)")
 
     try:

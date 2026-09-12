@@ -2237,6 +2237,27 @@ class AsyncHiveMindProxy:
             )
         target_base = llm_backend
 
+        # S-04 (Critical, PR A5): a request about to carry a provider
+        # key may only be POST to a framework-owned endpoint — never
+        # an arbitrary method/path forwarded verbatim to a
+        # credentialed backend.
+        # ADV-3: Placed before S5 model-mismatch refusal so a denied
+        # route returns 403 (with auth audit) rather than 400.
+        if LLM_BACKEND_TOKENS.get(llm_backend) is not None:
+            route = (request.method, request.rel_url.raw_path)
+            if (route not in CREDENTIALED_BACKEND_ALLOWED_ROUTES
+                    or request.rel_url.query_string):
+                record_credentialed_route_denied(
+                    llm_backend, request.method,
+                    _audited_route_spelling(request.rel_url),  # QA-1: RAW path + query marker
+                    agent_name=_safe_agent_name(request),
+                    request_id=_safe_request_id(request),
+                )
+                return web.json_response(
+                    {"error": "credentialed backends accept only framework endpoints"},
+                    status=403, headers={"X-SM-Fault-Origin": "gateway"},
+                )
+
         # S5: credentialed backend serves only its declared `model` (refuse, not rewrite).
         # We check this here before _forward_upstream so no capacity slot is consumed.
         backend_model = LLM_BACKEND_MODELS.get(llm_backend)
@@ -2345,7 +2366,8 @@ class AsyncHiveMindProxy:
         if steer_headers is None:
             steer_headers = request.headers
         target_url = _upstream_url(target_base, request.rel_url)
-        log.debug("→ %s %s", request.method, target_url)
+        scrubbed_target_url = scrub_url_credentials(target_url)
+        log.debug("→ %s %s", request.method, scrubbed_target_url)
 
         # P-6 (Model_Attributes_Routing_Plan_2026-08-18): X-SM-LLM-* headers
         # are stripped before the upstream forward for EVERY caller, daemons
@@ -2529,7 +2551,7 @@ class AsyncHiveMindProxy:
                                 except Exception as exc:
                                     log.warning(
                                         "credential-fault classification failed for %s: %s",
-                                        target_url, type(exc).__name__)
+                                        scrubbed_target_url, type(exc).__name__)
                             
                             headers = {"X-SM-Fault-Origin": "upstream"}
                             if llm_backend is not None:
@@ -2575,7 +2597,7 @@ class AsyncHiveMindProxy:
                         except (ConnectionResetError, IOError) as e:
                             log.warning(
                                 "Client disconnected before response headers "
-                                "could be sent: %s — %s", target_url, e)
+                                "could be sent: %s — %s", scrubbed_target_url, e)
                             record_llm_client_disconnect()
                             _client_aborted = True
                             return proxy_resp
@@ -2649,14 +2671,14 @@ class AsyncHiveMindProxy:
                             # (shutdown, timeout, framework teardown). It is NOT a disconnect
                             # signal. Must always be re-raised so the event loop can complete
                             # its cancellation sequence; swallowing it stalls graceful shutdown.
-                            log.warning("Handler task cancelled during stream: %s", target_url)
+                            log.warning("Handler task cancelled during stream: %s", scrubbed_target_url)
                             raise
 
                         except UPSTREAM_DISCONNECT as e:
                             # Upstream server dropped the connection mid-stream (clean close or
                             # abrupt reset). Response headers are already on the wire; log and
                             # return the partial response rather than attempting a new reply.
-                            log.warning("Upstream dropped connection mid-stream: %s — %s", target_url, e)
+                            log.warning("Upstream dropped connection mid-stream: %s — %s", scrubbed_target_url, e)
 
                         except (ConnectionResetError, IOError) as e:
                             # OS-level socket reset from the downstream client.
@@ -2671,7 +2693,7 @@ class AsyncHiveMindProxy:
                             # partial write is not "served": mark neither ok
                             # nor fail, so a genuinely flaky backend's streak
                             # survives an unrelated client hangup.
-                            log.warning("Client disconnected mid-stream: %s — %s", target_url, e)
+                            log.warning("Client disconnected mid-stream: %s — %s", scrubbed_target_url, e)
                             record_llm_client_disconnect()
                             _client_aborted = True
 
@@ -2691,7 +2713,7 @@ class AsyncHiveMindProxy:
                             except Exception as exc:
                                 log.warning(
                                     "credential-fault classification failed for %s: %s",
-                                    target_url, type(exc).__name__)
+                                    scrubbed_target_url, type(exc).__name__)
 
                         if usage_chunks:
                             try:
@@ -2755,7 +2777,7 @@ class AsyncHiveMindProxy:
                         log.warning(
                             "Stale connection to %s (%s) — retrying once on a fresh "
                             "connection before treating this as a backend failure.",
-                            target_url, e)
+                            scrubbed_target_url, e)
                         continue
                     raise
 
@@ -2773,7 +2795,7 @@ class AsyncHiveMindProxy:
             # does), and a real provider pattern puts a credential in a URL
             # (userinfo, or a `?key=...` query parameter). The client-visible
             # body below uses the exception's CLASS NAME only, never its text.
-            log.error("Upstream unreachable %s: %s", target_url,
+            log.error("Upstream unreachable %s: %s", scrubbed_target_url,
                       _short(_scrub_url_credentials(str(ce))))
             if llm_backend is not None:
                 _llm_mark_fail(llm_backend)
@@ -2791,7 +2813,7 @@ class AsyncHiveMindProxy:
 
         except asyncio.TimeoutError:
             # Connect timeout to upstream — correct status is 504, not 500.
-            log.warning("Upstream connect timeout: %s", target_url)
+            log.warning("Upstream connect timeout: %s", scrubbed_target_url)
             if llm_backend is not None:
                 _llm_mark_fail(llm_backend)
                 record_llm_gateway_fault(llm_backend, "TimeoutError",
@@ -2818,7 +2840,7 @@ class AsyncHiveMindProxy:
                 scrubbed_exc = type(e)(scrubbed_msg)
             except Exception:
                 scrubbed_exc = RuntimeError(scrubbed_msg)  # exotic __init__ signature — fall back
-            log.error("Unexpected proxy error for %s: %s", target_url, scrubbed_msg,
+            log.error("Unexpected proxy error for %s: %s", scrubbed_target_url, scrubbed_msg,
                       exc_info=(type(scrubbed_exc), scrubbed_exc, e.__traceback__))
             if llm_backend is not None:
                 record_llm_gateway_fault(llm_backend, type(e).__name__,
@@ -2998,6 +3020,14 @@ def _find_uv() -> "str | None":
     return None
 
 
+def _find_gateway_lock() -> str:
+    """Resolve the pinned requirements-gateway.lock for daemon spawns (SEC-1)."""
+    candidate = Path(__file__).resolve().parents[2] / "requirements-gateway.lock"
+    if candidate.is_file():
+        return str(candidate)
+    return "requirements-gateway.lock"
+
+
 async def _start_daemon() -> "asyncio.subprocess.Process | None":
     """Fix round finding 9 (QA LOW): `_daemon_proc` is published HERE,
     synchronously, the instant `create_subprocess_exec` returns — not left
@@ -3024,7 +3054,11 @@ async def _start_daemon() -> "asyncio.subprocess.Process | None":
     env, read_fd = _daemon_env_and_token_fd(_CONSOLIDATION_AGENT_NAME)
     try:
         proc = await asyncio.create_subprocess_exec(
-            sys.executable, str(daemon_path),
+            uv, "run",
+            "--no-project",
+            "--with-requirements", _find_gateway_lock(),
+            "--with", "psycopg2-binary==2.9.12",
+            "python", str(daemon_path),
             env=env,
             pass_fds=(read_fd,) if read_fd is not None else (),
         )
@@ -3059,7 +3093,11 @@ async def _start_rem_daemon() -> "asyncio.subprocess.Process | None":
     env, read_fd = _daemon_env_and_token_fd(_REM_DAEMON_AGENT_NAME)
     try:
         proc = await asyncio.create_subprocess_exec(
-            sys.executable, str(rem_path),
+            uv, "run",
+            "--no-project",
+            "--with-requirements", _find_gateway_lock(),
+            "--with", "psycopg2-binary==2.9.12",
+            "python", str(rem_path),
             env=env,
             pass_fds=(read_fd,) if read_fd is not None else (),
         )
