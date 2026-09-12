@@ -8459,3 +8459,6 @@ Migration 006 adds the `superseded` column — the coordinator will fail to serv
 [0.2.7]: https://github.com/KanenasInGreece/Shared_Memory/releases/tag/v0.2.7
 [0.2.0]: https://github.com/KanenasInGreece/Shared_Memory/releases/tag/v0.2.0
 [0.1.0]: https://github.com/KanenasInGreece/Shared_Memory/releases/tag/v0.1.0
+
+## 0.9.97
+- Pre-v1 design minimums (S7, S8, S9, S10) implemented.

@@ -2619,10 +2619,10 @@ ALT_VECTOR_FAILING_AFTER = _env_int("ALT_VECTOR_FAILING_AFTER", 5)
 LOCKS_MAX_SIZE = _env_int("LOCKS_MAX_SIZE", 4096)
 
 # Outer load-shed valve: cap concurrent in-flight requests at the auth seam.
-# 0 = disabled (default). Complements POOL_ACQUIRE_TIMEOUT — the semaphore caps
+# 100 (default), 0 = disabled. Complements POOL_ACQUIRE_TIMEOUT — the semaphore caps
 # total requests (incl. those parked on embeddings/LLM that hold no DB conn);
 # the pool timeout protects the DB connection budget specifically.
-GATEWAY_INFLIGHT_MAX = _env_int("GATEWAY_INFLIGHT_MAX", 0)
+GATEWAY_INFLIGHT_MAX = _env_int("GATEWAY_INFLIGHT_MAX", 100)
 
 # Thin per-request observability audit log (JSON-lines, append-only, OFF the DB
 # hot path). Records {ts, agent, role, method, path, status, latency_ms,

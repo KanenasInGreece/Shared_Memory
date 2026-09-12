@@ -2237,6 +2237,19 @@ class AsyncHiveMindProxy:
             )
         target_base = llm_backend
 
+        # S5: credentialed backend serves only its declared `model` (refuse, not rewrite).
+        # We check this here before _forward_upstream so no capacity slot is consumed.
+        backend_model = LLM_BACKEND_MODELS.get(llm_backend)
+        if LLM_BACKEND_TOKENS.get(llm_backend) is not None and backend_model and isinstance(body_obj, dict):
+            caller_model = body_obj.get("model")
+            if caller_model and caller_model != backend_model:
+                return web.json_response(
+                    {"error": "model_mismatch",
+                     "detail": f"credentialed backend requires model '{backend_model}', but request specified '{caller_model}'"},
+                    status=400,
+                    headers={"X-SM-Fault-Origin": "gateway"},
+                )
+
         # Per-backend body rewrites (LLM_BACKENDS_JSON "model" +
         # "extra_body") — a cloud endpoint needs its real model id, not the
         # local "local-model" every caller sends by default, and its
@@ -2497,7 +2510,37 @@ class AsyncHiveMindProxy:
                         # origin error — the body still passes through verbatim below,
                         # unchanged. This header is additive and never set on success.
                         if upstream.status >= 400:
-                            proxy_resp.headers["X-SM-Fault-Origin"] = "upstream"
+                            # S8: Typed refusal instead of verbatim provider >=400 bodies
+                            body_bytes = await upstream.read()
+                            content_encoding = upstream.headers.get("Content-Encoding")
+                            try:
+                                error_type = _parse_upstream_error_type(
+                                    _decompress_prefix_for_parse(body_bytes, content_encoding))
+                            except Exception:
+                                error_type = "transient"
+                            
+                            if llm_backend is not None:
+                                try:
+                                    record_llm_upstream_fault(
+                                        llm_backend, upstream.status, error_type,
+                                        credentialed=bool(backend_token),
+                                        request_id=_safe_request_id(request),
+                                    )
+                                except Exception as exc:
+                                    log.warning(
+                                        "credential-fault classification failed for %s: %s",
+                                        target_url, type(exc).__name__)
+                            
+                            headers = {"X-SM-Fault-Origin": "upstream"}
+                            if llm_backend is not None:
+                                headers["X-SM-LLM-Backend"] = scrub_url_credentials(llm_backend)
+                            
+                            return web.json_response(
+                                {"error": "upstream_fault", "status": upstream.status, "type": error_type},
+                                status=upstream.status,
+                                headers=headers,
+                            )
+                            
                         # D9 (OBS round): a NARROW except scoped to `prepare()`
                         # ONLY — the same classes the mid-stream write path
                         # below already catches, `(ConnectionResetError,
@@ -2598,24 +2641,6 @@ class AsyncHiveMindProxy:
                                         usage_chunks = None   # abandon — too big to hold
                                     else:
                                         usage_chunks.append(chunk)
-                                if not fault_classified:
-                                    fault_classified = True
-                                    try:
-                                        # O-2: the recorder call is wrapped — an
-                                        # exception here (e.g. a future edit to the
-                                        # recorder) must never truncate the
-                                        # passthrough that follows on the next line.
-                                        error_type = _parse_upstream_error_type(
-                                            _decompress_prefix_for_parse(chunk, content_encoding))
-                                        record_llm_upstream_fault(
-                                            llm_backend, upstream.status, error_type,
-                                            credentialed=bool(backend_token),
-                                            request_id=_safe_request_id(request),
-                                        )
-                                    except Exception as exc:
-                                        log.warning(
-                                            "credential-fault classification failed for %s: %s",
-                                            target_url, type(exc).__name__)
                                 await proxy_resp.write(chunk)
                             await proxy_resp.write_eof()
 
@@ -2999,11 +3024,7 @@ async def _start_daemon() -> "asyncio.subprocess.Process | None":
     env, read_fd = _daemon_env_and_token_fd(_CONSOLIDATION_AGENT_NAME)
     try:
         proc = await asyncio.create_subprocess_exec(
-            uv, "run",
-            "--with", "httpx",
-            "--with", "psycopg2-binary",
-            "--with", "neo4j",
-            "python", str(daemon_path),
+            sys.executable, str(daemon_path),
             env=env,
             pass_fds=(read_fd,) if read_fd is not None else (),
         )
@@ -3038,11 +3059,7 @@ async def _start_rem_daemon() -> "asyncio.subprocess.Process | None":
     env, read_fd = _daemon_env_and_token_fd(_REM_DAEMON_AGENT_NAME)
     try:
         proc = await asyncio.create_subprocess_exec(
-            uv, "run",
-            "--with", "httpx",
-            "--with", "psycopg2-binary",
-            "--with", "neo4j",
-            "python", str(rem_path),
+            sys.executable, str(rem_path),
             env=env,
             pass_fds=(read_fd,) if read_fd is not None else (),
         )
@@ -5441,6 +5458,32 @@ def _coordinator_health_keys(coordinator) -> dict:
         }
 
 
+
+_llm_status_cache: dict[str, str] = {}
+
+async def _llm_probe_daemon(proxy, stop_event) -> None:
+    """Background loop to probe LLM backends (S7), off the request path."""
+    global _llm_status_cache
+    while not stop_event.is_set():
+        new_status = {}
+        for b in LLM_BACKENDS:
+            try:
+                async with proxy.session.get(_v1_models_probe_url(b), timeout=ClientTimeout(total=2.0),
+                                             headers=_probe_headers(b), allow_redirects=False) as r:
+                    if r.status < 400:
+                        new_status[b] = "ok"
+                    else:
+                        new_status[b] = f"http_{r.status}"
+            except asyncio.TimeoutError:
+                new_status[b] = "timeout"
+            except Exception:
+                new_status[b] = "down"
+        _llm_status_cache = new_status
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=3.0)
+        except asyncio.TimeoutError:
+            pass
+
 async def _build_health_checks(proxy: "AsyncHiveMindProxy", coordinator) -> dict:
     """The full probe: every upstream backend, daemon liveness, config, and
     the dream-cycle snapshot. Returns the SAME shape regardless of caller —
@@ -5496,37 +5539,11 @@ async def _build_health_checks(proxy: "AsyncHiveMindProxy", coordinator) -> dict
     # Reasoning-LLM backend pool — probe each; "llm" is ok if ANY is up (the pool
     # tolerates a down backend). Per-backend statuses are reported for observability;
     # a reserved judge backend is flagged. A single-backend deployment just shows one.
-    backend_status: dict[str, str] = {}
-    for b in LLM_BACKENDS:
-        try:
-            async with proxy.session.get(_v1_models_probe_url(b), timeout=ClientTimeout(total=2.0),
-                                         headers=_probe_headers(b), allow_redirects=False) as r:
-                if r.status < 400:
-                    backend_status[b] = "ok"
-                else:
-                    # ⚠ FIXED IN 0.9.74 (enumerated in
-                    # telemetry_contract.MEANING_CHANGES). A 401/403 from a
-                    # CREDENTIALED backend used to be reported `ok`, on the
-                    # argument that the server ANSWERED and its rejection of a
-                    # bare probe is correct auth behaviour rather than downness.
-                    # ⚠ AND FIXED AGAIN IN 0.9.75: that 0.9.74 change kept the
-                    # probe BARE, so a credentialed backend's expected 401 to
-                    # an unauthenticated GET read as down (fact:1794). The probe
-                    # now carries the backend's own bearer (_probe_headers), so
-                    # a 401 here is a rejected key, never a missing one.
-                    # That argument is about the SERVER; the question /health
-                    # answers is about the DEPENDENCY, and a backend this
-                    # gateway cannot get a completion out of is not usable
-                    # however correct its refusal is. Reporting it green meant
-                    # the one failure an operator can actually fix — a wrong or
-                    # expired provider key — was the one failure /health hid.
-                    # The status code is passed through as-is, so `http_401`
-                    # says WHICH kind of unusable it is.
-                    backend_status[b] = f"http_{r.status}"
-        except asyncio.TimeoutError:
-            backend_status[b] = "timeout"
-        except Exception:
-            backend_status[b] = "down"
+    # Reasoning-LLM backend pool — now read from background probe cache (S7)
+    backend_status: dict[str, str] = dict(_llm_status_cache)
+    if not backend_status:
+        backend_status = {b: "unknown" for b in LLM_BACKENDS}
+
     # SEC B (defense in depth, second wall behind A): scrub every backend URL
     # KEY before this dict reaches ANY client-facing surface — it feeds BOTH
     # checks["llm_backends"] below AND _llm_runtime_snapshot()'s "backends"
@@ -6447,6 +6464,7 @@ async def main() -> None:
     rem_watchdog_task = asyncio.create_task(_watchdog_rem_daemon(stop_event))
     # Backend capability probe — measures whether the critical backends can
     # actually SERVE, not merely whether they answer /health.
+    llm_probe_task    = asyncio.create_task(_llm_probe_daemon(proxy, stop_event))
     capability_task   = asyncio.create_task(
         _capability_probe_daemon(proxy, stop_event, coordinator))
     # A2: periodic lifecycle token-count sum lines (no-op unless
