@@ -1418,6 +1418,9 @@ def main(argv=None) -> int:
         if not raw_token:
             print("✗ no token read from stdin", file=sys.stderr)
             return 1
+        if len(raw_token) < 20:
+            print("✗ token is too short (entropy floor: 20 characters minimum)", file=sys.stderr)
+            return 1
         print(f"{args.digest}:sha256:{_digest(raw_token)}")
         return 0
 
