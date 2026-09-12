@@ -5,6 +5,11 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.9.98] — 2026-09-12
+
+### Fixed
+- The credentialed-model gate no longer refuses the framework’s own default `local-model`. It is treated as “unspecified” and rewritten to the backend’s declared model, restoring the dreaming cycle (REM/NREM) on any host with a credentialed reasoning backend; any other caller-named model is still refused. The gate’s pre-existing limitation — a request that omits `model`, or sends a non-object body, is forwarded unchanged — is recorded, not changed.
+
 ## [0.9.97] — 2026-09-12
 
 ### Security seam — the pre-v1 S-group
