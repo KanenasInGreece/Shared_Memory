@@ -37,6 +37,7 @@ async def run_test():
 
     # 1. Start the daemon in the background with Mock LLM enabled
     env = os.environ.copy()
+    env["MOCK_LLM"] = "1"
     repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
     lock_path = os.path.join(repo_root, "requirements-gateway.lock")
     daemon_path = os.path.join(repo_root, "shared-memory", "scripts", "consolidation_loop.py")

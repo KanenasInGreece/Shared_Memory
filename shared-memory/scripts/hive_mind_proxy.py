@@ -1429,7 +1429,7 @@ def _record_backend_token_usage(backend: str, usage: dict) -> None:
         if touched:
             _llm_tokens_last_ts[backend] = datetime.now(timezone.utc).isoformat()
     except Exception as exc:
-        log.warning("token usage accounting failed for %s: %s", backend, exc)
+        log.warning("token usage accounting failed for %s: %s", scrub_url_credentials(backend), exc)
 
 
 def _record_llm_latency(backend: str, elapsed_s: float, failed: bool) -> None:
@@ -1445,7 +1445,7 @@ def _record_llm_latency(backend: str, elapsed_s: float, failed: bool) -> None:
         _llm_latency_max_s[backend] = max(_llm_latency_max_s.get(backend, 0.0), elapsed_s)
         _llm_latency_last_ts[backend] = datetime.now(timezone.utc).isoformat()
     except Exception as exc:
-        log.warning("latency accounting failed for %s: %s", backend, exc)
+        log.warning("latency accounting failed for %s: %s", scrub_url_credentials(backend), exc)
 
 
 def _llm_mark_fail(backend: str) -> None:
@@ -1458,7 +1458,7 @@ def _llm_mark_fail(backend: str) -> None:
     if len(fails) >= LLM_FAIL_THRESHOLD:
         _llm_unhealthy_until[backend] = now + LLM_COOLDOWN
         _llm_fail_times[backend] = []
-        log.warning("LLM backend %s in cooldown for %.0fs (%d fails)", backend, LLM_COOLDOWN, LLM_FAIL_THRESHOLD)
+        log.warning("LLM backend %s in cooldown for %.0fs (%d fails)", scrub_url_credentials(backend), LLM_COOLDOWN, LLM_FAIL_THRESHOLD)
 
 
 def _llm_mark_ok(backend: str) -> None:
@@ -2536,9 +2536,8 @@ class AsyncHiveMindProxy:
                         if upstream.status >= 400:
                             # S8: Typed refusal instead of verbatim provider >=400 bodies.
                             # ADV-5: the read is BOUNDED to _ERROR_BODY_PARSE_CAP — the
-                            # classification only ever needs a prefix, so a hostile or
-                            # hung upstream cannot pin the in-flight slot buffering an
-                            # unbounded ≥400 body.
+                            # classification only ever needs a prefix, so the read is
+                            # size-bounded and an oversized ≥400 body is not buffered.
                             content_encoding = upstream.headers.get("Content-Encoding")
                             try:
                                 body_bytes = await upstream.content.read(_ERROR_BODY_PARSE_CAP)
@@ -2549,7 +2548,7 @@ class AsyncHiveMindProxy:
                                     _decompress_prefix_for_parse(body_bytes, content_encoding))
                             except Exception:
                                 error_type = "transient"
-                            
+
                             if llm_backend is not None:
                                 try:
                                     record_llm_upstream_fault(
@@ -2561,17 +2560,16 @@ class AsyncHiveMindProxy:
                                     log.warning(
                                         "credential-fault classification failed for %s: %s",
                                         scrubbed_target_url, type(exc).__name__)
-                            
+
                             headers = {"X-SM-Fault-Origin": "upstream"}
                             if llm_backend is not None:
                                 headers["X-SM-LLM-Backend"] = scrub_url_credentials(llm_backend)
-                            
+
                             return web.json_response(
                                 {"error": "upstream_fault", "status": upstream.status, "type": error_type},
                                 status=upstream.status,
                                 headers=headers,
                             )
-                            
                         # D9 (OBS round): a NARROW except scoped to `prepare()`
                         # ONLY — the same classes the mid-stream write path
                         # below already catches, `(ConnectionResetError,
