@@ -458,22 +458,22 @@ def test_convert_digests_matches_leading_whitespace_agent_tokens_line(tmp_path):
 
 def test_digest_flag_prints_only_the_digest_entry(monkeypatch):
     gt = load_generate_tokens()
-    monkeypatch.setattr(gt.sys, "stdin", io.StringIO("tok_operator_chosen"))
+    monkeypatch.setattr(gt.sys, "stdin", io.StringIO("tok_operator_chosen_long"))
 
     rc, out = _capture(gt.main, ["--digest", "backup"])
 
     assert rc == 0
-    assert out.strip() == f"backup:sha256:{_digest('tok_operator_chosen')}"
+    assert out.strip() == f"backup:sha256:{_digest('tok_operator_chosen_long')}"
 
 
 def test_digest_flag_strips_surrounding_whitespace_from_stdin(monkeypatch):
     gt = load_generate_tokens()
-    monkeypatch.setattr(gt.sys, "stdin", io.StringIO("  tok_operator_chosen  \n"))
+    monkeypatch.setattr(gt.sys, "stdin", io.StringIO("  tok_operator_chosen_long  \n"))
 
     rc, out = _capture(gt.main, ["--digest", "backup"])
 
     assert rc == 0
-    assert out.strip() == f"backup:sha256:{_digest('tok_operator_chosen')}"
+    assert out.strip() == f"backup:sha256:{_digest('tok_operator_chosen_long')}"
 
 
 def test_digest_flag_mints_nothing_and_writes_nothing(monkeypatch, tmp_path):
@@ -481,11 +481,26 @@ def test_digest_flag_mints_nothing_and_writes_nothing(monkeypatch, tmp_path):
     claude_dir = tmp_path / "claude_skill"
     claude_dir.mkdir()
     gt.LOCAL_SKILL_ENV_PATHS = {"claude": str(claude_dir / ".env")}
-    monkeypatch.setattr(gt.sys, "stdin", io.StringIO("tok_x"))
+    monkeypatch.setattr(gt.sys, "stdin", io.StringIO("tok_operator_chosen_long"))
 
     _capture(gt.main, ["--digest", "backup"])
 
     assert not (claude_dir / ".env").exists(), "--digest must never write through to a skill .env"
+
+
+def test_digest_flag_refuses_a_short_token(monkeypatch):
+    """S11 (v0.9.97): the 20-character entropy floor. --digest refuses a token
+    shorter than 20 characters with a nonzero exit and prints NO digest entry
+    on stdout — an operator with a legacy short token is told to lengthen it,
+    never silently given a digest of a weak token."""
+    gt = load_generate_tokens()
+    monkeypatch.setattr(gt.sys, "stdin", io.StringIO("short"))
+
+    rc, out = _capture(gt.main, ["--digest", "backup"])
+
+    assert rc == 1
+    assert "sha256" not in out
+    assert out.strip() == ""
 
 
 def test_digest_flag_empty_stdin_errors_without_printing_a_digest(monkeypatch):

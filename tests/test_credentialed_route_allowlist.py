@@ -58,9 +58,11 @@ class _HeaderCaptureSession:
         raise RuntimeError("capture-only session — no real upstream call")
 
 
-def _req(method: str, raw: str):
+def _req(method: str, raw: str, model: str = "local-model"):
     """`raw` is the request target EXACTLY as it would arrive on the wire —
-    percent-encoding and query string included.
+    percent-encoding and query string included. `model` is the caller's body
+    model; the credentialed tests that must REACH the upstream pass the
+    backend's declared model so S5's refuse-not-rewrite check does not fire.
 
     T-1 (HYG round): `rel_url` is a REAL `yarl.URL(raw, encoded=True)`, because
     both gates now read `rel_url.raw_path` (ruling 2 — the request-target
@@ -80,7 +82,7 @@ def _req(method: str, raw: str):
     r.can_read_body = True
 
     async def read():
-        return b'{"messages":[],"model":"local-model"}'
+        return json.dumps({"messages": [], "model": model}).encode()
     r.read = read
     return r
 
@@ -107,7 +109,10 @@ def test_post_chat_completions_to_credentialed_backend_passes(monkeypatch):
     proxy = g.AsyncHiveMindProxy()
     session = _HeaderCaptureSession()
     proxy.session = session
-    resp = asyncio.run(proxy.handle_proxy(_req("POST", "/v1/chat/completions")))
+    # The caller sends the backend's declared model, so S5's refuse-not-rewrite
+    # check passes and the call reaches the upstream (this test is about the
+    # S-04 allowlist, not S5).
+    resp = asyncio.run(proxy.handle_proxy(_req("POST", "/v1/chat/completions", model="deepseek-chat")))
     # The capture session raises RuntimeError once .request() is actually
     # called -- handle_proxy's own exception handling turns that into a 500,
     # which is proof the allowlist let the call through (not a 403).
@@ -128,6 +133,25 @@ def test_get_to_credentialed_backend_403s_before_any_upstream_call(monkeypatch):
     # Honest, non-leaky: names the RULE, not the backend roster.
     assert "framework endpoints" in body["error"]
     assert "deepseek" not in body["error"].lower()
+
+
+def test_s5_model_mismatch_is_refused_before_any_upstream_call(monkeypatch):
+    """S5 (v0.9.97): a credentialed backend serves only its declared `model`
+    (refuse, not rewrite). A caller sending a different model gets 400
+    model_mismatch before any upstream call — the mismatch is named, the key
+    is never consumed, and no capacity slot is taken."""
+    g = _load_credentialed_gateway(monkeypatch)   # declares model "deepseek-chat"
+    proxy = g.AsyncHiveMindProxy()
+    proxy.session = _MustNotCallSession()
+    resp = asyncio.run(proxy.handle_proxy(
+        _req("POST", "/v1/chat/completions", model="local-model")))
+    assert resp.status == 400
+    body = json.loads(resp.body.decode())
+    assert body["error"] == "model_mismatch"
+    assert "deepseek-chat" in body["detail"]
+    assert "local-model" in body["detail"]
+    assert resp.headers.get("X-SM-Fault-Origin") == "gateway"
+    assert "sk-allowlist-test" not in json.dumps(body)
 
 
 def test_arbitrary_path_to_credentialed_backend_403s(monkeypatch):
@@ -287,7 +311,7 @@ def test_r4_still_allows_the_plain_spelling(monkeypatch):
     proxy = g.AsyncHiveMindProxy()
     session = _HeaderCaptureSession()
     proxy.session = session
-    resp = asyncio.run(proxy.handle_proxy(_req("POST", "/v1/chat/completions")))
+    resp = asyncio.run(proxy.handle_proxy(_req("POST", "/v1/chat/completions", model="deepseek-chat")))
     assert resp.status != 403
     assert session.captured_headers["Authorization"] == "Bearer sk-allowlist-test"
 
@@ -329,7 +353,7 @@ def test_mixed_fleet_sanity_r4_does_not_fire(monkeypatch):
     proxy = g.AsyncHiveMindProxy()
     session = _HeaderCaptureSession()
     proxy.session = session
-    resp = asyncio.run(proxy.handle_proxy(_req("POST", "/v1/chat/completions")))
+    resp = asyncio.run(proxy.handle_proxy(_req("POST", "/v1/chat/completions", model="deepseek-chat")))
     assert resp.status != 403
     assert session.captured_headers["Authorization"] == "Bearer sk-allowlist-test"
 

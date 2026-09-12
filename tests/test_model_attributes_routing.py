@@ -816,6 +816,25 @@ class _FixedStatusSession:
         return _StatusCm(self._status)
 
 
+async def _run_probe_cycle(g, proxy):
+    """Drive the S7 background probe daemon (_llm_probe_daemon) through one
+    full cycle and stop it, returning the resulting _llm_status_cache.
+
+    S7 moved the per-backend /v1/models probe OFF the request path into a
+    background task, so /health no longer runs it inline — a test that wants
+    /health to reflect a probed backend must run the daemon first (exactly
+    what this helper does), instead of the pre-S7 inline probe."""
+    stop = asyncio.Event()
+    task = asyncio.create_task(g._llm_probe_daemon(proxy, stop))
+    for _ in range(1000):
+        if g._llm_status_cache:
+            break
+        await asyncio.sleep(0.001)
+    stop.set()
+    await task
+    return dict(g._llm_status_cache)
+
+
 def test_a_credentialed_backend_that_401s_is_reported_unusable(monkeypatch):
     """RE-RULED at v0.9.74 (was: test_h1_credentialed_backend_401_reads_ok).
 
@@ -829,7 +848,10 @@ def test_a_credentialed_backend_that_401s_is_reported_unusable(monkeypatch):
     fix — was the one failure /health reported green.
 
     Enumerated as a meaning change in telemetry_contract.MEANING_CHANGES
-    (fact:1626), because the KEY did not change: only what it says."""
+    (fact:1626), because the KEY did not change: only what it says.
+
+    S7: the probe now runs in the background daemon, so this test drives it
+    once before reading /health."""
     monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
         {"url": "https://api.deepseek.com/v1", "token_env": "DEEPSEEK_API_KEY", "private_ok": True},
@@ -839,6 +861,7 @@ def test_a_credentialed_backend_that_401s_is_reported_unusable(monkeypatch):
     proxy.session = _FixedStatusSession(401)
 
     async def _run():
+        await _run_probe_cycle(g, proxy)
         return await g._build_health_checks(proxy, None)
     checks = asyncio.run(_run())
     # The status code is passed through, so the payload says WHICH kind of
@@ -859,6 +882,7 @@ def test_h1_uncredentialed_backend_401_stays_down(monkeypatch):
     proxy.session = _FixedStatusSession(401)
 
     async def _run():
+        await _run_probe_cycle(g, proxy)
         return await g._build_health_checks(proxy, None)
     checks = asyncio.run(_run())
     assert checks["llm"] == "down"
@@ -875,6 +899,7 @@ def test_h1_credentialed_backend_5xx_stays_down(monkeypatch):
     proxy.session = _FixedStatusSession(500)
 
     async def _run():
+        await _run_probe_cycle(g, proxy)
         return await g._build_health_checks(proxy, None)
     checks = asyncio.run(_run())
     assert checks["llm"] == "down"
@@ -1125,7 +1150,10 @@ def test_the_backend_probe_carries_the_backends_own_bearer(monkeypatch):
     unauthenticated request on every path, so a correct key read `http_401`
     and the pool `degraded` on the first live reading. The probe must send
     exactly what a real call sends: the backend's bearer, from the token map
-    (never os.environ, never logged). Then a 401 means a rejected key."""
+    (never os.environ, never logged). Then a 401 means a rejected key.
+
+    S7: the probe now runs in _llm_probe_daemon, off the request path — drive
+    one cycle and assert both the sent headers and the resulting cache."""
     monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
         {"url": "https://api.deepseek.com/v1", "token_env": "DEEPSEEK_API_KEY", "private_ok": True},
@@ -1136,11 +1164,14 @@ def test_the_backend_probe_carries_the_backends_own_bearer(monkeypatch):
     proxy.session = _FixedStatusSession(200)
 
     async def _run():
-        return await g._build_health_checks(proxy, None)
-    checks = asyncio.run(_run())
+        cache = await _run_probe_cycle(g, proxy)
+        checks = await g._build_health_checks(proxy, None)
+        return cache, checks
+    cache, checks = asyncio.run(_run())
     sent = proxy.session.probe_headers
     assert sent["https://api.deepseek.com/v1/models"] == {"Authorization": "Bearer sk-test"}
     assert sent["http://localhost:5000/v1/models"] == {}          # uncredentialed: nothing
+    assert cache["https://api.deepseek.com/v1"] == "ok"
     assert checks["llm_backends"]["https://api.deepseek.com/v1"] == "ok"
 
 
@@ -1158,6 +1189,7 @@ def test_a_401_with_the_bearer_attached_is_a_rejected_key(monkeypatch):
     proxy.session = _FixedStatusSession(401)
 
     async def _run():
+        await _run_probe_cycle(g, proxy)
         return await g._build_health_checks(proxy, None)
     checks = asyncio.run(_run())
     assert proxy.session.probe_headers["https://api.deepseek.com/v1/models"]["Authorization"] == "Bearer sk-test"
@@ -1182,7 +1214,7 @@ def test_the_probe_never_sends_a_bearer_over_plaintext_to_a_remote_host(monkeypa
     proxy.session = _FixedStatusSession(200)
 
     async def _run():
-        return await g._build_health_checks(proxy, None)
+        await _run_probe_cycle(g, proxy)
     asyncio.run(_run())
     sent = proxy.session.probe_headers
     # plaintext_ok: the operator asserted a private path, so the bearer rides

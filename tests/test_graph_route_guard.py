@@ -25,6 +25,7 @@ the mocked driver, proving the guard was the thing that stopped it). The
 two characters, which is exactly why the bypass needed a DOUBLE space to be
 found; they are kept as boundary coverage, not as the killing cases.
 """
+import json
 import os
 import sys
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -34,7 +35,7 @@ import pytest
 _SCRIPTS = os.path.join(os.path.dirname(__file__), "..", "shared-memory", "scripts")
 sys.path.insert(0, _SCRIPTS)
 
-from coordinator import _WRITE_CYPHER, MemoryCoordinator  # noqa: E402
+from coordinator import _WRITE_CYPHER, GRAPH_QUERY_ROW_CAP, MemoryCoordinator  # noqa: E402
 
 
 # ── Queries that MUST be refused ──────────────────────────────────────────────
@@ -141,7 +142,7 @@ async def test_handle_graph_still_opens_a_read_session_for_a_read_query():
     opened READ-only (the second layer stays in place)."""
     coord = _coordinator()
     session = MagicMock()
-    session.run = AsyncMock(return_value=MagicMock(data=AsyncMock(return_value=[{"n": 1}])))
+    session.run = AsyncMock(return_value=MagicMock(fetch=AsyncMock(return_value=[{"n": 1}])))
     ctx = MagicMock()
     ctx.__aenter__ = AsyncMock(return_value=session)
     ctx.__aexit__ = AsyncMock(return_value=False)
@@ -150,3 +151,44 @@ async def test_handle_graph_still_opens_a_read_session_for_a_read_query():
     resp = await coord.handle_graph(_request({"cypher": "MATCH (n) RETURN n.settings"}))
     assert resp.status == 200
     coord._neo4j.session.assert_called_once_with(default_access_mode="READ")
+
+
+@pytest.mark.asyncio
+async def test_handle_graph_refuses_query_exceeding_row_cap():
+    """SEC-6: a read query whose fetch returns more than GRAPH_QUERY_ROW_CAP
+    is refused with HTTP 400 and 'graph_row_cap_exceeded' before serialization."""
+    coord = _coordinator()
+    session = MagicMock()
+    over_cap_records = [{"n": i} for i in range(GRAPH_QUERY_ROW_CAP + 1)]
+    session.run = AsyncMock(return_value=MagicMock(fetch=AsyncMock(return_value=over_cap_records)))
+    ctx = MagicMock()
+    ctx.__aenter__ = AsyncMock(return_value=session)
+    ctx.__aexit__ = AsyncMock(return_value=False)
+    coord._neo4j.session = MagicMock(return_value=ctx)
+
+    resp = await coord.handle_graph(_request({"cypher": "MATCH (n) RETURN n.settings"}))
+    assert resp.status == 400
+    body = json.loads(resp.body)
+    assert body["status"] == "error"
+    assert body["error"] == "graph_row_cap_exceeded"
+    assert f"query returned more than {GRAPH_QUERY_ROW_CAP} rows" in body["message"]
+
+
+@pytest.mark.asyncio
+async def test_handle_graph_allows_query_at_or_under_row_cap():
+    """SEC-6: an at-or-under-cap query still returns HTTP 200."""
+    coord = _coordinator()
+    session = MagicMock()
+    at_cap_records = [{"n": i} for i in range(GRAPH_QUERY_ROW_CAP)]
+    session.run = AsyncMock(return_value=MagicMock(fetch=AsyncMock(return_value=at_cap_records)))
+    ctx = MagicMock()
+    ctx.__aenter__ = AsyncMock(return_value=session)
+    ctx.__aexit__ = AsyncMock(return_value=False)
+    coord._neo4j.session = MagicMock(return_value=ctx)
+
+    resp = await coord.handle_graph(_request({"cypher": "MATCH (n) RETURN n.settings"}))
+    assert resp.status == 200
+    body = json.loads(resp.body)
+    assert body["status"] == "success"
+    assert len(body["records"]) == GRAPH_QUERY_ROW_CAP
+

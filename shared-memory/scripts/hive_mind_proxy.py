@@ -87,6 +87,7 @@ from coordinator import (
     _parse_upstream_error_type,
     _decompress_prefix_for_parse,
     _decompress_full_for_usage,
+    _ERROR_BODY_PARSE_CAP,
     SUPPORTED_CONTENT_ENCODINGS,
     _short,
     # The telemetry contract's limits (v0.9.74) — imported rather than
@@ -2527,14 +2528,22 @@ class AsyncHiveMindProxy:
                         # degrades (R-2 accepted cost, HANDOFF note).
                         if llm_backend is not None:
                             proxy_resp.headers["X-SM-LLM-Backend"] = scrub_url_credentials(llm_backend)
-                        # Client-facing standard messaging (PR A3): a fault status
+                        # Client-facing standard messaging (PR A3 / S8): a fault status
                         # from ANY upstream (LLM, embedder, reranker) is an upstream-
-                        # origin error — the body still passes through verbatim below,
-                        # unchanged. This header is additive and never set on success.
+                        # origin error. S8 replaces the verbatim provider body with a
+                        # TYPED refusal (below); the fault-origin header is additive
+                        # and never set on success.
                         if upstream.status >= 400:
-                            # S8: Typed refusal instead of verbatim provider >=400 bodies
-                            body_bytes = await upstream.read()
+                            # S8: Typed refusal instead of verbatim provider >=400 bodies.
+                            # ADV-5: the read is BOUNDED to _ERROR_BODY_PARSE_CAP — the
+                            # classification only ever needs a prefix, so a hostile or
+                            # hung upstream cannot pin the in-flight slot buffering an
+                            # unbounded ≥400 body.
                             content_encoding = upstream.headers.get("Content-Encoding")
+                            try:
+                                body_bytes = await upstream.content.read(_ERROR_BODY_PARSE_CAP)
+                            except Exception:
+                                body_bytes = b""
                             try:
                                 error_type = _parse_upstream_error_type(
                                     _decompress_prefix_for_parse(body_bytes, content_encoding))
@@ -2602,19 +2611,9 @@ class AsyncHiveMindProxy:
                             _client_aborted = True
                             return proxy_resp
 
-                        # Best-effort credential-fault classification (PR A3): only for
-                        # the LLM pool (embeddings/reranking never carry a provider key)
-                        # and only on a fault status. Peeks the FIRST streamed chunk —
-                        # error bodies are small JSON that arrive in one chunk in
-                        # practice; classification never buffers or reorders anything,
-                        # so the passthrough below is untouched even when the peek
-                        # can't parse a split/foreign body (falls through to
-                        # "transient" — see _classify_llm_fault).
-                        fault_classified = llm_backend is None or upstream.status < 400
-                        # R-3: auto_decompress=False means a compressed error body
+                        # R-3: auto_decompress=False means a compressed response
                         # arrives as framing bytes, not JSON — read Content-Encoding
-                        # once so the peek below can decompress a bounded prefix
-                        # before parsing. The passthrough chunk itself is untouched.
+                        # once so the usage capture below can decompress it.
                         content_encoding = upstream.headers.get("Content-Encoding")
 
                         # Post-review addition A: accumulate the response body
@@ -2696,24 +2695,6 @@ class AsyncHiveMindProxy:
                             log.warning("Client disconnected mid-stream: %s — %s", scrubbed_target_url, e)
                             record_llm_client_disconnect()
                             _client_aborted = True
-
-                        # Fallback classification (PR A3): the loop above never ran its
-                        # body — an empty-bodied fault response, or a disconnect before
-                        # the first chunk arrived. Still worth recording: the status
-                        # alone is enough to classify 401/403, and an unparseable/absent
-                        # body classifies as transient either way.
-                        if not fault_classified:
-                            fault_classified = True
-                            try:
-                                record_llm_upstream_fault(
-                                    llm_backend, upstream.status, None,
-                                    credentialed=bool(backend_token),
-                                    request_id=_safe_request_id(request),
-                                )
-                            except Exception as exc:
-                                log.warning(
-                                    "credential-fault classification failed for %s: %s",
-                                    scrubbed_target_url, type(exc).__name__)
 
                         if usage_chunks:
                             try:
@@ -4889,8 +4870,15 @@ def _llm_pool_dependency(backend_status: dict) -> dict:
     """
     if not backend_status:
         return _dep(_STATE_UNKNOWN, "no backend configured")
-    bad = sorted(b for b, s in backend_status.items() if s != "ok")
-    if len(bad) == len(backend_status):
+    # S7 (ADV-4): "unknown" is a per-backend state meaning the background probe
+    # daemon has not landed yet. A never-probed backend is not a down backend,
+    # and a pool nobody has probed reads unknown, never down — the "unknown
+    # never elevates" contract (decision:374 / fact:375).
+    probed = {b: s for b, s in backend_status.items() if s != "unknown"}
+    if not probed:
+        return _dep(_STATE_UNKNOWN, "not yet probed")
+    bad = sorted(b for b, s in probed.items() if s != "ok")
+    if len(bad) == len(probed):
         down_reasons: list = []
         if LLM_POOL_FALLBACK_REASON:
             # H2 (handback, decision:1832): the fleet was DECLARED and
@@ -4924,7 +4912,7 @@ def _llm_pool_dependency(backend_status: dict) -> dict:
             config_empty_reason = f"{config_empty_reason}; {_LLM_POOL_LEGACY_REMEDY}"
         reasons.append(config_empty_reason)
     if bad:
-        reasons.append(f"{len(bad)}/{len(backend_status)} backend(s) down")
+        reasons.append(f"{len(bad)}/{len(probed)} backend(s) down")
     ineligible_reason = _all_roles_ineligible()
     if ineligible_reason:
         reasons.append(ineligible_reason)
@@ -5590,7 +5578,15 @@ async def _build_health_checks(proxy: "AsyncHiveMindProxy", coordinator) -> dict
     # production with A fatal on userinfo, but guards a test-seeded/future
     # bypass from silently merging two distinct backends into one key.
     backend_status = _scrub_backend_keyed_dict(backend_status, context="/health backend_status")
-    checks["llm"] = "ok" if any(s == "ok" for s in backend_status.values()) else "down"
+    # S7 (ADV-4): "unknown" is a per-backend state meaning the background probe
+    # has not landed yet — never-probed is not down. "unknown" only ever
+    # appears while the probe daemon's first cycle is still pending.
+    if any(s == "ok" for s in backend_status.values()):
+        checks["llm"] = "ok"
+    elif backend_status and all(s == "unknown" for s in backend_status.values()):
+        checks["llm"] = "unknown"
+    else:
+        checks["llm"] = "down"
     # Wedge visibility: reachability alone reported "ok" through a GPU-driver
     # hang (the accept thread answers while the generation engine is dead).
     # Surface the oldest in-flight age; past the suspect threshold, verify the

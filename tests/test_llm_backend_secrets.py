@@ -37,8 +37,14 @@ class _Req:
     headers = {"Authorization": "Bearer client-gateway-token"}
     can_read_body = True
 
+    def __init__(self, model="local-model"):
+        # S5 (v0.9.97): a credentialed backend serves only its declared model.
+        # Tests that must REACH the upstream pass the backend's declared model
+        # so the refuse-not-rewrite check does not fire.
+        self._model = model
+
     async def read(self):
-        return b'{"messages":[],"model":"local-model"}'
+        return json.dumps({"messages": [], "model": self._model}).encode()
 
 
 def test_client_authorization_never_forwarded_to_llm_backend(monkeypatch):
@@ -75,7 +81,7 @@ def test_backend_token_env_injected_as_authorization(monkeypatch):
     proxy = g.AsyncHiveMindProxy()
     session = _HeaderCaptureSession()
     proxy.session = session
-    asyncio.run(proxy.handle_proxy(_Req()))
+    asyncio.run(proxy.handle_proxy(_Req(model="deepseek-chat")))
 
     assert session.captured_headers["Authorization"] == "Bearer sk-test-123"
 
@@ -367,7 +373,7 @@ def test_token_never_leaks_into_client_visible_error_response(monkeypatch):
     ):
         proxy = g.AsyncHiveMindProxy()
         proxy.session = _FailSession(exc)
-        resp = asyncio.run(proxy.handle_proxy(_Req()))
+        resp = asyncio.run(proxy.handle_proxy(_Req(model="deepseek-chat")))
         assert resp.status in (503, 504, 500)
         assert "sk-must-never-appear-to-any-client" not in resp.body.decode()
         assert all("sk-must-never-appear-to-any-client" not in str(v)

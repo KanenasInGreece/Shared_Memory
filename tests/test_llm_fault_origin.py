@@ -1,13 +1,15 @@
 """Credential_Custody_Plan_2026-08-14, PR A3 — client-facing fault signalling
-and credential-fault recording on the proxy path (hive_mind_proxy.handle_proxy).
+and credential-fault recording on the proxy path (hive_mind_proxy.handle_proxy),
+plus the S8 typed-refusal contract (v0.9.97).
 
 Coverage:
   1. X-SM-Fault-Origin: upstream (a proxied backend itself returned the fault
-     status, body passed through verbatim) vs gateway (the gateway
-     constructed the error response) — never set on success.
-  2. The passthrough contract: an upstream error body/status survive the
-     proxy byte-for-byte (a stated contract, per the brief — this is the
-     regression test for it).
+     status) vs gateway (the gateway constructed the error response) — never
+     set on success.
+  2. The S8 typed-refusal contract: an upstream ≥400 body is NOT passed
+     through. The gateway returns its OWN bounded JSON — {"error":
+     "upstream_fault", "status", "type"} — so a provider's verbatim error
+     text (a reflected channel) never reaches the client.
   3. record_llm_upstream_fault / record_llm_gateway_fault actually fire from
      the real proxy code paths, not just in isolation (test_credential_audit_
      trail.py covers the recorder functions themselves).
@@ -35,7 +37,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "shared-memory"
 from aiohttp import web  # noqa: E402
 
 
-from yarl import URL
+from yarl import URL  # noqa: E402
 
 
 # ── test doubles ──────────────────────────────────────────────────────────────
@@ -72,9 +74,11 @@ class _DictReq(dict):
 
 
 class _OneShotAsyncIter:
-    """Minimal stand-in for aiohttp's StreamReader.iter_any() — yields the
-    whole body as one chunk, matching how a small JSON error body actually
-    arrives from a real LLM API in practice (never split mid-object)."""
+    """Minimal stand-in for aiohttp's StreamReader — supports both
+    `iter_any()` (the success-path streaming loop) and `read(n)` (the S8
+    bounded error-body read), each yielding the whole body as one chunk,
+    matching how a small JSON body actually arrives from a real LLM API in
+    practice (never split mid-object)."""
     def __init__(self, body: bytes):
         self._body = body
 
@@ -84,6 +88,11 @@ class _OneShotAsyncIter:
     async def _agen(self):
         if self._body:
             yield self._body
+
+    async def read(self, n=-1):
+        if n < 0:
+            return self._body
+        return self._body[:n]
 
 
 class _StatusBodyResp:
@@ -208,13 +217,12 @@ def _credentialed_backend(monkeypatch, url="http://a:5000", token_var="SM_TEST_T
 
 # ── 1 + 2. X-SM-Fault-Origin header + verbatim passthrough ──────────────────
 
-def test_upstream_fault_gets_upstream_origin_header_and_verbatim_body(monkeypatch):
+def test_upstream_fault_gets_upstream_origin_header_and_typed_refusal(monkeypatch):
     monkeypatch.delenv("LLM_BACKENDS", raising=False)
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps(
         [{"url": "http://a:5000", "private_ok": True}]))
     import hive_mind_proxy as g
     importlib.reload(g)
-    written = _patch_stream_response(monkeypatch)
 
     body = b'{"error":{"message":"bad key","type":"invalid_request_error","code":"invalid_api_key"}}'
     proxy = g.AsyncHiveMindProxy()
@@ -222,11 +230,15 @@ def test_upstream_fault_gets_upstream_origin_header_and_verbatim_body(monkeypatc
     resp = asyncio.run(proxy.handle_proxy(_FakeReq()))
 
     assert resp.status == 401
-    assert b"".join(written["chunks"]) == body, (
-        "the upstream error body must pass through byte-for-byte — this is "
-        "the stated passthrough contract"
-    )
-    assert written["headers"]["X-SM-Fault-Origin"] == "upstream"
+    assert resp.headers.get("X-SM-Fault-Origin") == "upstream"
+    parsed = json.loads(resp.body.decode())
+    assert parsed["error"] == "upstream_fault"
+    assert parsed["status"] == 401
+    assert parsed["type"] == "invalid_api_key"
+    # S8: the provider's own verbatim body must NOT be reflected back to the
+    # client — the typed refusal is the gateway's own message, not the
+    # upstream's.
+    assert "bad key" not in resp.body.decode()
 
 
 def test_successful_response_never_gets_fault_origin_header(monkeypatch):
@@ -249,13 +261,14 @@ def test_successful_response_never_gets_fault_origin_header(monkeypatch):
 
 def test_embedding_route_fault_also_gets_upstream_origin_header(monkeypatch):
     """The header is not LLM-pool-only — any proxied backend's fault status
-    (embeddings/reranking included) is upstream-origin too."""
+    (embeddings/reranking included) is upstream-origin too, and gets the same
+    S8 typed refusal (llm_backend is None on the encoder path, so no
+    X-SM-LLM-Backend header and no fault recording)."""
     monkeypatch.delenv("LLM_BACKENDS", raising=False)
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps(
         [{"url": "http://a:5000", "private_ok": True}]))
     import hive_mind_proxy as g
     importlib.reload(g)
-    written = _patch_stream_response(monkeypatch)
 
     class _EmbedReq:
         method = "POST"
@@ -274,7 +287,8 @@ def test_embedding_route_fault_also_gets_upstream_origin_header(monkeypatch):
     resp = asyncio.run(proxy.handle_encoder(_EmbedReq()))
 
     assert resp.status == 500
-    assert written["headers"]["X-SM-Fault-Origin"] == "upstream"
+    assert resp.headers.get("X-SM-Fault-Origin") == "upstream"
+    assert json.loads(resp.body.decode())["error"] == "upstream_fault"
 
 
 def test_gateway_origin_error_gets_gateway_fault_origin_header(monkeypatch):
@@ -398,15 +412,15 @@ def test_gateway_connect_failure_on_credentialed_call_records_gateway_fault(monk
 
 
 def test_empty_body_fault_response_still_classified(monkeypatch):
-    """An empty-bodied 401 (no chunks at all from iter_any()) must still be
-    recorded — the fallback classification after the streaming loop."""
+    """An empty-bodied 403 must still be recorded — with no body the parse
+    yields no error type, and _classify_llm_fault(403, None) is credential by
+    status alone, so the fault still counts as credential (S8)."""
     monkeypatch.delenv("LLM_BACKENDS", raising=False)
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps(
         [{"url": "http://a:5000", "private_ok": True}]))
     import coordinator
     import hive_mind_proxy as g
     importlib.reload(g)
-    _patch_stream_response(monkeypatch)
 
     proxy = g.AsyncHiveMindProxy()
     proxy.session = _StatusBodySession(403, b"")   # empty body -> iter_any yields nothing
@@ -500,22 +514,22 @@ def test_upstream_success_cannot_spoof_fault_origin_header(monkeypatch):
 def test_upstream_fault_cannot_spoof_a_different_backend_label(monkeypatch):
     """Same property on the fault path — the gateway's own
     X-SM-Fault-Origin: upstream assignment must not be pre-empted by
-    whatever the upstream itself sent under that name."""
+    whatever the upstream itself sent under that name (S8 constructs its own
+    headers on the typed refusal; the upstream's spoofed header is dropped)."""
     monkeypatch.delenv("LLM_BACKENDS", raising=False)
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps(
         [{"url": "http://a:5000", "private_ok": True}]))
     import hive_mind_proxy as g
     importlib.reload(g)
-    written = _patch_stream_response(monkeypatch)
 
     proxy = g.AsyncHiveMindProxy()
     proxy.session = _StatusBodySession(401, b'{"error":{"code":"x"}}', headers={
         "Content-Type": "application/json",
         "X-SM-Fault-Origin": "gateway",  # upstream tries to claim it's the gateway
     })
-    asyncio.run(proxy.handle_proxy(_FakeReq()))
+    resp = asyncio.run(proxy.handle_proxy(_FakeReq()))
 
-    assert written["headers"]["X-SM-Fault-Origin"] == "upstream"
+    assert resp.headers.get("X-SM-Fault-Origin") == "upstream"
 
 
 def test_request_direction_headers_unaffected_by_gateway_namespace_strip(monkeypatch):
@@ -533,15 +547,15 @@ def test_request_direction_headers_unaffected_by_gateway_namespace_strip(monkeyp
     assert filtered["X-SM-Custom"] == "client-value"
 
 
-# ── 6. O-2: the classification call must never truncate the passthrough ─────
+# ── 6. O-2: the classification call must never break the typed refusal ───────
 
-def test_classification_exception_never_truncates_the_passthrough(monkeypatch):
-    """⚑ Security review O-2, mutation-checked in the review itself: make
-    the recorder raise and confirm the body still arrives byte-for-byte.
-    MUTATION TARGET: remove the try/except around either
-    record_llm_upstream_fault call site and this fails with a truncated
-    body (today: only the in-loop site is exercised here, since a body-
-    bearing response always hits that site, never the fallback)."""
+def test_classification_exception_never_breaks_the_typed_refusal(monkeypatch):
+    """⚑ Security review O-2, carried onto the S8 shape: make the recorder
+    raise and confirm the typed refusal still arrives, with the parsed type
+    intact. MUTATION TARGET: remove the try/except around the
+    record_llm_upstream_fault call site and this fails (the recorder
+    exception propagates out to the generic exception handler instead of the
+    401 typed refusal)."""
     monkeypatch.delenv("LLM_BACKENDS", raising=False)
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps(
         [{"url": "http://a:5000", "private_ok": True}]))
@@ -549,7 +563,6 @@ def test_classification_exception_never_truncates_the_passthrough(monkeypatch):
     importlib.reload(g)
     monkeypatch.setattr(g, "record_llm_upstream_fault",
                          lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("recorder boom")))
-    written = _patch_stream_response(monkeypatch)
 
     body = b'{"error":{"code":"invalid_api_key"}}'
     proxy = g.AsyncHiveMindProxy()
@@ -557,14 +570,17 @@ def test_classification_exception_never_truncates_the_passthrough(monkeypatch):
     resp = asyncio.run(proxy.handle_proxy(_FakeReq()))
 
     assert resp.status == 401
-    assert b"".join(written["chunks"]) == body, (
-        "a raising recorder must never truncate the passthrough — "
+    parsed = json.loads(resp.body.decode())
+    assert parsed["error"] == "upstream_fault"
+    assert parsed["type"] == "invalid_api_key", (
+        "a raising recorder must never break the typed refusal — "
         "classification is best-effort, the response is not"
     )
 
 
-def test_classification_exception_on_empty_body_fallback_never_breaks_the_response(monkeypatch):
-    """Same property for the FALLBACK call site (empty-bodied fault)."""
+def test_classification_exception_on_empty_body_never_breaks_the_response(monkeypatch):
+    """Same property for an empty-bodied fault (error_type stays None → a
+    status-only credential classification)."""
     monkeypatch.delenv("LLM_BACKENDS", raising=False)
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps(
         [{"url": "http://a:5000", "private_ok": True}]))
@@ -572,7 +588,6 @@ def test_classification_exception_on_empty_body_fallback_never_breaks_the_respon
     importlib.reload(g)
     monkeypatch.setattr(g, "record_llm_upstream_fault",
                          lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("recorder boom")))
-    _patch_stream_response(monkeypatch)
 
     proxy = g.AsyncHiveMindProxy()
     proxy.session = _StatusBodySession(403, b"")
@@ -599,7 +614,6 @@ def test_gzip_compressed_429_body_classifies_as_credential_end_to_end(monkeypatc
     import coordinator
     import hive_mind_proxy as g
     importlib.reload(g)
-    _patch_stream_response(monkeypatch)
 
     body = json.dumps({"error": {"code": "insufficient_quota"}}).encode()
     compressed = gzip.compress(body)
@@ -615,17 +629,17 @@ def test_gzip_compressed_429_body_classifies_as_credential_end_to_end(monkeypatc
     assert entry["transient"]["count"] == 0
 
 
-def test_gzip_compressed_body_passthrough_stays_compressed_bytes(monkeypatch):
-    """The decompression is for CLASSIFICATION only — the client must still
-    receive the original compressed bytes, unchanged, with the original
-    Content-Encoding header (the client, not the gateway, decompresses)."""
+def test_typed_refusal_never_passes_through_the_compressed_body(monkeypatch):
+    """S8: the client receives the gateway's OWN JSON refusal, never the
+    upstream's compressed bytes or its Content-Encoding. The decompression is
+    for CLASSIFICATION only — the provider body is not reflected at all, so
+    the refusal is a plain JSON object, not gzip framing bytes."""
     import gzip
     monkeypatch.delenv("LLM_BACKENDS", raising=False)
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps(
         [{"url": "http://a:5000", "private_ok": True}]))
     import hive_mind_proxy as g
     importlib.reload(g)
-    written = _patch_stream_response(monkeypatch)
 
     body = json.dumps({"error": {"code": "insufficient_quota"}}).encode()
     compressed = gzip.compress(body)
@@ -633,10 +647,14 @@ def test_gzip_compressed_body_passthrough_stays_compressed_bytes(monkeypatch):
     proxy.session = _StatusBodySession(429, compressed, headers={
         "Content-Type": "application/json", "Content-Encoding": "gzip",
     })
-    asyncio.run(proxy.handle_proxy(_FakeReq()))
+    resp = asyncio.run(proxy.handle_proxy(_FakeReq()))
 
-    assert b"".join(written["chunks"]) == compressed
-    assert written["headers"]["Content-Encoding"] == "gzip"
+    assert resp.status == 429
+    parsed = json.loads(resp.body.decode())
+    assert parsed["error"] == "upstream_fault"
+    assert parsed["type"] == "insufficient_quota"
+    assert "Content-Encoding" not in resp.headers
+    assert not resp.body.startswith(b"\x1f\x8b")  # never gzip framing bytes
 
 
 # ── 8. O-6: proxy error bodies/logs never echo raw exception text ───────────

@@ -244,41 +244,60 @@ def _iter_input_files():
         yield _CLIENT_COPY
 
 
-def _is_os_environ_attr(node):
+def _os_aliases(tree):
+    """Names bound to the os module anywhere in this file — `import os` and
+    `import os as X` (ADV-6: `import os as _os_adv` opted the whole module out
+    of the gate, because the extractor matched the literal name `os` only).
+    `from os import ...` binds names to os ATTRIBUTES, not the module, and is
+    deliberately not collected here — see the one-level-deep limit note in the
+    module docstring."""
+    aliases = {"os"}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for a in node.names:
+                if a.name == "os":
+                    aliases.add(a.asname or "os")
+    return aliases
+
+
+def _is_os_environ_attr(node, os_names):
     return (
         isinstance(node, ast.Attribute)
         and node.attr == "environ"
         and isinstance(node.value, ast.Name)
-        and node.value.id == "os"
+        and node.value.id in os_names
     )
 
 
-def _environ_key_expression(node):
+def _environ_key_expression(node, os_names):
     """If `node` reads `os.environ` in any supported form, return the AST node
     standing for the KEY; otherwise None.
 
-    Four forms, and the fourth is the one the pre-W7 extractor lacked:
-      os.environ.get(<key>)   os.getenv(<key>)
-      os.environ[<key>]       <key> in os.environ
+    Five forms, the last two of which the pre-ADV-6 extractor lacked:
+      os.environ.get(<key>)       os.getenv(<key>)
+      os.environ[<key>]           <key> in os.environ
+      os.environ.setdefault(<key>, <default>)   (ADV-6: a read-with-default)
+    `os_names` is the file's set of os-module bindings (import aliases
+    included) — see _os_aliases.
     """
     if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
         func = node.func
-        if func.attr == "get" and _is_os_environ_attr(func.value) and node.args:
+        if func.attr in ("get", "setdefault") and _is_os_environ_attr(func.value, os_names) and node.args:
             return node.args[0]
         if (
             func.attr == "getenv"
             and isinstance(func.value, ast.Name)
-            and func.value.id == "os"
+            and func.value.id in os_names
             and node.args
         ):
             return node.args[0]
-    if isinstance(node, ast.Subscript) and _is_os_environ_attr(node.value):
+    if isinstance(node, ast.Subscript) and _is_os_environ_attr(node.value, os_names):
         return node.slice
     if (
         isinstance(node, ast.Compare)
         and len(node.ops) == 1
         and isinstance(node.ops[0], ast.In)
-        and _is_os_environ_attr(node.comparators[0])
+        and _is_os_environ_attr(node.comparators[0], os_names)
     ):
         return node.left
     return None
@@ -323,6 +342,7 @@ def _discover_env_helpers(trees):
     """
     helpers = {}
     for tree in trees.values():
+        os_names = _os_aliases(tree)
         for node in ast.walk(tree):
             if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 continue
@@ -330,7 +350,7 @@ def _discover_env_helpers(trees):
             if not names:
                 continue
             for child in ast.walk(node):
-                key = _environ_key_expression(child)
+                key = _environ_key_expression(child, os_names)
                 if isinstance(key, ast.Name) and key.id in names:
                     index = names.index(key.id)
                     default = defaults[index]
@@ -367,8 +387,9 @@ def _extract_names(tree, helpers, consts):
             return consts[node.id]
         return None
 
+    os_names = _os_aliases(tree)
     for node in ast.walk(tree):
-        key = _environ_key_expression(node)
+        key = _environ_key_expression(node, os_names)
         if key is not None:
             resolved = _resolve(key)
             if resolved:
@@ -496,6 +517,23 @@ def test_the_env_helper_discovery_actually_finds_the_helpers_this_tree_uses():
         "read_daemon_token_from_fd's env name exists only as a string default "
         "(no call site passes one); discovery must carry that default"
     )
+
+
+def test_the_extractor_collects_setdefault_and_import_os_alias_reads():
+    """ADV-6: two read forms the gate was blind to, now enumerated. A literal
+    `os.environ.setdefault("NAME", ...)` (a read-with-default) and an
+    `import os as _o` alias reading `_o.environ.get("NAME")` must both be
+    collected — before this, a name read only through those forms sailed past
+    the gate untemplated and the gate stayed green."""
+    tree = ast.parse(
+        "import os as _o\n"
+        "def _f():\n"
+        "    a = _o.environ.get('ALIAS_KNOB')\n"
+        "    b = os.environ.setdefault('SETDEFAULT_KNOB', 'x')\n"
+    )
+    names = _extract_names(tree, {}, {})
+    assert "ALIAS_KNOB" in names
+    assert "SETDEFAULT_KNOB" in names
 
 
 def test_the_allowlist_has_no_stale_entry():
