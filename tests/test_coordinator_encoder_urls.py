@@ -134,22 +134,21 @@ def test_bare_host_port_with_no_scheme_fails_startup(monkeypatch):
     assert "RERANKER_URL" in str(ei.value)
 
 
-def test_valid_scheme_case_insensitive_is_accepted(monkeypatch):
-    """urlsplit's scheme check is case-insensitive (HTTP:// is a valid
-    scheme) -- this must not raise. The base's own casing is passed through
-    verbatim (this validates, it does not normalize)."""
-    mod = _reloaded(monkeypatch, EMBEDDER_URL="HTTP://embedder.internal:8070")
-    assert mod.EMBED_URL == "HTTP://embedder.internal:8070/v1/embeddings"
+def test_uppercase_scheme_is_accepted_and_lowercased(monkeypatch):
+    """urlsplit lowercases the scheme (RFC 3986 schemes are case-insensitive),
+    so HTTP:// is accepted and normalized to http://."""
+    mod = _reloaded(monkeypatch, EMBEDDER_URL="HTTP://host:1234/v1")
+    assert mod.EMBED_URL == "http://host:1234/v1/embeddings"
 
 
-def test_v1_suffix_warns_and_still_resolves_with_doubled_path(caplog, monkeypatch):
-    """A base that already ends in /v1 is a footgun (doubles the /v1 segment
-    this function appends) but must not fail startup -- it warns and
-    continues, since a deployer proxying at that exact path is possible."""
-    with caplog.at_level(logging.WARNING, logger="coordinator"):
+def test_v1_suffix_is_stripped_and_logged(caplog, monkeypatch):
+    """A base that already ends in /v1 used to double the /v1 segment. It is
+    now stripped at read time (decision:2436) so the endpoint is the correct
+    single-/v1 form, with an INFO naming the suffix."""
+    with caplog.at_level(logging.INFO, logger="coordinator"):
         mod = _reloaded(monkeypatch, EMBEDDER_URL="http://embedder.internal:8070/v1")
-    assert mod.EMBED_URL == "http://embedder.internal:8070/v1/v1/embeddings"
-    assert "already carries a path" in caplog.text
+    assert mod.EMBED_URL == "http://embedder.internal:8070/v1/embeddings"
+    assert "/v1" in caplog.text
     assert "EMBEDDER_URL" in caplog.text
 
 
@@ -159,17 +158,79 @@ def test_no_path_warning_for_a_normal_base(caplog, monkeypatch):
     assert "already carries a path" not in caplog.text
 
 
-def test_l4_full_endpoint_pasted_as_base_also_warns(caplog, monkeypatch):
-    """L4 (PR #308 review): the ORIGINAL check only matched a base ending in
-    exactly '/v1' -- a plausible copy-paste of the FULL endpoint as the base
-    (http://h:8070/v1/embeddings, e.g. copied straight out of an error
-    message or this file's own docstrings) carries a path that does NOT end
-    in '/v1' and used to warn nothing, silently doubling the whole path."""
-    with caplog.at_level(logging.WARNING, logger="coordinator"):
+def test_l4_full_endpoint_pasted_as_base_is_stripped(caplog, monkeypatch):
+    """L4 (PR #308 review): a plausible copy-paste of the FULL endpoint as the
+    base (http://h:8070/v1/embeddings) used to silently double the whole path.
+    The longest suffix is now stripped, leaving exactly the correct endpoint."""
+    with caplog.at_level(logging.INFO, logger="coordinator"):
         mod = _reloaded(monkeypatch, EMBEDDER_URL="http://embedder.internal:8070/v1/embeddings")
-    assert mod.EMBED_URL == "http://embedder.internal:8070/v1/embeddings/v1/embeddings"
-    assert "already carries a path" in caplog.text
+    assert mod.EMBED_URL == "http://embedder.internal:8070/v1/embeddings"
+    assert "/v1/embeddings" in caplog.text
     assert "EMBEDDER_URL" in caplog.text
+
+
+# ── normalize_encoder_base — the shared helper (decision:2436) ────────────────
+#
+# A pasted LM Studio-style base (http://host:1234/v1) used to resolve to
+# /v1/v1/embeddings, which LM Studio answers 200 — masking the defect. The base
+# is normalized at read time in BOTH consumers; these cases pin the helper and
+# the endpoint the coordinator derives from it.
+
+@pytest.mark.parametrize("raw,expected_base,expected_endpoint", [
+    # The defect, exactly: a pasted /v1 base.
+    ("http://host:1234/v1", "http://host:1234", "http://host:1234/v1/embeddings"),
+    # The full endpoint pasted as the base.
+    ("http://host:8070/v1/embeddings", "http://host:8070", "http://host:8070/v1/embeddings"),
+    # A trailing slash after the suffix.
+    ("http://host:8070/v1/", "http://host:8070", "http://host:8070/v1/embeddings"),
+    # A proxy prefix is retained (not one of the known suffixes).
+    ("http://host/api", "http://host/api", "http://host/api/v1/embeddings"),
+    # A proxy prefix plus /v1: prefix retained, exactly one /v1 appended.
+    ("http://host/api/v1", "http://host/api", "http://host/api/v1/embeddings"),
+    # Userinfo stays in the netloc — it is preserved, not rejected.
+    ("http://user:pass@host:1234/v1", "http://user:pass@host:1234",
+     "http://user:pass@host:1234/v1/embeddings"),
+    # A plain base is unchanged.
+    ("http://host:8070", "http://host:8070", "http://host:8070/v1/embeddings"),
+])
+def test_normalize_base_and_endpoint_cases(monkeypatch, raw, expected_base, expected_endpoint):
+    coord = importlib.import_module("coordinator")
+    assert coord.normalize_encoder_base(raw) == expected_base
+    mod = _reloaded(monkeypatch, EMBEDDER_URL=raw)
+    assert mod.EMBED_URL == expected_endpoint
+
+
+@pytest.mark.parametrize("raw", [
+    "http://host/v1?key=x",
+    "http://host/v1#frag",
+    "http://user:pass@host:1234/v1?key=x",
+])
+def test_a_query_or_fragment_on_the_base_is_rejected_without_leaking(monkeypatch, raw):
+    """A query-bearing base is a split-brain: the coordinator could build a
+    query-bearing endpoint, but the gateway's own string joins cannot, so the
+    passthrough, capability probes and /health fan-out would break. It is
+    rejected loudly, and the raw secret never reaches the message
+    (scrub_url_credentials drops query/fragment and userinfo)."""
+    with pytest.raises(ValueError) as ei:
+        _reloaded(monkeypatch, EMBEDDER_URL=raw)
+    from log_hygiene import scrub_url_credentials
+    msg = str(ei.value)
+    assert "must not carry a query string or fragment" in msg
+    assert scrub_url_credentials(raw) in msg   # the scrubbed form is what is shown
+    assert "key=x" not in msg                  # ... never the raw query secret
+    assert "#frag" not in msg                  # ... never the raw fragment
+    assert "pass@" not in msg                  # ... never the raw userinfo
+
+
+def test_gateway_normalizes_a_pasted_v1_base(monkeypatch):
+    """The gateway's own module constant is normalized too, so the /health
+    fan-out, ROUTING_MAP passthrough and capability probes all see one /v1."""
+    monkeypatch.delenv("RERANKER_URL", raising=False)
+    monkeypatch.setenv("EMBEDDER_URL", "http://host:1234/v1")
+    importlib.reload(importlib.import_module("coordinator"))
+    g = importlib.reload(importlib.import_module("hive_mind_proxy"))
+    assert g.EMBEDDER_URL == "http://host:1234"
+    assert f"{g.EMBEDDER_URL}/v1/embeddings".count("/v1") == 1
 
 
 # ── log_encoder_endpoints() — scrubbing + idempotence (unit-level) ────────────

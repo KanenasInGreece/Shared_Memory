@@ -5,6 +5,11 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.9.99] — 2026-09-13
+
+### Fixed
+- The encoder base URLs (`EMBEDDER_URL` / `RERANKER_URL`) are normalized at read time: a pasted encoder path (`/v1`, `/v1/embeddings`, `/v1/reranking`) is stripped before the framework appends its own, so an LM Studio-style base `http://host:1234/v1` no longer resolves to `http://host:1234/v1/v1/embeddings` (which LM Studio answered with 200, masking it). A non-encoder path prefix such as `/api` is retained. A query string or fragment on the base is now refused loudly — it was never supported end to end. The `/health` fan-out for a base that carried a pasted `/v1` moves to the correct root (`<base>/health`).
+
 ## [0.9.98] — 2026-09-12
 
 ### Fixed

@@ -158,7 +158,7 @@ def _short(value: Any, cap: int = 200) -> str:
 # ships with the skill) and this coordinator. Bump it ONLY when the request or
 # response shape, auth scheme, or routes change in a way that breaks older clients.
 # Client and server build-versions are allowed to drift; their API_VERSION must agree.
-FRAMEWORK_VERSION = "0.9.98"
+FRAMEWORK_VERSION = "0.9.99"
 # v2 (retro-as-record): /memory/retrospective now creates a full record (own
 # pg_id, embedding, Retrospective node) and accepts rating enum + grounding —
 # the response shape changed (returns the retro's own pg_id).
@@ -2409,8 +2409,56 @@ NEO4J_ACQUIRE_TIMEOUT = _env_float("NEO4J_ACQUIRE_TIMEOUT", 30.0)
 # the raw /v1/embeddings passthrough while every real embedding still went to
 # localhost (measured on a LAN embedder: passthrough answered from the remote,
 # saves kept using the local container). The port is a default, never an assumption.
+# The encoder endpoint paths this framework appends to an encoder BASE. Kept
+# longest-first: stripping is a suffix match, so '/v1' would otherwise eat the
+# '/v1' inside '/v1/embeddings' and leave a '/embeddings' fragment behind.
+_ENCODER_BASE_SUFFIXES = ("/v1/embeddings", "/v1/reranking", "/v1")
+
+
+def normalize_encoder_base(base: str) -> str:
+    """Strip a pasted encoder-path suffix from an encoder BASE URL.
+    Parses with urllib.parse so scheme, netloc and userinfo are preserved; only
+    the PATH component is touched. Terminal slashes are removed, then the
+    longest of ('/v1/embeddings', '/v1/reranking', '/v1') that the path ends
+    with is stripped (longest first so '/v1' cannot eat '/v1/embeddings').
+    A path that is not one of those (e.g. a proxy prefix '/api') is retained.
+
+    A query string or fragment is REJECTED (ValueError): the framework appends
+    /v1/... itself, and only the coordinator can join onto a query — the
+    gateway's own string joins cannot, so a query-bearing base would work on
+    save/search but break the passthrough, capability probes and /health
+    fan-out. Credentials belong in userinfo (preserved in netloc) or a header,
+    not the query.
+
+    The scheme is lowercased by urlsplit (RFC 3986 schemes are case-
+    insensitive), which is the correct normalization. Returns the normalized
+    base with no trailing slash.
+    """
+    parsed = urllib.parse.urlsplit(base)
+    if parsed.query or parsed.fragment:
+        raise ValueError(
+            "encoder base must not carry a query string or fragment (the "
+            "framework appends /v1/... itself; use userinfo or a header for "
+            f"credentials): {scrub_url_credentials(base)}"
+        )
+    path = parsed.path.rstrip("/")
+    for suffix in _ENCODER_BASE_SUFFIXES:
+        if path.endswith(suffix):
+            path = path[: -len(suffix)]
+            break
+    return urllib.parse.urlunsplit(
+        (parsed.scheme, parsed.netloc, path, "", "")
+    )
+
+
 def _encoder_url(env_name: str, default_base: str, path: str) -> str:
     """Full endpoint for an encoder backend: env-overridable BASE + fixed PATH.
+
+    The BASE is normalized first (normalize_encoder_base): a pasted encoder
+    path — '/v1', '/v1/embeddings', '/v1/reranking' — is stripped so a base
+    copied from an LM Studio-style URL (http://host:1234/v1) does not resolve
+    to the doubled http://host:1234/v1/v1/embeddings that LM Studio answers
+    with 200, masking the defect. A non-encoder prefix (e.g. '/api') is kept.
 
     Validated at the same time it is derived (module import/reload) so a bad
     value is caught before the process ever accepts traffic, rather than
@@ -2419,31 +2467,46 @@ def _encoder_url(env_name: str, default_base: str, path: str) -> str:
         host, a typo'd scheme, a leftover placeholder) fails LOUDLY, naming
         env_name, rather than producing a confusing httpx/aiohttp exception
         deep inside _embed()/_rerank() on the first real request.
-      - a base carrying ANY path segment only WARNS (never fails): the path
-        this function appends always starts with "/v1/...", so ANY existing
-        path on the base — not only a base ending in exactly "/v1" — gets a
-        second path appended after it. L4 (PR #308 review): the original
-        check only matched a base ending in "/v1" literally, so a plausible
-        copy-paste like "http://h:8070/v1/embeddings" (the full endpoint,
-        pasted as if it were the base) silently doubled the whole path with
-        no warning at all.
+      - a known encoder suffix that was stripped is logged at INFO (the
+        suffix and the scrubbed URL named).
+      - a base still carrying a NON-encoder path segment only WARNS (never
+        fails): the endpoint appends onto that prefix, which is legitimate for
+        a proxy but worth naming.
+      - a query string or fragment on the base fails LOUDLY (the gateway's own
+        joins cannot carry one — see normalize_encoder_base).
     """
-    base = (os.environ.get(env_name) or default_base).strip().rstrip("/")
+    raw_base = (os.environ.get(env_name) or default_base).strip()
+    base = normalize_encoder_base(raw_base)
     parsed = urllib.parse.urlsplit(base)
     if parsed.scheme not in ("http", "https"):
         raise ValueError(
             f"{env_name} must be an http(s) URL, got {base!r} "
             f"(scheme {parsed.scheme!r}) — check {env_name} in shared-memory/.env"
         )
+    # Build the endpoint by setting the PATH component on the parsed base, not
+    # by f"{base}{path}" — a proxy prefix on the base ('/api') must be joined
+    # as a path, not concatenated as a string.
+    endpoint = urllib.parse.urlunsplit(
+        (parsed.scheme, parsed.netloc, parsed.path + path, "", "")
+    )
+    raw_path = urllib.parse.urlsplit(raw_base).path.rstrip("/")
+    stripped = raw_path[len(parsed.path):]
+    if stripped:
+        log.info(
+            "%s (%s) carried the encoder path %r — stripped it and using %s "
+            "as the base (one %s is appended).",
+            env_name, scrub_url_credentials(raw_base), stripped,
+            scrub_url_credentials(base), stripped,
+        )
     if parsed.path:
         log.warning(
             "%s (%s) already carries a path (%r) — the resolved endpoint "
-            "will be %s%s, appending onto whatever is already there. "
+            "will be %s, appending onto whatever is already there. "
             "%s should normally be just scheme://host[:port], with no path.",
-            env_name, scrub_url_credentials(base), parsed.path,
-            scrub_url_credentials(base), path, env_name,
+            env_name, scrub_url_credentials(raw_base), parsed.path,
+            scrub_url_credentials(endpoint), env_name,
         )
-    return f"{base}{path}"
+    return endpoint
 
 EMBED_URL  = _encoder_url("EMBEDDER_URL", FRAMEWORK_DEFAULTS["EMBEDDER_URL"]["default"], "/v1/embeddings")
 RERANK_URL = _encoder_url("RERANKER_URL", FRAMEWORK_DEFAULTS["RERANKER_URL"]["default"], "/v1/reranking")
