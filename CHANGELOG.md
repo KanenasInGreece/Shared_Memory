@@ -5,6 +5,11 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.9.100] — 2026-09-13
+
+### Fixed
+- The REM daemon's success-path parse no longer assumes a well-formed LLM response envelope. A 200 whose `content` is null or a non-string, or whose `choices` or `message` is null, is now classified as a transport failure — the backend's fault, not the record's — instead of raising an uncaught `AttributeError`/`TypeError` that aborted the whole REM cycle and left the responsible record uncharged (so it never dead-lettered). The batch path's envelope is guarded the same way, with `_parse_jsonl_batch` deliberately left outside the transport `try` so a genuine parse error is not masked as transport.
+
 ## [0.9.99] — 2026-09-13
 
 ### Fixed
