@@ -5,6 +5,11 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.9.101] — 2026-09-13
+
+### Fixed
+- The outbox apply no longer shadows its own Postgres connection. The inner acquisition for the entity-registry insert rebound the `conn` parameter, so the outbox status UPDATE ran on a connection asyncpg had already released back to the pool (`InterfaceError`); the failure was mislabeled a Neo4j write failure, so every fact saved with entities retried 5/5, never reached `applied`, and was deferred by REM forever. The inner connection now binds a distinct name, and a Postgres-origin exception is no longer counted as a Neo4j write failure.
+
 ## [0.9.100] — 2026-09-13
 
 ### Fixed
