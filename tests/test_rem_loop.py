@@ -1107,3 +1107,164 @@ async def test_run_cycle_batch_missing_line_charges_only_that_record(monkeypatch
     await daemon.run_cycle()
 
     daemon._bump_rem_attempts.assert_awaited_once_with([22])
+
+
+# ── Finding R1 (fact:2443): malformed-200 envelope handling ──────────────────
+
+def _envelope_resp(data):
+    class _Resp:
+        status_code = 200
+        headers = {}
+        def json(self):
+            return data
+        @property
+        def text(self):
+            return str(data)
+    return _Resp()
+
+
+@pytest.mark.asyncio
+async def test_llm_process_solo_envelope_content_null(monkeypatch):
+    """Solo: 200 OK with content: null must be classified as transport failure,
+    not raise AttributeError escaping _llm_process."""
+    daemon, _ = _make_daemon()
+    daemon._last_llm_failure = None
+    monkeypatch.delenv("MOCK_LLM", raising=False)
+    async def _fake_post(self, url, **kwargs):
+        return _envelope_resp({"choices": [{"finish_reason": "stop", "message": {"content": None}}]})
+    monkeypatch.setattr("httpx.AsyncClient.post", _fake_post)
+
+    long = "x" * (rem_mod.REM_SUMMARY_THRESHOLD + 1)
+    result, model = await daemon._llm_process(long, rem_mod.KIND_FACT, pg_id=1)
+    assert result is None
+    assert daemon._last_llm_failure == rem_mod.LLM_FAIL_TRANSPORT
+
+
+@pytest.mark.asyncio
+async def test_llm_process_solo_envelope_choices_null(monkeypatch):
+    """Solo: 200 OK with choices: null must be classified as transport failure,
+    not raise TypeError escaping _llm_process."""
+    daemon, _ = _make_daemon()
+    daemon._last_llm_failure = None
+    monkeypatch.delenv("MOCK_LLM", raising=False)
+    async def _fake_post(self, url, **kwargs):
+        return _envelope_resp({"choices": None})
+    monkeypatch.setattr("httpx.AsyncClient.post", _fake_post)
+
+    long = "x" * (rem_mod.REM_SUMMARY_THRESHOLD + 1)
+    result, model = await daemon._llm_process(long, rem_mod.KIND_FACT, pg_id=1)
+    assert result is None
+    assert daemon._last_llm_failure == rem_mod.LLM_FAIL_TRANSPORT
+
+
+@pytest.mark.asyncio
+async def test_llm_process_solo_envelope_message_null(monkeypatch):
+    """Solo: 200 OK with message: null must be classified as transport failure,
+    not raise TypeError escaping _llm_process."""
+    daemon, _ = _make_daemon()
+    daemon._last_llm_failure = None
+    monkeypatch.delenv("MOCK_LLM", raising=False)
+    async def _fake_post(self, url, **kwargs):
+        return _envelope_resp({"choices": [{"finish_reason": "stop", "message": None}]})
+    monkeypatch.setattr("httpx.AsyncClient.post", _fake_post)
+
+    long = "x" * (rem_mod.REM_SUMMARY_THRESHOLD + 1)
+    result, model = await daemon._llm_process(long, rem_mod.KIND_FACT, pg_id=1)
+    assert result is None
+    assert daemon._last_llm_failure == rem_mod.LLM_FAIL_TRANSPORT
+
+
+@pytest.mark.asyncio
+async def test_llm_process_solo_envelope_list_content(monkeypatch):
+    """Solo: 200 OK with list-valued content must be classified as transport failure,
+    not raise AttributeError escaping _llm_process."""
+    daemon, _ = _make_daemon()
+    daemon._last_llm_failure = None
+    monkeypatch.delenv("MOCK_LLM", raising=False)
+    async def _fake_post(self, url, **kwargs):
+        return _envelope_resp({"choices": [{"finish_reason": "stop", "message": {"content": ["unexpected", "list"]}}]})
+    monkeypatch.setattr("httpx.AsyncClient.post", _fake_post)
+
+    long = "x" * (rem_mod.REM_SUMMARY_THRESHOLD + 1)
+    result, model = await daemon._llm_process(long, rem_mod.KIND_FACT, pg_id=1)
+    assert result is None
+    assert daemon._last_llm_failure == rem_mod.LLM_FAIL_TRANSPORT
+
+
+@pytest.mark.asyncio
+async def test_llm_process_batch_envelope_content_null(monkeypatch):
+    """Batch: 200 OK with content: null must return None and be classified as transport failure,
+    not raise AttributeError in _parse_jsonl_batch escaping _llm_process_batch."""
+    daemon, _ = _make_daemon()
+    daemon._last_llm_failure = None
+    monkeypatch.delenv("MOCK_LLM", raising=False)
+    async def _fake_post(self, url, **kwargs):
+        return _envelope_resp({"choices": [{"finish_reason": "stop", "message": {"content": None}}]})
+    monkeypatch.setattr("httpx.AsyncClient.post", _fake_post)
+
+    long = "x" * (rem_mod.REM_SUMMARY_THRESHOLD + 1)
+    items = [{"pg_id": 1, "content": long}]
+    results, timing, model = await daemon._llm_process_batch(items)
+    assert results is None
+    assert timing is None
+    assert daemon._last_llm_failure == rem_mod.LLM_FAIL_TRANSPORT
+
+
+@pytest.mark.asyncio
+async def test_llm_process_batch_envelope_choices_null(monkeypatch):
+    """Batch: 200 OK with choices: null returns None and is classified as transport failure.
+    NOTE: Pinned baseline behavior (already passed on base 0159dce via broad try-except;
+    not an R1 regression test)."""
+    daemon, _ = _make_daemon()
+    daemon._last_llm_failure = None
+    monkeypatch.delenv("MOCK_LLM", raising=False)
+    async def _fake_post(self, url, **kwargs):
+        return _envelope_resp({"choices": None})
+    monkeypatch.setattr("httpx.AsyncClient.post", _fake_post)
+
+    long = "x" * (rem_mod.REM_SUMMARY_THRESHOLD + 1)
+    items = [{"pg_id": 1, "content": long}]
+    results, timing, model = await daemon._llm_process_batch(items)
+    assert results is None
+    assert timing is None
+    assert daemon._last_llm_failure == rem_mod.LLM_FAIL_TRANSPORT
+
+
+@pytest.mark.asyncio
+async def test_llm_process_batch_envelope_message_null(monkeypatch):
+    """Batch: 200 OK with message: null returns None and is classified as transport failure.
+    NOTE: Pinned baseline behavior (already passed on base 0159dce via broad try-except;
+    not an R1 regression test)."""
+    daemon, _ = _make_daemon()
+    daemon._last_llm_failure = None
+    monkeypatch.delenv("MOCK_LLM", raising=False)
+    async def _fake_post(self, url, **kwargs):
+        return _envelope_resp({"choices": [{"finish_reason": "stop", "message": None}]})
+    monkeypatch.setattr("httpx.AsyncClient.post", _fake_post)
+
+    long = "x" * (rem_mod.REM_SUMMARY_THRESHOLD + 1)
+    items = [{"pg_id": 1, "content": long}]
+    results, timing, model = await daemon._llm_process_batch(items)
+    assert results is None
+    assert timing is None
+    assert daemon._last_llm_failure == rem_mod.LLM_FAIL_TRANSPORT
+
+
+@pytest.mark.asyncio
+async def test_llm_process_batch_envelope_list_content(monkeypatch):
+    """Batch: 200 OK with list-valued content must return None and be classified as transport failure,
+    not raise AttributeError in _parse_jsonl_batch escaping _llm_process_batch."""
+    daemon, _ = _make_daemon()
+    daemon._last_llm_failure = None
+    monkeypatch.delenv("MOCK_LLM", raising=False)
+    async def _fake_post(self, url, **kwargs):
+        return _envelope_resp({"choices": [{"finish_reason": "stop", "message": {"content": ["unexpected", "list"]}}]})
+    monkeypatch.setattr("httpx.AsyncClient.post", _fake_post)
+
+    long = "x" * (rem_mod.REM_SUMMARY_THRESHOLD + 1)
+    items = [{"pg_id": 1, "content": long}]
+    results, timing, model = await daemon._llm_process_batch(items)
+    assert results is None
+    assert timing is None
+    assert daemon._last_llm_failure == rem_mod.LLM_FAIL_TRANSPORT
+

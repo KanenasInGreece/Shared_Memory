@@ -1263,8 +1263,11 @@ class REMDaemon:
             return None, model
 
         try:
-            raw = resp_json["choices"][0]["message"]["content"].strip()
-        except (KeyError, IndexError) as exc:
+            content = resp_json["choices"][0]["message"]["content"]
+            if not isinstance(content, str):
+                raise TypeError(f"content is {type(content).__name__}, expected str")
+            raw = content.strip()
+        except (KeyError, IndexError, TypeError) as exc:
             logger.error(
                 "LLM response schema unexpected (%s) — possible gateway error",
                 exc,
@@ -1383,6 +1386,8 @@ class REMDaemon:
                     batch_size=len(sent), prompt_chars=len(prompt))
                 truncated = _truncated(resp_json)
                 raw = resp_json["choices"][0]["message"]["content"]
+                if not isinstance(raw, str):
+                    raise TypeError(f"content is {type(raw).__name__}, expected str")
                 # L0-a: specimen logging extends to batch GENERATION calls
                 # (not verify — F-9, a confirm/deny tail is near-worthless).
                 # No RETRY POLICY change for batch (L0-b is solo-only); the
