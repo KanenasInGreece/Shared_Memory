@@ -69,6 +69,7 @@ from coordinator import (
     MemoryCoordinator,
     attach as attach_coordinator,
     auth_middleware,
+    normalize_encoder_base,
     backup_quiesce_active,
     resolve_identity,
     _AGENT_TOKENS,
@@ -148,8 +149,14 @@ _rem_healthy:    bool = False  # True while the REM subprocess is alive
 # `or`, not a get() default: an EMPTY value (EMBEDDER_URL= in .env) means "the
 # default", the same reading the coordinator gives the same variable — the two
 # consumers must never disagree on where the encoder is.
-EMBEDDER_URL = (os.environ.get("EMBEDDER_URL") or FRAMEWORK_DEFAULTS["EMBEDDER_URL"]["default"]).strip().rstrip("/")
-RERANKER_URL = (os.environ.get("RERANKER_URL") or FRAMEWORK_DEFAULTS["RERANKER_URL"]["default"]).strip().rstrip("/")
+# The base is normalized (normalize_encoder_base) so a pasted encoder path is
+# stripped HERE too, not only in the coordinator's own calls. ACCEPTED behavior
+# change: for a base that carried a pasted /v1, the /health fan-out target moves
+# from <base>/v1/health to <base>/health (the correct root); the bundled defaults
+# (no path) are unaffected, and the ROUTING_MAP passthrough / capability probes
+# now see exactly one /v1.
+EMBEDDER_URL = normalize_encoder_base((os.environ.get("EMBEDDER_URL") or FRAMEWORK_DEFAULTS["EMBEDDER_URL"]["default"]).strip())
+RERANKER_URL = normalize_encoder_base((os.environ.get("RERANKER_URL") or FRAMEWORK_DEFAULTS["RERANKER_URL"]["default"]).strip())
 ROUTING_MAP = {
     "/v1/embeddings": EMBEDDER_URL,
     "/v1/reranking":  RERANKER_URL,
