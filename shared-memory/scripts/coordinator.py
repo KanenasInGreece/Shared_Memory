@@ -4022,8 +4022,8 @@ class MemoryCoordinator:
                     **( {"source_ref": source_ref} if source_ref else {} ),
                 )
                 if clean_entities:
-                    async with self._acquire() as conn:
-                        await conn.executemany(
+                    async with self._acquire() as c:
+                        await c.executemany(
                             "INSERT INTO entity_registry (name, registered_by) VALUES ($1, 'fact_ingress') ON CONFLICT (name) DO NOTHING",
                             [(e,) for e in clean_entities],
                         )
@@ -4061,15 +4061,21 @@ class MemoryCoordinator:
                 (time.monotonic() - _t0) * 1000.0))
             log.debug("outbox: applied pg_id=%d (outbox_id=%d)", pg_id, outbox_id)
         except Exception as exc:
-            # OURS, not the caller's — the same discriminator the graph route
-            # uses: `cypher_rejected_total` is a query the DATABASE refused
-            # because the CALLER wrote it wrong, and there is no caller here.
-            safe(lambda: setattr(self, "_neo4j_tx_failures_total",
-                                 self._neo4j_tx_failures_total + 1))
-            log.warning(
-                "outbox: neo4j write failed pg_id=%d attempt %d/%d: %s",
-                pg_id, retries + 1, OUTBOX_MAX_RETRIES, exc,
-            )
+            if isinstance(exc, (asyncpg.PostgresError, asyncpg.InterfaceError)):
+                log.warning(
+                    "outbox: postgres error pg_id=%d attempt %d/%d: %s",
+                    pg_id, retries + 1, OUTBOX_MAX_RETRIES, exc,
+                )
+            else:
+                # OURS, not the caller's — the same discriminator the graph route
+                # uses: `cypher_rejected_total` is a query the DATABASE refused
+                # because the CALLER wrote it wrong, and there is no caller here.
+                safe(lambda: setattr(self, "_neo4j_tx_failures_total",
+                                     self._neo4j_tx_failures_total + 1))
+                log.warning(
+                    "outbox: neo4j write failed pg_id=%d attempt %d/%d: %s",
+                    pg_id, retries + 1, OUTBOX_MAX_RETRIES, exc,
+                )
             async with self._acquire() as conn:
                 if retries + 1 >= OUTBOX_MAX_RETRIES:
                     # Atomic: bump retries AND flip status in one statement
