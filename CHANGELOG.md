@@ -5,6 +5,18 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.9.103] — 2026-09-16
+
+### Fixed
+- Graph `params` that are not a JSON object are refused 400 instead of becoming a TypeError 500.
+- Save and retrospective ingress refuse an unknown `visibility` value, and refuse `visibility=scope` without a non-empty `scope` string, so a typo can no longer store a row that search never returns.
+- `update_framework.sh` treats a missing `git` as a missing tool. Previously an empty `symbolic-ref` was reported as a DETACHED HEAD.
+- Outbox apply classifies `asyncio.TimeoutError` and `ProjectIdentityUnavailable` as Postgres-domain, so they no longer increment the Neo4j failure counter. The retry status UPDATE is guarded: a second pool acquire failure is logged instead of leaving the row `in_progress` until restart.
+- REM charges `rem_attempts` on deterministic HTTP 400/404/422 (solo and batch). 401/403/408/429 and 5xx stay uncharged, so a wrong LLM key cannot dead-letter the corpus.
+
+### Changed
+- `POST /memory/graph`, CLI `graph`, named CLI `query` templates, and MCP `graph_query` require `full` or `admin`. A `read` token gets 403. `search`, `lineage`/`status`, and telemetry stay available to `read`. The MCP constitution snippet marker is v6 so Phase 8c re-proposes the wording. `default_access_mode="READ"` is documented as a driver routing hint, not a server-enforced second layer.
+
 ## [0.9.102] — 2026-09-15
 
 ### Security

@@ -406,3 +406,35 @@ def test_remote_unreachable_under_dry_run_also_proceeds(tmp_path):
     assert "Dry run complete" in out, out
     assert "could not verify" in out.lower(), out
     assert "no longer exists on origin" not in out, out
+
+
+def test_missing_git_refuses_as_missing_tool_not_detached_head(tmp_path):
+    """A4 Prove-It (RED on 06b892b): when git is missing on PATH,
+    update_framework.sh must refuse with 'missing on PATH: git',
+    NOT erroneously claim DETACHED HEAD."""
+    repo, log_path = _make_live_sandbox(tmp_path)
+    env = _stub_path_env(tmp_path, log_path)
+
+    # Build a PATH without git
+    bin_no_git = tmp_path / "bin_no_git"
+    bin_no_git.mkdir()
+    for entry in os.scandir("/usr/bin"):
+        if entry.name != "git":
+            try:
+                os.symlink(entry.path, bin_no_git / entry.name)
+            except OSError:
+                pass
+
+    stub_dir = tmp_path / "stubbin"
+    (stub_dir / "git").unlink()
+
+    env["PATH"] = f"{stub_dir}:{bin_no_git}"
+
+    proc = _run_live(repo, env, "--skip-backup")
+    out = _strip_ansi(proc.stdout + proc.stderr)
+
+    assert proc.returncode != 0, out
+    assert "missing on PATH:" in out, out
+    assert "git" in out, out
+    assert "DETACHED HEAD" not in out, out
+

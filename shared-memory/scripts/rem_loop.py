@@ -310,6 +310,7 @@ REM_STARVED_THRESHOLD = int(os.environ.get("REM_STARVED_THRESHOLD", "3"))
 
 # LLM failure classes recorded on REMDaemon._last_llm_failure.
 LLM_FAIL_TRANSPORT = "transport"   # HTTP non-200 / connection / gateway-shape — NOT chargeable
+LLM_FAIL_CLIENT    = "client"      # deterministic HTTP 4xx (400, 404, 422) — CHARGEABLE
 LLM_FAIL_TRUNCATED = "truncated"   # finish_reason=length even after the retry (widened for
                                     # an honest truncation, same-bound for a degenerate one)
 LLM_FAIL_PARSE     = "parse"       # response arrived but its content is unusable
@@ -319,7 +320,7 @@ LLM_FAIL_ROUTING_REFUSED = "routing_refused"   # gateway declined to place the j
                                     # a config gap, not a record defect — NOT chargeable
 
 # Failure classes that may count toward a record's dead-letter cap.
-LLM_FAIL_CHARGEABLE = frozenset({LLM_FAIL_TRUNCATED, LLM_FAIL_PARSE})
+LLM_FAIL_CHARGEABLE = frozenset({LLM_FAIL_TRUNCATED, LLM_FAIL_PARSE, LLM_FAIL_CLIENT})
 
 
 logging.basicConfig(level=logging.INFO)
@@ -1177,7 +1178,12 @@ class REMDaemon:
                                 ok=False, note=f"http_{resp.status_code}",
                                 prompt_chars=len(prompt))
                 logger.error("LLM returned %d: %s", resp.status_code, resp.text[:200])
-                return None, model, LLM_FAIL_TRANSPORT, False
+                fail_class = (
+                    LLM_FAIL_CLIENT
+                    if resp.status_code in (400, 404, 422)
+                    else LLM_FAIL_TRANSPORT
+                )
+                return None, model, fail_class, False
             try:
                 resp_json = resp.json()
             except Exception as exc:
@@ -1378,7 +1384,10 @@ class REMDaemon:
                                     ok=False, note=f"batch_http_{resp.status_code}",
                                     prompt_chars=len(prompt))
                     logger.error("REM batch LLM returned %d: %s", resp.status_code, resp.text[:200])
-                    self._last_llm_failure = LLM_FAIL_TRANSPORT
+                    if resp.status_code in (400, 404, 422):
+                        self._last_llm_failure = LLM_FAIL_CLIENT
+                    else:
+                        self._last_llm_failure = LLM_FAIL_TRANSPORT
                     return None, None, model
                 resp_json = resp.json()
                 _wall_s = time.monotonic() - _start
@@ -1758,16 +1767,23 @@ class REMDaemon:
                 results, call_timing, _model = await self._llm_process_batch(
                     fact_items)
                 if results is None:
-                    # F1: the CALL failed (transport/HTTP/envelope). That is
-                    # evidence about the backend, not about these facts — no
-                    # attempt is charged, so a pool 503 can never demote the
-                    # batch to solo or march innocent records toward
-                    # dead-letter. They retry, still batched, next cycle.
-                    logger.warning(
-                        "REM batch: call failed (%s) — %d fact(s) retry next cycle; "
-                        "no attempt charged (not attributable to any record)",
-                        self._last_llm_failure or LLM_FAIL_TRANSPORT, len(fact_items),
-                    )
+                    if self._last_llm_failure in LLM_FAIL_CHARGEABLE:
+                        logger.warning(
+                            "REM batch: call failed (%s) — %d fact(s) charged an attempt",
+                            self._last_llm_failure, len(fact_items),
+                        )
+                        await self._bump_rem_attempts([it["pg_id"] for it in fact_items])
+                    else:
+                        # F1: the CALL failed (transport/HTTP/envelope). That is
+                        # evidence about the backend, not about these facts — no
+                        # attempt is charged, so a pool 503 can never demote the
+                        # batch to solo or march innocent records toward
+                        # dead-letter. They retry, still batched, next cycle.
+                        logger.warning(
+                            "REM batch: call failed (%s) — %d fact(s) retry next cycle; "
+                            "no attempt charged (not attributable to any record)",
+                            self._last_llm_failure or LLM_FAIL_TRANSPORT, len(fact_items),
+                        )
                     results = {}
                 else:
                     # The call succeeded: a missing/invalid line IS evidence

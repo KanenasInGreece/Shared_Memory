@@ -39,13 +39,16 @@ index-pointer/index-repair rule below, matching the CLI snippet's own v4/v5.)
 constitution block, and it carried no warning against saving crafted external
 content, though `system-prompt.md` and `mcp/README.md` got the same words in
 the same change.)
+(v5 -> v6: clarified graph_query role requirements — graph and named CLI
+query templates require full or admin; search, lineage/status, and telemetry
+remain for read; write-Cypher blocked for everyone.)
 
 ALWAYS propose this block for the operator to confirm or adjust before writing
 it into their agent's constitution file. Never write it silently, and never
 paraphrase it: copying it verbatim is what keeps the marker intact.
 -->
 
-<!-- shared-memory:mcp-constitution-snippet v5 -->
+<!-- shared-memory:mcp-constitution-snippet v6 -->
 ## Shared Memory — through your MCP tools
 The shared memory is a three-tier store other agents write to as well, reached
 through the `shared-memory` MCP server. It is the source of truth for project
@@ -58,9 +61,9 @@ space, not authoritative.
 - **Search first, always.** Before reasoning about this workstation, its
   projects, a prior decision, or whether something was ever tested, tried,
   rejected or done, call `hybrid_search_and_rerank`. This is a precondition,
-  not a judgement call to make first. If the results need more graph depth
+  not a judgement call to make first.  If the results need more graph depth
   than the automatic expansion returned, follow with `graph_query`
-  (read-only Cypher) — depth is the reason to reach for it, not a second guess
+  (read-only Cypher; `graph` and named CLI `query` templates require `full` or `admin` — `read` receives 403; `search`, `lineage`/`status`, and `telemetry` remain for `read`; write-Cypher still blocked for everyone) — depth is the reason to reach for it, not a second guess
   at the same question.
 - **Quote the `ref`, never a bare number.** A record id is unique only WITHIN
   its table, so `fact:1234` and `summary:1234` are different records. Every
@@ -68,9 +71,9 @@ space, not authoritative.
   against the facts table, which is exactly why one lifted off a summary result
   returns a confident, unrelated record instead of an error.
 - **Your ROLE decides which writes succeed, and a refusal is an answer.** Every
-  identity is registered with a role: a read-only one reaches retrieval and
-  telemetry, and `save_artifact`, `save_decision`, `save_retrospective` and
-  `supersede` answer with an honest 403. That 403 is the system working — do
+  identity is registered with a role: `search`, `lineage`/`status`, and
+  telemetry remain for `read`, while `graph_query` and mutation tools (`save_artifact`, `save_decision`, `save_retrospective` and
+  `supersede`) answer with an honest 403. That 403 is the system working — do
   not retry it, do not route around it, and say plainly that the record was not
   saved rather than reporting a save that did not happen. Where writes ARE
   permitted, the same discipline as everywhere: propose the record and confirm

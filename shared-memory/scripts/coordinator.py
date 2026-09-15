@@ -158,7 +158,7 @@ def _short(value: Any, cap: int = 200) -> str:
 # ships with the skill) and this coordinator. Bump it ONLY when the request or
 # response shape, auth scheme, or routes change in a way that breaks older clients.
 # Client and server build-versions are allowed to drift; their API_VERSION must agree.
-FRAMEWORK_VERSION = "0.9.102"
+FRAMEWORK_VERSION = "0.9.103"
 # v2 (retro-as-record): /memory/retrospective now creates a full record (own
 # pg_id, embedding, Retrospective node) and accepts rating enum + grounding —
 # the response shape changed (returns the retro's own pg_id).
@@ -555,7 +555,7 @@ def _lookup_agent_by_token(token: str) -> "str | None":
 _READ_ROLE_ROUTES: set[tuple[str, str]] = {
     ("GET",  "/memory/telemetry"),
     # Search is a READ — this file's own quiesce classification already says so
-    # ("Reads (search/graph/telemetry/status) and /health always flow"). Admitting
+    # ("Reads (search/telemetry/status) and /health always flow"). Admitting
     # search lets read-only clients query knowledge safely without granting
     # arbitrary graph traversal or query execution (/memory/graph is confined
     # to full and admin roles; S1).
@@ -563,7 +563,7 @@ _READ_ROLE_ROUTES: set[tuple[str, str]] = {
 }
 
 # Client WRITE routes — shed (503 + Retry-After) while a backup quiesce is active.
-# Reads (search/graph/telemetry/status) and /health always flow.
+# Reads (search/telemetry/status) and /health always flow (/memory/graph requires full or admin role).
 _WRITE_ROUTES: set[tuple[str, str]] = {
     ("POST", "/memory/save"),
     ("POST", "/memory/retrospective"),
@@ -2982,6 +2982,42 @@ def _visibility_filter(viewer: str | None, viewer_scope: str | None,
     return "(" + " OR ".join(clauses) + ")", params
 
 
+def _validate_visibility_and_scope(body: dict) -> tuple[str, str] | web.Response:
+    """Validate visibility and scope on save and retrospective ingress (S4 / ADV-4 / ADV-5).
+
+    Refuses visibility not in ('global', 'scope', 'private').
+    When visibility == 'scope', scope must be a non-empty string (stripped).
+    """
+    if "visibility" in body:
+        visibility = body["visibility"]
+        if visibility not in ("global", "scope", "private"):
+            return web.json_response(
+                {
+                    "status": "error",
+                    "message": "visibility must be one of 'global', 'scope', 'private'",
+                },
+                status=400,
+            )
+    else:
+        visibility = "global"
+
+    if visibility == "scope":
+        raw_scope = body.get("scope")
+        if not isinstance(raw_scope, str) or not raw_scope.strip():
+            return web.json_response(
+                {
+                    "status": "error",
+                    "message": "scope is required and must be a non-empty string when visibility is 'scope'",
+                },
+                status=400,
+            )
+        scope = raw_scope.strip()
+    else:
+        scope = body.get("scope", "global")
+
+    return visibility, scope
+
+
 def _axis_filter_predicate(start: int, project: "str | list[str] | None",
                             domains: list[str] | None,
                             since: datetime | None) -> tuple[str, list]:
@@ -4061,7 +4097,7 @@ class MemoryCoordinator:
                 (time.monotonic() - _t0) * 1000.0))
             log.debug("outbox: applied pg_id=%d (outbox_id=%d)", pg_id, outbox_id)
         except Exception as exc:
-            if isinstance(exc, (asyncpg.PostgresError, asyncpg.InterfaceError)):
+            if isinstance(exc, (asyncpg.PostgresError, asyncpg.InterfaceError, asyncio.TimeoutError, ProjectIdentityUnavailable)):
                 log.warning(
                     "outbox: postgres error pg_id=%d attempt %d/%d: %s",
                     pg_id, retries + 1, OUTBOX_MAX_RETRIES, exc,
@@ -4076,28 +4112,41 @@ class MemoryCoordinator:
                     "outbox: neo4j write failed pg_id=%d attempt %d/%d: %s",
                     pg_id, retries + 1, OUTBOX_MAX_RETRIES, exc,
                 )
-            async with self._acquire() as conn:
-                if retries + 1 >= OUTBOX_MAX_RETRIES:
-                    # Atomic: bump retries AND flip status in one statement
-                    await conn.execute(
-                        "UPDATE neo4j_outbox SET status='failed', retries=retries+1 WHERE id=$1",
-                        outbox_id,
-                    )
-                    log.error(
-                        "outbox: pg_id=%d permanently failed after %d attempts",
-                        pg_id, retries + 1,
-                    )
+            try:
+                async def _record_retry(c):
+                    if retries + 1 >= OUTBOX_MAX_RETRIES:
+                        # Atomic: bump retries AND flip status in one statement
+                        await c.execute(
+                            "UPDATE neo4j_outbox SET status='failed', retries=retries+1 WHERE id=$1",
+                            outbox_id,
+                        )
+                        log.error(
+                            "outbox: pg_id=%d permanently failed after %d attempts",
+                            pg_id, retries + 1,
+                        )
+                    else:
+                        # Exponential backoff with jitter so a Neo4j outage backs off
+                        # rather than re-hammering BATCH_SIZE rows every poll cycle.
+                        delay = _outbox_backoff_delay(retries)
+                        await c.execute(
+                            "UPDATE neo4j_outbox"
+                            " SET retries=retries+1, status='pending',"
+                            "     next_attempt_at = now() + make_interval(secs => $2)"
+                            " WHERE id=$1",
+                            outbox_id, delay,
+                        )
+
+                if conn is not None:
+                    await _record_retry(conn)
                 else:
-                    # Exponential backoff with jitter so a Neo4j outage backs off
-                    # rather than re-hammering BATCH_SIZE rows every poll cycle.
-                    delay = _outbox_backoff_delay(retries)
-                    await conn.execute(
-                        "UPDATE neo4j_outbox"
-                        " SET retries=retries+1, status='pending',"
-                        "     next_attempt_at = now() + make_interval(secs => $2)"
-                        " WHERE id=$1",
-                        outbox_id, delay,
-                    )
+                    async with self._acquire() as c:
+                        await _record_retry(c)
+            except Exception as update_exc:
+                log.error(
+                    "outbox: failed to update retry status for outbox_id=%d (pg_id=%d): %s",
+                    outbox_id, pg_id, update_exc,
+                )
+
 
     # ── Per-alternative vectors ───────────────────────────────────────────────
 
@@ -6877,8 +6926,11 @@ class MemoryCoordinator:
         content    = body.get("content", "")
         metadata   = _coerce_jsonb_obj(body.get("metadata", {}))
         agent_id   = body.get("agent_id", "unknown")
-        scope      = body.get("scope", "global")
-        visibility = body.get("visibility", "global")
+        vis_res = _validate_visibility_and_scope(body)
+        if isinstance(vis_res, web.Response):
+            return vis_res
+        visibility, scope = vis_res
+
 
         # Server-side identity enforcement — verified agent name overrides client claim.
         # body["metadata"] is explicitly reattached; dict.get() returns an independent
@@ -7802,6 +7854,10 @@ class MemoryCoordinator:
                 {"status": "error", "message": "pg_id (int), rating, and notes are required"},
                 status=400,
             )
+        vis_res = _validate_visibility_and_scope(body)
+        if isinstance(vis_res, web.Response):
+            return vis_res
+        visibility, scope = vis_res
         if rating not in RETRO_RATINGS:
             return web.json_response(
                 {"status": "error",
@@ -7988,8 +8044,7 @@ class MemoryCoordinator:
                         RETURNING id
                         """,
                         notes, metadata, str(embedding), content_hash,
-                        agent_id, body.get("scope", "global"),
-                        body.get("visibility", "global"),
+                        agent_id, scope, visibility,
                     )
                     retro_pg_id = row["id"]
 
@@ -9287,7 +9342,15 @@ class MemoryCoordinator:
             )
 
         cypher = body.get("cypher", "")
-        params = body.get("params", {})
+        if "params" in body:
+            params = body["params"]
+            if not isinstance(params, dict):
+                return web.json_response(
+                    {"status": "error", "message": "params must be an object/dict"},
+                    status=400,
+                )
+        else:
+            params = {}
 
         if not cypher:
             return web.json_response(

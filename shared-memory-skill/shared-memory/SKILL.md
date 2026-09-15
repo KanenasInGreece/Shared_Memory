@@ -287,7 +287,8 @@ Query the knowledge graph for structural and provenance context.
   ```
   uv run --with httpx python ~/.gemini/skills/shared-memory/scripts/memory_bridge.py graph "<cypher_query>"
   ```
-  Read-only enforced: `CREATE`, `DELETE`, `DETACH DELETE`, `SET`, `MERGE`, `CALL`, `LOAD CSV`, `DROP` are blocked.
+  `graph` and named CLI `query` templates require `full` or `admin` (`read` tokens receive 403); `search`, `lineage`/`status`, and `telemetry` remain for `read`.
+  Read-only enforced: `CREATE`, `DELETE`, `DETACH DELETE`, `SET`, `MERGE`, `CALL`, `LOAD CSV`, `DROP` are blocked (write-Cypher is blocked for everyone).
   **A Cypher the database itself refuses — a syntax error, an unknown function, a type error — comes back as 400 `cypher_rejected` carrying Neo4j's own message, not as a 500.** It is your query to fix; re-sending it unchanged will never succeed. A 500 `query failed` means the gateway or Neo4j is the problem, and retrying is reasonable. A read-only Cypher returning more than `GRAPH_QUERY_ROW_CAP` rows (default 10000) is refused 400 `graph_row_cap_exceeded`; narrow the query or raise the cap.
 
 **Record lineage** — *"what happened to this record?"*:
@@ -541,7 +542,7 @@ Tool: review_hold
 Args: {"summary_id": 12, "pg_id": 43}
 ```
 
-The MCP surface mirrors the CLI except the named `query` shortcuts (`why-to-check`, `who-decided`, `retrospectives`, `agent-decisions`), which have no MCP twin — raw Cypher via `graph_query` is the MCP form; every other CLI action has a tool: `record_lineage` (pass a qualified `ref`), `memory_telemetry` and `check_memory_health` (the `status` / `doctor` pair), and `archive_reasoning_trace`. Same auth, same qualified-ref rules, same operator-involvement expectations as the CLI forms.
+The MCP surface mirrors the CLI except the named `query` shortcuts (`why-to-check`, `who-decided`, `retrospectives`, `agent-decisions`), which have no MCP twin — raw Cypher via `graph_query` is the MCP form; every other CLI action has a tool: `record_lineage` (pass a qualified `ref`), `memory_telemetry` and `check_memory_health` (the `status` / `doctor` pair), and `archive_reasoning_trace`. Same auth, same qualified-ref rules, same operator-involvement expectations as the CLI forms. (`graph`, `graph_query`, and named CLI `query` templates require `full` or `admin` role; `search`, `lineage`/`status`, and `telemetry` remain for `read`. Write-Cypher still blocked for everyone.)
 
 ---
 
@@ -611,7 +612,7 @@ minting all live in **[Documentation/server-setup.md](Documentation/server-setup
 ```bash
 # Liveness (anonymous — status/version/api_version only, v0.9.9 S-10):
 curl http://localhost:8888/health
-# → {"status":"ok","api_version":4,"version":"0.9.102"}
+# → {"status":"ok","api_version":4,"version":"0.9.103"}
 
 # Liveness + API contract check (this client vs the gateway):
 python ~/.claude/skills/shared-memory/scripts/memory_bridge.py doctor
@@ -700,7 +701,7 @@ must be running — see [Documentation/server-setup.md](Documentation/server-set
 
 ## Reference
 
-- **Version:** `python ~/.gemini/skills/shared-memory/scripts/memory_bridge.py --version` → `{"version": "0.9.102", "api_version": 4, "tool": "shared-memory-framework"}`
+- **Version:** `python ~/.gemini/skills/shared-memory/scripts/memory_bridge.py --version` → `{"version": "0.9.103", "api_version": 4, "tool": "shared-memory-framework"}`
 
 ### Updating This Skill
 

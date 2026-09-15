@@ -1257,7 +1257,11 @@ Give the agent the search-first conduct from
 file it reads — that file is the MCP counterpart of the CLI skill's constitution snippet
 (`mcp/system-prompt.md` carries the same rules for an LLM server configured by a system
 prompt), and the tool names it teaches (`hybrid_search_and_rerank`, `graph_query`) are exactly
-what the server exposes.
+what the server exposes. `graph_query` (and the CLI `graph` / named `query` templates that
+POST `/memory/graph`) requires a `full` or `admin` token; a `read` token gets 403.
+`hybrid_search_and_rerank`, lineage, and telemetry remain available to `read`.
+At save, `visibility` must be `global`, `scope`, or `private` (default `global`); `visibility=scope`
+requires a non-empty `scope` string.
 
 Register `mcp/vector-skill.py` in `mcp.json` with the coordinator URL and the `lm_studio` token in
 the `env` block — the token is not optional; without it every call 401s. Restart LM Studio

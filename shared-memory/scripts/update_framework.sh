@@ -347,7 +347,7 @@ echo
 # run uv perfectly well by hand. That is the DEFAULT outcome of a correct
 # install, so it is named here rather than treated as a broken machine.
 missing=""
-for tool in uv curl; do
+for tool in git uv curl; do
     command -v "$tool" >/dev/null 2>&1 || missing="$missing $tool"
 done
 if [[ -n "$missing" ]]; then
