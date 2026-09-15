@@ -2882,12 +2882,14 @@ def _consolidation_rollup(by_type: dict, any_stalled: bool, started_at: dict,
 
 
 # Cypher write-operation guard — reject queries containing mutating keywords.
-# Defence-in-depth (second layer: the session opens with default_access_mode
-# ="READ"). Every keyword is matched on WORD BOUNDARIES, never on a following
-# whitespace character: `SET\s` let `SET  n:Label` (two spaces) through the
-# guard entirely, because the `\b` closing the alternation then had to hold
-# between two spaces. Live-reproduced bypass, fact:1734 (item 7 of the
-# v0.9.69 post-first-write hardening plan).
+# Note: the read-transaction API (`session.execute_read`) and session access
+# mode (`default_access_mode="READ"`) are driver routing hints and do not provide
+# a server-enforced security boundary on Neo4j Community standalone.
+# The regex guard here stays the primary write control. Every keyword is matched
+# on WORD BOUNDARIES, never on a following whitespace character: `SET\s` let
+# `SET  n:Label` (two spaces) through the guard entirely, because the `\b`
+# closing the alternation then had to hold between two spaces. Live-reproduced
+# bypass, fact:1734 (item 7 of the v0.9.69 post-first-write hardening plan).
 #
 # `\bSET\b` does NOT match a property name that merely CONTAINS "set"
 # (`n.settings`, `n.asset`) — those are the cases the old comment feared and
@@ -9304,9 +9306,12 @@ class MemoryCoordinator:
 
         _t0 = time.monotonic()
         try:
+            async def _read_tx(tx):
+                result = await tx.run(cypher, **params)
+                return await result.fetch(GRAPH_QUERY_ROW_CAP + 1)
+
             async with self._neo4j.session(default_access_mode="READ") as session:
-                result  = await session.run(cypher, **params)
-                records = await result.fetch(GRAPH_QUERY_ROW_CAP + 1)
+                records = await session.execute_read(_read_tx)
             safe(lambda: self._neo4j_ring.record((time.monotonic() - _t0) * 1000.0))
         except ClientError as exc:
             # A REJECTION IS THE CALLER'S, NOT OURS — counted separately from
