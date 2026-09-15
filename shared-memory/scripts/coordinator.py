@@ -555,11 +555,10 @@ def _lookup_agent_by_token(token: str) -> "str | None":
 _READ_ROLE_ROUTES: set[tuple[str, str]] = {
     ("GET",  "/memory/telemetry"),
     # Search is a READ — this file's own quiesce classification already says so
-    # ("Reads (search/graph/telemetry/status) and /health always flow"), and the
-    # allowed read-only Cypher on /memory/graph can reach every record search
-    # can, so admitting search widens no exposure. Measured 2026-08-24: the
-    # first read-only MCP client on the fleet was 403'd on the most read-like
-    # operation there is, while graph_query would have answered.
+    # ("Reads (search/graph/telemetry/status) and /health always flow"). Admitting
+    # search lets read-only clients query knowledge safely without granting
+    # arbitrary graph traversal or query execution (/memory/graph is confined
+    # to full and admin roles; S1).
     ("POST", "/memory/search"),
 }
 
