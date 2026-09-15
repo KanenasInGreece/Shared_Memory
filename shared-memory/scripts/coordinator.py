@@ -2982,6 +2982,42 @@ def _visibility_filter(viewer: str | None, viewer_scope: str | None,
     return "(" + " OR ".join(clauses) + ")", params
 
 
+def _validate_visibility_and_scope(body: dict) -> tuple[str, str] | web.Response:
+    """Validate visibility and scope on save and retrospective ingress (S4 / ADV-4 / ADV-5).
+
+    Refuses visibility not in ('global', 'scope', 'private').
+    When visibility == 'scope', scope must be a non-empty string (stripped).
+    """
+    if "visibility" in body:
+        visibility = body["visibility"]
+        if visibility not in ("global", "scope", "private"):
+            return web.json_response(
+                {
+                    "status": "error",
+                    "message": "visibility must be one of 'global', 'scope', 'private'",
+                },
+                status=400,
+            )
+    else:
+        visibility = "global"
+
+    if visibility == "scope":
+        raw_scope = body.get("scope")
+        if not isinstance(raw_scope, str) or not raw_scope.strip():
+            return web.json_response(
+                {
+                    "status": "error",
+                    "message": "scope is required and must be a non-empty string when visibility is 'scope'",
+                },
+                status=400,
+            )
+        scope = raw_scope.strip()
+    else:
+        scope = body.get("scope", "global")
+
+    return visibility, scope
+
+
 def _axis_filter_predicate(start: int, project: "str | list[str] | None",
                             domains: list[str] | None,
                             since: datetime | None) -> tuple[str, list]:
@@ -6890,31 +6926,10 @@ class MemoryCoordinator:
         content    = body.get("content", "")
         metadata   = _coerce_jsonb_obj(body.get("metadata", {}))
         agent_id   = body.get("agent_id", "unknown")
-        if "visibility" in body:
-            visibility = body["visibility"]
-            if visibility not in ("global", "scope", "private"):
-                return web.json_response(
-                    {
-                        "status": "error",
-                        "message": "visibility must be one of 'global', 'scope', 'private'",
-                    },
-                    status=400,
-                )
-        else:
-            visibility = "global"
-
-        if visibility == "scope":
-            if "scope" not in body or not isinstance(body["scope"], str):
-                return web.json_response(
-                    {
-                        "status": "error",
-                        "message": "scope is required and must be a string when visibility is 'scope'",
-                    },
-                    status=400,
-                )
-            scope = body["scope"]
-        else:
-            scope = body.get("scope", "global")
+        vis_res = _validate_visibility_and_scope(body)
+        if isinstance(vis_res, web.Response):
+            return vis_res
+        visibility, scope = vis_res
 
 
         # Server-side identity enforcement — verified agent name overrides client claim.
@@ -7839,6 +7854,10 @@ class MemoryCoordinator:
                 {"status": "error", "message": "pg_id (int), rating, and notes are required"},
                 status=400,
             )
+        vis_res = _validate_visibility_and_scope(body)
+        if isinstance(vis_res, web.Response):
+            return vis_res
+        visibility, scope = vis_res
         if rating not in RETRO_RATINGS:
             return web.json_response(
                 {"status": "error",
@@ -8025,8 +8044,7 @@ class MemoryCoordinator:
                         RETURNING id
                         """,
                         notes, metadata, str(embedding), content_hash,
-                        agent_id, body.get("scope", "global"),
-                        body.get("visibility", "global"),
+                        agent_id, scope, visibility,
                     )
                     retro_pg_id = row["id"]
 

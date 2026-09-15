@@ -280,6 +280,61 @@ async def test_handle_save_visibility_valid_options_accepted():
             assert body["status"] == "success"
 
 
+@pytest.mark.asyncio
+async def test_handle_save_empty_or_whitespace_scope_refused():
+    """ADV-5 Prove-It: when visibility='scope', scope cannot be empty or whitespace."""
+    c = MemoryCoordinator()
+    for empty_scope in ("", "   ", "\t\n"):
+        req = _make_request({
+            "content": "fact",
+            "metadata": {"source": "claude_code", "project": "test_project", "entities": []},
+            "visibility": "scope",
+            "scope": empty_scope,
+        })
+        resp = await c.handle_save(req)
+        assert resp.status == 400
+        body = json.loads(resp.text)
+        assert "scope" in body["message"]
+
+
+@pytest.mark.asyncio
+async def test_handle_retrospective_rejects_invalid_visibility_enum():
+    """ADV-4 Prove-It: retrospective with visibility='typo' must return 400."""
+    c = MemoryCoordinator()
+    req = _make_request({
+        "pg_id": 42,
+        "rating": "validated",
+        "notes": "some notes",
+        "grounded_in": [1],
+        "visibility": "typo",
+    })
+    resp = await c.handle_retrospective(req)
+    assert resp.status == 400
+    body = json.loads(resp.text)
+    assert "visibility" in body["message"]
+
+
+@pytest.mark.asyncio
+async def test_handle_retrospective_rejects_empty_or_whitespace_scope():
+    """ADV-4 + ADV-5: retrospective with visibility='scope' and empty/whitespace/non-string scope must return 400."""
+    c = MemoryCoordinator()
+    for bad_scope in ("", "   ", 123, None):
+        req_data = {
+            "pg_id": 42,
+            "rating": "validated",
+            "notes": "some notes",
+            "grounded_in": [1],
+            "visibility": "scope",
+        }
+        if bad_scope is not None:
+            req_data["scope"] = bad_scope
+        req = _make_request(req_data)
+        resp = await c.handle_retrospective(req)
+        assert resp.status == 400
+        body = json.loads(resp.text)
+        assert "scope" in body["message"]
+
+
 # ── Slice 3: graph-visibility stay-green pin (S1) ─────────────────────────────
 
 @pytest.mark.asyncio
