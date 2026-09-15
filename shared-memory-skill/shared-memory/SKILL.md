@@ -287,7 +287,7 @@ Query the knowledge graph for structural and provenance context.
   ```
   uv run --with httpx python ~/.gemini/skills/shared-memory/scripts/memory_bridge.py graph "<cypher_query>"
   ```
-  Requires a token with `full` or `admin` role (`read` tokens receive 403). The named CLI `query` shortcuts above hit search and telemetry and stay available to `read` tokens.
+  `graph` and named CLI `query` templates require `full` or `admin` (`read` tokens receive 403); `search`, `lineage`/`status`, and `telemetry` remain for `read`.
   Read-only enforced: `CREATE`, `DELETE`, `DETACH DELETE`, `SET`, `MERGE`, `CALL`, `LOAD CSV`, `DROP` are blocked (write-Cypher is blocked for everyone).
   **A Cypher the database itself refuses — a syntax error, an unknown function, a type error — comes back as 400 `cypher_rejected` carrying Neo4j's own message, not as a 500.** It is your query to fix; re-sending it unchanged will never succeed. A 500 `query failed` means the gateway or Neo4j is the problem, and retrying is reasonable. A read-only Cypher returning more than `GRAPH_QUERY_ROW_CAP` rows (default 10000) is refused 400 `graph_row_cap_exceeded`; narrow the query or raise the cap.
 
@@ -542,7 +542,7 @@ Tool: review_hold
 Args: {"summary_id": 12, "pg_id": 43}
 ```
 
-The MCP surface mirrors the CLI except the named `query` shortcuts (`why-to-check`, `who-decided`, `retrospectives`, `agent-decisions`), which have no MCP twin — raw Cypher via `graph_query` is the MCP form; every other CLI action has a tool: `record_lineage` (pass a qualified `ref`), `memory_telemetry` and `check_memory_health` (the `status` / `doctor` pair), and `archive_reasoning_trace`. Same auth, same qualified-ref rules, same operator-involvement expectations as the CLI forms. (Named CLI `query` shortcuts hit search/telemetry and stay available to `read` tokens; raw `graph` / `graph_query` requires `full` or `admin` role, and write-Cypher is blocked for everyone.)
+The MCP surface mirrors the CLI except the named `query` shortcuts (`why-to-check`, `who-decided`, `retrospectives`, `agent-decisions`), which have no MCP twin — raw Cypher via `graph_query` is the MCP form; every other CLI action has a tool: `record_lineage` (pass a qualified `ref`), `memory_telemetry` and `check_memory_health` (the `status` / `doctor` pair), and `archive_reasoning_trace`. Same auth, same qualified-ref rules, same operator-involvement expectations as the CLI forms. (`graph`, `graph_query`, and named CLI `query` templates require `full` or `admin` role; `search`, `lineage`/`status`, and `telemetry` remain for `read`. Write-Cypher still blocked for everyone.)
 
 ---
 

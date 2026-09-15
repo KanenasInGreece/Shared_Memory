@@ -43,7 +43,7 @@ where the standing rules go.
 
 ## Tools (11; the CLI's named query shortcuts have no MCP twin — use graph_query)
 
-Retrieval and diagnostics: `hybrid_search_and_rerank`, `graph_query` (read-only Cypher; requires `full` or `admin` role — `read` receives 403; named CLI `query` shortcuts hit search/telemetry and stay available to `read`),
+Retrieval and diagnostics: `hybrid_search_and_rerank`, `graph_query` (read-only Cypher; `graph` and named CLI `query` templates require `full` or `admin` — `read` receives 403; `search`, `lineage`/`status`, and `telemetry` remain for `read`; write-Cypher still blocked for everyone),
 `record_lineage`, `memory_telemetry`, `check_memory_health`.
 Capture: `save_artifact`, `save_decision`, `save_retrospective`, `archive_reasoning_trace`.
 Record lifecycle: `supersede`, `review_hold`.
