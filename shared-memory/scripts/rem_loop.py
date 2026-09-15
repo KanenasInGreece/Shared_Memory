@@ -310,7 +310,7 @@ REM_STARVED_THRESHOLD = int(os.environ.get("REM_STARVED_THRESHOLD", "3"))
 
 # LLM failure classes recorded on REMDaemon._last_llm_failure.
 LLM_FAIL_TRANSPORT = "transport"   # HTTP non-200 / connection / gateway-shape — NOT chargeable
-LLM_FAIL_CLIENT    = "client"      # deterministic HTTP 4xx (except 429) — CHARGEABLE
+LLM_FAIL_CLIENT    = "client"      # deterministic HTTP 4xx (400, 404, 422) — CHARGEABLE
 LLM_FAIL_TRUNCATED = "truncated"   # finish_reason=length even after the retry (widened for
                                     # an honest truncation, same-bound for a degenerate one)
 LLM_FAIL_PARSE     = "parse"       # response arrived but its content is unusable
@@ -1180,7 +1180,7 @@ class REMDaemon:
                 logger.error("LLM returned %d: %s", resp.status_code, resp.text[:200])
                 fail_class = (
                     LLM_FAIL_CLIENT
-                    if 400 <= resp.status_code < 500 and resp.status_code != 429
+                    if resp.status_code in (400, 404, 422)
                     else LLM_FAIL_TRANSPORT
                 )
                 return None, model, fail_class, False
@@ -1384,7 +1384,7 @@ class REMDaemon:
                                     ok=False, note=f"batch_http_{resp.status_code}",
                                     prompt_chars=len(prompt))
                     logger.error("REM batch LLM returned %d: %s", resp.status_code, resp.text[:200])
-                    if 400 <= resp.status_code < 500 and resp.status_code != 429:
+                    if resp.status_code in (400, 404, 422):
                         self._last_llm_failure = LLM_FAIL_CLIENT
                     else:
                         self._last_llm_failure = LLM_FAIL_TRANSPORT

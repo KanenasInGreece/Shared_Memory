@@ -671,10 +671,10 @@ async def test_solo_transport_failure_does_not_charge_an_attempt(monkeypatch):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("status_code", [400, 401])
+@pytest.mark.parametrize("status_code", [400, 404])
 async def test_solo_client_4xx_charges_attempt(monkeypatch, status_code):
-    """fact:2435 Prove-It: deterministic HTTP 4xx (e.g. 400, 401) must classify as
-    client error and charge rem_attempts."""
+    """ADV-6 Prove-It: deterministic HTTP 400 and 404 must classify as client error
+    and charge rem_attempts."""
     daemon, _ = _make_daemon()
     monkeypatch.delenv("MOCK_LLM", raising=False)
 
@@ -700,19 +700,21 @@ async def test_solo_client_4xx_charges_attempt(monkeypatch, status_code):
 
 
 @pytest.mark.asyncio
-async def test_solo_rate_limit_429_does_not_charge_attempt(monkeypatch):
-    """fact:2435: HTTP 429 rate limit is transport/capacity, not a record defect;
-    it must NOT charge rem_attempts."""
+@pytest.mark.parametrize("status_code", [401, 403, 408, 429])
+async def test_solo_transport_4xx_does_not_charge_attempt(monkeypatch, status_code):
+    """ADV-6: HTTP 401, 403, 408, 429 are credential/capacity/timeout, not record defects;
+    they must NOT charge rem_attempts."""
     daemon, _ = _make_daemon()
     monkeypatch.delenv("MOCK_LLM", raising=False)
 
     class R:
-        status_code = 429
-        text = "rate limited"
-        headers = {}
+        def __init__(self, sc):
+            self.status_code = sc
+            self.text = f"transport error {sc}"
+            self.headers = {}
 
     async def _fake_post(self, url, **kwargs):
-        return R()
+        return R(status_code)
 
     monkeypatch.setattr("httpx.AsyncClient.post", _fake_post)
 
@@ -729,7 +731,10 @@ async def test_solo_rate_limit_429_does_not_charge_attempt(monkeypatch):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("status_code,expected_failure", [
     (400, "client"),
-    (401, "client"),
+    (404, "client"),
+    (401, rem_mod.LLM_FAIL_TRANSPORT),
+    (403, rem_mod.LLM_FAIL_TRANSPORT),
+    (408, rem_mod.LLM_FAIL_TRANSPORT),
     (429, rem_mod.LLM_FAIL_TRANSPORT),
 ])
 async def test_batch_failure_classification(monkeypatch, status_code, expected_failure):
