@@ -555,7 +555,7 @@ def _lookup_agent_by_token(token: str) -> "str | None":
 _READ_ROLE_ROUTES: set[tuple[str, str]] = {
     ("GET",  "/memory/telemetry"),
     # Search is a READ — this file's own quiesce classification already says so
-    # ("Reads (search/graph/telemetry/status) and /health always flow"). Admitting
+    # ("Reads (search/telemetry/status) and /health always flow"). Admitting
     # search lets read-only clients query knowledge safely without granting
     # arbitrary graph traversal or query execution (/memory/graph is confined
     # to full and admin roles; S1).
@@ -563,7 +563,7 @@ _READ_ROLE_ROUTES: set[tuple[str, str]] = {
 }
 
 # Client WRITE routes — shed (503 + Retry-After) while a backup quiesce is active.
-# Reads (search/graph/telemetry/status) and /health always flow.
+# Reads (search/telemetry/status) and /health always flow (/memory/graph requires full or admin role).
 _WRITE_ROUTES: set[tuple[str, str]] = {
     ("POST", "/memory/save"),
     ("POST", "/memory/retrospective"),

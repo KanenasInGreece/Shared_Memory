@@ -58,9 +58,9 @@ space, not authoritative.
 - **Search first, always.** Before reasoning about this workstation, its
   projects, a prior decision, or whether something was ever tested, tried,
   rejected or done, call `hybrid_search_and_rerank`. This is a precondition,
-  not a judgement call to make first. If the results need more graph depth
+  not a judgement call to make first.  If the results need more graph depth
   than the automatic expansion returned, follow with `graph_query`
-  (read-only Cypher) — depth is the reason to reach for it, not a second guess
+  (read-only Cypher; requires `full` or `admin` role — `read` receives 403) — depth is the reason to reach for it, not a second guess
   at the same question.
 - **Quote the `ref`, never a bare number.** A record id is unique only WITHIN
   its table, so `fact:1234` and `summary:1234` are different records. Every
@@ -68,9 +68,9 @@ space, not authoritative.
   against the facts table, which is exactly why one lifted off a summary result
   returns a confident, unrelated record instead of an error.
 - **Your ROLE decides which writes succeed, and a refusal is an answer.** Every
-  identity is registered with a role: a read-only one reaches retrieval and
-  telemetry, and `save_artifact`, `save_decision`, `save_retrospective` and
-  `supersede` answer with an honest 403. That 403 is the system working — do
+  identity is registered with a role: a read-only one reaches search and
+  telemetry, while `graph_query` and mutation tools (`save_artifact`, `save_decision`, `save_retrospective` and
+  `supersede`) answer with an honest 403. That 403 is the system working — do
   not retry it, do not route around it, and say plainly that the record was not
   saved rather than reporting a save that did not happen. Where writes ARE
   permitted, the same discipline as everywhere: propose the record and confirm

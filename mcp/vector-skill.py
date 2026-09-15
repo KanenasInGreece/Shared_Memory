@@ -1730,9 +1730,10 @@ async def graph_query(cypher: str) -> str:
     """
     Run a READ-ONLY Cypher query against the knowledge graph.
 
+    Requires a token with full or admin role (read-only tokens receive 403).
     The gateway enforces read-only: CREATE, DELETE, DETACH DELETE, SET, MERGE,
     CALL, LOAD CSV and DROP are rejected there, not here — a client-side check
-    would be advisory only.
+    would be advisory only. Write-Cypher is blocked for everyone.
     """
     try:
         async with httpx.AsyncClient(timeout=CALL_TIMEOUT, trust_env=False) as client:
