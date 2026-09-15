@@ -3,11 +3,11 @@
 # Install into a clean venv: pip install -r requirements.txt
 # Reproducible install (exact tested versions): uv venv && uv pip sync requirements.lock
 
-aiohttp>=3.13.5        # Hive-Mind Gateway (hive_mind_proxy.py)
+aiohttp>=3.14.3        # Hive-Mind Gateway (hive_mind_proxy.py)
 asyncpg>=0.31.0        # Async Postgres pool — coordinator.py
 httpx>=0.28.1          # HTTP client — memory_bridge.py, vector-skill.py
 psycopg2-binary>=2.9.12 # Postgres driver — consolidation_loop.py, migrations
 neo4j>=6.2.0           # Neo4j driver — coordinator.py, consolidation_loop.py
-fastmcp>=3.3.1         # MCP server — vector-skill.py (LM Studio only)
-starlette>=1.0.1       # Transitive via fastmcp; floor enforces BadHost fix (CVE-2026-48710)
+fastmcp>=3.4.7         # MCP server — vector-skill.py (LM Studio only)
+starlette>=1.6.0       # Transitive via fastmcp; floor enforces BadHost fix (CVE-2026-48710)
 json-repair>=0.63.2    # Salvage LLM JSON slips — rem_loop.py
