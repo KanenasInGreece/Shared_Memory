@@ -6877,8 +6877,32 @@ class MemoryCoordinator:
         content    = body.get("content", "")
         metadata   = _coerce_jsonb_obj(body.get("metadata", {}))
         agent_id   = body.get("agent_id", "unknown")
-        scope      = body.get("scope", "global")
-        visibility = body.get("visibility", "global")
+        if "visibility" in body:
+            visibility = body["visibility"]
+            if visibility not in ("global", "scope", "private"):
+                return web.json_response(
+                    {
+                        "status": "error",
+                        "message": "visibility must be one of 'global', 'scope', 'private'",
+                    },
+                    status=400,
+                )
+        else:
+            visibility = "global"
+
+        if visibility == "scope":
+            if "scope" not in body or not isinstance(body["scope"], str):
+                return web.json_response(
+                    {
+                        "status": "error",
+                        "message": "scope is required and must be a string when visibility is 'scope'",
+                    },
+                    status=400,
+                )
+            scope = body["scope"]
+        else:
+            scope = body.get("scope", "global")
+
 
         # Server-side identity enforcement — verified agent name overrides client claim.
         # body["metadata"] is explicitly reattached; dict.get() returns an independent

@@ -189,3 +189,95 @@ async def test_keyword_fallback_is_gated():
     reads = _all_read_sql(mock_conn)
     assert reads and all("visibility" in sql for sql in reads)
     assert "claude_code" in _all_bound_params(mock_conn)
+
+
+# ── S4: handle_save visibility validation ─────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_handle_save_visibility_typo_refused():
+    """S4 Prove-It (RED on 06b892b): save with visibility: 'typo' -> 400."""
+    c = MemoryCoordinator()
+    req = _make_request({
+        "content": "some fact content",
+        "metadata": {"source": "claude_code", "project": "test_project", "entities": ["TestEntity"]},
+        "visibility": "typo",
+    })
+    resp = await c.handle_save(req)
+    assert resp.status == 400
+    body = json.loads(resp.text)
+    assert body["status"] == "error"
+    assert "visibility" in body["message"]
+
+
+@pytest.mark.asyncio
+async def test_handle_save_visibility_scope_missing_or_non_string_refused():
+    """S4: if visibility=scope, scope must be present and a string."""
+    c = MemoryCoordinator()
+
+    # Missing scope
+    req1 = _make_request({
+        "content": "some fact content",
+        "metadata": {"source": "claude_code", "project": "test_project", "entities": ["TestEntity"]},
+        "visibility": "scope",
+    })
+    resp1 = await c.handle_save(req1)
+    assert resp1.status == 400
+    body1 = json.loads(resp1.text)
+    assert "scope" in body1["message"]
+
+    # Non-string scope (int)
+    req2 = _make_request({
+        "content": "some fact content",
+        "metadata": {"source": "claude_code", "project": "test_project", "entities": ["TestEntity"]},
+        "visibility": "scope",
+        "scope": 123,
+    })
+    resp2 = await c.handle_save(req2)
+    assert resp2.status == 400
+    body2 = json.loads(resp2.text)
+    assert "scope" in body2["message"]
+
+    # Non-string scope (None)
+    req3 = _make_request({
+        "content": "some fact content",
+        "metadata": {"source": "claude_code", "project": "test_project", "entities": ["TestEntity"]},
+        "visibility": "scope",
+        "scope": None,
+    })
+    resp3 = await c.handle_save(req3)
+    assert resp3.status == 400
+    body3 = json.loads(resp3.text)
+    assert "scope" in body3["message"]
+
+
+@pytest.mark.asyncio
+async def test_handle_save_visibility_valid_options_accepted():
+    """S4: valid visibility values ('global', 'private', 'scope') pass validation."""
+    c, mock_conn = _coordinator_with_mocks()
+    mock_conn.fetchval = AsyncMock(return_value=None)
+    mock_conn.fetchrow = AsyncMock(return_value={"id": 100})
+    mock_conn.execute = AsyncMock(return_value="INSERT 0 1")
+    mock_tx = MagicMock()
+    mock_tx.__aenter__ = AsyncMock(return_value=mock_tx)
+    mock_tx.__aexit__ = AsyncMock(return_value=False)
+    mock_conn.transaction = MagicMock(return_value=mock_tx)
+
+    with patch.object(c, "_embed", new=AsyncMock(return_value=[0.1] * 1024)):
+        for vis, sc in [("global", "global"), ("private", "global"), ("scope", "my-scope")]:
+            req_data = {
+                "content": f"fact with {vis}",
+                "metadata": {"source": "claude_code", "project": "general_discussion", "entities": []},
+                "visibility": vis,
+            }
+
+
+            if vis == "scope":
+                req_data["scope"] = sc
+            req = _make_request(req_data, authenticated_agent="claude_code")
+            resp = await c.handle_save(req)
+            assert resp.status == 200, f"Expected 200 for {vis}, got {resp.status}"
+            body = json.loads(resp.text)
+            assert body["status"] == "success"
+
+
+
