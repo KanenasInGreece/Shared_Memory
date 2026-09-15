@@ -548,13 +548,12 @@ def _lookup_agent_by_token(token: str) -> "str | None":
 # ── Read-only roles (e.g. the telemetry monitor) ────────────────────────────────
 #
 # Routes a "read" role may reach. Everything else — saves, retrospectives,
-# search, and the LLM/embeddings proxy passthrough — returns 403 for a read
+# graph, and the LLM/embeddings proxy passthrough — returns 403 for a read
 # token. /health is unauthenticated for everyone (see _UNPROTECTED_PATHS).
-# /memory/graph is included because handle_graph already enforces a read-only
-# Cypher guard, so a read token cannot mutate Neo4j through it.
+# /memory/graph is excluded: full and admin roles keep the route, while a
+# read token gets 403 (S1 confine route).
 _READ_ROLE_ROUTES: set[tuple[str, str]] = {
     ("GET",  "/memory/telemetry"),
-    ("POST", "/memory/graph"),
     # Search is a READ — this file's own quiesce classification already says so
     # ("Reads (search/graph/telemetry/status) and /health always flow"), and the
     # allowed read-only Cypher on /memory/graph can reach every record search

@@ -723,11 +723,22 @@ async def test_read_role_allows_telemetry():
 
 
 @pytest.mark.asyncio
-async def test_read_role_allows_graph():
+async def test_read_role_denies_graph():
+    from aiohttp.web_exceptions import HTTPForbidden
     mod = load_coordinator("monitor:tok_m", agent_roles="monitor:read")
     req = _make_request("/memory/graph", auth_header="Bearer tok_m", method="POST")
-    resp = await mod.auth_middleware(req, _noop_handler)
-    assert resp.status == 200
+    with pytest.raises(HTTPForbidden):
+        await mod.auth_middleware(req, _noop_handler)
+
+
+@pytest.mark.asyncio
+async def test_read_role_posting_cypher_match_to_graph_is_denied():
+    from aiohttp.web_exceptions import HTTPForbidden
+    mod = load_coordinator("monitor:tok_m", agent_roles="monitor:read")
+    req = _make_request("/memory/graph", auth_header="Bearer tok_m", method="POST")
+    req.json = AsyncMock(return_value={"cypher": "MATCH (f:Fact) RETURN f.content LIMIT 1"})
+    with pytest.raises(HTTPForbidden):
+        await mod.auth_middleware(req, _noop_handler)
 
 
 @pytest.mark.asyncio

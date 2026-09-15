@@ -1514,13 +1514,17 @@ async def test_handle_save_agent_id_falls_back_to_body_without_auth():
 # ── Read-role route gating — _read_role_permits ──────────────────────────────
 
 def test_read_role_permits_allows_exact_allowlisted_routes():
-    """The fixed _READ_ROLE_ROUTES entries (telemetry, graph) are always reachable
-    by a read-only role, with or without a trailing slash."""
+    """The fixed _READ_ROLE_ROUTES entries (telemetry, search) are reachable
+    by a read-only role, with or without a trailing slash, while POST /memory/graph is denied."""
     for path in ("/memory/telemetry", "/memory/telemetry/"):
         req = MagicMock(method="GET", path=path)
         assert coordinator_mod._read_role_permits(req) is True
-    req = MagicMock(method="POST", path="/memory/graph")
-    assert coordinator_mod._read_role_permits(req) is True
+    for path in ("/memory/search", "/memory/search/"):
+        req = MagicMock(method="POST", path=path)
+        assert coordinator_mod._read_role_permits(req) is True
+    for path in ("/memory/graph", "/memory/graph/"):
+        req = MagicMock(method="POST", path=path)
+        assert coordinator_mod._read_role_permits(req) is False
 
 
 def test_read_role_permits_allows_memory_status_with_pg_id():
