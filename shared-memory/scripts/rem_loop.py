@@ -1767,16 +1767,23 @@ class REMDaemon:
                 results, call_timing, _model = await self._llm_process_batch(
                     fact_items)
                 if results is None:
-                    # F1: the CALL failed (transport/HTTP/envelope). That is
-                    # evidence about the backend, not about these facts — no
-                    # attempt is charged, so a pool 503 can never demote the
-                    # batch to solo or march innocent records toward
-                    # dead-letter. They retry, still batched, next cycle.
-                    logger.warning(
-                        "REM batch: call failed (%s) — %d fact(s) retry next cycle; "
-                        "no attempt charged (not attributable to any record)",
-                        self._last_llm_failure or LLM_FAIL_TRANSPORT, len(fact_items),
-                    )
+                    if self._last_llm_failure in LLM_FAIL_CHARGEABLE:
+                        logger.warning(
+                            "REM batch: call failed (%s) — %d fact(s) charged an attempt",
+                            self._last_llm_failure, len(fact_items),
+                        )
+                        await self._bump_rem_attempts([it["pg_id"] for it in fact_items])
+                    else:
+                        # F1: the CALL failed (transport/HTTP/envelope). That is
+                        # evidence about the backend, not about these facts — no
+                        # attempt is charged, so a pool 503 can never demote the
+                        # batch to solo or march innocent records toward
+                        # dead-letter. They retry, still batched, next cycle.
+                        logger.warning(
+                            "REM batch: call failed (%s) — %d fact(s) retry next cycle; "
+                            "no attempt charged (not attributable to any record)",
+                            self._last_llm_failure or LLM_FAIL_TRANSPORT, len(fact_items),
+                        )
                     results = {}
                 else:
                     # The call succeeded: a missing/invalid line IS evidence

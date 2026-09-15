@@ -1180,6 +1180,71 @@ async def test_run_cycle_batch_transport_failure_charges_nobody(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_run_cycle_batch_client_400_charges_batch_members(monkeypatch):
+    """ADV-2 Prove-It: deterministic HTTP 400 on batch call must charge rem_attempts
+    for all batch members."""
+    ids = [21, 22, 23]
+    kinds = {i: rem_mod.KIND_FACT for i in ids}
+    daemon = _cycle_daemon(monkeypatch, ids, kinds)
+    async def _mock_batch(items):
+        daemon._last_llm_failure = rem_mod.LLM_FAIL_CLIENT
+        return None, None, "m"
+    daemon._llm_process_batch = _mock_batch
+
+    processed, attempted = await daemon.run_cycle()
+
+    assert processed == 0 and attempted == 3
+    daemon._bump_rem_attempts.assert_awaited_once_with(ids)
+
+
+@pytest.mark.asyncio
+async def test_run_cycle_batch_429_and_503_do_not_charge_batch_members(monkeypatch):
+    """ADV-2: HTTP 429 and 503 batch failures must NOT charge rem_attempts."""
+    ids = [21, 22, 23]
+    kinds = {i: rem_mod.KIND_FACT for i in ids}
+    for fail_mode in (rem_mod.LLM_FAIL_TRANSPORT, rem_mod.LLM_FAIL_ROUTING_REFUSED):
+        daemon = _cycle_daemon(monkeypatch, ids, kinds)
+        async def _mock_batch(items, fm=fail_mode):
+            daemon._last_llm_failure = fm
+            return None, None, "m"
+        daemon._llm_process_batch = _mock_batch
+
+        processed, attempted = await daemon.run_cycle()
+
+        assert processed == 0 and attempted == 3
+        daemon._bump_rem_attempts.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_run_cycle_batch_http_400_end_to_end_charges_attempts(monkeypatch):
+    """ADV-2 Prove-It: live _llm_process_batch returning HTTP 400 sets LLM_FAIL_CLIENT
+    and run_cycle charges rem_attempts."""
+    ids = [31, 32]
+    kinds = {i: rem_mod.KIND_FACT for i in ids}
+    content_map = {
+        p: {"content": "x" * (rem_mod.REM_SUMMARY_THRESHOLD + 1), "kind": kinds[p], "created_at": None}
+        for p in ids
+    }
+    daemon = _cycle_daemon(monkeypatch, ids, kinds, content_map=content_map)
+    monkeypatch.delenv("MOCK_LLM", raising=False)
+
+    class R:
+        status_code = 400
+        text = "bad request"
+        headers = {}
+
+    async def _fake_post(self, url, **kwargs):
+        return R()
+
+    monkeypatch.setattr("httpx.AsyncClient.post", _fake_post)
+
+    processed, attempted = await daemon.run_cycle()
+
+    assert processed == 0 and attempted == 2
+    daemon._bump_rem_attempts.assert_awaited_once_with(ids)
+
+
+@pytest.mark.asyncio
 async def test_run_cycle_batch_missing_line_charges_only_that_record(monkeypatch):
     """The complement: when the call SUCCEEDS, a record whose line is missing
     is chargeable — that is real evidence about that record."""
