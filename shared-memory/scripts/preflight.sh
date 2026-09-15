@@ -291,7 +291,8 @@ echo "Recommended:"
 # machine that meets the recommendation must be able to PASS the check for it
 # (measured: 16 GB host, MemTotal 15 GB, previously warned forever).
 mem_gb=$(awk '/MemTotal/ {printf "%d", $2/1024/1024}' /proc/meminfo 2>/dev/null || echo 0)
-neo4j_heap_override="$(read_env NEO4J_HEAP_MAX)"
+neo4j_heap_override=""
+[[ -f "$ENV_FILE" ]] && neo4j_heap_override="$(read_env NEO4J_HEAP_MAX)"
 if [[ "$mem_gb" -ge 15 ]]; then
     ok "RAM ${mem_gb} GB (meets the 16 GB recommendation)"
 elif [[ "$mem_gb" -ge 7 ]]; then
