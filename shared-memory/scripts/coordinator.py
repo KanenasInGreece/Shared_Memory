@@ -4076,28 +4076,41 @@ class MemoryCoordinator:
                     "outbox: neo4j write failed pg_id=%d attempt %d/%d: %s",
                     pg_id, retries + 1, OUTBOX_MAX_RETRIES, exc,
                 )
-            async with self._acquire() as conn:
-                if retries + 1 >= OUTBOX_MAX_RETRIES:
-                    # Atomic: bump retries AND flip status in one statement
-                    await conn.execute(
-                        "UPDATE neo4j_outbox SET status='failed', retries=retries+1 WHERE id=$1",
-                        outbox_id,
-                    )
-                    log.error(
-                        "outbox: pg_id=%d permanently failed after %d attempts",
-                        pg_id, retries + 1,
-                    )
+            try:
+                async def _record_retry(c):
+                    if retries + 1 >= OUTBOX_MAX_RETRIES:
+                        # Atomic: bump retries AND flip status in one statement
+                        await c.execute(
+                            "UPDATE neo4j_outbox SET status='failed', retries=retries+1 WHERE id=$1",
+                            outbox_id,
+                        )
+                        log.error(
+                            "outbox: pg_id=%d permanently failed after %d attempts",
+                            pg_id, retries + 1,
+                        )
+                    else:
+                        # Exponential backoff with jitter so a Neo4j outage backs off
+                        # rather than re-hammering BATCH_SIZE rows every poll cycle.
+                        delay = _outbox_backoff_delay(retries)
+                        await c.execute(
+                            "UPDATE neo4j_outbox"
+                            " SET retries=retries+1, status='pending',"
+                            "     next_attempt_at = now() + make_interval(secs => $2)"
+                            " WHERE id=$1",
+                            outbox_id, delay,
+                        )
+
+                if conn is not None:
+                    await _record_retry(conn)
                 else:
-                    # Exponential backoff with jitter so a Neo4j outage backs off
-                    # rather than re-hammering BATCH_SIZE rows every poll cycle.
-                    delay = _outbox_backoff_delay(retries)
-                    await conn.execute(
-                        "UPDATE neo4j_outbox"
-                        " SET retries=retries+1, status='pending',"
-                        "     next_attempt_at = now() + make_interval(secs => $2)"
-                        " WHERE id=$1",
-                        outbox_id, delay,
-                    )
+                    async with self._acquire() as c:
+                        await _record_retry(c)
+            except Exception as update_exc:
+                log.error(
+                    "outbox: failed to update retry status for outbox_id=%d (pg_id=%d): %s",
+                    outbox_id, pg_id, update_exc,
+                )
+
 
     # ── Per-alternative vectors ───────────────────────────────────────────────
 

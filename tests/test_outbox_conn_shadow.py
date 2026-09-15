@@ -162,8 +162,8 @@ async def test_outbox_postgres_error_does_not_bump_neo4j_tx_failures():
 
     # Postgres error must not bump Neo4j failure counter
     assert c._neo4j_tx_failures_total == 0
-    # Retry bookkeeping occurred
-    assert calls >= 2
+    # Retry bookkeeping occurred on the held batch_conn (B3: prefer existing conn)
+    assert any("status='pending'" in q for q, _ in batch_conn.executed)
 
 
 @pytest.mark.asyncio
@@ -206,7 +206,8 @@ async def test_outbox_postgres_interface_error_does_not_bump_neo4j_tx_failures()
 
     # InterfaceError must not bump Neo4j failure counter
     assert c._neo4j_tx_failures_total == 0
-    assert calls >= 2
+    # Retry bookkeeping occurred on the held batch_conn (B3: prefer existing conn)
+    assert any("status='pending'" in q for q, _ in batch_conn.executed)
 
 
 @pytest.mark.asyncio
@@ -245,7 +246,9 @@ async def test_outbox_asyncio_timeout_error_does_not_bump_neo4j_tx_failures():
     )
 
     assert c._neo4j_tx_failures_total == 0
-    assert calls >= 2
+    # Retry bookkeeping occurred on the held batch_conn (B3: prefer existing conn)
+    assert any("status='pending'" in q for q, _ in batch_conn.executed)
+
 
 
 @pytest.mark.asyncio
@@ -342,3 +345,61 @@ async def test_outbox_row_applies_with_conn_none_and_entities():
     applied_calls = [args for q, args in acquired_conns[1].executed if "status='applied'" in q]
     assert len(applied_calls) == 1
     assert applied_calls[0] == (1,)
+
+
+@pytest.mark.asyncio
+async def test_outbox_retry_update_prefers_existing_conn_when_acquire_fails():
+    """B3 Prove-It (RED on 06b892b): when an existing conn is available, retry UPDATE
+    must be attempted on it rather than failing on a second acquire."""
+    c = co.MemoryCoordinator()
+    c._project_identity = AsyncMock(return_value=None)
+    c._domain_identities = AsyncMock(return_value=[])
+
+    class _DeadNeo4j:
+        def session(self, **kw):
+            raise RuntimeError("Neo4j unavailable")
+
+    c._neo4j = _DeadNeo4j()
+    batch_conn = FakeConnection(name="batch")
+    c._acquire = MagicMock(side_effect=RuntimeError("pool acquire exhausted"))
+
+    await c._apply_outbox_row(
+        outbox_id=1,
+        pg_id=42,
+        params={"content_snippet": "x", "entities": [], "type": "fact"},
+        retries=0,
+        conn=batch_conn,
+    )
+
+    pending_calls = [q for q, args in batch_conn.executed if "status='pending'" in q]
+    assert len(pending_calls) == 1, f"Expected status='pending' on batch_conn, got {batch_conn.executed}"
+
+
+@pytest.mark.asyncio
+async def test_outbox_retry_update_acquire_failure_logged_without_escaping_when_conn_none(caplog):
+    """B3 Prove-It: when conn is None and bookkeeping acquire fails, the failure
+    must be logged without an unhandled exception escaping apply."""
+    import logging
+    c = co.MemoryCoordinator()
+    c._project_identity = AsyncMock(return_value=None)
+    c._domain_identities = AsyncMock(return_value=[])
+
+    class _DeadNeo4j:
+        def session(self, **kw):
+            raise RuntimeError("Neo4j unavailable")
+
+    c._neo4j = _DeadNeo4j()
+    c._acquire = MagicMock(side_effect=RuntimeError("pool acquire exhausted"))
+
+    with caplog.at_level(logging.ERROR):
+        # Must not raise RuntimeError escaping apply
+        await c._apply_outbox_row(
+            outbox_id=1,
+            pg_id=42,
+            params={"content_snippet": "x", "entities": [], "type": "fact"},
+            retries=0,
+            conn=None,
+        )
+
+    assert any("failed to update retry status" in r.message or "outbox:" in r.message for r in caplog.records)
+
