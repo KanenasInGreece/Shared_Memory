@@ -280,4 +280,30 @@ async def test_handle_save_visibility_valid_options_accepted():
             assert body["status"] == "success"
 
 
+# ── Slice 3: graph-visibility stay-green pin (S1) ─────────────────────────────
+
+@pytest.mark.asyncio
+async def test_read_role_denied_on_graph_route():
+    """Slice 3 stay-green pin: S1 already 403s a `read` token on /memory/graph.
+    Pins the route in test_visibility so this file cannot forget the graph route."""
+    from aiohttp.web_exceptions import HTTPForbidden
+    tests_dir = os.path.dirname(__file__)
+    if tests_dir not in sys.path:
+        sys.path.insert(0, tests_dir)
+    from test_auth import load_coordinator as load_auth_coord, _make_request as _make_auth_req, _noop_handler
+
+    for path in ("/memory/graph", "/memory/graph/"):
+        req_mock = MagicMock(method="POST", path=path)
+        assert coordinator_mod._read_role_permits(req_mock) is False
+
+    mod = load_auth_coord("monitor:tok_m", agent_roles="monitor:read")
+    for path in ("/memory/graph", "/memory/graph/"):
+        req = _make_auth_req(path, auth_header="Bearer tok_m", method="POST")
+        req.json = AsyncMock(return_value={"cypher": "RETURN 1 AS n"})
+        with pytest.raises(HTTPForbidden):
+            await mod.auth_middleware(req, _noop_handler)
+
+
+
+
 
