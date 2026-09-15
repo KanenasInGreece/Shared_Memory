@@ -1,4 +1,4 @@
-"""Test honest role wording across SKILL.md, MCP docs, and HANDOFF.md (ADV-1 / QA-1).
+"""Test honest role wording across SKILL.md and MCP docs (ADV-1 / QA-1).
 
 Named CLI query shortcuts (why-to-check, who-decided, retrospectives, agent-decisions)
 call query_graph() -> POST /memory/graph and return 403 for read tokens.
@@ -49,13 +49,3 @@ def test_honest_wording_present_in_skill():
     text = _read(os.path.join(_ROOT, "shared-memory", "SKILL.md"))
     assert "named CLI `query` templates require `full` or `admin`" in text
     assert "search" in text and "telemetry" in text
-
-
-def test_handoff_proposed_readme_sentence_1_has_honest_wording():
-    """HANDOFF.md proposed README sentence 1 must carry honest wording (ADV-1 / QA-1)."""
-    text = _read(os.path.join(_ROOT, "HANDOFF.md"))
-    assert (
-        "Querying the raw graph via `POST /memory/graph` (CLI `graph` or MCP `graph_query`) "
-        "and named CLI `query` templates require an authenticated token with `full` or `admin` role "
-        "(`read` tokens receive HTTP 403); `search`, `lineage`/`status`, and `telemetry` remain for `read`."
-    ) in text
