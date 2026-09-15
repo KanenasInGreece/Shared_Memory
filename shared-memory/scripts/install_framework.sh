@@ -406,18 +406,33 @@ export NEO4J_HOST_DIR PG_DATA_DIR LLM_MODELS_DIR LLAMA_CPU_THREADS
 (
   export NEO4J_PASSWORD PG_PASSWORD
   umask 077
-  # Render: copy the template, replacing only the value lines (ENVIRON avoids
-  # any escaping pitfalls with slashes/special chars in paths or passwords).
-  awk '
-    function put(k) { print k "=" ENVIRON[k]; }
-    /^NEO4J_HOST_DIR=/ { put("NEO4J_HOST_DIR"); next }
-    /^PG_DATA_DIR=/    { put("PG_DATA_DIR");    next }
-    /^LLM_MODELS_DIR=/ { put("LLM_MODELS_DIR"); next }
-    /^NEO4J_PASSWORD=/ { put("NEO4J_PASSWORD"); next }
-    /^PG_PASSWORD=/    { put("PG_PASSWORD");    next }
-    /^LLAMA_CPU_THREADS=/ { put("LLAMA_CPU_THREADS"); next }
-    { print }
-  ' "$EXAMPLE" > "$ENV_FILE"
+  if [ "$SECRET_MODE" = "overwrite" ]; then
+    # Overwrite mode (A1): update the six keys IN THE EXISTING FILE rather than
+    # blowing away custom keys like AGENT_TOKENS, DREAM_TEMPERATURE, etc.
+    # (same idea as bootstrap_tokens.sh replace_registry_lines).
+    tmp="$(mktemp "${ENV_FILE}.XXXXXX")"
+    cp "$ENV_FILE" "$tmp"
+    for k in NEO4J_HOST_DIR PG_DATA_DIR LLM_MODELS_DIR NEO4J_PASSWORD PG_PASSWORD LLAMA_CPU_THREADS; do
+      inner="$(mktemp "${ENV_FILE}.XXXXXX")"
+      grep -vE "^[[:space:]]*#?[[:space:]]*${k}=" "$tmp" > "$inner" || true
+      printf '%s=%s\n' "$k" "${!k}" >> "$inner"
+      mv "$inner" "$tmp"
+    done
+    mv "$tmp" "$ENV_FILE"
+  else
+    # Render: copy the template, replacing only the value lines (ENVIRON avoids
+    # any escaping pitfalls with slashes/special chars in paths or passwords).
+    awk '
+      function put(k) { print k "=" ENVIRON[k]; }
+      /^NEO4J_HOST_DIR=/ { put("NEO4J_HOST_DIR"); next }
+      /^PG_DATA_DIR=/    { put("PG_DATA_DIR");    next }
+      /^LLM_MODELS_DIR=/ { put("LLM_MODELS_DIR"); next }
+      /^NEO4J_PASSWORD=/ { put("NEO4J_PASSWORD"); next }
+      /^PG_PASSWORD=/    { put("PG_PASSWORD");    next }
+      /^LLAMA_CPU_THREADS=/ { put("LLAMA_CPU_THREADS"); next }
+      { print }
+    ' "$EXAMPLE" > "$ENV_FILE"
+  fi
 )
 chmod 600 "$ENV_FILE"
 
@@ -431,16 +446,25 @@ chmod 600 "$ENV_FILE"
 # writing at all, write ALL FOUR replica vars (never only the moved
 # encoder's), so the rendered compose matches the two answers on its own.
 if [ "$EMBEDDER_DEVICE" = "gpu" ] || [ "$RERANKER_DEVICE" = "gpu" ]; then
-  {
-    echo ""
-    echo "# ── Per-service encoder device split (Q3b, install_framework.sh) ──"
-    echo "EMBEDDER_CPU_REPLICAS=$EMBEDDER_CPU_REPLICAS"
-    echo "EMBEDDER_GPU_REPLICAS=$EMBEDDER_GPU_REPLICAS"
-    echo "RERANKER_CPU_REPLICAS=$RERANKER_CPU_REPLICAS"
-    echo "RERANKER_GPU_REPLICAS=$RERANKER_GPU_REPLICAS"
-    echo "GPU_RENDER_GID=$GPU_RENDER_GID"
-    echo "ENCODER_GPU_INDEX=0"
-  } >> "$ENV_FILE"
+  if grep -q '^[[:space:]]*EMBEDDER_CPU_REPLICAS=' "$ENV_FILE"; then
+    for k in EMBEDDER_CPU_REPLICAS EMBEDDER_GPU_REPLICAS RERANKER_CPU_REPLICAS RERANKER_GPU_REPLICAS GPU_RENDER_GID; do
+      inner="$(mktemp "${ENV_FILE}.XXXXXX")"
+      grep -vE "^[[:space:]]*#?[[:space:]]*${k}=" "$ENV_FILE" > "$inner" || true
+      printf '%s=%s\n' "$k" "${!k}" >> "$inner"
+      mv "$inner" "$ENV_FILE"
+    done
+  else
+    {
+      echo ""
+      echo "# ── Per-service encoder device split (Q3b, install_framework.sh) ──"
+      echo "EMBEDDER_CPU_REPLICAS=$EMBEDDER_CPU_REPLICAS"
+      echo "EMBEDDER_GPU_REPLICAS=$EMBEDDER_GPU_REPLICAS"
+      echo "RERANKER_CPU_REPLICAS=$RERANKER_CPU_REPLICAS"
+      echo "RERANKER_GPU_REPLICAS=$RERANKER_GPU_REPLICAS"
+      echo "GPU_RENDER_GID=$GPU_RENDER_GID"
+      echo "ENCODER_GPU_INDEX=0"
+    } >> "$ENV_FILE"
+  fi
   echo "  ✓ Encoder device split written: embedder=$EMBEDDER_DEVICE reranker=$RERANKER_DEVICE GPU_RENDER_GID=$GPU_RENDER_GID"
 fi
 
@@ -457,15 +481,17 @@ fi
 # before shared-memory/.env has been written at all — $_embedder_url_default/
 # $_reranker_url_default are already-validated plain script-level vars by
 # the time this block runs.
-{
-  echo ""
-  echo "# ── Encoder endpoints (install_framework.sh writes the framework's default explicitly) ──"
-  echo "# This installs the bundled compose's own default port for each encoder. If your"
-  echo "# encoders run somewhere else (Q2's 'existing endpoint' answer), edit these two lines —"
-  echo "# see AGENTS.md Phase 4."
-  echo "EMBEDDER_URL=$_embedder_url_default"
-  echo "RERANKER_URL=$_reranker_url_default"
-} >> "$ENV_FILE"
+if ! grep -q '^[[:space:]]*EMBEDDER_URL=' "$ENV_FILE"; then
+  {
+    echo ""
+    echo "# ── Encoder endpoints (install_framework.sh writes the framework's default explicitly) ──"
+    echo "# This installs the bundled compose's own default port for each encoder. If your"
+    echo "# encoders run somewhere else (Q2's 'existing endpoint' answer), edit these two lines —"
+    echo "# see AGENTS.md Phase 4."
+    echo "EMBEDDER_URL=$_embedder_url_default"
+    echo "RERANKER_URL=$_reranker_url_default"
+  } >> "$ENV_FILE"
+fi
 echo "  ✓ Encoder endpoints written: EMBEDDER_URL=$_embedder_url_default RERANKER_URL=$_reranker_url_default (edit if yours differ)"
 
 mkdir -p "$NEO4J_HOST_DIR"/{data,logs,import,plugins} "$PG_DATA_DIR"
