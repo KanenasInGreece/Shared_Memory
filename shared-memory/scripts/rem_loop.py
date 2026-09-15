@@ -310,6 +310,7 @@ REM_STARVED_THRESHOLD = int(os.environ.get("REM_STARVED_THRESHOLD", "3"))
 
 # LLM failure classes recorded on REMDaemon._last_llm_failure.
 LLM_FAIL_TRANSPORT = "transport"   # HTTP non-200 / connection / gateway-shape — NOT chargeable
+LLM_FAIL_CLIENT    = "client"      # deterministic HTTP 4xx (except 429) — CHARGEABLE
 LLM_FAIL_TRUNCATED = "truncated"   # finish_reason=length even after the retry (widened for
                                     # an honest truncation, same-bound for a degenerate one)
 LLM_FAIL_PARSE     = "parse"       # response arrived but its content is unusable
@@ -319,7 +320,7 @@ LLM_FAIL_ROUTING_REFUSED = "routing_refused"   # gateway declined to place the j
                                     # a config gap, not a record defect — NOT chargeable
 
 # Failure classes that may count toward a record's dead-letter cap.
-LLM_FAIL_CHARGEABLE = frozenset({LLM_FAIL_TRUNCATED, LLM_FAIL_PARSE})
+LLM_FAIL_CHARGEABLE = frozenset({LLM_FAIL_TRUNCATED, LLM_FAIL_PARSE, LLM_FAIL_CLIENT})
 
 
 logging.basicConfig(level=logging.INFO)
@@ -1177,7 +1178,12 @@ class REMDaemon:
                                 ok=False, note=f"http_{resp.status_code}",
                                 prompt_chars=len(prompt))
                 logger.error("LLM returned %d: %s", resp.status_code, resp.text[:200])
-                return None, model, LLM_FAIL_TRANSPORT, False
+                fail_class = (
+                    LLM_FAIL_CLIENT
+                    if 400 <= resp.status_code < 500 and resp.status_code != 429
+                    else LLM_FAIL_TRANSPORT
+                )
+                return None, model, fail_class, False
             try:
                 resp_json = resp.json()
             except Exception as exc:
@@ -1378,7 +1384,10 @@ class REMDaemon:
                                     ok=False, note=f"batch_http_{resp.status_code}",
                                     prompt_chars=len(prompt))
                     logger.error("REM batch LLM returned %d: %s", resp.status_code, resp.text[:200])
-                    self._last_llm_failure = LLM_FAIL_TRANSPORT
+                    if 400 <= resp.status_code < 500 and resp.status_code != 429:
+                        self._last_llm_failure = LLM_FAIL_CLIENT
+                    else:
+                        self._last_llm_failure = LLM_FAIL_TRANSPORT
                     return None, None, model
                 resp_json = resp.json()
                 _wall_s = time.monotonic() - _start
