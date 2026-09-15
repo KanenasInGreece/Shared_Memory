@@ -39,13 +39,16 @@ index-pointer/index-repair rule below, matching the CLI snippet's own v4/v5.)
 constitution block, and it carried no warning against saving crafted external
 content, though `system-prompt.md` and `mcp/README.md` got the same words in
 the same change.)
+(v5 -> v6: clarified graph_query role requirements — graph and named CLI
+query templates require full or admin; search, lineage/status, and telemetry
+remain for read; write-Cypher blocked for everyone.)
 
 ALWAYS propose this block for the operator to confirm or adjust before writing
 it into their agent's constitution file. Never write it silently, and never
 paraphrase it: copying it verbatim is what keeps the marker intact.
 -->
 
-<!-- shared-memory:mcp-constitution-snippet v5 -->
+<!-- shared-memory:mcp-constitution-snippet v6 -->
 ## Shared Memory — through your MCP tools
 The shared memory is a three-tier store other agents write to as well, reached
 through the `shared-memory` MCP server. It is the source of truth for project
