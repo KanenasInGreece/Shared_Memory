@@ -210,6 +210,76 @@ async def test_outbox_postgres_interface_error_does_not_bump_neo4j_tx_failures()
 
 
 @pytest.mark.asyncio
+async def test_outbox_asyncio_timeout_error_does_not_bump_neo4j_tx_failures():
+    """B1 Prove-It (RED on 06b892b): asyncio.TimeoutError is postgres-domain,
+    must not bump _neo4j_tx_failures_total."""
+    import asyncio
+    c = co.MemoryCoordinator()
+    c._project_identity = AsyncMock(return_value=None)
+    c._domain_identities = AsyncMock(return_value=[])
+
+    session = AsyncMock()
+    session.run = AsyncMock(return_value=AsyncMock())
+    c._neo4j = MagicMock()
+    c._neo4j.session = MagicMock(return_value=_async_ctx(session))
+
+    batch_conn = FakeConnection(name="batch")
+
+    calls = 0
+    def _acquire():
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise asyncio.TimeoutError("pool acquire timeout")
+        return FakeAcquireContext(FakeConnection(name=f"retry_{calls}"))
+
+    c._acquire = MagicMock(side_effect=_acquire)
+
+    assert c._neo4j_tx_failures_total == 0
+    await c._apply_outbox_row(
+        outbox_id=1,
+        pg_id=42,
+        params={"content_snippet": "x", "entities": ["SharedMemory"], "type": "fact"},
+        retries=0,
+        conn=batch_conn,
+    )
+
+    assert c._neo4j_tx_failures_total == 0
+    assert calls >= 2
+
+
+@pytest.mark.asyncio
+async def test_outbox_project_identity_unavailable_does_not_bump_neo4j_tx_failures():
+    """B2 Prove-It (RED on 06b892b): ProjectIdentityUnavailable is postgres-domain,
+    must not bump _neo4j_tx_failures_total."""
+    c = co.MemoryCoordinator()
+    c._project_identity = AsyncMock(
+        side_effect=co.ProjectIdentityUnavailable("project registry unavailable")
+    )
+    c._domain_identities = AsyncMock(return_value=[])
+
+    session = AsyncMock()
+    session.run = AsyncMock(return_value=AsyncMock())
+    c._neo4j = MagicMock()
+    c._neo4j.session = MagicMock(return_value=_async_ctx(session))
+
+    batch_conn = FakeConnection(name="batch")
+    c._acquire = MagicMock(side_effect=lambda: FakeAcquireContext(FakeConnection(name="retry")))
+
+    assert c._neo4j_tx_failures_total == 0
+    await c._apply_outbox_row(
+        outbox_id=1,
+        pg_id=42,
+        params={"content_snippet": "x", "entities": [], "type": "fact", "project": "proj_a"},
+        retries=0,
+        conn=batch_conn,
+    )
+
+    assert c._neo4j_tx_failures_total == 0
+
+
+@pytest.mark.asyncio
+
 async def test_outbox_neo4j_error_still_bumps_neo4j_tx_failures():
     """R3: A genuine Neo4j failure must still bump _neo4j_tx_failures_total."""
     c = co.MemoryCoordinator()

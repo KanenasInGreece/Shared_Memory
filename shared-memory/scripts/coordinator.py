@@ -4061,7 +4061,7 @@ class MemoryCoordinator:
                 (time.monotonic() - _t0) * 1000.0))
             log.debug("outbox: applied pg_id=%d (outbox_id=%d)", pg_id, outbox_id)
         except Exception as exc:
-            if isinstance(exc, (asyncpg.PostgresError, asyncpg.InterfaceError)):
+            if isinstance(exc, (asyncpg.PostgresError, asyncpg.InterfaceError, asyncio.TimeoutError, ProjectIdentityUnavailable)):
                 log.warning(
                     "outbox: postgres error pg_id=%d attempt %d/%d: %s",
                     pg_id, retries + 1, OUTBOX_MAX_RETRIES, exc,
