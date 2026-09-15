@@ -9287,7 +9287,15 @@ class MemoryCoordinator:
             )
 
         cypher = body.get("cypher", "")
-        params = body.get("params", {})
+        if "params" in body:
+            params = body["params"]
+            if not isinstance(params, dict):
+                return web.json_response(
+                    {"status": "error", "message": "params must be an object/dict"},
+                    status=400,
+                )
+        else:
+            params = {}
 
         if not cypher:
             return web.json_response(

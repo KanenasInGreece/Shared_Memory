@@ -220,3 +220,36 @@ async def test_handle_graph_uses_driver_execute_read():
     session.execute_read.assert_called_once()
     tx.run.assert_called_once()
 
+
+@pytest.mark.asyncio
+async def test_handle_graph_refuses_non_dict_params():
+    """S3 Prove-It: params must be a mapping (dict); list/string/null/int
+    refused with HTTP 400, not 500."""
+    coord = _coordinator()
+    coord._neo4j_ring = MagicMock()
+    coord._neo4j_tx_failures_total = 0
+    session = MagicMock()
+    result = MagicMock(fetch=AsyncMock(return_value=[{"n": 1}]))
+    tx = MagicMock(run=AsyncMock(return_value=result))
+    async def _exec_read(fn, *a, **kw):
+        return await fn(tx, *a, **kw)
+    session.execute_read = AsyncMock(side_effect=_exec_read)
+    ctx = MagicMock()
+    ctx.__aenter__ = AsyncMock(return_value=session)
+    ctx.__aexit__ = AsyncMock(return_value=False)
+    coord._neo4j.session = MagicMock(return_value=ctx)
+
+    for bad in ([1], "not-a-dict", 42, None):
+        resp = await coord.handle_graph(_request({"cypher": "RETURN 1 AS n", "params": bad}))
+        assert resp.status == 400, f"Expected 400 for params={bad!r}, got {resp.status}"
+        body = json.loads(resp.body)
+        assert body["status"] == "error"
+
+    # Stay green: valid read query with default params still 200
+    resp_ok = await coord.handle_graph(_request({"cypher": "RETURN 1 AS n"}))
+    assert resp_ok.status == 200
+    # Stay green: write-Cypher still 400
+    resp_write = await coord.handle_graph(_request({"cypher": "CREATE (n:Thing)"}))
+    assert resp_write.status == 400
+
+

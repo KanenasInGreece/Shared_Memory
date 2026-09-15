@@ -1052,3 +1052,44 @@ async def test_an_ordinary_agent_is_not_confined_by_the_roster():
     req = _make_request("/memory/save", auth_header="Bearer tok_c", method="POST")
     resp = await mod.auth_middleware(req, _noop_handler)
     assert resp.status == 200
+
+
+@pytest.mark.asyncio
+async def test_full_role_post_graph_invalid_params_refuses_400():
+    """S3 Prove-It: POST /memory/graph as full role with {"cypher": "RETURN 1 AS n", "params": [1]}
+    must be refused 400, not 500."""
+    mod = load_coordinator("claude:tok_c", agent_roles="claude:full")
+    coord = mod.MemoryCoordinator.__new__(mod.MemoryCoordinator)
+    coord._neo4j = MagicMock()
+    coord._neo4j_ring = MagicMock()
+    coord._neo4j_tx_failures_total = 0
+    session = MagicMock()
+    tx = MagicMock()
+    async def _exec_read(fn, *a, **kw):
+        return await fn(tx, *a, **kw)
+    session.execute_read = AsyncMock(side_effect=_exec_read)
+    ctx = MagicMock()
+    ctx.__aenter__ = AsyncMock(return_value=session)
+    ctx.__aexit__ = AsyncMock(return_value=False)
+    coord._neo4j.session = MagicMock(return_value=ctx)
+
+    # 1. Invalid params [1] -> 400, not 500
+    req = _make_request("/memory/graph", auth_header="Bearer tok_c", method="POST")
+    req.json = AsyncMock(return_value={"cypher": "RETURN 1 AS n", "params": [1]})
+    resp = await mod.auth_middleware(req, coord.handle_graph)
+    assert resp.status == 400
+
+    # 2. Stay green: write-cypher as full role still 400
+    req_write = _make_request("/memory/graph", auth_header="Bearer tok_c", method="POST")
+    req_write.json = AsyncMock(return_value={"cypher": "CREATE (n:Thing)"})
+    resp_write = await mod.auth_middleware(req_write, coord.handle_graph)
+    assert resp_write.status == 400
+
+    # 3. Stay green: valid read cypher as full role still 200
+    req_ok = _make_request("/memory/graph", auth_header="Bearer tok_c", method="POST")
+    req_ok.json = AsyncMock(return_value={"cypher": "RETURN 1 AS n"})
+    result = MagicMock(fetch=AsyncMock(return_value=[{"n": 1}]))
+    tx.run = AsyncMock(return_value=result)
+    resp_ok = await mod.auth_middleware(req_ok, coord.handle_graph)
+    assert resp_ok.status == 200
+
