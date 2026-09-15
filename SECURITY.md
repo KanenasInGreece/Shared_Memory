@@ -65,6 +65,20 @@ A crafted `Host` header containing `/`, `?`, or `#` causes Starlette to misparse
 
 ---
 
+### Neo4j 5.26.30-community CVE-2026-1337 (LOW) — accepted
+
+**Status: accepted; no image bump in this release.**
+
+CVE-2026-1337 is classified LOW severity for `neo4j:5.26.30-community`. The framework's dependency-currency check (`Component Security Updates` above) prioritises stability on the Neo4j 5.26 LTS line. Because this vulnerability carries LOW impact under the gateway's isolated container environment (container network isolation, non-root user execution, and authenticated access), the risk is accepted without forcing an immediate image tag bump or database container rebuild.
+
+If the operator or a future release updates the pinned Neo4j tag in `shared-memory/ops/postgres_neo4j_limits.yaml`, run `reconcile_stack.sh` to reconcile the running container against the updated compose pin:
+
+```bash
+bash shared-memory/scripts/reconcile_stack.sh --yes
+```
+
+---
+
 ### Gateway network exposure
 
 `hive_mind_proxy.py` binds to **`127.0.0.1:8888` by default** — localhost only.
