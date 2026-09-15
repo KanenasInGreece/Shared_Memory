@@ -158,6 +158,8 @@ def _sandbox(tmp_path: Path, compose_text: str = _FIXTURE_COMPOSE, env_lines: st
     scripts_dir.mkdir(parents=True)
     script = scripts_dir / "reconcile_stack.sh"
     shutil.copy(REAL_SCRIPT, script)
+    shutil.copy(REAL_SCRIPT.parent / "read_env_key.py", scripts_dir / "read_env_key.py")
+    shutil.copy(REAL_SCRIPT.parent / "secure_env.py", scripts_dir / "secure_env.py")
     st = script.stat()
     script.chmod(st.st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
 

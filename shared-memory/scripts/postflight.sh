@@ -74,9 +74,9 @@ ok()   { grn "  ✓ $*"; }
 warn() { ylw "  ! $*"; }
 bad()  { local a="$1"; shift; red "  ✗ $a $*"; afail["$a"]=1; }
 
-# Read one key from .env without sourcing it — values may contain spaces or
-# other characters bash `source` would mis-parse (same idiom as preflight.sh).
-read_env() { grep -E "^$1=" "$ENV_FILE" 2>/dev/null | tail -1 | cut -d= -f2-; }
+# Read one key from .env without sourcing it via the shared Python parser
+# (secure_env.read_env_value / read_env_key.py) — no bash quote-matching.
+read_env() { python3 "$SCRIPT_DIR/read_env_key.py" "$ENV_FILE" "$1"; }
 
 # JSON helpers — python3 one-liners, no new dependency (python3 is guaranteed:
 # uv is an install prerequisite).

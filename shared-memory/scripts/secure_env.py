@@ -258,6 +258,77 @@ def _strip_balanced_quotes(value: str) -> str:
     return value
 
 
+def _parse_env_val(val: str) -> str:
+    """Parse a .env value, stripping balanced quotes and inline comments.
+
+    Order matters: quote protection is checked first so that hashes embedded
+    in balanced quotes (e.g. KEY="foo # bar") are preserved verbatim rather
+    than truncated by comment stripping. Inverting this order breaks quoted
+    hash values.
+    """
+    val = val.strip()
+    if not val:
+        return ""
+    if val[0] in ('"', "'"):
+        q = val[0]
+        closing = val.find(q, 1)
+        if closing != -1:
+            rest = val[closing + 1:].strip()
+            if not rest or rest.startswith("#"):
+                return val[1:closing]
+    m = re.search(r"\s+#.*$", val)
+    if m:
+        val = val[:m.start()].strip()
+    elif val.startswith("#"):
+        return ""
+    return _strip_balanced_quotes(val)
+
+
+def read_env_value(
+    env_path: "Path | str | None", key: str, default: "str | None" = None
+) -> "str | None":
+    """Return the parsed value of `key` from the .env file at `env_path`.
+
+    Uses the single Python parser for framework environment files:
+    normalises CRLF, strips balanced quotes, strips inline comments
+    outside quotes, and resolves deterministically with last-definition-wins.
+    Returns `default` if the file does not exist or the key is not present.
+    """
+    if env_path is None:
+        p = _select_env_file()
+    else:
+        p = Path(env_path)
+    if p is None or not p.is_file():
+        return default
+
+    target_canonical = _normalize_key(key)
+    found = False
+    result = default
+
+    try:
+        content = p.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return default
+
+    for raw_line in content.splitlines():
+        line = raw_line.rstrip("\r\n").strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, _, val = line.partition("=")
+        k = _strip_export_prefix(k).strip()
+        if not k:
+            continue
+        if _normalize_key(k) == target_canonical:
+            found = True
+            result = _parse_env_val(val)
+
+    return result if found else default
+
+
+read_env_key = read_env_value
+
+
+
 def is_secret_key(name: str) -> bool:
     """True if `name` must never be exported to os.environ or forwarded into
     a child process environment — the known-config allowlist (checked first,
