@@ -60,6 +60,15 @@ services:
         reservations:
           memory: 2G
     restart: always
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - AUDIT_WRITE
+      - MKNOD
+      - NET_RAW
+      - SETFCAP
+      - SETPCAP
+      - SYS_CHROOT
 
   postgres:
     # Pinned exact. Floor is pgvector >= 0.8 for `hnsw.iterative_scan`
@@ -89,6 +98,15 @@ services:
         reservations:
           memory: 1G
     restart: always
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - AUDIT_WRITE
+      - MKNOD
+      - NET_RAW
+      - SETFCAP
+      - SETPCAP
+      - SYS_CHROOT
 
 # --- INFERENCE LAYER (CPU Optimized) ---
   # ⛔ BIND TO LOOPBACK. Only the gateway talks to these two, and neither has
@@ -174,6 +192,15 @@ services:
       retries: 3
       start_period: 60s
     restart: always
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - AUDIT_WRITE
+      - MKNOD
+      - NET_RAW
+      - SETFCAP
+      - SETPCAP
+      - SYS_CHROOT
 
   # Reranker: BGE-Reranker-v2
   reranker-api:
@@ -198,6 +225,15 @@ services:
       retries: 3
       start_period: 60s
     restart: always
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - AUDIT_WRITE
+      - MKNOD
+      - NET_RAW
+      - SETFCAP
+      - SETPCAP
+      - SYS_CHROOT
 
   # ── GPU encoder pair — same models, same ports, Vulkan image ───────────────
   # Off by default (replicas 0). Enable with GPU_ENCODER_REPLICAS=1 and
@@ -241,6 +277,15 @@ services:
       retries: 3
       start_period: 60s
     restart: always
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - AUDIT_WRITE
+      - MKNOD
+      - NET_RAW
+      - SETFCAP
+      - SETPCAP
+      - SYS_CHROOT
 
   reranker-api-gpu:
     image: ghcr.io/ggml-org/llama.cpp:server-vulkan
@@ -272,3 +317,12 @@ services:
       retries: 3
       start_period: 60s
     restart: always
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - AUDIT_WRITE
+      - MKNOD
+      - NET_RAW
+      - SETFCAP
+      - SETPCAP
+      - SYS_CHROOT

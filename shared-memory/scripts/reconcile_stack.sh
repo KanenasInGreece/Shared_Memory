@@ -63,9 +63,9 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# Read one key from .env without sourcing it (same idiom as postflight.sh /
-# init_db.sh — values may contain characters `source` would mis-parse).
-read_env() { grep -E "^$1=" "$ENV_FILE" 2>/dev/null | tail -1 | cut -d= -f2-; }
+# Read one key from .env without sourcing it via the shared Python parser
+# (secure_env.read_env_value / read_env_key.py) — no bash quote-matching.
+read_env() { python3 "$SCRIPT_DIR/read_env_key.py" "$ENV_FILE" "$1"; }
 
 [[ -f "$COMPOSE_FILE" ]] || die "compose file not found: $COMPOSE_FILE"
 

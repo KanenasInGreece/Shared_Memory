@@ -73,6 +73,9 @@ def _coord_with_records(records):
     result.fetch = AsyncMock(return_value=records)
     session = MagicMock()
     session.run = AsyncMock(return_value=result)
+    async def _exec_read(fn, *a, **kw):
+        return await fn(session, *a, **kw)
+    session.execute_read = AsyncMock(side_effect=_exec_read)
     neo4j = MagicMock()
     neo4j.session = MagicMock(return_value=_AsyncCtx(session))
     c._neo4j = neo4j
@@ -83,6 +86,9 @@ def _coord_raising(raises):
     c = MemoryCoordinator()
     session = MagicMock()
     session.run = AsyncMock(side_effect=raises)
+    async def _exec_read(fn, *a, **kw):
+        return await fn(session, *a, **kw)
+    session.execute_read = AsyncMock(side_effect=_exec_read)
     neo4j = MagicMock()
     neo4j.session = MagicMock(return_value=_AsyncCtx(session))
     c._neo4j = neo4j

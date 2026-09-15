@@ -21,7 +21,7 @@ import os
 import sys
 import textwrap
 from pathlib import Path
-from urllib.parse import urlparse, urlunparse
+from urllib.parse import quote_plus, urlparse, urlunparse
 
 try:
     import psycopg2
@@ -60,7 +60,7 @@ def _pg_conn() -> str:
     pg_pass = os.environ.get("PG_PASSWORD", "")
     return os.environ.get(
         "PG_CONN",
-        f"postgresql://postgres:{pg_pass}@localhost:5432/agent_data",
+        f"postgresql://postgres:{quote_plus(pg_pass)}@localhost:5432/agent_data",
     )
 
 

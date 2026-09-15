@@ -5,6 +5,20 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.9.102] — 2026-09-15
+
+### Security
+- `POST /memory/graph` is no longer on the read-role allowlist. A `read` token gets 403; full and admin keep the route. Graph queries run through the driver's `execute_read` API. On Community standalone that is a routing hint — the write-keyword regex remains the control. Neo4j `5.26.30-community` CVE-2026-1337 (LOW) is accepted without an image bump; `reconcile_stack.sh` is the later path if the pin moves.
+- Compose services set `security_opt: no-new-privileges:true` and a curated `cap_drop` that keeps `SETUID`/`SETGID` for gosu. Postgres and Neo4j data mounts stay writable.
+
+### Fixed
+- `install_framework.sh` overwrite updates the six directory/password/thread keys in the existing `.env` instead of rendering `.env.example` over it, so `AGENT_TOKENS` and other custom keys survive.
+- Constructed Postgres DSNs percent-encode the password (`quote_plus`) in `apply.py`, `rem_loop.py`, `generate_schema_init.py`, and `verify_schema_init.py`. An operator-supplied `PG_CONN` is left untouched.
+- `preflight.sh`, `postflight.sh`, `init_db.sh`, and `reconcile_stack.sh` read `.env` keys through one Python parser (`secure_env.read_env_value`), so a quoted value containing `#` is no longer truncated.
+
+### Changed
+- `requirements.txt` floors: `aiohttp>=3.14.3`, `starlette>=1.6.0`, `fastmcp>=3.4.7`. Locks were not regenerated.
+
 ## [0.9.101] — 2026-09-13
 
 ### Fixed

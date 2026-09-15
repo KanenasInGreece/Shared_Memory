@@ -173,35 +173,9 @@ for _tool in curl python3 timeout; do
     fi
 done
 
-# Read one key from .env without sourcing it — values may contain spaces or
-# other characters bash `source` would mis-parse (e.g. PROJECT_ALIASES).
-#
-# Normalises the raw grep/cut output the same way an operator's editor (or a
-# CRLF-saving one) or a trailing inline comment would leave it, so the value
-# this script COMPARES matches the value docker compose actually resolves —
-# not a stricter, unquoted, no-comment ideal of it. Three real spellings,
-# each of which renders CORRECTLY through compose but previously failed
-# preflight's double-start guard with a raw string compare (H1, PR #308
-# review, reproduced against the real compose file):
-#   EMBEDDER_CPU_REPLICAS="0"          (matched double quotes)
-#   EMBEDDER_CPU_REPLICAS=0 # keep off (trailing inline comment)
-#   EMBEDDER_CPU_REPLICAS=0\r          (CRLF-saved .env)
-# Order matters: strip the CR first (it would otherwise hide inside the
-# trailing-comment/quote match), then the inline comment, then one layer of
-# MATCHED surrounding quotes — mismatched or partial quoting is left as-is
-# rather than guessed at.
-read_env() {
-    local raw
-    raw="$(grep -E "^$1=" "$ENV_FILE" 2>/dev/null | tail -1 | cut -d= -f2-)"
-    raw="${raw%$'\r'}"
-    raw="$(printf '%s' "$raw" | sed -E 's/[[:space:]]+#.*$//')"
-    if [[ ${#raw} -ge 2 && "${raw:0:1}" == '"' && "${raw: -1}" == '"' ]]; then
-        raw="${raw:1:${#raw}-2}"
-    elif [[ ${#raw} -ge 2 && "${raw:0:1}" == "'" && "${raw: -1}" == "'" ]]; then
-        raw="${raw:1:${#raw}-2}"
-    fi
-    printf '%s' "$raw"
-}
+# Read one key from .env without sourcing it via the shared Python parser
+# (secure_env.read_env_value / read_env_key.py) — no bash quote-matching.
+read_env() { python3 "$SCRIPT_DIR/read_env_key.py" "$ENV_FILE" "$1"; }
 
 if [[ -f "$ENV_FILE" ]]; then
     ok ".env present ($ENV_FILE)"
@@ -317,7 +291,8 @@ echo "Recommended:"
 # machine that meets the recommendation must be able to PASS the check for it
 # (measured: 16 GB host, MemTotal 15 GB, previously warned forever).
 mem_gb=$(awk '/MemTotal/ {printf "%d", $2/1024/1024}' /proc/meminfo 2>/dev/null || echo 0)
-neo4j_heap_override="$(read_env NEO4J_HEAP_MAX)"
+neo4j_heap_override=""
+[[ -f "$ENV_FILE" ]] && neo4j_heap_override="$(read_env NEO4J_HEAP_MAX)"
 if [[ "$mem_gb" -ge 15 ]]; then
     ok "RAM ${mem_gb} GB (meets the 16 GB recommendation)"
 elif [[ "$mem_gb" -ge 7 ]]; then

@@ -42,6 +42,8 @@ def _fake_repo(tmp_path, env_lines: list[str]) -> Path:
     root = tmp_path / "repo"
     (root / "shared-memory" / "scripts").mkdir(parents=True)
     shutil.copy(PREFLIGHT, root / "shared-memory" / "scripts" / "preflight.sh")
+    shutil.copy(PREFLIGHT.parent / "read_env_key.py", root / "shared-memory" / "scripts" / "read_env_key.py")
+    shutil.copy(PREFLIGHT.parent / "secure_env.py", root / "shared-memory" / "scripts" / "secure_env.py")
     (root / "shared-memory" / ".env").write_text("".join(f"{l}\n" for l in env_lines))
     return root
 
@@ -56,6 +58,8 @@ def _fake_repo_with_models(tmp_path, env_lines: list[str]) -> Path:
     root = tmp_path / "repo"
     (root / "shared-memory" / "scripts").mkdir(parents=True)
     shutil.copy(PREFLIGHT, root / "shared-memory" / "scripts" / "preflight.sh")
+    shutil.copy(PREFLIGHT.parent / "read_env_key.py", root / "shared-memory" / "scripts" / "read_env_key.py")
+    shutil.copy(PREFLIGHT.parent / "secure_env.py", root / "shared-memory" / "scripts" / "secure_env.py")
     models = tmp_path / "models"
     (models / "gpustack" / "bge-m3-GGUF").mkdir(parents=True)
     (models / "gpustack" / "bge-reranker-v2-m3-GGUF").mkdir(parents=True)

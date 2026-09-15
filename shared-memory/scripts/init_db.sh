@@ -66,14 +66,14 @@ ylw() { printf '\033[33m%s\033[0m\n' "$*"; }
 # the actual cause (the sister project's install review found exactly this
 # misdiagnosis class: a script that dies for a reason it misreports).
 command -v docker >/dev/null 2>&1 || { red "✗ docker not found on PATH — install Docker first (preflight.sh checks this)."; exit 1; }
-# Read keys without sourcing — .env values may contain spaces (e.g.
-# PROJECT_ALIASES) that bash `source` would mis-parse. Schema/constraint work
+# Read keys without sourcing via the shared Python parser (secure_env.read_env_value /
+# read_env_key.py) — no bash quote-matching. Schema/constraint work
 # below still runs as the in-container postgres superuser over the local
 # socket (peer trust, no password) for Postgres, and with the password for
 # Neo4j's cypher-shell — PG_PASSWORD itself is read here only for the
 # AUTHENTICATED_CONNECTIVITY_CHECK near the end, which deliberately does NOT
 # use peer trust (see that block for why).
-read_env() { grep -E "^$1=" "$ENV_FILE" | tail -1 | cut -d= -f2-; }
+read_env() { python3 "$SCRIPT_DIR/read_env_key.py" "$ENV_FILE" "$1"; }
 NEO4J_PASSWORD="$(read_env NEO4J_PASSWORD)"
 [[ -n "$NEO4J_PASSWORD" ]] || { red "✗ NEO4J_PASSWORD not set in .env"; exit 1; }
 PG_PASSWORD="$(read_env PG_PASSWORD)"

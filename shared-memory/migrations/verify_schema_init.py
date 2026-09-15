@@ -55,6 +55,7 @@ Exit status is 1 when the fresh install would differ, so CI can gate on it.
 import os
 import re
 import sys
+import urllib.parse
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -127,7 +128,7 @@ def _dsn(dbname: str) -> str:
     host = os.environ.get("PG_HOST", "localhost")
     port = os.environ.get("PG_PORT", "5432")
     pw = os.environ.get("PG_PASSWORD", "")
-    return f"postgresql://{user}:{pw}@{host}:{port}/{dbname}"
+    return f"postgresql://{user}:{urllib.parse.quote_plus(pw)}@{host}:{port}/{dbname}"
 
 
 def _norm(text: str) -> str:

@@ -136,13 +136,21 @@ async def test_handle_graph_refuses_double_space_set_before_neo4j():
     coord._neo4j.session.assert_not_called()
 
 
+def _mock_read_session(run_mock):
+    session = MagicMock()
+    session.run = run_mock
+    async def _exec_read(fn, *a, **kw):
+        return await fn(session, *a, **kw)
+    session.execute_read = AsyncMock(side_effect=_exec_read)
+    return session
+
+
 @pytest.mark.asyncio
 async def test_handle_graph_still_opens_a_read_session_for_a_read_query():
     """The guard does not block ordinary reads, and the session is still
-    opened READ-only (the second layer stays in place)."""
+    opened READ-only with execute_read."""
     coord = _coordinator()
-    session = MagicMock()
-    session.run = AsyncMock(return_value=MagicMock(fetch=AsyncMock(return_value=[{"n": 1}])))
+    session = _mock_read_session(AsyncMock(return_value=MagicMock(fetch=AsyncMock(return_value=[{"n": 1}]))))
     ctx = MagicMock()
     ctx.__aenter__ = AsyncMock(return_value=session)
     ctx.__aexit__ = AsyncMock(return_value=False)
@@ -151,6 +159,7 @@ async def test_handle_graph_still_opens_a_read_session_for_a_read_query():
     resp = await coord.handle_graph(_request({"cypher": "MATCH (n) RETURN n.settings"}))
     assert resp.status == 200
     coord._neo4j.session.assert_called_once_with(default_access_mode="READ")
+    session.execute_read.assert_called_once()
 
 
 @pytest.mark.asyncio
@@ -158,9 +167,8 @@ async def test_handle_graph_refuses_query_exceeding_row_cap():
     """SEC-6: a read query whose fetch returns more than GRAPH_QUERY_ROW_CAP
     is refused with HTTP 400 and 'graph_row_cap_exceeded' before serialization."""
     coord = _coordinator()
-    session = MagicMock()
     over_cap_records = [{"n": i} for i in range(GRAPH_QUERY_ROW_CAP + 1)]
-    session.run = AsyncMock(return_value=MagicMock(fetch=AsyncMock(return_value=over_cap_records)))
+    session = _mock_read_session(AsyncMock(return_value=MagicMock(fetch=AsyncMock(return_value=over_cap_records))))
     ctx = MagicMock()
     ctx.__aenter__ = AsyncMock(return_value=session)
     ctx.__aexit__ = AsyncMock(return_value=False)
@@ -178,9 +186,8 @@ async def test_handle_graph_refuses_query_exceeding_row_cap():
 async def test_handle_graph_allows_query_at_or_under_row_cap():
     """SEC-6: an at-or-under-cap query still returns HTTP 200."""
     coord = _coordinator()
-    session = MagicMock()
     at_cap_records = [{"n": i} for i in range(GRAPH_QUERY_ROW_CAP)]
-    session.run = AsyncMock(return_value=MagicMock(fetch=AsyncMock(return_value=at_cap_records)))
+    session = _mock_read_session(AsyncMock(return_value=MagicMock(fetch=AsyncMock(return_value=at_cap_records))))
     ctx = MagicMock()
     ctx.__aenter__ = AsyncMock(return_value=session)
     ctx.__aexit__ = AsyncMock(return_value=False)
@@ -191,4 +198,25 @@ async def test_handle_graph_allows_query_at_or_under_row_cap():
     body = json.loads(resp.body)
     assert body["status"] == "success"
     assert len(body["records"]) == GRAPH_QUERY_ROW_CAP
+
+
+@pytest.mark.asyncio
+async def test_handle_graph_uses_driver_execute_read():
+    """S2: handle_graph executes read queries via the driver's read-transaction API (execute_read)."""
+    coord = _coordinator()
+    session = MagicMock()
+    result = MagicMock(fetch=AsyncMock(return_value=[{"n": 1}]))
+    tx = MagicMock(run=AsyncMock(return_value=result))
+    async def _exec_read(fn, *a, **kw):
+        return await fn(tx, *a, **kw)
+    session.execute_read = AsyncMock(side_effect=_exec_read)
+    ctx = MagicMock()
+    ctx.__aenter__ = AsyncMock(return_value=session)
+    ctx.__aexit__ = AsyncMock(return_value=False)
+    coord._neo4j.session = MagicMock(return_value=ctx)
+
+    resp = await coord.handle_graph(_request({"cypher": "MATCH (n) RETURN n.settings"}))
+    assert resp.status == 200
+    session.execute_read.assert_called_once()
+    tx.run.assert_called_once()
 

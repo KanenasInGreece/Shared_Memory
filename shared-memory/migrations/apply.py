@@ -65,6 +65,7 @@ before running `--adopt`.
 
 import os
 import sys
+import urllib.parse
 from pathlib import Path
 
 try:
@@ -114,7 +115,7 @@ def _pg_conn() -> str:
     pg_pass = os.environ.get("PG_PASSWORD", "")
     return os.environ.get(
         "PG_CONN",
-        f"postgresql://postgres:{pg_pass}@localhost:5432/agent_data",
+        f"postgresql://postgres:{urllib.parse.quote_plus(pg_pass)}@localhost:5432/agent_data",
     )
 
 

@@ -56,6 +56,7 @@ import sys
 import time
 from collections import Counter
 from datetime import datetime, timezone
+import urllib.parse
 
 import httpx
 import psycopg2
@@ -102,7 +103,7 @@ _pg_pass     = get_secret("PG_PASSWORD", "")
 # fell back to the constructed default" — the constructed default always
 # looks non-empty even when it embeds an empty password.
 _pg_conn_explicit = get_secret("PG_CONN", "")
-PG_CONN      = _pg_conn_explicit or f"postgresql://postgres:{_pg_pass}@localhost:5432/agent_data"
+PG_CONN      = _pg_conn_explicit or f"postgresql://postgres:{urllib.parse.quote_plus(_pg_pass)}@localhost:5432/agent_data"
 # The daemons' ONE way in is the hive-mind gateway — never a raw LLM. Pointing this
 # at a backend directly would bypass pooling, cache-affinity, wedge detection and
 # telemetry, so it is deliberately NOT an env knob: the shipped compose fixes the
