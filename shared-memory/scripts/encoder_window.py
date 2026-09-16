@@ -149,7 +149,7 @@ async def probe_encoder(
     ):
         return cached
 
-    full_ok = False
+    full_ok: bool | None = False
     if encoder_name == "embedder":
         post_url = _upstream_url(base_url, "/v1/embeddings")
         text = "x" * EMBED_MAX_CHARS
@@ -163,6 +163,7 @@ async def probe_encoder(
         except Exception:
             full_ok = False
     else:
+        full_ok = None
         post_url = _upstream_url(base_url, "/v1/reranking")
         raw_query = "encoder window probe"
         query = prefix_rerank_query(raw_query)
@@ -173,9 +174,14 @@ async def probe_encoder(
             timeout = ClientTimeout(total=ceiling)
             async with session.post(post_url, json=payload, timeout=timeout, allow_redirects=False) as r:
                 await r.read()
-                full_ok = (r.status == 200)
+                if r.status == 200:
+                    full_ok = True
+                elif r.status == 400:
+                    full_ok = False
+                else:
+                    full_ok = None
         except Exception:
-            full_ok = False
+            full_ok = None
 
 
     res = {

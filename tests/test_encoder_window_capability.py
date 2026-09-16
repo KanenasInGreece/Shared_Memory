@@ -194,6 +194,87 @@ async def test_rerank_one_shot_leaves_query_and_specials_in_window():
 
 
 @pytest.mark.asyncio
+async def test_rerank_one_shot_timeout_maps_to_none():
+    class FakeResponse:
+        def __init__(self, status, data):
+            self.status = status
+            self._data = data
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            pass
+
+        async def json(self):
+            return self._data
+
+        async def read(self):
+            return b""
+
+    class FakeSession:
+        def get(self, url, timeout=None, **kwargs):
+            if url.endswith("/props"):
+                return FakeResponse(200, {"default_generation_settings": {"n_ctx": 8192}})
+            return FakeResponse(404, {})
+
+        def post(self, url, json=None, timeout=None, **kwargs):
+            raise TimeoutError("rerank one-shot timed out")
+
+    res = await encoder_window.probe_encoder(
+        FakeSession(),
+        base_url="http://localhost:8071",
+        route="/v1/reranking",
+        model_id="bge-reranker-v2-m3",
+    )
+    assert res["advertised_tokens"] == 8192
+    assert res["full_payload_ok"] is None
+
+
+@pytest.mark.asyncio
+async def test_rerank_one_shot_status_map_non_400_to_none_and_400_to_false():
+    class FakeResponse:
+        def __init__(self, status):
+            self.status = status
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            pass
+
+        async def json(self):
+            return {}
+
+        async def read(self):
+            return b""
+
+    class FakePropsResponse(FakeResponse):
+        async def json(self):
+            return {"default_generation_settings": {"n_ctx": 8192}}
+
+    for status_code, expected in [(503, None), (413, None), (429, None), (500, None), (400, False), (200, True)]:
+        encoder_window.reset_encoder_window_cache()
+
+        class FakeSession:
+            def get(self, url, timeout=None, **kwargs):
+                if url.endswith("/props"):
+                    return FakePropsResponse(200)
+                return FakeResponse(404)
+
+            def post(self, url, json=None, timeout=None, **kwargs):
+                return FakeResponse(status_code)
+
+        res = await encoder_window.probe_encoder(
+            FakeSession(),
+            base_url="http://localhost:8071",
+            route="/v1/reranking",
+            model_id="bge-reranker-v2-m3",
+        )
+        assert res["full_payload_ok"] is expected, f"HTTP {status_code} mapped to {res['full_payload_ok']}, expected {expected}"
+
+
+@pytest.mark.asyncio
 async def test_probe_cache_and_carry_forward():
     # If encoder fails on subsequent cycle, carry forward cached advertised and full_payload_ok
     encoder_window.set_encoder_cache("embedder", {
