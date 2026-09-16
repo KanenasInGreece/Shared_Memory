@@ -2377,11 +2377,10 @@ class AsyncHiveMindProxy:
                             from dream_telemetry import prefix_rerank_doc, prefix_rerank_query
                             modified = False
                             q = data.get("query")
-                            if isinstance(q, str):
-                                pref_q = prefix_rerank_query(q)
-                                if pref_q != q:
-                                    data["query"] = pref_q
-                                    modified = True
+                            pref_q = prefix_rerank_query(q)
+                            data["query"] = pref_q
+                            if pref_q != q:
+                                modified = True
                             docs = data.get("documents")
                             if isinstance(docs, list):
                                 new_docs = []

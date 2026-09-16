@@ -195,3 +195,142 @@ def test_handle_encoder_rerank_invalid_json_forwarded_unchanged():
     resp = asyncio.run(proxy.handle_encoder(_InvalidReq()))
     assert resp.status == 200
     assert sent_data == raw_invalid
+
+
+@pytest.mark.parametrize("non_str_query", [123, True, ["list"]])
+def test_handle_encoder_rerank_coerces_non_str_query_to_empty(non_str_query):
+    """ADV-R1: POST/handle_encoder coerces non-str query to empty string on the wire without 500."""
+    sent_data = None
+
+    class _OneShotAsyncIter:
+        def __init__(self, body: bytes):
+            self._body = body
+
+        def iter_any(self):
+            return self._agen()
+
+        async def _agen(self):
+            if self._body:
+                yield self._body
+
+        async def read(self, n=-1):
+            return self._body
+
+    class _FakeUpstream:
+        status = 200
+        headers = {}
+
+        def __init__(self):
+            self.content = _OneShotAsyncIter(b'{"results": []}')
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            pass
+
+    class _CaptureSession:
+        def request(self, method, url, headers=None, data=None, allow_redirects=False):
+            nonlocal sent_data
+            sent_data = data
+            return _FakeUpstream()
+
+    class _RerankReq:
+        method = "POST"
+        path = "/v1/reranking"
+        rel_url = URL("/v1/reranking", encoded=True)
+        headers = {}
+        can_read_body = True
+
+        def __init__(self):
+            self._payload_writer = AsyncMock()
+            self._raw = json.dumps({
+                "query": non_str_query,
+                "documents": ["x" * 1000],
+                "model": "bge-reranker-v2-m3",
+            }).encode("utf-8")
+            self.content_length = len(self._raw)
+
+        async def read(self):
+            return self._raw
+
+    proxy = g.AsyncHiveMindProxy()
+    proxy.session = _CaptureSession()
+    resp = asyncio.run(proxy.handle_encoder(_RerankReq()))
+    assert resp.status == 200
+    assert sent_data is not None
+    forwarded = json.loads(sent_data)
+
+    assert forwarded["query"] == ""
+    assert forwarded["documents"][0] == prefix_rerank_doc("", "x" * 1000)
+
+
+def test_handle_encoder_rerank_oversize_query_pins_pair_budget():
+    """ADV-R2: query larger than pair_budget is prefixed to pair_budget and doc gets remaining 0."""
+    sent_data = None
+
+    class _OneShotAsyncIter:
+        def __init__(self, body: bytes):
+            self._body = body
+
+        def iter_any(self):
+            return self._agen()
+
+        async def _agen(self):
+            if self._body:
+                yield self._body
+
+        async def read(self, n=-1):
+            return self._body
+
+    class _FakeUpstream:
+        status = 200
+        headers = {}
+
+        def __init__(self):
+            self.content = _OneShotAsyncIter(b'{"results": []}')
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            pass
+
+    class _CaptureSession:
+        def request(self, method, url, headers=None, data=None, allow_redirects=False):
+            nonlocal sent_data
+            sent_data = data
+            return _FakeUpstream()
+
+    oversize_query = "q" * (pair_budget + 1000)
+
+    class _RerankReq:
+        method = "POST"
+        path = "/v1/reranking"
+        rel_url = URL("/v1/reranking", encoded=True)
+        headers = {}
+        can_read_body = True
+
+        def __init__(self):
+            self._payload_writer = AsyncMock()
+            self._raw = json.dumps({
+                "query": oversize_query,
+                "documents": ["x" * 1000],
+                "model": "bge-reranker-v2-m3",
+            }).encode("utf-8")
+            self.content_length = len(self._raw)
+
+        async def read(self):
+            return self._raw
+
+    proxy = g.AsyncHiveMindProxy()
+    proxy.session = _CaptureSession()
+    resp = asyncio.run(proxy.handle_encoder(_RerankReq()))
+    assert resp.status == 200
+    assert sent_data is not None
+    forwarded = json.loads(sent_data)
+
+    assert len(forwarded["query"]) == pair_budget
+    assert forwarded["query"] == "q" * pair_budget
+    assert forwarded["documents"][0] == ""
+
