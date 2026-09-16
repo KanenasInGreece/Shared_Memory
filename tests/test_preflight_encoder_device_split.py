@@ -180,6 +180,64 @@ def test_h1_genuine_half_set_still_exits_1(tmp_path):
     assert proc.returncode == 1, out
 
 
+def _fake_repo_with_selected_models(tmp_path, env_lines: list[str], *,
+                                    embed: bool = False, rerank: bool = False) -> Path:
+    """Plant only the named encoder GGUF(s) under a synthetic LLM_MODELS_DIR."""
+    root = tmp_path / "repo"
+    (root / "shared-memory" / "scripts").mkdir(parents=True)
+    shutil.copy(PREFLIGHT, root / "shared-memory" / "scripts" / "preflight.sh")
+    shutil.copy(PREFLIGHT.parent / "read_env_key.py", root / "shared-memory" / "scripts" / "read_env_key.py")
+    shutil.copy(PREFLIGHT.parent / "secure_env.py", root / "shared-memory" / "scripts" / "secure_env.py")
+    models = tmp_path / "models"
+    if embed:
+        (models / "gpustack" / "bge-m3-GGUF").mkdir(parents=True)
+        (models / "gpustack" / "bge-m3-GGUF" / "bge-m3-Q8_0.gguf").write_text("x")
+    if rerank:
+        (models / "gpustack" / "bge-reranker-v2-m3-GGUF").mkdir(parents=True)
+        (models / "gpustack" / "bge-reranker-v2-m3-GGUF" / "bge-reranker-v2-m3-Q8_0.gguf").write_text("x")
+    if not embed and not rerank:
+        models.mkdir(parents=True, exist_ok=True)
+    lines = list(env_lines) + [f"LLM_MODELS_DIR={models}"]
+    (root / "shared-memory" / ".env").write_text("".join(f"{l}\n" for l in lines))
+    return root
+
+
+def test_preflight_gguf_glxvm_reranker_only_is_not_bad(tmp_path):
+    """glxvm-shaped host: embedder replicas 0, reranker CPU 1, only rerank GGUF."""
+    root = _fake_repo_with_selected_models(tmp_path, [
+        "NEO4J_PASSWORD=x", "PG_PASSWORD=x",
+        "CPU_ENCODER_REPLICAS=0", "GPU_ENCODER_REPLICAS=0",
+        "EMBEDDER_CPU_REPLICAS=0", "EMBEDDER_GPU_REPLICAS=0",
+        "RERANKER_CPU_REPLICAS=1", "RERANKER_GPU_REPLICAS=0",
+    ], embed=False, rerank=True)
+    proc = _run(root)
+    out = proc.stdout + proc.stderr
+    gguf_bad_lines = [
+        line for line in out.splitlines()
+        if ("GGUF" in line or "gguf" in line) and ("✗" in line or "missing" in line.lower())
+    ]
+    assert gguf_bad_lines == [], f"GGUF hard-fail on reranker-only host: {gguf_bad_lines}\n{out}"
+    assert "encoder GGUFs present" in out
+
+
+def test_preflight_gguf_both_replicas_missing_embed_is_bad(tmp_path):
+    """Both encoders nonzero, only rerank GGUF present → embedder GGUF is bad."""
+    root = _fake_repo_with_selected_models(tmp_path, [
+        "NEO4J_PASSWORD=x", "PG_PASSWORD=x",
+        "EMBEDDER_CPU_REPLICAS=1", "EMBEDDER_GPU_REPLICAS=0",
+        "RERANKER_CPU_REPLICAS=1", "RERANKER_GPU_REPLICAS=0",
+    ], embed=False, rerank=True)
+    proc = _run(root)
+    out = proc.stdout + proc.stderr
+    gguf_bad_lines = [
+        line for line in out.splitlines()
+        if ("GGUF" in line or "gguf" in line) and ("✗" in line or "missing" in line.lower())
+    ]
+    assert gguf_bad_lines, f"missing embed GGUF must be a hard fail:\n{out}"
+    joined = "\n".join(gguf_bad_lines).lower()
+    assert "embed" in joined or "bge-m3" in joined or "encoder gguf" in joined
+
+
 def test_h1_non_integer_value_warns_and_skips_rather_than_hard_fails(tmp_path):
     """An unparseable replica value cannot be safely compared -- warn and
     skip this encoder's verdict rather than mis-flag it as a double-start
