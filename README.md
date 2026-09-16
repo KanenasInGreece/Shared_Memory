@@ -200,7 +200,9 @@ an unauthenticated reranking endpoint on every interface of the host.
 Two things hold whatever the hardware. **A vLLM process serves one model**, so an encoder pair needs
 two of them. And vLLM wants **Hugging Face weights, not GGUF** — `BAAI/bge-m3` (4.3 GB) and
 `BAAI/bge-reranker-v2-m3` (2.2 GB), the same models as the defaults in a different format and
-precision. Start both with `--runner pooling`: these are encoders, not generative models.
+precision. Start both with `--runner pooling` (these are encoders, not generative models) and
+`--max-model-len 8192` (required: equal to `EMBED_MAX_CONTEXT_TOKENS`; without it vLLM defaults to an
+undersized context window and postflight A9 will gate).
 
 ⚠ **Moving the *embedder* to a different engine mixes vector populations.** An embedding population
 is fixed by the weights *and* their precision *and* the engine *and* the device: change any one and

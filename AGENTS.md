@@ -852,7 +852,9 @@ vectors (see the warning at the end).
    `hf download BAAI/bge-m3 --local-dir <dir>/bge-m3` and
    `hf download BAAI/bge-reranker-v2-m3 --local-dir <dir>/bge-reranker-v2-m3`.
 2. **Two containers — a vLLM process serves ONE model.** Start each with `--runner pooling`
-   (these are encoders, not generative models), its own port, and `--served-model-name` set.
+   (these are encoders, not generative models), `--max-model-len 8192` (required to meet
+   `EMBED_MAX_CONTEXT_TOKENS`; postflight A9 will gate this), its own port, and
+   `--served-model-name` set.
    On Intel XPU the image is `intel/vllm:0.21.0-xpu`, and it needs **both** `--device /dev/dri`
    **and** `-v /dev/dri/by-path:/dev/dri/by-path` plus `-e CCL_ZE_IPC_EXCHANGE=sockets` — without
    the `by-path` mount oneCCL cannot enumerate the GPU and the engine never starts. On a shared

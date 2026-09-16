@@ -822,3 +822,34 @@ def test_llm_backend_private_ok_default_source_pin():
         f"a `.get(..., True)` default on LLM_BACKEND_PRIVATE_OK exists — this "
         f"silently widens default-deny's reach: {true_default_hits}"
     )
+
+
+# ── Task 7: vLLM runbooks pin --max-model-len 8192 (decision:2540) ───────────
+
+def test_vllm_runbooks_pin_max_model_len_8192():
+    """decision:2540 Task 7: both runbooks for serving encoders with vLLM
+    (README 'Serving the encoders with vLLM instead of llama.cpp' and
+    AGENTS.md 'Serve the encoders with vLLM') must require --max-model-len 8192
+    to match EMBED_MAX_CONTEXT_TOKENS."""
+    agents = _read("AGENTS.md")
+    readme = _read("README.md")
+
+    # Locate the vLLM sections
+    agents_marker = "### Serve the encoders with vLLM"
+    readme_marker = "#### Serving the encoders with vLLM instead of llama.cpp"
+
+    assert agents_marker in agents, f"AGENTS.md missing section {agents_marker!r}"
+    assert readme_marker in readme, f"README.md missing section {readme_marker!r}"
+
+    agents_section = agents[agents.index(agents_marker):agents.index(agents_marker) + 2000]
+    readme_section = readme[readme.index(readme_marker):readme.index(readme_marker) + 2000]
+
+    assert "--max-model-len 8192" in agents_section, (
+        "AGENTS.md's 'Serve the encoders with vLLM' section must require '--max-model-len 8192' "
+        "to ensure the encoder window meets EMBED_MAX_CONTEXT_TOKENS (decision:2540)"
+    )
+    assert "--max-model-len 8192" in readme_section, (
+        "README.md's 'Serving the encoders with vLLM instead of llama.cpp' section must require "
+        "'--max-model-len 8192' to ensure the encoder window meets EMBED_MAX_CONTEXT_TOKENS (decision:2540)"
+    )
+
