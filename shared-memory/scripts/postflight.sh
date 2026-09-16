@@ -355,6 +355,13 @@ if embed_ok is None:
     print(f"STILL_NULL|embedder full_payload_ok is null (required: {required})|")
     sys.exit(0)
 
+# 1b. Check if reranker probe is still in-flight
+# Wait until rerank advertised is non-null or rerank empirical is non-null (skip-null rule)
+if rerank_adv is None and rerank_ok is None:
+    print(f"STILL_NULL|reranker probe in-flight (advertised and full_payload_ok are null)|")
+    sys.exit(0)
+
+
 # 2. Check embedder advertised window short
 if isinstance(embed_adv, int) and embed_adv < required:
     print(f"FAIL_WINDOW_SHORT|embedder advertised window {embed_adv} < required {required} tokens (--max-model-len or -c required: {required}, EMBED_MAX_CONTEXT_TOKENS={required}, check for leftover EMBED_MAX_CHARS)|")
@@ -1289,11 +1296,13 @@ except Exception:
         warn "A9 skipped — embedder backend is down (see A1)"
     else
         ceiling_s="$(python3 -c '
-import sys
+import sys, math
 sys.path.insert(0, "'"$SCRIPT_DIR"'")
 try:
     import dream_telemetry as dt
-    print(int(dt.embed_ceiling(dt.EMBED_MAX_CHARS)))
+    e_ceil = dt.embed_ceiling(dt.EMBED_MAX_CHARS)
+    r_ceil = dt.rerank_ceiling(["x" * int(dt.RERANK_MAX_DOC_CHARS)])
+    print(int(math.ceil(e_ceil + r_ceil)) + 5)
 except Exception:
     print(60)
 ' 2>/dev/null || echo 60)"
@@ -1302,7 +1311,8 @@ except Exception:
         grade_res="$(printf '%s' "${health_full:-}" | a9_grade_window)"
         IFS='|' read -r verdict detail warn_part <<< "$grade_res"
 
-        while [[ "$verdict" == "STILL_NULL" && $(( SECONDS - start_s )) -lt "$ceiling_s" ]]; do
+        while [[ "$verdict" == "STILL_NULL" && $(( SECONDS - start_s )) -le "$ceiling_s" ]]; do
+
             sleep 2
             if [[ "$auth_on" == "1" && -n "${AGENT_TOKEN:-}" ]]; then
                 health_full="$(curl -s --compressed --max-time 15 -K - "$GATEWAY_URL/health" <<< "header = \"Authorization: Bearer $AGENT_TOKEN\"" || true)"

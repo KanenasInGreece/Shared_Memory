@@ -155,6 +155,19 @@ def test_a9_grade_window_still_null():
     assert verdict == "STILL_NULL"
 
 
+def test_a9_grade_window_still_null_when_reranker_unprobed():
+    payload = {
+        "encoder_window": {
+            "required_tokens": 8192,
+            "embed_max_chars": 24570,
+            "embedder": {"advertised_tokens": 8192, "source": "v1_models", "full_payload_ok": True},
+            "reranker": {"advertised_tokens": None, "source": None, "full_payload_ok": None},
+        }
+    }
+    verdict, detail, warn = _run_a9_grade_window(payload)
+    assert verdict == "STILL_NULL"
+
+
 def test_postflight_exit_loops_include_a9():
     text = POSTFLIGHT.read_text()
     # Check that summary loop checks A9
@@ -173,9 +186,15 @@ def test_a9_premarked_on_missing_token():
 def test_a9_derived_ceiling_used():
     text = POSTFLIGHT.read_text()
     assert "embed_ceiling" in text
+    assert "rerank_ceiling" in text
+    # A 30 literal must still fail
+    a9_section = text[text.find("A9 — encoder window contract:"):]
+    assert "ceiling_s=30" not in a9_section
+    assert "30s" not in a9_section.split("\n")[0]
 
 
 def test_a9_encoder_down_skips():
     text = POSTFLIGHT.read_text()
     assert "A9 skipped — embedder backend is down" in text
+
 
