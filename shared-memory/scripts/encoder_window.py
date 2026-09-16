@@ -22,6 +22,8 @@ from dream_telemetry import (
     EMBED_SPECIAL_TOKEN_RESERVE,
     RERANK_MAX_DOC_CHARS,
     embed_ceiling,
+    prefix_rerank_doc,
+    prefix_rerank_query,
     rerank_ceiling,
 )
 
@@ -162,10 +164,9 @@ async def probe_encoder(
             full_ok = False
     else:
         post_url = _upstream_url(base_url, "/v1/reranking")
-        query = "encoder window probe"
-        special_reserve_chars = int(EMBED_SPECIAL_TOKEN_RESERVE * EMBED_CHARS_PER_TOKEN)
-        doc_len = max(0, int(RERANK_MAX_DOC_CHARS - len(query) - special_reserve_chars))
-        doc = "x" * doc_len
+        raw_query = "encoder window probe"
+        query = prefix_rerank_query(raw_query)
+        doc = prefix_rerank_doc(query, "x" * RERANK_MAX_DOC_CHARS)
         payload = {"query": query, "documents": [doc], "model": model_id}
         ceiling = rerank_ceiling([doc])
         try:

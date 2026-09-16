@@ -2368,8 +2368,42 @@ class AsyncHiveMindProxy:
                         headers={"X-SM-Fault-Origin": "gateway"},
                     )
                 if raw_body:
-                    from encoder_window import clamp_encoder_payload
-                    llm_body = clamp_encoder_payload(raw_body)
+                    if request.rel_url.path_safe == "/v1/reranking":
+                        try:
+                            data = json.loads(raw_body)
+                        except (json.JSONDecodeError, UnicodeDecodeError):
+                            data = None
+                        if isinstance(data, dict):
+                            from dream_telemetry import prefix_rerank_doc, prefix_rerank_query
+                            modified = False
+                            q = data.get("query")
+                            if isinstance(q, str):
+                                pref_q = prefix_rerank_query(q)
+                                if pref_q != q:
+                                    data["query"] = pref_q
+                                    modified = True
+                            docs = data.get("documents")
+                            if isinstance(docs, list):
+                                new_docs = []
+                                for d in docs:
+                                    if isinstance(d, str):
+                                        pref_d = prefix_rerank_doc(data.get("query"), d)
+                                        if pref_d != d:
+                                            modified = True
+                                        new_docs.append(pref_d)
+                                    else:
+                                        new_docs.append(d)
+                                if modified:
+                                    data["documents"] = new_docs
+                            if modified:
+                                llm_body = json.dumps(data).encode("utf-8")
+                            else:
+                                llm_body = raw_body
+                        else:
+                            llm_body = raw_body
+                    else:
+                        from encoder_window import clamp_encoder_payload
+                        llm_body = clamp_encoder_payload(raw_body)
         return await self._forward_upstream(
             request,
             target_base=target_base,
