@@ -245,6 +245,10 @@ if [[ -f "$ENV_FILE" ]]; then
         else
             bad "encoder GGUF(s) missing under LLM_MODELS_DIR ($models_dir) — download commands are in shared-memory/.env.example (or set both *_ENCODER_REPLICAS=0 and point EMBEDDER_URL/RERANKER_URL elsewhere)"
         fi
+    else
+        ctx_tokens="$(read_env EMBED_MAX_CONTEXT_TOKENS)"
+        ctx_tokens="${ctx_tokens:-8192}"
+        warn "all encoder replicas are 0 (remote encoders): remote must serve context window ($ctx_tokens tokens, EMBED_MAX_CONTEXT_TOKENS) via --max-model-len or -c; postflight A9 will gate"
     fi
 
     # Neo4j data-dir writability for the container user. The neo4j image drops
