@@ -2554,9 +2554,10 @@ EMBED_BACKOFF = 0.5      # seconds × attempt number  (0.5 s, 1 s, 1.5 s, 2 s)
 # stdlib + log_hygiene, which this module already depends on, so this does not
 # pull psycopg2 into the gateway venv.)
 from dream_telemetry import (EMBED_CHARS_PER_TOKEN, EMBED_MAX_CHARS,  # noqa: E402
-                             EMBED_MAX_CONTEXT_TOKENS, EMBED_TIMEOUT_FLOOR_S,
-                             RERANK_MAX_DOC_CHARS, clamp_rerank_doc,
-                             embed_ceiling, rerank_ceiling)
+                             EMBED_MAX_CONTEXT_TOKENS, EMBED_SPECIAL_TOKEN_RESERVE,
+                             EMBED_TIMEOUT_FLOOR_S, RERANK_MAX_DOC_CHARS,
+                             clamp_rerank_doc, embed_ceiling, rerank_ceiling)
+
 
 # Read-contract graph expansion cap: how many edges surface per anchored record
 # in search results. Env-tunable. Ordering (in the expansion Cypher) puts
@@ -3795,6 +3796,7 @@ class MemoryCoordinator:
         # maximally-sized summary — the client default of 30s did not even cover
         # this function's own clamp.
         ceiling = embed_ceiling(len(text))
+        reserved_snap = int((EMBED_MAX_CONTEXT_TOKENS - EMBED_SPECIAL_TOKEN_RESERVE) * EMBED_CHARS_PER_TOKEN)
         for attempt in range(1, EMBED_RETRIES + 1):
             # ⛔ ONE ATTEMPT, ONE OBSERVATION. Timing the whole retry loop would
             # fold the backoff sleeps into "how long the embedder takes", which
@@ -3824,14 +3826,20 @@ class MemoryCoordinator:
                         safe(lambda: setattr(self, "_embed_window_overruns_last_ts", time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())))
                         log.error(
                             "embed input %d chars caused %d-token overflow on %d-token model — "
-                            "snapping to reserved clamp (EMBED_MAX_CHARS=%d)",
-                            len(text), classification.requested, classification.advertised, EMBED_MAX_CHARS,
+                            "snapping to reserved clamp (reserved=%d, EMBED_MAX_CHARS=%d)",
+                            len(text), classification.requested, classification.advertised, reserved_snap, EMBED_MAX_CHARS,
                         )
-                        new_len = min(EMBED_MAX_CHARS, len(text) - 1)
-                        if new_len >= 1:
-                            text = text[:new_len]
-                            ceiling = embed_ceiling(len(text))
-                            continue
+                        new_len = min(reserved_snap, len(text) - 1)
+                        if attempt == EMBED_RETRIES or new_len < 1:
+                            raise RuntimeError(
+                                f"Embedding context overrun after {attempt} attempts: server reported {classification.requested} "
+                                f"tokens on {classification.advertised}-token window (last input {len(text)} chars). "
+                                f"Check for leftover or oversize EMBED_MAX_CHARS (currently {EMBED_MAX_CHARS}) in .env; "
+                                f"unset or lower to {reserved_snap}."
+                            )
+                        text = text[:new_len]
+                        ceiling = embed_ceiling(len(text))
+                        continue
                     elif (
                         classification.advertised is not None
                         and classification.requested is not None
@@ -3856,6 +3864,7 @@ class MemoryCoordinator:
                 if isinstance(exc, RuntimeError) and (
                     "Embedding context mismatch:" in str(exc)
                     or "exceeds slack" in str(exc)
+                    or "Embedding context overrun" in str(exc)
                 ):
                     raise
                 safe(lambda: self._embed_ring.record_error())
@@ -3876,6 +3885,13 @@ class MemoryCoordinator:
                 )
                 await asyncio.sleep(wait)
 
+        raise RuntimeError(
+            f"Embedding context overrun: failed after {EMBED_RETRIES} attempts. "
+            f"Check for leftover or oversize EMBED_MAX_CHARS (currently {EMBED_MAX_CHARS}) in .env; "
+            f"unset or lower to {reserved_snap}."
+        )
+
+
     async def _embed_many(
         self, texts: list[str], client: httpx.AsyncClient
     ) -> list[list[float]]:
@@ -3895,6 +3911,7 @@ class MemoryCoordinator:
         clamped = [t[:EMBED_MAX_CHARS] for t in texts]
         total_chars = sum(len(t) for t in clamped)
         ceiling = embed_ceiling(total_chars)
+        reserved_snap = int((EMBED_MAX_CONTEXT_TOKENS - EMBED_SPECIAL_TOKEN_RESERVE) * EMBED_CHARS_PER_TOKEN)
         for attempt in range(1, EMBED_RETRIES + 1):
             _t0 = time.monotonic()
             try:
@@ -3923,10 +3940,27 @@ class MemoryCoordinator:
                         safe(lambda: setattr(self, "_embed_window_overruns_last_ts", time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())))
                         log.error(
                             "batch embed caused %d-token overflow on %d-token model — "
-                            "snapping items to reserved clamp (EMBED_MAX_CHARS=%d)",
-                            classification.requested, classification.advertised, EMBED_MAX_CHARS,
+                            "snapping items to reserved clamp (reserved=%d, EMBED_MAX_CHARS=%d)",
+                            classification.requested, classification.advertised, reserved_snap, EMBED_MAX_CHARS,
                         )
-                        clamped = [t[:min(EMBED_MAX_CHARS, len(t) - 1)] for t in clamped]
+                        max_len = max(len(t) for t in clamped)
+                        if attempt == EMBED_RETRIES or max_len < 1:
+                            raise RuntimeError(
+                                f"Batch embedding context overrun after {attempt} attempts: server reported {classification.requested} "
+                                f"tokens on {classification.advertised}-token window. "
+                                f"Check for leftover or oversize EMBED_MAX_CHARS (currently {EMBED_MAX_CHARS}) in .env; "
+                                f"unset or lower to {reserved_snap}."
+                            )
+                        if max_len >= reserved_snap:
+                            clamped = [
+                                t[:min(reserved_snap, len(t) - 1)] if len(t) >= reserved_snap else t
+                                for t in clamped
+                            ]
+                        else:
+                            clamped = [
+                                t[:len(t) - 1] if len(t) == max_len else t
+                                for t in clamped
+                            ]
                         total_chars = sum(len(t) for t in clamped)
                         ceiling = embed_ceiling(total_chars)
                         continue
@@ -3958,6 +3992,7 @@ class MemoryCoordinator:
                 if isinstance(exc, RuntimeError) and (
                     "Embedding context mismatch:" in str(exc)
                     or "exceeds slack" in str(exc)
+                    or "Batch embedding context overrun" in str(exc)
                 ):
                     raise
                 safe(lambda: self._embed_ring.record_error())
@@ -3974,6 +4009,13 @@ class MemoryCoordinator:
                     attempt, EMBED_RETRIES, scrub_url_credentials(str(exc)), wait,
                 )
                 await asyncio.sleep(wait)
+
+        raise RuntimeError(
+            f"Batch embedding context overrun: failed after {EMBED_RETRIES} attempts. "
+            f"Check for leftover or oversize EMBED_MAX_CHARS (currently {EMBED_MAX_CHARS}) in .env; "
+            f"unset or lower to {reserved_snap}."
+        )
+
 
     # ── Outbox worker ─────────────────────────────────────────────────────────
 

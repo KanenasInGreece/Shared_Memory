@@ -2269,3 +2269,76 @@ def test_embed_larger_than_slack_fails_with_named_error():
     assert len(posts) == 1
     err_msg = str(exc_info.value)
     assert "Lower EMBED_CHARS_PER_TOKEN" in err_msg or "EMBED_MAX_CHARS" in err_msg
+
+
+def test_embed_leftover_env_24576_snaps_to_reserved_and_raises_named_error(monkeypatch):
+    import asyncio
+    monkeypatch.setenv("EMBED_MAX_CHARS", "24576")
+    coord = load_coordinator()
+    monkeypatch.setattr(coord, "EMBED_MAX_CHARS", 24576)
+    posts = []
+
+    class FakeOverrunResp:
+        status_code = 400
+        text = '{"message": "value=8193 exceeds max_model_len 8192"}'
+
+        def raise_for_status(self):
+            import httpx
+            raise httpx.HTTPStatusError("400 Bad Request", request=None, response=self)
+
+    class FakeClient:
+        async def post(self, url, json=None, timeout=None):
+            posts.append(json)
+            return FakeOverrunResp()
+
+    with pytest.raises(RuntimeError) as exc_info:
+        res = asyncio.run(coord.MemoryCoordinator._embed(None, "x" * 24576, FakeClient()))
+        assert res is not None, "must not return None on exhausted loop"
+
+    # Must POST 24570 (snapping to reserved window, not merely -1)
+    posted_lens = [len(p["input"]) for p in posts]
+    assert 24570 in posted_lens, f"Did not POST reserved 24570. Posted: {posted_lens}"
+    err_msg = str(exc_info.value)
+    assert "leftover" in err_msg.lower() or "embed_max_chars" in err_msg.lower()
+
+
+def test_embed_many_preserves_short_siblings_on_overrun():
+    import asyncio
+    coord = load_coordinator()
+    posts = []
+
+    class FakeOverrunResp:
+        status_code = 400
+        text = '{"message": "value=8193 exceeds max_model_len 8192"}'
+
+        def raise_for_status(self):
+            import httpx
+            raise httpx.HTTPStatusError("400 Bad Request", request=None, response=self)
+
+    class Fake200Resp:
+        status_code = 200
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"data": [{"embedding": [0.1], "index": 0}, {"embedding": [0.2], "index": 1}]}
+
+    class FakeClient:
+        async def post(self, url, json=None, timeout=None):
+            posts.append(json)
+            if len(posts) == 1:
+                return FakeOverrunResp()
+            return Fake200Resp()
+
+    res = asyncio.run(
+        coord.MemoryCoordinator._embed_many(
+            None, ["short", "x" * 24570], FakeClient()
+        )
+    )
+    assert len(posts) == 2
+    retry_input = posts[1]["input"]
+    assert retry_input[0] == "short", f"Short sibling mutated to {retry_input[0]!r}"
+    assert len(retry_input[1]) == 24569
+
+
