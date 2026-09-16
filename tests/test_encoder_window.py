@@ -45,6 +45,52 @@ def test_classify_overflow_value_8193_bare():
     assert res.requested == 8193
 
 
+LIVE_VLLM_INPUT_TOKENS_SENTENCE = (
+    "This model's maximum context length is 8192 tokens. However, you requested "
+    "0 output tokens and your prompt contains at least 8193 input tokens, for a "
+    "total of at least 8193 tokens. Please reduce the length of the input prompt "
+    "or the number of requested output tokens. (parameter=input_tokens, value=8193)"
+)
+
+
+def test_classify_overflow_live_vllm_input_tokens_not_zero_output():
+    """Workstation vLLM 400 (fact:2581): 'requested 0 output tokens' must not win."""
+    res = encoder_window.classify_overflow(
+        400, LIVE_VLLM_INPUT_TOKENS_SENTENCE, required_tokens=8192
+    )
+    assert res.kind == "overrun"
+    assert res.advertised == 8192
+    assert res.requested == 8193
+
+
+def test_overflow_from_response_json_requires_dict_and_enum():
+    assert encoder_window.overflow_from_response_json("nope") is None
+    assert encoder_window.overflow_from_response_json({"overflow": "nope"}) is None
+    assert encoder_window.overflow_from_response_json(
+        {"overflow": {"kind": "garbage", "advertised": 8192, "requested": 8193}}
+    ) is None
+    res = encoder_window.overflow_from_response_json(
+        {"error": "upstream_fault", "overflow": {
+            "kind": "overrun", "advertised": "8192", "requested": 8193,
+        }}
+    )
+    assert res is not None
+    assert res.kind == "overrun"
+    assert res.advertised == 8192
+    assert res.requested == 8193
+
+
+def test_overflow_fields_coerces_int_or_null():
+    fields = encoder_window.overflow_fields(
+        encoder_window.OverflowResult("overrun", 8192, 8193)
+    )
+    assert fields == {"kind": "overrun", "advertised": 8192, "requested": 8193}
+    fields_none = encoder_window.overflow_fields(
+        encoder_window.OverflowResult("other", None, None)
+    )
+    assert fields_none == {"kind": "other", "advertised": None, "requested": None}
+
+
 def test_classify_overflow_mismatch_short_window():
     body = {
         "message": (

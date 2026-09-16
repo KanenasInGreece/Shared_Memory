@@ -2633,8 +2633,31 @@ class AsyncHiveMindProxy:
                             if llm_backend is not None:
                                 headers["X-SM-LLM-Backend"] = scrub_url_credentials(llm_backend)
 
+                            payload = {
+                                "error": "upstream_fault",
+                                "status": upstream.status,
+                                "type": error_type,
+                            }
+                            # Encoder embed 400/413: structured overflow for
+                            # get_embedding (decision:2583). Never the verbatim
+                            # provider body. Not on LLM pool, rerank, or 5xx.
+                            path_safe = getattr(request.rel_url, "path_safe", "") or ""
+                            if (
+                                llm_backend is None
+                                and path_safe == "/v1/embeddings"
+                                and upstream.status in (400, 413)
+                            ):
+                                from encoder_window import (
+                                    classify_overflow,
+                                    overflow_fields,
+                                )
+                                prefix = _decompress_prefix_for_parse(
+                                    body_bytes, content_encoding)
+                                payload["overflow"] = overflow_fields(
+                                    classify_overflow(upstream.status, prefix))
+
                             return web.json_response(
-                                {"error": "upstream_fault", "status": upstream.status, "type": error_type},
+                                payload,
                                 status=upstream.status,
                                 headers=headers,
                             )

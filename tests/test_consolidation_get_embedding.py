@@ -229,6 +229,43 @@ def test_get_embedding_classifies_400_and_413_in_source():
     """Mutation: skip classify → 400 → None on overrun (this source pin fails)."""
     src = inspect.getsource(ConsolidationDaemon.get_embedding)
     assert "classify_overflow" in src
+    assert "overflow_from_response_json" in src
     assert "400" in src
     assert "413" in src
     assert "reserved" in src.lower() or "reserved_clamp" in src
+
+
+GATEWAY_OVERRUN_JSON = (
+    '{"error":"upstream_fault","status":400,'
+    '"overflow":{"kind":"overrun","advertised":8192,"requested":8193}}'
+)
+
+
+def test_get_embedding_gateway_overflow_json_halves_to_1024(monkeypatch):
+    """Production daemon sees S8 JSON, not the vLLM sentence (fact:2581)."""
+
+    def handler(body, n):
+        if len(body["input"]) > 24570 // 2:
+            return _FakeResp(400, GATEWAY_OVERRUN_JSON)
+        return _FakeResp(200, embedding=VEC_1024)
+
+    original = "x" * 24570
+    result, posts = _run_embed(original, handler, monkeypatch)
+
+    assert result == VEC_1024
+    assert len(result) == 1024
+    assert 2 <= len(posts) <= 8
+    assert len(posts[0]["input"]) == 24570
+    assert len(posts[1]["input"]) == 24570 // 2
+    assert len(original) == 24570
+
+
+def test_get_embedding_malformed_overflow_string_does_not_crash(monkeypatch):
+    """ADV R1: overflow as a string must fall back, not raise."""
+
+    def handler(body, n):
+        return _FakeResp(400, '{"error":"upstream_fault","overflow":"nope"}')
+
+    result, posts = _run_embed("x" * 2000, handler, monkeypatch)
+    assert result is None or isinstance(result, list)
+    assert len(posts) >= 1

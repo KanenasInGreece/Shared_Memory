@@ -5,6 +5,11 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.9.107] — 2026-09-16
+
+### Fixed
+- Encoder embed HTTP 400/413 through the gateway now carries structured `overflow` fields (`kind`, `advertised`, `requested`) on the S8 typed refusal, so `get_embedding` classifies overrun vs mismatch without the provider body. The live vLLM sentence that says both "requested 0 output tokens" and `value=8193` is classified as requested=8193, not 0. Credentialed LLM faults and `/v1/reranking` stay typed with no `overflow` key and no verbatim provider text.
+
 ## [0.9.106] — 2026-09-16
 
 ### Fixed

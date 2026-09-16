@@ -2605,9 +2605,19 @@ class ConsolidationDaemon:
                         timeout=ceiling,
                     )
                     if resp.status_code in (400, 413):
-                        classification = classify_overflow(
-                            resp.status_code, getattr(resp, "text", ""),
-                        )
+                        from encoder_window import overflow_from_response_json
+                        body_text = getattr(resp, "text", "") or ""
+                        parsed = None
+                        if isinstance(body_text, str) and body_text.lstrip().startswith("{"):
+                            try:
+                                parsed = json.loads(body_text)
+                            except Exception:
+                                parsed = None
+                        classification = overflow_from_response_json(parsed)
+                        if classification is None:
+                            classification = classify_overflow(
+                                resp.status_code, body_text,
+                            )
                         if classification.kind == "mismatch":
                             logger.error(
                                 "Embedding context mismatch: server advertised %s tokens, "
