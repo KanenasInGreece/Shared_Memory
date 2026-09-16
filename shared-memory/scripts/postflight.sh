@@ -2,7 +2,7 @@
 #
 # postflight.sh — verify an installed Shared Memory stack END TO END.
 #
-# Implements assertions A1–A8 of shared-memory/Documentation/postflight.md.
+# Implements assertions A1–A9 of shared-memory/Documentation/postflight.md.
 # THE SPEC IS THE CONTRACT: where this script and that document disagree, the
 # document wins and this script is the defect.
 #
@@ -16,8 +16,10 @@
 #   A8  reasoning-backend       a REAL completion through the gateway proxy path; SKIPs
 #       liveness, end to end    when no backend is reported HEALTHY (/health's
 #                                llm_backends status map), never on a missing LLM
+#   A9  encoder window contract verifies advertised >= required context tokens and
+#                               empirical full payload acceptance (decision:2540)
 #
-# Exit 0 iff A1–A5 and A8 all pass (A8 SKIPs, never gates, when no reasoning
+# Exit 0 iff A1–A5, A8 and A9 all pass (A8 SKIPs, never gates, when no reasoning
 # backend is reported healthy right now). Run after first install (AGENTS.md
 # Phase 9) and after every upgrade:
 #
@@ -309,6 +311,82 @@ print("OK" if ok else "EMPTY")
 }
 # <<< A8_GRADE_COMPLETION
 
+# >>> A9_GRADE_WINDOW (tests/test_postflight_a9.py extracts this block
+# VERBATIM and runs it standalone via subprocess with fixture stdin).
+# Pure function: given the authenticated /health JSON on stdin,
+# parses `encoder_window` and prints:
+# <VERDICT>|<DETAIL>|<WARNING>
+# Where VERDICT is one of:
+#   OK | STILL_NULL | FAIL_WINDOW_SHORT | FAIL_EMBED_OVERRUN | FAIL_MISSING_BLOCK | UNPARSEABLE | EMPTY
+a9_grade_window() {
+    python3 -c '
+import json, sys
+
+raw = sys.stdin.read().strip()
+if not raw:
+    print("EMPTY||")
+    sys.exit(0)
+
+try:
+    data = json.loads(raw)
+except Exception:
+    print("UNPARSEABLE||")
+    sys.exit(0)
+
+checks = data if isinstance(data, dict) else {}
+win = checks.get("encoder_window")
+if not isinstance(win, dict):
+    print("FAIL_MISSING_BLOCK|encoder_window block missing from /health|")
+    sys.exit(0)
+
+required = win.get("required_tokens", 8192)
+embed_max_chars = win.get("embed_max_chars", 24570)
+embed = win.get("embedder") or {}
+rerank = win.get("reranker") or {}
+
+embed_adv = embed.get("advertised_tokens")
+embed_ok = embed.get("full_payload_ok")
+
+rerank_adv = rerank.get("advertised_tokens")
+rerank_ok = rerank.get("full_payload_ok")
+
+# 1. Check if embedder probe is still in-flight
+if embed_ok is None:
+    print(f"STILL_NULL_EMBED|embedder full_payload_ok is null (required: {required})|")
+    sys.exit(0)
+
+# 2. Check embedder advertised window short
+if isinstance(embed_adv, int) and embed_adv < required:
+    print(f"FAIL_WINDOW_SHORT|embedder advertised window {embed_adv} < required {required} tokens (--max-model-len or -c required: {required}, EMBED_MAX_CONTEXT_TOKENS={required}, check for leftover EMBED_MAX_CHARS)|")
+    sys.exit(0)
+
+# 3. Check embedder empirical full payload failure
+if embed_ok is False:
+    print(f"FAIL_EMBED_OVERRUN|embedder full payload test failed (full_payload_ok is false). Upstream encoder must support --max-model-len {required} or -c {required} (EMBED_MAX_CONTEXT_TOKENS={required}); check for leftover EMBED_MAX_CHARS={embed_max_chars}|")
+    sys.exit(0)
+
+# 1b. Check if reranker probe is still in-flight
+# Wait until rerank advertised is non-null or rerank empirical is non-null (skip-null rule)
+if rerank_adv is None and rerank_ok is None:
+    print(f"STILL_NULL_RERANK|reranker probe in-flight (advertised and full_payload_ok are null)|")
+    sys.exit(0)
+
+# 4. Check reranker advertised window short
+if isinstance(rerank_adv, int) and rerank_adv < required:
+    print(f"FAIL_WINDOW_SHORT|reranker advertised window {rerank_adv} < required {required} tokens (--max-model-len or -c required: {required}, EMBED_MAX_CONTEXT_TOKENS={required}, check for leftover EMBED_MAX_CHARS)|")
+    sys.exit(0)
+
+# 5. Reranker empirical false is warn-only
+warn_msg = ""
+if rerank_ok is False:
+    warn_msg = "reranker full payload probe failed (full_payload_ok: false); search will fall back or truncate on large candidate sets"
+
+adv_str = f"advertised: {embed_adv}" if embed_adv is not None else "advertised: unprobed"
+print(f"OK|embed full_payload_ok: true, {adv_str}, required: {required}|{warn_msg}")
+'
+}
+# <<< A9_GRADE_WINDOW
+
 # GNU date assumed (%3N) — like the rest of the stack (Linux/docker hosts).
 # Bash builtin, never `date`: uutils coreutils (default on Ubuntu ≥25.10)
 # ignores the %3N width in `date +%s%3N` and returns nanoseconds — every timing
@@ -430,6 +508,7 @@ print(",".join(k for k in ("nrem_daemon_process", "backend_capability", "depende
             token_missing=1
             afail[A5]=1
             afail[A8]=1
+            afail[A9]=1
         fi
     else
         missing="$(printf '%s' "$anon_health" | python3 -c '
@@ -1189,10 +1268,87 @@ print(json.dumps({
     fi
 fi
 
+# ── A9 — encoder window contract ───────────────────────────────────────────────
+echo "A9 — encoder window contract:"
+
+if [[ "$token_missing" == "1" ]]; then
+    warn "A9 skipped — AGENT_TOKEN missing (see A1)"
+elif [[ "$gateway_down" == "1" ]]; then
+    bad A9 "skipped — gateway unreachable (see A1)"
+else
+    embedder_down="$(printf '%s' "${health_full:-}" | python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+    deps = d.get("dependencies", {})
+    state = deps.get("embedder", {}).get("state")
+    probe = d.get("embedder")
+    if state == "down" or probe == "down" or (probe and probe != "ok" and not str(probe).startswith("http_")):
+        print("1")
+    else:
+        print("0")
+except Exception:
+    print("0")
+' 2>/dev/null || echo "0")"
+
+    if [[ "$embedder_down" == "1" ]]; then
+        warn "A9 skipped — embedder backend is down (see A1)"
+    else
+        ceiling_s="$(python3 -c '
+import sys, math
+sys.path.insert(0, "'"$SCRIPT_DIR"'")
+try:
+    import dream_telemetry as dt
+    e_ceil = dt.embed_ceiling(dt.EMBED_MAX_CHARS)
+    r_ceil = dt.rerank_ceiling(["x" * int(dt.RERANK_MAX_DOC_CHARS)])
+    print(int(math.ceil(e_ceil + r_ceil)) + 5)
+except Exception:
+    print(60)
+' 2>/dev/null || echo 60)"
+
+        start_s=$SECONDS
+        grade_res="$(printf '%s' "${health_full:-}" | a9_grade_window)"
+        IFS='|' read -r verdict detail warn_part <<< "$grade_res"
+
+        while [[ ( "$verdict" == "STILL_NULL_EMBED" || "$verdict" == "STILL_NULL_RERANK" || "$verdict" == "STILL_NULL" ) && $(( SECONDS - start_s )) -le "$ceiling_s" ]]; do
+            sleep 2
+            if [[ "$auth_on" == "1" && -n "${AGENT_TOKEN:-}" ]]; then
+                health_full="$(curl -s --compressed --max-time 15 -K - "$GATEWAY_URL/health" <<< "header = \"Authorization: Bearer $AGENT_TOKEN\"" || true)"
+            else
+                health_full="$(curl -s --compressed --max-time 15 "$GATEWAY_URL/health" || true)"
+            fi
+            grade_res="$(printf '%s' "${health_full:-}" | a9_grade_window)"
+            IFS='|' read -r verdict detail warn_part <<< "$grade_res"
+        done
+
+        case "$verdict" in
+            OK)
+                if [[ -n "$warn_part" ]]; then
+                    warn "A9 $warn_part"
+                fi
+                ok "A9 encoder window contract verified ($detail)"
+                ;;
+            STILL_NULL_RERANK)
+                warn "A9 reranker probe in-flight timed out after ${ceiling_s}s (skip-null); search will fall back or truncate on large candidate sets"
+                ok "A9 encoder window contract verified ($detail)"
+                ;;
+            STILL_NULL|STILL_NULL_EMBED)
+                bad A9 "encoder window probe timed out after ${ceiling_s}s (still null). Verify upstream encoder is started with --max-model-len or -c matching EMBED_MAX_CONTEXT_TOKENS, and check for leftover EMBED_MAX_CHARS"
+                ;;
+            FAIL_WINDOW_SHORT|FAIL_EMBED_OVERRUN)
+                bad A9 "$detail"
+                ;;
+            *)
+                bad A9 "encoder window verification failed: $detail (verdict: $verdict)"
+                ;;
+        esac
+    fi
+fi
+
 # ── Summary ───────────────────────────────────────────────────────────────────
 echo
 fail=0
-for a in A1 A2 A3 A4 A5 A8; do
+for a in A1 A2 A3 A4 A5 A8 A9; do
     [[ "${afail[$a]:-0}" == "1" ]] && fail=1
 done
 if [[ "$fail" -eq 0 ]]; then
@@ -1200,13 +1356,13 @@ if [[ "$fail" -eq 0 ]]; then
         # ND6: the skip is loud at the A8 check itself, but must survive a
         # scrolled-past terminal — a passing run with A8 named-skipped reads
         # identically to a full pass unless the summary says otherwise.
-        grn "Postflight passed (A1–A5, A8 skipped: ${a8_skip_declaration}). The install works end to end for what is declared; A6's baseline is your performance reference."
+        grn "Postflight passed (A1–A5, A8 skipped: ${a8_skip_declaration}, A9). The install works end to end for what is declared; A6's baseline is your performance reference."
     else
-        grn "Postflight passed (A1–A5, A8). The install works end to end; A6's baseline is your performance reference."
+        grn "Postflight passed (A1–A5, A8 and A9). The install works end to end; A6's baseline is your performance reference."
     fi
 else
     failed=""
-    for a in A1 A2 A3 A4 A5 A8; do
+    for a in A1 A2 A3 A4 A5 A8 A9; do
         [[ "${afail[$a]:-0}" == "1" ]] && failed="$failed $a"
     done
     red "Postflight failed —$failed did not pass. Resolve the ✗ items above, then re-run."

@@ -167,6 +167,42 @@ FRAMEWORK_DEFAULTS = MappingProxyType({
             "LLM_DEFAULT_TARGET is ALSO present-but-empty."
         ),
     }),
+    "EMBED_MAX_CONTEXT_TOKENS": MappingProxyType({
+        "default": 8192,
+        "kind": "env-default",
+        "idiom": "get",
+        "consumers": ("dream_telemetry.py:88",),
+        "note": "Maximum context window (tokens) the embedder/reranker supports.",
+    }),
+    "EMBED_CHARS_PER_TOKEN": MappingProxyType({
+        "default": 3.0,
+        "kind": "env-default",
+        "idiom": "get",
+        "consumers": ("dream_telemetry.py:94",),
+        "note": "Conservative characters-per-token ratio for text clamping.",
+    }),
+    "EMBED_SPECIAL_TOKEN_RESERVE": MappingProxyType({
+        "default": 2,
+        "kind": "env-default",
+        "idiom": "get",
+        "consumers": ("dream_telemetry.py:108",),
+        "note": "Special tokens reserved for BOS/EOS/framing.",
+    }),
+    "EMBED_MAX_CHARS": MappingProxyType({
+        "default": 24570,
+        "kind": "env-default",
+        "idiom": "get",
+        "consumers": ("dream_telemetry.py:114",),
+        "note": "Maximum character length sent to embedder before vector clamping.",
+    }),
+    "OVERFLOW_TOKEN_SLACK": MappingProxyType({
+        "default": 16,
+        "kind": "env-default",
+        "idiom": "get",
+        "consumers": ("encoder_window.py:30",),
+        "note": "Token slack allowed above context window during overflow snap loop.",
+    }),
+
 
     # ── hardcoded-literal rows — documented only, no code change in W1 ─────
 

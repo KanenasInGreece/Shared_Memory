@@ -203,7 +203,18 @@ from log_hygiene import scrub_url_credentials  # noqa: E402
 # PROXY_BIND's idiom lives there too, even though its "kind" stays
 # documented-only — no W1 code change at that site — precisely so this
 # script never needs a second, hand-written idiom table of its own).
-ENV_ROW_ORDER = ("EMBEDDER_URL", "RERANKER_URL", "LLM_DEFAULT_TARGET", "LLM_BACKENDS", "PROXY_BIND")
+ENV_ROW_ORDER = (
+    "EMBEDDER_URL",
+    "RERANKER_URL",
+    "LLM_DEFAULT_TARGET",
+    "LLM_BACKENDS",
+    "PROXY_BIND",
+    "EMBED_MAX_CONTEXT_TOKENS",
+    "EMBED_CHARS_PER_TOKEN",
+    "EMBED_SPECIAL_TOKEN_RESERVE",
+    "EMBED_MAX_CHARS",
+    "OVERFLOW_TOKEN_SLACK",
+)
 
 # ── Exception rendering (SEC-HIGH, fold round) — see the module docstring's
 #    "Exception rendering" section for the full policy this implements. ────
@@ -308,7 +319,7 @@ def phase_a_render() -> "tuple[list[str], bool]":
     for key in ENV_ROW_ORDER:
         v = _verdict(key)
         effective = scrub_url_credentials(str(v["effective"]))
-        lines.append(f"  {key:<20} {v['state']:<20} -> {effective!r}  [idiom={v['idiom']}]")
+        lines.append(f"  {key:<28} {v['state']:<20} -> {effective!r}  [idiom={v['idiom']}]")
 
     lines.append("")
     lines.append("Credentials (boolean only — the value is never rendered):")
@@ -543,6 +554,34 @@ def phase_b_render() -> "tuple[list[str], int]":
             lines.append(f"    {scrub_url_credentials(str(e))}")
 
     lines.extend(_w4_census_lines(proxy))
+
+    # Encoder window (decision:2540): probed window vs required is a note,
+    # never a gateway startup refusal.
+    lines.append("")
+    lines.append("Encoder context window (probed window vs required is a note, never a startup refusal):")
+    try:
+        import dream_telemetry as dt
+        req = dt.EMBED_MAX_CONTEXT_TOKENS
+    except Exception:
+        req = 8192
+    lines.append(f"  required: {req} tokens (EMBED_MAX_CONTEXT_TOKENS)")
+
+    try:
+        import encoder_window
+        snapshot = encoder_window.get_encoder_window_snapshot()
+        embed_adv = snapshot.get("embedder", {}).get("advertised_tokens")
+        rerank_adv = snapshot.get("reranker", {}).get("advertised_tokens")
+        if embed_adv is not None or rerank_adv is not None:
+            lines.append(f"  embedder advertised: {embed_adv} (source={snapshot.get('embedder', {}).get('source')})")
+            lines.append(f"  reranker advertised: {rerank_adv} (source={snapshot.get('reranker', {}).get('source')})")
+            if (isinstance(embed_adv, int) and embed_adv < req) or (isinstance(rerank_adv, int) and rerank_adv < req):
+                lines.append(f"  note: advertised window is short of required {req} tokens — postflight A9 will gate this")
+            else:
+                lines.append("  note: advertised context window meets requirement")
+        else:
+            lines.append(f"  note: encoder window unprobed (endpoint unreached or not exposing context length; required: {req} tokens)")
+    except Exception:
+        lines.append(f"  note: encoder window unprobed (required: {req} tokens)")
 
     lines.append("")
     lines.append("Gateway startup refusals (calling the gateway's own guard functions):")

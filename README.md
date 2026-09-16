@@ -200,7 +200,9 @@ an unauthenticated reranking endpoint on every interface of the host.
 Two things hold whatever the hardware. **A vLLM process serves one model**, so an encoder pair needs
 two of them. And vLLM wants **Hugging Face weights, not GGUF** — `BAAI/bge-m3` (4.3 GB) and
 `BAAI/bge-reranker-v2-m3` (2.2 GB), the same models as the defaults in a different format and
-precision. Start both with `--runner pooling`: these are encoders, not generative models.
+precision. Start both with `--runner pooling` (these are encoders, not generative models) and
+`--max-model-len 8192` (required: equal to `EMBED_MAX_CONTEXT_TOKENS`; without it vLLM defaults to an
+undersized context window and postflight A9 will gate).
 
 ⚠ **Moving the *embedder* to a different engine mixes vector populations.** An embedding population
 is fixed by the weights *and* their precision *and* the engine *and* the device: change any one and
@@ -477,7 +479,7 @@ A fresh gateway host goes from clone to running with five helper scripts in
 9. **Verify the install.** Back on the gateway host:
    export `AGENT_TOKEN` by reading it out of a write-capable agent's skill `.env` from step 6 (the
    `AGENT_ENV` + `sed` idiom at the top of `postflight.md` — never a pasted export), then
-   `bash shared-memory/scripts/postflight.sh` — eight assertions that prove the stack end to
+   `bash shared-memory/scripts/postflight.sh` — exits 0 iff assertions **A1–A5, A8 and A9** all pass, proving the stack end to
    end, from health payload shapes to a canary save traced into both stores, a real completion
    driven through the reasoning backend, and a baseline JSON of this hardware's save/search
    timings for later comparison. The contract it checks

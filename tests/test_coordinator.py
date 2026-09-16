@@ -2172,6 +2172,173 @@ def test_embed_passes_short_input_untruncated():
             return FakeResp()
     asyncio.run(coord.MemoryCoordinator._embed(None, "short text", FakeClient()))
     assert captured["len"] == len("short text")
-    # A short save sits on the floor — the derivation must not make small
-    # writes wait longer than they used to.
     assert captured["timeout"] == coord.EMBED_TIMEOUT_FLOOR_S
+
+
+def test_embed_mismatch_fails_with_named_error_in_one_post():
+    import asyncio
+    coord = load_coordinator()
+    posts = []
+
+    class FakeResp:
+        status_code = 400
+        text = '{"message": "This model\'s maximum context length is 512 tokens. However, you requested 600 tokens."}'
+
+        def raise_for_status(self):
+            import httpx
+            raise httpx.HTTPStatusError("400 Bad Request", request=None, response=self)
+
+    class FakeClient:
+        async def post(self, url, json=None, timeout=None):
+            posts.append(json)
+            return FakeResp()
+
+    with pytest.raises(RuntimeError) as exc_info:
+        asyncio.run(coord.MemoryCoordinator._embed(None, "x" * 2000, FakeClient()))
+
+    # Single POST: mismatch never truncates or retries
+    assert len(posts) == 1
+    err_msg = str(exc_info.value)
+    assert "--max-model-len" in err_msg
+    assert "-c" in err_msg
+    assert "EMBED_MAX_CONTEXT_TOKENS" in err_msg
+    assert "EMBED_MAX_CHARS" in err_msg
+
+
+def test_embed_overrun_snaps_to_clamp_and_retries_to_200():
+    import asyncio
+    coord = load_coordinator()
+    posts = []
+
+    class Fake400Resp:
+        status_code = 400
+        text = '{"message": "This model\'s maximum context length is 8192 tokens. However, you requested 8193 tokens in the messages, please reduce the length of the messages."}'
+
+        def raise_for_status(self):
+            import httpx
+            raise httpx.HTTPStatusError("400 Bad Request", request=None, response=self)
+
+    class Fake200Resp:
+        status_code = 200
+        text = '{"data": [{"embedding": [0.3, 0.4]}]}'
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"data": [{"embedding": [0.3, 0.4]}]}
+
+    class FakeClient:
+        async def post(self, url, json=None, timeout=None):
+            posts.append(json)
+            if len(posts) == 1:
+                return Fake400Resp()
+            return Fake200Resp()
+
+    # Pass 24576 chars (older clamp / overrun scenario)
+    vec = asyncio.run(coord.MemoryCoordinator._embed(None, "x" * 24576, FakeClient()))
+    assert vec == [0.3, 0.4]
+    assert len(posts) == 2
+    # First attempt clamped at EMBED_MAX_CHARS (24570)
+    # Second attempt snapped to min(EMBED_MAX_CHARS, len-1) = 24569
+    assert len(posts[0]["input"]) == coord.EMBED_MAX_CHARS
+    assert len(posts[1]["input"]) == coord.EMBED_MAX_CHARS - 1
+
+
+def test_embed_larger_than_slack_fails_with_named_error():
+    import asyncio
+    coord = load_coordinator()
+    posts = []
+
+    class Fake400Resp:
+        status_code = 400
+        text = '{"message": "This model\'s maximum context length is 8192 tokens. However, you requested 8300 tokens in the messages."}'
+
+        def raise_for_status(self):
+            import httpx
+            raise httpx.HTTPStatusError("400 Bad Request", request=None, response=self)
+
+    class FakeClient:
+        async def post(self, url, json=None, timeout=None):
+            posts.append(json)
+            return Fake400Resp()
+
+    with pytest.raises(RuntimeError) as exc_info:
+        asyncio.run(coord.MemoryCoordinator._embed(None, "x" * 24570, FakeClient()))
+
+    assert len(posts) == 1
+    err_msg = str(exc_info.value)
+    assert "Lower EMBED_CHARS_PER_TOKEN" in err_msg or "EMBED_MAX_CHARS" in err_msg
+
+
+def test_embed_leftover_env_24576_snaps_to_reserved_and_raises_named_error(monkeypatch):
+    import asyncio
+    monkeypatch.setenv("EMBED_MAX_CHARS", "24576")
+    coord = load_coordinator()
+    monkeypatch.setattr(coord, "EMBED_MAX_CHARS", 24576)
+    posts = []
+
+    class FakeOverrunResp:
+        status_code = 400
+        text = '{"message": "value=8193 exceeds max_model_len 8192"}'
+
+        def raise_for_status(self):
+            import httpx
+            raise httpx.HTTPStatusError("400 Bad Request", request=None, response=self)
+
+    class FakeClient:
+        async def post(self, url, json=None, timeout=None):
+            posts.append(json)
+            return FakeOverrunResp()
+
+    with pytest.raises(RuntimeError) as exc_info:
+        res = asyncio.run(coord.MemoryCoordinator._embed(None, "x" * 24576, FakeClient()))
+        assert res is not None, "must not return None on exhausted loop"
+
+    # Must POST 24570 (snapping to reserved window, not merely -1)
+    posted_lens = [len(p["input"]) for p in posts]
+    assert 24570 in posted_lens, f"Did not POST reserved 24570. Posted: {posted_lens}"
+    err_msg = str(exc_info.value)
+    assert "leftover" in err_msg.lower() or "embed_max_chars" in err_msg.lower()
+
+
+def test_embed_many_preserves_short_siblings_on_overrun():
+    import asyncio
+    coord = load_coordinator()
+    posts = []
+
+    class FakeOverrunResp:
+        status_code = 400
+        text = '{"message": "value=8193 exceeds max_model_len 8192"}'
+
+        def raise_for_status(self):
+            import httpx
+            raise httpx.HTTPStatusError("400 Bad Request", request=None, response=self)
+
+    class Fake200Resp:
+        status_code = 200
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"data": [{"embedding": [0.1], "index": 0}, {"embedding": [0.2], "index": 1}]}
+
+    class FakeClient:
+        async def post(self, url, json=None, timeout=None):
+            posts.append(json)
+            if len(posts) == 1:
+                return FakeOverrunResp()
+            return Fake200Resp()
+
+    res = asyncio.run(
+        coord.MemoryCoordinator._embed_many(
+            None, ["short", "x" * 24570], FakeClient()
+        )
+    )
+    assert len(posts) == 2
+    retry_input = posts[1]["input"]
+    assert retry_input[0] == "short", f"Short sibling mutated to {retry_input[0]!r}"
+    assert len(retry_input[1]) == 24569
+
+
