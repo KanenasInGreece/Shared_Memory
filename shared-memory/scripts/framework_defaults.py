@@ -196,12 +196,13 @@ FRAMEWORK_DEFAULTS = MappingProxyType({
         "note": "Maximum character length sent to embedder before vector clamping.",
     }),
     "OVERFLOW_TOKEN_SLACK": MappingProxyType({
-        "default": 64,
+        "default": 16,
         "kind": "env-default",
         "idiom": "get",
-        "consumers": ("encoder_window.py:27",),
-        "note": "Token slack subtracted during overflow retry loop.",
+        "consumers": ("encoder_window.py:30",),
+        "note": "Token slack allowed above context window during overflow snap loop.",
     }),
+
 
     # ── hardcoded-literal rows — documented only, no code change in W1 ─────
 
