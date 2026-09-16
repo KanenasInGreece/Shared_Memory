@@ -169,9 +169,31 @@ def test_get_embedding_other_9000_vs_8192_shrinks_to_1024(monkeypatch):
     assert len(result) == 1024
     assert 2 <= len(posts) <= 8
     assert len(posts[0]["input"]) == 24570
-    expected = min(24570 - 1, 24570 * 8192 // 9000)
-    assert len(posts[1]["input"]) == expected
-    assert len(posts[1]["input"]) < 24570
+    # 24570 * 8192/9000 ≈ 22368 is still ≥ 90% of current → must halve.
+    assert len(posts[1]["input"]) == 24570 // 2
+    assert len(original) == 24570
+
+
+def test_get_embedding_overrun_value_8193_at_24570_halves_to_1024(monkeypatch):
+    """Live 400 body value=8193 at EMBED_MAX_CHARS==reserved (24570).
+
+    Ratio 8192/8193 drops ~3 chars/attempt; eight of those still 400.
+    Reserved snap is a no-op. Must HALVE and return 1024-dim from the
+    shorter prefix. Fails on a2a5aef (None after 8 tiny steps).
+    """
+    def handler(body, n):
+        if len(body["input"]) > 24570 // 2:
+            return _FakeResp(400, "value=8193")
+        return _FakeResp(200, embedding=VEC_1024)
+
+    original = "x" * 24570
+    result, posts = _run_embed(original, handler, monkeypatch)
+
+    assert result == VEC_1024
+    assert len(result) == 1024
+    assert 2 <= len(posts) <= 8
+    assert len(posts[0]["input"]) == 24570
+    assert len(posts[1]["input"]) == 24570 // 2
     assert len(original) == 24570
 
 

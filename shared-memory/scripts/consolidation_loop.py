@@ -2573,9 +2573,11 @@ class ConsolidationDaemon:
            advertised+slack) shrink the *vector prefix* only; the full
            summary stays stored. First snap is the imported reserved clamp
            when the body is still longer; then at most ~8 HTTP attempts
-           using advertised/requested ratio when known, else halve. Floor
-           without 200 returns None — never a 24570-step len-1 loop, never
-           1-char garbage.
+           using advertised/requested ratio when known, else halve. A
+           reserved snap that does not shorten, or a new_len still ≥ 90% of
+           current, halves instead (live value=8193 at 24570 is ~3 chars per
+           ratio step). Floor without 200 returns None — never a 24570-step
+           len-1 loop, never 1-char garbage.
         """
         if len(text) > EMBED_MAX_CHARS:
             logger.warning(
@@ -2620,14 +2622,21 @@ class ConsolidationDaemon:
                         advertised = classification.advertised
                         requested = classification.requested
                         if prev > reserved_snap:
+                            # Leftover EMBED_MAX_CHARS > reserved: one reserved
+                            # snap even when that drop is < 10%.
                             new_len = min(reserved_snap, prev - 1)
-                        elif (
-                            advertised is not None and requested is not None
-                            and advertised > 0 and requested > advertised
-                        ):
-                            new_len = min(prev - 1, prev * advertised // requested)
                         else:
-                            new_len = prev // 2
+                            if (
+                                advertised is not None and requested is not None
+                                and advertised > 0 and requested > advertised
+                            ):
+                                new_len = min(prev - 1, prev * advertised // requested)
+                            else:
+                                new_len = prev // 2
+                            # Reserved was a no-op (production 24570==24570) or
+                            # the ratio barely moved (8192/8193). Halve.
+                            if new_len * 10 >= prev * 9:
+                                new_len = prev // 2
                         if (
                             new_len < 2 or new_len >= prev
                             or attempt == max_overflow_attempts
