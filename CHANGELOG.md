@@ -5,6 +5,15 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.9.106] — 2026-09-16
+
+### Fixed
+- Thematic-fold embedding of a dense Zettelkasten that still overruns BGE-M3 at `EMBED_MAX_CHARS` (24570) no longer 400s and requeues forever. `get_embedding` classifies HTTP 400/413, then shortens the **vector prefix** (halve when the reserved snap is a no-op) while storing the full summary text. That was the workstation `fact_consolidation` stall on `shared-memory-GitHub/development`.
+- `preflight.sh` requires each encoder GGUF only when that encoder's replicas are nonzero (split-replica hosts such as glxvm with a local reranker only).
+
+### Changed
+- Postflight A9's wait loop is pinned to re-curl authenticated `/health` while the probe is still null, then treat a rerank-only timeout as warn+ok.
+
 ## [0.9.105] — 2026-09-16
 
 ### Fixed
