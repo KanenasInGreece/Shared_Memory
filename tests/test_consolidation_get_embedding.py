@@ -38,6 +38,12 @@ MISMATCH_BODY = (
     '{"message": "This model\'s maximum context length is 512 tokens. '
     'However, you requested 600 tokens in the messages."}'
 )
+# Dense Zettelkasten: requested ≫ advertised+slack → classify kind "other".
+DENSE_OTHER_BODY = (
+    '{"message": "This model\'s maximum context length is 8192 tokens. '
+    'However, you requested 9000 tokens in the messages, '
+    'please reduce the length of the messages."}'
+)
 VEC_1024 = [0.01] * 1024
 
 
@@ -145,8 +151,32 @@ def test_get_embedding_mismatch_does_not_truncate(monkeypatch, caplog):
     assert "none" in joined or "returning none" in joined or "will not" in joined
 
 
+def test_get_embedding_other_9000_vs_8192_shrinks_to_1024(monkeypatch):
+    """Live stall: 24570-char dense text, requested=9000 advertised=8192 (kind other).
+
+    Must shrink the vector prefix (ratio) and return 1024-dim. Caller text
+    stays full length. Fails on a7468a9: other → None on the first 400.
+    """
+    def handler(body, n):
+        if n == 1:
+            return _FakeResp(400, DENSE_OTHER_BODY)
+        return _FakeResp(200, embedding=VEC_1024)
+
+    original = "x" * 24570
+    result, posts = _run_embed(original, handler, monkeypatch)
+
+    assert result == VEC_1024
+    assert len(result) == 1024
+    assert 2 <= len(posts) <= 8
+    assert len(posts[0]["input"]) == 24570
+    expected = min(24570 - 1, 24570 * 8192 // 9000)
+    assert len(posts[1]["input"]) == expected
+    assert len(posts[1]["input"]) < 24570
+    assert len(original) == 24570
+
+
 def test_get_embedding_floor_without_200_returns_none_not_one_char(monkeypatch, caplog):
-    """Reserved clamp still 400 → None. No 1-char garbage, no per-char HTTP spam."""
+    """Always-400 → None. No 1-char garbage, no 24570-step len-1 HTTP spam."""
     caplog.set_level(logging.ERROR)
 
     def handler(body, n):
@@ -155,13 +185,13 @@ def test_get_embedding_floor_without_200_returns_none_not_one_char(monkeypatch, 
     result, posts = _run_embed("x" * 24576, handler, monkeypatch, embed_max_chars=24576)
 
     assert result is None
-    assert 1 <= len(posts) <= 4
+    assert 1 <= len(posts) <= 8
     posted = [len(p["input"]) for p in posts]
     assert min(posted) > 1
     assert 1 not in posted
-    # At least one snap to the reserved clamp, never a walk down to 1 char.
-    assert RESERVED_CLAMP in posted or posted[-1] <= RESERVED_CLAMP
-    assert min(posted) >= RESERVED_CLAMP - 16
+    # Geometric / reserved / ratio shrink, not one char per request.
+    if len(posted) >= 3:
+        assert posted[0] - posted[-1] >= len(posted) - 1 or posted[-1] <= posted[0] // 2
 
 
 def test_get_embedding_other_4xx_stays_none_no_snap(monkeypatch):

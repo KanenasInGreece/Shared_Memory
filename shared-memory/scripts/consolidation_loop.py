@@ -2567,11 +2567,15 @@ class ConsolidationDaemon:
         2. SIZE THE TIMEOUT ON THE INPUT. Embedding cost is superlinear in
            length, so the old constant 20 s covered barely half the context
            window and killed large summaries deterministically.
-        3. Slack-bounded overflow (decision:2569): HTTP 400 or 413 that
-           classify as overrun snaps to the imported reserved clamp (same
-           formula as coordinator._embed), not a per-char HTTP loop. Floor
-           without 200 returns None — never 1-char garbage. Mismatch does
-           not silent-prefix a short advertised window.
+        3. Overflow (decision:2569 remainder): HTTP 400 or 413. Mismatch
+           (advertised < required) returns None — do not silent-prefix a
+           short server. Overrun *and* other (dense text, requested ≫
+           advertised+slack) shrink the *vector prefix* only; the full
+           summary stays stored. First snap is the imported reserved clamp
+           when the body is still longer; then at most ~8 HTTP attempts
+           using advertised/requested ratio when known, else halve. Floor
+           without 200 returns None — never a 24570-step len-1 loop, never
+           1-char garbage.
         """
         if len(text) > EMBED_MAX_CHARS:
             logger.warning(
@@ -2586,10 +2590,11 @@ class ConsolidationDaemon:
             reserved_clamp_chars,
         )
         reserved_snap = reserved_clamp_chars()
+        max_overflow_attempts = 8
         ceiling = embed_ceiling(len(text))
         try:
             async with httpx.AsyncClient(timeout=ceiling, trust_env=False) as client:
-                for attempt in range(1, 3):
+                for attempt in range(1, max_overflow_attempts + 1):
                     ceiling = embed_ceiling(len(text))
                     resp = await client.post(
                         RETRIEVER_URL,
@@ -2611,34 +2616,40 @@ class ConsolidationDaemon:
                             return None
                         if classification.kind == "overrun":
                             record_embed_window_overrun()
-                            new_len = min(reserved_snap, len(text) - 1)
-                            if attempt == 2 or new_len < 1 or new_len >= len(text):
-                                logger.error(
-                                    "embed reserved clamp (%d chars) still overflowed "
-                                    "advertised %s-token window (requested %s) — "
-                                    "returning None rather than 1-char garbage "
-                                    "(reserved=%d, EMBED_MAX_CHARS=%d)",
-                                    len(text), classification.advertised,
-                                    classification.requested, reserved_snap,
-                                    EMBED_MAX_CHARS,
-                                )
-                                return None
+                        prev = len(text)
+                        advertised = classification.advertised
+                        requested = classification.requested
+                        if prev > reserved_snap:
+                            new_len = min(reserved_snap, prev - 1)
+                        elif (
+                            advertised is not None and requested is not None
+                            and advertised > 0 and requested > advertised
+                        ):
+                            new_len = min(prev - 1, prev * advertised // requested)
+                        else:
+                            new_len = prev // 2
+                        if (
+                            new_len < 2 or new_len >= prev
+                            or attempt == max_overflow_attempts
+                        ):
                             logger.error(
-                                "embed input %d chars caused %d-token overflow on "
-                                "%d-token model — snapping to reserved clamp "
-                                "(reserved=%d, EMBED_MAX_CHARS=%d)",
-                                len(text), classification.requested,
-                                classification.advertised, reserved_snap,
-                                EMBED_MAX_CHARS,
+                                "embed overflow floor (%d chars, kind=%s, advertised=%s, "
+                                "requested=%s) after %d attempt(s) — returning None rather "
+                                "than 1-char garbage (reserved=%d, EMBED_MAX_CHARS=%d)",
+                                prev, classification.kind, advertised, requested,
+                                attempt, reserved_snap, EMBED_MAX_CHARS,
                             )
-                            text = text[:new_len]
-                            continue
+                            return None
                         logger.error(
-                            "Embedding error after %.0fs ceiling on %d chars: "
-                            "HTTP %s overflow unclassified — returning None",
-                            ceiling, len(text), resp.status_code,
+                            "embed input %d chars HTTP %s kind=%s (requested=%s on "
+                            "%s-token window) — shrinking vector prefix to %d chars "
+                            "(full text still stored; reserved=%d, EMBED_MAX_CHARS=%d)",
+                            prev, resp.status_code, classification.kind,
+                            requested, advertised, new_len, reserved_snap,
+                            EMBED_MAX_CHARS,
                         )
-                        return None
+                        text = text[:new_len]
+                        continue
                     resp.raise_for_status()
                     return resp.json()["data"][0]["embedding"]
         except Exception as e:
