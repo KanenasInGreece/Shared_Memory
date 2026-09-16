@@ -378,6 +378,11 @@ def classify_overflow(
                 advertised, requested = int(m.group(1)), int(m.group(2))
             break
 
+    # "you requested 0 output tokens" is not a window request (live vLLM
+    # sentence, fact:2581). Drop it so value=N / input-token patterns win.
+    if requested == 0:
+        requested = None
+
     # Check for bare value=8193 when advertised wasn't explicitly captured
     if requested is None:
         m_val = re.search(r"value\s*[:=]\s*(\d+)", text, re.IGNORECASE)
@@ -385,7 +390,8 @@ def classify_overflow(
             val = int(m_val.group(1))
             if val >= required_tokens:
                 requested = val
-                advertised = required_tokens
+                if advertised is None:
+                    advertised = required_tokens
 
     if advertised is None or requested is None:
         return OverflowResult("other", None, None)
@@ -398,6 +404,45 @@ def classify_overflow(
 
     # Larger than slack with advertised >= required
     return OverflowResult("other", advertised, requested)
+
+
+_OVERFLOW_KINDS = frozenset({"overrun", "mismatch", "other"})
+
+
+def _coerce_overflow_int(value: Any) -> int | None:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def overflow_fields(classification: OverflowResult) -> dict:
+    """S8 encoder overflow object: enum + ints/null, never provider text."""
+    kind = classification.kind if classification.kind in _OVERFLOW_KINDS else "other"
+    return {
+        "kind": kind,
+        "advertised": _coerce_overflow_int(classification.advertised),
+        "requested": _coerce_overflow_int(classification.requested),
+    }
+
+
+def overflow_from_response_json(obj: Any) -> OverflowResult | None:
+    """Parse gateway overflow fields. None if missing or malformed (not a crash)."""
+    if not isinstance(obj, dict):
+        return None
+    ov = obj.get("overflow")
+    if not isinstance(ov, dict):
+        return None
+    kind = ov.get("kind")
+    if kind not in _OVERFLOW_KINDS:
+        return None
+    return OverflowResult(
+        kind,
+        _coerce_overflow_int(ov.get("advertised")),
+        _coerce_overflow_int(ov.get("requested")),
+    )
 
 
 def clamp_encoder_payload(raw_body: bytes) -> bytes:
