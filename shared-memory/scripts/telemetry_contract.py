@@ -69,6 +69,7 @@ __all__ = [
     "INTRODUCED_0_9_81",
     "INTRODUCED_0_9_88",
     "INTRODUCED_0_9_97",
+    "INTRODUCED_0_9_104",
     "DUAL_EMIT_DROP_TARGET",
     "WARNING_KEYS",
     "CATEGORIES",
@@ -205,6 +206,8 @@ INTRODUCED_0_9_88 = "0.9.88"
 #: probed, before the daemon's first cycle lands — on top of the existing
 #: ok/timeout/down/http_* set.
 INTRODUCED_0_9_97 = "0.9.97"
+#: The 0.9.104 stamp: decision:2540 encoder window contract.
+INTRODUCED_0_9_104 = "0.9.104"
 #: The FROZEN stamp of the first drop: the release from which the dual-emitted
 #: copies moved off `/health` at v0.9.74 stop being SERVED. Every row carrying
 #: it keeps its `moved_to`, so the document still renders the old→new map after
@@ -355,6 +358,12 @@ HEALTH: dict[str, dict] = {
     "backend_capability.*.projection_stale": _k("bool", "encoders"),
     "backend_capability.*.last_ok_at": _k("str|null", "encoders"),
     "backend_capability.*.projection_age_s": _k("float|null", "encoders", unit="_s"),
+    "encoder_window.required_tokens": _k("int", "encoders", since=INTRODUCED_0_9_104),
+    "encoder_window.special_token_reserve": _k("int", "encoders", since=INTRODUCED_0_9_104),
+    "encoder_window.embed_max_chars": _k("int", "encoders", since=INTRODUCED_0_9_104),
+    "encoder_window.*.advertised_tokens": _k("int|null", "encoders", since=INTRODUCED_0_9_104),
+    "encoder_window.*.source": _k("str|null", "encoders", since=INTRODUCED_0_9_104),
+    "encoder_window.*.full_payload_ok": _k("bool|null", "encoders", since=INTRODUCED_0_9_104),
 
     # ── capacity: FIVE keys a client reads stay; the rest move ─────────────
     "capacity.timestamp": _k("str", "capacity"),
@@ -768,6 +777,11 @@ TELEMETRY: dict[str, dict] = {
         "encoder_{embedder,reranker}_projected_ms; null means it is derived "
         "per-encoder from backend_capability.*.ceiling_s rather than pinned by "
         "env (QA fix round, finding 3: this note previously named the p95s).")),
+    "encoders.embed_window_overruns_total": _k("int", "encoders", unit="_total",
+                                               since=INTRODUCED_0_9_104,
+                                               note="slack-bounded retries only"),
+    "encoders.embed_window_overruns_last_ts": _k("str|null", "encoders",
+                                                 since=INTRODUCED_0_9_104),
 
     # ── gateway (NEW, 0.9.74) ───────────────────────────────────────────────
     "gateway.requests_total": _k("int", "gateway", unit="_total", since=INTRODUCED_0_9_74),

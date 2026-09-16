@@ -11463,10 +11463,14 @@ class MemoryCoordinator:
         probe — a PROJECTION from one synthetic payload, not an observation of
         what real callers experienced. These are the real calls.
         """
+        from encoder_window import get_embed_window_overruns
+        overruns_total, overruns_last_ts = get_embed_window_overruns()
         return {
             "embed": self._embed_ring.snapshot(),
             "rerank": self._rerank_ring.snapshot(),
             "limit_ms": ENCODER_LATENCY_WARN_MS,
+            "embed_window_overruns_total": overruns_total,
+            "embed_window_overruns_last_ts": overruns_last_ts,
         }
 
     @staticmethod

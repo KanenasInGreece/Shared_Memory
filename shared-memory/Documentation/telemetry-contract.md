@@ -277,6 +277,12 @@ Paths are relative to the response object.
 | `backend_capability.probed_at` | str/null | — | <=0.9.73 | — | — | — | — |
 | `backend_capability.status` | str/null | — | <=0.9.73 | — | — | — | — |
 | `embedder` | str | — | <=0.9.73 | — | — | — | ok \| timeout \| down \| http_<code> |
+| `encoder_window.*.advertised_tokens` | int/null | — | 0.9.104 | — | — | — | — |
+| `encoder_window.*.full_payload_ok` | bool/null | — | 0.9.104 | — | — | — | — |
+| `encoder_window.*.source` | str/null | — | 0.9.104 | — | — | — | — |
+| `encoder_window.embed_max_chars` | int | — | 0.9.104 | — | — | — | — |
+| `encoder_window.required_tokens` | int | — | 0.9.104 | — | — | — | — |
+| `encoder_window.special_token_reserve` | int | — | 0.9.104 | — | — | — | — |
 | `reranker` | str | — | <=0.9.73 | — | — | — | ok \| timeout \| down \| http_<code> |
 
 ### llm
@@ -398,6 +404,8 @@ The envelope is `{"status": "success", "telemetry": {…}}`; paths below are rel
 | `encoders.embed.p50_ms` | float/null | _ms | 0.9.74 | — | — | — | — |
 | `encoders.embed.p95_ms` | float/null | _ms | 0.9.74 | — | — | — | NOT the field `encoder_embedder_projected_ms` observes — that warning compares backend_capability.embedder.projected_full_payload_s against encoders.limit_ms, never this p95 ring. No `log=` here: the wildcarded backend_capability.*.projected_full_payload_s entry cannot carry a single per-encoder log string, so there is no field this p95 can correctly point at (QA fix round, finding 3). |
 | `encoders.embed.window` | int | — | 0.9.74 | — | — | — | observations the percentiles were computed over — NOT the ring's capacity. p95 over 3 calls is not a p95. |
+| `encoders.embed_window_overruns_last_ts` | str/null | — | 0.9.104 | — | — | — | — |
+| `encoders.embed_window_overruns_total` | int | _total | 0.9.104 | — | — | — | slack-bounded retries only |
 | `encoders.limit_ms` | float/null | _ms | 0.9.74 | — | — | — | ENCODER_LATENCY_WARN_MS — the limit backend_capability.*.projected_full_payload_s (NOT the p95s above) is compared against, per encoder, to raise encoder_{embedder,reranker}_projected_ms; null means it is derived per-encoder from backend_capability.*.ceiling_s rather than pinned by env (QA fix round, finding 3: this note previously named the p95s). |
 | `encoders.rerank.calls` | int | — | 0.9.74 | — | — | — | — |
 | `encoders.rerank.errors` | int | — | 0.9.74 | — | — | — | — |
