@@ -5,6 +5,16 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.9.104] — 2026-09-16
+
+### Fixed
+- The embed clamp now reserves two special tokens (`EMBED_MAX_CHARS` defaults to 24570, not 24576). A leftover `EMBED_MAX_CHARS=24576` that overruns BGE-M3's 8192-token window snaps to the reserved length and then raises a named error instead of retrying the same 8193-token body four times (or returning `None`).
+- Public vLLM runbooks require `--max-model-len` equal to `EMBED_MAX_CONTEXT_TOKENS` (8192). The bundled compose encoder commands stay pinned at `-c 8192 -b 8192 -ub 8192`.
+
+### Changed
+- Postflight assertion A9 gates the encoder window from authenticated `/health` (`encoder_window`). Exit condition is `A1–A5, A8 and A9`. Wait uses embed plus one-max-doc rerank ceilings. A short advertised reranker still fails; a green embed with an unadvertised reranker after that wait is warn/skip-null, not a fail.
+- Authenticated `/health` carries top-level `encoder_window`. `config.embed_max_chars` is the process clamp, not the old `"24000"` default. A short advertised window degrades the encoder dependency (`window_short`); it does not 503.
+
 ## [0.9.103] — 2026-09-16
 
 ### Fixed
