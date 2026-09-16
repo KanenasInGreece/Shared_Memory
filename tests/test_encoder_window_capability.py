@@ -45,6 +45,34 @@ def test_encoder_dependency_window_overrun_degraded():
     assert dep["reason"] == "window_overrun"
 
 
+def test_encoder_dependency_reranker_full_payload_false_is_not_window_overrun():
+    window = {"advertised_tokens": 8192, "source": "v1_models", "full_payload_ok": False}
+    dep = g._encoder_dependency("ok", {"status": "ok"}, window, kind="reranker")
+    assert dep["state"] == "ok"
+    assert dep.get("reason") is None
+
+
+def test_encoder_dependency_reranker_too_slow_still_degrades():
+    window = {"advertised_tokens": 8192, "source": "v1_models", "full_payload_ok": False}
+    dep = g._encoder_dependency("ok", {"status": "too_slow"}, window, kind="reranker")
+    assert dep["state"] == "degraded"
+    assert dep["reason"] == "capability:too_slow"
+
+
+def test_encoder_dependency_reranker_window_short_still_degrades():
+    window = {"advertised_tokens": 512, "source": "v1_models", "full_payload_ok": False}
+    dep = g._encoder_dependency("ok", {"status": "ok"}, window, kind="reranker")
+    assert dep["state"] == "degraded"
+    assert dep["reason"] == "window_short:512<8192"
+
+
+def test_encoder_dependency_reranker_advertised_null_not_window_overrun():
+    window = {"advertised_tokens": None, "source": None, "full_payload_ok": False}
+    dep = g._encoder_dependency("ok", {"status": "ok"}, window, kind="reranker")
+    assert dep["state"] == "ok"
+    assert dep.get("reason") is None
+
+
 def test_encoder_dependency_unreachable_stays_down():
     window = {"advertised_tokens": 512, "source": "v1_models", "full_payload_ok": False}
     dep = g._encoder_dependency("down", {"status": "failing"}, window)
