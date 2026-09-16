@@ -1,0 +1,179 @@
+"""Tests for encoder_window.py — window contract, overflow classification, and proxy clamping."""
+import json
+import os
+import sys
+import pytest
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "shared-memory", "scripts"))
+
+import dream_telemetry
+import encoder_window
+
+
+def test_classify_overflow_vllm_8193_overrun():
+    body = {
+        "message": (
+            "This model's maximum context length is 8192 tokens. "
+            "However, you requested 8193 tokens in the messages, "
+            "please reduce the length of the messages."
+        ),
+        "type": "invalid_request_error",
+        "param": "messages",
+        "code": 400,
+    }
+    res = encoder_window.classify_overflow(400, body, required_tokens=8192)
+    assert res.kind == "overrun"
+    assert res.advertised == 8192
+    assert res.requested == 8193
+    # Tuple unpacking support
+    kind, (adv, req) = res
+    assert kind == "overrun" and adv == 8192 and req == 8193
+
+
+def test_classify_overflow_value_8193_body():
+    body = '{"error": {"message": "Invalid request: value=8193 exceeds max_model_len 8192"}}'
+    res = encoder_window.classify_overflow(400, body, required_tokens=8192)
+    assert res.kind == "overrun"
+    assert res.advertised == 8192
+    assert res.requested == 8193
+
+
+def test_classify_overflow_value_8193_bare():
+    body = 'value=8193'
+    res = encoder_window.classify_overflow(400, body, required_tokens=8192)
+    assert res.kind == "overrun"
+    assert res.requested == 8193
+
+
+def test_classify_overflow_mismatch_short_window():
+    body = {
+        "message": (
+            "This model's maximum context length is 512 tokens. "
+            "However, you requested 600 tokens in the messages."
+        )
+    }
+    res = encoder_window.classify_overflow(400, body, required_tokens=8192)
+    assert res.kind == "mismatch"
+    assert res.advertised == 512
+    assert res.requested == 600
+
+
+def test_classify_overflow_larger_than_slack():
+    # Gap > OVERFLOW_TOKEN_SLACK (16) with advertised >= required
+    body = {
+        "message": (
+            "This model's maximum context length is 8192 tokens. "
+            "However, you requested 8250 tokens in the messages."
+        )
+    }
+    res = encoder_window.classify_overflow(400, body, required_tokens=8192)
+    assert res.kind == "other"
+    assert res.advertised == 8192
+    assert res.requested == 8250
+
+
+def test_classify_overflow_unparseable_400():
+    res = encoder_window.classify_overflow(400, "Bad request: invalid JSON format", required_tokens=8192)
+    assert res.kind == "other"
+    assert res.advertised is None
+    assert res.requested is None
+
+
+def test_classify_overflow_non_400():
+    res = encoder_window.classify_overflow(500, "Internal server error", required_tokens=8192)
+    assert res.kind == "other"
+
+
+def test_clamp_encoder_payload_string():
+    raw = json.dumps({"input": "x" * 50000, "model": "bge-m3"}).encode("utf-8")
+    clamped_bytes = encoder_window.clamp_encoder_payload(raw)
+    data = json.loads(clamped_bytes)
+    assert len(data["input"]) == dream_telemetry.EMBED_MAX_CHARS
+    assert data["model"] == "bge-m3"
+
+
+def test_clamp_encoder_payload_list_of_strings():
+    raw = json.dumps({
+        "input": ["a" * 50000, "b" * 30000, "c" * 10],
+        "model": "bge-m3"
+    }).encode("utf-8")
+    clamped_bytes = encoder_window.clamp_encoder_payload(raw)
+    data = json.loads(clamped_bytes)
+    assert len(data["input"]) == 3
+    assert len(data["input"][0]) == dream_telemetry.EMBED_MAX_CHARS
+    assert len(data["input"][1]) == dream_telemetry.EMBED_MAX_CHARS
+    assert data["input"][2] == "c" * 10
+
+
+def test_clamp_encoder_payload_token_ids_untouched():
+    raw = json.dumps({"input": [101, 2054, 102], "model": "bge-m3"}).encode("utf-8")
+    clamped_bytes = encoder_window.clamp_encoder_payload(raw)
+    data = json.loads(clamped_bytes)
+    assert data["input"] == [101, 2054, 102]
+
+
+def test_handle_encoder_clamps_array_per_element():
+    import asyncio
+    from yarl import URL
+    import hive_mind_proxy as g
+
+    sent_data = None
+
+    from unittest.mock import AsyncMock
+
+    class _OneShotAsyncIter:
+        def __init__(self, body: bytes):
+            self._body = body
+
+        def iter_any(self):
+            return self._agen()
+
+        async def _agen(self):
+            if self._body:
+                yield self._body
+
+        async def read(self, n=-1):
+            return self._body
+
+    class _FakeUpstream:
+        status = 200
+        headers = {}
+
+        def __init__(self):
+            self.content = _OneShotAsyncIter(b'{"data": [{"embedding": [0.1]}]}')
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            pass
+
+    class _CaptureSession:
+        def request(self, method, url, headers=None, data=None, allow_redirects=False):
+            nonlocal sent_data
+            sent_data = data
+            return _FakeUpstream()
+
+    class _EmbedReq:
+        method = "POST"
+        path = "/v1/embeddings"
+        rel_url = URL("/v1/embeddings", encoded=True)
+        headers = {}
+        can_read_body = True
+        content_length = None
+
+        def __init__(self):
+            self._payload_writer = AsyncMock()
+
+        async def read(self):
+            return json.dumps({"input": ["x" * 50000], "model": "bge-m3"}).encode("utf-8")
+
+    proxy = g.AsyncHiveMindProxy()
+    proxy.session = _CaptureSession()
+    resp = asyncio.run(proxy.handle_encoder(_EmbedReq()))
+    assert resp.status == 200
+    assert sent_data is not None
+    forwarded = json.loads(sent_data)
+    # The array must have 1 element, clamped to EMBED_MAX_CHARS (never array slicing)
+    assert len(forwarded["input"]) == 1
+    assert len(forwarded["input"][0]) == dream_telemetry.EMBED_MAX_CHARS

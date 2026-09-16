@@ -2553,7 +2553,8 @@ EMBED_BACKOFF = 0.5      # seconds × attempt number  (0.5 s, 1 s, 1.5 s, 2 s)
 # one context limit, so they get one derivation. (dream_telemetry imports only
 # stdlib + log_hygiene, which this module already depends on, so this does not
 # pull psycopg2 into the gateway venv.)
-from dream_telemetry import (EMBED_MAX_CHARS, EMBED_TIMEOUT_FLOOR_S,  # noqa: E402
+from dream_telemetry import (EMBED_CHARS_PER_TOKEN, EMBED_MAX_CHARS,  # noqa: E402
+                             EMBED_MAX_CONTEXT_TOKENS, EMBED_TIMEOUT_FLOOR_S,
                              RERANK_MAX_DOC_CHARS, clamp_rerank_doc,
                              embed_ceiling, rerank_ceiling)
 
@@ -3452,6 +3453,8 @@ class MemoryCoordinator:
         self._neo4j_ring = LatencyRing(NEO4J_LATENCY_WINDOW)
         self._cypher_rejected_total = 0
         self._neo4j_tx_failures_total = 0
+        self._embed_window_overruns_total = 0
+        self._embed_window_overruns_last_ts: str | None = None
         # ⛔ NO OUTBOX RING HERE, DELIBERATELY. Apply latency and drain rate are
         # DERIVABLE — `neo4j_outbox` already stores `created_at` and
         # `applied_at`, and `_apply_outbox_row` already stamps the second one.
@@ -3800,6 +3803,46 @@ class MemoryCoordinator:
             try:
                 r = await client.post(EMBED_URL, json={"input": text, "model": "bge-m3"},
                                       timeout=ceiling)
+                if getattr(r, "status_code", None) == 400:
+                    from encoder_window import (
+                        classify_overflow,
+                        record_embed_window_overrun,
+                        OVERFLOW_TOKEN_SLACK,
+                    )
+                    resp_text = getattr(r, "text", "")
+                    classification = classify_overflow(400, resp_text, EMBED_MAX_CONTEXT_TOKENS)
+                    if classification.kind == "mismatch":
+                        raise RuntimeError(
+                            f"Embedding context mismatch: server advertised {classification.advertised} tokens, "
+                            f"but framework requires EMBED_MAX_CONTEXT_TOKENS={EMBED_MAX_CONTEXT_TOKENS}. "
+                            f"Start the encoder with --max-model-len {EMBED_MAX_CONTEXT_TOKENS} or "
+                            f"-c {EMBED_MAX_CONTEXT_TOKENS} (or unset/lower oversize EMBED_MAX_CHARS)."
+                        )
+                    elif classification.kind == "overrun":
+                        record_embed_window_overrun()
+                        safe(lambda: setattr(self, "_embed_window_overruns_total", getattr(self, "_embed_window_overruns_total", 0) + 1))
+                        safe(lambda: setattr(self, "_embed_window_overruns_last_ts", time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())))
+                        log.error(
+                            "embed input %d chars caused %d-token overflow on %d-token model — "
+                            "snapping to reserved clamp (EMBED_MAX_CHARS=%d)",
+                            len(text), classification.requested, classification.advertised, EMBED_MAX_CHARS,
+                        )
+                        new_len = min(EMBED_MAX_CHARS, len(text) - 1)
+                        if new_len >= 1:
+                            text = text[:new_len]
+                            ceiling = embed_ceiling(len(text))
+                            continue
+                    elif (
+                        classification.advertised is not None
+                        and classification.requested is not None
+                        and classification.advertised >= EMBED_MAX_CONTEXT_TOKENS
+                    ):
+                        raise RuntimeError(
+                            f"Embedding input requested {classification.requested} tokens on "
+                            f"{classification.advertised}-token window (exceeds slack {OVERFLOW_TOKEN_SLACK}). "
+                            f"Lower EMBED_CHARS_PER_TOKEN (currently {EMBED_CHARS_PER_TOKEN}) or "
+                            f"EMBED_MAX_CHARS (currently {EMBED_MAX_CHARS}) in .env."
+                        )
                 r.raise_for_status()
                 vec = r.json()["data"][0]["embedding"]
                 # `safe` (not a bare call) because the recorder must tolerate a
@@ -3810,6 +3853,11 @@ class MemoryCoordinator:
                     (time.monotonic() - _t0) * 1000.0, payload_chars=len(text)))
                 return vec
             except Exception as exc:
+                if isinstance(exc, RuntimeError) and (
+                    "Embedding context mismatch:" in str(exc)
+                    or "exceeds slack" in str(exc)
+                ):
+                    raise
                 safe(lambda: self._embed_ring.record_error())
                 if attempt == EMBED_RETRIES:
                     # The encoder URL is operator-supplied and may carry
@@ -3854,6 +3902,45 @@ class MemoryCoordinator:
                     EMBED_URL, json={"input": clamped, "model": "bge-m3"},
                     timeout=ceiling,
                 )
+                if getattr(r, "status_code", None) == 400:
+                    from encoder_window import (
+                        classify_overflow,
+                        record_embed_window_overrun,
+                        OVERFLOW_TOKEN_SLACK,
+                    )
+                    resp_text = getattr(r, "text", "")
+                    classification = classify_overflow(400, resp_text, EMBED_MAX_CONTEXT_TOKENS)
+                    if classification.kind == "mismatch":
+                        raise RuntimeError(
+                            f"Embedding context mismatch: server advertised {classification.advertised} tokens, "
+                            f"but framework requires EMBED_MAX_CONTEXT_TOKENS={EMBED_MAX_CONTEXT_TOKENS}. "
+                            f"Start the encoder with --max-model-len {EMBED_MAX_CONTEXT_TOKENS} or "
+                            f"-c {EMBED_MAX_CONTEXT_TOKENS} (or unset/lower oversize EMBED_MAX_CHARS)."
+                        )
+                    elif classification.kind == "overrun":
+                        record_embed_window_overrun()
+                        safe(lambda: setattr(self, "_embed_window_overruns_total", getattr(self, "_embed_window_overruns_total", 0) + 1))
+                        safe(lambda: setattr(self, "_embed_window_overruns_last_ts", time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())))
+                        log.error(
+                            "batch embed caused %d-token overflow on %d-token model — "
+                            "snapping items to reserved clamp (EMBED_MAX_CHARS=%d)",
+                            classification.requested, classification.advertised, EMBED_MAX_CHARS,
+                        )
+                        clamped = [t[:min(EMBED_MAX_CHARS, len(t) - 1)] for t in clamped]
+                        total_chars = sum(len(t) for t in clamped)
+                        ceiling = embed_ceiling(total_chars)
+                        continue
+                    elif (
+                        classification.advertised is not None
+                        and classification.requested is not None
+                        and classification.advertised >= EMBED_MAX_CONTEXT_TOKENS
+                    ):
+                        raise RuntimeError(
+                            f"Batch embedding requested {classification.requested} tokens on "
+                            f"{classification.advertised}-token window (exceeds slack {OVERFLOW_TOKEN_SLACK}). "
+                            f"Lower EMBED_CHARS_PER_TOKEN (currently {EMBED_CHARS_PER_TOKEN}) or "
+                            f"EMBED_MAX_CHARS (currently {EMBED_MAX_CHARS}) in .env."
+                        )
                 r.raise_for_status()
                 data = r.json()["data"]
                 if len(data) != len(clamped):
@@ -3868,6 +3955,11 @@ class MemoryCoordinator:
                     (time.monotonic() - _t0) * 1000.0, payload_chars=total_chars))
                 return [d["embedding"] for d in ordered]
             except Exception as exc:
+                if isinstance(exc, RuntimeError) and (
+                    "Embedding context mismatch:" in str(exc)
+                    or "exceeds slack" in str(exc)
+                ):
+                    raise
                 safe(lambda: self._embed_ring.record_error())
                 if attempt == EMBED_RETRIES:
                     raise RuntimeError(

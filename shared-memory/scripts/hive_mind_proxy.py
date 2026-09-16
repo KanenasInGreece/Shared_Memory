@@ -2356,9 +2356,18 @@ class AsyncHiveMindProxy:
         # resolution.py against aiohttp's own source), which is the same
         # string ROUTING_MAP is keyed by.
         target_base = ROUTING_MAP[request.rel_url.path_safe]
+        llm_body: bytes | None = None
+        if request.can_read_body:
+            content_length = request.content_length
+            if content_length is None or content_length <= EMBED_RERANK_BUFFER_CAP:
+                raw_body = await request.read()
+                if raw_body:
+                    from encoder_window import clamp_encoder_payload
+                    llm_body = clamp_encoder_payload(raw_body)
         return await self._forward_upstream(
             request,
             target_base=target_base,
+            llm_body=llm_body,
             steer_headers=request.headers,
         )
 
