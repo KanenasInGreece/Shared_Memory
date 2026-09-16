@@ -158,7 +158,7 @@ def _short(value: Any, cap: int = 200) -> str:
 # ships with the skill) and this coordinator. Bump it ONLY when the request or
 # response shape, auth scheme, or routes change in a way that breaks older clients.
 # Client and server build-versions are allowed to drift; their API_VERSION must agree.
-FRAMEWORK_VERSION = "0.9.104"
+FRAMEWORK_VERSION = "0.9.105"
 # v2 (retro-as-record): /memory/retrospective now creates a full record (own
 # pg_id, embedding, Retrospective node) and accepts rating enum + grounding —
 # the response shape changed (returns the retro's own pg_id).
@@ -2556,7 +2556,8 @@ EMBED_BACKOFF = 0.5      # seconds × attempt number  (0.5 s, 1 s, 1.5 s, 2 s)
 from dream_telemetry import (EMBED_CHARS_PER_TOKEN, EMBED_MAX_CHARS,  # noqa: E402
                              EMBED_MAX_CONTEXT_TOKENS, EMBED_SPECIAL_TOKEN_RESERVE,
                              EMBED_TIMEOUT_FLOOR_S, RERANK_MAX_DOC_CHARS,
-                             clamp_rerank_doc, embed_ceiling, rerank_ceiling)
+                             clamp_rerank_doc, prefix_rerank_doc, prefix_rerank_query,
+                             embed_ceiling, rerank_ceiling)
 
 
 # Read-contract graph expansion cap: how many edges surface per anchored record
@@ -9046,9 +9047,9 @@ class MemoryCoordinator:
             # bounded, the same relationship EMBED_MAX_CHARS has with
             # embed_ceiling.
             rerank_docs = [
-                clamp_rerank_doc(r["content"] or "") for r in t3_rows
+                prefix_rerank_doc(query, r["content"] or "") for r in t3_rows
             ] + [
-                clamp_rerank_doc(_rerank_doc_text(c, m, t))
+                prefix_rerank_doc(query, _rerank_doc_text(c, m, t))
                 for c, m, t in zip(contents, metas, createds)
             ]
             # Payload-size instrument (fact:1441). fact:1441's cross-host
@@ -9064,9 +9065,9 @@ class MemoryCoordinator:
             # derived per search.
             #
             # Measured HERE, after `rerank_docs` is fully built — every entry
-            # has already been through `clamp_rerank_doc` above — because a
+            # has already been through `prefix_rerank_doc` above — because a
             # PRE-clamp count would reintroduce the very ambiguity this exists
-            # to remove (a document longer than RERANK_MAX_DOC_CHARS is
+            # to remove (a document longer than the pair budget after query is
             # truncated before the reranker ever sees the rest of it, so only
             # the truncated length was actually "sent"). Pure arithmetic over
             # a list already in hand: no extra query, no extra I/O, and
@@ -9109,7 +9110,7 @@ class MemoryCoordinator:
                     # failure path. Both are sent because other reranking servers
                     # spell it differently — but neither is TRUSTED: the slice
                     # below is what actually enforces the contract.
-                    json={"query": query, "documents": rerank_docs,
+                    json={"query": prefix_rerank_query(query), "documents": rerank_docs,
                           "top_n": limit, "top_k": limit},
                     # Derived from the payload, never constant — a constant
                     # under-provisions exactly the large sets that need it most.

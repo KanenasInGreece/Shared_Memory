@@ -2368,8 +2368,41 @@ class AsyncHiveMindProxy:
                         headers={"X-SM-Fault-Origin": "gateway"},
                     )
                 if raw_body:
-                    from encoder_window import clamp_encoder_payload
-                    llm_body = clamp_encoder_payload(raw_body)
+                    if request.rel_url.path_safe == "/v1/reranking":
+                        try:
+                            data = json.loads(raw_body)
+                        except (json.JSONDecodeError, UnicodeDecodeError):
+                            data = None
+                        if isinstance(data, dict):
+                            from dream_telemetry import prefix_rerank_doc, prefix_rerank_query
+                            modified = False
+                            q = data.get("query")
+                            pref_q = prefix_rerank_query(q)
+                            data["query"] = pref_q
+                            if pref_q != q:
+                                modified = True
+                            docs = data.get("documents")
+                            if isinstance(docs, list):
+                                new_docs = []
+                                for d in docs:
+                                    if isinstance(d, str):
+                                        pref_d = prefix_rerank_doc(data.get("query"), d)
+                                        if pref_d != d:
+                                            modified = True
+                                        new_docs.append(pref_d)
+                                    else:
+                                        new_docs.append(d)
+                                if modified:
+                                    data["documents"] = new_docs
+                            if modified:
+                                llm_body = json.dumps(data).encode("utf-8")
+                            else:
+                                llm_body = raw_body
+                        else:
+                            llm_body = raw_body
+                    else:
+                        from encoder_window import clamp_encoder_payload
+                        llm_body = clamp_encoder_payload(raw_body)
         return await self._forward_upstream(
             request,
             target_base=target_base,
@@ -4846,7 +4879,8 @@ def _dep(state: str, reason: str | None = None) -> dict:
     return {"state": state, "reason": reason}
 
 
-def _encoder_dependency(probe: str, capability: object, window: dict | None = None) -> dict:
+def _encoder_dependency(probe: str, capability: object, window: dict | None = None,
+                        kind: str = "embedder") -> dict:
     """One encoder's dependency enum.
 
     ⛔ LIVENESS IS NOT CAPABILITY, and this is where that finally reaches
@@ -4860,6 +4894,8 @@ def _encoder_dependency(probe: str, capability: object, window: dict | None = No
     decision:2540: window contract checks. Advertised context < required tokens
     degrades with `window_short:N<required`; embed full_payload_ok: False degrades
     with `window_overrun`. Unreachable encoder stays DOWN.
+    decision:2557: kind="reranker" with full_payload_ok False does not degrade with
+    window_overrun (reranker ranks prefix of pair); it falls through to capability.
     """
     if probe != "ok":
         return _dep(_STATE_DOWN, f"probe:{probe}")
@@ -4869,7 +4905,7 @@ def _encoder_dependency(probe: str, capability: object, window: dict | None = No
         required = EMBED_MAX_CONTEXT_TOKENS
         if isinstance(adv, int) and adv < required:
             return _dep(_STATE_DEGRADED, f"window_short:{adv}<{required}")
-        if window.get("full_payload_ok") is False:
+        if kind != "reranker" and window.get("full_payload_ok") is False:
             return _dep(_STATE_DEGRADED, "window_overrun")
     if isinstance(capability, dict):
         status = capability.get("status")
@@ -5775,10 +5811,12 @@ async def _build_health_checks(proxy: "AsyncHiveMindProxy", coordinator) -> dict
         "neo4j": dep_snap.get("neo4j") or _dep(_STATE_UNKNOWN, "not yet probed"),
         "embedder": _encoder_dependency(checks["embedder"],
                                         capability.get("embedder"),
-                                        checks.get("encoder_window", {}).get("embedder")),
+                                        checks.get("encoder_window", {}).get("embedder"),
+                                        kind="embedder"),
         "reranker": _encoder_dependency(checks["reranker"],
                                         capability.get("reranker"),
-                                        checks.get("encoder_window", {}).get("reranker")),
+                                        checks.get("encoder_window", {}).get("reranker"),
+                                        kind="reranker"),
         "llm_pool": _llm_pool_dependency(backend_status),
         "rem_daemon": _rem_dependency(
             _rem_healthy,

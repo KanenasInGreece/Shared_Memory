@@ -180,6 +180,27 @@ RERANK_SAFETY_FACTOR = float(os.environ.get("RERANK_SAFETY_FACTOR", "1.5"))
 # request, because the reranker serialises across its slots.
 RERANK_TIMEOUT_FLOOR_S = float(os.environ.get("RERANK_TIMEOUT_FLOOR_S", "10"))
 
+special_reserve_chars = int(EMBED_SPECIAL_TOKEN_RESERVE * EMBED_CHARS_PER_TOKEN)
+pair_budget = max(0, RERANK_MAX_DOC_CHARS - special_reserve_chars)
+
+
+def as_text(v) -> str:
+    """Safely return v if it is a string, else empty string. Never raises."""
+    return v if isinstance(v, str) else ""
+
+
+def prefix_rerank_query(query) -> str:
+    """Rank the leading slice of query within the pair budget."""
+    budget = max(0, RERANK_MAX_DOC_CHARS - special_reserve_chars)
+    return as_text(query)[:budget]
+
+
+def prefix_rerank_doc(query, doc) -> str:
+    """Rank the leading slice of doc that fits in the pair budget after query."""
+    budget = max(0, RERANK_MAX_DOC_CHARS - special_reserve_chars)
+    q = prefix_rerank_query(query)
+    return as_text(doc)[: max(0, budget - len(q))]
+
 
 def clamp_rerank_doc(text: str) -> str:
     """The slice of one record the reranker SCORES. Bounding this is what makes

@@ -68,6 +68,7 @@ def load_coordinator():
 coordinator_mod = load_coordinator()
 MemoryCoordinator = coordinator_mod.MemoryCoordinator
 clamp_rerank_doc = coordinator_mod.clamp_rerank_doc
+prefix_rerank_doc = coordinator_mod.prefix_rerank_doc
 RERANK_MAX_DOC_CHARS = coordinator_mod.RERANK_MAX_DOC_CHARS
 
 
@@ -185,8 +186,9 @@ async def test_payload_chars_is_post_clamp_not_raw_content_length():
     body = await _search(c, _ok_rerank_response(1), limit=1)
 
     row = body["results"][0]
-    assert row["rerank_payload_chars"] == RERANK_MAX_DOC_CHARS, (
-        f"expected the clamped length {RERANK_MAX_DOC_CHARS}, got "
+    expected_len = len(prefix_rerank_doc("anything", long_content))
+    assert row["rerank_payload_chars"] == expected_len, (
+        f"expected the prefixed length {expected_len}, got "
         f"{row['rerank_payload_chars']} — this must be the POST-clamp sum"
     )
     # Sanity: the raw content really was longer, so a pre-clamp count would
