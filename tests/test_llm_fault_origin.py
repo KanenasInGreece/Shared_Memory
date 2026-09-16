@@ -235,6 +235,7 @@ def test_upstream_fault_gets_upstream_origin_header_and_typed_refusal(monkeypatc
     assert parsed["error"] == "upstream_fault"
     assert parsed["status"] == 401
     assert parsed["type"] == "invalid_api_key"
+    assert "overflow" not in parsed
     # S8: the provider's own verbatim body must NOT be reflected back to the
     # client — the typed refusal is the gateway's own message, not the
     # upstream's.
@@ -257,6 +258,80 @@ def test_successful_response_never_gets_fault_origin_header(monkeypatch):
 
     assert resp.status == 200
     assert "X-SM-Fault-Origin" not in written["headers"]
+
+
+LIVE_VLLM_EMBED_400 = (
+    b"This model's maximum context length is 8192 tokens. However, you requested "
+    b"0 output tokens and your prompt contains at least 8193 input tokens, for a "
+    b"total of at least 8193 tokens. Please reduce the length of the input prompt "
+    b"or the number of requested output tokens. (parameter=input_tokens, value=8193)"
+)
+
+
+def test_embedding_400_attaches_overflow_without_provider_text(monkeypatch):
+    """decision:2583 — encoder embed 400 gets overflow fields, never the vLLM sentence."""
+    monkeypatch.delenv("LLM_BACKENDS", raising=False)
+    monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps(
+        [{"url": "http://a:5000", "private_ok": True}]))
+    import hive_mind_proxy as g
+    importlib.reload(g)
+
+    class _EmbedReq:
+        method = "POST"
+        path = "/v1/embeddings"
+        rel_url = URL("/v1/embeddings", encoded=True)
+        headers = {}
+        can_read_body = True
+        content_length = 40
+
+        async def read(self):
+            return b'{"input":"hello","model":"bge-m3"}'
+
+    proxy = g.AsyncHiveMindProxy()
+    proxy.session = _StatusBodySession(400, LIVE_VLLM_EMBED_400)
+    resp = asyncio.run(proxy.handle_encoder(_EmbedReq()))
+
+    assert resp.status == 400
+    assert resp.headers.get("X-SM-Fault-Origin") == "upstream"
+    assert "X-SM-LLM-Backend" not in resp.headers
+    body = resp.body.decode()
+    parsed = json.loads(body)
+    assert parsed["error"] == "upstream_fault"
+    assert parsed["overflow"]["kind"] == "overrun"
+    assert parsed["overflow"]["advertised"] == 8192
+    assert parsed["overflow"]["requested"] == 8193
+    assert "value=8193" not in body
+    assert "maximum context length" not in body
+    assert "input_tokens" not in body
+
+
+def test_reranking_400_has_no_overflow_key(monkeypatch):
+    """Overflow attach is embed-only; rerank 400 stays typed S8 without overflow."""
+    monkeypatch.delenv("LLM_BACKENDS", raising=False)
+    monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps(
+        [{"url": "http://a:5000", "private_ok": True}]))
+    import hive_mind_proxy as g
+    importlib.reload(g)
+
+    class _RerankReq:
+        method = "POST"
+        path = "/v1/reranking"
+        rel_url = URL("/v1/reranking", encoded=True)
+        headers = {}
+        can_read_body = True
+        content_length = 40
+
+        async def read(self):
+            return b'{"query":"q","documents":["d"],"model":"bge-reranker"}'
+
+    proxy = g.AsyncHiveMindProxy()
+    proxy.session = _StatusBodySession(400, LIVE_VLLM_EMBED_400)
+    resp = asyncio.run(proxy.handle_encoder(_RerankReq()))
+
+    assert resp.status == 400
+    parsed = json.loads(resp.body.decode())
+    assert parsed["error"] == "upstream_fault"
+    assert "overflow" not in parsed
 
 
 def test_embedding_route_fault_also_gets_upstream_origin_header(monkeypatch):
@@ -288,7 +363,9 @@ def test_embedding_route_fault_also_gets_upstream_origin_header(monkeypatch):
 
     assert resp.status == 500
     assert resp.headers.get("X-SM-Fault-Origin") == "upstream"
-    assert json.loads(resp.body.decode())["error"] == "upstream_fault"
+    parsed = json.loads(resp.body.decode())
+    assert parsed["error"] == "upstream_fault"
+    assert "overflow" not in parsed
 
 
 def test_gateway_origin_error_gets_gateway_fault_origin_header(monkeypatch):
