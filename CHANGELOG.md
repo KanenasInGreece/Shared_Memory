@@ -5,6 +5,14 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.9.105] — 2026-09-16
+
+### Fixed
+- The reranker ranks the first 8192 tokens of the query+document pair (query reserved, document prefixed). It no longer treats overflow as a reject: `/health` does not mark a reachable reranker `window_overrun` when a full-payload probe 400s or times out, and search still returns the full record. Live 0.9.104 had marked llama.cpp rerankers on glxvm and d9400 degraded for that reason. Embedder 8192 stays a rejection boundary.
+
+### Changed
+- Rerank probe, search path, and `handle_encoder` `/v1/reranking` share one pair-prefix helper. Non-string `query` is coerced to empty on the wire. Reranker one-shot: HTTP 200 → true, 400 → false, timeout or other status → unknown.
+
 ## [0.9.104] — 2026-09-16
 
 ### Fixed
