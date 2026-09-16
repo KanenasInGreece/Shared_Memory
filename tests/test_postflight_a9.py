@@ -295,12 +295,32 @@ def test_a9_premarked_on_missing_token():
 
 def test_a9_derived_ceiling_used():
     text = POSTFLIGHT.read_text()
-    assert "embed_ceiling" in text
-    assert "rerank_ceiling" in text
-    # A 30 literal must still fail
-    a9_section = text[text.find("A9 — encoder window contract:"):]
-    assert "ceiling_s=30" not in a9_section
-    assert "30s" not in a9_section.split("\n")[0]
+    a9 = _extract_a9_section()
+    assert "embed_ceiling" in a9
+    assert "rerank_ceiling" in a9
+    assert "ceiling_s=30" not in a9
+    assert "30s" not in a9.split("\n")[0]
+    # Substring of embed_ceiling is not enough: pin the wait loop that
+    # re-curls /health while the probe is still null, then skip-null
+    # STILL_NULL_RERANK (ok, not bad A9). Mutation: drop curl from the
+    # loop body → this fails.
+    loop = re.search(r"while \[\[(.*?)\]\]; do\n(.*?)done", a9, re.S)
+    assert loop, "A9 wait loop (while STILL_NULL_* re-grade) missing from postflight.sh"
+    cond, body = loop.group(1), loop.group(2)
+    assert "STILL_NULL_EMBED" in cond
+    assert "STILL_NULL_RERANK" in cond
+    assert 'verdict" == "STILL_NULL"' in cond or '"STILL_NULL"' in cond
+    assert re.search(r"\bcurl\b", body), "wait loop must re-curl /health"
+    assert "/health" in body
+    rerank_arm = re.search(r"STILL_NULL_RERANK\)\s*(.*?);;", a9, re.S)
+    assert rerank_arm, "STILL_NULL_RERANK case arm missing"
+    arm = rerank_arm.group(1)
+    assert re.search(r"\bok\b", arm), "STILL_NULL_RERANK after timeout must ok, not fail A9"
+    assert "skip-null" in arm
+    assert not re.search(r"\bbad A9\b", arm)
+    embed_arm = re.search(r"STILL_NULL\|STILL_NULL_EMBED\)\s*(.*?);;", a9, re.S)
+    assert embed_arm, "STILL_NULL_EMBED timeout arm missing"
+    assert re.search(r"\bbad A9\b", embed_arm.group(1))
 
 
 def test_a9_encoder_down_skips():

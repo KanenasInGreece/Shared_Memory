@@ -1,7 +1,7 @@
 """Encoder window contract and overflow handling for shared-memory (decision:2540).
 
 Defines:
-- classify_overflow(): detects window mismatch vs slack-bounded overrun on HTTP 400.
+- classify_overflow(): detects window mismatch vs slack-bounded overrun on HTTP 400/413.
 - clamp_encoder_payload(): clamps OpenAI-style embedding inputs per string element.
 - OverflowResult: classification result with unpacked tuple compatibility.
 """
@@ -30,6 +30,17 @@ from dream_telemetry import (
 log = logging.getLogger("EncoderWindow")
 
 OVERFLOW_TOKEN_SLACK = int(os.environ.get("OVERFLOW_TOKEN_SLACK", "16"))
+
+
+def reserved_clamp_chars() -> int:
+    """Char length that fits the required window after special-token reserve.
+
+    Same arithmetic coordinator._embed uses as the snap target:
+    (EMBED_MAX_CONTEXT_TOKENS - EMBED_SPECIAL_TOKEN_RESERVE) * EMBED_CHARS_PER_TOKEN.
+    """
+    return int(
+        (EMBED_MAX_CONTEXT_TOKENS - EMBED_SPECIAL_TOKEN_RESERVE) * EMBED_CHARS_PER_TOKEN
+    )
 
 _window_cache: dict[str, dict] = {
     "embedder": {"advertised_tokens": None, "source": None, "full_payload_ok": None},
@@ -335,12 +346,12 @@ def classify_overflow(
 ) -> OverflowResult:
     """Classify an HTTP response as mismatch, overrun, or other.
 
-    - status != 400 -> 'other'
+    - status not in (400, 413) -> 'other' (proxy/backend may 413 on window overrun)
     - advertised < required_tokens -> 'mismatch'
     - advertised >= required_tokens and requested <= advertised + OVERFLOW_TOKEN_SLACK -> 'overrun'
     - larger-than-slack or unparseable -> 'other' with (advertised, requested) when parsed
     """
-    if status != 400:
+    if status not in (400, 413):
         return OverflowResult("other", None, None)
 
     if required_tokens is None:

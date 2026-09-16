@@ -234,16 +234,31 @@ if [[ -f "$ENV_FILE" ]]; then
     # framework.sh no longer writes it. The double-start guard above is the
     # only encoder-config verdict this section reaches.
 
-    if [[ "$emb_cpu" != "0" || "$emb_gpu" != "0" || "$rer_cpu" != "0" || "$rer_gpu" != "0" ]]; then
+    # Per-encoder GGUF: require the embedder file only if an embedder replica
+    # will start, the reranker file only if a reranker replica will start.
+    # A host that runs one encoder remotely (glxvm: reranker-only) must not
+    # fail because the unused encoder's GGUF is absent.
+    need_embed=0
+    need_rerank=0
+    if [[ "$emb_cpu" != "0" || "$emb_gpu" != "0" ]]; then need_embed=1; fi
+    if [[ "$rer_cpu" != "0" || "$rer_gpu" != "0" ]]; then need_rerank=1; fi
+    if [[ "$need_embed" == "1" || "$need_rerank" == "1" ]]; then
         models_dir="$(read_env LLM_MODELS_DIR)"
         embed_sub="$(read_env EMBED_MODEL_SUBPATH)"
         embed_sub="${embed_sub:-gpustack/bge-m3-GGUF/bge-m3-Q8_0.gguf}"
         rerank_sub="$(read_env RERANK_MODEL_SUBPATH)"
         rerank_sub="${rerank_sub:-gpustack/bge-reranker-v2-m3-GGUF/bge-reranker-v2-m3-Q8_0.gguf}"
-        if [[ -f "$models_dir/$embed_sub" && -f "$models_dir/$rerank_sub" ]]; then
+        gguf_missing=0
+        if [[ "$need_embed" == "1" && ! -f "$models_dir/$embed_sub" ]]; then
+            bad "embedder GGUF missing under LLM_MODELS_DIR ($models_dir/$embed_sub) — download commands are in shared-memory/.env.example (or set EMBEDDER_*_REPLICAS=0 and point EMBEDDER_URL elsewhere)"
+            gguf_missing=1
+        fi
+        if [[ "$need_rerank" == "1" && ! -f "$models_dir/$rerank_sub" ]]; then
+            bad "reranker GGUF missing under LLM_MODELS_DIR ($models_dir/$rerank_sub) — download commands are in shared-memory/.env.example (or set RERANKER_*_REPLICAS=0 and point RERANKER_URL elsewhere)"
+            gguf_missing=1
+        fi
+        if [[ "$gguf_missing" == "0" ]]; then
             ok "encoder GGUFs present under LLM_MODELS_DIR"
-        else
-            bad "encoder GGUF(s) missing under LLM_MODELS_DIR ($models_dir) — download commands are in shared-memory/.env.example (or set both *_ENCODER_REPLICAS=0 and point EMBEDDER_URL/RERANKER_URL elsewhere)"
         fi
     else
         ctx_tokens="$(read_env EMBED_MAX_CONTEXT_TOKENS)"

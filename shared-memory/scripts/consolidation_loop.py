@@ -94,7 +94,7 @@ from nrem_gate import eligible_domain_level_clusters, count_domain_level_cycles 
 from domain_axis import resolve_domains
 from pool_status import pool_has_free_slot
 from dream_telemetry import (record_llm_call, adaptive_ceiling, embed_ceiling,
-                             EMBED_MAX_CHARS)
+                             EMBED_MAX_CHARS, EMBED_MAX_CONTEXT_TOKENS)
 from record_ref import make_ref
 from secure_env import (
     load_split_env, get_secret, require_db_credentials, read_daemon_token_from_fd,
@@ -2567,6 +2567,17 @@ class ConsolidationDaemon:
         2. SIZE THE TIMEOUT ON THE INPUT. Embedding cost is superlinear in
            length, so the old constant 20 s covered barely half the context
            window and killed large summaries deterministically.
+        3. Overflow (decision:2569 remainder): HTTP 400 or 413. Mismatch
+           (advertised < required) returns None — do not silent-prefix a
+           short server. Overrun *and* other (dense text, requested ≫
+           advertised+slack) shrink the *vector prefix* only; the full
+           summary stays stored. First snap is the imported reserved clamp
+           when the body is still longer; then at most ~8 HTTP attempts
+           using advertised/requested ratio when known, else halve. A
+           reserved snap that does not shorten, or a new_len still ≥ 90% of
+           current, halves instead (live value=8193 at 24570 is ~3 chars per
+           ratio step). Floor without 200 returns None — never a 24570-step
+           len-1 loop, never 1-char garbage.
         """
         if len(text) > EMBED_MAX_CHARS:
             logger.warning(
@@ -2575,16 +2586,81 @@ class ConsolidationDaemon:
                 "stored and searchable).",
                 len(text), EMBED_MAX_CHARS, EMBED_MAX_CHARS)
             text = text[:EMBED_MAX_CHARS]
+        from encoder_window import (
+            classify_overflow,
+            record_embed_window_overrun,
+            reserved_clamp_chars,
+        )
+        reserved_snap = reserved_clamp_chars()
+        max_overflow_attempts = 8
         ceiling = embed_ceiling(len(text))
         try:
             async with httpx.AsyncClient(timeout=ceiling, trust_env=False) as client:
-                resp = await client.post(
-                    RETRIEVER_URL,
-                    headers=_auth_headers(),
-                    json={"input": text, "model": "bge-m3"},
-                )
-                resp.raise_for_status()
-                return resp.json()["data"][0]["embedding"]
+                for attempt in range(1, max_overflow_attempts + 1):
+                    ceiling = embed_ceiling(len(text))
+                    resp = await client.post(
+                        RETRIEVER_URL,
+                        headers=_auth_headers(),
+                        json={"input": text, "model": "bge-m3"},
+                        timeout=ceiling,
+                    )
+                    if resp.status_code in (400, 413):
+                        classification = classify_overflow(
+                            resp.status_code, getattr(resp, "text", ""),
+                        )
+                        if classification.kind == "mismatch":
+                            logger.error(
+                                "Embedding context mismatch: server advertised %s tokens, "
+                                "framework requires EMBED_MAX_CONTEXT_TOKENS=%s — returning None "
+                                "(will not silent-prefix a short advertised window)",
+                                classification.advertised, EMBED_MAX_CONTEXT_TOKENS,
+                            )
+                            return None
+                        if classification.kind == "overrun":
+                            record_embed_window_overrun()
+                        prev = len(text)
+                        advertised = classification.advertised
+                        requested = classification.requested
+                        if prev > reserved_snap:
+                            # Leftover EMBED_MAX_CHARS > reserved: one reserved
+                            # snap even when that drop is < 10%.
+                            new_len = min(reserved_snap, prev - 1)
+                        else:
+                            if (
+                                advertised is not None and requested is not None
+                                and advertised > 0 and requested > advertised
+                            ):
+                                new_len = min(prev - 1, prev * advertised // requested)
+                            else:
+                                new_len = prev // 2
+                            # Reserved was a no-op (production 24570==24570) or
+                            # the ratio barely moved (8192/8193). Halve.
+                            if new_len * 10 >= prev * 9:
+                                new_len = prev // 2
+                        if (
+                            new_len < 2 or new_len >= prev
+                            or attempt == max_overflow_attempts
+                        ):
+                            logger.error(
+                                "embed overflow floor (%d chars, kind=%s, advertised=%s, "
+                                "requested=%s) after %d attempt(s) — returning None rather "
+                                "than 1-char garbage (reserved=%d, EMBED_MAX_CHARS=%d)",
+                                prev, classification.kind, advertised, requested,
+                                attempt, reserved_snap, EMBED_MAX_CHARS,
+                            )
+                            return None
+                        logger.error(
+                            "embed input %d chars HTTP %s kind=%s (requested=%s on "
+                            "%s-token window) — shrinking vector prefix to %d chars "
+                            "(full text still stored; reserved=%d, EMBED_MAX_CHARS=%d)",
+                            prev, resp.status_code, classification.kind,
+                            requested, advertised, new_len, reserved_snap,
+                            EMBED_MAX_CHARS,
+                        )
+                        text = text[:new_len]
+                        continue
+                    resp.raise_for_status()
+                    return resp.json()["data"][0]["embedding"]
         except Exception as e:
             # Name the exception CLASS: the bare str() of an httpx timeout is
             # empty, which printed "Embedding error:" and told the operator
@@ -2592,6 +2668,7 @@ class ConsolidationDaemon:
             logger.error("Embedding error after %.0fs ceiling on %d chars: %s: %s",
                          ceiling, len(text), type(e).__name__, e)
             return None
+        return None
 
     # ⛔ REMOVED (C4): `generate_summary` — the LLM-narrative synthesis method
     # the thematic fold used to call. §3.1/§4.2 Path A step 2 replace that

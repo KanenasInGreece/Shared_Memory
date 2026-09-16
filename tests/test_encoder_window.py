@@ -84,6 +84,30 @@ def test_classify_overflow_non_400():
     assert res.kind == "other"
 
 
+def test_classify_overflow_413_overrun():
+    """Proxy/backend may 413 on window overrun — same classification as 400."""
+    body = {
+        "message": (
+            "This model's maximum context length is 8192 tokens. "
+            "However, you requested 8193 tokens in the messages."
+        )
+    }
+    res = encoder_window.classify_overflow(413, body, required_tokens=8192)
+    assert res.kind == "overrun"
+    assert res.advertised == 8192
+    assert res.requested == 8193
+
+
+def test_reserved_clamp_chars_matches_special_token_formula():
+    expected = int(
+        (dream_telemetry.EMBED_MAX_CONTEXT_TOKENS
+         - dream_telemetry.EMBED_SPECIAL_TOKEN_RESERVE)
+        * dream_telemetry.EMBED_CHARS_PER_TOKEN
+    )
+    assert encoder_window.reserved_clamp_chars() == expected
+    assert expected == 24570
+
+
 def test_clamp_encoder_payload_string():
     raw = json.dumps({"input": "x" * 50000, "model": "bge-m3"}).encode("utf-8")
     clamped_bytes = encoder_window.clamp_encoder_payload(raw)
