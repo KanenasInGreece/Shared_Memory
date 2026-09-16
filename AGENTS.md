@@ -731,7 +731,7 @@ Prove the installed stack works end to end — liveness and payload shape, versi
 truth, the full write path (canary save → 1024-dim vector → outbox applied → `:Fact` node), and an
 honestly-graded read path — and emit a performance baseline for this hardware. The contract is
 `shared-memory/Documentation/postflight.md`; the script implements it and exits 0 iff assertions
-**A1–A5 and A8** pass (A8 SKIPs rather than gates when no reasoning backend is currently reported
+**A1–A5, A8 and A9** pass (A8 SKIPs rather than gates when no reasoning backend is currently reported
 healthy — a SKIP there is not a failure). The canary lands under the reserved project `install-verification` and stays in the
 corpus — the install's birth certificate. **This first run always mints it** (the corpus has no
 live Tier-3 summaries yet); a **later re-run** (e.g. after a hardware change) switches

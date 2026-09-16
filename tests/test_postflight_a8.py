@@ -87,7 +87,7 @@ def _extract_marked_block(begin: str, end: str) -> str:
 
 
 A8_SECTION_START = "# ── A8 — reasoning-backend liveness, end to end"
-A8_SECTION_END = "# ── Summary"
+A8_SECTION_END = "# ── A9 — encoder window contract"
 SUMMARY_SECTION_START = "# ── Summary"
 
 

@@ -18,7 +18,7 @@ AGENT_TOKEN=$(sed -n 's/^AGENT_TOKEN=//p' "$AGENT_ENV" | head -1); export AGENT_
 bash shared-memory/scripts/postflight.sh
 ```
 
-- **Exit code:** `0` iff assertions **A1–A5 and A8** all pass. A6 is a measurement, never a gate;
+- **Exit code:** `0` iff assertions **A1–A5, A8 and A9** all pass. A6 is a measurement, never a gate;
   A7 holds by construction and is documented below. A8 **SKIPs** (never gates) when no reasoning
   backend is reported *healthy* on the gateway right now, **or** when the real completion itself
   comes back a declared, gateway-origin `no_eligible_backend` refusal (W4 default-deny, an
@@ -420,3 +420,39 @@ state. The skip message names the declaration value (`none` or `no_role_less_opt
 at `check_config.py` for the per-backend detail. **Only cases (3) and (4) print as a SKIP** (never
 `bad()`); they exist so A8 can never fail an install that legitimately has no working LLM right
 now, or one whose fleet is honestly undeclared rather than broken.
+
+## A9 — Encoder window contract
+
+**Why this assertion exists.** In v0.9.104 (`decision:2540`), the encoder window contract makes
+the context capacity of the upstream embedding and reranking backends verifiable at deploy time.
+Prior to this release, an encoder backend configured with an undersized context window (e.g. a
+512-token vLLM instance or a llama.cpp container started without `-c 8192`) answered `/health`
+with `200 ok` and passed all previous postflight checks, but failed real saves and searches with
+HTTP `400` context overflows whenever texts approached `EMBED_MAX_CHARS`. A9 verifies that the
+running encoders advertise a window meeting `EMBED_MAX_CONTEXT_TOKENS` and can empirically accept
+full-payload requests up to `EMBED_MAX_CHARS`.
+
+**Check.** Read the top-level `encoder_window` block from the authenticated `/health` payload
+(conduct constraints: reads authenticated `/health` only; writes nothing).
+If `full_payload_ok` is `null` (background one-shot probe still in flight after startup), wait
+and poll `/health` up to the derived timeout ceiling (`embed_ceiling(EMBED_MAX_CHARS)`), never
+a flat 30s timeout.
+
+**Pass criterion.**
+- **Embedder:** `full_payload_ok` must be `true`, and `advertised_tokens` (when reported, i.e.
+  non-null) must be `>= required_tokens`. A `null` advertised value (e.g. backend does not expose
+  `/v1/models` or `/props`) is accepted if empirical `full_payload_ok` is `true`.
+- **Reranker:** `advertised_tokens` (when non-null) must be `>= required_tokens`. A `false`
+  `full_payload_ok` on the reranker is **warn-only** unless `advertised_tokens < required_tokens`.
+
+**Failure meaning.**
+- Embedder `full_payload_ok` is `false`, or `advertised_tokens < required_tokens` (`window_short`),
+  or the probe timed out (values remain `null` after waiting the derived ceiling).
+- The failure message names `--max-model-len` (vLLM), `-c` (llama.cpp), `EMBED_MAX_CONTEXT_TOKENS`,
+  and warns about any leftover `EMBED_MAX_CHARS` setting.
+
+**When A9 SKIPs — and never gates.**
+- **(1)** `AGENT_TOKEN` missing while auth is configured: pre-marked at A1, printed as a skip.
+- **(2)** Gateway unreachable: marked failed (following A1/A2 cascading convention).
+- **(3)** Embedder backend is down: A9 SKIPs (A1/503 already handles encoder liveness failure).
+- Re-baseline mode: A9 runs in both canary and re-baseline modes.

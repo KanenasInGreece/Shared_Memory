@@ -476,6 +476,13 @@ def test_agents_md_states_postflights_actual_exit_condition():
         "it is quoting a stale assertion range again."
     )
 
+    readme = _read("README.md")
+    assert exit_condition in readme, (
+        f"postflight.md's spec now says the exit condition is {exit_condition!r}, "
+        "but README.md's Quick Start section does not say the same thing -- "
+        "it is quoting a stale assertion range again."
+    )
+
 
 def test_agents_md_pipes_the_right_number_of_answers_into_install_framework():
     """GROUP 5. AGENTS.md's Phase 1 no longer hand-mirrors install_framework.sh

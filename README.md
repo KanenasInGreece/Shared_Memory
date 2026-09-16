@@ -477,7 +477,7 @@ A fresh gateway host goes from clone to running with five helper scripts in
 9. **Verify the install.** Back on the gateway host:
    export `AGENT_TOKEN` by reading it out of a write-capable agent's skill `.env` from step 6 (the
    `AGENT_ENV` + `sed` idiom at the top of `postflight.md` — never a pasted export), then
-   `bash shared-memory/scripts/postflight.sh` — eight assertions that prove the stack end to
+   `bash shared-memory/scripts/postflight.sh` — exits 0 iff assertions **A1–A5, A8 and A9** all pass, proving the stack end to
    end, from health payload shapes to a canary save traced into both stores, a real completion
    driven through the reasoning backend, and a baseline JSON of this hardware's save/search
    timings for later comparison. The contract it checks
