@@ -20,7 +20,16 @@ SCRIPTS_DIR = REPO_ROOT / "shared-memory" / "scripts"
 sys.path.insert(0, str(SCRIPTS_DIR))
 
 import check_config
+import encoder_window
 import framework_defaults
+
+
+@pytest.fixture(autouse=True)
+def clean_encoder_window_cache():
+    encoder_window.reset_encoder_window_cache()
+    yield
+    encoder_window.reset_encoder_window_cache()
+
 
 
 def test_phase_a_renders_all_five_encoder_window_rows(monkeypatch):

@@ -42,12 +42,13 @@ def set_encoder_cache(encoder_name: str, val: dict) -> None:
 
 def get_encoder_window_snapshot() -> dict:
     """Return top-level /health encoder_window block."""
+    _default_probe = {"advertised_tokens": None, "source": None, "full_payload_ok": None}
     return {
         "required_tokens": EMBED_MAX_CONTEXT_TOKENS,
         "special_token_reserve": EMBED_SPECIAL_TOKEN_RESERVE,
         "embed_max_chars": EMBED_MAX_CHARS,
-        "embedder": dict(_window_cache["embedder"]),
-        "reranker": dict(_window_cache["reranker"]),
+        "embedder": dict(_window_cache.get("embedder") or _default_probe),
+        "reranker": dict(_window_cache.get("reranker") or _default_probe),
     }
 
 
@@ -212,6 +213,14 @@ def reset_embed_window_overruns() -> None:
     global _embed_window_overruns_total, _embed_window_overruns_last_ts
     _embed_window_overruns_total = 0
     _embed_window_overruns_last_ts = None
+
+
+def reset_encoder_window_cache() -> None:
+    """Reset the probe window cache to defaults (useful for unit tests)."""
+    _window_cache["embedder"] = {"advertised_tokens": None, "source": None, "full_payload_ok": None}
+    _window_cache["reranker"] = {"advertised_tokens": None, "source": None, "full_payload_ok": None}
+
+
 
 
 class OverflowResult:

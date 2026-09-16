@@ -11,6 +11,13 @@ import encoder_window
 import hive_mind_proxy as g
 
 
+@pytest.fixture(autouse=True)
+def clean_encoder_window_cache():
+    encoder_window.reset_encoder_window_cache()
+    yield
+    encoder_window.reset_encoder_window_cache()
+
+
 def test_config_snapshot_reports_real_embed_max_chars(monkeypatch):
     monkeypatch.delenv("EMBED_MAX_CHARS", raising=False)
     monkeypatch.delenv("EMBED_SPECIAL_TOKEN_RESERVE", raising=False)
