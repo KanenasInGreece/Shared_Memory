@@ -7,6 +7,7 @@ leftover EMBED_MAX_CHARS), and postflight flow.
 import json
 import os
 import re
+import shlex
 import subprocess
 import pytest
 from pathlib import Path
@@ -152,7 +153,7 @@ def test_a9_grade_window_still_null():
         }
     }
     verdict, detail, warn = _run_a9_grade_window(payload)
-    assert verdict == "STILL_NULL"
+    assert verdict == "STILL_NULL_EMBED"
 
 
 def test_a9_grade_window_still_null_when_reranker_unprobed():
@@ -165,7 +166,116 @@ def test_a9_grade_window_still_null_when_reranker_unprobed():
         }
     }
     verdict, detail, warn = _run_a9_grade_window(payload)
-    assert verdict == "STILL_NULL"
+    assert verdict == "STILL_NULL_RERANK"
+
+
+A9_SECTION_START = "# ── A9 — encoder window contract"
+SUMMARY_SECTION_START = "# ── Summary"
+
+
+def _extract_a9_section() -> str:
+    text = POSTFLIGHT.read_text()
+    start = text.find(A9_SECTION_START)
+    end = text.find(SUMMARY_SECTION_START)
+    assert start != -1, f"could not find {A9_SECTION_START!r} in {POSTFLIGHT}"
+    assert end != -1 and end > start, (
+        f"could not find {SUMMARY_SECTION_START!r} after the A9 header in {POSTFLIGHT}"
+    )
+    return text[start:end]
+
+
+def run_a9_live(*, health_full: dict | str, auth_on="0", token_missing="0",
+                gateway_down="0", agent_token="tok"):
+    a9_grade_window_def = _extract_marked_block(
+        "# >>> A9_GRADE_WINDOW",
+        "# <<< A9_GRADE_WINDOW",
+    )
+    a9_section = _extract_a9_section()
+    health_str = health_full if isinstance(health_full, str) else json.dumps(health_full)
+    script_dir = str(POSTFLIGHT.parent)
+    lines = [
+        "set -uo pipefail",
+        f"SCRIPT_DIR={shlex.quote(script_dir)}",
+        f"GATEWAY_URL='http://127.0.0.1:8888'",
+        f"auth_on={shlex.quote(auth_on)}",
+        f"token_missing={shlex.quote(token_missing)}",
+        f"gateway_down={shlex.quote(gateway_down)}",
+        f"AGENT_TOKEN={shlex.quote(agent_token)}",
+        f"health_full={shlex.quote(health_str)}",
+        "declare -A afail",
+        "red()   { printf '\\033[31m%s\\033[0m\\n' \"$*\"; }",
+        "grn()   { printf '\\033[32m%s\\033[0m\\n' \"$*\"; }",
+        "ylw()   { printf '\\033[33m%s\\033[0m\\n' \"$*\"; }",
+        'ok()   { echo "OK: $*"; }',
+        'warn() { echo "WARN: $*"; }',
+        'bad()  { local a="$1"; shift; echo "BAD: $a $*"; afail["$a"]=1; }',
+        'sleep() { SECONDS=$(( SECONDS + 100 )); }',
+        'curl() { printf \'%s\' "$health_full"; }',
+        a9_grade_window_def,
+        a9_section,
+        'echo "AFAIL_A9=${afail[A9]:-0}"',
+    ]
+    harness = "\n".join(lines)
+    return subprocess.run(
+        ["bash", "-c", harness],
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+
+
+def test_a9_postflight_timeout_rerank_still_null_warns_and_passes():
+    payload = {
+        "dependencies": {"embedder": {"state": "ok"}},
+        "embedder": "ok",
+        "encoder_window": {
+            "required_tokens": 8192,
+            "embed_max_chars": 24570,
+            "embedder": {"advertised_tokens": 8192, "source": "v1_models", "full_payload_ok": True},
+            "reranker": {"advertised_tokens": None, "source": None, "full_payload_ok": None},
+        },
+    }
+    result = run_a9_live(health_full=payload)
+    assert result.returncode == 0, f"script failed: {result.stderr}"
+    assert "WARN: A9 reranker probe" in result.stdout
+    assert "skip-null" in result.stdout
+    assert "OK: A9 encoder window contract verified" in result.stdout
+    assert "BAD: A9" not in result.stdout
+    assert "AFAIL_A9=0" in result.stdout
+
+
+def test_a9_postflight_timeout_embed_still_null_fails():
+    payload = {
+        "dependencies": {"embedder": {"state": "ok"}},
+        "embedder": "ok",
+        "encoder_window": {
+            "required_tokens": 8192,
+            "embed_max_chars": 24570,
+            "embedder": {"advertised_tokens": 8192, "source": "v1_models", "full_payload_ok": None},
+            "reranker": {"advertised_tokens": 8192, "source": "v1_models", "full_payload_ok": True},
+        },
+    }
+    result = run_a9_live(health_full=payload)
+    assert result.returncode == 0, f"script failed: {result.stderr}"
+    assert "BAD: A9 encoder window probe timed out" in result.stdout
+    assert "AFAIL_A9=1" in result.stdout
+
+
+def test_a9_postflight_rerank_advertised_short_fails():
+    payload = {
+        "dependencies": {"embedder": {"state": "ok"}},
+        "embedder": "ok",
+        "encoder_window": {
+            "required_tokens": 8192,
+            "embed_max_chars": 24570,
+            "embedder": {"advertised_tokens": 8192, "source": "v1_models", "full_payload_ok": True},
+            "reranker": {"advertised_tokens": 512, "source": "v1_models", "full_payload_ok": False},
+        },
+    }
+    result = run_a9_live(health_full=payload)
+    assert result.returncode == 0, f"script failed: {result.stderr}"
+    assert "BAD: A9 reranker advertised window 512 < required 8192" in result.stdout
+    assert "AFAIL_A9=1" in result.stdout
 
 
 def test_postflight_exit_loops_include_a9():

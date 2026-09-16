@@ -352,15 +352,8 @@ rerank_ok = rerank.get("full_payload_ok")
 
 # 1. Check if embedder probe is still in-flight
 if embed_ok is None:
-    print(f"STILL_NULL|embedder full_payload_ok is null (required: {required})|")
+    print(f"STILL_NULL_EMBED|embedder full_payload_ok is null (required: {required})|")
     sys.exit(0)
-
-# 1b. Check if reranker probe is still in-flight
-# Wait until rerank advertised is non-null or rerank empirical is non-null (skip-null rule)
-if rerank_adv is None and rerank_ok is None:
-    print(f"STILL_NULL|reranker probe in-flight (advertised and full_payload_ok are null)|")
-    sys.exit(0)
-
 
 # 2. Check embedder advertised window short
 if isinstance(embed_adv, int) and embed_adv < required:
@@ -370,6 +363,12 @@ if isinstance(embed_adv, int) and embed_adv < required:
 # 3. Check embedder empirical full payload failure
 if embed_ok is False:
     print(f"FAIL_EMBED_OVERRUN|embedder full payload test failed (full_payload_ok is false). Upstream encoder must support --max-model-len {required} or -c {required} (EMBED_MAX_CONTEXT_TOKENS={required}); check for leftover EMBED_MAX_CHARS={embed_max_chars}|")
+    sys.exit(0)
+
+# 1b. Check if reranker probe is still in-flight
+# Wait until rerank advertised is non-null or rerank empirical is non-null (skip-null rule)
+if rerank_adv is None and rerank_ok is None:
+    print(f"STILL_NULL_RERANK|reranker probe in-flight (advertised and full_payload_ok are null)|")
     sys.exit(0)
 
 # 4. Check reranker advertised window short
@@ -1311,8 +1310,7 @@ except Exception:
         grade_res="$(printf '%s' "${health_full:-}" | a9_grade_window)"
         IFS='|' read -r verdict detail warn_part <<< "$grade_res"
 
-        while [[ "$verdict" == "STILL_NULL" && $(( SECONDS - start_s )) -le "$ceiling_s" ]]; do
-
+        while [[ ( "$verdict" == "STILL_NULL_EMBED" || "$verdict" == "STILL_NULL_RERANK" || "$verdict" == "STILL_NULL" ) && $(( SECONDS - start_s )) -le "$ceiling_s" ]]; do
             sleep 2
             if [[ "$auth_on" == "1" && -n "${AGENT_TOKEN:-}" ]]; then
                 health_full="$(curl -s --compressed --max-time 15 -K - "$GATEWAY_URL/health" <<< "header = \"Authorization: Bearer $AGENT_TOKEN\"" || true)"
@@ -1330,7 +1328,11 @@ except Exception:
                 fi
                 ok "A9 encoder window contract verified ($detail)"
                 ;;
-            STILL_NULL)
+            STILL_NULL_RERANK)
+                warn "A9 reranker probe in-flight timed out after ${ceiling_s}s (skip-null); search will fall back or truncate on large candidate sets"
+                ok "A9 encoder window contract verified ($detail)"
+                ;;
+            STILL_NULL|STILL_NULL_EMBED)
                 bad A9 "encoder window probe timed out after ${ceiling_s}s (still null). Verify upstream encoder is started with --max-model-len or -c matching EMBED_MAX_CONTEXT_TOKENS, and check for leftover EMBED_MAX_CHARS"
                 ;;
             FAIL_WINDOW_SHORT|FAIL_EMBED_OVERRUN)
