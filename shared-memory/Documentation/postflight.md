@@ -435,8 +435,10 @@ full-payload requests up to `EMBED_MAX_CHARS`.
 **Check.** Read the top-level `encoder_window` block from the authenticated `/health` payload
 (conduct constraints: reads authenticated `/health` only; writes nothing).
 If `full_payload_ok` is `null` (background one-shot probe still in flight after startup), wait
-and poll `/health` up to the derived timeout ceiling (`embed_ceiling(EMBED_MAX_CHARS)`), never
-a flat 30s timeout.
+and poll `/health` up to the derived timeout ceiling
+(`embed_ceiling(EMBED_MAX_CHARS) + rerank_ceiling([one max doc])` plus a small margin), never
+a flat 30s timeout. Reranker advertised/empirical still both `null` after that wait is skip-null
+(warn, not a fail) when the embedder empirical is already `true`.
 
 **Pass criterion.**
 - **Embedder:** `full_payload_ok` must be `true`, and `advertised_tokens` (when reported, i.e.
@@ -447,7 +449,8 @@ a flat 30s timeout.
 
 **Failure meaning.**
 - Embedder `full_payload_ok` is `false`, or `advertised_tokens < required_tokens` (`window_short`),
-  or the probe timed out (values remain `null` after waiting the derived ceiling).
+  or the embedder probe timed out (`full_payload_ok` still `null` after waiting the derived ceiling).
+  A reranker that never advertises after that wait is skip-null (warn), not this failure.
 - The failure message names `--max-model-len` (vLLM), `-c` (llama.cpp), `EMBED_MAX_CONTEXT_TOKENS`,
   and warns about any leftover `EMBED_MAX_CHARS` setting.
 
