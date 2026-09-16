@@ -3631,6 +3631,8 @@ async def _capability_probe_daemon(proxy, stop_event, coordinator=None) -> None:
     global _capability
     while not stop_event.is_set():
         try:
+            from encoder_window import probe_encoder_window
+            await probe_encoder_window(proxy.session, EMBEDDER_URL, RERANKER_URL)
             _capability = _merge_capability_projection(
                 _capability, await _probe_capability(proxy.session))
             await _maybe_derive_capacity(_capability, coordinator)
@@ -4837,7 +4839,7 @@ def _dep(state: str, reason: str | None = None) -> dict:
     return {"state": state, "reason": reason}
 
 
-def _encoder_dependency(probe: str, capability: object) -> dict:
+def _encoder_dependency(probe: str, capability: object, window: dict | None = None) -> dict:
     """One encoder's dependency enum.
 
     ⛔ LIVENESS IS NOT CAPABILITY, and this is where that finally reaches
@@ -4847,9 +4849,21 @@ def _encoder_dependency(probe: str, capability: object) -> dict:
     verdict (`too_slow` / `failing`) now makes the encoder DEGRADED. It does NOT
     make it down, and that distinction is load-bearing: down is the 503, and a
     slow encoder still returns vectors.
+
+    decision:2540: window contract checks. Advertised context < required tokens
+    degrades with `window_short:N<required`; embed full_payload_ok: False degrades
+    with `window_overrun`. Unreachable encoder stays DOWN.
     """
     if probe != "ok":
         return _dep(_STATE_DOWN, f"probe:{probe}")
+    if isinstance(window, dict):
+        adv = window.get("advertised_tokens")
+        from dream_telemetry import EMBED_MAX_CONTEXT_TOKENS
+        required = EMBED_MAX_CONTEXT_TOKENS
+        if isinstance(adv, int) and adv < required:
+            return _dep(_STATE_DEGRADED, f"window_short:{adv}<{required}")
+        if window.get("full_payload_ok") is False:
+            return _dep(_STATE_DEGRADED, "window_overrun")
     if isinstance(capability, dict):
         status = capability.get("status")
         if status in ("too_slow", "failing", "degraded"):
@@ -5372,6 +5386,7 @@ def _config_snapshot() -> dict:
     monitor-visible from the moment it is configured rather than only once
     someone goes looking (fact 898).
     """
+    import dream_telemetry
     cfg = {
         # SEC B: "url" is scrub_url_credentials(b) — a list of per-backend
         # dicts, so no key-collapse is possible (unlike the dict-keyed
@@ -5401,7 +5416,7 @@ def _config_snapshot() -> dict:
             "ttl_s": AFFINITY_TTL,
             "max_inflight": AFFINITY_MAX_INFLIGHT,
         },
-        "embed_max_chars": int(os.environ.get("EMBED_MAX_CHARS", "24000")),
+        "embed_max_chars": dream_telemetry.EMBED_MAX_CHARS,
     }
     # SEC-A5-02: present ONLY while the S-05 override is actually exposing a
     # live provider key unauthenticated — additive, so a monitor that does not
@@ -5587,6 +5602,8 @@ async def _build_health_checks(proxy: "AsyncHiveMindProxy", coordinator) -> dict
     # this deployment's lifetime lands. REPORT ONLY — see the section this
     # snapshot function lives in for the "never limits a request" invariant.
     checks["capacity"] = capacity_snapshot()
+    from encoder_window import get_encoder_window_snapshot
+    checks["encoder_window"] = get_encoder_window_snapshot()
 
     # Reasoning-LLM backend pool — probe each; "llm" is ok if ANY is up (the pool
     # tolerates a down backend). Per-backend statuses are reported for observability;
@@ -5750,9 +5767,11 @@ async def _build_health_checks(proxy: "AsyncHiveMindProxy", coordinator) -> dict
         "postgres": dep_snap.get("postgres") or _dep(_STATE_UNKNOWN, "not yet probed"),
         "neo4j": dep_snap.get("neo4j") or _dep(_STATE_UNKNOWN, "not yet probed"),
         "embedder": _encoder_dependency(checks["embedder"],
-                                        capability.get("embedder")),
+                                        capability.get("embedder"),
+                                        checks.get("encoder_window", {}).get("embedder")),
         "reranker": _encoder_dependency(checks["reranker"],
-                                        capability.get("reranker")),
+                                        capability.get("reranker"),
+                                        checks.get("encoder_window", {}).get("reranker")),
         "llm_pool": _llm_pool_dependency(backend_status),
         "rem_daemon": _rem_dependency(
             _rem_healthy,

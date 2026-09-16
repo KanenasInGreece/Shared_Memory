@@ -13,17 +13,182 @@ import os
 import re
 from typing import Any
 
+from aiohttp import ClientTimeout
+
 from dream_telemetry import (
     EMBED_CHARS_PER_TOKEN,
     EMBED_MAX_CHARS,
     EMBED_MAX_CONTEXT_TOKENS,
     EMBED_SPECIAL_TOKEN_RESERVE,
     RERANK_MAX_DOC_CHARS,
+    embed_ceiling,
+    rerank_ceiling,
 )
 
 log = logging.getLogger("EncoderWindow")
 
 OVERFLOW_TOKEN_SLACK = int(os.environ.get("OVERFLOW_TOKEN_SLACK", "16"))
+
+_window_cache: dict[str, dict] = {
+    "embedder": {"advertised_tokens": None, "source": None, "full_payload_ok": None},
+    "reranker": {"advertised_tokens": None, "source": None, "full_payload_ok": None},
+}
+
+
+def set_encoder_cache(encoder_name: str, val: dict) -> None:
+    """Explicitly set cached state for an encoder (unit tests / mock injection)."""
+    _window_cache[encoder_name] = dict(val)
+
+
+def get_encoder_window_snapshot() -> dict:
+    """Return top-level /health encoder_window block."""
+    return {
+        "required_tokens": EMBED_MAX_CONTEXT_TOKENS,
+        "special_token_reserve": EMBED_SPECIAL_TOKEN_RESERVE,
+        "embed_max_chars": EMBED_MAX_CHARS,
+        "embedder": dict(_window_cache["embedder"]),
+        "reranker": dict(_window_cache["reranker"]),
+    }
+
+
+def _upstream_url(base: str, rel: str) -> str:
+    base = str(base).rstrip("/")
+    rel = str(rel)
+    if not rel.startswith("/"):
+        rel = "/" + rel
+    if base.endswith("/v1") and rel.startswith("/v1/"):
+        rel = rel[len("/v1"):]
+    return f"{base}{rel}"
+
+
+async def probe_encoder(
+    session: Any,
+    base_url: str,
+    route: str,
+    model_id: str,
+) -> dict:
+    """Probe an encoder backend for advertised tokens and empirical full payload capability."""
+    encoder_name = "embedder" if "embed" in route else "reranker"
+    cached = dict(_window_cache.get(encoder_name, {}))
+
+    adv: int | None = None
+    src: str | None = None
+    reachable = False
+
+    # 1. Try GET /v1/models matching model_id
+    models_url = _upstream_url(base_url, "/v1/models")
+    try:
+        timeout = ClientTimeout(total=5.0)
+        async with session.get(models_url, timeout=timeout) as r:
+            reachable = True
+            if r.status == 200:
+                body = await r.json()
+                data = body.get("data", [])
+                if isinstance(data, list):
+                    for item in data:
+                        if isinstance(item, dict):
+                            mid = str(item.get("id", ""))
+                            if mid == model_id or mid.endswith("/" + model_id) or mid.endswith(model_id):
+                                ctx = (
+                                    item.get("max_model_len")
+                                    or item.get("context_length")
+                                    or item.get("n_ctx")
+                                    or item.get("max_tokens")
+                                )
+                                if ctx is not None:
+                                    try:
+                                        adv = int(ctx)
+                                        src = "v1_models"
+                                        break
+                                    except (ValueError, TypeError):
+                                        pass
+    except Exception:
+        pass
+
+    # 2. If not found, try /props (llama.cpp)
+    if adv is None:
+        props_base = str(base_url).rstrip("/").removesuffix("/v1")
+        props_url = f"{props_base}/props"
+        try:
+            timeout = ClientTimeout(total=5.0)
+            async with session.get(props_url, timeout=timeout) as r:
+                reachable = True
+                if r.status == 200:
+                    body = await r.json()
+                    if isinstance(body, dict):
+                        ctx = (
+                            body.get("default_generation_settings", {}).get("n_ctx")
+                            or body.get("n_ctx")
+                        )
+                        if ctx is not None:
+                            try:
+                                adv = int(ctx)
+                                src = "props"
+                            except (ValueError, TypeError):
+                                pass
+        except Exception:
+            pass
+
+    # Carry forward previous advertised and full_payload_ok across failing cycles
+    if not reachable:
+        if cached.get("advertised_tokens") is not None or cached.get("full_payload_ok") is not None:
+            return cached
+        return {
+            "advertised_tokens": None,
+            "source": None,
+            "full_payload_ok": None,
+        }
+
+    # Re-run one-shot only if advertised changes or last result failed/missing and encoder is up
+    if (
+        adv == cached.get("advertised_tokens")
+        and cached.get("full_payload_ok") is True
+    ):
+        return cached
+
+    full_ok = False
+    if encoder_name == "embedder":
+        post_url = _upstream_url(base_url, "/v1/embeddings")
+        text = "x" * EMBED_MAX_CHARS
+        payload = {"input": text, "model": model_id}
+        ceiling = embed_ceiling(EMBED_MAX_CHARS)
+        try:
+            timeout = ClientTimeout(total=ceiling)
+            async with session.post(post_url, json=payload, timeout=timeout) as r:
+                await r.read()
+                full_ok = (r.status == 200)
+        except Exception:
+            full_ok = False
+    else:
+        post_url = _upstream_url(base_url, "/v1/reranking")
+        query = "encoder window probe"
+        special_reserve_chars = int(EMBED_SPECIAL_TOKEN_RESERVE * EMBED_CHARS_PER_TOKEN)
+        doc_len = max(0, int(RERANK_MAX_DOC_CHARS - len(query) - special_reserve_chars))
+        doc = "x" * doc_len
+        payload = {"query": query, "documents": [doc], "model": model_id}
+        ceiling = rerank_ceiling([doc])
+        try:
+            timeout = ClientTimeout(total=ceiling)
+            async with session.post(post_url, json=payload, timeout=timeout) as r:
+                await r.read()
+                full_ok = (r.status == 200)
+        except Exception:
+            full_ok = False
+
+    res = {
+        "advertised_tokens": adv if adv is not None else cached.get("advertised_tokens"),
+        "source": src if src is not None else cached.get("source"),
+        "full_payload_ok": full_ok,
+    }
+    _window_cache[encoder_name] = res
+    return res
+
+
+async def probe_encoder_window(session: Any, embed_base: str, rerank_base: str) -> dict:
+    """Probe both encoders and return the updated snapshot."""
+    await probe_encoder(session, embed_base, "/v1/embeddings", "bge-m3")
+    await probe_encoder(session, rerank_base, "/v1/reranking", "bge-reranker-v2-m3")
+    return get_encoder_window_snapshot()
 
 _embed_window_overruns_total: int = 0
 _embed_window_overruns_last_ts: str | None = None
