@@ -92,11 +92,27 @@ EMBED_MAX_CONTEXT_TOKENS = int(os.environ.get("EMBED_MAX_CONTEXT_TOKENS", "8192"
 # context) and over-estimates tokens (never under-sizes the timeout). Both
 # errors are on the safe side, which is why one constant serves both uses.
 EMBED_CHARS_PER_TOKEN = float(os.environ.get("EMBED_CHARS_PER_TOKEN", "3.0"))
+# Special-token reserve (BOS/EOS/CLS/SEP) so raw text sent to the tokenizer
+# never pushes the final sequence over the model window. Valid range: [0, EMBED_MAX_CONTEXT_TOKENS).
+def _parse_special_token_reserve(max_ctx: int) -> int:
+    raw = os.environ.get("EMBED_SPECIAL_TOKEN_RESERVE", "2")
+    try:
+        val = int(raw)
+        if 0 <= val < max_ctx:
+            return val
+    except (ValueError, TypeError):
+        pass
+    return 2
+
+
+EMBED_SPECIAL_TOKEN_RESERVE = _parse_special_token_reserve(EMBED_MAX_CONTEXT_TOKENS)
+
 # Longest input ever SENT to the embedder — derived from the context above, not
 # a magic number. The FULL text is always kept in Tier 1 and still returned by
 # search; only the vector is computed from the leading slice.
+# Default: (8192 - 2) * 3.0 = 24570 chars (leaving 2 tokens for specials).
 EMBED_MAX_CHARS = int(os.environ.get(
-    "EMBED_MAX_CHARS", str(int(EMBED_MAX_CONTEXT_TOKENS * EMBED_CHARS_PER_TOKEN))))
+    "EMBED_MAX_CHARS", str(int((EMBED_MAX_CONTEXT_TOKENS - EMBED_SPECIAL_TOKEN_RESERVE) * EMBED_CHARS_PER_TOKEN))))
 # Margin over the derived time. Not the invariant — just headroom, because
 # measured throughput falls as the input grows, so a ceiling fitted exactly to
 # the floor has nothing left for the slowest run at the largest size.

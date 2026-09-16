@@ -274,8 +274,8 @@ def test_embed_ceiling_is_monotone_and_bounded_by_the_context(monkeypatch):
     assert vals == sorted(vals), "ceiling must never shrink as input grows"
     full = dt.embed_ceiling(dt.EMBED_MAX_CHARS)
     assert dt.embed_ceiling(dt.EMBED_MAX_CHARS * 10) == full
-    expected = (dt.EMBED_MAX_CONTEXT_TOKENS / dt.EMBED_MIN_TOK_S
-                * dt.EMBED_SAFETY_FACTOR)
+    expected = ((dt.EMBED_MAX_CONTEXT_TOKENS - dt.EMBED_SPECIAL_TOKEN_RESERVE)
+                / dt.EMBED_MIN_TOK_S * dt.EMBED_SAFETY_FACTOR)
     assert abs(full - expected) < 1e-6
 
 
@@ -292,12 +292,47 @@ def test_embed_ceiling_covers_the_measured_cost_at_full_context(monkeypatch):
     assert measured_worst > 20.0
 
 
-def test_embed_max_chars_derives_from_the_context(monkeypatch):
+def test_embed_max_chars_derives_from_the_context_with_reserve(monkeypatch):
     monkeypatch.setenv("EMBED_MAX_CONTEXT_TOKENS", "4096")
     monkeypatch.setenv("EMBED_CHARS_PER_TOKEN", "3.0")
+    monkeypatch.delenv("EMBED_SPECIAL_TOKEN_RESERVE", raising=False)
     monkeypatch.delenv("EMBED_MAX_CHARS", raising=False)
     dt = _fresh(monkeypatch)
-    assert dt.EMBED_MAX_CHARS == 12_288
+    # (4096 - 2) * 3.0 = 12282
+    assert dt.EMBED_SPECIAL_TOKEN_RESERVE == 2
+    assert dt.EMBED_MAX_CHARS == 12_282
+
+
+def test_embed_special_token_reserve_overrides_and_bounds(monkeypatch):
+    monkeypatch.delenv("EMBED_MAX_CHARS", raising=False)
+    # Override reserve to 0 -> (8192 - 0) * 3.0 = 24576
+    monkeypatch.setenv("EMBED_SPECIAL_TOKEN_RESERVE", "0")
+    dt = _fresh(monkeypatch)
+    assert dt.EMBED_SPECIAL_TOKEN_RESERVE == 0
+    assert dt.EMBED_MAX_CHARS == 24_576
+
+    # Default unset env: reserve 2 -> (8192 - 2) * 3.0 = 24570
+    monkeypatch.delenv("EMBED_SPECIAL_TOKEN_RESERVE", raising=False)
+    dt = _fresh(monkeypatch)
+    assert dt.EMBED_SPECIAL_TOKEN_RESERVE == 2
+    assert dt.EMBED_MAX_CHARS == 24_570
+
+    # Explicit EMBED_MAX_CHARS still wins
+    monkeypatch.setenv("EMBED_MAX_CHARS", "20000")
+    dt = _fresh(monkeypatch)
+    assert dt.EMBED_MAX_CHARS == 20_000
+
+    # Bounds: reserve out of [0, EMBED_MAX_CONTEXT_TOKENS) falls back to default 2
+    monkeypatch.delenv("EMBED_MAX_CHARS", raising=False)
+    monkeypatch.setenv("EMBED_SPECIAL_TOKEN_RESERVE", "-1")
+    dt = _fresh(monkeypatch)
+    assert dt.EMBED_SPECIAL_TOKEN_RESERVE == 2
+    assert dt.EMBED_MAX_CHARS == 24_570
+
+    monkeypatch.setenv("EMBED_SPECIAL_TOKEN_RESERVE", "8192")
+    dt = _fresh(monkeypatch)
+    assert dt.EMBED_SPECIAL_TOKEN_RESERVE == 2
+    assert dt.EMBED_MAX_CHARS == 24_570
 
 
 def test_embed_ceiling_knobs_are_env_tunable(monkeypatch):
@@ -306,7 +341,7 @@ def test_embed_ceiling_knobs_are_env_tunable(monkeypatch):
     monkeypatch.setenv("EMBED_SAFETY_FACTOR", "2.0")
     dt = _fresh(monkeypatch)
     assert dt.embed_ceiling(dt.EMBED_MAX_CHARS) == \
-        dt.EMBED_MAX_CONTEXT_TOKENS / 400 * 2.0
+        (dt.EMBED_MAX_CONTEXT_TOKENS - dt.EMBED_SPECIAL_TOKEN_RESERVE) / 400 * 2.0
     assert dt.embed_ceiling(1) == 5.0
 
 
