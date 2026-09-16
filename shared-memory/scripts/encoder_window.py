@@ -80,7 +80,7 @@ async def probe_encoder(
     models_url = _upstream_url(base_url, "/v1/models")
     try:
         timeout = ClientTimeout(total=5.0)
-        async with session.get(models_url, timeout=timeout) as r:
+        async with session.get(models_url, timeout=timeout, allow_redirects=False) as r:
             reachable = True
             if r.status == 200:
                 body = await r.json()
@@ -112,7 +112,7 @@ async def probe_encoder(
         props_url = f"{props_base}/props"
         try:
             timeout = ClientTimeout(total=5.0)
-            async with session.get(props_url, timeout=timeout) as r:
+            async with session.get(props_url, timeout=timeout, allow_redirects=False) as r:
                 reachable = True
                 if r.status == 200:
                     body = await r.json()
@@ -155,7 +155,7 @@ async def probe_encoder(
         ceiling = embed_ceiling(EMBED_MAX_CHARS)
         try:
             timeout = ClientTimeout(total=ceiling)
-            async with session.post(post_url, json=payload, timeout=timeout) as r:
+            async with session.post(post_url, json=payload, timeout=timeout, allow_redirects=False) as r:
                 await r.read()
                 full_ok = (r.status == 200)
         except Exception:
@@ -170,11 +170,12 @@ async def probe_encoder(
         ceiling = rerank_ceiling([doc])
         try:
             timeout = ClientTimeout(total=ceiling)
-            async with session.post(post_url, json=payload, timeout=timeout) as r:
+            async with session.post(post_url, json=payload, timeout=timeout, allow_redirects=False) as r:
                 await r.read()
                 full_ok = (r.status == 200)
         except Exception:
             full_ok = False
+
 
     res = {
         "advertised_tokens": adv if adv is not None else cached.get("advertised_tokens"),

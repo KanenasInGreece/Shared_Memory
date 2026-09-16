@@ -2359,8 +2359,14 @@ class AsyncHiveMindProxy:
         llm_body: bytes | None = None
         if request.can_read_body:
             content_length = request.content_length
-            if content_length is None or content_length <= EMBED_RERANK_BUFFER_CAP:
+            if content_length is not None and content_length <= EMBED_RERANK_BUFFER_CAP:
                 raw_body = await request.read()
+                if len(raw_body) > EMBED_RERANK_BUFFER_CAP:
+                    return web.json_response(
+                        {"error": f"Payload length {len(raw_body)} exceeds buffer cap of {EMBED_RERANK_BUFFER_CAP} bytes"},
+                        status=413,
+                        headers={"X-SM-Fault-Origin": "gateway"},
+                    )
                 if raw_body:
                     from encoder_window import clamp_encoder_payload
                     llm_body = clamp_encoder_payload(raw_body)
@@ -2370,6 +2376,7 @@ class AsyncHiveMindProxy:
             llm_body=llm_body,
             steer_headers=request.headers,
         )
+
 
     async def _forward_upstream(
         self,

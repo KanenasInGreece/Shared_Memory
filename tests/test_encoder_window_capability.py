@@ -76,7 +76,7 @@ async def test_probe_matches_served_model_id_not_data_zero():
         def __init__(self):
             self.posts = []
 
-        def get(self, url, timeout=None):
+        def get(self, url, timeout=None, **kwargs):
             if url.endswith("/v1/models"):
                 return FakeResponse(200, {
                     "data": [
@@ -88,9 +88,10 @@ async def test_probe_matches_served_model_id_not_data_zero():
                 return FakeResponse(404, {})
             return FakeResponse(404, {})
 
-        def post(self, url, json=None, timeout=None):
+        def post(self, url, json=None, timeout=None, **kwargs):
             self.posts.append((url, json, timeout))
             return FakeResponse(200, {"data": [{"embedding": [0.1]}]})
+
 
     session = FakeSession()
     res = await encoder_window.probe_encoder(
@@ -133,14 +134,14 @@ async def test_rerank_one_shot_leaves_query_and_specials_in_window():
         def __init__(self):
             self.posts = []
 
-        def get(self, url, timeout=None):
+        def get(self, url, timeout=None, **kwargs):
             if url.endswith("/v1/models"):
                 return FakeResponse(404, {})
             elif url.endswith("/props"):
                 return FakeResponse(200, {"default_generation_settings": {"n_ctx": 8192}})
             return FakeResponse(404, {})
 
-        def post(self, url, json=None, timeout=None):
+        def post(self, url, json=None, timeout=None, **kwargs):
             self.posts.append((url, json, timeout))
             return FakeResponse(200, {"results": []})
 
@@ -174,11 +175,12 @@ async def test_probe_cache_and_carry_forward():
     })
 
     class FailingSession:
-        def get(self, url, timeout=None):
+        def get(self, url, timeout=None, **kwargs):
             raise ConnectionRefusedError("down")
 
-        def post(self, url, json=None, timeout=None):
+        def post(self, url, json=None, timeout=None, **kwargs):
             raise ConnectionRefusedError("down")
+
 
     session = FailingSession()
     res = await encoder_window.probe_encoder(
@@ -244,3 +246,38 @@ async def test_build_health_checks_includes_encoder_window():
         for name in ("embedder", "reranker")
     )
     assert critical_down is False
+
+
+@pytest.mark.asyncio
+async def test_probe_encoder_disallows_redirects():
+    calls = []
+
+    class FakeResp:
+        status = 200
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            pass
+
+        async def json(self):
+            return {"data": [{"id": "bge-m3", "max_model_len": 8192}]}
+
+        async def read(self):
+            return b"{}"
+
+    class FakeSession:
+        def get(self, url, timeout=None, allow_redirects=True):
+            calls.append(("get", url, allow_redirects))
+            return FakeResp()
+
+        def post(self, url, json=None, timeout=None, allow_redirects=True):
+            calls.append(("post", url, allow_redirects))
+            return FakeResp()
+
+    await encoder_window.probe_encoder(FakeSession(), "http://localhost:8070", "/v1/embeddings", "bge-m3")
+    assert len(calls) >= 2
+    for method, url, allow_red in calls:
+        assert allow_red is False, f"{method} {url} had allow_redirects={allow_red}"
+

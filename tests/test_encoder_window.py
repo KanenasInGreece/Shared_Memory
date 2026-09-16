@@ -160,13 +160,14 @@ def test_handle_encoder_clamps_array_per_element():
         rel_url = URL("/v1/embeddings", encoded=True)
         headers = {}
         can_read_body = True
-        content_length = None
 
         def __init__(self):
             self._payload_writer = AsyncMock()
+            self._raw = json.dumps({"input": ["x" * 50000], "model": "bge-m3"}).encode("utf-8")
+            self.content_length = len(self._raw)
 
         async def read(self):
-            return json.dumps({"input": ["x" * 50000], "model": "bge-m3"}).encode("utf-8")
+            return self._raw
 
     proxy = g.AsyncHiveMindProxy()
     proxy.session = _CaptureSession()
@@ -177,3 +178,74 @@ def test_handle_encoder_clamps_array_per_element():
     # The array must have 1 element, clamped to EMBED_MAX_CHARS (never array slicing)
     assert len(forwarded["input"]) == 1
     assert len(forwarded["input"][0]) == dream_telemetry.EMBED_MAX_CHARS
+
+
+def test_handle_encoder_chunked_does_not_buffer_for_clamp():
+    import asyncio
+    from yarl import URL
+    import hive_mind_proxy as g
+    from unittest.mock import AsyncMock
+
+    sent_data = None
+
+    class _CaptureSession:
+        def request(self, method, url, headers=None, data=None, allow_redirects=False):
+            nonlocal sent_data
+            sent_data = data
+            class _FakeUpstream:
+                status = 200
+                headers = {}
+                async def __aenter__(self):
+                    return self
+                async def __aexit__(self, *args):
+                    pass
+            return _FakeUpstream()
+
+    class _ChunkedEmbedReq:
+        method = "POST"
+        path = "/v1/embeddings"
+        rel_url = URL("/v1/embeddings", encoded=True)
+        headers = {}
+        can_read_body = True
+        content_length = None  # Chunked / streaming (unknown content length)
+        content = b"streamed-chunked-content"
+
+        def __init__(self):
+            self._payload_writer = AsyncMock()
+
+        async def read(self):
+            return b'{"input": ["not-clamped"], "model": "bge-m3"}'
+
+    proxy = g.AsyncHiveMindProxy()
+    proxy.session = _CaptureSession()
+    resp = asyncio.run(proxy.handle_encoder(_ChunkedEmbedReq()))
+    assert resp.status == 200
+    # llm_body was NOT buffered; request.content was passed directly to upstream
+    assert sent_data == b"streamed-chunked-content"
+
+
+def test_handle_encoder_body_exceeding_cap_returns_413():
+    import asyncio
+    from yarl import URL
+    import hive_mind_proxy as g
+    from unittest.mock import AsyncMock
+
+    class _ExceedingReq:
+        method = "POST"
+        path = "/v1/embeddings"
+        rel_url = URL("/v1/embeddings", encoded=True)
+        headers = {}
+        can_read_body = True
+        content_length = g.EMBED_RERANK_BUFFER_CAP
+
+        def __init__(self):
+            self._payload_writer = AsyncMock()
+
+        async def read(self):
+            return b"x" * (g.EMBED_RERANK_BUFFER_CAP + 1)
+
+    proxy = g.AsyncHiveMindProxy()
+    resp = asyncio.run(proxy.handle_encoder(_ExceedingReq()))
+    assert resp.status == 413
+    assert resp.headers.get("X-SM-Fault-Origin") == "gateway"
+
