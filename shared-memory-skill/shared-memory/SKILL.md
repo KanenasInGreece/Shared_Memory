@@ -140,7 +140,9 @@ than rewritten.
 ledgered operator operation may change its project, domain or entities — a plain re-save that matches
 an existing record's content but names a different project, domain or entity set is refused (409
 `axis_conflict`, naming both the stored and the incoming values); a re-save that matches on every axis
-too is the ordinary idempotent path and succeeds unchanged. ⚠ **A renamed DOMAIN makes that re-save
+too is the ordinary idempotent path and succeeds unchanged. A save whose `metadata.type` is not a
+known record type (`fact`, omitted, or `decision` on `save`; judgements have their own endpoints) is
+refused 400 `unknown_type` — do not invent a type string to reach the graph. ⚠ **A renamed DOMAIN makes that re-save
 refuse:** domain aliases are not resolved on the re-save path, so identical content saved again after
 its section was renamed reads as a different domain and is refused with `axis_conflict` — supersede
 the record instead of re-saving it.
@@ -612,7 +614,7 @@ minting all live in **[Documentation/server-setup.md](Documentation/server-setup
 ```bash
 # Liveness (anonymous — status/version/api_version only, v0.9.9 S-10):
 curl http://localhost:8888/health
-# → {"status":"ok","api_version":4,"version":"0.9.107"}
+# → {"status":"ok","api_version":4,"version":"0.9.108"}
 
 # Liveness + API contract check (this client vs the gateway):
 python ~/.claude/skills/shared-memory/scripts/memory_bridge.py doctor
@@ -701,7 +703,7 @@ must be running — see [Documentation/server-setup.md](Documentation/server-set
 
 ## Reference
 
-- **Version:** `python ~/.gemini/skills/shared-memory/scripts/memory_bridge.py --version` → `{"version": "0.9.107", "api_version": 4, "tool": "shared-memory-framework"}`
+- **Version:** `python ~/.gemini/skills/shared-memory/scripts/memory_bridge.py --version` → `{"version": "0.9.108", "api_version": 4, "tool": "shared-memory-framework"}`
 
 ### Updating This Skill
 
