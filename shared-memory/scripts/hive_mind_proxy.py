@@ -2805,9 +2805,10 @@ async def _probe_capability(session) -> dict:
             json={"query": "capability probe", "documents": docs,
                   "top_n": len(docs)},
             timeout=ClientTimeout(total=max(30.0, rerank_ceiling(docs))),
+            allow_redirects=False,
         ) as r:
             await r.read()
-            ok = r.status < 400
+            ok = 200 <= r.status < 300
         dt = max(time.monotonic() - t0, 1e-6)
         entry["latency_s"] = round(dt, 2)
         entry["throughput_chars_s"] = round(probe_chars / dt)
@@ -2837,9 +2838,10 @@ async def _probe_capability(session) -> dict:
             f"{EMBEDDER_URL}/v1/embeddings",
             json={"input": text, "model": "bge-m3"},
             timeout=ClientTimeout(total=max(30.0, embed_ceiling(len(text)))),
+            allow_redirects=False,
         ) as r:
             await r.read()
-            ok = r.status < 400
+            ok = 200 <= r.status < 300
         dt = max(time.monotonic() - t0, 1e-6)
         entry["latency_s"] = round(dt, 2)
         entry["throughput_chars_s"] = round(len(text) / dt)
@@ -4565,8 +4567,8 @@ async def _build_health_checks(proxy: "AsyncHiveMindProxy", coordinator) -> dict
     ]:
         try:
             timeout = ClientTimeout(total=2.0)
-            async with proxy.session.get(url, timeout=timeout) as r:
-                checks[name] = "ok" if r.status < 400 else f"http_{r.status}"
+            async with proxy.session.get(url, timeout=timeout, allow_redirects=False) as r:
+                checks[name] = "ok" if 200 <= r.status < 300 else f"http_{r.status}"
         except asyncio.TimeoutError:
             checks[name] = "timeout"
         except Exception:
@@ -5367,8 +5369,10 @@ async def main() -> None:
         await uds_site.stop()
     log.info("Draining in-flight requests...")
     await runner.cleanup()
+    # S7 probe uses the proxy session, so cancel it before session close.
     await _drain_watchdogs_and_daemons(
-        watchdog_task, rem_watchdog_task, (capability_task, token_lifecycle_task))
+        watchdog_task, rem_watchdog_task,
+        (capability_task, token_lifecycle_task, llm_probe_task))
     # A2: unconditional lifecycle sum on graceful shutdown — DIRECT
     # SYNCHRONOUS write (see _emit_token_lifecycle_sums' docstring), so it
     # runs here rather than through proxy.cleanup()/coordinator.stop().

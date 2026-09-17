@@ -333,7 +333,7 @@ async def test_build_health_checks_includes_encoder_window():
             pass
 
     class FakeSession:
-        def get(self, url, timeout=None):
+        def get(self, url, timeout=None, **_kw):
             return FakeResp()
 
     class FakeProxy:

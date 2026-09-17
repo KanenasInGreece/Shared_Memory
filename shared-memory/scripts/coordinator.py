@@ -631,6 +631,51 @@ class ProjectIdentityUnavailable(RuntimeError):
     """Registry lookup failed for a name that should have an id: outbox retries, save is 503, readers degrade."""
 
 
+class DomainIdentityUnavailable(RuntimeError):
+    """Registry lookup failed for a section that should have an id: outbox retries; a missing row stays None."""
+
+
+_OUTBOX_ROW_TYPES = frozenset({
+    "fact", "decision", "retrospective", "supersede", "project_of", "domain_of",
+})
+_OUTBOX_GRAPH_PRESENT = frozenset({"applied", "rem_reviewed", "consolidated"})
+_DREAM_CYCLE_OUTBOX_TYPE = (
+    "(cypher_params->>'type' IS NULL"
+    " OR cypher_params->>'type' IN ('fact','decision','retrospective'))"
+)
+
+
+def _outbox_row_type(raw) -> str:
+    """Known outbox type, or fact for missing/blank. Unknown non-empty stays unknown so `_require_outbox_type` raises."""
+    if not isinstance(raw, str) or not raw.strip():
+        return "fact"
+    t = raw.strip().lower()
+    return t if t in _OUTBOX_ROW_TYPES else t
+
+
+def _require_outbox_type(params: dict) -> None:
+    """Refuse an unknown cypher_params type before INSERT (CHECK is the other half)."""
+    t = params.get("type") if isinstance(params, dict) else None
+    if t is None or t == "":
+        return
+    if isinstance(t, str) and t.strip().lower() in _OUTBOX_ROW_TYPES:
+        return
+    raise ValueError(f"unknown neo4j_outbox type {t!r}")
+
+
+def _record_kind_label(metadata, incoming_type=None) -> str:
+    """Graph kind for the frozen kind axis: record_label_for_type, plus a decision blob means Decision."""
+    meta = _coerce_jsonb_obj(metadata) if metadata is not None else {}
+    if not isinstance(meta, dict):
+        meta = {}
+    t = incoming_type if incoming_type is not None else meta.get("type")
+    label = record_label_for_type(t)
+    blob = meta.get("decision")
+    if label == ONT.fact and isinstance(blob, dict) and blob:
+        return ONT.decision
+    return label
+
+
 # Resolve one name via entity_normalize: canonical first, then alias (fact:1375).
 ENTITY_VOCAB_RESOLVE_SQL = """
     SELECT COALESCE(canon.name, alias_canon.name) AS canonical_name
@@ -1692,8 +1737,8 @@ async def auth_middleware(request: web.Request, handler):
         # the agent. Every handler and the audit hook read it from here, spoof-proof.
         principal = _peer_identity(request)
         request["principal"] = principal
-        # Role + governance gate. Read-only roles are confined to the telemetry/graph
-        # allowlist; admin-role tokens are confined to /admin/* (and no other role may
+        # Role + governance gate. Read-only roles are confined to telemetry/search
+        # (graph stays 403 — do not add /memory/graph to _READ_ROLE_ROUTES); admin-role tokens are confined to /admin/* (and no other role may
         # reach an admin route); and while a backup quiesce is active the write routes
         # shed 503 + Retry-After so the dump sees a quiet DB. Reads always flow — so a
         # leaked monitor token cannot save/supersede/proxy, and a leaked backup token
@@ -3309,24 +3354,29 @@ class MemoryCoordinator:
         # One clock read on either side, and the recorders cannot raise.
         _t0 = time.monotonic()
         try:
-            if params.get("type") == "decision":
-                await self._apply_decision_outbox_row(outbox_id, pg_id, params)
-                return
-
-            if params.get("type") == "retrospective":
-                await self._apply_retrospective_outbox_row(outbox_id, pg_id, params)
-                return
-
-            if params.get("type") == "supersede":
-                await self._apply_supersede_outbox_row(outbox_id, params)
-                return
-
-            if params.get("type") == "project_of":
-                await self._apply_project_of_outbox_row(outbox_id, pg_id, params)
-                return
-
-            if params.get("type") == "domain_of":
-                await self._apply_domain_of_outbox_row(outbox_id, pg_id, params)
+            row_type = params.get("type")
+            if row_type not in (None, "", "fact"):
+                if row_type == "decision":
+                    await self._apply_decision_outbox_row(outbox_id, pg_id, params)
+                    return
+                if row_type == "retrospective":
+                    await self._apply_retrospective_outbox_row(outbox_id, pg_id, params)
+                    return
+                if row_type == "supersede":
+                    await self._apply_supersede_outbox_row(outbox_id, params)
+                    return
+                if row_type == "project_of":
+                    await self._apply_project_of_outbox_row(outbox_id, pg_id, params)
+                    return
+                if row_type == "domain_of":
+                    await self._apply_domain_of_outbox_row(outbox_id, pg_id, params)
+                    return
+                log.warning(
+                    "outbox: unknown type %r pg_id=%d (outbox_id=%d) — marking failed; "
+                    "a type error will never succeed",
+                    row_type, pg_id, outbox_id,
+                )
+                await self._fail_outbox_immediately(outbox_id, conn)
                 return
 
             # Standard Fact + Entity MERGE — all writes in one round-trip so they
@@ -3338,8 +3388,10 @@ class MemoryCoordinator:
                 pg_id, project_id, params.get("domains"))
             clean_entities = self._gate_graph_entities(pg_id, params.get("entities", []))
             async with self._neo4j.session() as session:
-                await session.run(
-                    f"MERGE (f:{ONT.fact} {{pg_id: $pg_id}})"
+                merge_result = await session.run(
+                    f"OPTIONAL MATCH (existing:{self._SPINE}) WHERE existing.pg_id = $pg_id"
+                    f" WITH existing WHERE existing IS NULL OR existing:{ONT.fact}"
+                    f" MERGE (f:{ONT.fact} {{pg_id: $pg_id}})"
                     f" SET f.content = $content, f.source = $source,"
                     f"     f.fact_kind = $fact_kind"
                     + (" SET f.source_ref = $source_ref" if source_ref else "")
@@ -3382,6 +3434,14 @@ class MemoryCoordinator:
                     entities=clean_entities,
                     **( {"source_ref": source_ref} if source_ref else {} ),
                 )
+                if not await self._outbox_write_landed(merge_result):
+                    log.warning(
+                        "outbox: pg_id=%d already exists under a different spine label — "
+                        "marking failed (will never succeed)",
+                        pg_id,
+                    )
+                    await self._fail_outbox_immediately(outbox_id, conn)
+                    return
                 if clean_entities:
                     async with self._acquire() as c:
                         await c.executemany(
@@ -3422,7 +3482,7 @@ class MemoryCoordinator:
                 (time.monotonic() - _t0) * 1000.0))
             log.debug("outbox: applied pg_id=%d (outbox_id=%d)", pg_id, outbox_id)
         except Exception as exc:
-            if isinstance(exc, (asyncpg.PostgresError, asyncpg.InterfaceError, asyncio.TimeoutError, ProjectIdentityUnavailable)):
+            if isinstance(exc, (asyncpg.PostgresError, asyncpg.InterfaceError, asyncio.TimeoutError, ProjectIdentityUnavailable, DomainIdentityUnavailable)):
                 log.warning(
                     "outbox: postgres error pg_id=%d attempt %d/%d: %s",
                     pg_id, retries + 1, OUTBOX_MAX_RETRIES, exc,
@@ -3471,6 +3531,36 @@ class MemoryCoordinator:
                     "outbox: failed to update retry status for outbox_id=%d (pg_id=%d): %s",
                     outbox_id, pg_id, update_exc,
                 )
+
+    async def _fail_outbox_immediately(self, outbox_id: int, conn=None) -> None:
+        """Mark failed without bumping retries — a type error will never succeed."""
+        if conn is None:
+            async with self._acquire() as c:
+                await c.execute(
+                    "UPDATE neo4j_outbox SET status='failed' WHERE id=$1",
+                    outbox_id,
+                )
+        else:
+            await conn.execute(
+                "UPDATE neo4j_outbox SET status='failed' WHERE id=$1",
+                outbox_id,
+            )
+
+    @staticmethod
+    async def _outbox_write_landed(result) -> bool:
+        """False when the spine-kind WHERE dropped the MERGE (0 nodes, 0 properties)."""
+        consume = getattr(result, "consume", None)
+        if consume is None:
+            return True
+        summary = consume()
+        if hasattr(summary, "__await__"):
+            summary = await summary
+        counters = getattr(summary, "counters", None)
+        if counters is None:
+            return True
+        created = getattr(counters, "nodes_created", None)
+        props = getattr(counters, "properties_set", None)
+        return not (created == 0 and props == 0)
 
 
     # ── Per-alternative vectors ───────────────────────────────────────────────
@@ -3784,8 +3874,10 @@ class MemoryCoordinator:
         domain_ids = await self._domain_identities(
             pg_id, project_id, params.get("domains"))
         async with self._neo4j.session() as session:
-            await session.run(
-                f"MERGE (d:{ONT.decision} {{pg_id: $pg_id}})"
+            merge_result = await session.run(
+                f"OPTIONAL MATCH (existing:{self._SPINE}) WHERE existing.pg_id = $pg_id"
+                f" WITH existing WHERE existing IS NULL OR existing:{ONT.decision}"
+                f" MERGE (d:{ONT.decision} {{pg_id: $pg_id}})"
                 f"  SET d.title       = $title,"
                 f"      d.rationale   = $rationale,"
                 f"      d.date        = $date,"
@@ -3827,6 +3919,14 @@ class MemoryCoordinator:
                 domains=domain_ids,
                 assisted_by=decision.get("assisted_by", []),
             )
+            if not await self._outbox_write_landed(merge_result):
+                log.warning(
+                    "outbox: pg_id=%d already exists under a different spine label — "
+                    "marking failed (will never succeed)",
+                    pg_id,
+                )
+                await self._fail_outbox_immediately(outbox_id)
+                return
             # Typed decision→fact grounding (decision 582): shared writer — see
             # _write_typed_grounding. Legacy flat GROUNDED_IN is the fallback for
             # outbox rows queued before this shipped (no 'grounded').
@@ -3892,8 +3992,10 @@ class MemoryCoordinator:
             if params.get("v") == 2:
                 target_pg_id = params.get("target_pg_id")
                 source_ref = params.get("source_ref") or None
-                await session.run(
-                    f"MERGE (r:{ONT.retrospective} {{pg_id: $pg_id}})"
+                merge_result = await session.run(
+                    f"OPTIONAL MATCH (existing:{self._SPINE}) WHERE existing.pg_id = $pg_id"
+                    f" WITH existing WHERE existing IS NULL OR existing:{ONT.retrospective}"
+                    f" MERGE (r:{ONT.retrospective} {{pg_id: $pg_id}})"
                     f" SET r.rating = $rating, r.date = $date,"
                     f"     r.content = $content, r.source = $source,"
                     f"     r.fact_kind = $fact_kind"
@@ -3906,6 +4008,14 @@ class MemoryCoordinator:
                     fact_kind=params.get("fact_kind") or "observation",
                     **({"source_ref": source_ref} if source_ref else {}),
                 )
+                if not await self._outbox_write_landed(merge_result):
+                    log.warning(
+                        "outbox: pg_id=%d already exists under a different spine label — "
+                        "marking failed (will never succeed)",
+                        pg_id,
+                    )
+                    await self._fail_outbox_immediately(outbox_id)
+                    return
                 # HAD_OUTCOME trigger edge from the target Decision (+ reversal
                 # mirror) — separate statement: a missing decision is a no-op
                 # for the edge but never loses the Retrospective record.
@@ -4035,38 +4145,27 @@ class MemoryCoordinator:
                 "no graph write, row dropped (outbox_id=%d)", pg_id, outbox_id,
             )
             return
+        project_id = await self._project_identity(params.get("project"))
+        domain_ids = await self._domain_identities(
+            pg_id, project_id, params.get("domains"))
         async with self._neo4j.session() as session:
-            # MATCH, never MERGE — a repair mints no records. A record whose node
-            # is gone leaves the row dropped rather than conjuring a phantom.
-            exists = await (await session.run(
-                f"MATCH (n:{self._SPINE}) WHERE n.pg_id = $pg_id RETURN count(n) AS n",
-                pg_id=pg_id,
-            )).single()
-            if not exists or not exists["n"]:
-                log.info("outbox: domain_of pg_id=%s has no spine node — row dropped",
-                         pg_id)
-            else:
-                project_id = await self._project_identity(params.get("project"))
-                domain_ids = await self._domain_identities(
-                    pg_id, project_id, params.get("domains"))
-                await session.run(
-                    f"MATCH (n:{self._SPINE}) WHERE n.pg_id = $pg_id"
-                    f" MATCH (n)-[stale:{ONT.domain_of}]->()"
-                    f" DELETE stale",
-                    pg_id=pg_id,
-                )
-                if domain_ids and project_id is not None:
-                    await session.run(
-                        f"MATCH (n:{self._SPINE}) WHERE n.pg_id = $pg_id"
-                        f" FOREACH (row IN $domains |"
-                        f"   MERGE (dp:{ONT.project} {{project_id: $project_id}})"
-                        f"   {domain_merge_cypher(id_param='row.id')}"
-                        f"   SET d.name = row.name"
-                        f"   MERGE (n)-[:{ONT.domain_of}]->(d)"
-                        f"   MERGE (d)-[:{ONT.project_of}]->(dp))",
-                        pg_id=pg_id, domains=domain_ids, project_id=project_id,
-                    )
-                    written = len(domain_ids)
+            # One statement: OPTIONAL MATCH/DELETE stale, then UNWIND to MATCH
+            # existing Domain nodes (FOREACH cannot contain MATCH). Empty
+            # $domains still clears and stops. Repair mints no Domain/spine nodes.
+            await session.run(
+                f"MATCH (n:{self._SPINE}) WHERE n.pg_id = $pg_id"
+                f" OPTIONAL MATCH (n)-[stale:{ONT.domain_of}]->()"
+                f" DELETE stale"
+                f" WITH DISTINCT n"
+                f" UNWIND $domains AS row"
+                f" MATCH (d:{ONT.domain} {{domain_id: row.id}})"
+                f" SET d.name = row.name"
+                f" MERGE (n)-[:{ONT.domain_of}]->(d)"
+                f" MERGE (dp:{ONT.project} {{project_id: $project_id}})"
+                f" MERGE (d)-[:{ONT.project_of}]->(dp)",
+                pg_id=pg_id, domains=domain_ids, project_id=project_id,
+            )
+            written = len(domain_ids)
         async with self._acquire() as conn:
             await conn.execute("DELETE FROM neo4j_outbox WHERE id=$1", outbox_id)
         log.info(
@@ -4075,17 +4174,26 @@ class MemoryCoordinator:
         )
 
     async def _wait_for_outbox(self, pg_id: int) -> bool:
-        """Poll until the outbox row for pg_id is applied, or CONSISTENCY_TIMEOUT expires."""
+        """Poll the dream-cycle outbox row until the graph is present, failed, or CONSISTENCY_TIMEOUT."""
         loop = asyncio.get_running_loop()
         deadline = loop.time() + CONSISTENCY_TIMEOUT
         while loop.time() < deadline:
             async with self._acquire() as conn:
                 row = await conn.fetchrow(
-                    "SELECT status FROM neo4j_outbox WHERE pg_id=$1 ORDER BY id DESC LIMIT 1",
+                    "SELECT status FROM neo4j_outbox WHERE pg_id=$1"
+                    f" AND {_DREAM_CYCLE_OUTBOX_TYPE}"
+                    " ORDER BY id DESC LIMIT 1",
                     pg_id,
                 )
-            if row and row["status"] == "applied":
+            if row is None:
+                # Fast worker: applied (and NREM-deleted) before the first poll,
+                # or vanished after we had seen the dream-cycle row.
                 return True
+            status = row["status"]
+            if status in _OUTBOX_GRAPH_PRESENT:
+                return True
+            if status == "failed":
+                return False
             await asyncio.sleep(0.25)
         return False
 
@@ -4828,11 +4936,14 @@ class MemoryCoordinator:
         try:
             async with self._acquire() as conn:
                 return await conn.fetchval(DOMAIN_EXISTS_SQL, project_id, name.strip())
+        except DomainIdentityUnavailable:
+            raise
         except Exception as exc:
-            log.warning("domain identity lookup failed for %r in project id %s, "
-                        "the record keeps its domain and gets no edge: %s",
-                        name, project_id, exc)
-            return None
+            log.error("domain identity lookup FAILED for %r in project id %s: %s",
+                      name, project_id, exc)
+            raise DomainIdentityUnavailable(
+                f"the domain registry could not be read for {name!r} in project id {project_id}"
+            ) from exc
 
     async def _resolve_domain_alias(self, project_id: int, name: str) -> str | None:
         """The canonical section a retired spelling resolves to, or None.
@@ -5273,6 +5384,7 @@ class MemoryCoordinator:
 
     async def _axis_conflict_error(
         self, stored: object, project, domains, entities, is_judgement: bool,
+        incoming_type=None, incoming_metadata=None,
     ) -> dict | None:
         """409 when re-saving identical CONTENT under DIFFERENT axes — or None
         (P1, item 4 of the v0.9.69 plan). Pure.
@@ -5340,6 +5452,15 @@ class MemoryCoordinator:
                 "existing": existing,
                 "incoming": incoming,
             }
+
+        incoming_meta = incoming_metadata if isinstance(incoming_metadata, dict) else {}
+        if incoming_type is not None or incoming_meta:
+            incoming_label = _record_kind_label(incoming_meta, incoming_type=incoming_type)
+        else:
+            incoming_label = ONT.decision if is_judgement else ONT.fact
+        stored_label = _record_kind_label(stored)
+        if stored_label != incoming_label:
+            return _refusal("kind", stored_label, incoming_label)
 
         existing_project = resolve_project(stored)
         if axis_key(existing_project) != axis_key(project):
@@ -6048,6 +6169,25 @@ class MemoryCoordinator:
             return web.json_response(
                 {"status": "error", "message": "content is required"}, status=400
             )
+        try:
+            _require_outbox_type({
+                "type": _outbox_row_type(
+                    metadata.get("type") if isinstance(metadata, dict) else None
+                ),
+            })
+        except ValueError:
+            raw_type = metadata.get("type") if isinstance(metadata, dict) else None
+            return web.json_response(
+                {
+                    "status": "error",
+                    "error": "unknown_type",
+                    "message": (
+                        f"metadata.type {_short(raw_type)} is not a known record type. "
+                        "A fact omits type (or sends 'fact'); a decision sends 'decision'."
+                    ),
+                },
+                status=400,
+            )
         if not isinstance(metadata, dict):
             return web.json_response(
                 {"status": "error", "message": "metadata must be a JSON object"}, status=400
@@ -6302,7 +6442,8 @@ class MemoryCoordinator:
         if prior is not None:
             conflict = await self._axis_conflict_error(
                 prior, incoming_project, incoming_domains,
-                entity_plan.get("canonical") or [], is_judgement)
+                entity_plan.get("canonical") or [], is_judgement,
+                incoming_type=metadata.get("type"), incoming_metadata=metadata)
             if conflict is not None:
                 self._count_refusal(conflict)
                 return web.json_response(conflict, status=409)
@@ -6387,7 +6528,9 @@ class MemoryCoordinator:
                     if prior is not None:
                         conflict = await self._axis_conflict_error(
                             prior, incoming_project, incoming_domains,
-                            entities, is_judgement)
+                            entities, is_judgement,
+                            incoming_type=metadata.get("type"),
+                            incoming_metadata=metadata)
                         if conflict is not None:
                             self._count_refusal(conflict)
                             return web.json_response(conflict, status=409)
@@ -6433,13 +6576,7 @@ class MemoryCoordinator:
 
                     # Outbox row written atomically with the fact.
                     # The Phase 2 outbox worker drains this table.
-                    await conn.execute(
-                        """
-                        INSERT INTO neo4j_outbox (pg_id, cypher_params)
-                        VALUES ($1, $2::jsonb)
-                        """,
-                        pg_id,
-                        {
+                    outbox_params = {
                             "content_snippet": content[:200],
                             "source": metadata.get("source", "coordinator"),
                             # ⛔ FACTS ONLY (item 3, v0.9.69). A judgement
@@ -6461,7 +6598,7 @@ class MemoryCoordinator:
                             "project": project_for_graph(metadata),
                             # Outbox carries domain NAMES (resolved at apply); judgements never reach here with a value.
                             "domains": resolve_domains(metadata),
-                            "type": metadata.get("type", "fact"),
+                            "type": _outbox_row_type(metadata.get("type")),
                             "decision": metadata.get("decision", {}),
                             "source_ref": metadata.get("source_ref") or None,
                             # fact_kind: soft epistemic tag, DERIVED from source_ref
@@ -6488,7 +6625,15 @@ class MemoryCoordinator:
                                 supersedes if (supersedes is not None
                                                and supersedes != pg_id) else None
                             ),
-                        },
+                    }
+                    _require_outbox_type(outbox_params)
+                    await conn.execute(
+                        """
+                        INSERT INTO neo4j_outbox (pg_id, cypher_params)
+                        VALUES ($1, $2::jsonb)
+                        """,
+                        pg_id,
+                        outbox_params,
                     )
 
                     # Flag the superseded predecessor in the SAME transaction as
@@ -6659,10 +6804,12 @@ class MemoryCoordinator:
                     " WHERE id = $1",
                     pg_id, by,
                 )
+                _supersede_params = {"type": "supersede", "old_pg_id": pg_id, "new_pg_id": by}
+                _require_outbox_type(_supersede_params)
                 await conn.execute(
                     "INSERT INTO neo4j_outbox (pg_id, cypher_params) VALUES ($1, $2::jsonb)",
                     pg_id,
-                    {"type": "supersede", "old_pg_id": pg_id, "new_pg_id": by},
+                    _supersede_params,
                 )
                 # Ride-along only if a live successor fact row exists to purge us
                 # later; otherwise purge this fact's own dream-cycle row now.
@@ -6888,12 +7035,11 @@ class MemoryCoordinator:
         entities_rewritten = None
 
         # Embedding — hard mandate, same as every record; no save without a vector.
-        # Identity: a retrospective is (target decision, notes) — the target is part
-        # of the hash, so identical boilerplate notes on two DIFFERENT decisions stay
-        # two records (and can never hash-collide with a plain fact whose content
-        # equals the notes), while re-saving the same retro still dedupes.
+        # Identity: a retrospective is (target, date, rating, notes) — the target is
+        # part of the hash, so identical boilerplate notes on two DIFFERENT decisions
+        # stay two records, and a reversed rating is not the same record as validated.
         content_hash = hashlib.sha256(
-            f"retrospective:{pg_id}:{notes}".encode()
+            f"retrospective:{pg_id}:{date}:{rating}:{notes}".encode()
         ).hexdigest()
         try:
             async with httpx.AsyncClient(timeout=30.0, trust_env=False) as client:
@@ -6959,10 +7105,7 @@ class MemoryCoordinator:
                     # lifecycle (applied → rem_reviewed → consolidated → deleted
                     # after the insight fold). 'v': 2 selects the node projection;
                     # target_pg_id keys the insight triggers.
-                    await conn.execute(
-                        "INSERT INTO neo4j_outbox (pg_id, cypher_params) VALUES ($1, $2::jsonb)",
-                        retro_pg_id,
-                        {
+                    _retro_outbox = {
                             "v": 2,
                             "type": "retrospective",
                             "target_pg_id": pg_id,
@@ -6979,7 +7122,12 @@ class MemoryCoordinator:
                             "fact_kind": fact_kind_from_source_ref(source_ref),
                             "grounded_in": grounded_ids,
                             "grounded": grounded_typed,
-                        },
+                    }
+                    _require_outbox_type(_retro_outbox)
+                    await conn.execute(
+                        "INSERT INTO neo4j_outbox (pg_id, cypher_params) VALUES ($1, $2::jsonb)",
+                        retro_pg_id,
+                        _retro_outbox,
                     )
                     if is_reversal:
                         try:
@@ -8217,7 +8365,8 @@ class MemoryCoordinator:
             )
             ob = await conn.fetchrow(
                 "SELECT status, retries, applied_at, rem_reviewed_at, consolidated_at"
-                " FROM neo4j_outbox WHERE pg_id = $1 ORDER BY id DESC LIMIT 1", pg_id,
+                f" FROM neo4j_outbox WHERE pg_id = $1 AND {_DREAM_CYCLE_OUTBOX_TYPE}"
+                " ORDER BY id DESC LIMIT 1", pg_id,
             )
             summ = await conn.fetch(
                 "SELECT cs.id, COALESCE(cs.metadata->>'kind','thematic') AS kind,"

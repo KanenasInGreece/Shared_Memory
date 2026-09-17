@@ -2,7 +2,7 @@
 //
 // Run this ONCE on a fresh Neo4j instance, before the first gateway start.
 // Neo4j constraints are NOT created automatically — without them, MERGE races
-// can create duplicate Entity / Fact / Decision nodes. This is the Neo4j
+// can create duplicate Entity / Fact / Decision / Retrospective nodes. This is the Neo4j
 // counterpart to schema_init.sql for Postgres.
 //
 // Usage (cypher-shell):
@@ -32,6 +32,13 @@ CREATE CONSTRAINT community_summary_pg_id IF NOT EXISTS
 // Decision: one per technical_docs row of type=decision
 CREATE CONSTRAINT decision_pg_id IF NOT EXISTS
     FOR (n:Decision) REQUIRE n.pg_id IS UNIQUE;
+
+// Retrospective: one per technical_docs row of type=retrospective.
+// Duplicate :Retrospective nodes (same pg_id) must be merged by an operator
+// before this constraint can apply on a long-lived instance — this file does
+// not auto-DELETE them.
+CREATE CONSTRAINT retrospective_pg_id IF NOT EXISTS
+    FOR (n:Retrospective) REQUIRE n.pg_id IS UNIQUE;
 
 // Human: the person who owns a decision (decided_by field)
 CREATE CONSTRAINT human_name IF NOT EXISTS
