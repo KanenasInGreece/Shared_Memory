@@ -134,12 +134,15 @@ def postgres_projects(conn) -> dict[int, str | None]:
 
 
 def already_queued(conn, pg_ids: list[int]) -> set[int]:
+    """pg_ids with a project_of row still pending or in_progress. Failed rows
+    are excluded so a re-run enqueues a new repair rather than resetting them."""
     if not pg_ids:
         return set()
     with conn.cursor() as cur:
         cur.execute(
             "SELECT DISTINCT pg_id FROM neo4j_outbox"
-            " WHERE cypher_params->>'type' = 'project_of' AND pg_id = ANY(%s)",
+            " WHERE cypher_params->>'type' = 'project_of' AND pg_id = ANY(%s)"
+            " AND status IN ('pending','in_progress')",
             (pg_ids,),
         )
         return {r[0] for r in cur.fetchall()}

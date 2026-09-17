@@ -494,7 +494,14 @@ CREATE TABLE IF NOT EXISTS neo4j_outbox (
     applied_at       TIMESTAMPTZ,
     next_attempt_at  TIMESTAMPTZ,
     rem_reviewed_at  TIMESTAMPTZ,
-    consolidated_at  TIMESTAMPTZ
+    consolidated_at  TIMESTAMPTZ,
+    CONSTRAINT neo4j_outbox_type_known CHECK (
+        ((cypher_params->>'type') IS NULL)
+        OR ((cypher_params->>'type') = '')
+        OR ((cypher_params->>'type') IN (
+            'fact', 'decision', 'retrospective', 'supersede', 'project_of', 'domain_of'
+        ))
+    )
 );
 
 CREATE INDEX IF NOT EXISTS neo4j_outbox_pending_id_idx ON public.neo4j_outbox USING btree (id) WHERE (status = 'pending'::text);

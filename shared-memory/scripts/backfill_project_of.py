@@ -28,7 +28,8 @@ silent, graph-side data loss, so the version check below is a GUARD, not a
 convenience: enqueue only after the deploy, never before.
 
 Dry-run by default. Idempotent: re-running enqueues nothing for facts that
-already have the edge, and skips any fact with a row already pending.
+already have the edge, and skips any fact with a row already pending or
+in_progress (failed rows are excluded so a re-run enqueues a new repair).
 
     python backfill_project_of.py                 # report only
     python backfill_project_of.py --apply         # enqueue
@@ -126,14 +127,17 @@ def resolve(conn, pg_ids: list[int]) -> dict[int, str | None]:
 
 
 def already_queued(conn, pg_ids: list[int]) -> set[int]:
-    """pg_ids with a project_of row still pending — so a re-run before the
-    worker drains does not enqueue the same repair twice."""
+    """pg_ids with a project_of row still pending or in_progress — so a re-run
+    before the worker drains does not enqueue the same repair twice. Failed
+    rows are excluded — a re-run enqueues a new repair rather than resetting
+    them."""
     if not pg_ids:
         return set()
     with conn.cursor() as cur:
         cur.execute(
             "SELECT DISTINCT pg_id FROM neo4j_outbox"
-            " WHERE cypher_params->>'type' = 'project_of' AND pg_id = ANY(%s)",
+            " WHERE cypher_params->>'type' = 'project_of' AND pg_id = ANY(%s)"
+            " AND status IN ('pending','in_progress')",
             (pg_ids,),
         )
         return {r[0] for r in cur.fetchall()}

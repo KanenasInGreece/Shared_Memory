@@ -85,7 +85,7 @@ def test_tier3_thematic_fallback_filters_superseded():
         pass
     # every community_summaries read on the search path carries the guard
     start = SRC.index("vis_t3, vis_t3_params = _visibility_filter")
-    end = SRC.index("# Tier 1 — vector search", start)
+    end = SRC.index("Retrieve pool is a floor", start)
     block = SRC[start:end]
     assert block.count("FROM community_summaries") == 3
     assert block.count("NOT superseded") == 3, (
@@ -158,7 +158,7 @@ def test_lifecycle_attaches_and_does_not_add_rows():
     """The caller's limit is a contract (v0.8.51). Resolution must ENRICH the
     decision row, never append a companion record that inflates the result set
     past what was asked for."""
-    i = SRC.index("# ── LIFECYCLE RESOLUTION")
+    i = SRC.index("# Attach each returned decision's current verdict in place")
     frag = SRC[i:i + 3000]
     assert 'r["lifecycle"] = entry' in frag
     assert "final.append" not in frag, (
@@ -171,7 +171,7 @@ def test_qualifying_ratings_carry_the_verdict_text():
     a rating word alone does not carry the reasoning — so the retrospective's own
     text travels with the decision. `validated`/`pending` need only the rating."""
     assert '_QUALIFYING_RATINGS = ("refined", "mixed", "reversed")' in SRC
-    i = SRC.index("# ── LIFECYCLE RESOLUTION")
+    i = SRC.index("# Attach each returned decision's current verdict in place")
     frag = SRC[i:i + 3000]
     assert "_QUALIFYING_RATINGS" in frag
     assert "retrospective_content" in frag
@@ -182,6 +182,6 @@ def test_lifecycle_failure_never_fails_the_search():
     lifecycle rather than to no search — the FAILURE != IDLE rule."""
     i = SRC.index("async def _resolve_decision_lifecycle")
     assert "return {}" in SRC[i:i + 2200]
-    j = SRC.index("# ── LIFECYCLE RESOLUTION")
+    j = SRC.index("# Attach each returned decision's current verdict in place")
     frag = SRC[j:j + 3000]
     assert frag.count("except Exception:") >= 2

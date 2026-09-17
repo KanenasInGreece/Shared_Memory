@@ -1,22 +1,4 @@
-"""One project resolution, shared by every reader (invariant P1).
-
-The project a record belongs to is Postgres-metadata semantics, not graph
-vocabulary, so this does not belong in ``ontology.py``. It is also not owned by
-either daemon: ``coordinator.py`` and ``consolidation_loop.py`` import nothing
-from each other, and before this module the same COALESCE existed in eight
-places in five files — three of them already canonical, five of them not. Two
-readers additionally fell back to ``domain`` and one to ``scope``, so the same
-record answered "which project?" differently depending on who asked.
-
-Two things are deliberately OUT of the chain:
-
-* ``domain`` — a domain is a SECTION OF a project. Falling back from a project
-  to a section of some project was never defensible: it makes a section answer
-  a question about the whole, and on this corpus it is what let 219 of 261
-  decisions read as untagged while carrying a project all along.
-* ``scope`` — access control, never topical. Including it keys a record by who
-  may SEE it rather than what it is ABOUT, which on a deployment that uses
-  scopes silently partitions along permission lines.
+"""Resolve a record's project from Postgres metadata; never fall back to domain (a section) or scope (access control).
 
 SERVER-SIDE ONLY. Never added to ``sync_skills.sh`` or ``shared-memory-skill/``
 — the skill is a thin HTTP client and resolution happens at ingress.

@@ -809,8 +809,9 @@ place**, every other agent's digest byte-identical, untouched.
 
 ⛔ **A READ-ONLY IDENTITY IS ALWAYS MINTED READ-ONLY.** `generate_tokens.py`'s `READ_ONLY_AGENTS`
 list is authoritative on **every** mint path: `--add monitor` writes `monitor:read` into
-`AGENT_ROLES`, confining that token to `GET /health`, `GET /memory/telemetry` and read-only Cypher
-on `POST /memory/graph` — every other route answers 403. Pass `--role read|full|admin` to confine an
+`AGENT_ROLES`. A `read` token may reach `GET /memory/telemetry`, `POST /memory/search`, and
+`GET /memory/status/{pg_id}`; `POST /memory/graph` is 403; `/health` is anonymous (not a
+read-role grant). Pass `--role read|full|admin` to confine an
 agent that is *not* on that list; **widening one that is, is refused before anything is minted.**
 Absence from `AGENT_ROLES` means full read/write, so a missing entry is not a neutral default — it
 is the widest one. *(Until v0.9.35 only the BULK mint emitted this line, so `--add monitor` produced

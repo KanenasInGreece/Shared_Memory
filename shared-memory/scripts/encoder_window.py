@@ -1,4 +1,4 @@
-"""Encoder window contract and overflow handling for shared-memory (decision:2540).
+"""Classify embed/rerank 400/413 as window mismatch vs slack-bounded overrun, and clamp embedding inputs per string (decision:2540).
 
 Defines:
 - classify_overflow(): detects window mismatch vs slack-bounded overrun on HTTP 400/413.

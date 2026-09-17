@@ -36,7 +36,8 @@ Records whose domain is not a REGISTERED section are reported and skipped: the
 worker would drop them anyway (there is no name-keyed Domain node), and
 registering on their behalf is the operator's judgement, not this tool's.
 
-Dry-run by default. Idempotent: skips any record with a row already pending, and
+Dry-run by default. Idempotent: skips any record with a row already pending or
+in_progress (failed rows are excluded so a re-run enqueues a new repair), and
 the worker's apply replaces the record's edge set rather than accumulating.
 
     python backfill_domain_of.py                 # report only
@@ -131,12 +132,15 @@ def registry(conn) -> dict:
 
 
 def already_queued(conn) -> set:
-    """pg_ids with a domain_of row still pending, so a re-run before the worker
-    drains does not enqueue the same repair twice."""
+    """pg_ids with a domain_of row still pending or in_progress, so a re-run
+    before the worker drains does not enqueue the same repair twice. Failed
+    rows are excluded — a re-run enqueues a new repair rather than resetting
+    them."""
     with conn.cursor() as cur:
         cur.execute(
             "SELECT DISTINCT pg_id FROM neo4j_outbox"
             " WHERE cypher_params->>'type' = 'domain_of'"
+            " AND status IN ('pending','in_progress')"
         )
         return {r[0] for r in cur.fetchall()}
 

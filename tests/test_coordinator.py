@@ -1705,7 +1705,7 @@ async def test_retrospective_v2_inherits_target_project_and_stores_record():
     # a DIFFERENT record (and can never collide with a plain fact's hash).
     import hashlib as _hl
     assert mock_conn.fetchrow.await_args_list[1].args[4] == _hl.sha256(
-        b"retrospective:240:partly held").hexdigest()
+        f"retrospective:240:{meta['date']}:mixed:partly held".encode()).hexdigest()
 
 
 # ── Graph-integrity telemetry (decision 928) ──────────────────────────────────

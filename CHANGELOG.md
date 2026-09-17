@@ -5,6 +5,18 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.9.108] — 2026-09-17
+
+### Fixed
+- Unknown `neo4j_outbox` types no longer fall through to Fact MERGE (which could blank `content`). Apply marks them `failed` immediately with no retries. `handle_save` returns 400 `unknown_type` before embed or INSERT. A Postgres CHECK (`041_outbox_type_check.sql`) and an INSERT whitelist are the other half. A MERGE onto a `pg_id` that already exists under a different spine label also fails the row instead of reporting `applied`.
+- `?consistency=neo4j` wait treats `applied` / `rem_reviewed` / `consolidated`, a row that vanished after it was seen, and a first poll with no row (fast worker) as success; a `failed` dream-cycle row returns immediately. Latest-row `domain_of` / `project_of` one-shots no longer starve the wait.
+- `domain_of` apply is one Cypher (`OPTIONAL MATCH` delete + `UNWIND` `MATCH` existing Domain nodes). Domain registry read errors raise like project identity (retry, no stripped edges). `:Retrospective.pg_id` is unique. Repair `already_queued` ignores `failed` rows so a dead-letter no longer blocks a later `--apply`. A second retrospective with the same notes and a different rating or date is a new row.
+- Gateway shutdown now drains `_llm_probe_daemon` with the other background tasks, before the proxy session closes.
+- Encoder `/health` GETs and capability POSTs set `allow_redirects=False` and treat 3xx as not-ok (a 302 is no longer `"ok"` because it is `< 400`).
+
+### Changed
+- Read-role help (minter stdout, `AGENTS.md`, `SECURITY.md`, `.env.example`) matches the gateway: `GET /memory/telemetry`, `POST /memory/search`, `GET /memory/status/{pg_id}`; `POST /memory/graph` is 403; `/health` is anonymous. Comment interiors were rewritten to match live code (no behavior change).
+
 ## [0.9.107] — 2026-09-16
 
 ### Fixed

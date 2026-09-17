@@ -132,8 +132,7 @@ import tempfile
 # removing a name from here must never revoke a credential already in use.
 AGENTS = ["claude", "gemini", "grok", "codex", "lm_studio", "antigravity"]
 
-# Read-only identities: registered like any agent, but confined to GET /health,
-# GET /memory/telemetry, and POST /memory/graph (read-only Cypher).
+# Read-only identities: GET /health, GET /memory/telemetry, POST /memory/search; /memory/graph is 403.
 #
 # ⛔ THE ROSTER LIVES IN agent_roles.py, NOT HERE. It used to be defined in this
 # file, which made the guarantee a minting convention: the gateway believed
@@ -871,8 +870,9 @@ def mint(
     _merged_roles = enforce_roster(_merged_roles)
     print("# === Gateway .env — merged roles (read-only roster + what you declared) ===")
     print("AGENT_ROLES=" + ",".join(f"{n}:{r}" for n, r in _merged_roles.items()))
-    print("# read-role agents may reach only GET /health, GET /memory/telemetry,")
-    print("# and POST /memory/graph (read-only Cypher). All other routes → 403.")
+    print("# read-role agents may reach GET /memory/telemetry, POST /memory/search,")
+    print("# and GET /memory/status/{pg_id}; POST /memory/graph is 403.")
+    print("# GET /health is anonymous (not a read-role grant). All other routes → 403.")
     print()
     print("# === Gateway .env — install-path registry (sync exactly what's registered) ===")
     print("AGENT_INSTALLS=" + _format_agent_installs(persisted_installs))
@@ -1171,8 +1171,9 @@ def add_agent(
         print("# === Gateway .env — merged AGENT_ROLES= line (write this in place) ===")
         print("AGENT_ROLES=" + ",".join(f"{n}:{r}" for n, r in merged_roles.items()))
         if effective_role == "read":
-            print(f"# {name} is a READ-ONLY identity: GET /health, GET /memory/telemetry")
-            print("# and read-only Cypher on POST /memory/graph. Every other route → 403.")
+            print(f"# {name} is a READ-ONLY identity: GET /memory/telemetry, POST /memory/search,")
+            print("# and GET /memory/status/{pg_id}; POST /memory/graph is 403.")
+            print("# GET /health is anonymous (not a read-role grant). Every other route → 403.")
 
     if install_path is not None:
         merged_installs = dict(installs)

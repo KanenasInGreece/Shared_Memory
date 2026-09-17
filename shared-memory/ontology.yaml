@@ -59,4 +59,4 @@ consolidation:
   # 5 -> 3 when the gate moved off entity hubs onto this axis (a smaller,
   # sparser population by construction).
   density_threshold: 3
-  insight_threshold: 2           # min unconsolidated Decisions per shared grounded Entity to fold an insight
+  insight_threshold: 2           # min unconsolidated judgements the G3 walk must reach (not an entity-hub count)

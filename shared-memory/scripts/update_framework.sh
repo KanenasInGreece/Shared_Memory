@@ -73,20 +73,7 @@ grn() { printf '\033[32m%s\033[0m\n' "$*"; }
 ylw() { printf '\033[33m%s\033[0m\n' "$*"; }
 die() { red "✗ $*"; exit 1; }
 
-# ── EXIT trap registry (W3, env migration) — CHAINS, never replaces. This
-# script sets no other EXIT trap today (verified fe98761: only a prose
-# comment at :141 matches) but a future addition must not clobber the
-# pre-image tmpdir cleanup below by re-assigning `trap ... EXIT` directly —
-# every caller registers a FUNCTION NAME here instead, and exactly one
-# trap is ever installed, on top of all of them.
-#
-# SEC L-1 (fix round): the original cut stored raw COMMAND STRINGS and ran
-# them through `eval` — `add_exit_cleanup "rm -rf '$PREIMAGE_DIR'"` breaks
-# out of its own single-quoting if $PREIMAGE_DIR (operator/TMPDIR-
-# influenced) ever contained a single quote. Storing FUNCTION NAMES and
-# calling them directly needs no quoting or escaping at all: each caller
-# defines a tiny function closing over its own variables (read at CALL
-# time, never string-interpolated) and registers its name.
+# EXIT trap registry: function names only (never eval of a command string).
 _EXIT_CLEANUP_FUNCS=()
 _run_exit_cleanup() {
     local fn

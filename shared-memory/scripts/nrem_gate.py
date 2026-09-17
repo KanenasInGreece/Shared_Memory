@@ -1,34 +1,6 @@
-"""THE v2 FACT GATE PARTITIONER — pure, no DB driver, no I/O (fix wave, 2026-08).
+"""Pure (project, domain) fold partitioner; no DB driver, so the gateway telemetry gauge can import it without psycopg2.
 
-Extracted out of ``consolidation_loop.py`` so it can be imported by anything
-that only needs to *count* what the fold would do, without pulling in the
-whole daemon module. ``consolidation_loop.py`` imports ``psycopg2`` at module
-level (for its own synchronous DB work) — importing it just to reach these
-two pure functions means executing that whole module's top-level code
-(psycopg2 import included) inside a caller that may not carry that
-dependency. `coordinator.py`'s ``_nrem_cycle_counts`` (the `GET
-/memory/telemetry` → `telemetry.nrem` gauge) is exactly that caller: the
-shipped gateway service (``shared-memory/ops/hive-mind-gateway.service``)
-runs with `--with aiohttp --with asyncpg --with neo4j --with httpx --with
-json-repair` and never carries psycopg2, so a lazy
-``from consolidation_loop import count_domain_level_cycles`` inside that
-method raised ``ModuleNotFoundError: No module named 'psycopg2'`` on every
-call — caught and rendered as ``{"error": ...}`` rather than crashing, so the
-gauge failed silently in production while 1236 unit tests (all DB access
-stubbed) stayed green. See CLAUDE.md's Group 3 note: daemon/observability has
-no mechanical test tie, and a green suite proves nothing about a path no test
-exercises under the real dependency set.
-
-``project_axis`` (``fold_eligible``) and ``ontology`` are this module's only
-imports besides stdlib — both stdlib-only themselves (verified: neither
-imports psycopg2, asyncpg, neo4j, or httpx). Keep it that way: adding any DB
-driver or network client import here reintroduces exactly the defect this
-module exists to remove. ``test_nrem_gate_import_purity.py`` enforces it.
-
-``consolidation_loop.py`` re-exports both names (``from nrem_gate import
-eligible_domain_level_clusters, count_domain_level_cycles``) so its own fold
-code and every existing test/caller of the old location keep working
-unchanged — this is a location split, not a rename or a behaviour change.
+Keep imports stdlib-only besides project_axis and ontology; test_nrem_gate_import_purity.py enforces that.
 """
 
 from project_axis import fold_eligible

@@ -35,14 +35,8 @@ from datetime import datetime
 
 import httpx
 
-VERSION = "0.9.107"
-# Wire contract this client was built against. Must match the gateway's
-# api_version (reported by GET /health). Bump only on breaking protocol changes.
-# v4 (project registry): a fact save without a REGISTERED metadata.project is
-# rejected 400 carrying error=project_required|project_unknown plus near-match
-# proposals. BREAKING for any client that saved untagged facts. The second
-# submission is accepted in three forms: a proposal, new_project=true, or the
-# reserved sentinel general_discussion.
+VERSION = "0.9.108"
+# Must match GET /health api_version; v4 refuses unregistered project on fact save.
 API_VERSION = 4
 
 # Retrospective outcome-state ratings — MUST mirror ontology.RETRO_RATINGS on
@@ -57,17 +51,7 @@ CLIENT_VERSION_HEADER = "X-SM-Api-Version"
 # before 0.9.74 nothing on either side recorded the caller's build.
 CLIENT_BUILD_HEADER = "X-Shared-Memory-Client"
 
-# Skill-directory-scoped `.env` search (S-18, Credential_Custody_Plan
-# PR A2) — exactly two candidates, in order, first definition wins:
-#   1. script-adjacent .env — scripts/.env, co-located with this file
-#   2. skill root .env — ../.env from here, e.g.
-#      ~/.gemini/skills/shared-memory/.env (the documented install location)
-# NEVER a parent-directory walk: a walk from this file up toward $HOME takes
-# the first ".env" it finds anywhere on the way, so a stray $HOME/.env (some
-# other tool's, or a leftover from a different agent's install) could silently
-# supply AGENT_TOKEN/COORDINATOR_URL before this skill's own .env was ever
-# consulted. Always invoke memory_bridge.py by absolute path so __file__
-# resolves correctly (e.g. ~/.gemini/skills/shared-memory/scripts/).
+# Only this skill's scripts/.env then ../.env; never walk toward $HOME.
 _ENV_CANDIDATES = [
     os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"),
     os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env"),
@@ -267,20 +251,7 @@ for _env in _ENV_CANDIDATES:
 COORDINATOR_BASE = os.environ.get("COORDINATOR_URL", "http://localhost:8888")
 AGENT_ID         = os.environ.get("AGENT_ID", "memory_bridge")
 
-# ── Search timeout sizing ────────────────────────────────────────────────────
-# The SAME lesson as the server's rerank_ceiling(), on the side it was never
-# applied to. A search costs what the RERANKER costs, and that tracks the total
-# candidate payload — not the caller's `limit`, which barely moves it. Both
-# clients shipped a CONSTANT ceiling (CLI 30 s, MCP 60 s) while the gateway sized
-# its own rerank call from measured throughput and published the result on
-# /health. The constants straddled the real cost, so searches failed
-# intermittently and blamed a gateway that had answered /health 3 ms earlier.
-# Measured 2026-08-06 at v0.8.56: real searches 19-35 s against a client ceiling
-# of 30 s, while /health projected 127 s for a full payload (fact:1112).
-#
-# So the ceiling is DERIVED from the gateway's own published sizing instead of
-# guessed at. The client then needs no re-tuning when the server's text window,
-# hardware or model changes: the number it uses is the server's own number.
+# Search wait is derived from /health backend_capability (and capacity when present), not a fixed 30s (fact:1112).
 HEALTH_PROBE_TIMEOUT_S    = float(os.environ.get("HEALTH_PROBE_TIMEOUT_S", "3"))
 SEARCH_TIMEOUT_S          = float(os.environ.get("SEARCH_TIMEOUT_S", "0") or 0)
 SEARCH_TIMEOUT_FLOOR_S    = float(os.environ.get("SEARCH_TIMEOUT_FLOOR_S", "30"))
@@ -370,76 +341,9 @@ def _sync_client(timeout: float) -> "httpx.Client":
 
 
 def search_ceiling(capability: dict | None, capacity: dict | None = None) -> float:
-    """Client-side search timeout in seconds, derived from the gateway's own
-    published backend sizing (``backend_capability`` on GET /health), and — when
-    the gateway has one — its own measured worst case (``capacity`` on GET
-    /health).
+    """Seconds to wait for search: max of /health projections, with SEARCH_TIMEOUT_FALLBACK_S if any encoder is unknown or failing (fact:1560).
 
-    Pure → unit-testable with no gateway present. Both probed backends contribute:
-    the reranker dominates, but the query is embedded on the same path, and the
-    two run on hardware that may or may not be shared.
-
-    A missing, malformed or unprobed capability block yields
-    ``SEARCH_TIMEOUT_FALLBACK_S``, which is deliberately well ABOVE the constant it
-    replaces — the failure being fixed is a ceiling *below* the real cost, so an
-    unknown cost must not fall back to the number already known to be too small.
-
-    fact:1560 (grounded on decision:1114): that same rule also covers the MIXED
-    case — one backend probes fine while the other reports ``status: "failing"``
-    (or ``projection_stale: true``) with no positive projection of its own. The
-    known backend's number is still only a LOWER bound on the true cost; a
-    failing backend's true cost is unknown, not zero. So when any backend block
-    carries one of those EXPLICIT "I don't know" signals, the floor under
-    the derivation is ``SEARCH_TIMEOUT_FALLBACK_S``, never
-    ``SEARCH_TIMEOUT_FLOOR_S`` — ignorance of PART of the cost must not resolve
-    to the number already known to be too small, exactly as ignorance of ALL of
-    it does.
-
-    R2-N3 (PR-A delta review): a backend block that is ABSENT entirely, an
-    empty ``{}``, or not a dict at all (malformed) is the SAME ignorance as an
-    explicit ``status: "failing"`` — a caller that sent no block, or sent
-    nothing usable, told us nothing about that backend's cost, which is exactly
-    what "unknown" means. The server mirror gets the identical rule.
-
-    This is narrower than "every backend must report a positive projection": a
-    block that IS a well-formed, non-empty dict — carrying a plain
-    ``status: "error"``, or ``"ok"`` with no projection at all — does NOT trip
-    the fallback floor by itself; only the three states above do (T-05/R2-N3,
-    PR #310 review). Our own gateway's probe
-    (``hive_mind_proxy._probe_capability``) never actually produces that
-    narrower gap today — it always writes both blocks, and only ever as
-    ``ok``/``too_slow``/``failing``, never ``ok`` with no projection — but this
-    function also has to make sense of an older, third-party or future
-    gateway's /health, so that shape is exercised and pinned as documented
-    behaviour below rather than assumed unreachable.
-
-    When ``capacity`` carries the gateway's own measured numbers
-    (``capacity["derived"]``), three of its fields are folded in too — the
-    server's measured/derived worst case wins over the client's own theoretical
-    projection whenever it is larger (never smaller: this only ever RAISES the
-    ceiling):
-
-      * ``client_ceiling_s`` — the server's own already-derived ceiling;
-        compared as-is.
-      * ``s_mean_s`` — the theoretical full-payload projection the GATEWAY
-        itself computed, always present once the gateway has probed at all
-        (T-02, PR #310 review: this is the one field that would have sized
-        fact:1560's own measured 96-260s case correctly on the host that
-        measured it — folding it in is what closes that gap rather than
-        merely improving on it).
-      * ``s_max_measured_s`` — a PROJECTION too, the same kind of number as
-        ``projected_full_payload_s``, but computed over the coordinator's own
-        observed MAXIMUM rerank payload instead of the theoretical full-payload
-        one; ``None`` until real search traffic has been served this process's
-        lifetime, unlike ``s_mean_s`` above.
-
-    ``s_mean_s`` and ``s_max_measured_s`` are not yet safety-scaled for THIS
-    client, so each gets the same ``SEARCH_SAFETY_FACTOR``/
-    ``SEARCH_OVERHEAD_S`` treatment as the theoretical projection before being
-    compared.
-
-    ``SEARCH_TIMEOUT_S`` wins outright when set: the operator's escape hatch, and
-    the only way to get a constant back.
+    SEARCH_TIMEOUT_S overrides. Absent/empty/non-dict blocks count as unknown. Capacity derived fields only raise the ceiling.
     """
     if SEARCH_TIMEOUT_S > 0:
         return SEARCH_TIMEOUT_S
@@ -448,10 +352,6 @@ def search_ceiling(capability: dict | None, capacity: dict | None = None) -> flo
     for backend in ("reranker", "embedder"):
         block = (capability or {}).get(backend)
         if not isinstance(block, dict) or not block:
-            # R2-N3 (PR-A delta review): an ABSENT, empty {} or non-dict
-            # block is the SAME ignorance as an explicit `status: "failing"`
-            # — this backend's real cost is unknown, not zero, exactly as if
-            # it had said so. (The server mirror gets the identical rule.)
             unknown = True
             continue
         try:
@@ -481,10 +381,6 @@ def search_ceiling(capability: dict | None, capacity: dict | None = None) -> flo
         s_max_measured_s = capacity_derived.get("s_max_measured_s")
         if isinstance(s_max_measured_s, (int, float)) and s_max_measured_s > 0:
             derived = max(derived, s_max_measured_s * SEARCH_SAFETY_FACTOR + SEARCH_OVERHEAD_S)
-        # T-02 (fact:1560): the gateway's own full-payload projection, always
-        # present once ANY probe has run — unlike s_max_measured_s above,
-        # which needs real search traffic first. This is the field that would
-        # have sized fact:1560's measured case correctly; see the docstring.
         s_mean_s = capacity_derived.get("s_mean_s")
         if isinstance(s_mean_s, (int, float)) and s_mean_s > 0:
             derived = max(derived, s_mean_s * SEARCH_SAFETY_FACTOR + SEARCH_OVERHEAD_S)
@@ -741,39 +637,7 @@ def _gateway_message(r) -> str | None:
 
 def _reply_json(r, *, log_auth: bool = False,
                 accept_status: tuple = ()) -> dict:
-    """Decode a gateway response ONLY after branching on its status class.
-
-    ``accept_status`` names non-2xx statuses whose BODY this caller wants
-    decoded rather than converted to an error — and the enumeration is the
-    point: fact:1503's defect was decoding a status nobody had thought about,
-    so a caller that wants a 503 body must SAY 503. `/health` is the route that
-    needs it: it answers 503 when an encoder is down, and that response carries
-    the very `status`/`dependencies`/`warnings` payload an operator is asking
-    for. The decode still happens HERE, inside the one helper allowed to do it,
-    so no new decode site is created.
-
-    THE RULE (fact:1503). A non-2xx aiohttp page is plain text — ``"403:
-    Read-only token: this route requires a write-capable agent token"`` — and
-    ``json.loads`` of ANY such page raises ``JSONDecodeError: Extra data: line
-    1 column 4 (char 3)``. Decoding before the status class is branched on
-    therefore turns EVERY unenumerated status into a decode exception, which
-    the transport handler then reports as "coordinator unreachable — is
-    hive_mind_proxy.py running?". A live gateway refusing on authorization was
-    read as a dead gateway; three wrong diagnoses followed. The defect is a
-    CLASS, not a 403 special case, so the fix is a single rule applied at
-    every response site rather than another per-site guard (v0.9.33 patched
-    one site; the class shipped again).
-
-    401 keeps ``_auth_error()``'s two sub-branches verbatim (sent vs not
-    sent). 403 surfaces the gateway's OWN message, so a read-only role refusal
-    says exactly that instead of sending the operator to inspect auth setup.
-    Any other >= 400 names the status and quotes the body. A 2xx whose body
-    will not parse says the gateway is LIVE and its reply malformed — which is
-    a different fault with a different fix from an unreachable one.
-
-    Raises GatewayReplyError on every non-2xx and on an unparseable 2xx;
-    returns the decoded payload otherwise.
-    """
+    """Decode JSON only after the status class is known; pass accept_status to keep a non-2xx body (fact:1503)."""
     # ONE name for the line written and the line reported: the event the catch
     # block is told about IS the event this branch wrote, never a second literal
     # that could drift away from it.
@@ -815,20 +679,7 @@ def _reply_json(r, *, log_auth: bool = False,
 
 
 def _coordinator_unavailable(exc: Exception, ceiling: float | None = None) -> dict:
-    """Map a transport failure to a message that names the RIGHT cause.
-
-    A read timeout and a dead gateway are different faults with different fixes,
-    and httpx's ReadTimeout stringifies to the empty string — so reporting both as
-    "unreachable — is hive_mind_proxy.py running? ()" sent readers to inspect a
-    daemon that had answered /health 3 ms earlier (fact:1112). The same shape as
-    the v0.8.45 verifiers reporting a credentials error for a missing dependency.
-
-    Structural guard, not a courtesy: a GatewayReplyError means the gateway
-    ANSWERED, so it can never be reported as unreachable — even from a call
-    site that forgot its own `except GatewayReplyError` clause. This function
-    is the last place the defect of fact:1503 could re-enter, so the rule is
-    enforced here too rather than relying on eleven call sites staying correct.
-    """
+    """Timeout vs refused vs unreachable are different messages; a GatewayReplyError is never 'unreachable' (fact:1112, fact:1503)."""
     if isinstance(exc, GatewayReplyError):
         return exc.payload
     if isinstance(exc, httpx.TimeoutException):
@@ -1474,13 +1325,6 @@ def format_status(payload: dict, health: dict | None = None) -> str:
     eg = t.get("entity_graph", {})
     if eg and "error" not in eg:
         _tot = eg.get("entities_total", 0) or 0
-        # ⛔ THE ALIAS FIGURES ARE GONE (v0.9.74), not merely unavailable. They
-        # counted an ALIASES relationship no code path has ever written, so
-        # `aliases 0 (0% covered)` was printed on every run of this command
-        # since it shipped — a measurement of nothing, next to a registry that
-        # holds real aliases. Rendering it was the read-side half of the same
-        # defect; removing the writer without removing this line would have
-        # left `aliases 0` printing forever off a `.get` default.
         lines.append(f"  entities:  {_tot} total | singletons {eg.get('singleton_entities',0)} "
                      f"| orphans {eg.get('orphan_entities',0)} "
                      f"| referenced {eg.get('genuinely_referenced_entities',0)}")

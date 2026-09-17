@@ -351,7 +351,7 @@ AGENT_ID = os.environ.get("AGENT_ID", "vector_skill")
 # submission is accepted in three forms: a proposal, new_project=true, or the
 # reserved sentinel general_discussion.
 API_VERSION = 4
-VERSION = "0.9.107"
+VERSION = "0.9.108"
 CLIENT_VERSION_HEADER = "X-SM-Api-Version"
 # This client's own FRAMEWORK VERSION, distinct from the wire API_VERSION: two
 # clients can speak api_version 4 while one of them is forty releases behind on
@@ -371,14 +371,7 @@ RECORD_TYPES = ("fact", "decision", "retrospective", "summary", "insight")
 
 CALL_TIMEOUT = httpx.Timeout(30.0, connect=5.0)
 
-# ── Search timeout sizing ────────────────────────────────────────────────────
-# Mirrors memory_bridge.search_ceiling() exactly — a thin client never imports
-# server modules, and the two front doors never import each other, so the rule is
-# restated here and held in step by a parity test. A search costs what the
-# RERANKER costs, which tracks the candidate payload rather than `limit`. This
-# door shipped a constant 60 s against a gateway that projected 127 s for a full
-# payload and permits far more; the CLI door shipped 30 s and was already failing
-# intermittently, blaming a gateway that was up (fact:1112).
+# Same search_ceiling rule as memory_bridge (parity test); derived from /health, not a fixed 60s (fact:1112).
 HEALTH_PROBE_TIMEOUT_S    = float(os.environ.get("HEALTH_PROBE_TIMEOUT_S", "3"))
 SEARCH_TIMEOUT_S          = float(os.environ.get("SEARCH_TIMEOUT_S", "0") or 0)
 SEARCH_TIMEOUT_FLOOR_S    = float(os.environ.get("SEARCH_TIMEOUT_FLOOR_S", "30"))
@@ -389,54 +382,7 @@ SEARCH_OVERHEAD_S         = float(os.environ.get("SEARCH_OVERHEAD_S", "15"))
 
 
 def search_ceiling(capability: dict | None, capacity: dict | None = None) -> float:
-    """Client-side search timeout in seconds, derived from the gateway's own
-    published backend sizing (``backend_capability`` on GET /health), and —
-    when the gateway has one — its own measured worst case (``capacity`` on
-    GET /health).
-
-    Pure → unit-testable with no gateway present. MUST stay behaviourally
-    identical to ``memory_bridge.search_ceiling``; a parity test compares the two
-    across the shipped defaults, the fallback, and both clamps.
-
-    fact:1560 (grounded on decision:1114): a MIXED capability block — one
-    backend probes fine while the other reports ``status: "failing"`` (or
-    ``projection_stale: true``) with no positive projection of its own — floors
-    the derivation at ``SEARCH_TIMEOUT_FALLBACK_S``, never
-    ``SEARCH_TIMEOUT_FLOOR_S``. The known backend's number is only a LOWER
-    bound on the true cost; a failing backend's true cost is unknown, not zero.
-
-    R2-N3 (PR-A delta review): a backend block that is ABSENT entirely, an
-    empty ``{}``, or not a dict at all (malformed) is the SAME ignorance as an
-    explicit ``status: "failing"`` — the server mirror gets the identical rule.
-
-    This is narrower than "every backend must report a positive projection": a
-    block that IS a well-formed, non-empty dict — carrying a plain
-    ``status: "error"``, or ``"ok"`` with no projection at all — does NOT trip
-    the fallback floor by itself; only the three states above do (T-05/R2-N3,
-    PR #310 review). Our own gateway's probe never actually produces that
-    narrower gap today, but this function also has to make sense of an older,
-    third-party or future gateway's /health, so that shape is exercised and
-    pinned as documented behaviour rather than assumed unreachable.
-
-    When ``capacity`` carries the gateway's own measured numbers
-    (``capacity["derived"]``), three of its fields are folded in too — never
-    smaller, this only ever RAISES the ceiling:
-
-      * ``client_ceiling_s`` — the server's own already-derived ceiling;
-        compared as-is.
-      * ``s_mean_s`` — the theoretical full-payload projection the GATEWAY
-        itself computed, always present once the gateway has probed at all
-        (T-02, PR #310 review: the field that would have sized fact:1560's own
-        measured case correctly).
-      * ``s_max_measured_s`` — a PROJECTION too, the same kind of number as
-        ``projected_full_payload_s``, but over the coordinator's own observed
-        MAXIMUM rerank payload; ``None`` until real search traffic has been
-        served this process's lifetime, unlike ``s_mean_s``.
-
-    ``s_mean_s``/``s_max_measured_s`` are not yet safety-scaled for THIS
-    client, so each gets the same ``SEARCH_SAFETY_FACTOR``/
-    ``SEARCH_OVERHEAD_S`` treatment as the theoretical projection before
-    comparison; ``client_ceiling_s`` is already derived and is compared as-is.
+    """Seconds to wait for search: must match memory_bridge.search_ceiling (parity test); mixed/unknown encoders floor at SEARCH_TIMEOUT_FALLBACK_S (fact:1560).
     """
     if SEARCH_TIMEOUT_S > 0:
         return SEARCH_TIMEOUT_S
@@ -445,10 +391,6 @@ def search_ceiling(capability: dict | None, capacity: dict | None = None) -> flo
     for backend in ("reranker", "embedder"):
         block = (capability or {}).get(backend)
         if not isinstance(block, dict) or not block:
-            # R2-N3 (PR-A delta review): an ABSENT, empty {} or non-dict
-            # block is the SAME ignorance as an explicit `status: "failing"`
-            # — this backend's real cost is unknown, not zero, exactly as if
-            # it had said so. (The server mirror gets the identical rule.)
             unknown = True
             continue
         try:
@@ -477,8 +419,6 @@ def search_ceiling(capability: dict | None, capacity: dict | None = None) -> flo
         s_max_measured_s = capacity_derived.get("s_max_measured_s")
         if isinstance(s_max_measured_s, (int, float)) and s_max_measured_s > 0:
             derived = max(derived, s_max_measured_s * SEARCH_SAFETY_FACTOR + SEARCH_OVERHEAD_S)
-        # T-02 (fact:1560): the gateway's own full-payload projection, always
-        # present once ANY probe has run.
         s_mean_s = capacity_derived.get("s_mean_s")
         if isinstance(s_mean_s, (int, float)) and s_mean_s > 0:
             derived = max(derived, s_mean_s * SEARCH_SAFETY_FACTOR + SEARCH_OVERHEAD_S)
@@ -737,20 +677,7 @@ def _gateway_message(r) -> str | None:
 
 
 def _reply_json(r, tool: str) -> dict:
-    """Decode a gateway response ONLY after branching on its status class.
-
-    THE RULE (fact:1503). A non-2xx aiohttp page is plain text — ``"403:
-    Read-only token: this route requires a write-capable agent token"`` — and
-    ``json.loads`` of ANY such page raises ``JSONDecodeError``. Decoding before
-    the status class is branched on therefore turns every unenumerated status
-    into a decode exception, which the transport handler then reports as an
-    unreachable gateway: a live gateway refusing on authorization read as a
-    dead one. This surface carried the identical idiom at twelve sites; the fix
-    is one rule applied at all of them, not another per-site guard.
-
-    Raises GatewayReplyError (already-phrased tool string) on every non-2xx and
-    on an unparseable 2xx; returns the decoded payload otherwise.
-    """
+    """Decode JSON only after the status class is known (fact:1503)."""
     # _auth_rejected writes `auth_failed` in BOTH of its sub-branches, so the
     # 401 is already in the audit log by the time this is raised — which is what
     # `logged_event` tells the catch block.
