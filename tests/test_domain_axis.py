@@ -284,9 +284,7 @@ def test_the_domain_merge_is_keyed_on_the_identity_and_never_on_a_name():
 
 @pytest.mark.asyncio
 async def test_an_unresolvable_domain_writes_no_edge_and_keeps_the_value():
-    """D6. The project axis falls back to a name-keyed node so the write is never
-    lost; this axis deliberately does not, because it gates nothing yet and the
-    value survives in Postgres either way."""
+    """D6. No registry id means no DOMAIN_OF edge; the section name stays in Postgres metadata."""
     c = _coord()
     c._domain_identity = AsyncMock(return_value=None)
     assert await c._domain_identities(1, 6, ["operations"]) == []

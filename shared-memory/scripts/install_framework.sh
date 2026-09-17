@@ -59,57 +59,7 @@ ask() {  # prompt default  → echoes answer (default if blank)
   local v; read -r -p "$1 [$2]: " v; printf '%s' "${v:-$2}"
 }
 # >>> ASK_SECRET
-# Prompts for a DB password (hidden input) and never returns until it has a
-# valid one — never a blank/short value silently written to .env (framework
-# fact:1499 CRITICAL 1: pressing Enter used to write NEO4J_PASSWORD= /
-# PG_PASSWORD= as literal empty strings, and the install still reported
-# success).
-#
-# ⭐ W7 round 3 (fact:1499 class, on the PUBLISHED agent install path this
-# time): an EMPTY answer no longer re-prompts — it means "generate a strong
-# password INTERNALLY, right here, in this process" (python3's
-# secrets.token_hex(20), 40 hex characters — hex never contains '/', so it
-# also always clears the Neo4j no-slash check below for free). Before this,
-# AGENTS.md's Phase 1 had THE AGENT run `openssl rand -hex 20` in its OWN
-# shell and pipe the result in — the value then existed in the agent's shell
-# and its transcript, the exact fact:1499 class, on a path this framework
-# actively tells agents to drive. Generating it in here instead means no
-# agent shell and no agent transcript ever holds the plaintext, at any point.
-# This ALSO retires two smaller, related hazards for free: fact:1499
-# CRITICAL 1 itself (Enter used to write an empty password) is now
-# impossible by construction (empty means "generate", never "accept
-# blank"), and the desync where an empty piped line used to be REJECTED and
-# consumed the NEXT answer line off the pipe (silently shifting every answer
-# after it by one) cannot happen either, because empty is now a terminal,
-# valid answer rather than a rejected one. (Answers that ARE rejected — too
-# short, a '/' in the Neo4j password, surrounding whitespace — still
-# re-prompt and so still consume the next piped line; that is by design and
-# is why the documented printf supplies genuinely empty lines, not blanks.)
-#
-# The generated value NEVER reaches any process's argv: python3's own argv
-# here is the literal, fixed script text `import secrets; print(...)` —
-# never the secret — and the value leaves python3 only via its STDOUT, which
-# this function's own `$(...)` command substitution captures into a shell
-# variable. It is never echoed, printed to a terminal, or logged — the ONLY
-# place it is ever written out is the single `printf '%s' "$v"` at the
-# bottom of this function, which is the SAME stdout-capture path a
-# human-typed password already used (pinned by
-# tests/test_install_framework_password_validation.py) — both call sites
-# capture it the same way — via command substitution — so nothing here is new exposure;
-# an UNCAPTURED call to this function would print the value to whatever
-# stdout is connected to, exactly as an uncaptured call already would have
-# for a human-typed one. The install may say THAT a password was generated
-# and WHERE it ends up (shared-memory/.env, mode 600) — never WHAT it is.
-#
-# A NON-EMPTY answer keeps today's behaviour exactly: strictly more than 8
-# characters is required, 8-or-fewer is refused and re-prompts.
-#
-# On EXHAUSTED input (stdin closed, or a pipe with no more lines left) `read`
-# itself fails — bash's own signal that there is no one left to answer. That
-# is exactly the measured failure mode this guards: piping stdin with nothing
-# left ran the whole install silently on an empty/default password. Here it
-# is instead a hard, loud, nonzero-exit failure that names the step, rather
-# than a silent fall-through to the empty string.
+# Empty answer generates a password inside this process (never on argv); too-short or exhausted stdin fails loudly (fact:1499).
 ask_secret() {  # prompt [mode] → echoes answer (input hidden), or exits 1
   # ⭐ W7/F7 — GENERATION IS FIRST-INSTALL-ONLY, AND THE MODE IS AN EXPLICIT
   # PARAMETER, NEVER READ OFF THE DISK HERE. The second argument is

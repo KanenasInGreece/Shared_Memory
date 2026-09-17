@@ -1,8 +1,4 @@
-"""THE TELEMETRY CONTRACT — one Python source of truth for every key the
-gateway emits on ``GET /health`` and ``GET /memory/telemetry``. Introduced at
-v0.9.74; ``VERSION`` below tracks the release this file was last meaningfully
-edited in (W2, decision:1832, added it as a fifth version pin — see
-``VERSION``'s own comment).
+"""Keys emitted on GET /health and GET /memory/telemetry; Documentation/telemetry-contract.md is generated from this dict (decision:1832).
 
 ⛔ THIS DICT IS THE CONTRACT. ``Documentation/telemetry-contract.md`` is
 GENERATED from it (``render_markdown``), and ``tests/test_telemetry_contract.py``

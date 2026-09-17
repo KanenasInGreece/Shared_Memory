@@ -22,15 +22,7 @@ from aiohttp.client_exceptions import (
 )
 from multidict import CIMultiDict
 
-# Load .env BEFORE importing coordinator — coordinator reads config vars at
-# module level, so config must be in os.environ by the time that import runs
-# (and secrets must be in secure_env's in-process store — coordinator reads
-# those via get_secret(), never os.environ).
-#
-# SEC-05/S-03 (Credential_Custody_Plan_2026-08-14, PR A1): this used to be a
-# private _load_env() that dumped the whole .env into os.environ, including
-# every secret it held. It is now the shared split loader also used by
-# rem_loop.py and consolidation_loop.py — see secure_env.py.
+# Load .env before importing coordinator (it reads config at module level).
 from secure_env import (  # noqa: E402
     load_split_env, get_secret, is_secret_key, require_llm_backends_json_parses,
 )
@@ -105,11 +97,7 @@ from coordinator import (
     _llm_faults_snapshot,
 )
 
-# Unified Hive-Mind Async Proxy v7
-# Routes /v1/embeddings -> 8070 (BGE-M3)
-# Routes /v1/reranking  -> 8071 (BGE-Reranker-v2-m3)
-# Routes everything else -> 5000 (LM Studio / local LLM)
-# Usage: python proxy_v6.py [PORT]
+# Gateway HTTP process: encoder routes, LLM pool, /health, and daemon watchdogs.
 
 logging.basicConfig(
     level=logging.INFO,
@@ -138,23 +126,7 @@ _daemon_healthy: bool = False  # True while the consolidation subprocess is aliv
 _rem_proc:       "asyncio.subprocess.Process | None" = None
 _rem_healthy:    bool = False  # True while the REM subprocess is alive
 
-# --------------------------------------------------------------------------- #
-# Routing
-# --------------------------------------------------------------------------- #
-# Embedding / reranking backends. Overridable because deployments differ — these
-# may run on other ports, in another container network, or on a REMOTE host — so
-# the ports this stack happens to use are a default, never an assumption. Clients
-# still only ever call the gateway (the 1024-dim mandate is unchanged); this is
-# where the gateway itself forwards to.
-# `or`, not a get() default: an EMPTY value (EMBEDDER_URL= in .env) means "the
-# default", the same reading the coordinator gives the same variable — the two
-# consumers must never disagree on where the encoder is.
-# The base is normalized (normalize_encoder_base) so a pasted encoder path is
-# stripped HERE too, not only in the coordinator's own calls. ACCEPTED behavior
-# change: for a base that carried a pasted /v1, the /health fan-out target moves
-# from <base>/v1/health to <base>/health (the correct root); the bundled defaults
-# (no path) are unaffected, and the ROUTING_MAP passthrough / capability probes
-# now see exactly one /v1.
+# Encoder bases from EMBEDDER_URL/RERANKER_URL (`or` empty=default, same as coordinator); normalize_encoder_base strips a pasted /v1.
 EMBEDDER_URL = normalize_encoder_base((os.environ.get("EMBEDDER_URL") or FRAMEWORK_DEFAULTS["EMBEDDER_URL"]["default"]).strip())
 RERANKER_URL = normalize_encoder_base((os.environ.get("RERANKER_URL") or FRAMEWORK_DEFAULTS["RERANKER_URL"]["default"]).strip())
 ROUTING_MAP = {
@@ -191,41 +163,14 @@ def _encoder_near_miss(path: str) -> "str | None":
             return encoder_path
     return None
 
-# S-04 (Critical, Credential_Custody_Plan PR A5): the catch-all route forwards
-# request.rel_url VERBATIM to whatever backend gets selected, and a backend
-# configured with token_env has the provider key attached — so before this
-# gate, any caller with a gateway agent token could make the gateway sign an
-# arbitrary GET/PUT/DELETE to an arbitrary path on the provider. Binds ONLY
-# the credentialed branch (see handle_proxy's `backend_token` check) — a
-# local, uncredentialed backend keeps today's full pass-through, because
-# there is no key to misuse. Framework-internal (not env-overridable): this
-# is the exact, closed set of endpoints the framework itself ever calls.
+# S-04: catch-all forwards rel_url verbatim to a credentialed backend, so only exact (method, raw_path) framework POSTs may carry a provider key.
 CREDENTIALED_BACKEND_ALLOWED_ROUTES = frozenset({
     ("POST", "/v1/chat/completions"),
-    # ⚠ The two encoder entries are UNREACHABLE BY BRANCH STRUCTURE, and kept
-    # anyway rather than deleted silently. /v1/embeddings and /v1/reranking are
-    # served by handle_encoder, which forwards with `llm_backend` None — the
-    # credentialed gates below both live on the POOL path and neither one can
-    # see an encoder request. They would become live the day an encoder was
-    # ever routed through the backend pool (a credentialed remote embedder,
-    # say), and on that day the allowlist has to already contain them: this set
-    # is the closed list of endpoints the framework itself calls, and removing
-    # a name from it is a decision about what MAY be signed, not tidying.
+    # Encoder POST paths stay on the S-04 allowlist even though handle_encoder never takes the pool path today (a future credentialed embedder would need them).
     ("POST", "/v1/embeddings"),
     ("POST", "/v1/reranking"),
 })
-# fact:1535 (route-guard): a mistyped or wrong-method framework request must
-# FAIL AND SAY WHY, not fall through the catch-all into a reasoning-LLM
-# dispatch. A shipped MCP tool once did exactly this — GET against a path the
-# gateway registers POST-only — and the request was silently forwarded to the
-# LLM pool as if it were a chat completion. RESERVED_ROUTE_PREFIXES
-# is the ONLY hand-written table this guard uses: which path namespaces are
-# framework-owned, so an unrecognised path under one of them is a mistyped
-# framework call (404) rather than a legitimate LLM-passthrough path (which
-# is everything NOT under these prefixes, and keeps today's behaviour). The
-# actual known ROUTES — and their allowed methods — are never hand-written;
-# see AsyncHiveMindProxy.set_known_routes(), which derives them from the
-# app router itself (decision:1032 class — never write what can be derived).
+# Mistyped/wrong-method framework paths must 404/405, never fall through to the LLM catch-all (fact:1535). Known routes come from the router (decision:1032).
 RESERVED_ROUTE_PREFIXES = ("/memory/", "/admin/")
 # Embeddings/reranking bodies at or under this size get buffered (not streamed),
 # which is what makes the stale-connection retry possible for them. Every real
@@ -238,69 +183,9 @@ EMBED_RERANK_BUFFER_CAP = int(os.environ.get("EMBED_RERANK_BUFFER_CAP", str(1024
 # instead of baking one port into the code. LLM_BACKENDS is the real knob.
 DEFAULT_TARGET = os.environ.get("LLM_DEFAULT_TARGET", FRAMEWORK_DEFAULTS["LLM_DEFAULT_TARGET"]["default"])
 
-# Reasoning-LLM backend POOL. The gateway owns LLM routing + parallelisation:
-# clients have ONE way in (/v1/chat/completions) and never know how many models
-# back it, where they live (local or REMOTE host), or which GPU. Configure the
-# pool ONLY here, in the framework env — never exposed to clients.
-#   LLM_BACKENDS="http://localhost:5000@3,http://localhost:4000@1,http://remote:1234@2"
-# Each entry is "url" or "url@weight" (capacity weight, default 1 — give a faster/
-# larger card a higher weight). Unset → single backend (DEFAULT_TARGET); identical
-# to before. Algorithm (advisor-agent-validated for this exact stack): WEIGHTED
-# LEAST-IN-FLIGHT (score = inflight/weight) → fan out concurrent long jobs to the
-# free-est capable card. NOT least-response-time (long completions make latency
-# meaningless), NOT a gateway queue (forward-and-absorb into llama.cpp's own slot
-# queue keeps the gateway stateless). A backend that fails twice in a window is put
-# in cooldown and EXCLUDED FROM SELECTION until it elapses — but this is
-# per-BACKEND health bookkeeping for the NEXT request's routing decision, not a
-# per-REQUEST retry (S12, OBS round — LLM_MAX_TRIES/"max_tries" promised
-# cross-backend failover this pool never had, and has been removed): a request
-# that fails against the backend it was routed to gets that backend's own 503,
-# not a silent hop to a different card. The one retry that DOES exist is
-# same-target only — a buffered-body request may be replayed once on a fresh
-# connection to the SAME backend after a connection-reuse race (see
-# `have_buffered_body`/`max_attempts` below, in the dispatch loop).
-#
-# LLM_BACKENDS_JSON is the preferred form when any backend needs its own
-# credential (a paid cloud API, e.g. DeepSeek/xAI) or its own model id — the
-# plain comma form above has no way to carry either. It takes priority over
-# LLM_BACKENDS when set:
-#   LLM_BACKENDS_JSON=[{"url":"http://localhost:5000"},
-#                       {"url":"https://api.deepseek.com/v1",
-#                        "token_env":"DEEPSEEK_API_KEY","model":"deepseek-chat"}]
-# `token_env` names an env var the gateway PROCESS must already have — never a
-# literal secret. The gateway resolves it once at startup and, for every request
-# routed to that backend, sets Authorization from it — the client's own
-# Authorization (its gateway auth token) is never forwarded to any backend, see
-# _filter_headers. A configured token_env that isn't actually set excludes that
-# backend from the pool (loud, at startup) rather than sending a doomed request.
-# `model` overrides the global LLM_MODEL for that backend only — see the model
-# rewrite in handle_proxy. See shared-memory/ops/README.md for how to get the
-# named var into the gateway's process env (systemd EnvironmentFile, etc.).
+# LLM_BACKENDS_JSON (preferred) or LLM_BACKENDS CSV; token_env is a process env NAME, never a literal in the URL.
 def _backend_url_credential_error(url: str) -> "str | None":
-    """SEC A (R-1, fatal): flag a backend URL whose userinfo carries a
-    credential (`user:pass@host` or a bare `user@host`). Shared by BOTH
-    ingest paths — the LLM_BACKENDS_JSON per-entry loop and the legacy CSV
-    form — so neither can admit a credentialed URL string into the pool:
-    the framework's only accepted channel for a backend credential is
-    `token_env` (a NAME resolved from the gateway's own process env), never
-    a literal in the URL. A bare QUERY STRING is deliberately NOT flagged
-    here (R-2, refining the 2026-08-28 "userinfo/query" wording) — an
-    Azure-style `?api-version=` backend stays loadable; queries are instead
-    scrubbed from every RENDER (log_hygiene.scrub_url_credentials / item B),
-    accepting degraded per-backend dream attribution for such backends (none
-    in our own fleet) as the documented cost. Returns None for a clean URL,
-    else a scrubbed, human-readable message naming the offending URL —
-    scrubbed THROUGH the fixed (item C) scrub_url_credentials, never the raw
-    credential itself.
-
-    Fix round finding 6 (QA LOW): an unparseable URL used to fail OPEN
-    (`except Exception: return None`, i.e. "clean") — measured:
-    `urlsplit("http://u:p@[::1")` raises `ValueError: Invalid IPv6 URL`, so
-    that entry was admitted to the pool with its credential intact in
-    process state (renders were still safe — scrub_url_credentials's own
-    `except` redacts unconditionally — but this function's contract is
-    "refuse anything credential-shaped", and an unparseable string cannot be
-    proven clean). Now refuses instead."""
+    """None if the URL has no userinfo credential; otherwise a scrubbed refusal. Unparseable URLs refuse. Query strings are allowed."""
     try:
         parsed = urllib.parse.urlsplit(url)
     except Exception:
@@ -328,52 +213,7 @@ _BACKEND_WEIGHT_TOKEN_RE = re.compile(r"^[+-]?\d+(\.\d+)?$")
 
 
 def _parse_backend(entry: str) -> tuple[str, float]:
-    """SEC A.3: split on the LAST "@" (rpartition), not the first
-    (ADV1-4 — the old `entry.partition("@")` mis-split a credentialed URL
-    like "http://u:p@h:8000" into url="http://u:p", weight=1.0, silently
-    discarding the real host AND leaving the URL's own userinfo behind as
-    if it were the whole url).
-
-    The tail is treated as a WEIGHT only when it is a finite numeric token
-    (see _BACKEND_WEIGHT_TOKEN_RE) AND `head` already reads as a
-    self-terminated authority: either a bare token with no scheme at all
-    (the plain "url@weight" legacy shorthand) or a "scheme://host:port" that
-    already carries an explicit port. Both conditions are necessary —
-    "head has no userinfo" ALONE cannot tell "http://a:5000@2" (host:port
-    already present -> unambiguously url@weight) apart from "http://user@10"
-    (no port -> "user" IS this URL's own credential, "10" its host): both
-    give `urlsplit(head).username is None`, confirmed by direct execution.
-    Getting this wrong would silently turn a credentialed URL into
-    url="http://user" weight=10, discarding the very credential the new
-    _backend_url_credential_error() refusal exists to catch (ADV2-6) — see
-    HANDOFF.md for this deviation from the brief's literal wording. When the
-    tail is not treated as a weight, the WHOLE entry is the URL, which then
-    hits _backend_url_credential_error() at the call site.
-
-    Legit "url@1.5" and the existing fixture "http://a:5000@2" keep parsing
-    unchanged.
-
-    Fix round F1 (QA HIGH-1): the port-or-bare-token condition above (see
-    Finding 1 in HANDOFF.md) left one documented form silently broken — a
-    port-LESS, scheme'd URL whose "@weight" landed in the PATH rather than
-    the netloc, e.g. "https://api.example.com/v1@2" (README.md's own
-    generic "url@weight" example, applied to a path-bearing URL). Measured:
-    `head` there is "https://api.example.com/v1" — no port, not a bare
-    token — so neither existing disjunct fires, and the whole entry falls
-    through as one URL with the stray "@2" left attached: no refusal (the
-    "@" is in the path, so `urlsplit(url).username` is None), just a silent
-    weight of 1.0 and a URL nothing will ever answer at. The fix: also
-    treat the tail as a weight when the WHOLE ENTRY (not just `head`) has
-    no userinfo of its own — `urlsplit(entry).username is None` proves the
-    entry's own last "@" cannot be a real userinfo separator (if it were,
-    urlsplit would have found it), so the "@" the CSV form's rpartition
-    just consumed can only have been the weight separator. This recovers
-    the silent path-"@" case (loads correctly, no refusal) while the
-    genuinely ambiguous port-less, path-less form ("http://user@10",
-    ADV2-6) stays refusing — there `urlsplit(entry).username` IS "user"
-    (the "@" WAS the netloc's own userinfo separator), so the new disjunct
-    does not fire and the whole entry still reaches the credential check
-    below, unchanged from before this fix."""
+    """Split url@weight on the last @ only when the tail is numeric and is not URL userinfo."""
     entry = entry.strip()
     head, sep, tail = entry.rpartition("@")
     if sep and _BACKEND_WEIGHT_TOKEN_RE.match(tail):
@@ -404,27 +244,7 @@ def _parse_backend(entry: str) -> tuple[str, float]:
     return url.rstrip("/"), max(weight, 0.1)
 
 
-# Model-attributes routing (Model_Attributes_Routing_Plan_2026-08-18, REVISED
-# DESIGN). Descriptor schema, additive to the existing url/weight/token_env/
-# model/extra_body fields:
-#   roles          list from {extract, judge} — the two dream functions that
-#                  actually send a role: REM's per-record summary call sends
-#                  "extract", NREM's insight fold sends "judge". "summarize"
-#                  is RESERVED — NREM narrative folds are zero-inference by
-#                  construction. Absent = serves all (homogeneous-fleet
-#                  degenerate case, every existing install unchanged).
-#   n_ctx          int, the model's usable context in tokens. Absent = no fit
-#                  information (this backend always "fits").
-#   private_ok     bool. Default = False, unconditionally — an undeclared
-#                  backend (credentialed or not) serves no role-less traffic
-#                  until this is set true (W4 default-deny, decision:1824).
-#                  An EXPLICIT value of either true or false always wins.
-#   max_inflight   int, per-backend concurrency ceiling. Absent = unbounded
-#                  (today's behavior).
-#   price_per_mtok_in / price_per_mtok_out — optional operator metadata,
-#                  stored + surfaced on /health for the MONITOR to multiply.
-#                  NEVER used in any routing decision here — the gateway
-#                  stays price-agnostic (M-4 honesty note).
+# Backend descriptor: roles (extract/judge; absent=serves-all), n_ctx, private_ok default-deny (decision:1824), max_inflight, optional price metadata (never used to route).
 ROUTING_ROLE_NAMES = frozenset({"extract", "judge"})
 RESERVED_ROLE_NAMES = frozenset({"summarize"})
 
@@ -468,20 +288,7 @@ def _bearer_transport_ok(backend_url: str, plaintext_ok: bool = False) -> bool:
     except ValueError:
         pass
     if host in ("localhost",) or "." not in host:
-        # SEC E (S3, measured): a dotless host can still be a numeric IPv4
-        # literal in a form the RESOLVER accepts but ipaddress.ip_address()
-        # above already refused as non-dotted-quad — a decimal dword
-        # ("16909060" == 1.2.3.4) or hex ("0x7f000001" == 127.0.0.1) —
-        # letting either through here would carry a bearer to whatever
-        # public address the resolver actually connects to.
-        # `int(host, 0)` is NOT sufficient: it rejects a leading-zero octal
-        # string ("00100403004") that the resolver still accepts — measured,
-        # socket.inet_aton("00100403004") -> 1.2.6.4, a PUBLIC address.
-        # Refuse whenever inet_aton succeeds — it accepts exactly the
-        # literal alphabet (decimal dword, 0x hex, leading-zero octal) the
-        # resolver does. A bare alphabetic hostname ("myhost", or a
-        # hex-alphabet name like "beef" WITHOUT "0x") still passes below —
-        # deliberate, inet_aton refuses both.
+        # Reject numeric IPv4 spellings ipaddress.ip_address() misses but the resolver accepts (S3).
         try:
             socket.inet_aton(host)
             return False
@@ -640,14 +447,7 @@ def _load_llm_backends() -> tuple[
                 # environment rather than the framework .env.
                 token = get_secret(token_env)
                 if not token:
-                    # Wording covers BOTH causes of a falsy value, because
-                    # v0.9.63 gave this branch a second one: unset (nothing
-                    # anywhere resolves the name) and REFUSED (a `_FILE` /
-                    # $CREDENTIALS_DIRECTORY secret was found but rejected —
-                    # over the size cap, empty, or holding a control
-                    # character). Saying only "not set" sends an operator
-                    # whose key file IS present looking for a missing export
-                    # instead of at the [secure_env] line that names the file.
+                    # Falsy token_env is unset or a refused `_FILE` secret; do not say only "not set".
                     log.warning(
                         "LLM backend %s configured with token_env=%s but that "
                         "variable did not resolve to a usable secret (unset, or "
@@ -670,17 +470,7 @@ def _load_llm_backends() -> tuple[
                     "backend from the pool.",
                     scrub_url_credentials(url), token_env)
                 continue
-            # Per-backend request-body overrides ("extra_body", the OpenAI-SDK
-            # name for the same thing): keys merged into every chat payload
-            # routed to this backend. This is what carries provider-specific
-            # switches a caller does not know it needs — e.g. DeepSeek's
-            # {"thinking": {"type": "disabled"}}, without which a hybrid
-            # reasoning model burns metered output tokens on a think block and
-            # returns reasoning_content the daemons' JSON extraction never
-            # asked for. A malformed value excludes the backend rather than
-            # routing to it unconfigured: for a metered backend, "reached
-            # without its overrides" is exactly the misconfiguration the
-            # field exists to prevent.
+            # extra_body merges provider switches (e.g. DeepSeek thinking disabled); a malformed value excludes the backend.
             extra_body = entry.get("extra_body")
             if extra_body is not None and not isinstance(extra_body, dict):
                 log.error(
@@ -763,14 +553,7 @@ def _load_llm_backends() -> tuple[
         _u, _w = _parse_backend(_e)
         _cred_err = _backend_url_credential_error(_u)
         if _cred_err:
-            # F1 (QA HIGH-1): when the whole entry was kept as-is (never
-            # split) BECAUSE it looked exactly like "url@weight" but was
-            # genuinely ambiguous (no port, no path — _parse_backend
-            # couldn't tell "the userinfo's own credential" from "a missing
-            # port before the weight separator"), say so explicitly rather
-            # than emitting the generic credential message: this is a
-            # config-shape problem the operator can fix two ways, not just
-            # a URL that happens to carry a password.
+            # Ambiguous url@weight (no port/path) is a config-shape error, not a generic credential message.
             _stripped_e = _e.strip()
             _tail_candidate = _stripped_e.rpartition("@")[2]
             if _u == _stripped_e and _BACKEND_WEIGHT_TOKEN_RE.match(_tail_candidate):
@@ -828,26 +611,11 @@ LLM_BACKEND_PRICE_OUT: dict[str, "float | None"]
  LLM_BACKEND_MAX_INFLIGHT, LLM_BACKEND_PRICE_IN, LLM_BACKEND_PRICE_OUT,
  _LLM_BACKEND_ROLE_CONFIG_ERRORS, _LLM_BACKEND_URL_CREDENTIAL_ERRORS) = _load_llm_backends()
 
-# W4 default-deny (§6.5, decision:1824) — a PURE environment-presence question,
-# computed ONCE at module level, NEVER inside _load_llm_backends(): the JSON
-# path RETURNS at its own branch and never reaches the legacy-CSV/fallback
-# branch, so a fact assigned only there would be silently defaulted (False)
-# for every JSON-declared install. True iff this install still carries either
-# legacy declaration shape (a live LLM_BACKENDS CSV, or a bare
-# LLM_DEFAULT_TARGET override) — the population a version jump from pre-W4
-# can land on with a now-ineligible fleet. Read directly wherever needed;
-# never cached inside a function (A8-purity, Opus A8).
+# W4 default-deny is computed once at import from env presence, never inside the loader (decision:1824).
 LLM_POOL_LEGACY_KEY_PRESENT: bool = (
     "LLM_BACKENDS" in os.environ or "LLM_DEFAULT_TARGET" in os.environ)
 
-# Remedy honesty (§6.5): post-W4, at RUNTIME, migrate_env.py's same-generation
-# gate (§6.4 V2) means it deliberately plans nothing for an install already on
-# current loader semantics — naming it here would be a false remedy ("run this
-# tool" when the tool will correctly no-op). The actionable remedy at runtime
-# is check_config.py's per-backend census plus declaring LLM_BACKENDS_JSON
-# explicitly; migrate_env.py is named instead where it CAN act: its own
-# boundary-crossing report during an update, and AGENTS.md's documented
-# pre-W3 -> post-W4 jump procedure.
+# Runtime remedy for an empty role-less pool is check_config.py + declaring LLM_BACKENDS_JSON; migrate_env.py no-ops on current-generation loader.
 _LLM_POOL_LEGACY_REMEDY = (
     "run check_config.py and declare LLM_BACKENDS_JSON explicitly "
     "(private_ok/roles) — see GET /health")
@@ -892,49 +660,14 @@ def _apply_backend_body_overrides(body: bytes, model: "str | None",
         payload["model"] = model
     return json.dumps(payload).encode("utf-8")
 
-# Failure/cooldown (advisor spec): N fails within a window → cooldown; re-probed
-# (a normal request) after it elapses. A success clears the fail streak.
-# ⛔ S12 (OBS round): this is PER-BACKEND bookkeeping that changes future
-# ROUTING, never a per-request retry. `LLM_MAX_TRIES` used to exist here,
-# read by nothing but the /memory/telemetry render — no code path ever
-# consulted it. The real retry is same-target and buffered-body-gated (see
-# `have_buffered_body`/`max_attempts` in the dispatch loop below): a
-# connection-reuse race may replay ONE buffered request on a fresh
-# connection to the SAME backend. A genuine failure — connect refusal,
-# timeout, a client abort — 503s (or its own status) straight to the
-# caller; it is never silently re-routed to a different backend.
+# Per-backend fail/cooldown changes future routing; the only retry is one same-target replay of a buffered body on a stale socket (S12).
 LLM_FAIL_THRESHOLD = int(os.environ.get("LLM_FAIL_THRESHOLD", "2"))
 LLM_FAIL_WINDOW = float(os.environ.get("LLM_FAIL_WINDOW", "60"))
 LLM_COOLDOWN = float(os.environ.get("LLM_COOLDOWN", "300"))
 
-# ── Fit check (A-1/A-2/N-1/N-3, Model_Attributes_Routing_Plan_2026-08-18) ────
-# est_prompt_tokens = body_chars / CHARS_PER_TOKEN_RATIO, computed GATEWAY-side
-# from the already-buffered request body char count (no per-message chat-
-# template simulation — deliberately simple, see N-1). MEASURED (builder,
-# v0.9.13, HANDOFF.md): 20 live /tokenize comparisons against BOTH local
-# backends (localhost:5000, localhost:4000 — same Qwen3-14B model, identical
-# results) across prose/JSON/code/SQL/Greek-text samples gave chars/token
-# ranging 1.205 (Greek, the densest) to 6.905 (English prose, the sparsest).
-# 1.2 is that measured floor, rounded down slightly — the MOST CONSERVATIVE
-# (highest tokens-per-char) observed ratio, per N-3, so est_prompt_tokens
-# never UNDER-counts for any sampled content type. A live chat-completion
-# check (4 real message-array bodies, max_tokens=1) confirmed this floor
-# already overestimates true chat-template prompt_n by 83%-525% in every
-# sample — i.e. RATIO's own conservatism, not FIT_MARGIN, is what protects
-# against under-counting; FIT_MARGIN is the residual buffer below.
+# Fit uses chars/CHARS_PER_TOKEN_RATIO (measured floor 1.2) plus FIT_MARGIN; never under-count prompt tokens.
 CHARS_PER_TOKEN_RATIO = float(os.environ.get("LLM_CHARS_PER_TOKEN_RATIO", "1.2"))
-# Fraction of n_ctx held back as headroom: eligible iff est_prompt_tokens +
-# effective_max_tokens <= n_ctx * (1 - FIT_MARGIN). MEASURED (builder,
-# v0.9.13): since CHARS_PER_TOKEN_RATIO's own conservatism already
-# overestimates real prompt tokens by 83%-525% against the live samples
-# above, there is no measured within-sample under-count for this margin to
-# cover — its job is the residual, UNMEASURED risk of content denser than
-# anything sampled (heavy CJK/emoji, deeply repeated JSON keys) plus general
-# n_ctx bookkeeping slop (special/BOS-EOS tokens, KV overhead) this estimator
-# does not model. 10% is a modest, deliberately non-zero buffer for that
-# unmeasured residual — flagged, not derived from a further live measurement
-# (see HANDOFF.md; N-3 names per-family ratios as the escalation if this
-# proves insufficient in practice).
+# Eligible iff est_prompt_tokens + effective_max_tokens <= n_ctx * (1 - FIT_MARGIN).
 FIT_MARGIN = float(os.environ.get("FIT_MARGIN", "0.10"))
 # Reserved output budget when the caller's body has no max_tokens at all.
 # UNMEASURED (flagged in .env.example per fact:1338) — conservative round
@@ -952,24 +685,10 @@ LLM_MAX_INFLIGHT_WAIT_S = float(os.environ.get("LLM_MAX_INFLIGHT_WAIT_S", "120")
 # Floor of 0.05s: a configured 0 would busy-spin the event loop for the whole
 # wait window (Optional finding, decision:1357).
 LLM_MAX_INFLIGHT_POLL_S = max(0.05, float(os.environ.get("LLM_MAX_INFLIGHT_POLL_S", "0.5")))
-# R-4 (decision:1357): how many requests may HOLD a capacity-wait slot at
-# once. Every waiter occupies an admitted request for up to the full wait
-# window (and, with GATEWAY_INFLIGHT_MAX set, counts toward the gateway-wide
-# S-11 shed) — unbounded waiters let one capped backend starve the whole
-# gateway. Beyond this many concurrent waiters a request gets an immediate
-# 503 backend_at_capacity instead of waiting. ⚠ UNMEASURED default
-# (fact:1338 — flagged in .env.example): a small bound chosen for its shape
-# (strictly less than any plausible S-11 admission budget), not derived from
-# a live measurement.
-# Floor of 1 (FR-4, delta re-review): 0/negative would mean nothing ever
-# waits — the same invalid-int class the descriptor fields now reject.
+# Cap concurrent capacity-waiters (floor 1); beyond that, 503 backend_at_capacity (decision:1357, fact:1338).
 LLM_MAX_CAPACITY_WAITERS = max(1, int(os.environ.get("LLM_MAX_CAPACITY_WAITERS", "8")))
 
-# The whole pool parallelises. Judge/quality routing (v0.6.1) is GATEWAY-controlled
-# at runtime — NOT a user/env setting. The framework's judge will signal its role
-# (X-SM-LLM-Role: judge) and the gateway decides allocation; for now every role
-# shares the weighted pool, so the judge simply gets the free-est backend. Any
-# future dedicate-a-backend policy lives here, in the gateway, never in env.
+# Working set the router iterates; eligibility is `_role_eligible` (roles / private_ok), not "every role shares the pool".
 LLM_POOL: list[str] = list(LLM_BACKENDS)
 
 _llm_inflight: dict[str, int] = {b: 0 for b in LLM_BACKENDS}
@@ -1050,14 +769,7 @@ def _probe_headers(backend: str) -> dict:
     token = LLM_BACKEND_TOKENS.get(backend)
     if not token:
         return {}
-    # Same transport rule as the loader (_bearer_transport_ok). For a pool
-    # backend this branch is defence in depth: a credentialed backend that
-    # fails the rule was already EXCLUDED at load and never reaches here. It
-    # matters for any future caller that probes a URL the loader did not vet.
-    # S-04 note: handle_proxy attaches a provider key only on the allowed POST
-    # routes; the probe is the one deliberate GET carve-out — its URL comes
-    # from operator configuration (_v1_models_probe_url / the backend's own
-    # /health), never from a request.
+    # Probe uses the same bearer-transport rule as the loader; GET /v1/models is the one deliberate S-04 GET carve-out (URL from config, not the request).
     if _bearer_transport_ok(backend, LLM_BACKEND_PLAINTEXT_OK.get(backend, False)):
         return {"Authorization": f"Bearer {token}"}
     return {}
@@ -1120,30 +832,13 @@ _warned_unknown_role_values: set[str] = set()
 _llm_tokens_prompt_total: dict[str, int] = {b: 0 for b in LLM_BACKENDS}
 _llm_tokens_completion_total: dict[str, int] = {b: 0 for b in LLM_BACKENDS}
 _llm_tokens_last_ts: dict[str, "str | None"] = {b: None for b in LLM_BACKENDS}
-# Per-backend LLM request latency (new instrument, single-cloud-fleet
-# debugging cycle): nothing recorded per-request latency, so a local-vs-
-# online backend comparison had no data. Measured with time.monotonic()
-# around the FULL proxied upstream exchange — request sent through response
-# body fully drained (write_eof or the terminal disconnect/cancellation
-# branch) — for pool-routed LLM requests only (llm_backend is not None;
-# embeddings/reranking never touch these dicts). Recorded for success AND
-# failure, with failures (status >= 400 or an exception) counted separately
-# so the average isn't diluted by them. IN-PROCESS only — reset on restart,
-# same lifecycle as the token counters above; the paired last-ts is what
-# makes a restart-aware delta computable.
+# Per-backend LLM latency is the full proxied exchange (success and failure, in-process, reset on restart).
 _llm_requests_total: dict[str, int] = {b: 0 for b in LLM_BACKENDS}
 _llm_requests_failed_total: dict[str, int] = {b: 0 for b in LLM_BACKENDS}
 _llm_latency_sum_s: dict[str, float] = {b: 0.0 for b in LLM_BACKENDS}
 _llm_latency_max_s: dict[str, float] = {b: 0.0 for b in LLM_BACKENDS}
 _llm_latency_last_ts: dict[str, "str | None"] = {b: None for b in LLM_BACKENDS}
-# Bounds how much response body the usage-parsing peek accumulates for a
-# single LLM call — a streamed multi-megabyte completion must never be held
-# fully in memory just to look for a trailing `usage` object. Capture is
-# abandoned (not attempted) once this is exceeded. Applies to the COMPRESSED
-# bytes accumulated for a gzip/deflate/br response too (see
-# _decompress_full_for_usage in coordinator.py) — the memory bound is the
-# point, and decompression happens once, after the loop, on the
-# already-cap-bounded accumulated body.
+# LLM_USAGE_CAPTURE_CAP_BYTES bounds compressed bytes accumulated for a trailing usage parse; over the cap, capture is abandoned.
 LLM_USAGE_CAPTURE_CAP_BYTES = int(os.environ.get("LLM_USAGE_CAPTURE_CAP_BYTES", str(2 * 1024 * 1024)))
 # Runtime reservation (gateway-controlled, NEVER env/user). A backend in this set
 # is held OUT of the general parallelise pool so a quality task can use it
@@ -1153,15 +848,7 @@ LLM_USAGE_CAPTURE_CAP_BYTES = int(os.environ.get("LLM_USAGE_CAPTURE_CAP_BYTES", 
 # with the v0.6.1 quality work; the state + pool-exclusion seam is here now.
 _llm_reserved: set[str] = set()
 
-# Cache-affinity dispatch (advisor-reviewed). llama.cpp's KV prefix-cache makes a
-# repeated large prompt prefix ~8x cheaper (measured 22251->5 prompt tokens,
-# 274s->35s) IF the request lands on the SAME backend that already holds that
-# prefix. REM's grounding prefix is byte-stable (ORDER BY name), so all REM calls
-# share one affinity key and pin to one warm card; NREM's varied prompts flow
-# elsewhere. Allocation-free: the card is chosen by least-in-flight on first sight,
-# then remembered by prefix hash. A prefix reused >=PROTECT_HITS times (i.e. REM's
-# grounding, not a one-shot NREM cluster) marks its card protected, so a non-affine
-# request won't evict that warm cache (--parallel 1 has a single KV slot).
+# Cache-affinity: sticky routing for a repeated prompt prefix (llama.cpp KV cache).
 AFFINITY_PREFIX_CHARS = int(os.environ.get("LLM_AFFINITY_PREFIX_CHARS", "6144"))
 AFFINITY_TTL          = float(os.environ.get("LLM_AFFINITY_TTL", "600"))
 AFFINITY_MAX_INFLIGHT = int(os.environ.get("LLM_AFFINITY_MAX_INFLIGHT", "4"))
@@ -1227,19 +914,7 @@ def _serves_all(url: str) -> bool:
 
 
 def _role_eligible(url: str, role: str) -> bool:
-    """Role+privacy eligibility (P-1/P-3, I-1a) — the HARD PRE-FILTER's role
-    axis, independent of health/cooldown/reserved/cap. R-3′ (decision:1824,
-    reversing R-3/decision:1357): role-less traffic reaches ONLY backends
-    with an explicit private_ok: true; a roles-carrying backend without it
-    serves exactly its declared roles; an undeclared backend serves nothing.
-    Role-carrying traffic: eligible iff (roles absent AND private_ok) OR role
-    in roles — an explicit roles list is itself the per-function privacy
-    opt-in (I-1), so a private_ok=false backend CAN be eligible for a role it
-    explicitly lists. Role-less traffic: eligible ONLY on an explicit
-    private_ok=true backend; the roles list is IGNORED for role-less
-    traffic — a role-carrying backend with no privacy opt-in now serves
-    nothing role-less (R-B, W4), and a private_ok=false/undeclared backend is
-    NEVER eligible for role-less traffic, regardless of its roles list."""
+    """Role-less traffic needs explicit private_ok; a roles list serves only those roles (decision:1824)."""
     roles = LLM_BACKEND_ROLES.get(url)
     if not role:
         return LLM_BACKEND_PRIVATE_OK.get(url, False)
@@ -1297,27 +972,7 @@ def _all_roles_ineligible() -> "str | None":
 
 
 def _declaration_gap() -> "str | None":
-    """Ruling E(α2) 2026-09-01 (§5, decision:1824): a two-valued fact the
-    422 body's `declaration` key carries when the POOL'S SHAPE, not merely
-    which gate fired, explains why nothing is eligible. Iterates
-    ``LLM_POOL`` (:698 — the map the refusal was actually computed over;
-    NOT ``LLM_BACKENDS``, which the dream-side functions iterate). Arms
-    evaluated IN ORDER (V6):
-
-    1. ANY entry carries an explicit `private_ok` of EITHER value -> None.
-       Something was deliberately declared — including a fleet that
-       explicitly scoped itself AWAY from role-less traffic; that is not a
-       misconfiguration, it keeps the plain refusal and a FATAL A8.
-    2. "none" iff every entry has `private_ok_explicit` False AND `roles`
-       None — nothing was EVER declared (legacy CSV and the built-in
-       fallback land here). An EMPTY LLM_POOL vacuously satisfies this arm
-       (`all()` over nothing is True) -> "none", deliberately (pinned by
-       test — arm 1's `any()` over nothing is False, so it falls through
-       here rather than short-circuiting to None).
-    3. else "no_role_less_opt_in" — roles exist somewhere, but no privacy
-       intent was EVER stated (the R-B population; the refusal carries the
-       opt-back remedy this wave announces).
-    """
+    """None if any LLM_POOL entry set private_ok; else 'none' (nothing declared) or 'no_role_less_opt_in' (roles without a privacy opt-in) (decision:1824)."""
     if any(LLM_BACKEND_PRIVATE_OK_EXPLICIT.get(b, False) for b in LLM_POOL):
         return None
     if all(LLM_BACKEND_PRIVATE_OK_EXPLICIT.get(b, False) is False
@@ -1585,43 +1240,19 @@ async def _wait_for_capacity_slot(role: str, affinity_key: "str | None",
     finally:
         _capacity_waiters -= 1
 
-# --------------------------------------------------------------------------- #
-# RFC 7230 §6.1 — hop-by-hop headers must never be forwarded by a proxy.
-# Content-Length is included because we always stream (chunked TE); forwarding
-# a stale byte-count causes clients to truncate or hang indefinitely.
-# Accept-Encoding is NOT included here — it is an end-to-end request header
-# by RFC definition and must be forwarded. Compression is handled transparently
-# via auto_decompress=False on the ClientSession (see start_session).
-# --------------------------------------------------------------------------- #
+# Hop-by-hop headers (RFC 7230 §6.1) plus Content-Length are never forwarded; Accept-Encoding stays (auto_decompress=False).
 HOP_BY_HOP = frozenset({
     "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
     "te", "trailers", "transfer-encoding", "upgrade", "content-length",
 })
 
-# --------------------------------------------------------------------------- #
-# S13 (R-C) — headers that describe OUR CALLER and must not reach a backend.
-# A DENYLIST, deliberately: an allowlist at a proxy boundary breaks the next
-# provider-specific header somebody legitimately sends, silently and remotely.
-# Cookie is here because a gateway token is the only credential this hop has;
-# the X-Forwarded-* / X-Real-IP family because a backend has no business
-# learning our caller's network position, and a client-supplied value there is
-# unverified anyway. `Referer` and `User-Agent` are deliberately NOT here —
-# R-C left them, and tests/test_gateway_edge_hygiene.py pins that so a later
-# change to an allowlist cannot narrow the request surface unremarked.
-# --------------------------------------------------------------------------- #
+# S13 denylist: caller-describing headers (Cookie, X-Forwarded-*, X-Real-IP) never reach a backend; Referer/User-Agent stay (pinned).
 CLIENT_ORIGIN_HEADERS = frozenset({
     "cookie", "x-forwarded-for", "x-forwarded-proto", "x-forwarded-host",
     "x-real-ip",
 })
 
-# --------------------------------------------------------------------------- #
-# S16f (R-C') — response headers a backend must not be able to plant on our
-# caller through us. `Set-Cookie` only: the CORS `Access-Control-*` family was
-# DEFERRED to the small-rulings bundle because the monitor's dependency on it
-# is unverified, and `Server` is not stripped here — it is OVERWRITTEN for
-# every response by _set_server_header (S16e), refusals included, so that the
-# header cannot distinguish which path answered.
-# --------------------------------------------------------------------------- #
+# S16f: drop Set-Cookie from upstream responses so a backend cannot plant a cookie on our caller.
 UPSTREAM_ONLY_RESPONSE_HEADERS = frozenset({"set-cookie"})
 
 GATEWAY_SERVER_HEADER = "shared-memory-gateway"
@@ -1721,14 +1352,7 @@ def _safe_resolve_identity(request) -> "str | None":
 # below) — are the sole non-admin identities allowed to steer LLM routing.
 _CONSOLIDATION_AGENT_NAME = "consolidation"
 _REM_DAEMON_AGENT_NAME    = "rem_daemon"
-# R-6 (decision:1357, closing the plan's R-2 item): a standalone framework
-# tool that legitimately steers — it sends X-SM-LLM-Role but runs outside the
-# gateway process, so it can never hold a minted daemon token — gets in via
-# an OPERATOR-DECLARED name allowlist, unioned here. The
-# operator mints an ordinary agent token under one of these names and points
-# the tool at it. Deliberately a NAME list, never a role-based widening and
-# never admin (auth_middleware confines admin tokens to /admin/*): each
-# entry is one explicit identity the operator chose to trust with steering.
+# Framework tools that send X-SM-LLM-Role but run outside the gateway are the explicit steering allowlist (decision:1357).
 LLM_STEER_EXTRA_AGENT_NAMES = frozenset(
     n.strip() for n in os.environ.get("LLM_STEER_EXTRA_AGENT_NAMES", "").split(",")
     if n.strip())
@@ -1811,14 +1435,7 @@ class AsyncHiveMindProxy:
         known: dict = {}
         for route in router.routes():
             if route.method == "*":
-                # A wildcard-method registration — the catch-all proxy route
-                # ("*", "/{tail:.*}") — is by definition not a specific
-                # framework route: snapshotting it would mark every path
-                # "known" and blanket-405 the LLM passthrough. Filtering by
-                # method makes the snapshot correct regardless of WHEN it is
-                # taken relative to the catch-all's registration, so the
-                # startup ordering is a convention, not a correctness
-                # requirement.
+                # Do not snapshot the catch-all * route (that would 405 every LLM passthrough).
                 continue
             resource = route.resource
             if resource is None:
@@ -1841,14 +1458,7 @@ class AsyncHiveMindProxy:
             ttl_dns_cache=300,
             enable_cleanup_closed=True, # evicts half-open sockets immediately; prevents pool leaks
         )
-        # connect=5.0: fail fast if an upstream is down.
-        # total=None:  never cut off a long-running LLM generation mid-stream.
-        #
-        # auto_decompress=False: aiohttp decompresses by default but still forwards
-        # the upstream's Content-Encoding header. A client receiving decompressed bytes
-        # labelled Content-Encoding: gzip will try to decompress again — corruption.
-        # With auto_decompress=False the proxy is fully transparent: compressed bytes
-        # and their headers travel together and the client handles them correctly.
+        # connect=5s, total=None (never cut a generation), auto_decompress=False (keep Content-Encoding with the bytes).
         timeout = ClientTimeout(total=None, connect=5.0)
         self.session = ClientSession(
             connector=connector,
@@ -1913,41 +1523,7 @@ class AsyncHiveMindProxy:
         return result
 
     def _route_guard(self, request: web.Request) -> "web.Response | None":
-        """fact:1535 — run BEFORE any ROUTING_MAP/LLM dispatch decision.
-
-        handle_proxy is the catch-all handler: by construction, aiohttp only
-        ever reaches it for a (method, path) pair no specific resource
-        accepted — either because the path matches a real framework
-        resource but the METHOD doesn't (aiohttp's own router can't surface
-        that as 405 here, because the catch-all's method="*" absorbs every
-        method once a specific resource declines to match), or because the
-        path is genuinely unregistered. This tells the two apart using the
-        route view set_known_routes() derived from the router itself:
-
-        - Path matches a known resource, method doesn't → 405, Allow header
-          naming the accepted method(s), body says the request was NOT
-          forwarded to any LLM backend (same voice as the 401/403 replies
-          coordinator.auth_middleware raises — fact:1503 class: informative,
-          says explicitly what did NOT happen, so a retry can be safe).
-        - Path doesn't match any known resource, but starts with a reserved
-          framework prefix (/memory/, /admin/) → 404, same voice.
-        - Path doesn't match any known resource and is outside the reserved
-          prefixes, but is a trailing-slash NEAR-MISS spelling of a known
-          static one (`/health/`, `/health//`, `/health%2f`,
-          `/pool/status/`) → 404, same voice. Security fix A1, v0.9.76 — see
-          the block below for why this is here and not a second mechanism
-          somewhere else, and why it runs AFTER the reserved-prefix branch.
-        - Anything else → None (today's ROUTING_MAP/LLM behaviour, unchanged
-          — the LM Studio passthrough for /v1/chat/completions and any
-          non-framework path is a supported contract, not a mistyped call).
-
-        ⚠ SCOPE. The near-miss branch normalises with `rstrip("/")` and
-        therefore covers TRAILING SLASHES ONLY. `//health`, `/pool//status`
-        and `/health/.` are not near-misses to it; on an auth-on install they
-        are a plain 401, and on an auth-off install they reach LLM dispatch
-        exactly like every other unregistered path — that is the auth-off
-        posture, not an A1 residue.
-        """
+        """Catch-all: known path + any method → 405; reserved prefix unknown → 404; trailing-slash near-miss of /health or /pool/status → 404; else None (LLM passthrough) (fact:1535, A1)."""
         path = request.path
         methods = None
         for key, entry in self._known_routes.items():
@@ -1960,25 +1536,7 @@ class AsyncHiveMindProxy:
                 methods = entry["methods"]
                 break
 
-        # ⛔ LOAD-BEARING FOR SECURITY FIX A1 — this branch returns 405 for ANY
-        # known key, INCLUDING one whose method is allowed. That reads like a
-        # bug against its own message ("Method GET not allowed on
-        # /pool/status") and it is tempting to "correct" it to
-        # `if methods is not None and request.method not in methods:`.
-        #
-        # ⛔ DO NOT. `path` here is `request.path`, which is percent-DECODED,
-        # so `GET /pool%2fstatus` arrives with `path == "/pool/status"`, finds
-        # the known key, and is stopped HERE. aiohttp itself matched the request
-        # on `rel_url.path_safe` (`/pool%2Fstatus`), which no route accepts —
-        # that is why an allowed-method request reached the catch-all at all.
-        # Adding the method test would hand `/pool%2fstatus` straight to the LLM
-        # dispatch on every auth-off install, and the full suite would stay
-        # green except for the pin below. Measured, fix round.
-        #
-        # Pinned by tests/test_auth_exemption_route_resolution.py::
-        #   test_encoded_slash_spelling_of_an_owned_route_is_never_proxied
-        # If this branch is ever corrected to match its message, the near-miss
-        # branch below must first be taught to compare `rel_url.path_safe`.
+        # 405 for any decoded path that matches a known key (do not add a method test): GET /pool%2fstatus must not reach LLM dispatch. Pinned by test_encoded_slash_spelling_of_an_owned_route_is_never_proxied.
         if methods is not None:
             allow = ", ".join(sorted(methods))
             return web.json_response(
@@ -1990,16 +1548,7 @@ class AsyncHiveMindProxy:
                 headers={"Allow": allow, "X-SM-Fault-Origin": "gateway"},
             )
 
-        # Reserved-prefix refusal runs BEFORE the near-miss branch below.
-        # Ordering is deliberate (fix round, review SEC-3): every unregistered
-        # `/memory/*` and `/admin/*` path — trailing slash or not — keeps the
-        # refusal message it has always had. When the near-miss branch ran
-        # first it answered for `/memory/save/` and `/admin/backup/` too and
-        # silently changed their 404 body, which on an auth-off install let an
-        # anonymous caller distinguish a registered route name from an
-        # unregistered one by appending a slash. The near-miss branch exists
-        # for the paths this one does NOT cover — gateway-owned routes outside
-        # the reserved prefixes — so running it second is what it means.
+        # Reserved-prefix 404 runs before the near-miss branch so /memory/*/ and /admin/*/ keep their original body (A1).
         if path.startswith(RESERVED_ROUTE_PREFIXES):
             return web.json_response(
                 {"error": f"No such framework route: {path}. This path is "
@@ -2010,33 +1559,7 @@ class AsyncHiveMindProxy:
                 headers={"X-SM-Fault-Origin": "gateway"},
             )
 
-        # Security fix A1 (v0.9.76) — the NEAR-MISS branch.
-        #
-        # /health and /pool/status are gateway-OWNED routes that sit outside
-        # RESERVED_ROUTE_PREFIXES, so until now a trailing-slash spelling of
-        # them matched no known key, cleared the reserved-prefix check, and
-        # fell straight through to the LLM dispatch. `/memory/search/` and
-        # `/memory/telemetry/` were already closed by the prefix branch above
-        # — the class was solved once and these two names were left outside
-        # it. This closes them by OWNERSHIP rather than by prefix, which is
-        # exactly why it runs after the prefix branch and not before it: the
-        # paths it is for are the ones that branch cannot reach.
-        #
-        # It matters most on the SHIPPED DEFAULT install. With AGENT_TOKENS
-        # unset (.env.example's backward-compatible default) auth_middleware
-        # returns before its exemption ever runs, so the coordinator-side half
-        # of this fix is inert there and this branch is the only thing between
-        # an anonymous `GET /health/` and the LLM backend.
-        #
-        # Normalised for the REFUSAL, exact for the GRANT: the auth exemption
-        # never matches a normalised spelling (coordinator._UNPROTECTED_PATHS),
-        # so no normalisation here can ever hand anything out — it can only
-        # take the near-miss away from the proxy.
-        #
-        # Static keys only. A dynamic key is a pattern, and every dynamic
-        # route the gateway registers already lives under a reserved prefix,
-        # so widening this to patterns would add no coverage and would risk
-        # 404-ing a legitimate passthrough that merely resembles one.
+        # Trailing-slash near-miss of a static gateway-owned route (/health/, /pool/status/) is 404, not LLM passthrough — grant stays exact (A1).
         normalised = path.rstrip("/") or "/"
         if normalised != path:
             for key, entry in self._known_routes.items():
@@ -2062,16 +1585,7 @@ class AsyncHiveMindProxy:
         if guard_response is not None:
             return guard_response
 
-        # R-A' (HYG round): the encoder paths are REGISTERED routes now, so
-        # anything that merely LOOKS like one — a suffix, an extra segment, a
-        # traversal spelling — reaches this catch-all instead of the encoder.
-        # Before registration those spellings were prefix-matched and forwarded
-        # to the encoder; after it they would fall through to the reasoning-LLM
-        # pool, which is the fact:1535 defect wearing a different hat. Refuse
-        # them in _route_guard's own voice, right after the guard itself, so a
-        # near-miss of a gateway-owned route answers the same way wherever it
-        # is spelled. Runs AFTER the guard: a known key (including the
-        # trailing-slash and %2f spellings) is the guard's to answer.
+        # Encoder near-miss spellings (suffix/extra segment) 404 in the guard's voice; they must not fall through to the LLM pool (fact:1535).
         encoder_near_miss = _encoder_near_miss(request.path)
         if encoder_near_miss is not None:
             return web.json_response(
@@ -2085,14 +1599,7 @@ class AsyncHiveMindProxy:
                 headers={"X-SM-Fault-Origin": "gateway"},
             )
 
-        # Every request that reaches this catch-all is a reasoning-LLM request,
-        # dispatched through the backend POOL so the gateway owns
-        # parallelisation. The optional X-SM-LLM-Role header is set
-        # ONLY by framework components (e.g. the v0.6.1 judge) — never by clients.
-        # S-14: backend steering is a daemon/admin capability — every X-SM-LLM-*
-        # header a non-steering caller sent is dropped from the view used below
-        # AND from what gets forwarded upstream (see upstream_headers further
-        # down), before either the role signal or the routing decision is read.
+        # Catch-all is pool-routed LLM; strip X-SM-LLM-* from non-steering callers before role or routing is read (S-14).
         steer_headers = (request.headers if _may_steer_llm(request)
                           else _strip_llm_steering_headers(request.headers))
         # The encoder paths are their OWN registered routes (handle_encoder)
@@ -2172,45 +1679,7 @@ class AsyncHiveMindProxy:
                 status=422, headers={"X-SM-Fault-Origin": "gateway"},
             )
 
-        # R-4 (decision:1357): a request that can ONLY land on a
-        # credentialed backend but is not on the S-04 allowlist is DOOMED
-        # — deny it here, BEFORE it can hold a capacity-wait slot for the
-        # full window. A mixed eligible set (any uncredentialed member)
-        # falls through: selection may legitimately pick the
-        # uncredentialed one, and the post-selection S-04 check below
-        # still guards the credentialed choice.
-        #
-        # R-B: THE GATE COMPARES THE RAW REQUEST-TARGET PATH, EXACTLY —
-        # `rel_url.raw_path`, the path as it arrived on the wire, against the
-        # allowlist. `_upstream_url` forwards `str(rel_url)`, so the string
-        # compared here IS the string signed and sent to the provider. No
-        # spelling is normalised.
-        #
-        # ⛔ NOT `request.path` and ⛔ NOT `path_safe`. Both are percent-DECODED
-        # (`path_safe` keeps only %2F and %25, measured — its own docstring says
-        # so), so `/v1%2fchat/completions` and `/v1/chat/completio%6es` would
-        # READ as the allowed route here while something else entirely went to
-        # the provider. `raw_path` is the request target verbatim, minus the
-        # query, which is the string this gate is actually about.
-        #
-        # A FRAGMENT is never on an HTTP request-target at all, so a conforming
-        # client cannot express one; yarl drops it from `raw_path_qs`. An HTTP
-        # request-target path is never empty either, so the compare needs no
-        # empty-path fallback.
-        #
-        # The rule, stated plainly: a caller that spells an allowed path any way
-        # other than the exact way is REFUSED. No framework caller encodes
-        # anything or appends a trailing slash — both clients and both daemons
-        # send literal paths — so the only traffic this turns away is traffic
-        # spelling a framework endpoint in a way the framework never does.
-        #
-        # A QUERY STRING on a credentialed route is denied outright for the
-        # same reason: the forward carries it verbatim, no framework caller
-        # sends one, and `?key=…` is a real provider idiom — an unexamined
-        # query steers a signed request past a (method, path) allowlist that
-        # cannot see it. The credentialed_route_denied population widens under
-        # an unchanged name (CHANGELOG line owed, Group 3) — trailing-slash
-        # spellings now join the same counter.
+        # Credentialed-only eligible set: refuse before the capacity wait unless (method, rel_url.raw_path) is on the S-04 allowlist with no query string (decision:1357).
         _route = (request.method, request.rel_url.raw_path)
         if ((_route not in CREDENTIALED_BACKEND_ALLOWED_ROUTES
              or request.rel_url.query_string)
@@ -2266,20 +1735,7 @@ class AsyncHiveMindProxy:
                     status=403, headers={"X-SM-Fault-Origin": "gateway"},
                 )
 
-        # S5: credentialed backend serves only its declared `model` (refuse, not rewrite).
-        # We check this here before _forward_upstream so no capacity slot is consumed.
-        #
-        # "local-model" is exempt: it is the framework's own default placeholder,
-        # sent by the dream daemons (rem_loop.py / consolidation_loop.py), the CLI
-        # clients and postflight A8, so it means "unspecified" — not a request for
-        # a specific model. It must proceed to the per-backend rewrite below
-        # (_apply_backend_body_overrides), which replaces it with the backend's
-        # declared model. Any OTHER caller-named model is still refused, preserving
-        # S5's intent.
-        #
-        # Known limitation (pre-existing, unchanged here): this gate only applies to
-        # a JSON-object body carrying a truthy `model` — an absent model, or a
-        # non-object body, is forwarded unchanged.
+        # S5: a credentialed backend serves only its declared model (refuse, not rewrite) before a capacity slot is taken.
         backend_model = LLM_BACKEND_MODELS.get(llm_backend)
         if LLM_BACKEND_TOKENS.get(llm_backend) is not None and backend_model and isinstance(body_obj, dict):
             caller_model = body_obj.get("model")
@@ -2438,15 +1894,7 @@ class AsyncHiveMindProxy:
         scrubbed_target_url = scrub_url_credentials(target_url)
         log.debug("→ %s %s", request.method, scrubbed_target_url)
 
-        # P-6 (Model_Attributes_Routing_Plan_2026-08-18): X-SM-LLM-* headers
-        # are stripped before the upstream forward for EVERY caller, daemons
-        # and admins included — the role/affinity signal above was already
-        # read off `steer_headers` (whose S-14 gate decides who may SET it
-        # for the gateway's OWN routing decision); the provider itself must
-        # never see routing metadata on the wire, aligning the request
-        # direction with the response direction's existing X-SM- stripping
-        # (_filter_headers' strip_gateway_namespace). Deliberately changes
-        # the pinned expectation in tests/test_llm_steering_headers.py:98.
+        # Strip X-SM-LLM-* before the upstream forward for every caller (provider never sees routing metadata).
         upstream_headers = self._filter_headers(_strip_llm_steering_headers(steer_headers))
         # Authorization was just stripped above (see _filter_headers) — add it
         # back ONLY for a backend that has its own configured credential. Every
@@ -2455,20 +1903,7 @@ class AsyncHiveMindProxy:
         if llm_backend is not None:
             backend_token = LLM_BACKEND_TOKENS.get(llm_backend)
             if backend_token:
-                # S-04 (Critical, PR A5): a request about to carry a provider
-                # key may only be POST to a framework-owned endpoint — never
-                # an arbitrary method/path forwarded verbatim to a
-                # credentialed backend. Checked before Authorization is
-                # attached (below) and before any upstream call, so a
-                # rejected request never gets near the key.
-                # R-B: the RAW request-target path compared exactly, and a query
-                # denies — same rule and same reasons as the R-4 pre-dispatch
-                # gate above (⛔ `raw_path`, never `path_safe`: see there). The
-                # compared string is the forwarded string; no spelling is
-                # normalised. This gate is the one that fires when the eligible
-                # set was MIXED, so R-4's `all(...)` was false and selection
-                # nevertheless landed on the credentialed member; each gate
-                # therefore needs its own fleet shape to be pinned at all.
+                # S-04: a request about to carry a provider key may only POST a framework-owned path (raw_path, no query) before Authorization is attached.
                 route = (request.method, request.rel_url.raw_path)
                 if (route not in CREDENTIALED_BACKEND_ALLOWED_ROUTES
                         or request.rel_url.query_string):
@@ -2496,19 +1931,7 @@ class AsyncHiveMindProxy:
             except (TypeError, AttributeError):
                 pass
 
-        # Stream the request body directly to the upstream without buffering it
-        # into a single byte array first, UNLESS it's small enough that buffering
-        # (and the stale-connection retry that requires a buffered body — see
-        # ServerDisconnectedError handling below) is worth it. Every real caller
-        # (coordinator._embed) sends one text field capped at EMBED_MAX_CHARS
-        # (24000 chars), so this covers all observed traffic; anything with no
-        # Content-Length or over the cap keeps streaming as before (memory-flat,
-        # unprotected by the retry — the original behaviour for oversized/chunked
-        # bodies, e.g. large GraphRAG ingestion payloads if any client ever sends
-        # one through this path).
-        # NOTE: this bypasses the client_max_size check that request.read() would
-        # enforce. Acceptable for this trusted localhost deployment; revisit if the
-        # proxy is ever exposed to untrusted clients.
+        # Stream the body unless it is under EMBED_RERANK_BUFFER_CAP (buffering is what makes the stale-socket retry possible).
         embed_body: bytes | None = None
         if llm_body is None and request.can_read_body:
             content_length = request.content_length
@@ -2533,14 +1956,7 @@ class AsyncHiveMindProxy:
         max_attempts = 2 if have_buffered_body else 1
 
         try:
-            # Reserve the in-flight slot INSIDE the try, so the finally below is
-            # GUARANTEED to release it. Reserving before the try left a window —
-            # target_url/_filter_headers construction, or a CancelledError from an
-            # early client disconnect — in which a slot leaked permanently. A leaked
-            # slot makes the pool read busy forever, which starves the idle-gated
-            # dream daemons (NREM defers on a never-idle pool) with no way back
-            # short of a gateway restart. One reservation covers both attempts —
-            # a retry is the same logical request, not a second one.
+            # Reserve the inflight slot inside the try (one slot covers retries) so a pre-try cancel cannot leak it forever.
             if llm_backend is not None:
                 _llm_inflight[llm_backend] = _llm_inflight.get(llm_backend, 0) + 1
                 _llm_inflight_started.setdefault(llm_backend, []).append(time.monotonic())
@@ -2552,24 +1968,10 @@ class AsyncHiveMindProxy:
                 if role:
                     _record_role_routed(role)
 
-            # New instrument: latency timer starts here (request dispatch),
-            # spans every retry attempt below as ONE logical request (same
-            # framing as the inflight/_llm_routed accounting just above —
-            # a retry is the same call, not a second one), and is read back
-            # in the finally at the bottom of this method regardless of how
-            # the method exits. _llm_req_failed defaults to True (covers
-            # every exception/error-status exit path below) and is flipped
-            # to False only at the single success return.
+            # LLM latency timer spans retries as one request; _llm_req_failed flips False only on the success return.
             _llm_req_start_mono = time.monotonic() if llm_backend is not None else None
             _llm_req_failed = True
-            # D9 (OBS round): a CLIENT abort (our caller hung up — either
-            # before we could write response headers, at `prepare()`, or
-            # partway through the streamed body) is the CALLER's event, not
-            # the backend's: neither `_llm_mark_ok` nor `_llm_mark_fail` fires
-            # for it, no gateway fault is recorded, and its duration is not a
-            # service time — set True by either abort window below, read by
-            # the mid-stream success gate and by the `finally` at the bottom
-            # of this method to skip `_record_llm_latency` entirely.
+            # Client abort is the caller's event: no backend ok/fail mark, skip latency record.
             _client_aborted = False
 
             for attempt in range(max_attempts):
@@ -2586,14 +1988,7 @@ class AsyncHiveMindProxy:
                             status=upstream.status,
                             headers=self._filter_headers(upstream.headers, strip_gateway_namespace=True),
                         )
-                        # Stamp the serving backend so daemons can attribute per-backend
-                        # telemetry (obs tok/s) without learning routing — observability only.
-                        # SEC B (defense in depth, second wall behind A): scrubbed through
-                        # scrub_url_credentials — for a clean, query-less backend URL this is
-                        # byte-identical to the raw pool key (item C), so rem_loop.py /
-                        # consolidation_loop.py's record_llm_call(backend=...) attribution
-                        # round-trips unchanged; a query-bearing backend's attribution
-                        # degrades (R-2 accepted cost, HANDOFF note).
+                        # Stamp serving backend via scrub_url_credentials (query-less keys round-trip; query-bearing attribution degrades).
                         if llm_backend is not None:
                             proxy_resp.headers["X-SM-LLM-Backend"] = scrub_url_credentials(llm_backend)
                         # Client-facing standard messaging (PR A3 / S8): a fault status
@@ -2661,35 +2056,7 @@ class AsyncHiveMindProxy:
                                 status=upstream.status,
                                 headers=headers,
                             )
-                        # D9 (OBS round): a NARROW except scoped to `prepare()`
-                        # ONLY — the same classes the mid-stream write path
-                        # below already catches, `(ConnectionResetError,
-                        # IOError)`. Proved (commit body) that aiohttp's own
-                        # web-writer raises exactly this: `web.StreamResponse`
-                        # defaults `_send_headers_immediately = True`, so
-                        # `prepare()` sends headers SYNCHRONOUSLY via
-                        # `http_writer.StreamWriter._write()`, which raises
-                        # `aiohttp.client_exceptions.ClientConnectionResetError`
-                        # ("Cannot write to closing transport") when OUR
-                        # downstream transport (this client's connection to
-                        # US) is already closing — and that class IS-A builtin
-                        # `ConnectionResetError` (checked via its MRO), so this
-                        # narrow except catches it structurally, with no need
-                        # to name the aiohttp class explicitly. Before this
-                        # fix that exception fell through uncaught to the
-                        # per-attempt `except (ClientConnectionResetError,
-                        # ServerDisconnectedError)` below — the clause meant
-                        # for the UPSTREAM connection-reuse race — which
-                        # treats `proxy_resp is not None` (true here, it was
-                        # already constructed above) as "not the retryable
-                        # case" and re-raises into the `ClientError` handler:
-                        # an "Upstream unreachable" ERROR log + `_llm_mark_fail`
-                        # for a card that never saw a single byte of this
-                        # request. ⛔ Deliberately NOT `asyncio.CancelledError`
-                        # (task cancellation is not a client abort — see the
-                        # existing comments below on why swallowing it would
-                        # stall shutdown); it is a `BaseException`, not caught
-                        # by this tuple regardless.
+                        # prepare() ConnectionResetError is a downstream client abort, not the upstream reuse race (do not mark the backend failed; do not swallow CancelledError).
                         try:
                             await proxy_resp.prepare(request)
                         except (ConnectionResetError, IOError) as e:
@@ -2705,32 +2072,7 @@ class AsyncHiveMindProxy:
                         # once so the usage capture below can decompress it.
                         content_encoding = upstream.headers.get("Content-Encoding")
 
-                        # Post-review addition A: accumulate the response body
-                        # for a best-effort `usage` parse AFTER the loop, so a
-                        # per-backend token count can be kept without ever
-                        # delaying or altering the passthrough chunk written
-                        # below. Attempted for a successful LLM response that
-                        # is either uncompressed OR compressed with a
-                        # SUPPORTED_CONTENT_ENCODINGS value (gzip/deflate/br —
-                        # see _decompress_full_for_usage). Live debugging on a
-                        # cloud backend (api.deepseek.com) showed the original
-                        # `not content_encoding` gate reading 0 tokens on
-                        # every gzipped response while the billable call
-                        # succeeded — the cost meter was blind exactly where
-                        # cost matters. The accumulation itself is bounded by
-                        # LLM_USAGE_CAPTURE_CAP_BYTES on the COMPRESSED bytes
-                        # (the memory bound is the point — decompression
-                        # happens once, after the loop, on the accumulated
-                        # cap-bounded body) so a large streamed completion is
-                        # never held fully in memory just to look for a
-                        # trailing `usage` object. An unsupported/unknown
-                        # encoding (e.g. a future provider using `zstd`)
-                        # leaves capture_usage False, same as the original
-                        # gate for any compression it didn't understand.
-                        # stream:true responses are SSE — the accumulated
-                        # bytes can never parse as a single JSON object, so
-                        # skip capture instead of buffering up to the cap for
-                        # a parse that always fails (Optional, decision:1357).
+                        # Best-effort usage parse after the loop (gzip/deflate/br, cap-bounded; skip SSE) (decision:1357).
                         _capture_encoding_ok = (
                             not content_encoding
                             or content_encoding.strip().lower() in SUPPORTED_CONTENT_ENCODINGS
@@ -2769,18 +2111,7 @@ class AsyncHiveMindProxy:
                             log.warning("Upstream dropped connection mid-stream: %s — %s", scrubbed_target_url, e)
 
                         except (ConnectionResetError, IOError) as e:
-                            # OS-level socket reset from the downstream client.
-                            # Nothing more can be sent; log and return.
-                            #
-                            # D9 (OBS round): this branch used to fall through
-                            # to `_llm_mark_ok` below unconditionally — a
-                            # mid-stream client abort on a 200 upstream
-                            # recorded SUCCESS and cleared the backend's fail
-                            # streak, the opposite defect from the prepare()
-                            # window (which recorded a FALSE failure). A
-                            # partial write is not "served": mark neither ok
-                            # nor fail, so a genuinely flaky backend's streak
-                            # survives an unrelated client hangup.
+                            # Downstream client reset: log and return; nothing more can be sent.
                             log.warning("Client disconnected mid-stream: %s — %s", scrubbed_target_url, e)
                             record_llm_client_disconnect()
                             _client_aborted = True
@@ -2789,17 +2120,7 @@ class AsyncHiveMindProxy:
                             try:
                                 usage_body = b"".join(usage_chunks)
                                 if content_encoding:
-                                    # Whole-body decompress — mirrors
-                                    # _decompress_prefix_for_parse's encoding
-                                    # support exactly (gzip/deflate/br) but
-                                    # without its bounded-prefix truncation,
-                                    # since the `usage` object trails the
-                                    # response and a prefix would miss it.
-                                    # Raises on failure (unlike the prefix
-                                    # helper), caught by this same except —
-                                    # a decompression failure abandons
-                                    # capture silently, exactly like today's
-                                    # parse failure.
+                                    # Whole-body decompress for trailing usage (gzip/deflate/br); failure abandons capture.
                                     usage_body = _decompress_full_for_usage(usage_body, content_encoding)
                                 resp_payload = json.loads(usage_body)
                                 usage = (resp_payload.get("usage")
@@ -2814,35 +2135,12 @@ class AsyncHiveMindProxy:
                         # this backend — neither ok nor fail fires for it.
                         if llm_backend is not None and not _client_aborted:
                             _llm_mark_ok(llm_backend)   # connected + served — clear fail streak
-                        # The exchange completed and the body was fully
-                        # written above (write_eof / the disconnect branches
-                        # both fall through to here) — but a fault STATUS
-                        # from upstream (>= 400) still reaches this same
-                        # return (the body passes through verbatim either
-                        # way, per the X-SM-Fault-Origin comment above), so
-                        # the latency instrument's failed flag reads the
-                        # status here rather than assuming success. Unused
-                        # when `_client_aborted` — the `finally` below skips
-                        # `_record_llm_latency` entirely for an abort.
+                        # This return is the <400 stream path; >=400 already returned a typed S-08 JSON above.
                         _llm_req_failed = upstream.status >= 400
                         return proxy_resp
 
                 except (ClientConnectionResetError, ServerDisconnectedError) as e:
-                    # A pooled connection reused just as the backend started closing
-                    # it — a connection-reuse race, not evidence the backend is down
-                    # (enable_cleanup_closed already evicts the stale socket).
-                    # "Cannot write to closing transport" (the write-phase reset,
-                    # verified live as the actual exception raised — aiohttp 3.14
-                    # ClientConnectionResetError, NOT ServerDisconnectedError, which
-                    # an earlier version of this fix caught instead and which never
-                    # once matched this error in production) is caught here alongside
-                    # ServerDisconnectedError (the read-phase counterpart) since both
-                    # represent the same underlying race, just observed at a
-                    # different point in the request lifecycle. proxy_resp is still
-                    # None here: the failure happens writing the request, before any
-                    # response is read, so retrying on a fresh connection is safe.
-                    # First-attempt-only: a second failure in a row is treated as a
-                    # real problem, same as before this retry existed.
+                    # First-attempt retry on ClientConnectionResetError / ServerDisconnectedError (stale pooled socket); second failure is real.
                     if attempt < max_attempts - 1 and proxy_resp is None:
                         log.warning(
                             "Stale connection to %s (%s) — retrying once on a fresh "
@@ -2895,16 +2193,7 @@ class AsyncHiveMindProxy:
                                       headers={"X-SM-Fault-Origin": "gateway"})
 
         except Exception as e:
-            # O-6: same treatment as the ClientError branch above — scrubbed/
-            # bounded text in the log, class name only in the client-visible
-            # body. `exc_info=True` alone is NOT enough here: the traceback
-            # formatter calls str() on the ORIGINAL exception object again
-            # when rendering its final line, which would re-embed the raw
-            # (unscrubbed) text regardless of what was passed as the log
-            # message — so a substitute exception carrying the SCRUBBED text
-            # is passed via an explicit exc_info tuple instead, keeping the
-            # real traceback frames (file/line — the actual debugging value)
-            # while the rendered exception message stays scrubbed.
+            # Log ClientError with a substitute exception carrying scrubbed text (traceback str() would re-embed the raw message).
             scrubbed_msg = _short(_scrub_url_credentials(str(e)))
             try:
                 scrubbed_exc = type(e)(scrubbed_msg)
@@ -2933,21 +2222,7 @@ class AsyncHiveMindProxy:
                 starts = _llm_inflight_started.get(llm_backend)
                 if starts:
                     starts.remove(min(starts))
-                # New instrument: record latency for every exit path from
-                # this method (success, upstream fault status, gateway
-                # error, timeout, cancellation) — _llm_req_start_mono is set
-                # iff llm_backend is not None, i.e. exactly the pool-routed
-                # requests this instrument covers; embeddings/reranking
-                # never reach here with a backend set. _llm_req_failed
-                # defaults True and is flipped only at the single success
-                # return above, reading the upstream status there.
-                #
-                # D9 (OBS round): SKIP this entirely on a client abort
-                # (`_client_aborted`) — a `failed=False` record still updates
-                # `latency_max`, and an abort's duration is not a service
-                # time. Accepted survivor bias: this hides "clients hang up
-                # because the backend is slow" from the latency ring (no
-                # second ring is added to recover it — HANDOFF note).
+                # Record pool-routed LLM latency on every exit except a client abort (abort duration is not a service time).
                 if _llm_req_start_mono is not None and not _client_aborted:
                     _record_llm_latency(
                         llm_backend, time.monotonic() - _llm_req_start_mono, _llm_req_failed)
@@ -3588,20 +2863,7 @@ async def _probe_capability(session) -> dict:
     return out
 
 
-# The MEASURED set a successful probe cycle produces for one backend. These
-# keys travel TOGETHER: throughput and the latency it was computed from are
-# one coherent reading, and the projection and its ceiling are derived from
-# that same reading — carrying half of them forward would publish a mix of
-# two different cycles under one block.
-#
-# ⛔ `serves_full_payload` is deliberately NOT here (operator ruling A-1 on
-# ADV-1). It is not a reading, it is a VERDICT in the present tense — "this
-# backend can serve a full payload inside the caller's timeout" — and
-# publishing it as `true` beside `status: "failing"` prints an affirmative
-# green next to a backend that answered nothing, demoted only by a sibling
-# key no renderer is obliged to show. Only measured NUMBERS are carried; the
-# verdict goes to null while the reading ages (see _merge_capability_
-# projection).
+# Capability measured keys travel together; serves_full_payload is a present-tense verdict and is not carried here (null while the reading ages).
 _PROJECTION_CARRY_KEYS = ("projected_full_payload_s", "ceiling_s",
                           "throughput_chars_s", "latency_s")
 
@@ -3727,16 +2989,7 @@ def _probe_sleep_s(capability: dict | None,
     return interval_s
 
 
-# --------------------------------------------------------------------------- #
-# Capacity derivation — R0-I (decision:1424). REPORT ONLY: this section never
-# limits, queues, rejects or resizes a single request. It reads the capability
-# probe's own numbers (never a second measurement) and derives what an
-# operator or a future wall would need — a projected mean rerank service
-# time, a sustainable queue depth against the CLIENT's own timeout ceiling,
-# and a memory allowance the reranker container could be given without
-# starving Neo4j/Postgres/the embedder/the gateway/the OS. Nothing here
-# writes a compose file or applies a limit.
-# --------------------------------------------------------------------------- #
+# Capacity derivation is report-only (decision:1424): no request is limited, queued, or rejected here.
 _MEM_SIZE_RE = re.compile(r"^([0-9]*\.?[0-9]+)\s*([KMGT]?I?B?)$", re.IGNORECASE)
 # M5 (fix round): KI/MI/GI/TI added alongside the existing KIB/MIB/GIB/TIB
 # so k8s-style binary notation ("8Gi", "512Mi", "4Ki" -- no trailing "B")
@@ -3773,16 +3026,7 @@ def _parse_mem_size(raw: str | None) -> int | None:
         return None
 
 
-# Each subtrahend below is a DECLARED ALLOWANCE, not a measurement — the
-# comment on each says what it stands in for. Every one is env-overridable so
-# a deployment whose compose limits or steady-state usage differ can correct
-# the recommendation without a code change.
-#
-# Neo4j: prefer the OPERATOR'S OWN configured heap+pagecache (the same
-# NEO4J_HEAP_MAX / NEO4J_PAGECACHE env vars ops/postgres_neo4j_limits.yaml
-# already reads) over the compose `deploy.resources.limits.memory: 8G` cap —
-# the configured heap+pagecache is what Neo4j will actually try to hold;
-# the 8G cap is only what docker permits it, and is usually never reached.
+# Capacity RAM subtrahends are declared allowances (env-overridable); Neo4j prefers configured heap+pagecache over the compose 8G cap.
 CAPACITY_NEO4J_FALLBACK_BYTES = _parse_mem_size(
     os.environ.get("CAPACITY_NEO4J_FALLBACK_BYTES", "8G"))
 # Postgres: the compose `deploy.resources.limits.memory: 4G` cap — Postgres
@@ -3826,25 +3070,7 @@ def _capacity_env_number(name: str, default, cast):
         return default
 
 
-# Mirrors memory_bridge.py's search_ceiling() — same FORMULA, same shipped
-# DEFAULTS — so client_ceiling_s (reported alongside, but see
-# CAPACITY_TOLERABLE_WAIT_S below for what queue_bound is actually measured
-# against) reflects the same timeout the client will actually apply by
-# default. Duplicated rather than imported: hive_mind_proxy is the server
-# (ADR-014); importing the thin client back into the server would invert
-# that split. A parity unit test (given the same capability input, both
-# functions must agree) is the guard against the two copies drifting apart.
-#
-# Deliberately CAPACITY_-prefixed, NOT the client's own SEARCH_TIMEOUT_* names
-# — this repo's own .env.example already documents that those names, set in
-# the GATEWAY's env, "have no effect unless a client happens to run with this
-# file loaded" (the client reads them from its own, separate .env). Reusing
-# the identical names here would make that documented boundary quietly false
-# for this one purpose while looking unchanged everywhere else — exactly the
-# kind of stale-comment defect CLAUDE.md calls out. An operator who wants
-# this derivation's ceiling to track a non-default client ceiling sets the
-# CAPACITY_ variant explicitly; the defaults agree today by construction
-# (the parity test pins the numbers, not just the env var names).
+# Server-side search_ceiling mirrors the client formula (same defaults); CAPACITY_TOLERABLE_WAIT_S is what queue_bound actually uses.
 CAPACITY_SEARCH_TIMEOUT_S          = _capacity_env_number("CAPACITY_SEARCH_TIMEOUT_S", 0.0, float)
 CAPACITY_SEARCH_TIMEOUT_FLOOR_S    = _capacity_env_number("CAPACITY_SEARCH_TIMEOUT_FLOOR_S", 30.0, float)
 CAPACITY_SEARCH_TIMEOUT_MAX_S      = _capacity_env_number("CAPACITY_SEARCH_TIMEOUT_MAX_S", 300.0, float)
@@ -3852,85 +3078,13 @@ CAPACITY_SEARCH_TIMEOUT_FALLBACK_S = _capacity_env_number("CAPACITY_SEARCH_TIMEO
 CAPACITY_SEARCH_SAFETY_FACTOR      = _capacity_env_number("CAPACITY_SEARCH_SAFETY_FACTOR", 1.5, float)
 CAPACITY_SEARCH_OVERHEAD_S         = _capacity_env_number("CAPACITY_SEARCH_OVERHEAD_S", 15.0, float)
 
-# H1 (fix round): what queue_bound is actually measured against -- an
-# operator's own stated tolerance for how long a search may sit in queue.
-# Deliberately NOT client_ceiling_s: client_ceiling_s is itself partly
-# DERIVED from s_mean (see _capacity_client_ceiling_s), so the original
-# queue_bound = floor(client_ceiling / s_mean) - 1 folded the same
-# measurement into itself -- circular, and degenerate (pinned to 0 or 1)
-# outside a narrow clamp region. client_ceiling_s is still computed and
-# reported as its own field (informative: what the client will itself time
-# out at) but no longer feeds this calculation.
-#
-# Default 30.0s is MEASURED, not a guess: it is the developer reference
-# machine's own validated tolerance -- see .env.example's
-# CAPACITY_TOLERABLE_WAIT_S comment for the full provenance. Change it to
-# your own validated tolerance.
+# queue_bound is measured against CAPACITY_TOLERABLE_WAIT_S, not client_ceiling_s (that one is informative only).
 CAPACITY_TOLERABLE_WAIT_S = _capacity_env_number("CAPACITY_TOLERABLE_WAIT_S", 30.0, float)
 
-# Measured-payload basis (operator rulings, 2026-08-23): s_mean_s above
-# projects onto a fixed THEORETICAL worst case -- 20 x RERANK_MAX_DOC_CHARS
-# (encoder_config's own search_candidate_floor x rerank_max_doc_chars) --
-# 491,520 chars, a payload no real query on the reference workstation
-# produces. Measured there: 8 real searches against a 1377-record corpus
-# had a MEAN of 71,139 rerank_payload_chars and topped out (MAX) at
-# 101,240 -- the max is 0.21x the theoretical basis and 1.42x the mean
-# (NOT "~4.9x the mean": 4.9x is theoretical-over-observed-max, the
-# opposite ratio; an earlier draft of this comment had this backwards).
-# The resulting s_mean_s of 36.4s tripped single_search_exceeds_wait
-# against real search times measured at 2.78-10.84s wall.
-# CAPACITY_TOLERABLE_WAIT_S itself is not the problem -- see its own
-# comment above; this is what gets compared against it.
-#
-# RULING 1: the basis that replaces the theoretical one is the OBSERVED
-# MAXIMUM, not the mean -- this is a CAPACITY signal, and an average-case
-# basis would under-project a search at the observed max by the same 1.42x
-# just measured, exactly the direction a safety bound must never err in.
-# Using the max still clears the false alarm with room to spare (it
-# projects to roughly 7.5s here, comfortably under the 30s
-# CAPACITY_TOLERABLE_WAIT_S default) while staying conservative. The mean
-# is still computed and reported alongside (s_mean_measured_s) as cheap,
-# useful context -- it is NEVER what feeds queue_bound or
-# single_search_exceeds_wait; only the max-based s_max_measured_s does
-# (see payload_basis in the derived record for which one actually drove a
-# given reading).
-#
-# When the coordinator (fact:1441's payload counters, reused verbatim --
-# see _capacity_payload_stats) has served at least this many real searches
-# this process's lifetime, the derivation trusts the observed max over the
-# fixed theoretical one. Below this count -- including every fresh
-# install, which has zero -- it falls back to the theoretical basis
-# unchanged. UNMEASURED: no data here justifies 5 over 3 or 10; it exists
-# only so a single one-off search right after startup is never treated as
-# representative. Fails open like every CAPACITY_* setting.
-#
-# The observed max is MONOTONIC non-decreasing for this process's
-# lifetime -- it can only rise, so one outlier search pins
-# s_max_measured_s until the next gateway restart. For a capacity signal
-# that is the safe direction (it never becomes less conservative over
-# time), never a defect -- but it is a real property a reader should know
-# rather than discover.
-#
-# STALENESS ACROSS A CONFIG CHANGE: _encoder_config_fingerprint includes
-# rerank_max_doc_chars/search_candidate_floor, so raising either fires a
-# fresh derivation (config_change trigger) while the coordinator's payload
-# counters still hold pre-change traffic -- a record can read
-# payload_basis "measured" against a max observed under the OLD config.
-# No reset hook exists for this (the counters are process-lifetime, not
-# config-lifetime); a reader comparing records across a config change
-# should treat payload_basis "measured" readings from before/after the
-# change as not directly comparable.
+# Capacity projects the observed-max rerank payload once CAPACITY_PAYLOAD_MIN_SAMPLES is met, else the theoretical 20×RERANK_MAX_DOC_CHARS worst case; mean is reported, never the bound (fact:1441).
 CAPACITY_PAYLOAD_MIN_SAMPLES = _capacity_env_number("CAPACITY_PAYLOAD_MIN_SAMPLES", 5, int)
 
-# "Outside a x2 band" for the probe_drift trigger: fires when the current
-# reranker chars/s is more than this factor above OR below the basis
-# reading stored in the last derivation record. Exactly at the factor is
-# still INSIDE the band (see _capacity_drift_outside_band's docstring).
-# A factor <= 1.0 DISABLES this trigger entirely (see
-# _capacity_drift_outside_band's own guard) -- documented in .env.example
-# (L12, fix round): "fire on any change" is not a meaningful band, so a
-# non-positive-band value is treated as "do not use this trigger" rather
-# than as "fire on the smallest possible difference".
+# probe_drift fires outside a ×N band of last derived chars/s; factor <= 1.0 disables the trigger.
 CAPACITY_DRIFT_BAND_FACTOR = _capacity_env_number("CAPACITY_DRIFT_BAND_FACTOR", 2.0, float)
 
 # Where derivation records persist (MEMORY_LOG_PATH's convention: env-
@@ -3948,44 +3102,10 @@ CAPACITY_LOG_MAX_RECORDS = _capacity_env_number("CAPACITY_LOG_MAX_RECORDS", 20, 
 # discipline decision 928 established for _capability.
 _capacity_latest: dict | None = None
 _capacity_latest_loaded_from_disk = False   # memoizes the one lazy disk read
-# True once this PROCESS has run its first capability probe — distinguishes
-# the startup check (trigger gateway_start_fingerprint_mismatch, which
-# compares against whatever the LOG says, not against this process's own
-# prior state) from every later cycle (trigger config_change / probe_drift).
+# True after this process's first capability probe (startup fingerprint vs later config_change/probe_drift).
 _capacity_first_probe_done = False
 
-# B-1 fix (reviewer HIGH, operator 2026-08-23): the payload_threshold_
-# crossed trigger (see _maybe_derive_capacity) used to be gated by a
-# PROCESS-LOCAL one-shot latch, exactly like _capacity_first_probe_done
-# above. That was wrong for this specific trigger: a process-local latch
-# resets on every restart, but the comparison it gated (whether the STORED
-# record still says "theoretical") is read from the durable, cross-process
-# LOG -- so after any restart with unchanged hardware/config (no
-# fingerprint mismatch, hence no other trigger fires either), the stored
-# record already said "measured" from the PREVIOUS process's life, the
-# latch's "last basis is still theoretical" half of the guard was already
-# false, and the trigger could never fire again for the rest of this
-# install's life -- even as the new process's own observed max grew past
-# what the dead process ever saw. That is staleness in the UNSAFE
-# direction for a capacity signal: it under-reports the worst payload,
-# exactly what the max basis exists to prevent (reviewer's live
-# reproduction: process 1 measured/max 100,000 -> restart -> 12 real
-# searches, observed max 150,000 -> zero new records).
-#
-# Fix: no process-local latch at all. The trigger now re-arms itself by
-# comparing LIVE state against the DURABLE stored record's own
-# payload_max_chars_measured (see _maybe_derive_capacity) -- it fires
-# again exactly when the live observed max exceeds whatever is already on
-# disk, regardless of which process wrote that disk record or how long ago.
-# This is restart-safe by construction (a fresh process's live max is
-# compared against the SAME durable value a long-running process would be
-# compared against) and storm-safe without a latch: immediately after a
-# successful derivation the stored max equals the live max, so the same
-# reading never re-fires -- only a NEW, larger reading does, which is
-# inherently sparse. It is also retry-safe (B-2): a failed append leaves
-# the stored record unchanged, so the very next cycle re-evaluates the
-# identical comparison and tries again, rather than a spent latch
-# permanently forfeiting the one attempt it had.
+# payload_threshold_crossed compares live observed max to the durable stored max (no process-local latch) so a restart cannot freeze an under-reported worst case.
 
 
 def _capacity_neo4j_allowance_bytes() -> int | None:
@@ -4353,24 +3473,7 @@ def _build_capacity_record(capability: dict | None, fingerprint: dict,
         payload_basis = "theoretical"
         effective_s_mean = s_mean_theoretical
 
-    # H1: queue_bound is measured against the operator's own tolerable-wait
-    # setting, NOT client_ceiling_s -- client_ceiling_s is still computed
-    # and reported below (informative: what the client will itself time out
-    # at) but no longer feeds this calculation. See CAPACITY_TOLERABLE_WAIT_S's
-    # module-level comment for why the old formula was circular.
-    #
-    # Operator ruling (2026-08-23): queue_bound and single_search_exceeds_
-    # wait are now derived from `effective_s_mean` -- the observed-MAX
-    # basis when CAPACITY_PAYLOAD_MIN_SAMPLES is met, else the same
-    # theoretical basis these two fields always used. Their CONTRACT ("is
-    # a single search's projected rerank time within the operator's
-    # tolerable wait") is unchanged; what changes is which population the
-    # basis describes (worst-case theoretical vs worst-case OBSERVED,
-    # never the average -- see ruling 1 above). s_mean_s (below) is never
-    # altered, precisely so a fixed meaning stays available even while
-    # these two derived fields adopt the better input -- see
-    # _build_capacity_record's own docstring for why reusing these names is
-    # still honest (payload_basis is mandatory and always present).
+    # queue_bound / single_search_exceeds_wait use effective_s_mean (observed max when sampled, else theoretical); s_mean_s itself stays the theoretical figure.
     client_ceiling = _capacity_client_ceiling_s(capability)
     queue_bound = _capacity_queue_bound(effective_s_mean, CAPACITY_TOLERABLE_WAIT_S)
     # M10: makes explicit what queue_bound == 0 means, since "not yet
@@ -4399,14 +3502,7 @@ def _build_capacity_record(capability: dict | None, fingerprint: dict,
             "reranker_status": reranker.get("status"),
             "embedder_chars_per_s": embedder.get("throughput_chars_s"),
             "probed_at": (capability or {}).get("probed_at"),
-            # A-3 (ADV-5, Group 3): once a reading can be CARRIED from an
-            # earlier cycle, `<backend>_chars_per_s` stamped with this
-            # cycle's `probed_at` alone would silently change meaning under
-            # an unchanged name -- in a record that is appended to the
-            # durable capacity.jsonl log. So each throughput now travels
-            # with the timestamp it was actually MEASURED at (equal to
-            # `probed_at` on a fresh cycle, earlier on a carried one), and
-            # `probe_stale` says outright that this block mixes cycles.
+            # Carried throughput travels with the timestamp it was measured at; probe_stale says the block mixes cycles.
             "reranker_measured_at": _probe_measured_at(capability, reranker),
             "embedder_measured_at": _probe_measured_at(capability, embedder),
             "probe_stale": bool(reranker.get("projection_stale")
@@ -4416,17 +3512,7 @@ def _build_capacity_record(capability: dict | None, fingerprint: dict,
             # UNCHANGED meaning -- see this function's docstring. Always the
             # theoretical full-payload projection, regardless of basis.
             "s_mean_s": s_mean_theoretical,
-            # NEW (additive, ruling 1): the projection computed over the
-            # coordinator's OBSERVED MAXIMUM rerank payload instead of the
-            # theoretical worst case. This -- NOT s_mean_measured_s below
-            # -- is what feeds queue_bound/single_search_exceeds_wait when
-            # payload_basis is "measured". None until CAPACITY_PAYLOAD_
-            # MIN_SAMPLES real searches have been served this process's
-            # lifetime (always None with no coordinator wired through --
-            # e.g. a fresh install, or any pre-existing caller of this
-            # function). MONOTONIC non-decreasing for this process's
-            # lifetime -- see CAPACITY_PAYLOAD_MIN_SAMPLES's module-level
-            # comment for why that is the safe direction, not a defect.
+            # s_max_measured_s is the observed-max projection that feeds queue_bound once CAPACITY_PAYLOAD_MIN_SAMPLES is met.
             "s_max_measured_s": s_max_measured,
             # NEW (additive): the same projection over the OBSERVED MEAN
             # instead -- cheap, useful CONTEXT only. Never feeds
@@ -4469,16 +3555,7 @@ def _build_capacity_record(capability: dict | None, fingerprint: dict,
             # self-describing even if the operator's setting changes later.
             "tolerable_wait_s": CAPACITY_TOLERABLE_WAIT_S,
             "single_search_exceeds_wait": single_search_exceeds_wait,
-            # A-4 (ADV-6): there is deliberately NO staleness flag in this
-            # block. `capacity` on /health is the last DERIVED record, and
-            # derivation fires on rare triggers -- so during an outage this
-            # block is frozen at its last healthy derivation and a flag here
-            # would read "fresh" during exactly the outage it exists to
-            # expose. Liveness of the projection is reported ONLY where it is
-            # actually re-evaluated every cycle: `backend_capability.<backend>
-            # .projection_stale` / `.projection_age_s`. Within THIS record,
-            # `probe.probe_stale` above describes the reading it was derived
-            # from, alongside `timestamp` (when the record was derived).
+            # No staleness flag on the derived capacity record; projection liveness lives on backend_capability.*.projection_stale.
             "recommended_reranker_mem_limit_bytes": recommended_mem_limit,
         },
     }
@@ -4670,18 +3747,7 @@ async def _maybe_derive_capacity(capability: dict, coordinator=None) -> None:
         trigger = None
         if is_first:
             if last is None:
-                # N1(a) (fix round 2): no prior record ANYWHERE -- this is a
-                # first-ever baseline, not a mismatch (there is nothing to
-                # have mismatched against). But a not-ok probe (warming
-                # compose stack, connection refused, fast HTTP error) must
-                # NOT be allowed to establish that baseline: a not-ok basis
-                # blocks every later trigger from ever firing again --
-                # probe_drift requires an "ok" stored basis, config_change
-                # has nothing changed to compare, and a later restart's
-                # fingerprint still matches -- so a single bad first probe
-                # used to freeze the instrument permanently with no operator
-                # remedy. Defer silently (one INFO log) instead; the next
-                # healthy probe cycle derives the baseline normally.
+                # First-ever capacity baseline (no prior record), not a mismatch.
                 if current_status != "ok":
                     log.info(
                         "capacity baseline deferred -- reranker probe not "
@@ -4691,16 +3757,7 @@ async def _maybe_derive_capacity(capability: dict, coordinator=None) -> None:
             elif last.get("fingerprint") != fingerprint:
                 trigger = "gateway_start_fingerprint_mismatch"
         else:
-            # config_change: encoder_config is module-level state fixed for
-            # this process's whole lifetime (RERANK_MAX_DOC_CHARS et al. are
-            # read once at import), so within ONE process this can only ever
-            # equal what trigger 1 already checked. It still earns its own
-            # cheap check on every cycle because the LOG is shared state: a
-            # differently-configured process (a rolling restart mid-flight,
-            # or CAPACITY_LOG_PATH pointed at a shared location) can have
-            # written the last record, and that mismatch should surface on
-            # the very next cycle rather than wait for this process's own
-            # next restart.
+            # config_change still runs every cycle: the log is shared, so a differently-configured process can have written the last record.
             if last is None:
                 # Log file cleared/rotated out from under a running process,
                 # OR this process's own first cycle never found one either.
@@ -4735,91 +3792,12 @@ async def _maybe_derive_capacity(capability: dict, coordinator=None) -> None:
                     trigger = "probe_drift"
 
         if trigger is None and last is not None:
-            # N1(b) (fix round 2): recovers an already-stored not-ok basis
-            # (or a status-less legacy record predating this field -- absent
-            # reads the same as not-ok here) the moment a healthy probe shows
-            # up. Mirror image of (a): the only remedy for a basis that was
-            # ALREADY poisoned before this fix landed, since (a) alone only
-            # stops NEW poisoning. No operator action needed -- the next
-            # healthy probe cycle heals it on its own. Only reached once
-            # every trigger above has had its say: a fingerprint/config
-            # change already produces a fresh (healthy) record on its own,
-            # so this exists specifically for the "nothing else moved" case
-            # that used to go permanently, silently stuck.
+            # Recover a stored not-ok/legacy basis on the next healthy probe when nothing else triggered a re-derive.
             basis_status = (last.get("probe") or {}).get("reranker_status")
             if basis_status != "ok" and current_status == "ok":
                 trigger = "basis_recovery"
 
-        # Ruling 2 (operator, 2026-08-23), fixed for B-1/B-2/B-3 (reviewer,
-        # 2026-08-23): without this, the feature added by rulings elsewhere
-        # in this module is INERT in normal operation -- verified live: a
-        # fresh theoretical/samples-0 baseline plus six real searches left
-        # the stored record reading theoretical/samples 0, because a
-        # capacity record is only ever (re)computed on one of the triggers
-        # above, and at each of those moments the payload counters are at
-        # or near zero. "measured" was reachable only incidentally, if a
-        # probe_drift/config_change happened to fire after traffic had
-        # already accumulated.
-        #
-        # Checked LAST, only when nothing else already decided to fire this
-        # cycle -- it never fights or reorders first_derivation /
-        # gateway_start_fingerprint_mismatch / config_change / probe_drift /
-        # basis_recovery above; it only ever fills a cycle those would
-        # otherwise leave silent.
-        #
-        # B-1 (HIGH, fixed): the original version of this trigger gated on
-        # a PROCESS-LOCAL one-shot latch plus "the stored basis is still
-        # theoretical". After any restart with unchanged hardware/config
-        # (no fingerprint mismatch -> no other trigger fires either), the
-        # stored record already said "measured" from the PREVIOUS process's
-        # life -- so guard (b) was permanently false for the rest of this
-        # install's life, even as the NEW process's own observed max grew
-        # past what the dead process ever saw. That is staleness in the
-        # UNSAFE direction for a capacity signal (under-reporting the worst
-        # payload) -- exactly what the max basis exists to prevent.
-        #
-        # Fixed by dropping the process-local latch AND the "theoretical
-        # only" restriction entirely. The trigger now compares LIVE state
-        # against the DURABLE stored record's own payload_max_chars_
-        # measured, regardless of which process wrote that stored record or
-        # how long ago: it fires whenever the live observed max EXCEEDS the
-        # max already on disk (or the disk has none yet, i.e. still
-        # theoretical). This is:
-        #   - restart-safe by construction: a freshly restarted process
-        #     with fresh (zero) counters is compared against the exact same
-        #     durable value a long-running process would be compared
-        #     against, so "a restarted process with a larger observed max"
-        #     re-derives correctly -- there is no process-local memory to
-        #     go stale.
-        #   - storm-safe without any latch: immediately after a successful
-        #     derivation the stored max equals the live max, so the
-        #     identical reading can never re-fire on the next cycle -- only
-        #     a NEW, larger reading does, which is inherently sparse (the
-        #     max is monotonic per process, so within one process this
-        #     fires at most once per new high-water mark; across a restart
-        #     it fires again only if the new process's traffic genuinely
-        #     exceeds the old one's worst case).
-        #   - a smaller live max than the stored one deliberately does NOT
-        #     re-fire and does NOT regress the stored value -- the stored
-        #     max stays the more conservative (larger, safer) figure until
-        #     real traffic actually exceeds it. This is not a residual bug:
-        #     the capacity signal must never UNDER-report, and a real
-        #     historical worst-case number is not "wrong" merely because
-        #     the process that observed it has since restarted.
-        #   - B-2 (MEDIUM, fixed as a consequence): retry-safe with no
-        #     special-casing needed. A failed _append_capacity_record leaves
-        #     the durable max unchanged, so the very next cycle re-evaluates
-        #     the identical "live > stored" comparison and tries again --
-        #     there is no one-shot flag to have been spent prematurely.
-        #   - B-3 (LOW, fixed): requiring live_payload["max_chars_per_
-        #     search"] is not None closes the all-empty-payload edge case
-        #     (chars_max stays 0 despite samples > 0) that used to satisfy
-        #     the old guards and still yield "theoretical".
-        # Still gated on current_status == "ok", a positive current
-        # throughput reading, and enough samples -- the same preconditions
-        # _build_capacity_record itself needs to actually produce a
-        # "measured" basis, checked here too so a doomed-to-fail attempt is
-        # never even tried (e.g. a reranker probe that is momentarily down).
+        # Last trigger: re-derive when live observed max exceeds the durable stored max (restart/retry-safe; never regresses a larger stored worst case).
         if trigger is None and last is not None:
             live_payload = _capacity_payload_stats(coordinator)
             current_throughput = current_reranker.get("throughput_chars_s")
@@ -4843,20 +3821,7 @@ async def _maybe_derive_capacity(capability: dict, coordinator=None) -> None:
         log.warning("capacity derivation failed: %s", exc)
 
 
-# --------------------------------------------------------------------------- #
-# Health endpoint
-# --------------------------------------------------------------------------- #
-# S-11 (PR A5): short TTL cache around handle_health's own expensive fan-out
-# (2+N upstream probes per hit: embedder, reranker, every LLM backend, plus
-# the wedge probe when suspect). /health is polled frequently (the monitor,
-# `doctor`, every LLM-wedge caller) and none of that traffic needs a fresh
-# probe every single hit. Env-overridable; a few seconds by default — long
-# enough to absorb a burst, short enough that a real outage still shows up
-# fast. In-process only: a restart clears `_health_cache` along with every
-# other module global, so a cached response can never outlive the process it
-# was computed in — trivially true, not merely assumed, because the cache
-# and FRAMEWORK_VERSION/API_VERSION live in the same process memory and are
-# rebuilt together on the next probe after a restart.
+# /health TTL cache (S-11): in-process, a few seconds, so a poll burst does not re-fan-out every upstream.
 HEALTH_CACHE_TTL_S = float(os.environ.get("HEALTH_CACHE_TTL_S", "3"))
 _health_cache: dict = {"checks": None, "ts": 0.0}
 # SEC-A5-05b (PR A5 fix round): single-flight coalescing for a cache miss —
@@ -4867,25 +3832,7 @@ _health_cache: dict = {"checks": None, "ts": 0.0}
 _health_probe_lock = asyncio.Lock()
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# THE DEPENDENCY / WARNING LAYER (v0.9.74, decision:1785)
-#
-# THE RULE OF THUMB (the operator's): up/down → health · a number → telemetry ·
-# number > limit → telemetry keeps the number, health raises the warning, the log
-# records the crossing.
-#
-# ⛔ THE THRESHOLD LIVES HERE, SERVER-SIDE. The monitor was already deriving
-# health from telemetry numbers client-side (outbox.failed > 0, backlog,
-# contention >= 30%), which meant every consumer had its own private opinion
-# about when the system was unwell, and a second consumer would have invented a
-# third. One verdict, computed once, read by everyone.
-#
-# ⛔ AND THE HTTP STATUS CODE IS NOT THIS LAYER'S OUTPUT. 503 still means exactly
-# what it meant before: the embedder or the reranker is down, so a save cannot
-# produce a vector. A degraded dependency, a failing outbox row, a dead-lettered
-# REM record — all of those are 200 with the enum in the body. Widening the 503
-# would turn every one of these new signals into an outage for every client.
-# ═══════════════════════════════════════════════════════════════════════════════
+# /health HTTP 503 is only embedder or reranker down; every other degraded dependency is 200 with status in the body (decision:1785).
 
 _STATE_OK, _STATE_DEGRADED, _STATE_DOWN = "ok", "degraded", "down"
 _STATE_UNKNOWN = "unknown"
@@ -5162,21 +4109,7 @@ def _warning(key: str, limit, observed, unit: str) -> dict:
     return {"key": key, "limit": limit, "observed": observed, "unit": unit}
 
 
-# ⛔ A WARNING MUST BE ABLE TO CLEAR, so `_gateway_shed_rate` below is not read
-# off a cumulative counter. A `shed_503_total > 0` warning raised once would
-# stay raised until the process restarted, and an alert that never clears is
-# an alert an operator learns to close. It takes the DELTA since the previous
-# health build (the TTL bounds how often that is), which falls back to zero
-# on its own as soon as the condition stops.
-#
-# D1 (OBS round): `token_verify_failed`'s warning USED to share this
-# health-build-delta pattern via `_delta_per_min` below — it no longer does
-# (see `_token_verify_failure_rate`'s docstring for why that reading was
-# poll-cadence-dependent, not a true rate). `_delta_per_min` now has no
-# caller left (left in place, unmodified — out of this round's scope);
-# `_rate_marks` still backs `_gateway_shed_rate`'s "shed" key, untouched
-# (HANDOFF note: `_gateway_shed_rate`'s own cadence sensitivity is out of
-# this round's scope too).
+# Shed warning is a health-build delta, not a cumulative counter, so it can clear. token_verify_failed uses the timestamp ring, not this helper.
 _rate_marks: dict[str, tuple[int, float]] = {}
 
 
@@ -5618,15 +4551,7 @@ async def _llm_probe_daemon(proxy, stop_event) -> None:
             pass
 
 async def _build_health_checks(proxy: "AsyncHiveMindProxy", coordinator) -> dict:
-    """The full probe: every upstream backend, daemon liveness, config, and
-    the dream-cycle snapshot. Returns the SAME shape regardless of caller —
-    disclosure is handle_health's job, applied AFTER this is computed or
-    read from cache, never baked into the probe itself (S-10). has_credential/
-    model are unconditionally included here for that reason: only an
-    authenticated caller ever sees this dict at all now, so the per-field
-    gate this function used to apply is redundant — handle_health's own
-    caller_authenticated branch is the one gate that matters.
-    """
+    """Full /health probe shape (S-10 disclosure is handle_health's job, applied after cache)."""
     checks: dict[str, str] = {}
 
     # The embedder and reranker are llama.cpp containers that expose /health.
@@ -5647,19 +4572,7 @@ async def _build_health_checks(proxy: "AsyncHiveMindProxy", coordinator) -> dict
         except Exception:
             checks[name] = "down"
 
-    # ⛔ LIVENESS IS NOT CAPABILITY. The two probes above ask "is the process
-    # up", which both backends answered "ok" throughout a period in which the
-    # reranker could not serve a single real request inside the caller's
-    # timeout: a full candidate set cost ~64 s against a 5 s ceiling, so every
-    # search silently fell back to unranked vector order while /health read
-    # green. A backend that answers /health and cannot do its job is the exact
-    # failure this section exists to make visible.
-    #
-    # So alongside liveness we report CAPABILITY, measured by sending a fixed
-    # representative payload to the real scoring endpoint and timing it. The
-    # result is CACHED and refreshed on a slow cadence by a background task —
-    # the probe costs real seconds, and /health is polled by the monitor, so it
-    # must never run inline. Same pattern as the consolidation snapshot below.
+    # Encoder /health liveness is not capability; window/throughput come from the capability probe, not these GETs.
     checks["backend_capability"] = capability_snapshot()
     # R0-I (decision:1424): the latest CAPACITY derivation record, if any —
     # a top-level ADDITIVE key, never nested under backend_capability (that
@@ -5716,21 +4629,7 @@ async def _build_health_checks(proxy: "AsyncHiveMindProxy", coordinator) -> dict
                         _wedged.append(scrub_url_credentials(b))
             if _wedged:
                 checks["llm_suspect_wedged"] = _wedged
-    # Gate on ANY configured backend, not "more than one" — the original
-    # `> 1` read single-backend as "legacy default, nothing interesting to
-    # show", but that meaning inverted: a cloud-only fleet (the
-    # VRAM-constrained configuration our own docs recommend) IS a
-    # single-backend fleet, and the old gate made it vanish from the
-    # monitor entirely. This is a PRESENCE change only — additive, no
-    # existing key's meaning changes; sections below now also appear for a
-    # one-backend fleet.
-    # v0.9.74: the llm_* runtime family is built ONCE, by
-    # `_llm_runtime_snapshot`, and rendered on BOTH endpoints from that single
-    # call — /health under its historical flat key names (dual-emit, removed in
-    # 0.9.75) and /memory/telemetry under `llm.*`, which is where it belongs.
-    # ⛔ Not two builders producing "the same" dict: two builders is how the two
-    # copies start disagreeing, and a monitor comparing them would have no way
-    # to tell which one was wrong.
+    # llm_* runtime is built once by _llm_runtime_snapshot for any configured backend (including a one-backend fleet).
     _llm_rt = _llm_runtime_snapshot(backend_status)
     if LLM_BACKENDS:
         checks["llm_backends"] = backend_status
@@ -5743,12 +4642,7 @@ async def _build_health_checks(proxy: "AsyncHiveMindProxy", coordinator) -> dict
         checks["llm_token_usage"] = _llm_rt["token_usage"]
         checks["llm_latency"] = _llm_rt["latency"]
 
-    # ⚠ RENAMED IN 0.9.74. These are PID CHECKS and nothing more, and the old
-    # names did not say so — `rem_daemon: running` was read as "REM is healthy"
-    # when it only ever meant "a process exists". The `_process` suffix says
-    # what is actually measured; the derived HEALTH verdict is
-    # dependencies.rem_daemon / dependencies.nrem_daemon. Old keys kept this
-    # release (removed in 0.9.75).
+    # PID liveness only; HEALTH uses dependencies.rem_daemon / nrem_daemon. Bare `daemon`/`rem_daemon` are still filled then stripped by the contract.
     checks["nrem_daemon_process"] = "running" if _daemon_healthy else "stopped"
     checks["rem_daemon_process"]  = "running" if _rem_healthy    else "stopped"
     checks["daemon"]     = checks["nrem_daemon_process"]
@@ -5759,25 +4653,7 @@ async def _build_health_checks(proxy: "AsyncHiveMindProxy", coordinator) -> dict
     checks["version"]     = FRAMEWORK_VERSION
     checks["api_version"] = API_VERSION
 
-    # Effective NON-SECRET configuration the running gateway resolved from the
-    # environment — so the live LLM/tuning setup is inspectable via /health
-    # without reading .env on the host (and works for a single backend too, where
-    # llm_pool above is omitted). Secrets (AGENT_TOKENS, PG/NEO4J passwords) are
-    # NEVER echoed here — has_credential is a bool, never the token itself.
-    # Tracked regardless of whether any backend actually uses it today, so the
-    # capability (external/paid backends, LLM_BACKENDS_JSON) is monitor-visible
-    # from the moment it's configured, not only once someone goes looking (fact 898).
-    #
-    # has_credential/model: confirming "this specific backend has a live paid
-    # key loaded right now" is materially more sensitive than a bare URL — a
-    # URL alone doesn't confirm a credential is actually attached, and every
-    # backend that reaches LLM_BACKENDS at all already has one iff it needed
-    # one (an unresolved token_env excludes it from the pool entirely, see
-    # _load_llm_backends). Unconditional here (S-10): this whole function's
-    # output is now only ever handed to an authenticated caller — see this
-    # function's own docstring.
-    # v0.9.74: built once by `_config_snapshot`, rendered on both endpoints
-    # from that one call — same reason as the llm_* family above.
+    # Non-secret resolved config on authenticated /health (no .env read); credentialed backends show has_credential, never the value.
     checks["config"] = _config_snapshot()
 
     # `status` is now the DERIVED enum over `dependencies` + `warnings`, both
@@ -5942,22 +4818,7 @@ async def _health_probe_cached(proxy: "AsyncHiveMindProxy", coordinator) -> dict
 
 
 def _health_role_for(agent_name: str) -> str:
-    """`read`, `write` or `admin` for an authenticated /health caller (A-4).
-
-    ⚠ THREE-VALUED SINCE 0.9.74, and the third value is a FIX. This used to
-    collapse to two — anything not `read` was reported `write` — which
-    OVERSTATED an admin token: an admin credential is confined to `/admin/*`
-    and cannot save either, so a caller holding one was told it may write and
-    then 403'd on every write route. That was raised as a finding at the time
-    and left for the operator to rule on the vocabulary; `admin` is the
-    vocabulary, and it is the roster's own word for the role.
-
-    It goes through `effective_role`, never a bare `_AGENT_ROLES` lookup, and
-    that is the whole reason this is a function. `read_only_agents()` confines
-    an identity REGARDLESS of what AGENT_ROLES declares, so a raw read of the
-    map would report `write` for an identity the gateway 403s on every write
-    route — the exact false reassurance this key exists to remove.
-    """
+    """read / write / admin via effective_role (admin is not write; read_only_agents() still confines regardless of AGENT_ROLES)."""
     role = effective_role(agent_name, _AGENT_ROLES.get(agent_name))
     if role == "read":
         return "read"
@@ -5967,84 +4828,10 @@ def _health_role_for(agent_name: str) -> str:
 
 
 async def handle_health(request: web.Request) -> web.Response:
-    """GET /health — liveness for everyone; the full operational payload
-    (backend roster, per-backend pool state, capability probes, daemon/
-    dream-cycle detail) only for a caller presenting a valid agent bearer
-    token ON AN AUTH-CONFIGURED INSTALL (S-10, Credential_Custody_Plan
-    PR A5). That detail is operational information about this deployment's
-    infrastructure, not something every unauthenticated network peer should
-    learn just by asking.
-
-    SEC-A5-03 (PR A5 fix round): slimming applies ONLY when
-    AUTH_CONFIGURED_AT_STARTUP is true. An auth-off install has no token
-    registry at all — `resolve_identity()` can never match ANY presented
-    token against an empty `_AGENT_TOKENS`, so gating on bare
-    `resolve_identity()` made such an install "always anonymous, with no
-    reachable alternative": its monitor, `doctor`, and every `/health`
-    triage command would have silently and PERMANENTLY lost the full
-    payload with no token able to restore it. There is also nothing on such
-    an install for the slimming to protect — S-05 guarantees an auth-off
-    install has no LIVE provider key unless it took the explicit override
-    (and that override is itself now surfaced in the full payload — see
-    `_unauthenticated_provider_keys_override_active`), so an auth-off
-    install keeps today's full payload unconditionally, exactly as before
-    this branch.
-
-    Anonymous shape on an auth-configured install: {"status", "version",
-    "api_version"} — exactly what memory_bridge.py's `doctor` parses
-    (check_gateway_compat() reads only these three keys), so `doctor` and
-    any liveness-only poller keep working unchanged. Authenticated shape
-    (or ANY caller on an auth-off install): today's full payload,
-    byte-compatible.
-
-    A-4 — WHO AM I, AND WHAT MAY I DO? Two additive keys, `agent` and
-    `role`, on the AUTHENTICATED payload only. A client holding a token
-    could not previously learn either without attempting a write and reading
-    the refusal, which is a poor way to find out: a read-only token gets a
-    403 that looks like a permissions bug to anyone who did not already know
-    the token was confined. `doctor` can now say it plainly.
-
-    ⛔ THE OTHER TWO SHAPES ARE UNCHANGED, and that is the whole constraint.
-    An ANONYMOUS caller on an auth-configured install still gets the
-    three-key slim payload — adding an identity to a response served to
-    someone who proved no identity would be absurd, and the slimming
-    contract test asserts that shape exactly. An AUTH-OFF install still gets
-    today's full payload with NEITHER key: there is no token registry there,
-    so every caller is the same unnamed everyone, and emitting `agent: null`
-    / `role: "write"` would dress an absence up as an answer. Absent means
-    "this install has no identities", which is true and useful.
-
-    ⚠ `role` is THREE-valued since v0.9.74 — `read` for an identity confined
-    to the read allowlist, `admin` for an admin credential, `write` for
-    everyone else. It used to collapse to two, and an `admin` token (which
-    reaches here because `/health` is in `_UNPROTECTED_PATHS`, so the role
-    gate never runs on it) was reported `write`. That OVERSTATED it: an admin
-    token is confined to `/admin/*` and cannot save either, so the caller was
-    told it may write and then 403'd on every write route. The finding was
-    raised at the time and left for the operator, whose vocabulary this is;
-    `admin` is the roster's own word for the role, and it is what ships.
-
-    HTTP 200: embedder + reranker both reachable (save/search path healthy).
-    HTTP 503: at least one critical backend is down — computed identically
-    for every caller; an anonymous caller learns the VERDICT, not why.
-
-    ⛔ THE STATUS CODE IS NOT THE `status` ENUM, and v0.9.74 is where the two
-    part company. The enum is now derived from `dependencies` + `warnings` and
-    can read `degraded` or `down` for a failing outbox, a dead-lettering REM
-    daemon, an unreadable registry or a crossed limit — none of which stop a
-    save from producing a vector. The CODE still answers exactly one question:
-    can this gateway embed? 503 iff the embedder or the reranker is down. It is
-    read off `dependencies` below rather than off the enum, and a test pins it.
-    """
+    """GET /health: anonymous auth-on installs get {status, version, api_version}; a valid bearer (or auth-off) gets the full payload. HTTP 503 only if embedder or reranker is down."""
     proxy: AsyncHiveMindProxy = request.app["proxy"]
     checks = await _health_probe_cached(proxy, request.app.get("coordinator"))
-    # ⛔ THE 503 GATE IS UNCHANGED BY v0.9.74, and it is read HERE rather than
-    # off `status`. Before this release the two were the same test, because
-    # `status` was ONLY ever "not ok" when an encoder was down. `status` now
-    # also goes degraded for a failing outbox, a dead-lettering REM, an
-    # unreadable registry and a raised warning — none of which stop a save from
-    # producing a vector, and none of which may turn every client's every call
-    # into a 503. The save mandate is the encoders and nothing else.
+    # HTTP 503 only if embedder or reranker state is down; other degraded deps stay 200.
     _deps = checks.get("dependencies") or {}
     critical_down = any(
         (_deps.get(name) or {}).get("state") == _STATE_DOWN
@@ -6052,13 +4839,7 @@ async def handle_health(request: web.Request) -> web.Response:
     )
     status_code = 503 if critical_down else 200
 
-    # Resolved HERE rather than read off `request["authenticated_agent"]`,
-    # because /health is in `_UNPROTECTED_PATHS`: auth_middleware returns
-    # early on it and never stashes a name, so the only way to know who is
-    # asking is to resolve it. On an auth-off install it is not even
-    # attempted — `resolve_identity()` cannot match anything against an empty
-    # registry, and asking would only produce a None meaning "no identities
-    # exist here", not "you are anonymous".
+    # /health is unprotected so auth_middleware never stashes a name; resolve here (skip on auth-off).
     identity = _safe_resolve_identity(request) if AUTH_CONFIGURED_AT_STARTUP else None
     if AUTH_CONFIGURED_AT_STARTUP and not identity:
         return web.json_response(
@@ -6067,31 +4848,10 @@ async def handle_health(request: web.Request) -> web.Response:
             status=status_code,
         )
     if identity:
-        # ⛔ A COPY, NEVER A MUTATION. `checks` is the TTL cache, SHARED by
-        # every caller inside the window (see _health_probe_cached), and its
-        # docstring states the contract this obeys: the per-caller projection
-        # is applied fresh on every call and is never cached itself.
-        #
-        # ⚠ SAID HONESTLY, because the first draft of this comment claimed a
-        # leak it could not produce: an in-place write is NOT observable from
-        # outside today. There is one consumer, the anonymous branch above
-        # rebuilds its own three keys and is immune, and two authenticated
-        # callers each overwrite with their own values. What makes the copy
-        # right is that writing per-caller identity into shared state is only
-        # safe by accident — a second consumer, or a response serialised after
-        # an await, turns it into a cross-identity disclosure with no other
-        # change. The test pins the CACHE CONTENTS rather than a response,
-        # because a response cannot see the difference.
+        # Copy before stamping agent/role — checks is the shared TTL cache.
         checks = {**checks, "agent": identity,
                   "role": _health_role_for(identity)}
-    # THE DROP, at the response boundary: the copies this release stopped
-    # serving come off HERE, on a fresh object, for the same reason the
-    # identity keys go on a copy. ⛔ Never off `_health_cache["checks"]` —
-    # telemetry_extras() reads the cached llm_oldest_inflight_age_s and
-    # llm_suspect_wedged to BUILD the new homes, so stripping the cache would
-    # blank the very keys this drop points readers at. Applied on both paths
-    # that reach here, so an auth-off install and an authenticated caller see
-    # one shape; the anonymous three-key payload returned above is untouched.
+    # Strip dropped keys on a fresh object at the response boundary, never off the cache telemetry_extras still reads.
     return web.json_response(strip_dropped(checks, HEALTH_CONTRACT),
                              status=status_code)
 
@@ -6183,16 +4943,7 @@ def require_auth_when_provider_keys_configured() -> None:
     if not credentialed:
         return
     if os.environ.get("ALLOW_UNAUTHENTICATED_PROVIDER_KEYS", "").strip().lower() in ("1", "true", "yes", "on"):
-        # SEC-A5-02 (PR A5 fix round): this branch used to be a bare
-        # `return` — no log line, no telemetry, no /health field. Six
-        # months later there was no artefact anywhere that would let anyone
-        # discover the gateway was running as an unauthenticated proxy
-        # signing requests with a live provider key short of re-reading
-        # .env. Loud now: this log.warning at startup, PLUS a flat additive
-        # field on the authenticated /health config block (see
-        # _unauthenticated_provider_keys_override_active, used by
-        # _build_health_checks) so the condition stays visible for the
-        # gateway's whole lifetime, not just the moment it boots.
+        # Auth-off + live provider key: warn at startup and keep a /health config flag for the process lifetime (SEC-A5-02).
         log.warning(
             "ALLOW_UNAUTHENTICATED_PROVIDER_KEYS is set — starting UNAUTHENTICATED "
             "with a live provider key attached to %d backend(s): %s. Any caller "
@@ -6443,26 +5194,7 @@ def _resolve_proxy_bind_host() -> str:
 async def _drain_watchdogs_and_daemons(
         watchdog_task: "asyncio.Task", rem_watchdog_task: "asyncio.Task",
         other_tasks: "tuple[asyncio.Task, ...]" = ()) -> None:
-    """Steps 3-4 of main()'s drain sequence (see the comment at its call
-    site) — terminate both daemon processes (unblocking each watchdog's own
-    `proc.wait()`), THEN cancel and await the watchdog tasks (plus any other
-    background tasks passed in), THEN revoke both daemons' ephemeral tokens
-    as an idempotent BACKSTOP.
-
-    G (S6, ADV2-9): the backstop revoke below is deliberately placed AFTER
-    the awaited cancellation of both watchdog tasks — never a concurrent
-    mutator racing a still-running watchdog. Each watchdog's own try/finally
-    (see _watchdog_daemon / _watchdog_rem_daemon) already revokes its
-    agent's token on every exit path, including this cancel; this call
-    costs nothing extra when the token is already gone
-    (_revoke_daemon_token() pops with a default) and only matters if some
-    future change to a watchdog body ever loses its own revoke.
-
-    Extracted from main() into its own coroutine so this ORDER — terminate
-    BEFORE cancel, which G's own cancel-safety argument depends on — is
-    directly testable (FakeProc doubles, no real subprocess or listening
-    socket) rather than only provable by reading main() end to end.
-    """
+    """Terminate both daemon processes, then cancel watchdogs and other_tasks, then revoke tokens as an idempotent backstop (order is load-bearing)."""
     if _daemon_proc and _daemon_proc.returncode is None:
         log.info("Stopping consolidation daemon (pid %d)...", _daemon_proc.pid)
         _daemon_proc.terminate()
@@ -6548,14 +5280,7 @@ async def main() -> None:
     attach_coordinator(app, coordinator)
     app.router.add_get("/health", handle_health)
     app.router.add_get("/pool/status", handle_pool_status)
-    # R-A (HYG round): the encoder paths are REAL routes with their own
-    # handler, registered here — before set_known_routes() — so they land in
-    # the route snapshot and the guard can answer for their near spellings.
-    # ⛔ NEVER bind these to proxy.handle_proxy and never wrap them in
-    # _route_guard: the guard returns 405 for ANY known key including an
-    # allowed method (load-bearing for security fix A1), so either shape would
-    # 405 every legitimate POST /v1/embeddings — an outage the whole mocked
-    # suite reports green, because nothing but a real router can see it.
+    # Register encoder routes before set_known_routes; never bind them to handle_proxy/_route_guard (A1 405s every known key).
     app.router.add_post("/v1/embeddings", proxy.handle_encoder)
     app.router.add_post("/v1/reranking", proxy.handle_encoder)
     # fact:1535 route-guard: snapshot the known framework routes from the
@@ -6635,21 +5360,7 @@ async def main() -> None:
 
     await stop_event.wait()
 
-    # Drain sequence — order is load-bearing:
-    # 1. site.stop()      — close the listen socket; no new connections accepted
-    # 2. runner.cleanup() — wait for in-flight requests to finish
-    # 3. terminate daemon — unblocks watchdog's proc.wait()
-    # 4. watchdog_task    — wait for watchdog to confirm it has exited
-    # 5. coordinator/proxy cleanup last
-    #
-    # G (S6, ADV1-13): step 3 before step 4 is now ALSO why cancelling the
-    # watchdog tasks below (whose bodies revoke their own agent's ephemeral
-    # daemon token in a `finally`, which also fires on CancelledError — see
-    # _watchdog_daemon / _watchdog_rem_daemon) is safe: by the time
-    # _drain_watchdogs_and_daemons() cancels them, both daemon processes
-    # have already been terminated and awaited, so no cancel-triggered
-    # revoke can ever race a still-live daemon that still holds that token.
-    # Do NOT reorder step 3 after step 4.
+    # Drain: stop listener, finish in-flight, terminate daemons, then cancel watchdogs (revoke after terminate so the token cannot race a live daemon).
     log.info("Stopping listener...")
     await site.stop()
     if uds_site is not None:

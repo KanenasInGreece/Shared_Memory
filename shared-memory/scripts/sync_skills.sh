@@ -243,42 +243,7 @@ else
   AGENTS=("${_default_dirs[@]}")
 fi
 
-# ── uv PATH reachability — the same silent failure preflight.sh now checks,
-# printed from HERE instead where it actually matters for delivery. ─────────
-#
-# preflight.sh can only ask "is uv installed somewhere on this host" — it has
-# no idea whether an agent skill is actually deployed. This script is the one
-# place that DOES know: it is about to write (or has already written) real
-# skill installs into real directories. So this is where the warning belongs
-# for an operator who never ran (or re-ran) preflight after installing an
-# agent — sync runs on every release, preflight does not.
-#
-# Mirrors preflight.sh's check exactly (see the long comment there for the
-# full rationale): env -i clears the whole environment so no inherited PATH
-# edit survives, and getconf PATH is the platform's own compiled-in default —
-# the closest thing to "what a profile-free shell starts with" any POSIX host
-# can answer, and it depends on neither uv nor python (this project's OWN
-# instrument obligation, fact:1338/1321 — the check must not depend on the
-# thing it is checking for).
-#
-# ONE warning for the whole run, not one per directory: the cause is a
-# property of THIS HOST's PATH, not of any individual agent's install, and a
-# warning repeated once per target would just restate the same fact four
-# times. Gated on at least one install actually existing on disk — an
-# operator syncing to nothing but --install targets that do not exist yet has
-# nothing here to warn about (yet).
-#
-# ⚠ THIS APPLIES TO MCP INSTALLS TOO, AND MORE SHARPLY. This comment used to
-# say an MCP-only host "is not broken by this at all" — measured wrong on a live
-# conversion: an MCP host spawns its stdio server from a non-interactive,
-# non-login shell, exactly like a CLI agent spawns the skill, and the shipped
-# config template invokes a bare `uv`. On a host where uv sits in
-# $HOME/.local/bin (the outcome of the recommended installer) that server never
-# starts, and the host reports a dead MCP server rather than a PATH problem. The
-# fix in an MCP config is to name uv by ABSOLUTE path.
-#
-# Non-fatal by design: sync's job is delivery, and a host that reaches uv some
-# other way is not broken by this at all.
+# Warn once if uv is missing from a profile-free PATH; MCP configs must name uv by absolute path.
 _any_install_exists=0
 for _d in "${AGENTS[@]}"; do
   [ -d "$_d" ] && _any_install_exists=1 && break

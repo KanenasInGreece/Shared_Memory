@@ -1,31 +1,8 @@
-"""
-Memory Coordinator — Phase 2
+"""Memory coordinator: Postgres ingress, neo4j_outbox origin, and dual-store reads.
 
-Owns all Postgres and Neo4j I/O for the memory system.
-Embedded in hive_mind_proxy.py via attach(); designed so the only change
-needed to extract it into a standalone process (Phase 4) is the attach() call.
-
-Isolation principle: no import-time dependency on aiohttp internals beyond
-web.Request / web.Response / web.Application. All storage logic lives here.
-
-Phase 2 additions (over Phase 1)
-─────────────────────────────────
-  Outbox worker — background asyncio task that drains neo4j_outbox:
-    - polls every OUTBOX_POLL_INTERVAL seconds
-    - applies each pending row to Neo4j (MERGE Fact + Entity + MENTIONS)
-    - marks rows applied or failed (up to OUTBOX_MAX_RETRIES attempts)
-    - started with the coordinator, cancelled on clean shutdown
-  Direct Neo4j writes removed from handle_save — all Neo4j writes now
-    go through the outbox worker (eliminates ADR-001 atomicity risk)
-  ?consistency=neo4j query param on /memory/save — blocks until the
-    outbox row for the saved fact is marked applied (or timeout)
-
-Routes registered by attach()
-──────────────────────────────
-  POST /memory/save              Postgres-ack; returns 200 + pg_id
-  POST /memory/search            Tier 3 → Tier 1 → rerank → Neo4j expand
-  POST /memory/graph             Raw Cypher passthrough
-  GET  /memory/status/{pg_id}   Outbox row state
+Saves ack Postgres and enqueue neo4j_outbox in the same SQL transaction; a
+background worker applies the graph. attach() registers save, search, graph,
+status, telemetry, supersede, review_hold, retrospective, and admin backup/outbox.
 """
 
 import asyncio
@@ -159,14 +136,7 @@ def _short(value: Any, cap: int = 200) -> str:
 # response shape, auth scheme, or routes change in a way that breaks older clients.
 # Client and server build-versions are allowed to drift; their API_VERSION must agree.
 FRAMEWORK_VERSION = "0.9.107"
-# v2 (retro-as-record): /memory/retrospective now creates a full record (own
-# pg_id, embedding, Retrospective node) and accepts rating enum + grounding —
-# the response shape changed (returns the retro's own pg_id).
-# v4 (project registry): a fact save without a REGISTERED metadata.project is
-# rejected 400 carrying error=project_required|project_unknown plus near-match
-# proposals. BREAKING for any client that saved untagged facts. The second
-# submission is accepted in three forms: a proposal, new_project=true, or the
-# reserved sentinel general_discussion.
+# API v2: retrospective is a full record. v4: unregistered project is 400 (proposal / new_project / sentinel).
 API_VERSION = 4
 CLIENT_VERSION_HEADER = "X-SM-Api-Version"
 #: The client's own FRAMEWORK VERSION (e.g. "0.9.74"), distinct from the wire
@@ -176,22 +146,7 @@ CLIENT_VERSION_HEADER = "X-SM-Api-Version"
 #: 0.9.74; a pre-0.9.74 client sends nothing and is simply not counted.
 CLIENT_BUILD_HEADER = "X-Shared-Memory-Client"
 
-# ── Record references: a record id is only unique WITHIN ITS TABLE ────────────
-# `technical_docs` and `community_summaries` run INDEPENDENT id sequences, so the
-# same integer names two unrelated real records. Inside this process that has
-# always been safe by accident — every content path happens to be label-scoped or
-# table-scoped — but a BARE integer crossing the API boundary is genuinely
-# ambiguous: search returns the id under the same field name for both namespaces,
-# so an id lifted off a summary result and handed back to a lookup used to resolve
-# against technical_docs and return a confident, unrelated record.
-#
-# The fix is to make the record TYPE explicit on every reference (`fact:816`,
-# `summary:87`) rather than to renumber both tables onto one global sequence — an
-# irreversible migration to close something this closes additively. A bare integer
-# is still accepted, and still means technical_docs, for compatibility.
-#
-# Shared with consolidation_loop.py (decision 882 reuses this exact scheme to key
-# the NREM fold dead-letter ledger) — see record_ref.py, the single source of truth.
+# A record id is unique only inside its table; qualify as fact:N / summary:N (bare ints still mean technical_docs) (decision:882).
 from record_ref import (             # noqa: E402
     REF_TYPES_DOCS, REF_TYPES_SUMMARIES, REF_SEPARATOR,
     make_ref, parse_ref, summary_record_type, doc_record_type,
@@ -232,102 +187,19 @@ def _check_client_version(request: web.Request) -> None:
     )
 
 
-# ── Agent authentication ───────────────────────────────────────────────────────
-
-# /pool/status is read-only, DB-free in-memory LLM capacity — the REM/NREM daemons
-# poll it (tokenless) to gate dreaming, same trust level as /health.
-#
-# ⛔ INVARIANT (v0.9.76, security fix A1): every member of this set must be the
-# canonical of a registered PLAIN (static) aiohttp resource, and membership is
-# tested against `request.rel_url.path_safe` — the string the ROUTER itself
-# compares — by EXACT equality. Never against a normalised or decoded spelling.
-#
-# Until v0.9.76 the exemption tested `request.path.rstrip("/")`, which exempted
-# `/health/`, `/health//` and `/health%2f` while the router sent all three to
-# the catch-all LLM proxy: the auth middleware and the router disagreed about
-# what "/health" meant, and the gap between them was an unauthenticated,
-# unaudited path to the LLM backend.
-#
-# ⛔ The FIRST round of that fix replaced `rstrip` with `request.path` and left
-# the same class open, because `request.path` is fully percent-DECODED:
-# `/pool%2fstatus` decodes to `/pool/status` and was exempted, while the router
-# — which matches on `path_safe`, where `%2F` stays encoded — resolved it to
-# the catch-all. Exempt from auth AND proxied: A1's exact shape, inside A1's
-# own fix. `_router_match_path` below closes it by comparing what the router
-# compares; `require_unprotected_paths_are_plain_routes` enforces at startup
-# the route-ownership half that makes that comparison meaningful.
+# Auth exemption uses the router's own path_safe string, exact match, plain routes only (A1).
 _UNPROTECTED_PATHS = {"/health", "/pool/status"}
 
 
 def _router_match_path(request) -> "str | None":
-    """The exact path string aiohttp's router compared this request against,
-    or None when there is no usable one.
-
-    Security fix A1. The auth exemption must test the SAME string the router
-    tests. Any second opinion — a normalisation, a decoding, a rstrip — is a
-    place where the middleware and the router can disagree about what
-    "/health" means, and every A1-class hole lives in that disagreement.
-
-    aiohttp 3.14.3, `web_urldispatcher.Resource.resolve`::
-
-        if (match_dict := self._match(request.rel_url.path_safe)) is None:
-
-    and `PlainResource._match` is `self._path == path`, where `_path` is the
-    resource's `canonical`. So for a PLAIN (static) resource — which
-    `require_unprotected_paths_are_plain_routes` guarantees every exempt entry
-    is — `rel_url.path_safe in _UNPROTECTED_PATHS` is byte-for-byte the
-    router's own admission test, run on the router's own input. The middleware
-    grants exactly when the router will route to the exempt handler.
-
-    ⛔ NOT `request.path`: that is the fully percent-DECODED path, so
-    `/pool%2fstatus` reads as `/pool/status` there while the router sees
-    `/pool%2Fstatus` and matches nothing. `path_safe` keeps `%2F` and `%25`
-    encoded, which is precisely the difference the defect lived in.
-
-    ⚠ Read defensively, and require a `str`. Anything that is not a `str` — a
-    None link in the chain, a test double's auto-attribute — yields None and
-    therefore DENIES: the exemption is never granted on a value whose type we
-    could not establish. A `None` return is not in `_UNPROTECTED_PATHS`, so the
-    caller needs no separate check.
-    """
+    """aiohttp's path_safe string, or None (deny) if it is missing or not a str."""
     rel_url   = getattr(request, "rel_url", None)
     path_safe = getattr(rel_url, "path_safe", None)
     return path_safe if isinstance(path_safe, str) else None
 
 
 def require_unprotected_paths_are_plain_routes(router) -> None:
-    """Startup assertion for the invariant the A1 exemption rests on: every
-    `_UNPROTECTED_PATHS` entry must be the canonical of a registered
-    PlainResource (adversarial review A-08).
-
-    WHY THIS STILL MATTERS AFTER THE FIX ROUND. The per-request test is
-    `_router_match_path(request) in _UNPROTECTED_PATHS`, i.e. the router's own
-    `PlainResource._match` comparison. That equivalence holds *only* for a
-    plain resource: `PlainResource._match` is string equality, but every other
-    resource class matches by pattern or prefix, and `canonical` is deliberately
-    MANY-TO-ONE for them — `/memory/status/1` and `/memory/status/2` both report
-    `/memory/status/{pg_id}`. So the moment this set gains a value that is a
-    dynamic canonical, the middleware's exact compare stops modelling the
-    router's match, and the whole family behind that pattern is at risk of being
-    treated as exempt. The offending string looks perfectly innocent in a diff.
-    Fail at startup instead, where an operator sees it.
-
-    It also guarantees the weaker but load-bearing property that an exempt path
-    is a path some registered route OWNS — an exemption for a path the router
-    does not own can only ever be honoured by the catch-all, which forwards to
-    an LLM backend. That IS the A1 defect, stated as a route-table property.
-
-    Raises RuntimeError naming the offending entry. Called from
-    hive_mind_proxy.main() next to set_known_routes(), i.e. after every real
-    route is registered and before the catch-all — the same window that makes
-    the route snapshot meaningful.
-    """
-    # The exemption reads `rel_url.path_safe` because that is the attribute
-    # `Resource.resolve` passes to `_match`. If the installed yarl does not
-    # expose it, `_router_match_path` returns None for EVERY request and
-    # /health 401s on every auth-on install — a hard availability failure
-    # wearing the shape of a safe deny, and one no unit test that builds its
-    # own request double would ever see. Refuse to boot instead.
+    """Boot-fail unless every unprotected path is a registered PlainResource canonical (A1)."""
     from yarl import URL as _URL  # aiohttp's own hard dependency; always present
     if not isinstance(getattr(_URL("/health"), "path_safe", None), str):
         raise RuntimeError(
@@ -366,17 +238,7 @@ def require_unprotected_paths_are_plain_routes(router) -> None:
         )
 
 
-# Plaintext AGENT_TOKENS entries are REFUSED outright, as of v0.9.3 (RULED,
-# Xenofon, 2026-08-14, superseding this PR's own original accept+warn draft —
-# there is no deprecation window). A plaintext entry is a standing downgrade
-# vector: a stale on-disk registry that still verifies exactly as strong as
-# a live one is not a convenience worth keeping, even temporarily. Parsing
-# still ACCEPTS the shape below (so the refusal can name exactly which
-# agents need converting) — the refusal itself is a startup-time check,
-# `require_no_plaintext_agent_tokens()`, called ONLY from
-# hive_mind_proxy.main() (the real gateway entrypoint), never at bare
-# import time — merely importing coordinator.py (every test in this repo
-# does) must not crash on a plaintext-configured checkout.
+# Parse accepts plaintext so boot can name the agents; require_no_plaintext_agent_tokens() then refuses.
 _PLAINTEXT_AGENT_TOKENS_SEEN: list[str] = []
 
 # Digest-form AGENT_TOKENS entries: name:sha256:<64-hex-char digest>.
@@ -390,32 +252,7 @@ def _token_digest(token: str) -> str:
 
 
 def _load_agent_tokens() -> dict[str, str]:
-    """Parse AGENT_TOKENS env var into a digest(sha256 hex) → agent_name mapping.
-
-    Two accepted entry shapes, comma-separated:
-      - digest form (required from v0.9.3): name:sha256:<64-hex-digest>
-      - legacy plaintext:                   name:token  (token MAY itself
-        contain one or more colons — everything after the first colon is
-        the token, unless it takes the digest shape above)
-
-    A legacy plaintext entry is hashed once, here, at load time and stored
-    exactly like a digest entry — from this point on in the process, the raw
-    token value is retained nowhere. Parsing still ACCEPTS a plaintext entry
-    (so the gateway can name it precisely when refusing to start — see
-    require_no_plaintext_agent_tokens() below); every plaintext agent name
-    seen is recorded in _PLAINTEXT_AGENT_TOKENS_SEEN. `generate_tokens.py
-    --convert-digests` rewrites an existing gateway .env's plaintext entries
-    to digest form in place, in one command.
-
-    Returns empty dict if AGENT_TOKENS is not set (auth disabled, backward
-    compat) — unchanged by the format change.
-
-    Read via secure_env.get_secret(), never os.environ directly (SEC-05/
-    SEC-09, PR A1) — AGENT_TOKENS is a secret key, so hive_mind_proxy's split
-    loader never exports it to os.environ; get_secret() still falls back to
-    os.environ for a value set through the process's own exec-time
-    environment (a test's monkeypatch.setenv, an operator's `export`).
-    """
+    """Parse AGENT_TOKENS via get_secret into digest→name; plaintext entries are hashed then refused at boot."""
     raw = get_secret("AGENT_TOKENS", "").strip()
     _PLAINTEXT_AGENT_TOKENS_SEEN.clear()
     if not raw:
@@ -436,19 +273,7 @@ def _load_agent_tokens() -> dict[str, str]:
                 )
                 continue
         elif len(parts) == 3:
-            # Finding 6 (A2 security review): a 3-part split whose middle
-            # segment ISN'T "sha256" is not malformed -- split(":", 2) only
-            # ever produces 3 parts when the raw value has 2+ colons, which
-            # a PLAINTEXT token containing a colon of its own triggers just
-            # as easily as a genuine digest entry. Falling through to
-            # "malformed, drop it" here used to mean this entry never
-            # reached _PLAINTEXT_AGENT_TOKENS_SEEN, so
-            # require_no_plaintext_agent_tokens() never named it and a
-            # gateway with this entry started up "clean" while the agent's
-            # real token silently verified nothing -- an unexplained 401
-            # instead of the one-line startup refusal. Reassemble the
-            # colon(s) the split consumed: the token is everything after
-            # the FIRST colon, verbatim.
+            # A 3-part split whose middle is not sha256 is still a plaintext token (rejoin after the first colon) so require_no_plaintext_agent_tokens() can refuse boot.
             name  = parts[0].strip()
             token = f"{parts[1]}:{parts[2]}".strip()
             if not name or not token:
@@ -482,22 +307,7 @@ def _load_agent_tokens() -> dict[str, str]:
 
 _AGENT_TOKENS: dict[str, str] = _load_agent_tokens()
 
-# Captured ONCE, immediately after the line above, before any daemon token
-# has ever been minted (CRITICAL fix, A2 security review, finding 1). The
-# auth middleware's backward-compat bypass and /health's `auth_required`
-# MUST gate on this flag, never on `bool(_AGENT_TOKENS)` at request time:
-# hive_mind_proxy._mint_daemon_token() mutates this same dict in place, a
-# few seconds after boot, when the REM/NREM watchdogs first spawn their
-# daemons (SEC-10, PR A2) -- registering an ephemeral entry even on an
-# install that never configured AGENT_TOKENS at all. A bypass keyed on live
-# emptiness would therefore flip an auth-unset install to "authenticating"
-# moments after startup, 401-ing every unauthenticated client -- exactly
-# the seamlessness invariant ("clients: zero action required") this
-# workstream is not allowed to break. This flag never changes for the life
-# of the process; hive_mind_proxy skips minting entirely when it is False
-# (see _daemon_env_and_token_fd()), so _AGENT_TOKENS in fact stays empty
-# too in that case -- but the gate reads this flag explicitly rather than
-# relying on that as an invariant to keep proving forever.
+# AUTH_CONFIGURED_AT_STARTUP is captured once at boot, before daemon mint mutates _AGENT_TOKENS; request-time emptiness would flip an auth-off install to authenticating.
 AUTH_CONFIGURED_AT_STARTUP: bool = bool(_AGENT_TOKENS)
 
 
@@ -637,25 +447,11 @@ def _read_role_permits(request: web.Request) -> bool:
     path = request.path.rstrip("/") or "/"
     if (request.method, path) in _READ_ROLE_ROUTES:
         return True
-    # Per-record lineage — GET /memory/status/{pg_id} — is read-only (no mutation),
-    # so a read-role client (e.g. the Monitor drilling into a record) may reach it.
-    # It carries a path param, so it is matched by a fullmatch regex, NOT a prefix
-    # check — a bare `startswith("/memory/status/")` let a crafted extra-segment
-    # path (e.g. "/memory/status/1/x") pass this gate while aiohttp's own single-
-    # segment {pg_id} pattern does NOT match it, so the request actually falls
-    # through to the catch-all proxy passthrough underneath a "granted" verdict —
-    # a read-role token reaching the LLM/embeddings proxy it's meant to be denied.
+    # GET /memory/status/{pg_id} is read-role; match by fullmatch, not prefix (extra segments used to grant then fall through to the LLM catch-all).
     return request.method == "GET" and bool(_MEMORY_STATUS_RE.fullmatch(path))
 
 
-# ── Pluggable identity resolution ───────────────────────────────────────────────
-#
-# resolve_identity() walks an ordered list of resolvers and returns the first
-# verified agent name. Today only Bearer-token resolution is wired; the planned
-# PoP (asymmetric-key + proof-of-possession) overhaul appends a second resolver
-# here and bumps API_VERSION. Everything downstream — the role check, the audit
-# hook, and every handler — only ever sees the resolved *name*, so none of it
-# changes when the scheme does. (This is the seam PoP plugs into.)
+# resolve_identity() returns the first verified agent name; downstream only sees the name (PoP plugs in here).
 AUTH_SCHEME = "bearer"
 
 
@@ -706,26 +502,7 @@ def resolve_identity(request: web.Request) -> str | None:
     return None
 
 
-# ── Person axis: the principal (OS account), kernel-attested ─────────────────────
-#
-# Identity has two orthogonal axes: the AGENT (which tool — resolved above) and the
-# PRINCIPAL (which human is accountable). The principal is NEVER carried in the
-# request and is NEVER inferred from the agent: it is the OS login account behind
-# the connection, read from the kernel via SO_PEERCRED on the AF_UNIX listener.
-# Local users are their logged-in account; remote users reach the gateway over SSH
-# (which already authenticated them by public key), and the agent process inherits
-# that login UID. The peer cannot lie about it — it is the kernel's word, not a
-# client claim, so the connecting party can neither forge nor repudiate it.
-#
-# Alongside the username we capture the *connection fingerprint* (pid, the immutable
-# audit loginuid, and the audit session id). loginuid is set once by PAM at login
-# and cannot be changed thereafter (kernel audit subsystem), so it survives fork and
-# setuid — a non-repudiable handle on the login session. The session id resolves the
-# remote host on demand via `loginctl show-session <id>` (RemoteHost) — i.e. final
-# resolution to the person is deliberately left to the OS records, not duplicated
-# here. On a TCP transport there is no peer credential, so the principal is honestly
-# None (unknown); the gateway never guesses. (Pre-PoP person-identity foundation —
-# decision pg_id 347.)
+# Principal is the kernel SO_PEERCRED login on AF_UNIX (never a client claim); TCP has no peercred so principal is None (decision:347).
 _LOGINUID_UNSET = 0xFFFFFFFF  # /proc/<pid>/loginuid when no login session is attached
 
 
@@ -789,29 +566,7 @@ _PRINCIPAL_KEYS = ("uid", "gid", "pid", "login_uid", "login_user", "session")
 
 
 def _normalise_decided_by(metadata: dict[str, Any]) -> bool:
-    """Canonicalise a decision's person axis onto the KERNEL-ATTESTED principal.
-
-    `decided_by` is free text an agent types, so it drifts: the same operator has
-    arrived as a case variant, and as a compound naming the AI that helped
-    ("<operator> + <agent>") or naming only the agent. Each spelling mints its own
-    :Human node and splits that person across Tier-3 provenance, so a summary
-    sourced from one operator's decisions can report several.
-
-    The OS account behind the socket is already the normal form — server-owned,
-    unforgeable, and identical for every write that operator makes. So when a
-    principal exists it BECOMES `decided_by`, and the original wording is kept as
-    `decided_by_claimed` whenever it differed, losing nothing: the attested axis is
-    what provenance joins on, the claim is what the operator said.
-
-    This deliberately does NOT parse compounds. Splitting "<operator> + <agent>"
-    would need heuristics about which component is a person, and the principal
-    already answers that without guessing — the AI's contribution belongs in
-    `assisted_by`, which the caller sets directly.
-
-    With no principal (TCP transport carries no kernel credential) the claim is
-    left exactly as given — honestly unknown, never guessed, matching
-    _apply_principal. Returns True when the stored value changed.
-    """
+    """When a UDS principal exists, store it as decided_by and keep the typed wording as decided_by_claimed."""
     if not isinstance(metadata, dict) or metadata.get("type") != "decision":
         return False
     principal = metadata.get("principal")
@@ -829,28 +584,7 @@ def _normalise_decided_by(metadata: dict[str, Any]) -> bool:
 
 
 def _supersession_target_error(pg_id: int, record_type: object) -> str | None:
-    """Reject supersession of a JUDGEMENT record. Returns an error message, or
-    None when the target may be superseded.
-
-    Supersession is the FACT lifecycle: a fact is a claim about the world, and
-    when the world changes the claim is retracted and replaced. A judgement is
-    not a claim about the world — it is a dated act by a person, and the record
-    that it turned out wrong is a RETROSPECTIVE, not a retraction. Overturning a
-    decision therefore goes through `rating='reversed'`, which marks the decision
-    superseded as a CONSEQUENCE of a verdict that stays in the graph, leaving the
-    lineage a successor can ground on. Retracting it directly would delete the
-    reasoning instead of recording that it was overturned.
-
-    A retrospective is refused for the mirror-image reason: it is an observation
-    dated to when it was made, so a changed outcome is a NEW retrospective, not
-    an edit of the old one. The latest live retrospective is simply read as the
-    current verdict, so nothing needs retracting for the newer judgement to take
-    effect.
-
-    Both refusals also close a real corruption: the supersede mirror MERGEs its
-    target as a :Fact by pg_id, so superseding a decision or retrospective minted
-    a phantom :Fact node carrying that id while the real node stayed unmarked.
-    """
+    """Error string if this record_type cannot be superseded (judgements use a retrospective); None if a fact may be."""
     kind = (record_type or "fact").strip().lower() if isinstance(record_type, str) else "fact"
     if kind == "decision":
         return (
@@ -874,15 +608,7 @@ def _supersession_target_error(pg_id: int, record_type: object) -> str | None:
 # spelling to accommodate.
 ENTITIES_PROVENANCE_VALUES = ("operator", "agent")
 
-# The two JUDGEMENT record types. Only FACTS carry entities (decision:1664,
-# ruled R1 at v0.9.69): a judgement reaches its topics by walking to the facts
-# it rests on, so an entity named on one is never written to the graph and only
-# adds an unvetted name to the vocabulary (`fact:970`).
-# ⛔ THERE IS NO `JUDGEMENT_TYPES` TUPLE OF RAW STRINGS, deliberately. One
-# existed for exactly one release and every use of it was a bug waiting to be
-# written: an exact `metadata["type"] in (...)` match against a CLIENT-SUPPLIED
-# string, beside a `record_label_for_type` that normalises. Removed so the only
-# way to ask the question is the predicate below.
+# Only facts carry entities; judgements inherit topics from grounded facts. Ask via is_judgement_type(), never a raw-string tuple (decision:1664, fact:970).
 JUDGEMENT_LABELS = (ONT.decision, ONT.retrospective)
 
 
@@ -902,29 +628,10 @@ def is_judgement_type(record_type: object) -> bool:
 
 
 class ProjectIdentityUnavailable(RuntimeError):
-    """The project registry could not produce an identity for a name that has
-    one (item 6, v0.9.69; ruled R3).
-
-    Its own class rather than a bare RuntimeError because three surfaces answer
-    it differently and each must be able to say which one it is handling: an
-    outbox row RETRIES (then goes `failed`, visibly); an ingress turns it into
-    a 503 `registry_unavailable`; a READER degrades to "no identity" and
-    reports the degrade, never a 500.
-    """
+    """Registry lookup failed for a name that should have an id: outbox retries, save is 503, readers degrade."""
 
 
-# ── Entity vocabulary ingress (fact:1375, migration 033) ──────────────────────
-#
-# The two SQL primitives the save-time entity gate needs (Coordinator methods
-# `_entity_vocab_resolve`/`_entity_vocab_mint`, near `_project_ingress_error`).
-# Both call the migration's own `entity_normalize()` rather than reimplementing
-# it in Python — the ONE normalization definition every reader/writer of this
-# vocabulary must share (033's own comment on the function).
-#
-# Resolve: canonical match first, alias match second, COALESCEd into one
-# column — NULL when neither table knows the name. LIMIT 1 caps the (harmless,
-# same-canonical) duplicate rows Option B's alias table can produce when one
-# entity has two verbatim aliases that happen to normalize to the same key.
+# Resolve one name via entity_normalize: canonical first, then alias (fact:1375).
 ENTITY_VOCAB_RESOLVE_SQL = """
     SELECT COALESCE(canon.name, alias_canon.name) AS canonical_name
       FROM (SELECT entity_normalize($1::text) AS norm) n
@@ -937,14 +644,7 @@ ENTITY_VOCAB_RESOLVE_SQL = """
      LIMIT 1
 """
 
-# Mint: the ONLY INSERT this gate ever issues, and only into entity_vocabulary
-# — never entity_vocab_aliases (rule 5; alias curation stays a manual,
-# operator-only act, decision:1380). ON CONFLICT (normalized_key) DO NOTHING
-# lets Postgres's own unique index arbitrate a same-table race between two
-# concurrent mints (exactly what the migration's seed relies on for its own
-# idempotency — "ON CONFLICT arbitrates"); RETURNING comes back empty exactly
-# when that happened, which is the caller's signal to re-resolve rather than
-# assume its own mint won.
+# Only INSERT into entity_vocabulary; aliases are operator-curated (decision:1380).
 ENTITY_VOCAB_MINT_SQL = """
     INSERT INTO entity_vocabulary (name, registered_by)
     VALUES ($1, $2)
@@ -952,15 +652,7 @@ ENTITY_VOCAB_MINT_SQL = """
     RETURNING id, name
 """
 
-# Batched resolve (S-5, security review fact:1412): the array/ANY form of
-# ENTITY_VOCAB_RESOLVE_SQL, one round trip for the whole candidate list
-# instead of one `self._acquire()` per name. `unnest` drives the row set so
-# every input name gets exactly one output row even when it matches nothing;
-# GROUP BY collapses the (harmless, same-canonical) duplicate rows Option B's
-# alias table can produce when one entity has two verbatim aliases that
-# normalize to the same key — the same case ENTITY_VOCAB_RESOLVE_SQL's
-# LIMIT 1 caps for a single name. Verified against the live database
-# read-only; see EG_LEG1_HANDOFF.md's FIX ROUND section for the numbers.
+# One round-trip resolve for a list of names (fact:1412).
 ENTITY_VOCAB_RESOLVE_MANY_SQL = """
     SELECT i.raw_name,
            COALESCE(canon.name, alias_canon.name) AS canonical_name
@@ -974,52 +666,7 @@ ENTITY_VOCAB_RESOLVE_MANY_SQL = """
      GROUP BY i.raw_name, COALESCE(canon.name, alias_canon.name)
 """
 
-# ── Minting a NEW entity: the CONFUSABLE check (item 1, v0.9.69) ──────────────
-#
-# The mint path had no equivalent of `_new_project_refusal` / `_new_domain_refusal`:
-# `Games Workshops` minted straight beside `Games Workshop` with no warning
-# (`fact:1734` A(2)). This is the same rule those two enforce, on the same
-# override — the caller names the neighbour it means to differ from, because a
-# name cannot be produced without having read it, while a boolean can be flipped
-# without reading anything.
-#
-# ⚠ THERE IS NO SPELLING-VARIANT HALF HERE, and its absence is deliberate rather
-# than an omission. On the project axis a separator/case variant is refused
-# outright, uncconfirmable — but for entities that case cannot reach the mint at
-# all: `_entity_ingress_validate` resolves every candidate through
-# `ENTITY_VOCAB_RESOLVE_MANY_SQL`, which joins on `entity_normalize()` (the SQL
-# twin of `axis_key`), so a key-identical name is already RESOLVED to its
-# canonical and never appears in `unknown`. A spelling-variant guard here would
-# be code no input can reach — and a test for it would be unkillable.
-#
-# Names and aliases both, because a caller confusing its new name with a
-# spelling the operator has already curated is the same mistake as confusing it
-# with a canonical.
-#
-# ⚠ IT IS A SEQUENTIAL SCAN, AND NO INDEX WOULD CHANGE THAT. A trigram GIN
-# index answers `name % $1` and `name ILIKE '%…%'`; it cannot answer
-# `similarity(name, $1) >= $2`, which is an ordinary function call in the WHERE
-# clause, so the planner reads every row whatever indexes exist. A migration
-# adding `gin (name gin_trgm_ops)` for this query was written, reviewed and
-# DROPPED for exactly that reason — an index that is never used is not free:
-# it costs every INSERT, and its presence argues that the cost was measured.
-#
-# ⚠ THE COST IS UNMEASURED (`fact:1338`). What is known is the SIZE: 157 rows
-# in `entity_vocabulary` on this deployment today, plus the alias table, on a
-# path that only runs when a save actually MINTS. No timing has been taken. If
-# this ever needs to be fast, the change is to the PREDICATE — `name % $1`,
-# which a trigram index does serve, with `similarity()` kept only for ordering
-# — and it should be driven by a measurement, not by adding an index to the
-# query as it stands.
-#
-# ✅ SAME SHAPE, SAME NON-USE, in `CONFUSABLE_SQL` (projects, migration 022) and
-# `DOMAIN_CONFUSABLE_SQL` (domains, 028) — and those two indexes are now GONE
-# (migration 039, v0.9.72). Measured before dropping them:
-# `pg_stat_user_indexes.idx_scan` was 0 for both against a
-# `pg_stat_database.stats_reset` of NULL, so neither had ever been used, and
-# every one of the five similarity() lookups planned as a sequential scan in
-# well under a millisecond. The `pg_trgm` EXTENSION stays — `similarity()`
-# comes from it.
+# Near-match names/aliases at mint time; key-identical spellings already resolve and never reach this (fact:1734).
 ENTITY_CONFUSABLE_SQL = """
     SELECT name, similarity(name, $1) AS score
       FROM (
@@ -1032,60 +679,14 @@ ENTITY_CONFUSABLE_SQL = """
      LIMIT $3
 """
 
-# ⚠ UNMEASURED ON THIS VOCABULARY, and said plainly (`fact:1338`). The default
-# is CARRIED OVER from `PROJECT_CONFUSABLE_SIMILARITY`, whose 0.6 was derived
-# from a live registry — every pair of 37 registered projects, closest
-# legitimately distinct pair 0.500, realistic typos 0.78-1.00. No equivalent
-# pairwise sweep has been run over `entity_vocabulary`, whose names are longer
-# and more varied than project names, so this floor is a starting point that
-# INHERITS a measurement rather than one that has its own.
-#
-# The measurement that would settle it: score every pair of registered canonical
-# + alias spellings, and score a set of realistic typos of them, then place the
-# floor in the gap between the two populations — the same procedure the project
-# floor came from. Until that runs, the env override is the answer for an
-# install whose vocabulary this floor fits badly.
+# Floor inherited from projects; not re-measured on this vocabulary (fact:1338).
 ENTITY_CONFUSABLE_SIMILARITY = float(
     os.environ.get("ENTITY_CONFUSABLE_SIMILARITY", "0.6")
 )
 ENTITY_PROPOSAL_LIMIT = _env_int("ENTITY_PROPOSAL_LIMIT", 5)
 
 
-# A project name is an AXIS, never an entity (`fact:1215`) — and the graph's own
-# gate does not catch it: `sanitize_entity_name` rejects `Project` (the schema
-# label) but passes `shared-memory-GitHub` cleanly, which is exactly why the rule
-# kept being broken and why the live graph carries `:Entity` nodes named after
-# registered projects (`fact:1734` A/C).
-#
-# ⚠ IT READS THE STORED KEY, for the reason `PROJECT_NAME_OR_KEY_SQL` documents:
-# migration 035 maintains `projects.normalized_key` with a trigger and a UNIQUE
-# constraint, so the key is the database's own materialised value on an indexed
-# column, and the Python side stays the single definition (`axis_key`).
-#
-# ⚠ THE COMPARISON SET IS `projects` ALONE. A retired spelling is not a separate
-# population to check — a rename writes the old spelling into `project_aliases`
-# AND keeps its row in `projects`, so the alias table adds nothing here. The one
-# name that is NOT in `projects` is the sentinel (a CHECK constraint keeps it
-# out), so it is named explicitly in `RESERVED_ENTITY_AXIS_KEYS` below.
-#
-# ANY() rather than one query per name: one round trip for the whole candidate
-# list, the same choice `ENTITY_VOCAB_RESOLVE_MANY_SQL` makes.
-# ⚠ TWO POPULATIONS, AND THE SECOND ONE IS THE LIKELIER MISTAKE. A live project
-# keeps a `projects` row with a trigger-maintained `normalized_key`. A RETIRED
-# spelling does not: `normalize_projects.py` deletes the `projects` row and
-# leaves the old string in `aliases`, joined through `project_aliases`. So a
-# registry-only check answers "not a project" for exactly the spelling a machine
-# still carrying the old folder name will send — which is the same reasoning
-# `_new_project_refusal` records for its own alias sweep.
-#
-# ⚠ THE ALIAS HALF COMPUTES ITS KEY, because `aliases` has no `normalized_key`
-# column (035 added one to `projects` and `project_domains` only). It calls the
-# database's own `axis_normalize()` — the SQL twin of `axis_key`, and the same
-# function 035's trigger uses — never a second normalisation expression.
-#
-# ⚠ BOTH HALVES RETURN THE CANONICAL PROJECT NAME, never the alias: an alias is
-# not somewhere a record may be saved, so pointing a refusal at one would name a
-# spelling the caller must not use either.
+# A registered (or retired-alias) project name is an axis, not an entity; refuse minting it (fact:1215, fact:1734).
 ENTITY_RESERVED_PROJECT_SQL = (
     "SELECT p.name AS name, p.normalized_key AS matched_key"
     "  FROM projects p"
@@ -1106,17 +707,7 @@ RESERVED_ENTITY_AXIS_KEYS: dict[str, str] = {
     axis_key(SENTINEL): SENTINEL,
 }
 
-# Env-overridable caps (S-5): a name/list-length bound is a correctness/DoS
-# property, not a performance tuning parameter (fact:1338 governs the
-# UNCACHED lookup choice, not this). Measured against the live corpus before
-# choosing defaults (2026-08-20, `agent_data`, 1316 technical_docs rows):
-# max canonical/alias name length 22 chars (avg 9/11), max individual entity
-# string ever saved 22 chars; max `entities` list length ever saved 6 (p99
-# 5.0, avg 1.28), max in the last 30 days 5. Defaults set comfortably above
-# both (≈9x the measured name-length max, ≈8x the measured list-length max)
-# — a bound, not a claim about what "should" be typical. Env-overridable so
-# an install with a genuinely different usage pattern is not locked to this
-# one's measurement.
+# Entity name/list caps are DoS bounds measured above this corpus (fact:1338), env-overridable.
 ENTITY_NAME_MAX_LEN = _env_int("ENTITY_NAME_MAX_LEN", 200)
 ENTITY_LIST_MAX_LEN = _env_int("ENTITY_LIST_MAX_LEN", 50)
 
@@ -1196,42 +787,15 @@ def _apply_principal(target: dict[str, Any], principal: dict[str, Any] | None) -
     return target
 
 
-# ── Governance: outer in-flight load-shed valve ─────────────────────────────────
-# Checked FIRST in auth_middleware, ahead of every auth exemption (S-11).
-# SEC-A5-05a (PR A5 fix round): incremented/decremented uniformly around
-# EVERY admitted request — auth-disabled bypass, unprotected-path exemption,
-# and the authenticated dispatch alike — so an anonymous /health/pool-status
-# flood, or (on an auth-off install) any traffic at all, actually counts
-# toward the cap it can also be shed by. A request the valve sheds was never
-# admitted and never reaches the increment.
+# S-11 load-shed is first in auth_middleware and counts every admitted request, including anonymous /health.
 _inflight = 0
 
-# ── Gateway request instrument (the telemetry contract, v0.9.74) ───────────────
-# The per-request latency the audit line already carries (see auth_middleware's
-# `finally`) was written to the JSONL and aggregated NOWHERE, so nothing could
-# answer "what is this gateway's p95" without parsing a log. These are the same
-# numbers, aggregated in memory.
-#
-# ⛔ RECORDING MUST NOT CHANGE THIS PATH'S FAILURE MODES. Every write below goes
-# through telemetry_instruments, whose recorders swallow everything, and the one
-# assembling function is wrapped by the caller. It never awaits, never touches a
-# connection, and runs in the SAME `finally` that already writes the audit line —
-# so it cannot add a failure mode the audit line does not already have.
+# In-memory gateway latency/status counters; recorders swallow so they cannot add a failure mode the audit line does not already have.
 GATEWAY_LATENCY_WINDOW = int(os.environ.get("GATEWAY_LATENCY_WINDOW", "500"))
 _gateway_latency = LatencyRing(GATEWAY_LATENCY_WINDOW)
 _gateway_requests_total = 0
 _gateway_shed_503_total = 0
-# D9 (OBS round) — the LLM proxy's own client-abort counter. Storage lives
-# here rather than in hive_mind_proxy.py (which owns the increment SITES,
-# in its prepare()/streaming windows) for the same reason `_llm_faults_snapshot`
-# and its `record_llm_*_fault` writers do: `telemetry_extras_provider`'s merge
-# into the telemetry payload (see `_build_telemetry` below) is a SHALLOW
-# `dict.update`, which would silently clobber this whole `gateway` section
-# were a second copy of it assembled on the hive_mind_proxy side instead.
-# ⚠ SCOPE NOTE: this is a deviation from this build step's stated coordinator.py
-# ownership (`/memory/graph handler ONLY`) — recorded in HANDOFF.md, not
-# decided silently. See `record_llm_client_disconnect` below and its one new
-# line in `_gateway_telemetry`.
+# LLM client-abort counter lives here (shallow telemetry merge would clobber a hive-side copy of the gateway section).
 _gateway_client_disconnects_total = 0
 _gateway_by_status: dict[str, int] = {
     "2xx": 0, "4xx": 0, "5xx": 0, "401": 0, "403": 0, "409": 0, "503": 0,
@@ -1366,14 +930,7 @@ def _record_client_version(request: web.Request) -> None:
     except Exception:
         pass
 
-# ── Backup quiesce: client-write shed + daemon advisory-lock gate ───────────────
-# While a backup runs, client WRITE routes shed (503 + Retry-After) so the dump
-# sees a quiet database; reads always flow. Set/cleared via POST /admin/backup by
-# an admin-role token. _backup_quiesce mirrors the state for the auth chokepoint
-# and is surfaced on /health as backup_in_progress. The REM/NREM daemons are fenced
-# separately through a Postgres advisory lock (MemoryCoordinator._begin_quiesce):
-# the gateway holds it EXCLUSIVE for the dump, each daemon takes it SHARED per cycle
-# and skips when it can't — so a dump never races a daemon write.
+# Backup quiesce sheds client writes (503 Retry-After); reads flow. Daemons take the advisory lock SHARED and skip if the gateway holds it EXCLUSIVE.
 _backup_quiesce: bool = False
 
 # Single well-known advisory-lock key shared by the gateway (exclusive) and the
@@ -1460,22 +1017,7 @@ def _audit(agent: str, method: str, path: str, status: int,
         log.warning("audit write failed: %s", exc)
 
 
-# ── Credential-use audit trail (ISO 27001 A.5.17 property 4, PR A3) ─────────────
-#
-# Governing split: telemetry (below, served on GET /memory/telemetry) surfaces
-# SIGNAL — operator-attention counters plus the last event's context. The
-# credential-audit log (_credential_audit_writer, a SEPARATE stream from the
-# per-request _audit_writer above) carries the DETAIL, and only for HIGH-SIGNAL
-# events — never a mirror of request volume. Per-request use-auditing (every
-# proxied call) stays in the existing gateway audit line via _audit()'s
-# additive backend/key_attached fields; this log is for faults and credential
-# lifecycle events only.
-#
-# Origin-ownership invariant: `gateway` = what the gateway itself decided or
-# observed (routing, shed, connect/timeout, retries, own-door auth, key
-# attach). `llm` = what the upstream SAID (status class, typed error body).
-# A retried request counts per-attempt in `llm`, once in `gateway`. Nothing is
-# ever counted in both groups for the same cause.
+# Credential-audit log is faults/lifecycle only (ISO 27001 A.5.17); per-request use stays on the gateway audit line. gateway=our decision, llm=upstream said.
 _llm_fault_counters: dict[str, dict] = {}
 _credential_counters: dict[str, int] = {
     "token_verify_failed": 0,
@@ -1485,40 +1027,14 @@ _credential_counters: dict[str, int] = {
     # see hive_mind_proxy.record_credentialed_route_denied.
     "credentialed_route_denied": 0,
 }
-# When each credential counter last moved. Counters answer "how many"; a
-# consumer asking "is this still happening?" needs "when", and for these
-# events there is nowhere else to get it: the no-token 401 is deliberately
-# never logged (C-1), the rate-limited path emits its suppression summary
-# only lazily, and both counters reset with the process — so a poll-delta
-# INVERTS across a restart (the count drops to 0 and reads as "never
-# failed" while a real failure was minutes ago). Stamped at the increment,
-# beside the counter, so the pair can never disagree.
+# Credential counters stamp last-moved at increment (no-token 401 is unlogged; a restart would invert a poll-delta).
 _credential_last_ts: dict[str, str | None] = {
     "token_verify_failed": None,
     "daemon_tokens_issued": None,
     "credentialed_route_denied": None,
 }
 
-# D1 (OBS round): a FIXED, bounded ring of the monotonic timestamp of every
-# token_verify_failed event — replaces the old health-build-gap extrapolation
-# (`hive_mind_proxy._delta_per_min`), whose reading was poll-cadence-dependent
-# (one event read ~24/min at the 3 s HEALTH_CACHE_TTL_S, 0.1/min under 600 s
-# polling — the poll cadence WAS the reading, not the event rate).
-#
-# ⛔ `maxlen=256` is a FIXED bound, deliberately NOT derived from
-# TOKEN_VERIFY_WARN_PER_MIN (an env-overridable float defined ~800 lines
-# below the two bump sites this ring is appended from) — deriving the ring's
-# capacity from that threshold invites a NameError at import order, a
-# maxlen=0 crash if the operator ever sets the threshold to 0, or an
-# unbounded ring if they set it to something that reads as infinite. A flood
-# inside one 60 s window therefore saturates at exactly 256 counted events,
-# not the true rate — the warning still fires; the unbounded lifetime total
-# stays visible at credentials.token_verify_failed. See
-# telemetry_token_verify_ring()'s docstring for the read side.
-#
-# Stamped with time.monotonic(), NEVER wall-clock: a wall-clock step
-# backward would make every past event look freshly-arrived and stick the
-# gateway `degraded` until the ring drains 256 entries later.
+# Bounded monotonic ring of token_verify_failed timestamps (maxlen=256, not derived from the warn threshold) so /health rate is not poll-cadence.
 _token_verify_failure_ring: "deque[float]" = deque(maxlen=256)
 
 
@@ -1703,14 +1219,7 @@ _credential_audit_writer = (
     if CREDENTIAL_AUDIT_LOG_PATH.strip() else None
 )
 
-# Events an attacker fully controls the volume of — either fully
-# unauthenticated (security review R-5) or, for credentialed_route_denied
-# (SEC-A5-04, PR A5 fix round), any holder of a valid-but-leaked agent
-# token in a loop. Their log lines use drop-NEWEST eviction (a flood can
-# only evict itself) instead of the writer's default drop-oldest, which
-# would otherwise let the flood evict the genuine lifecycle/compromise
-# evidence (token_verify_failed, key_attached) queued before it started —
-# exactly the audit trail this log exists to preserve.
+# Flood-controlled credential-audit events drop-NEWEST so they cannot evict genuine lifecycle evidence.
 _ATTACKER_TRIGGERABLE_EVENTS = frozenset({
     "token_verify_failed", "token_verify_failed_suppressed",
     "credentialed_route_denied",
@@ -1888,21 +1397,7 @@ def _tvf_unprotected_rate_limit_allow() -> bool:
 
 
 def _record_unprotected_path_token_verify_failed(request: web.Request, presented_token: str) -> None:
-    """F (S4): a bearer PRESENTED on an UNPROTECTED path (/health,
-    /pool/status) that fails to verify — a token-oracle probe. Never gates
-    the response: the caller still gets exactly the same anonymous/slim
-    payload it always did (auth_middleware's own unprotected-path exemption
-    is unchanged; this is a pure side-effect audit call). This is what makes
-    such an attempt visible for forensics, the same way a bad bearer on a
-    protected path already is.
-
-    Shares _record_token_verify_failed's COUNTER
-    (credentials.token_verify_failed) and event name — decision:1785 rules
-    out a new /health-only telemetry key, so the existing
-    /memory/telemetry consumer sees this signal too, unchanged in shape.
-    Only the LOG-LINE rate limit is separate (its own bucket, above), so a
-    caller flooding /health with a bad bearer cannot exhaust the budget a
-    protected-path failure depends on to be seen."""
+    """Audit a bad bearer on /health or /pool/status without changing the anonymous response (decision:1785)."""
     global _tvf_unprotected_suppressed_count, _tvf_unprotected_suppressed_since
     _credential_counters["token_verify_failed"] += 1
     _token_verify_failure_ring.append(time.monotonic())
@@ -2111,14 +1606,7 @@ async def auth_middleware(request: web.Request, handler):
     _check_client_version(request)  # logs API skew to the gateway log; never raises
     _record_client_version(request)  # counts the caller's build; never raises
 
-    # S-11 (PR A5): the load-shed valve is the FIRST gate — ahead of both the
-    # auth-disabled bypass below and the per-path _UNPROTECTED_PATHS
-    # exemption further down. It used to sit after both, so an anonymous
-    # /health or /pool/status hit (and, on an auth-unset install, EVERY
-    # request) could never be shed no matter how saturated the gateway
-    # already was. The valve exists to protect the PROCESS from an in-flight
-    # pile-up, not to gate access, so it must apply uniformly regardless of
-    # what auth decides afterward.
+    # Load-shed is the first gate (ahead of auth-off and unprotected exemptions) so anonymous /health floods still count.
     if GATEWAY_INFLIGHT_MAX and _inflight >= GATEWAY_INFLIGHT_MAX:
         # Counted HERE, not in the `finally` below: a shed request is never
         # admitted, so it never reaches the audit line and would otherwise be
@@ -2142,33 +1630,12 @@ async def auth_middleware(request: web.Request, handler):
                           "retry after the Retry-After interval."),
         )
 
-    # SEC-A5-05a (PR A5 fix round): a request that reaches this point WAS
-    # ADMITTED past the valve above — count it uniformly here, regardless of
-    # which branch below actually serves it, so the cap the valve enforces
-    # reflects TOTAL admitted load (anonymous /health/pool-status traffic
-    # and, on an auth-off install, every request) and not just the
-    # authenticated dispatch. The earlier version of this comment claimed
-    # this protection while `_inflight` was only ever incremented far below,
-    # inside the authenticated-only branch — that was false; this `try/
-    # finally` is what makes it true. A request that sheds at the check
-    # above was never admitted and correctly never reaches this increment.
     _inflight += 1
     try:
         # Gate on the STARTUP truth (finding 1), not on whether _AGENT_TOKENS
         # happens to be non-empty right now -- see AUTH_CONFIGURED_AT_STARTUP's
         # docstring above for why the two diverge after a daemon token is minted.
         if not AUTH_CONFIGURED_AT_STARTUP:
-            # D2 (OBS round): count this request too — auth-off traffic used
-            # to be entirely invisible to gateway.requests_total/by_status.
-            # `_audit` is UNTOUCHED and still never fires on this path (its
-            # variable dependencies — agent_name/started/request_id — are
-            # never established here; ADV1's traced UnboundLocalError trap
-            # only exists if `_audit` itself moves into this block, which it
-            # does not). No latency ring entry (R-C): this exit never takes
-            # `started` either. `_status` defaults to 500 exactly like the
-            # deep block below's own fallback, for any exception this
-            # bypass does not special-case (it never converted
-            # asyncio.TimeoutError before, and still does not).
             _status = 500
             try:
                 resp = await handler(request)
@@ -2179,59 +1646,11 @@ async def auth_middleware(request: web.Request, handler):
                 raise
             finally:
                 _record_gateway_request(_status, None)
-        # Security fix A1 (v0.9.76). ONE comparison, and it is the ROUTER's own.
-        #
-        # `rel_url.path_safe` is the exact string aiohttp hands to
-        # `PlainResource._match` (`self._path == path`), so membership in
-        # _UNPROTECTED_PATHS *is* the router's admission test for the two static
-        # routes this set names. The middleware and the router cannot disagree
-        # about what "/health" means, because they compare the same bytes. See
-        # _router_match_path's docstring for the aiohttp source this rests on,
-        # and require_unprotected_paths_are_plain_routes for the startup
-        # assertion that keeps the "plain resource" precondition true.
-        #
-        # This is also why `OPTIONS /health` and `POST /health` keep the
-        # anonymous 405 + `Allow: GET, HEAD` that fact:1535 requires. Their
-        # path_safe IS "/health", so the exemption grants; aiohttp then routes
-        # them to the catch-all (no GET/HEAD route accepts the method) whose
-        # _route_guard answers 405 before any LLM dispatch. "Get a token" is
-        # not why those requests failed.
-        #
-        # ⛔ TWO spellings have been removed from here, and BOTH were the defect:
-        #   `request.path.rstrip("/")` — exempted `/health/`, `/health//`,
-        #        `/health%2f`, `/pool/status/`; the router sends none of them to
-        #        handle_health, so each fell through the catch-all into an
-        #        anonymous, unaudited LLM proxy call.
-        #   `request.path` — the fix round's own first attempt, and the same
-        #        class: `request.path` is fully percent-DECODED, so
-        #        `/pool%2fstatus` read as `/pool/status` and was EXEMPTED while
-        #        the router (matching `/pool%2Fstatus`) sent it to the catch-all.
-        # Do not reintroduce either. Normalisation and decoding are legitimate
-        # for a REFUSAL decision (see AsyncHiveMindProxy._route_guard, which
-        # refuses a near-miss spelling of an owned path), never for a GRANT.
+        # Exempt /health and /pool/status by the router's path_safe string (A1).
         if _router_match_path(request) in _UNPROTECTED_PATHS:
-            # F (S4, ADV1-16/ADV2-1/ADV2-15): a bearer PRESENTED on this
-            # unprotected path that fails to verify is a token-oracle probe
-            # — audit the attempt, but the RESPONSE must stay byte-identical
-            # either way (ADV2-1: falling through to the 401 branch below
-            # would break the anonymous contract every daemon and doctor
-            # relies on). A VALID bearer still reaches the full
-            # authenticated payload — handle_health resolves identity itself
-            # via _safe_resolve_identity, entirely independent of this
-            # audit-only side effect. Scheme match is case-insensitive here
-            # (unlike the protected-path helper) so a lower-case `bearer`
-            # scheme is audited too, not silently ignored.
             _unprotected_presented = _extract_bearer_token_ci(request)
             if _unprotected_presented is not None and not _lookup_agent_by_token(_unprotected_presented):
                 _record_unprotected_path_token_verify_failed(request, _unprotected_presented)
-            # D2 (OBS round): count this request too — /health and
-            # /pool/status traffic used to be entirely invisible to
-            # gateway.requests_total/by_status. A stale-bearer probe here
-            # still serves the SAME anonymous 200 it always did (the
-            # response is untouched above), so it lands in `by_status.2xx`,
-            # never `by_status.401` — that 401-shaped signal already went
-            # to `credentials.token_verify_failed` and the D1 ring above.
-            # No latency ring entry (R-C): this exit never takes `started`.
             _status = 500
             try:
                 resp = await handler(request)
@@ -2372,15 +1791,7 @@ async def auth_middleware(request: web.Request, handler):
     finally:
         _inflight -= 1
 
-# ── Config ────────────────────────────────────────────────────────────────────
-# PG_PASSWORD/NEO4J_PASSWORD/PG_CONN are secrets (SEC-05/SEC-09, PR A1; PG_CONN
-# added in the review fix round — a DSN embeds the password verbatim) — read
-# via secure_env.get_secret(), never os.environ directly. hive_mind_proxy calls
-# secure_env.load_split_env() before importing this module, so by the time
-# these run the framework .env's secret keys are already in secure_env's
-# in-process store; get_secret() checks os.environ first regardless (an
-# operator-exported value always wins), so a direct module load (tests, a
-# standalone run) still works off an exported var.
+# PG_PASSWORD/NEO4J_PASSWORD/PG_CONN via secure_env.get_secret() (a DSN embeds the password); hive loads the store before importing this module.
 
 _pg_pass = get_secret("PG_PASSWORD", "")
 PG_DSN   = get_secret(
@@ -2395,21 +1806,7 @@ NEO4J_AUTH = ("neo4j", get_secret("NEO4J_PASSWORD", ""))
 NEO4J_MAX_POOL        = _env_int("NEO4J_MAX_POOL", 50)
 NEO4J_ACQUIRE_TIMEOUT = _env_float("NEO4J_ACQUIRE_TIMEOUT", 30.0)
 
-# Both inference backends are called directly so the coordinator does not
-# route through its own auth middleware (which would require a valid token
-# for an internal call).  External agents still go through :8888 and must
-# authenticate; the coordinator is trusted and bypasses that layer.
-#
-# The backend BASE is the same env the gateway's routing map reads
-# (EMBEDDER_URL / RERANKER_URL, hive_mind_proxy.py) — one setting moves BOTH the
-# passthrough and the coordinator's own save/search calls. Before this the two
-# were literals here, so pointing EMBEDDER_URL at a remote host redirected only
-# the raw /v1/embeddings passthrough while every real embedding still went to
-# localhost (measured on a LAN embedder: passthrough answered from the remote,
-# saves kept using the local container). The port is a default, never an assumption.
-# The encoder endpoint paths this framework appends to an encoder BASE. Kept
-# longest-first: stripping is a suffix match, so '/v1' would otherwise eat the
-# '/v1' inside '/v1/embeddings' and leave a '/embeddings' fragment behind.
+# Coordinator calls EMBEDDER_URL/RERANKER_URL directly (same env as the gateway map); strip pasted /v1 suffixes longest-first.
 _ENCODER_BASE_SUFFIXES = ("/v1/embeddings", "/v1/reranking", "/v1")
 
 
@@ -2509,17 +1906,7 @@ def _encoder_url(env_name: str, default_base: str, path: str) -> str:
 EMBED_URL  = _encoder_url("EMBEDDER_URL", FRAMEWORK_DEFAULTS["EMBEDDER_URL"]["default"], "/v1/embeddings")
 RERANK_URL = _encoder_url("RERANKER_URL", FRAMEWORK_DEFAULTS["RERANKER_URL"]["default"], "/v1/reranking")
 
-# M1 (PR #308 review): this USED to log right here, at module import — but
-# hive_mind_proxy.py imports coordinator (line 55) BEFORE its own
-# logging.basicConfig() call (line ~85), and a named logger's .info() before
-# basicConfig is dropped (root defaults to WARNING; Python's "lastResort"
-# handler is WARNING-and-above only). Verified in isolation: the /v1 WARNING
-# above survives that gap (it reaches lastResort), the INFO line did not —
-# it never appeared in the running gateway's own journal, which is exactly
-# the debugging surface review finding F6 (PR #307) added it for. Moved to
-# a plain function, called once from MemoryCoordinator.start() — which only
-# ever runs from hive_mind_proxy's real startup path, strictly after
-# basicConfig has configured the root logger — instead of firing at import.
+# Encoder-base INFO log runs from MemoryCoordinator.start() (after hive basicConfig); an import-time INFO was dropped.
 _encoder_endpoints_logged = False
 
 def log_encoder_endpoints() -> None:
@@ -2540,19 +1927,7 @@ def log_encoder_endpoints() -> None:
 
 EMBED_RETRIES = 4
 EMBED_BACKOFF = 0.5      # seconds × attempt number  (0.5 s, 1 s, 1.5 s, 2 s)
-# BGE-M3 runs with -c 8192 (context tokens). An input over that fails to embed —
-# which would abort a save or drop a community summary from search. Truncate the
-# EMBEDDING input to a conservative char budget derived from that context; the
-# FULL text is always kept in Tier 1 (technical_docs), so search still returns
-# it — only the vector is computed from the prefix. Prompted by an advisor
-# hitting a smaller BGE-M3 limit; guards us as summaries grow with the
-# larger-context work.
-#
-# The clamp AND the request timeout both come from dream_telemetry so the save
-# path and the NREM fold path cannot drift apart — they call one embedder with
-# one context limit, so they get one derivation. (dream_telemetry imports only
-# stdlib + log_hygiene, which this module already depends on, so this does not
-# pull psycopg2 into the gateway venv.)
+# Truncate embedding input to the dream_telemetry char budget from the 8192-token context; full text stays in Tier 1.
 from dream_telemetry import (EMBED_CHARS_PER_TOKEN, EMBED_MAX_CHARS,  # noqa: E402
                              EMBED_MAX_CONTEXT_TOKENS, EMBED_SPECIAL_TOKEN_RESERVE,
                              EMBED_TIMEOUT_FLOOR_S, RERANK_MAX_DOC_CHARS,
@@ -2653,32 +2028,11 @@ CONSISTENCY_TIMEOUT  = 15.0  # seconds to wait for ?consistency=neo4j
 OUTBOX_BACKOFF_BASE = _env_float("OUTBOX_BACKOFF_BASE", 2.0)   # seconds
 OUTBOX_BACKOFF_MAX  = _env_float("OUTBOX_BACKOFF_MAX", 300.0)  # seconds (cap)
 
-# Per-alternative vectors (migration 026). A decision's alternatives are written
-# to `decision_alternatives` inside the save transaction with a NULL embedding,
-# and filled here afterwards — the save path stays one embedding call regardless
-# of how many options a decision weighed.
-#
-# THE TABLE IS THE QUEUE, which is what makes the async choice safe: pending
-# work is `embedding IS NULL` in a committed row, so a restart between the write
-# and the embed cannot strand anything. The sweep interval is therefore a
-# latency knob, not a correctness one.
+# Alternative embeddings fill after save (embedding IS NULL is the queue); the sweep is latency, not correctness.
 ALT_VECTOR_POLL_INTERVAL = _env_float("ALT_VECTOR_POLL_INTERVAL", 10.0)
 ALT_VECTOR_BATCH_SIZE    = _env_int("ALT_VECTOR_BATCH_SIZE", 32)
 
-# A PENDING ROW IS NEVER ABANDONED, and this threshold does not abandon it.
-#
-# The outbox gives up after OUTBOX_MAX_RETRIES because a Cypher statement can be
-# permanently unapplyable. An alternative cannot: the text is non-blank, clamped
-# to the embedder's context, and already stored — so essentially the only way to
-# fail is that the embedder is unavailable, which is a condition of the SYSTEM
-# and says nothing about the row. Charging a batch-wide outage to each row until
-# it is written off is the v0.7.2 defect exactly (a batch 503 charged to every
-# record, which stopped the cycle for days).
-#
-# So `attempts` counts CONSECUTIVE failures, resets on success, and drives the
-# backoff. Past this threshold the row is reported as `failing` in telemetry
-# with its last error, and keeps retrying at the capped interval — visible, and
-# still recoverable the moment the embedder returns.
+# OUTBOX_MAX_RETRIES gives up on a permanently unapplicable Cypher; a still-pending row is retried, never abandoned.
 ALT_VECTOR_FAILING_AFTER = _env_int("ALT_VECTOR_FAILING_AFTER", 5)
 
 # Per-entity write-lock registry size. Locks are kept only for keys in active
@@ -2702,22 +2056,7 @@ GATEWAY_AUDIT_LOG_PATH = os.environ.get("GATEWAY_AUDIT_LOG_PATH", "").strip()
 # import; its drain task starts lazily on the first write within a running loop.
 _audit_writer = AsyncLineWriter(GATEWAY_AUDIT_LOG_PATH) if GATEWAY_AUDIT_LOG_PATH else None
 
-# NREM dream-cycle backlog gauge (GET /memory/telemetry). A "cycle" is one
-# (project, domain) group that meets the v2 FACT GATE NREM actually fires on
-# (Dreaming Cycle Plan to v2, §2.1; C1/C1b) — NOT a raw unconsolidated record
-# count, and NOT a per-entity or project-only count (neither level exists any
-# more). Fact groups reuse ONT.density_threshold, the SAME value
-# consolidation_loop.py gates on, over facts resolved straight off the graph's
-# GROUNDED_IN/DOMAIN_OF/PROJECT_OF edges — no project_axis.PROJECT_SQL
-# involved here, since a DOMAIN_OF/PROJECT_OF edge only exists for an already-
-# registered (project, domain) pair. Decision cycles run the insight gate
-# itself, count-only, from insight_gate.py — its own threshold travels with
-# it, so a deployment that tunes insight_threshold sees the tuned number here
-# rather than a hardcoded twin.
-#
-# There is deliberately no default-project constant here any more: the gauge
-# never invents a key. consolidation_loop keeps DEFAULT_DOMAIN for a summary's
-# OWN stored key, which is a different thing from a fact's fold key.
+# NREM dream-cycle backlog gauge: pending (project, domain) cycles from graph edges, using the same density/insight thresholds as the fold; untagged facts are skipped.
 
 # ── Consolidation health signal (ADR-018) ───────────────────────────────────
 # The coordinator rolls up the daemon's consolidation_runs ledger into a cached
@@ -2735,16 +2074,7 @@ CONSOLIDATION_HEALTH_REFRESH_SEC = int(os.environ.get("CONSOLIDATION_HEALTH_REFR
 # also reaps these on restart; this is the read-side backstop).
 CONSOLIDATION_ORPHAN_TIMEOUT_SEC = int(os.environ.get("CONSOLIDATION_ORPHAN_TIMEOUT_SEC", "1800"))
 
-# ── The telemetry contract's tunables (v0.9.74, decision:1785) ─────────────────
-# ⚠ EVERY DEFAULT BELOW IS UNMEASURED unless its comment says otherwise
-# (fact:1338 — a proposed limit is a measurement claim in disguise, so it says
-# plainly which it is). The same statement is repeated in .env.example, where an
-# operator actually reads it.
-#
-#: Whole-payload cache for /memory/telemetry. UNMEASURED: chosen so the
-#: monitor's 30 s browser re-fetch cannot stack two builds, not from a measured
-#: build cost. The measured build cost on this corpus at 0.9.73 was 733 ms
-#: median (7 samples) for the WHOLE payload.
+# Telemetry tunables: every default is unmeasured unless its comment says otherwise (decision:1785, fact:1338).
 TELEMETRY_CACHE_S = float(os.environ.get("TELEMETRY_CACHE_S", "15"))
 #: Observation window for the encoder latency rings. UNMEASURED.
 ENCODER_LATENCY_WINDOW = int(os.environ.get("ENCODER_LATENCY_WINDOW", "200"))
@@ -2774,14 +2104,7 @@ TOKEN_VERIFY_WARN_PER_MIN = float(os.environ.get("TOKEN_VERIFY_WARN_PER_MIN", "1
 #: succeeded) is the ruling; the number is a floor to keep one unlucky fold from
 #: raising an alarm.
 NREM_FOLD_ATTEMPT_WARN = int(os.environ.get("NREM_FOLD_ATTEMPT_WARN", "5"))
-#: Guards the `(rem_timing->>'ts')::double precision` cast in `_rem_telemetry`.
-#: ⛔ NOT DECORATION. `rem_timing` is JSONB on a table with rows older than the
-#: writer that fills `ts`, and ONE unparseable value aborts the whole query —
-#: taking the REM section down with it, not just that row. Named rather than
-#: inlined so the pattern is unit-testable: every row on the development corpus
-#: is a clean number today (measured 2026-08-28, 188/188), so the guard is a
-#: no-op HERE and would go untested exactly where it matters — a corpus that
-#: has one bad row.
+#: Guard the rem_timing ts cast: one unparseable JSONB value aborts the whole REM telemetry query.
 REM_TS_NUMERIC_RE = r"^[0-9]+(\.[0-9]+)?$"
 #: Top-N for the two REGISTRY-BACKED breakdowns (projects, domains). ⚠
 #: UNMEASURED as a value; what IS measured is that the previous hard-coded 12
@@ -2883,22 +2206,7 @@ def _consolidation_rollup(by_type: dict, any_stalled: bool, started_at: dict,
     }
 
 
-# Cypher write-operation guard — reject queries containing mutating keywords.
-# Note: the read-transaction API (`session.execute_read`) and session access
-# mode (`default_access_mode="READ"`) are driver routing hints and do not provide
-# a server-enforced security boundary on Neo4j Community standalone.
-# The regex guard here stays the primary write control. Every keyword is matched
-# on WORD BOUNDARIES, never on a following whitespace character: `SET\s` let
-# `SET  n:Label` (two spaces) through the guard entirely, because the `\b`
-# closing the alternation then had to hold between two spaces. Live-reproduced
-# bypass, fact:1734 (item 7 of the v0.9.69 post-first-write hardening plan).
-#
-# `\bSET\b` does NOT match a property name that merely CONTAINS "set"
-# (`n.settings`, `n.asset`) — those are the cases the old comment feared and
-# they still pass. It DOES over-block a bare `n.set`, an `AS set` alias, and
-# any write keyword appearing inside a string literal; those are known,
-# accepted over-blocks (a read-only guard erring towards refusal), pinned as
-# such in tests/test_graph_route_guard.py.
+# Word-boundary mutating-keyword regex is the write control (Community READ mode is not a server boundary); over-blocks of n.set / string literals are accepted (fact:1734).
 _WRITE_CYPHER = re.compile(
     r"\b(CREATE|DELETE|DETACH\s+DELETE|SET|REMOVE|MERGE|CALL|LOAD\s+CSV|DROP)\b",
     re.IGNORECASE,
@@ -3024,60 +2332,7 @@ def _validate_visibility_and_scope(body: dict) -> tuple[str, str] | web.Response
 def _axis_filter_predicate(start: int, project: "str | list[str] | None",
                             domains: list[str] | None,
                             since: datetime | None) -> tuple[str, list]:
-    """Build the optional project/domains/since AND-predicate `handle_search`
-    adds to a candidate query — Tier-1 `technical_docs` and Tier-3
-    `community_summaries` alike. Applied to the CANDIDATE SET the reranker
-    scores, never as a post-hoc filter on already-ranked results: a named
-    place/time is a FILTER, not query text (the motivating measured failure —
-    folding a project name into query text ranked records that merely MENTION
-    the project above records that BELONG to it, and the genuinely relevant
-    facts landed below the limit cut on their weakest signal).
-
-    All three are optional and additive. No filter requested returns `("", [])`
-    — an unfiltered search's query text and arg list are byte-for-byte
-    unchanged from before this predicate existed.
-
-    `project` matches the top-level `metadata->>'project'` string against a SET
-    of spellings (`= ANY`), and `domains` matches the top-level
-    `metadata->'domains'` JSON array against the union of every filter entry's
-    spellings. BOTH ARE ALREADY EXPANDED BY THE CALLER — `handle_search`
-    resolves what the searcher typed to a canonical and hands in every stored
-    spelling that means it (`expand_axis_spellings`). A str is accepted for
-    `project` and treated as a one-element set, which is what an unresolvable
-    value degrades to: the literal string, matching whatever carries it —
-    exactly the behaviour before the expansion existed.
-
-    ⚠ THE EXPANSION IS THE CALLER'S, AND MUST STAY THERE. It costs two registry
-    reads; doing it here would put them inside a pure function called once per
-    candidate query (five of them) and turn one lookup into five.
-
-    `domains` matches with OR semantics (`?|` — true when ANY named domain is
-    present) — the
-    CANONICAL KEY ONLY (decision:1214), never the older singular `domain`
-    string or the `decision` blob. A pre-1214 thematic community_summaries row
-    (still written with singular `domain`) legitimately does not match a
-    domains filter rather than being silently reached through a second key —
-    the canonical key is the contract now. `since` matches `created_at >=` a
-    parsed, tz-aware datetime.
-
-    Read path never blocks on registry state: an unknown project/domain name is
-    not refused here, it simply matches nothing (a searcher may probe).
-
-    ⚠ `domains` is CALLER-BOUND before it ever reaches here: `handle_search`
-    rejects more than `SEARCH_DOMAINS_FILTER_CAP` (16) entries with a 400
-    `filters_invalid` at ingress, never truncates silently — an unbounded list
-    binds straight into the `?|` scan (a DoS vector), and a silent drop would
-    let a partial filter's empty result read as authoritative. This function
-    does not re-check the cap; it trusts its caller.
-
-    ⛔ THE CAP IS ON WHAT THE CALLER SUPPLIED, NEVER ON THE EXPANDED SET, and
-    that distinction is load-bearing rather than pedantic. The cap exists to
-    bound what an UNTRUSTED caller can make the database scan; the expansion is
-    the SERVER's own answer, derived from its own registry, and is bounded by
-    how many spellings that registry holds. Applying the cap after expansion
-    would let a deployment that has recorded a few renames silently lose filter
-    entries — a partial filter whose empty result reads as authoritative, which
-    is the precise failure the cap was written to prevent.
+    """AND-predicate for search candidates: project ANY, domains ?| on metadata.domains, since created_at (decision:1214). Caller already expanded spellings and capped the domain list.
 
     `start` is the next free asyncpg positional index (`$N`).
     """
@@ -3435,14 +2690,7 @@ class MemoryCoordinator:
         self.pgvector_version: str | None = None
         self.hnsw_iterative_scan: bool = False
 
-        # ── The telemetry contract's in-process instruments (v0.9.74) ────────
-        # ⛔ EVERY ONE OF THESE IS WRITTEN FROM A WORK PATH, so every write goes
-        # through telemetry_instruments (which swallows) and never awaits. See
-        # that module's docstring for the rule and why it is centralised there.
-        #
-        # The encoders had NO per-call latency at all before this: the only
-        # number was the 600 s synthetic capability probe, which is a
-        # projection, not an observation of what real callers experienced.
+        # Work-path instruments go through telemetry_instruments (never await). Encoder per-call latency is observed here, not the 600s probe.
         self._embed_ring = LatencyRing(ENCODER_LATENCY_WINDOW)
         self._rerank_ring = LatencyRing(ENCODER_LATENCY_WINDOW)
         # Postgres pool wait — how long `_acquire` blocked before handing over a
@@ -3457,23 +2705,7 @@ class MemoryCoordinator:
         self._neo4j_tx_failures_total = 0
         self._embed_window_overruns_total = 0
         self._embed_window_overruns_last_ts: str | None = None
-        # ⛔ NO OUTBOX RING HERE, DELIBERATELY. Apply latency and drain rate are
-        # DERIVABLE — `neo4j_outbox` already stores `created_at` and
-        # `applied_at`, and `_apply_outbox_row` already stamps the second one.
-        # Adding an in-memory ring would write a value a reader can reach by
-        # query (decision:1032), and would be the WORSE copy: it resets on
-        # restart, where the columns do not. Both numbers are SQL percentiles
-        # over those two columns — see `_outbox_telemetry`.
-        #
-        # Registry census health (F1). ⛔ THE CENSUS QUERY WAS DEAD FROM THE DAY
-        # IT SHIPPED — it selected FROM a `domains` table that does not exist —
-        # and the refresher's bare `except Exception: registry = None` made that
-        # indistinguishable from "not probed yet". Three pieces of state fix the
-        # class, not just the query: a COUNTER the registry dependency reads, so
-        # /health degrades when its own census cannot be read; the LAST GOOD
-        # value plus when it was taken, so a transient failure does not blank a
-        # number an operator was watching; and an ok/failed flag so the log line
-        # fires ONCE PER TRANSITION rather than once per 60-second tick.
+        # Outbox apply latency/drain rate are SQL over created_at/applied_at, not an in-memory ring (decision:1032). Registry census keeps last-good + fail counter so a dead query is not silent.
         self._registry_census_failures = 0
         self._registry_census_last_error: str | None = None
         self._registry_census_last_good: dict | None = None
@@ -3518,15 +2750,7 @@ class MemoryCoordinator:
         # writing it twice would duplicate a derivable value.
         self._rerank_payload_chars_total = 0
         self._rerank_payload_docs_total = 0
-        # Observed-maximum tracker (operator ruling, 2026-08-23, on top of
-        # fact:1441): a capacity SIGNAL needs the worst case a real search
-        # actually produced, not an average -- a sum+count only ever gives a
-        # mean. Updated at the SAME increment site as the pair above so it
-        # stays aligned with the identical population (both outcome paths,
-        # via `ranked`). Monotonic non-decreasing for this process's
-        # lifetime BY DESIGN: it can only rise, so one outlier search pins it
-        # until the next restart -- for a capacity signal that is the safe
-        # direction (it never becomes less conservative), never a defect.
+        # Observed-max rerank payload (monotonic this process) for the capacity signal, updated with the cumulative pair (fact:1441).
         self._rerank_payload_chars_max = 0
         # Backup quiesce: dedicated connection holding the EXCLUSIVE advisory lock
         # (None = not held), plus the TTL auto-resume task.
@@ -3594,20 +2818,7 @@ class MemoryCoordinator:
         # replaces (a caplog-forced test hid it: the fixture installs its own
         # handler, so it never observed the real, unconfigured logger).
         log_encoder_endpoints()
-        # pgvector version probe — on a STANDALONE connection, BEFORE the pool
-        # is created, so self.hnsw_iterative_scan is already correct by the
-        # time _init_connection runs for the pool's own warm-up connections.
-        # Probing AFTER create_pool() (e.g. via the first acquired connection,
-        # the way the outbox recovery below does) would leave the first
-        # POOL_MIN connections permanently without the SET below — they are
-        # created and initialised during create_pool() itself, before any
-        # query against them could have told us whether to apply it.
-        #
-        # ONE shared startup-wait deadline for BOTH the probe below and
-        # create_pool further down (C3/C4, merger fix round) — see
-        # _connect_with_startup_wait's docstring for why a separate budget
-        # per call site would leave hnsw_iterative_scan silently disabled
-        # forever instead of ever crashing start() when Postgres never comes up.
+        # Probe pgvector on a standalone connection before create_pool so pool warm-up connections already have hnsw_iterative_scan set.
         _pg_startup_deadline = _monotonic() + PG_STARTUP_WAIT_S
         try:
             _probe = await _connect_with_startup_wait(
@@ -4133,14 +3344,7 @@ class MemoryCoordinator:
                     f"     f.fact_kind = $fact_kind"
                     + (" SET f.source_ref = $source_ref" if source_ref else "")
                     + f" WITH f"
-                    # Fact-custody edges (decision 915): the agent GENERATED this
-                    # record (WAS_ATTRIBUTED_TO), acting ON BEHALF OF the operator
-                    # (ACTED_ON_BEHALF_OF — delegation, NOT authorship: this is why we
-                    # do not point WAS_ATTRIBUTED_TO at the human as decisions do),
-                    # scoped to a project. All three are DERIVED (agent = token source,
-                    # person = kernel principal, project = folder) and written only when
-                    # present. The 'coordinator' fallback source is the system itself,
-                    # not a real agent, so it mints no AIAgent node.
+                    # Fact WAS_ATTRIBUTED_TO agent, ACTED_ON_BEHALF_OF principal, PROJECT_OF folder — derived, written only when present (decision:915).
                     f" FOREACH (_ IN CASE WHEN $source <> '' AND $source <> 'coordinator'"
                     f"                    THEN [1] ELSE [] END |"
                     f"   MERGE (a:{ONT.ai_agent} {{name: $source}})"
@@ -4153,21 +3357,7 @@ class MemoryCoordinator:
                     f" FOREACH (_ IN CASE WHEN $project <> '' THEN [1] ELSE [] END |"
                     f"   {project_merge_cypher(project_id)}"
                     f"   MERGE (f)-[:{ONT.project_of}]->(p))"
-                    # The domain chain, in the SAME round-trip (028):
-                    # (:Fact)-[:DOMAIN_OF]->(:Domain)-[:PROJECT_OF]->(:Project).
-                    # One FOREACH per named section, keyed on the registry id —
-                    # there is no name-keyed form, so an unresolved section
-                    # simply contributes no row to $domains and no edge.
-                    # The Domain→Project edge reuses PROJECT_OF rather than
-                    # inventing a second belonging relation: a section belongs
-                    # to its project in exactly the sense a record does.
-                    # ⚠ The project node is MERGED AGAIN here rather than reusing
-                    # `p`. A variable bound inside a FOREACH does not survive it,
-                    # so `p` is simply not in scope in this block — and Cypher
-                    # would reject the query outright rather than silently
-                    # writing the wrong thing. Re-merging on the same key is
-                    # idempotent and reaches the same node; the name is SET by
-                    # the project block above, so it is not repeated here.
+                    # Same-round-trip DOMAIN_OF then Domain-[:PROJECT_OF]->Project (re-MERGE the project; FOREACH does not keep `p`).
                     + (
                         f" FOREACH (row IN $domains |"
                         f"   MERGE (dp:{ONT.project} {{project_id: $project_id}})"
@@ -4600,14 +3790,7 @@ class MemoryCoordinator:
                 f"      d.rationale   = $rationale,"
                 f"      d.date        = $date,"
                 f"      d.source      = $source"
-                # ⛔ confidence + alternatives are deliberately NOT written here.
-                # They stay SPINE ADR fields and are still never minted as
-                # :Entity (fact 551: alternatives are 65% free phrases, which
-                # would flood the graph — REM still extracts clean CONSIDERED
-                # entities from the text). What changed is that they are not
-                # COPIED either: nothing walks on them, so the node carries the
-                # pg_id and the record carries the payload
-                # (`_attach_decision_payload`).
+                # confidence/alternatives stay on the record payload, never minted as :Entity (fact:551).
                 f" WITH d"
                 f" MERGE (h:{ONT.human} {{name: $decided_by}})"
                 f" MERGE (d)-[:{ONT.was_attributed_to}]->(h)"
@@ -4650,14 +3833,7 @@ class MemoryCoordinator:
             if grounded:
                 await self._write_typed_grounding(session, ONT.decision, pg_id, grounded)
             elif grounded_in_flat:
-                # Legacy path — RESOLVE the cited id's real label before linking.
-                # This used to MERGE the target as a :Fact unconditionally, which
-                # manufactured a contentless phantom whenever the cited record was
-                # a decision or a retrospective: the real node kept its own label,
-                # so the stub was never filled, never enriched, and sat in the REM
-                # queue forever (820). A pg_id does not imply a Fact — check what
-                # the id actually refers to and attach to THAT node, creating the
-                # placeholder only when no record node exists yet.
+                # Resolve the cited pg_id's real label before linking; MERGE-as-Fact used to mint a phantom beside a Decision/Retrospective.
                 await session.run(
                     f"MATCH (d:{ONT.decision} {{pg_id: $pg_id}})"
                     f" UNWIND $grounded_in AS fid"
@@ -4746,16 +3922,7 @@ class MemoryCoordinator:
                 await self._write_typed_grounding(
                     session, ONT.retrospective, pg_id, params.get("grounded") or []
                 )
-                # ⛔ A RETROSPECTIVE'S SAVE WRITES NO DOMAIN_OF EDGE — neither
-                # onto the decision it judges nor onto itself (`decision:1736`).
-                # It used to do both: it re-ran the decision's inheritance
-                # (because a retrospective is the moment an ungrounded decision
-                # first reaches facts) and then took the decision's sections for
-                # itself. Both were POST-FIRST-WRITE MUTATIONS of somebody's
-                # belonging axis, inferred rather than asserted — the class
-                # `fact:1671` forbids. The verdict is reached from its decision
-                # and its facts on READ, and `derived_belonging_cypher` is where
-                # that answer now lives.
+                # A retrospective writes no DOMAIN_OF; belonging is derived on read (decision:1736, fact:1671).
             else:
                 superseded_clause = " SET d.superseded = true" if reversal else ""
                 await session.run(
@@ -4774,17 +3941,7 @@ class MemoryCoordinator:
             )
         log.debug("outbox: applied retrospective pg_id=%d (outbox_id=%d)", pg_id, outbox_id)
 
-    # Resolve a pg_id to the node that ALREADY carries it under any spine label,
-    # creating a :Fact placeholder only when no such node exists. A plain
-    # `MERGE (n:Fact {pg_id: $id})` matches on label+property together, so a
-    # pg_id belonging to a :Decision or :Retrospective node does not match and a
-    # SECOND, phantom :Fact node is minted beside the real record — carrying the
-    # supersession while the real node stays unmarked. Ingress now refuses to
-    # supersede a judgement at all (_supersession_target_error), but outbox rows
-    # queued before that guard existed still replay through here, and the
-    # successor side was never guarded at ingress at all. The placeholder branch
-    # is kept because the target's own outbox row may not have applied yet — the
-    # original reason this was a MERGE.
+    # MERGE the existing spine node by pg_id (any label); a :Fact placeholder only if none exists yet, so a judgement is not cloned as Fact.
     _SPINE = f"{ONT.fact}|{ONT.decision}|{ONT.retrospective}"
 
     async def _ensure_spine_node(self, session, pg_id: int) -> None:
@@ -4841,37 +3998,7 @@ class MemoryCoordinator:
     async def _apply_project_of_outbox_row(
         self, outbox_id: int, pg_id: int, params: dict
     ) -> None:
-        """Point an EXISTING spine record at its :Project — the narrow repair row
-        that backfill_project_of.py and the promotion writer enqueue, so both the
-        historical gap and the parked → real transition close through the outbox
-        instead of by writing Neo4j directly.
-
-        ⚠ It exists because re-enqueuing an ordinary fact row would be actively
-        DESTRUCTIVE. That row's Cypher also re-runs `UNWIND $entities MERGE
-        MENTIONS`, so replaying it would resurrect every enrichment edge a later
-        sweep deliberately deleted — the below-floor cleanup would silently undo
-        itself. A repair must touch only what it repairs.
-
-        MATCH on the record, never MERGE: a repair mints no records. If the node
-        is gone the row is dropped rather than conjuring a phantom whose only
-        property is a pg_id. The match is over the SPINE, not :Fact alone —
-        a promotion cascades to retrospectives (P20), and matching one label
-        would silently drop those rows.
-
-        ⚠ IT REPLACES, IT DOES NOT ACCUMULATE (P19). This used to be a bare
-        MERGE, and a bare MERGE is only correct while every target has no edge —
-        which is true of the backfill's population by construction and false of
-        the promotion writer's. Measured before this changed: 35 parked facts
-        already carried an edge Postgres could not justify, and 4 spine nodes
-        carried TWO project edges. A record belongs to one project, and the
-        Postgres resolution is that answer (P1), so the graph mirrors it rather
-        than keeping every value ever written. Deleting first is unconditional
-        on purpose — a flag that can be omitted is how the second-writer defect
-        arrives, and on a node with no edge the delete is simply a no-op.
-
-        One-shot, DELETED on success, following the supersede row: it carries no
-        dream lifecycle and must never be counted as working-set backlog.
-        """
+        """Replace PROJECT_OF on an existing spine node from the repair row; MATCH not MERGE, then delete the outbox row."""
         project = (params.get("project") or "").strip()
         if project:
             project_id = await self._project_identity(project)
@@ -4895,39 +4022,7 @@ class MemoryCoordinator:
     async def _apply_domain_of_outbox_row(
         self, outbox_id: int, pg_id: int, params: dict
     ) -> None:
-        """Point an EXISTING record at its :Domain(s) — the narrow repair row
-        `backfill_domain_of.py` enqueues.
-
-        `domains: [names]`  the record's OWN, ASSERTED sections, resolved through
-                            the registry the same way first write resolves them.
-                            The only mode there is.
-
-        ⛔ THE `inherit: true` MODE IS GONE (`decision:1736`). It re-derived a
-        judgement's sections from what it grounds in and wrote them as edges
-        stamped `inherited` — a materialised copy of a value the reader can
-        reach by walking, and a mutation of a record's belonging axis after its
-        first write. Nothing derives belonging into an edge any more; the read
-        side answers it (`derived_belonging_cypher`).
-
-        ⚠ A LEGACY `inherit` ROW IS DROPPED, NOT FALLEN THROUGH. Rows enqueued
-        before this shipped may still be pending, and they carry no `domains`
-        key — so letting one reach the explicit branch below would DELETE every
-        DOMAIN_OF edge the record has and write nothing back. Recognising the
-        retired mode and dropping the row is the difference between a no-op and
-        silent data loss.
-
-        Narrow, like `project_of` and for the same reason: replaying an ordinary
-        fact row would re-run its `MENTIONS` merges and resurrect enrichment
-        edges a later sweep deliberately deleted.
-
-        ⚠ IT REPLACES THE SET IT MANAGES: it deletes EVERY DOMAIN_OF edge, then
-        writes what Postgres says. The record's own assertion is the whole
-        answer — that is the P19 lesson on a MULTI-valued axis, "the graph
-        mirrors the current answer rather than keeping every answer".
-
-        One-shot, DELETED on success: it carries no dream lifecycle and must
-        never be counted as working-set backlog.
-        """
+        """Replace DOMAIN_OF edges with the asserted names; drop a legacy inherit=true row without writing (decision:1736)."""
         retired_inherit = bool(params.get("inherit"))
         written = 0
         if retired_inherit:
@@ -5012,31 +4107,7 @@ class MemoryCoordinator:
         if isinstance(blob, dict) and blob.get("project") == supplied:
             blob["project"] = canonical
 
-    # ── Deferred axis registration (P4′, v0.9.72) ────────────────────────────
-    #
-    # ⛔ NO REGISTRY ROW IS WRITTEN BY A REFUSAL THAT COULD HAVE FIRED EARLIER.
-    # The project and domain gates ACCEPT a declared-new name where they always
-    # did — the position of that acceptance is the rule (P9) and has not moved
-    # — but they now record an INTENT instead of inserting.
-    # `_commit_axis_registrations` performs the inserts in `handle_save`,
-    # immediately before `_entity_commit_mints`: after every validation that
-    # can still 400, before the embed. It is the same ordering rule S-4 gave
-    # the entity mint (`decision:1413`) and for the same reason — a write that
-    # survives the refusal of the save that requested it is a lie in the
-    # registry.
-    #
-    # ⚠ P4′ IS "COULD HAVE FIRED EARLIER", NOT "NEVER". Stating it as an
-    # absolute was wrong (review R1) and hid a real leak for one release
-    # candidate. Three exits remain downstream of the commit BY CONSTRUCTION —
-    # the hard-mandate embed's 503, the in-transaction `axis_conflict` 409, and
-    # the commit's own 503 — each enumerated in
-    # `_commit_axis_registrations`'s docstring with why it cannot be hoisted.
-    # Anything that is NOT in that list and still fires after the commit is a
-    # defect, and the list is how you tell.
-    #
-    # The intents live in the axis REPORT dict, the out parameter both gates
-    # already carry, keyed under `_PENDING_KEY`. `_commit_axis_registrations`
-    # POPS it, so it can never reach the save response.
+    # Axis gates record an intent; `_commit_axis_registrations` inserts after every 400 and before embed so a refused save cannot leave a registry row (decision:1413).
     _PENDING_KEY = "pending_registrations"
 
     def _pending_registrations(self, report: dict | None) -> dict | None:
@@ -5060,14 +4131,7 @@ class MemoryCoordinator:
                                     agent_id: str, metadata: dict) -> None:
         pending = self._pending_registrations(report)
         if pending is None:
-            # ⛔ A CODING ERROR, AND IT RAISES (v0.9.72, R4). The first version
-            # logged a warning and returned, which meant a caller that forgot
-            # the report got a 200 for a save whose project was never
-            # registered — the graph would then carry a project the registry
-            # does not have, which is the exact divergence migration 027
-            # exists to remove, reintroduced by an omission nobody would see.
-            # There is one production caller and it always passes a report, so
-            # this can only fire in new code, which is when it is cheap to fix.
+            # Missing axis-report argument raises (a 200 without a registry row would diverge graph from registry).
             raise RuntimeError(
                 f"_defer_project_registration({name!r}) was called with no "
                 "axis report — the caller must pass one, because that is "
@@ -5204,28 +4268,7 @@ class MemoryCoordinator:
         if await self._project_registered(supplied):
             return None
 
-        # P9 — the second submission is ACCEPTED, in any of its three forms: pick
-        # a proposal (now a registry hit), declare a new project, or park it on
-        # the sentinel. There is deliberately NO round counter on the server: the
-        # bound comes from those three forms all succeeding, not from per-caller
-        # state a gateway would have to keep and expire. What the gateway never
-        # does, however many times it is asked, is accept an unregistered name.
-        #
-        # ⛔ IT IS ANSWERED HERE — AFTER THE REGISTRY, BEFORE EVERY OTHER STEP —
-        # AND THE POSITION IS THE RULE. A caller that DECLARES a new project is
-        # asserting that no such project exists. When the name is a retired
-        # spelling, or a separator/case variant of a live or retired one, that
-        # assertion is FALSE and the caller must be told, loudly, with the
-        # spelling to use. Resolving it quietly would store the record correctly
-        # and destroy the only signal that an agent believes it is creating
-        # projects that already exist — which is how every retired spelling in
-        # this registry arrived. A save that makes no such claim gets the
-        # opposite treatment below: its spelling is simply resolved, because it
-        # never claimed anything about the registry in the first place.
-        #
-        # ⚠ It sits AFTER the exact-registry check above, and only there: a
-        # `new_project` flag on a name that is already registered verbatim is a
-        # redundant flag, not a false claim, and has always been accepted.
+        # new_project is accepted only as a true claim of absence (after exact-registry); a retired or variant spelling is refused, never quietly resolved.
         if metadata.get("new_project") is True:
             # ⛔ A DECLARATION IS NOT A DEFENCE. The agent that sets this flag is
             # the same agent that makes the spelling error, so accepting the
@@ -5235,14 +4278,7 @@ class MemoryCoordinator:
             refusal = await self._new_project_refusal(supplied, metadata)
             if refusal is not None:
                 return refusal
-            # ⛔ ACCEPTED HERE, WRITTEN LATER (P4′, v0.9.72). This used to INSERT
-            # the registry row on the spot, which made the acceptance and the
-            # write the same event — and every 400 still ahead of it (an
-            # axis_conflict on the content hash, a mint Postgres refuses) and the
-            # 503 `registry_unavailable` then left a project row behind for a
-            # record that was never stored, under a refusal whose own text says
-            # "Nothing was written". The acceptance is unchanged; only the write
-            # moved, to `_commit_axis_registrations`.
+            # new_project is accepted here and written later in `_commit_axis_registrations` so a later 400/503 cannot leave a registry row.
             self._defer_project_registration(report, supplied, agent_id, metadata)
             return None
 
@@ -5264,17 +4300,7 @@ class MemoryCoordinator:
                 }
             return None
 
-        # Steps 3 and 4 — THE SAME NAME, SPELLED DIFFERENTLY (decision:1015,
-        # fact:1047, fact:1490). A registry that answers only exact strings makes
-        # `Shared_Memory` and `shared-memory` two unrelated events: one is a
-        # project and the other is a stranger, and the caller is asked to pick a
-        # proposal that is character-for-character what it already meant. The key
-        # is what fact:1047's spelling guard has always compared on — this simply
-        # stops the guard being the only thing that knows it.
-        #
-        # It runs LAST because exact answers must never be reachable through a
-        # key: a value already on file is answered by itself, and only a value
-        # that is on file NOWHERE gets normalised.
+        # Key-identical spellings (Shared_Memory vs shared-memory) are the same project; exact hits stay exact (decision:1015, fact:1047, fact:1490).
         registered, aliases, _err = await self._project_spellings(supplied)
         canonical, via = resolve_axis_value(supplied, registered, aliases)
         if canonical is not None:
@@ -5491,24 +4517,10 @@ class MemoryCoordinator:
                 ),
             }
 
-        # ⛔ NEW-PROJECT MODE (v0.9.72). The project gate above now DEFERS the
-        # registry row for a declared-new project, so by here that project has
-        # no row — and `_project_identity` RAISES on a missing row, which would
-        # turn the ordinary "new project plus its first section" save into a
-        # false 503 `registry_unavailable`. So the pending intent is read first
-        # and answers the identity question instead: a project being registered
-        # by THIS save has no sections yet, which is a fact about the registry,
-        # not a failure to read it.
+        # Pending new-project intent answers identity here (no registry row yet); _project_identity would otherwise 503 the first section save.
         new_project = self._pending_project(report) == project
 
-        # ⛔ STRICT SINCE v0.9.69 (item 6, ruled R3). This used to treat a None
-        # identity as "accept the record with its domain unvalidated and
-        # unlinked" — which turned an unreadable registry into a SILENTLY
-        # half-filed record: stored, searchable by text, and reachable from no
-        # axis. `_project_identity` now RAISES instead, and handle_save turns
-        # that into a 503 `registry_unavailable` — the same answer the hard
-        # embedding mandate gives when the other half of a save cannot be
-        # completed. A save that cannot be filed correctly is not saved.
+        # Unreadable project identity is 503 registry_unavailable, not a silently unlinked save.
         project_id = None if new_project else await self._project_identity(project)
 
         for name in supplied:
@@ -5914,14 +4926,7 @@ class MemoryCoordinator:
             body["proposals"] = proposals
         return body
 
-    # ── Entity vocabulary ingress (fact:1375, migration 033) ──────────────────
-    #
-    # The whole gate lives in `_entity_ingress_error`, called from both writers
-    # of caller-supplied entity names — handle_save (facts and decisions share
-    # this generic path) and handle_retrospective (its own endpoint, its own
-    # `entities` field). See that method's docstring for the full rule; the
-    # two methods below are its DB-facing primitives, kept separate so a test
-    # can stub either one without reimplementing the gate's control flow.
+    # Entity vocabulary is minted only on facts (fact:1375, migration 033); judgements are refused by `_judgement_entities_error` before this gate.
 
     #: Which refusal CODE lands in which contract counter. Several counters
     #: aggregate a family: the contract documents one key per KIND of refusal an
@@ -6372,22 +5377,7 @@ class MemoryCoordinator:
 
     @staticmethod
     def _judgement_entities_error(metadata: dict) -> dict | None:
-        """400 when a DECISION or RETROSPECTIVE carries entities — or None
-        (item 3, v0.9.69; ruled R1, grounded on `decision:1664`).
-
-        ONLY FACTS CARRY ENTITIES. A judgement reaches its topics by walking to
-        the facts it rests on, which is why its `entities` never became a
-        MENTIONS edge in the first place — but the value was still validated,
-        still MINTABLE through `new_entities`, and still returned by search,
-        which made the judgement path a second, unvetted faucet into the
-        vocabulary (`fact:970`, `fact:1734` A(3)).
-
-        An EMPTY list is accepted PERMANENTLY, not for one release: the shipped
-        client's `build_decision_metadata` always emits `entities: []`, and a
-        field that is present-and-empty asserts nothing.
-
-        Refuses BEFORE any write — nothing reaches Postgres, nothing mints.
-        """
+        """400 unless this judgement omits entities / new_entities (or sends an empty list); facts alone mint vocabulary (decision:1664)."""
         entities = metadata.get("entities")
         new_entities = metadata.get("new_entities")
         offending = "entities" if entities else None
@@ -6619,15 +5609,7 @@ class MemoryCoordinator:
             if isinstance(e, str) and len(e) > ENTITY_NAME_MAX_LEN:
                 return self._entity_name_too_long_rejection(e), empty_plan
 
-        # RESERVED VOCABULARY (item 2a, v0.9.69) — a schema word or an axis
-        # declaration, on the RAW names, because `sanitize_entity_name` rejects
-        # exactly these and they would otherwise never become candidates: the
-        # name would reach Postgres verbatim and be dropped at the graph, which
-        # is the silence this refusal replaces. `new_entities` is swept too, so
-        # a reserved name is refused whether or not it is also a mint request.
-        # ⚠ `new_entities` has not had its SHAPE validated yet (that check needs
-        # `candidates`, below) — so only sweep it when it is already a list.
-        # A malformed one still gets its own `new_entities_invalid` refusal.
+        # Reserved schema/axis names are refused on the raw list (and new_entities when it is already a list).
         declared_new = metadata.get("new_entities")
         swept = list(raw_entities) + (
             list(declared_new) if isinstance(declared_new, list) else [])
@@ -6639,16 +5621,7 @@ class MemoryCoordinator:
 
         candidates = sanitize_entity_names(raw_entities)
         if not candidates:
-            # ⛔ THE PLAN STILL HAS TO SAY WHAT WILL BE STORED. This returned
-            # `empty_plan`, whose `canonical` is hard-coded `[]` — but a record
-            # whose entities are ALL shape-noise (`["254"]`, I3's gate-exempt
-            # class) stores those names VERBATIM. The re-save axis check then
-            # compared a stored `["254"]` against an incoming `[]` and refused
-            # every re-save of that record with a 409, permanently, over an
-            # axis that never moved. `_canonical_entity_list(metadata, {})` is
-            # the same answer `_rewrite_entities` produces for an empty
-            # `resolved` — it leaves the list exactly as it is — so the two
-            # cannot disagree.
+            # Shape-noise-only entities stay verbatim (not empty_plan []) so a re-save does not 409 against a list that never moved.
             return None, {"resolved": {}, "to_mint": [],
                           "canonical": self._canonical_entity_list(metadata, {})}
         candidates_set = set(candidates)
@@ -6688,15 +5661,7 @@ class MemoryCoordinator:
                     }, empty_plan
                 mint_requested.add(sanitized)
 
-            # ⛔ THE UNNAMEABLE CHECK, HERE AND NOT AT THE MINT (v0.9.72, R1).
-            # Cheapest of the mint validations and the only one needing no
-            # query at all — the project and domain axes put their twin in the
-            # same position, first, for the same reason. Checked over
-            # `mint_requested` rather than over `to_mint`: the two coincide
-            # (a name normalizing to nothing can never be IN the vocabulary,
-            # because the same trigger refused it there too), and this way the
-            # refusal fires before the reserved-project query and the batched
-            # resolution as well as before every write.
+            # Unnameable (normalizes to nothing) is refused here before any mint query.
             for sanitized in sorted(mint_requested):
                 unnameable = self._new_entity_unnameable_refusal(sanitized)
                 if unnameable is not None:
@@ -6785,15 +5750,7 @@ class MemoryCoordinator:
         for name in (plan.get("to_mint") or []):
             canonical = await self._entity_vocab_mint(name, agent_id)
             if canonical is None:
-                # ⚠ NO LONGER THE FIRST LINE OF DEFENCE, and kept anyway. The
-                # normalizes-to-nothing case is refused by
-                # `_entity_ingress_validate` now (v0.9.72, R1) — before the
-                # axis registrations commit — so this fires only if the
-                # database refuses a mint the gateway-side twin accepted:
-                # a `[:alnum:]` locale difference, or a future trigger rule
-                # Python does not know about. The database is the authority on
-                # its own writes; this is what turns its RAISE into a 400
-                # rather than a 500.
+                # DB RAISE on mint becomes 400 (gateway already refused unnameable; this is locale/trigger drift).
                 return self._new_entity_unnameable_refusal(name, forced=True)
             resolved[name] = canonical
             log.info("entity vocabulary: %r minted as canonical %r by %s "
@@ -7146,56 +6103,10 @@ class MemoryCoordinator:
                          metadata["decision"].get("decided_by_claimed"))
                 body["metadata"] = metadata
 
-        # Project is REQUIRED and checked against the registry (P4) — on FACTS
-        # and on DECISIONS alike.
-        #
-        # Unconditional — no env gate. A nullifiable invariant is not an invariant,
-        # and the failure it guards against is silent: an untagged record saves
-        # cleanly, searches cleanly, and simply never reaches synthesis.
-        #
-        # ⚠ The check is on `project`, never on a chain. A record carrying only a
-        # `domain` is NOT accepted as tagged: a domain is a SECTION of a project,
-        # so accepting it here would mean a part vouching for the whole.
-        #
-        # ⛔ DECISIONS WERE EXCLUDED FROM THIS UNTIL v0.8.44, and the reasoning
-        # that excluded them conflated PRESENCE with VALIDITY: "decisions already
-        # fail without decision.project". They do — but a present name that no
-        # registry knows was accepted, and the outbox then minted a `:Project`
-        # node for it. That is the one way the graph can end up holding a project
-        # the registry does not have, and unlike the ingress→outbox window (which
-        # leaves the graph BEHIND the registry, always safe) it does not resolve
-        # itself. Registration is what makes a project an identity, so a record
-        # that can create a node without one puts an unidentifiable project into
-        # the axis that gates consolidation.
-        #
-        # ⚠ IT RUNS AFTER the decision-shape check, deliberately: a decision with
-        # no project at all should still be told it is missing decided_by,
-        # project and rationale together, rather than being rejected for the
-        # project alone and coming back to discover the rest one at a time.
-        #
-        # RETROSPECTIVES stay out, and that one IS a scope statement rather than
-        # an oversight: they arrive on their own endpoint and inherit the project
-        # of the decision they judge — a decision that passed this very check.
-        # What the two axis gates REWROTE, collected for the response. A save
-        # that is rewritten and not told about it is a save whose caller keeps
-        # sending the same spelling forever and never learns where its record
-        # actually landed — the same reasoning that put `entities_rewritten` on
-        # this response.
+        # Project is required on facts and decisions (not retrospectives, which inherit); registry check runs after decision-shape so missing fields surface together.
         axis_report: dict = {}
 
-        # ⛔ ENTITY VALIDATION RUNS FIRST — BEFORE THE PROJECT AXIS, and the
-        # position is the rule (item 8, v0.9.69; `fact:1734` A(4)).
-        # `_project_ingress_error` used to REGISTER a declared-new project as
-        # its acceptance, and every entity refusal below could still 400 the
-        # save afterwards — so a save refused for an unknown entity left a
-        # project registered that no record ever named. ⚠ v0.9.72 closed the
-        # same hole from the other side (P4′: the registry write is deferred to
-        # `_commit_axis_registrations`), which makes this ordering no longer
-        # the ONLY thing standing between an entity refusal and a stray
-        # project row — it is kept because it is still the right order: a save
-        # is refused on the cheapest, most local check first. Validation writes
-        # NOTHING; the mint it plans is committed further down, still last
-        # (S-4, decision:1413).
+        # Entity validation runs before the project axis so a 400 cannot leave a stray registry row; mint still commits last (fact:1734, decision:1413).
         entities_field = metadata.get("entities", [])
         if not isinstance(entities_field, list):
             return web.json_response(
@@ -7224,24 +6135,7 @@ class MemoryCoordinator:
                 self._count_refusal(entity_refusal)
                 return web.json_response(entity_refusal, status=400)
 
-        # ⛔ A JUDGEMENT'S PROJECT IS ONE VALUE, AND IT IS `decision.project`
-        # (v0.9.72, `fact:1757`). The client's `build_decision_metadata` never
-        # set the TOP-LEVEL key, so `save_artifact` filled it from the cwd walk
-        # — which yields `.claude` under `~/.claude/...` and nothing under `~`.
-        # The gateway stored what it was given, and 12 live decisions ended up
-        # with a top-level project their own decision blob disagreed with. The
-        # client now sets both; this makes the SERVER independent of that, for
-        # every client that has not been updated and every one that never will.
-        #
-        # ⚠ ONE DIRECTION ONLY. The blob is what the operator asserted through
-        # `--project`; the top level is what a walk DERIVED. The assertion
-        # wins, always — never the reverse.
-        #
-        # It runs BEFORE `_project_ingress_error` so the registry gate answers
-        # about the value that will actually be stored. The pre-overwrite value
-        # is kept here because the ingress derives `project_resolved` by
-        # comparing what it was HANDED against the canonical: rewriting first
-        # and letting it report would hide the rewrite entirely.
+        # A decision's project is decision.project; copy it to the top-level key (blob wins over a cwd walk) before the registry gate (fact:1757).
         decision_project_rewrite = None
         _blob = metadata.get("decision")
         if (metadata.get("type") in ("decision", "retrospective")
@@ -7280,18 +6174,7 @@ class MemoryCoordinator:
             axis_report["project_resolved"] = {
                 **_ingress, **decision_project_rewrite}
 
-        # The domain axis (028), AFTER the project — a section cannot be resolved
-        # before the project that contains it, and by here the project name is
-        # canonical, so an aliased project reaches the right registry. A record
-        # naming no domain passes straight through: most do, and that is correct
-        # rather than untagged.
-        #
-        # ⛔ 503, NOT 500 AND NOT A SILENT ACCEPT (item 6, ruled R3). The domain
-        # axis resolves through the project's registry IDENTITY, so an
-        # unreadable registry means this record cannot be FILED — and a record
-        # that saves without its axes is invisible to every reader who navigates
-        # by them. Same answer as the hard embedding mandate, and the same
-        # reason: half a save is not a save.
+        # Domain resolves after project (canonical name in hand); an unreadable registry is 503, not a silent accept.
         try:
             domain_error = await self._domain_ingress_error(
                 metadata, agent_id, axis_report)
@@ -7315,33 +6198,7 @@ class MemoryCoordinator:
             self._count_refusal(domain_error)
             return web.json_response(domain_error, status=400)
 
-        # Canonical top-level axis key (decision:1214): every OPERATOR-ASSERTED
-        # axis lives at metadata TOP LEVEL on every record type — that is
-        # already how a fact carries its `project`/`domain`, and it is the key
-        # every reader that inspects Postgres directly (rather than resolving
-        # through `resolve_domains`) should be able to trust. A decision's
-        # asserted domains have only ever lived in the `decision` blob (the
-        # client shape memory_bridge.py's build_decision_metadata has always
-        # used), so materialise the SAME list to the top level here — after
-        # ingress validation, so any alias rewrite has already landed on the
-        # blob, and before the row is persisted.
-        #
-        # ⚠ ADDITIVE, NOT A REWRITE: the blob is left exactly as sent (payload
-        # fidelity for existing clients — nothing threads a new field through
-        # the CLI/MCP surface for this). Only decisions gain the top-level key;
-        # a retrospective is refused before this point if it names a domain at
-        # all (P17) and never populates a `decision` blob of its own, so it can
-        # never reach this branch with a value.
-        #
-        # ⛔ WHY NO GATE WAS NEEDED FOR THE OUTBOX: `resolve_domains` (used to
-        # build the outbox row's cypher_params["domains"] a few lines below)
-        # reads the `decision` blob FIRST and only falls back to the top level
-        # when the blob is empty (domain_axis.py). Since the blob already
-        # carries this exact list, adding it at the top level changes nothing
-        # `resolve_domains` returns for a decision — the outbox row is
-        # unaffected, not double-written, and a judgement still never reaches
-        # the graph write with a top-level-ONLY value. See
-        # test_decision_domain_materialisation_does_not_change_the_outbox_row.
+        # Materialise a decision's asserted domains to metadata top-level after ingress rewrite (additive; blob unchanged) (decision:1214).
         if metadata.get("type") == "decision":
             decision_domains = resolve_domains(metadata)
             if decision_domains:
@@ -7386,14 +6243,7 @@ class MemoryCoordinator:
         # already run) above, before the project axis.
         entities = metadata.get("entities", [])
 
-        # Per-entity provenance stamping (fact:1215) — additive, no api_version
-        # bump. `entities_provenance` is an optional {name: "operator"|"agent"}
-        # mapping saying, for each named entity, WHO named it: the operator
-        # (an explicit, human-chosen concept) or the agent (proposed without
-        # that confirmation). Validated at ingress so a malformed mapping fails
-        # loudly rather than being stored verbatim and silently ignored; the
-        # shape check is the whole job here — the values themselves are never
-        # second-guessed against the record's content.
+        # entities_provenance is an optional operator|agent map, shape-checked at ingress (fact:1215).
         entities_provenance = metadata.get("entities_provenance")
         if entities_provenance is not None:
             if not isinstance(entities_provenance, dict):
@@ -7439,21 +6289,7 @@ class MemoryCoordinator:
         # below) so it is seen at capture time rather than only on inspection.
         entities_provenance_missing = bool(entities) and entities_provenance is None
 
-        # ── P1: a re-save never moves a record's axes (item 4, v0.9.69) ──────
-        #
-        # The hash moved UP to here, ahead of the mint and the embed. `content`
-        # is fixed by this point (nothing below rewrites it), so computing it
-        # earlier changes no value — it just lets the conflict be found before
-        # anything is written. What it PROTECTS is exactly what used to be
-        # spent on a save that was going to be refused anyway: a vocabulary
-        # mint, and a GPU embedding.
-        #
-        # ⚠ THIS CHECK IS ADVISORY, and deliberately so: the AUTHORITATIVE one
-        # is the `FOR UPDATE` re-read inside the transaction below, which is
-        # the only place a concurrent save of the same content cannot slip
-        # between the read and the INSERT. This one exists for the cost, not
-        # for the correctness — the same "cheap indexed pre-check before the
-        # GPU" shape `handle_retrospective` uses for its target pg_id.
+        # Cheap hash pre-check before mint/embed; the authoritative axis_conflict is the FOR UPDATE re-read inside the transaction.
         is_judgement = is_judgement_type(metadata.get("type"))
         content_hash = hashlib.sha256(content.encode()).hexdigest()
         incoming_project = resolve_project(metadata)
@@ -7500,24 +6336,7 @@ class MemoryCoordinator:
                 status=503,
             )
 
-        # Entity vocabulary ingress gate (fact:1375, migration 033) — the
-        # COMMIT half. Every refusal the gate can produce already fired above,
-        # before the project axis (item 8, v0.9.69); what is left here is the
-        # mint itself plus the in-place rewrite of `metadata['entities']` to
-        # the CANONICAL spelling, before anything downstream — locks, PG
-        # metadata, the outbox row, entity_registry, the graph — sees this
-        # list, so `entities` is re-read below.
-        #
-        # ⛔ S-4 (security review fact:1412, ruled decision:1413): the MINT is
-        # still LAST among the writes — after entities_provenance above, after
-        # the axis gates, after the axis registrations just committed, and
-        # immediately before the hard-mandate embedding call. A mint is a real
-        # write (to entity_vocabulary, no shared transaction with the record
-        # insert), so anything that can still 400 the save must run BEFORE this
-        # call, or a mint survives the very refusal that requested it. Only the
-        # hard-mandate embedding 503 (unavoidably later — it needs the final
-        # content) can still race a mint; that residual is accepted by ruling,
-        # not fixed here — see the method's own docstring.
+        # Entity mint is last among writes (after axis commit, before embed) so a 400 cannot leave a vocabulary row (fact:1375, decision:1413).
         entities_before = list(entities)
         entity_error = await self._entity_commit_mints(
             metadata, agent_id, entity_plan)
@@ -7631,14 +6450,7 @@ class MemoryCoordinator:
                             **({} if is_judgement_type(metadata.get("type"))
                                else {"entities": entities}),
                             "agent_id": agent_id,
-                            # Fact-provenance axes (decision 912) — materialised as
-                            # traversable edges on the :Fact node so provenance is a
-                            # type-bounded subgraph, not just Postgres metadata. All
-                            # three are DERIVED, never elicited: person = kernel-attested
-                            # principal (SO_PEERCRED user, "user from system", None on
-                            # TCP), agent = the token-verified source ("agent from token"),
-                            # project = the normalised folder name ("project from folder").
-                            # Each edge is written only when its value is present.
+                            # Fact provenance edges (person/agent/project) are derived and written only when present (decision:912).
                             "person": metadata.get("principal"),
                             # P3 + P8 — the resolved PROJECT, never a section and
                             # never a chain, and never the SENTINEL: a :Project node
@@ -7647,15 +6459,7 @@ class MemoryCoordinator:
                             # project set, where the insight gate's ">= 2 distinct
                             # projects" rule would count it as a subject.
                             "project": project_for_graph(metadata),
-                            # The SECTIONS of that project this record sits in
-                            # (028) — a list, because a record may sit in
-                            # several. Carried as NAMES and resolved to registry
-                            # ids by the worker, exactly as `project` is: the
-                            # outbox row must stay replayable, and an id
-                            # captured here would be a snapshot of the registry
-                            # at enqueue time rather than at apply time.
-                            # Judgements never reach this with a value — ingress
-                            # refuses one, and their domains are inherited.
+                            # Outbox carries domain NAMES (resolved at apply); judgements never reach here with a value.
                             "domains": resolve_domains(metadata),
                             "type": metadata.get("type", "fact"),
                             "decision": metadata.get("decision", {}),
@@ -8045,14 +6849,7 @@ class MemoryCoordinator:
             g for g in (body.get("grounded_in") or [])
             if isinstance(g, int) and not isinstance(g, bool)
         ]
-        # Grounding is REQUIRED of a retrospective, and this is the asymmetry
-        # between the two judgement types. A decision may legitimately rest on
-        # experience alone before its project has any evidence. A retrospective
-        # cannot: it exists to report what MEASURING the outcome showed, so with
-        # nothing measured it asserts a verdict from nowhere — and it is also the
-        # route by which an ungrounded decision finally reaches topics, across
-        # HAD_OUTCOME. An ungrounded retrospective therefore breaks two records,
-        # not one, which is why this is a refusal and not a warning.
+        # A retrospective without grounding is refused (a decision may be ungrounded); it is also how an ungrounded decision reaches topics.
         if not grounded_ids:
             return web.json_response(
                 {"status": "error",
@@ -8082,17 +6879,7 @@ class MemoryCoordinator:
                 status=404,
             )
 
-        # ⛔ THE ENTITY GATE NO LONGER RUNS HERE (item 3, v0.9.69; ruled R1 on
-        # decision:1664). A retrospective is a JUDGEMENT: it reaches its topics
-        # by walking to the facts it is grounded in, so an entity named on one
-        # was never written to the graph — it was merely validated, mintable
-        # through `new_entities`, and returned by search, which made this
-        # endpoint a second unvetted faucet into the vocabulary (`fact:970`).
-        # Naming any is now a refusal, checked BEFORE any write; an empty list
-        # is accepted permanently, so an unchanged client still saves.
-        #
-        # `metadata['entities']` stays initialised (to the empty list it now
-        # always is) because the locks loop and the response below index it.
+        # Retrospectives mint no entities; a non-empty list is 400 (decision:1664).
         judgement_error = self._judgement_entities_error(metadata)
         if judgement_error is not None:
             self._count_refusal(judgement_error)
@@ -8136,33 +6923,7 @@ class MemoryCoordinator:
                             {"status": "error", "message": f"No record found with pg_id={pg_id}"},
                             status=404,
                         )
-                    # Inherit the target's project so domain-scoped reads see the
-                    # retro beside its decision.
-                    #
-                    # ⚠ OPEN, deliberately not settled here: whether a
-                    # retrospective's project MUST equal its decision's — i.e.
-                    # whether it is derived rather than self-asserted.
-                    #
-                    # The case FOR it: a retrospective never needs to span
-                    # projects, because a decision in one project affecting
-                    # another is expressed as an INTERMEDIATE DECISION in the
-                    # second project grounded in the first — and that decision
-                    # carries its own same-project retrospective. Cross-project
-                    # linkage then lives decision→decision, where it is explicit,
-                    # rather than inside a retrospective, where it would be
-                    # implicit. Both halves check out against the live corpus
-                    # (2026-08-04): 0 of 162 retrospectives differ from their
-                    # target, and the intermediate-decision pattern is already in
-                    # use — 28 decision→judgement grounding links, one of them
-                    # genuinely cross-project (a decision in one project grounded
-                    # in a decision in another).
-                    #
-                    # If it is ratified, this line becomes unconditional — a
-                    # PARKED target would then have to CLEAR the retro's own
-                    # value rather than leave it standing — and the promotion
-                    # writer gains a cascade, because it would then be a second
-                    # writer of a derived value. Until that is decided, behaviour
-                    # is left exactly as it was.
+                    # Copy the decision's project onto the retrospective when the decision has one.
                     if target["project"]:
                         metadata["project"] = target["project"]
 
@@ -8410,14 +7171,7 @@ class MemoryCoordinator:
             result = await session.run(
                 f"MATCH (n {{pg_id: $pg_id}}) WHERE {anchor_where}"
                 " OPTIONAL MATCH (n)-[r]-(related)"
-                # ADR-017: also pull each related Entity's alias siblings so
-                # search surfaces every surface form of a concept. One query,
-                # no-op-safe (empty when no ALIASES edges exist). Gated on
-                # ontology.py's GENUINELY_REFERENCED_ENTITY_RULE (decision 890)
-                # so a Decision-provenance node's stray legacy ALIASES edge
-                # (pre-718) never surfaces a wrongly-merged real entity name
-                # as if it were a "surface form" of free-text condition/
-                # alternative content — same criterion as fetch_entities().
+                # Pull genuinely-referenced entity alias siblings (decision:890); stray Decision ALIASES edges do not surface.
                 f" OPTIONAL MATCH (related)-[:{ONT.aliases}]-(al:{ONT.entity})"
                 f"   WHERE EXISTS {{"
                 f"     MATCH (related)<-[:{ONT.entity_link}]-(m)"
@@ -8425,21 +7179,7 @@ class MemoryCoordinator:
                 f"   }}"
                 " WITH n, r, related, labels(related) AS labels,"
                 "      collect(DISTINCT al.name) AS aliases"
-                # Highest-signal edges survive the cap: provenance-bearing
-                # first, then any typed relation, bare MENTIONS last.
-                # LIFECYCLE EDGES RANK BY TYPE, NOT BY THE PROVENANCE STAMP.
-                # The stamp was never a proxy for "structurally important" — it
-                # means "something asserted this", and INHERITANCE was a
-                # something: it wrote MENTIONS with asserted_by='inherited'. Those
-                # edges are LEGACY now (no writer since `decision:1736`) but they
-                # are still in the graph, so the ordering rule stands on the data
-                # that provoked it. A decision with 31 such edges buried its own
-                # HAD_OUTCOME (stamp null)
-                # below the cap, so a reader could not see the decision had been
-                # judged at all, and a retrospective did not surface the decision
-                # it judges. Measured: 131 decisions carry a verdict, 6 had it
-                # certainly hidden and 8 more at risk — growing as inheritance
-                # stamps more edges.
+                # Cap keeps provenance then typed relations then MENTIONS; lifecycle edges rank by type, not asserted_by (legacy inherited MENTIONS still in the graph) (decision:1736).
                 f" ORDER BY CASE WHEN type(r) IN ['{ONT.had_outcome}','{ONT.supersedes}',"
                 f"                                '{ONT.grounded_in}','{ONT.informed_by}'] THEN 0"
                 "               WHEN r.asserted_by IS NOT NULL THEN 1 ELSE 2 END,"
@@ -8951,18 +7691,7 @@ class MemoryCoordinator:
                         str(q_vec), *vis_t3_params, *t3_axis_params,
                     )
 
-                # Tier 1 — vector search. The pool handed to the reranker is a
-                # DEFAULT FLOOR, never a ceiling on what the caller may ask for:
-                # it was a hardcoded 20, so a caller requesting more than 20
-                # silently received 20 while the endpoint advertised up to 100.
-                # A default the caller can exceed is configuration; a limit the
-                # caller cannot see is a defect.
-                #
-                # Retrieve-then-rerank also needs the pool to be at least as
-                # large as the result set — reranking can only reorder what it
-                # was given, so a pool equal to the limit makes the stage
-                # pointless. The floor keeps small searches reranking from a
-                # genuinely wider pool.
+                # Retrieve pool is a floor (max(limit, SEARCH_CANDIDATE_FLOOR)), never a silent 20-cap the caller cannot see.
                 pool = max(SEARCH_CANDIDATE_FLOOR, limit)
                 # Reversed decisions (superseded=true, migration 009) are
                 # excluded; the fallback keeps pre-migration schemas working.
@@ -9021,22 +7750,7 @@ class MemoryCoordinator:
             # created_at column is absent — recency simply degrades to off.
             createds = [r.get("created_at") for r in candidates]
 
-            # Rerank — direct to RERANK_URL (env-derived) to avoid a circular proxy call.
-            # Decisions/retrospectives are scored WITH their recording date
-            # prepended (recency-aware: the newest retro is the current verdict).
-            # ⛔ TIER-3 NARRATIVES ARE CANDIDATES, NOT GUARANTEED POSITIONS.
-            # They used to be fetched nearest-neighbour with LIMIT 1 and NO
-            # distance floor, then placed ABOVE every fact without ever being
-            # scored — so the two most prominent slots of every answer were held
-            # by records that had never been required to be relevant, and a
-            # summary was not ranked badly, it was not ranked at all.
-            #
-            # Measured before this change (10 queries, summary scored against the
-            # same 20 facts): median rank 6 of 21, a NEGATIVE relevance score on
-            # 6 of 10, and genuinely first on 2. So the guarantee was wrong on 8
-            # of 10 — but the TIER is not noise, which is why summaries are
-            # demoted into the contest rather than dropped from it. They keep the
-            # top slot exactly when they earn it.
+            # Rerank goes to RERANK_URL; Tier-3 narratives are scored candidates, not reserved top slots.
             t3_rows = [r for r in (insight, summary) if r is not None]
             n_t3 = len(t3_rows)
 
@@ -9052,46 +7766,10 @@ class MemoryCoordinator:
                 prefix_rerank_doc(query, _rerank_doc_text(c, m, t))
                 for c, m, t in zip(contents, metas, createds)
             ]
-            # Payload-size instrument (fact:1441). fact:1441's cross-host
-            # capacity sweep on a CPU-only test host produced an
-            # UNDER-DETERMINED finding: the harness never recorded how many
-            # characters were actually sent to the reranker per search, so
-            # per-request FIXED OVERHEAD (embedding, two DB round trips,
-            # candidate batching, HTTP) could not be separated from
-            # DOCUMENT-LENGTH cost — and the capacity model's `chars / mu`
-            # term, with no fixed-overhead component, turns from conservative
-            # to OPTIMISTIC below roughly 2000 chars. This closes exactly that
-            # gap: total chars and document count, so a mean chars/doc can be
-            # derived per search.
-            #
-            # Measured HERE, after `rerank_docs` is fully built — every entry
-            # has already been through `prefix_rerank_doc` above — because a
-            # PRE-clamp count would reintroduce the very ambiguity this exists
-            # to remove (a document longer than the pair budget after query is
-            # truncated before the reranker ever sees the rest of it, so only
-            # the truncated length was actually "sent"). Pure arithmetic over
-            # a list already in hand: no extra query, no extra I/O, and
-            # nothing here can raise — adding a metric must not add a new
-            # failure mode to the search path.
-            #
-            # Computed BEFORE the try/except below so BOTH outcomes carry the
-            # measurement: a reranked search records what it sent, and a
-            # fallback records what it WOULD have sent — the two are
-            # distinguished by `ranked`, never by one of them going missing.
+            # Measure chars/docs actually sent (post-clamp, both ranked and fallback) so capacity can separate document length from fixed overhead (fact:1441).
             rerank_payload_chars = sum(len(d) for d in rerank_docs)
             rerank_payload_docs = len(rerank_docs)
-            # Cumulative, same reset-on-restart contract as
-            # _rerank_successes/_rerank_failures below. Deliberately NOT
-            # paired with a third "searches measured" counter: that count
-            # already exists as _rerank_successes + _rerank_failures (every
-            # search that reaches this point ends up in exactly one of those
-            # two buckets), and writing it again would be exactly the
-            # derived-value duplication this repo's storage rule forbids.
-            # Read it off the pair instead: successes+failures == 0 means
-            # "not measured yet" (the payload totals below are vacuous, not a
-            # real zero); once it's > 0 the totals are real measurements, and
-            # a zero among them is a genuine all-empty-content search, not an
-            # absence.
+            # Cumulative rerank payload totals; searches-measured is successes+failures, not a third counter.
             self._rerank_payload_chars_total += rerank_payload_chars
             self._rerank_payload_docs_total += rerank_payload_docs
             # Same increment site as the pair above -- see this counter's
@@ -9124,17 +7802,7 @@ class MemoryCoordinator:
                     payload_chars=rerank_payload_chars))
             except Exception as exc:
                 safe(lambda: self._rerank_ring.record_error())
-                # FAILURE != IDLE. The fallback serves VECTOR order, which is a
-                # different answer from a ranked one — so it is logged, counted
-                # and declared in the response rather than dressed up as a
-                # confident uniform score.
-                #
-                # Probable-cause extension (operator ruling, W2′): a dropped or
-                # reset connection mid-request is the httpx shape a reranker
-                # container makes when the kernel OOM-kills it — a timeout is
-                # not that shape (the process is merely slow/busy, not gone),
-                # so only the transport-drop family gets the extra sentence.
-                # Matched by TYPE, never a blanket except-Exception guess.
+                # Rerank fallback is vector order (logged/counted); a dropped connection adds the OOM-kill sentence, a timeout does not.
                 is_dropped_connection = isinstance(
                     exc,
                     (httpx.RemoteProtocolError, httpx.ConnectError, httpx.ReadError),
@@ -9155,15 +7823,7 @@ class MemoryCoordinator:
                 log.warning(msg, type(exc).__name__, scrub_url_credentials(str(exc)), len(rerank_docs))
                 self._rerank_failures += 1
                 self._rerank_fallback_last_ts = datetime.now(timezone.utc).isoformat()
-                # ⛔ THE FALLBACK DROPS TIER-3 ENTIRELY, and that is deliberate.
-                # Vector order is meaningful only WITHIN one table: the fact
-                # distances and the summary distances come from separate queries
-                # and are never comparable. Emitting the combined list in index
-                # order would put summaries first again — silently restoring the
-                # guarantee this release removed, at the exact moment there is no
-                # evidence to justify any position for them. When ranking is
-                # unavailable the honest answer is the facts in their own order,
-                # not a guess about where a narrative belongs.
+                # Unranked fallback omits Tier-3: vector distances are not comparable across tables, so narratives get no guessed slot.
                 ranked = [
                     {"index": i + n_t3, "relevance_score": None}
                     for i in range(len(candidates))
@@ -9226,18 +7886,7 @@ class MemoryCoordinator:
                 if pid in stale_map and pid not in acked
             ]
 
-        # Lazy thematic→insight LINEAGE annotation (decision:1207). §2.5/§5.2
-        # AMENDED: a superseded thematic summary no longer eagerly supersedes
-        # an insight resting on it (consolidation_loop.py's lineage leg 3 is
-        # disabled). Same philosophy as `stale_sources` above — annotate at
-        # READ time, let the consumer judge materiality — but keyed on the
-        # insight's OWN `summary_ids` (C4's field: the thematic summaries the
-        # insight rests on), never on `source_pg_ids`.
-        # ⚠ `summary_ids` holds `community_summaries` ids — a DIFFERENT,
-        # OVERLAPPING sequence from `technical_docs` (§3.2's documented trap).
-        # This MUST query `community_summaries`, never `technical_docs`, or a
-        # `technical_docs` row sharing the same integer id would silently
-        # produce a wrong-provenance false positive.
+        # Annotate insight stale_summaries at read time from community_summaries via summary_ids, never technical_docs (decision:1207).
         insight_summary_ids: set[int] = set()
         if insight:
             insight_meta = insight.get("metadata")
@@ -9281,16 +7930,7 @@ class MemoryCoordinator:
         final: list[dict] = []
 
         async with self._neo4j.session() as session:
-            # Summary→sources walk: a Tier-3 narrative's graph context (its
-            # SUMMARIZED_BY source records + any typed edges) surfaces the same
-            # way a record's does. Degrades to [] on any Neo4j failure. Batched
-            # (one round-trip for every summary/insight anchor, not one per) —
-            # was an N+1 here, up to ~102 sequential queries per search call.
-            #
-            # ⚠ The two id namespaces are INDEPENDENT sequences that collide
-            # freely — community_summaries.id 42 and technical_docs.id 42 are
-            # different records — so the two context maps are kept apart and each
-            # hit is resolved against the one for ITS kind, never merged.
+            # Batched summary→sources graph context; keep summary vs fact id maps apart (independent sequences).
             surviving_t3 = [t3_rows[h["index"]] for h in ranked
                             if h["index"] < n_t3]
             summary_ctx = await self._expand_graph_context_batch(
@@ -9384,18 +8024,7 @@ class MemoryCoordinator:
                     # and carry NO score — a fabricated 1.0 made a dead reranker
                     # indistinguishable from a confident one.
                     "ranked": reranked,
-                    # Chars/docs actually sent to the reranker for THIS
-                    # search — same value on every row of the response, one
-                    # search-level measurement, not a per-row one (fact:1441).
-                    # Computed once, before the rerank try/except, so a
-                    # fallback row carries the payload it WOULD have sent
-                    # rather than a null: `ranked` is what tells the reader
-                    # whether it was scored, this is what tells them what was
-                    # measured — the two are never conflated, and a zero here
-                    # is always a real (if degenerate) all-empty-content
-                    # search, never "not measured" (see the counters near
-                    # __init__ for how absence is told apart from zero at the
-                    # cumulative-telemetry level).
+                    # Search-level rerank chars/docs (same on every row; fallback still carries what would have been sent) (fact:1441).
                     "rerank_payload_chars": rerank_payload_chars,
                     "rerank_payload_docs": rerank_payload_docs,
                     "score": raw_score,
@@ -9408,14 +8037,7 @@ class MemoryCoordinator:
                     "graph_context": ctx,
                 })
 
-        # ── LIFECYCLE RESOLUTION (decision 1109) ────────────────────────────
-        # The reranked set is an ENTRY POINT into the graph, not the answer. Each
-        # returned decision is walked to its current verdict so the reader is
-        # never handed an ADR that has since been judged without being told.
-        #
-        # It ATTACHES rather than adding rows: the caller's limit is a contract
-        # (v0.8.51), so a companion record must not silently inflate the result
-        # set. The verdict's reasoning travels with the decision it qualifies.
+        # Attach each returned decision's current verdict in place (does not inflate limit) (decision:1109).
         decision_ids = [r["pg_id"] for r in final
                         if r.get("record_type") == "decision"
                         and r.get("pg_id") is not None]
@@ -9516,21 +8138,7 @@ class MemoryCoordinator:
             # a failure count makes a user's typo read as a database outage.
             safe(lambda: setattr(self, "_cypher_rejected_total",
                                  self._cypher_rejected_total + 1))
-            # ⛔ THE CALLER'S ERROR, NOT THE SERVER'S (v0.9.72). Every exception
-            # used to become a 500 "query failed" — including a Cypher the
-            # DATABASE refused: a syntax error, an unknown function, a type
-            # error (live-reproduced with `coalesce(x.name, x.pg_id)` over
-            # mixed-typed properties). A 500 tells the caller the gateway is
-            # broken and to retry, when the one thing that will never help is
-            # sending the same query again; it also buries a real outage in the
-            # same bucket as a typo. `ClientError` is the driver's own word for
-            # "you asked for something invalid", so it is the discriminator —
-            # not a string match on the message.
-            #
-            # The driver's message is passed through, capped: it names the
-            # offending clause and column, which is the entire value of the
-            # reply, and nothing in it comes from the database's contents —
-            # only from the query the caller just sent.
+            # neo4j.exceptions.ClientError is 400 cypher_rejected (caller's invalid Cypher), not 500 query failed.
             log.info("graph query REJECTED by neo4j for cypher=%r: %s",
                      cypher[:120], exc)
             return web.json_response(
@@ -9562,14 +8170,7 @@ class MemoryCoordinator:
             for r in records
         ]
 
-        # Serialization is a SEPARATE question from "did the query succeed" —
-        # a Neo4j `DateTime`/`Date`/`Time` (or anything else `json.dumps`
-        # chokes on) in a returned property is a bug in OUR coercion, not
-        # evidence the database failed. Deliberately a NARROW try, split from
-        # the query try/except above: only (TypeError, ValueError) — the
-        # exceptions `json.dumps` itself raises — are caught here, and
-        # `_neo4j_tx_failures_total` is NOT touched, so a serialization defect
-        # never reads as a database outage on `/memory/telemetry`.
+        # json.dumps TypeError/ValueError is our coercion bug, not a Neo4j tx failure.
         try:
             body = json.dumps({"status": "success", "records": _json_safe(records)})
         except (TypeError, ValueError) as exc:
@@ -9740,15 +8341,7 @@ class MemoryCoordinator:
             "ref": make_ref(actual, pg_id),
             "exists": True,
             "entity": meta.get("entity"),
-            # A thematic summary carries a single `domain`; an insight (C4,
-            # §3.2) carries MULTI-VALUED `domains` instead (the walk can
-            # legitimately cross domains). Expose both keys always — a
-            # thematic row's `domains` degrades to a one-element list built
-            # from its own `domain` so a caller can read either field
-            # uniformly regardless of record kind, and an insight row's
-            # `domain` stays present (its first `domains` entry, or None for
-            # an insight with none) rather than silently disappearing for a
-            # client that has not been updated to read the new field yet.
+            # Thematic domain plus insight domains both exposed (thematic domains degrades to a one-element list).
             "domain": meta.get("domain") or (
                 (meta.get("domains") or [None])[0] if meta.get("domains") else None),
             "domains": meta.get("domains") or (
@@ -9942,16 +8535,7 @@ class MemoryCoordinator:
                 "rem_passed_over_total": sum(r["n"] * r["p"] for r in attempts),
                 "rem_starved_pending":  sum(r["n"] for r in attempts
                                             if r["p"] >= REM_STARVED_THRESHOLD),
-                # Neo4j's own service numbers (0.9.74). Before this the section
-                # named after Neo4j contained only REM/NREM backlog counts —
-                # nothing about the DATABASE. `cypher_rejected_total` is the
-                # CALLER's fault and `tx_failures_total` is ours; see the
-                # increment sites for why they are never summed.
-                # ONE snapshot, three reads (F12). Three separate snapshot()
-                # calls sorted the ring three times and — worse — could observe
-                # three different windows, since a concurrent request can record
-                # between them: p50 and p95 would then describe populations that
-                # never coexisted, and `window` would name neither.
+                # Neo4j telemetry is one snapshot (p50/p95 share a window); cypher_rejected is the caller's fault, tx_failures is ours.
                 **{f"query_{k}": v for k, v in _nj.items()
                    if k in ("p50_ms", "p95_ms", "window")},
                 "cypher_rejected_total": self._cypher_rejected_total,
@@ -9976,22 +8560,7 @@ class MemoryCoordinator:
         except Exception as exc:
             snap["registry"] = {"error": str(exc)}
 
-        # NREM dream-cycle backlog — pending consolidation CYCLES, not raw facts.
-        # One cycle per (entity, domain) cluster meeting the density threshold.
-        # Needs both backends: Neo4j supplies the rem_processed/unconsolidated
-        # clusters; Postgres supplies the authoritative domain per pg_id (the
-        # Fact node has no domain). This is the join a read-only client cannot
-        # do itself — hence it lives here.
-        #
-        # ⭐ SERVED FROM THE 60 s REFRESHER, NOT COMPUTED HERE (v0.9.74, B4).
-        # MEASURED on this corpus 2026-08-28 through the gateway's own read-only
-        # graph route: the insight half is 149 SEQUENTIAL Neo4j round-trips —
-        # 8 gating (project, domain) groups at density>=3, each walked over 9-26
-        # BFS layers — and the walk is unbounded by construction (insight_gate,
-        # I3: no hop cap, no edge cap, termination by fixpoint). A per-request
-        # cap would not have been honest either: the number of layers is a
-        # property of the corpus, not a budget. `as_of` states when it was
-        # computed so a reader is never guessing how old it is.
+        # NREM backlog is pending (project, domain) cycles from graph edges, served from the 60s refresher (as_of stamped).
         dep = self._dependency_health
         nrem = dep.get("nrem")
         if isinstance(nrem, dict):
@@ -10079,42 +8648,17 @@ class MemoryCoordinator:
         # so the monitor never shows a false "idle".
         snap["inference_busy"] = self._consolidation_health.get("inference_busy", "unknown")
 
-        # Rerank outcome counters (operator ruling, W2′) — in-process, no I/O,
-        # same reset-on-restart contract as the LLM-fault/credential counters
-        # this pairing mirrors. The reranker degrades to vector order on ANY
-        # failure (a dead process, a timeout, or the kernel OOM-killing it on
-        # a memory-constrained host) and still answers 200 — so without this
-        # the whole class of failure is invisible from outside the log.
-        # Flat additive keys + a paired last-event timestamp, never a nested
-        # restructure (see inference_busy — the existing flat top-level
-        # exemplar; ruled flat at W2' merge, fact:1314 shape).
+        # Rerank success/fallback counters (in-process); fallback still answers 200 so this is the only outside-the-log signal (fact:1314).
         snap["rerank_successes_total"] = self._rerank_successes
         snap["rerank_fallbacks_total"] = self._rerank_failures
         snap["rerank_fallbacks_last_ts"] = self._rerank_fallback_last_ts
 
-        # Axis registry read failures (PR-C) — the same shape, for the same
-        # reason. When the projects/domains registry cannot be read, the gateway
-        # still answers 200: by-key resolution silently becomes a no-op and a
-        # filtered search matches only the literal string it was given. From
-        # outside, that is identical to a name nobody registered. NEW KEYS, never
-        # a rename of an existing one; `..._total` is cumulative since process
-        # start and `..._last_ts` is stamped at the same increment so the pair
-        # cannot disagree.
+        # Registry-read-failure counters: a failed lookup still 200s and looks like an unknown name.
         snap["axis_registry_read_failures_total"] = self._axis_registry_read_failures
         snap["axis_registry_read_failures_last_ts"] = \
             self._axis_registry_read_failure_last_ts
 
-        # Payload-size instrument (fact:1441) — same flat-additive style,
-        # ADDED alongside the pair above rather than restructuring them.
-        # Cumulative chars/docs actually handed to the reranker across every
-        # search this process has served (both outcomes count — see
-        # handle_search). Deliberately no third "searches measured" counter:
-        # rerank_successes_total + rerank_fallbacks_total already IS that
-        # count, and a reader who wants to know whether the totals below are
-        # a real zero or simply "no searches yet" reads it off that existing
-        # pair rather than a duplicate written here. Divide chars_total by
-        # docs_total for the mean-chars-per-doc that separates document-length
-        # cost from the fixed per-request overhead fact:1441 could not.
+        # Cumulative rerank chars/docs this process; divide for mean chars/doc (fact:1441).
         snap["rerank_payload_chars_total"] = self._rerank_payload_chars_total
         snap["rerank_payload_docs_total"] = self._rerank_payload_docs_total
         # NEW (operator ruling, 2026-08-23): observed maximum, not just the
@@ -10144,14 +8688,7 @@ class MemoryCoordinator:
         snap["gateway"] = safe(self._gateway_telemetry, default={"error": "unavailable"})
         snap["clients"] = {"versions_seen": dict(_client_versions_seen)}
 
-        # ── The blocks that live in hive_mind_proxy's module state ───────────
-        # The whole llm_* family, the capability/capacity snapshots and the
-        # resolved config were only ever on /health, which is the 30-second
-        # endpoint every client hits on every call — ~130 of its 193 keys were
-        # ANALYTICS a monitor drawer reads, not liveness. They belong here.
-        # Delivered through a provider callback (see telemetry_extras_provider)
-        # because hive_mind_proxy imports this module, so importing back would
-        # be a cycle.
+        # llm/capability/capacity/config come from hive via telemetry_extras_provider (import cycle otherwise).
         if self.telemetry_extras_provider is not None:
             extras = safe(self.telemetry_extras_provider, default=None)
             if isinstance(extras, dict):
@@ -10232,17 +8769,7 @@ class MemoryCoordinator:
                 "SELECT k, count(*) AS n FROM technical_docs, jsonb_object_keys(metadata) k"
                 " WHERE NOT superseded GROUP BY k ORDER BY n DESC"
             )
-            # Per-alternative vectors (migration 026). `alternatives_pct` above
-            # says how many decisions RECORDED alternatives; this says how many
-            # of those entries are actually retrievable by similarity. The two
-            # answer different questions and both are needed — a full
-            # `alternatives_pct` beside a stalled `pending` is a populator that
-            # has stopped, which no coverage figure would show.
-            #
-            # `failing` is the working/failing split Group 3 asks for: rows that
-            # keep coming back are counted separately from rows that simply have
-            # not been reached yet, and `oldest_pending_age_s` distinguishes a
-            # backlog that is draining from one that is stuck.
+            # Alternative-vector pending vs failing vs oldest_pending_age_s (coverage vs a stuck populator).
             try:
                 arow = await conn.fetchrow(
                     "SELECT count(*) AS entries,"
@@ -10279,20 +8806,7 @@ class MemoryCoordinator:
                 # the whole rollup down with it.
                 alt_vectors = {"error": str(exc)}
 
-        # ⛔ THE `alias` BLOCK IS GONE (v0.9.72). It counted
-        # `alias_adjudications`, the ADR-017 per-pair verdict ledger migration
-        # 014 built: the alias-writer sweep wrote a row per adjudicated pair,
-        # and this rollup was its ONLY reader. Nothing has written to it since
-        # v0.8.60, so the block reported a frozen census of a retired layer as
-        # though it were current state — the worst shape a metric can take. The
-        # table is dropped by migration 040, so the key leaves with it rather
-        # than becoming an `{"error": ...}` on every call.
-        #
-        # ⚠ `aliases` (the AXIS alias table `project_aliases.alias_id` and
-        # `domain_aliases.alias_id` point at) is a different table and STAYS —
-        # it is live identity, not the retired adjudication layer.
-        #
-        # MONITOR CONTRACT: `/memory/telemetry` no longer carries `alias`.
+        # Telemetry no longer carries `alias` (retired adjudication ledger); axis alias tables stay.
 
         dn, fn, rn = drow["n"], frow["n"], rrow["n"]
         emergent = [{"key": r["k"], "n": r["n"]}
@@ -10598,17 +9112,7 @@ class MemoryCoordinator:
             err = None
             if r and r["last_error_class"]:
                 last_error_at = r["last_error_at"]
-                # C1 fix (merger ruling): compare against last_completed_at,
-                # NEVER last_success. last_success is FILTERed on
-                # `folds_succeeded > 0`, which a run that itself CRASHED after
-                # folding at least one cluster also satisfies (consolidation_
-                # loop writes a crashed row with rec.succeeded already > 0) —
-                # so last_success can be exactly this crash's own finished_at,
-                # and comparing against it would call a seconds-old crash
-                # "superseded" by itself. last_completed_at is FILTERed on
-                # `outcome = 'completed'` — a run that actually finished
-                # clean — the only apples-to-apples comparison for
-                # "did a real success land after this crash".
+                # Crash-superseded uses last_completed_at (outcome=completed), never last_success (a crash after a fold can stamp that).
                 last_completed_at = r["last_completed_at"]
                 # superseded: a real success has landed AFTER this crash — the
                 # crash is history, not a current condition. NOT the same test
@@ -11263,18 +9767,7 @@ class MemoryCoordinator:
             )
             fact_rows = await fres.data()
 
-        # SAME pure partitioner the fold uses (eligible_domain_level_clusters,
-        # here used for its GROUPS, not just its count-only twin) — sourced
-        # from nrem_gate, a module that imports no DB driver. NEVER reach back
-        # into the daemon module that owns the fold itself: that module
-        # imports psycopg2 at its own top level and the shipped gateway
-        # service does not carry psycopg2, so an import of this function that
-        # reached into the daemon module used to raise ModuleNotFoundError on
-        # every call — silently killing this gauge in production while every
-        # unit test (fully stubbed) stayed green. nrem_gate.py holds only
-        # these two functions and imports no DB driver — see its docstring.
-        # Never invent a second rule, and never route this import back
-        # through the daemon module again.
+        # NREM gauge uses nrem_gate (no DB driver); never import the daemon module (psycopg2 not in the gateway venv).
         from nrem_gate import count_domain_level_cycles
         from nrem_gate import eligible_domain_level_clusters
         project_map: dict[int, str] = {}
@@ -11316,20 +9809,7 @@ class MemoryCoordinator:
             if passes_insight_gate(labels, consolidated):
                 decision_cycles += 1
 
-        # v2 (C2): `decision_threshold` is REMOVED, not repurposed — same
-        # precedent v0.8.64 set for `domain_threshold` (removed outright with
-        # NREM_DOMAIN_THRESHOLD, never repointed at a different number).
-        # There is no decision COUNT any more to report a threshold for: G2
-        # and G3 are each "at least one" conditions (>=1 Retrospective
-        # reached, >=1 fresh judgement reached), not a tunable volume. A bare
-        # number under the old name would read as "the threshold was lowered
-        # to 1", which is false — nothing was lowered, the concept a decision
-        # THRESHOLD named no longer exists for this gate. No replacement
-        # field: G2/G3 are not "a threshold under a new name", they are a
-        # different kind of condition, and inventing a field that still reads
-        # as a number would recreate the exact trap. Consumers of this
-        # endpoint (including the monitor dashboard) must be updated — see
-        # HANDOFF.md's monitor-effect list, carried into the release notes.
+        # No decision_threshold: G2/G3 are at-least-one conditions, not a lowered count.
         return {
             "fact_cycles": fact_cycles,
             "decision_cycles": decision_cycles,
@@ -11374,12 +9854,7 @@ class MemoryCoordinator:
             "apply_latency_p50_s": _r(lat["p50"]),
             "apply_latency_p95_s": _r(lat["p95"]),
             "apply_latency_window": lat["n"],
-            # ⛔ NULL WHEN THERE IS NO BASIS, 0.0 WHEN THERE IS. `n` is how many
-            # rows were applied in the 24 h window; if none were, this process
-            # has measured nothing and a rate of 0.0 would assert an
-            # observation nobody made. With a non-empty window a 0.0 IS a real
-            # measurement — nothing drained this minute — and nulling THAT
-            # would be the same absence-is-not-zero rule pointed backwards.
+            # Drain rate is null with an empty window (no observation) and 0.0 when rows applied but none this minute.
             "drain_rate_per_min": (float(lat["applied_last_min"])
                                    if lat["n"] else None),
             "age_limit_s": OUTBOX_AGE_WARN_S,
@@ -11446,13 +9921,7 @@ class MemoryCoordinator:
         """
         census = self._registry_census_last_good
         out = {
-            # ⛔ NEVER NULL ONCE A CENSUS HAS SUCCEEDED. On a failed poll the
-            # LAST GOOD value is served and `error`/`as_of` say what happened
-            # and how old it is — a null would make "the query failed" look
-            # exactly like "this deployment has no projects", which is the same
-            # absence-is-not-zero confusion the outbox census had. Before the
-            # first successful poll they are 0 with `as_of: null`, which reads
-            # as "nothing counted yet" rather than "nothing exists".
+            # After a successful census, serve last-good on a failed poll (error/as_of say so); null would look like an empty registry.
             "projects": (census or {}).get("projects", 0),
             "domains": (census or {}).get("domains", 0),
             "aliases": (census or {}).get("aliases", 0),
@@ -11582,14 +10051,7 @@ class MemoryCoordinator:
                 "              THEN metadata->'domains' ELSE '[]'::jsonb END) AS d"
                 " GROUP BY 1 ORDER BY count DESC LIMIT $1", BREAKDOWN_AXIS_TOP_N
             )
-            # ⛔ THE DENOMINATOR SHIPS WITH THE DISTRIBUTION. Domain counts are
-            # over an ARRAY column, so they are not comparable with any other
-            # breakdown in this payload and cannot be read against a record
-            # total the reader has to guess at. Live 2026-08-28: 629 of 1691
-            # records carry a non-empty `domains` — 62.8% carry NONE — so the
-            # counts describe a 37% subset. Without these two numbers a reader
-            # sums the distribution, gets less than the corpus, and concludes
-            # records are missing rather than unlabelled.
+            # Domain breakdown ships its own denominator (array column; most records have none).
             coverage = await conn.fetchrow(
                 "SELECT count(*)::int AS records_total,"
                 "       count(*) FILTER ("
@@ -11933,12 +10395,7 @@ class MemoryCoordinator:
 # ── Registration ──────────────────────────────────────────────────────────────
 
 def attach(app: web.Application, coordinator: MemoryCoordinator) -> None:
-    """Register /memory/* routes on an aiohttp Application.
-
-    Must be called before the proxy catch-all route so these exact-path routes
-    take precedence. To extract the coordinator into a standalone process
-    (Phase 4), only this call site changes.
-    """
+    """Register the coordinator's exact-path routes before the proxy catch-all."""
     app.router.add_post("/memory/save",           coordinator.handle_save)
     app.router.add_post("/memory/retrospective",  coordinator.handle_retrospective)
     app.router.add_post("/memory/supersede",      coordinator.handle_supersede)

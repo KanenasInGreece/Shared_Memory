@@ -1,50 +1,6 @@
-"""
-REM (Rapid Eye Movement) daemon — idle-time SUMMARISATION of Neo4j anchor
-records (Fact, Decision, Retrospective).
+"""REM daemon: summarise Fact/Decision/Retrospective nodes; write rem_summary and rem_processed only (decision:1664).
 
-⭐ THE CONTRACT (`decision:1664`): **REM writes NO edges and NO labels.**
-Entities, attribution, grounding and the decision extras are written at FIRST
-WRITE, from the operator's own metadata, and nothing afterwards may refuse,
-invent or add to them. Entities are human-only, exactly like the project and
-domain axes. REM's job is the summary: it writes `rem_summary` and marks
-`rem_processed`, and that is the whole of what it puts in the graph.
-
-Pipeline per record:
-  1. Fetch oldest non-REM anchors (pickups, then attempts, then pg_id) from Neo4j.
-  2. Gate on outbox status='applied' — skip records whose Neo4j write is not yet
-     confirmed.
-  3. Batch-fetch content from Postgres technical_docs.
-  4. ONE LLM call per record, asking for a summary and nothing else — and only
-     when the content exceeds REM_SUMMARY_THRESHOLD; short records are not asked
-     for one at all (prompt-gated non-destructive policy). Regular facts are
-     batched (JSONL, idx-echo alignment); decisions and retrospectives run solo.
-  5. Write to Neo4j in ONE session — the NON-DESTRUCTIVE content policy, with
-     rem_processed = true LAST (never set on a partially-written record):
-         Fact          → f.content = ORIGINAL text verbatim [:2000]; the LLM
-                         summary lands in f.rem_summary ONLY when the original
-                         exceeds REM_SUMMARY_THRESHOLD (and is only REQUESTED
-                         then). NREM reads coalesce(rem_summary, content).
-         Decision      → rationale intact; summary (when requested) → rem_summary.
-         Retrospective → notes intact; summary (when requested) → rem_summary.
-  6. Verify the Fact node is consistent; optionally write to the audit log
-     (AUDIT_LOG_PATH env var); mark the outbox row rem_reviewed (retro type filter).
-  7. Notify NREM (pg_notify new_artifact) so consolidation re-evaluates the
-     record; persist per-call rem_timing on the durable row.
-
-⚠ Edges REM asserted before `decision:1664` are still in the live graph. This
-code stops the writer; it deletes nothing. Removing them is a separate, ledgered
-one-time operation.
-
-Postgres connections:
-  One AUTOCOMMIT connection is opened per REM cycle and shared across all
-  helpers.
-
-Configuration env vars (beyond PG_CONN / NEO4J_PASSWORD):
-  AUDIT_LOG_PATH  — if set, each reviewed outbox row is appended as JSON-lines before
-                    being marked rem_reviewed.  Default: disabled (empty = no log).
-                    See README §14 "REM outbox audit log" for format details.
-  MOCK_LLM=1      — bypass LLM calls for testing; returns deterministic stub output
-                    (verification skipped; votes = k = 3).
+Does not add edges or labels. Short records skip the LLM. MOCK_LLM=1 returns a stub summary. Transport failures do not increment rem_attempts.
 """
 
 import asyncio
@@ -268,37 +224,13 @@ REM_MAX_TOKENS_SOLO        = int(os.environ.get("REM_MAX_TOKENS_SOLO", "1500"))
 REM_MAX_TOKENS_PER_FACT    = int(os.environ.get("REM_MAX_TOKENS_PER_FACT", "400"))
 REM_MAX_TOKENS_PER_SUMMARY = int(os.environ.get("REM_MAX_TOKENS_PER_SUMMARY", "250"))
 
-# On a truncated generation the retry differs by CLASS (L0-b, fact:1329/1330,
-# pre-build review fact:1346). An HONEST truncation — the record legitimately
-# needs more room — gets the bound widened ONCE and the call retried before
-# the unit is failed: a FIXED bound plus the attempt cap below would otherwise
-# silently dead-letter any record that DETERMINISTICALLY needs more output
-# than the bound, permanent invisible exclusion from the graph, which is the
-# very failure this widening exists to prevent. A DEGENERATE truncation (a
-# repetition loop — see truncation_is_degenerate below) gets exactly one retry
-# at the SAME bound instead: widening only hands the loop a bigger budget to
-# repeat into, it never fixes it. Either class still fails the unit if the
-# retry also truncates.
+# Honest truncation: widen max_tokens once and retry; a repetition loop retries at the same bound (fact:1329).
 REM_TRUNCATION_RETRY_FACTOR = float(os.environ.get("REM_TRUNCATION_RETRY_FACTOR", "2.0"))
 
-# Bounded tail of a truncated completion body kept for diagnosis — the journal
-# WARN/ERROR line and the dream-metrics JSONL row, never the persisted record
-# (a truncated body is never parsed or saved; see truncation_is_degenerate and
-# N3 below). Same disclosure class as the raw[:300]/resp.text[:200] excerpts
-# already logged elsewhere in this file (fact:1346 F-8).
+# Truncated body excerpt for logs only; never persisted.
 REM_TRUNCATION_SPECIMEN_CHARS = int(os.environ.get("REM_TRUNCATION_SPECIMEN_CHARS", "500"))
 
-# Poison-record escape hatch: a record whose enrichment failed this many times
-# is DEAD-LETTERED — excluded from the fetch until the operator resets
-# n.rem_attempts (or the record is fixed). Success clears the counter.
-#
-# ONLY RECORD-CHARGEABLE failures count (see LLM_FAIL_* below): a failure that
-# says something about THIS record — its line was missing/unparseable from an
-# otherwise-good batch response, its required summary was absent, its Neo4j
-# write or consistency check failed. A TRANSPORT failure (HTTP non-200,
-# connection error, gateway/pool 503) says nothing about any record and must
-# never be charged: doing so let one 503 demote a whole batch to solo and
-# march five innocent records toward dead-letter (fix-wave A′ F1).
+# After this many chargeable failures the record is skipped until rem_attempts is reset; transport is not charged.
 REM_MAX_ATTEMPTS = int(os.environ.get("REM_MAX_ATTEMPTS", "5"))
 
 # STEP 3 (decision 890) — batch-vs-solo starvation. A solo record passed over
@@ -642,11 +574,7 @@ class REMDaemon:
         return pg_ids, attempts, sel_labels, passed_over
 
     async def _bump_rem_attempts(self, pg_ids: list[int]) -> None:
-        """Durable failure counter (poison-record escape hatch): +1 on the
-        anchor's `rem_attempts` for EVERY failure class — LLM/HTTP failure,
-        parse failure, truncation, missing batch line, Neo4j write failure,
-        consistency failure. At REM_MAX_ATTEMPTS the fetch dead-letters the
-        record. Best-effort: the bump must never mask the original failure."""
+        """Increment rem_attempts for these pg_ids; callers pass only truncated/parse/client failures, never transport or routing refusal."""
         if not pg_ids:
             return
         try:

@@ -25,26 +25,13 @@ class OntologyConfig:
     human: str = "Human"
     ai_agent: str = "AIAgent"
     project: str = "Project"
-    # A SECTION of one project (migration 028). SPINE, pinned here and never
-    # read from ontology.yaml — an AMENDMENT to decision 550, recorded as one.
-    # The yaml's own header promises that the consolidation cycle reads only
-    # spine identifiers and that the configurable vocabulary "never triggers or
-    # decides the consolidation mechanism"; the fold gate moves onto this axis,
-    # so a renameable `:Domain` would make that sentence false.
+    # Section of one project; spine, not loaded from ontology.yaml (decision:550).
     domain: str = "Domain"
     activity: str = "Activity"
     milestone: str = "Milestone"
-    # Retrospective-as-record (retro-as-node session, 2026-07-14): a retrospective
-    # is a first-class SPINE record — own pg_id/technical_docs row, own node,
-    # keyed by pg_id like Fact/Decision (never by name). The Decision keeps a
-    # HAD_OUTCOME edge to it as the trigger; NREM hops to the node for rating/
-    # content/grounding. Never configurable from ontology.yaml.
+    # First-class spine record keyed by pg_id; HAD_OUTCOME points at it.
     retrospective: str = "Retrospective"
-    # Node labels — entity type sub-labels (Path A multi-label under :Entity; decision 472).
-    # ⚠ No writer applies these any more — REM stopped assigning them (decision:1664,
-    # v0.9.66); every :Entity is merged plain. They survive only as the schema-compliance
-    # allowlist (KNOWN_LABELS below). Person/Agent/Process reuse the provenance labels
-    # above (Human/AIAgent/Activity).
+    # Entity sub-labels: allowlist only — REM writes no labels (decision:1664).
     component: str = "Component"   # software unit we build (module/class/script/daemon)
     system: str = "System"        # service / datastore / framework / infra we run
     model: str = "Model"          # AI/ML model
@@ -70,17 +57,13 @@ class OntologyConfig:
     informed_by: str = "INFORMED_BY"
     had_outcome: str = "HAD_OUTCOME"
     references: str = "REFERENCES"   # record→record cross-reference resolved from content (Stage 1.2b)
-    grounded_in: str = "GROUNDED_IN" # Decision/Retrospective→Fact: fact(s) grounding this record (decision 550) — SPINE
-    # REM-enrichment relationships (written by rem_loop.py)
+    grounded_in: str = "GROUNDED_IN"  # judgement → fact (decision:550)
+    # Spine names kept for compliance; REM writes none of these edges (decision:1664).
     produces_insight: str = "PRODUCES_INSIGHT"
     under_conditions: str = "UNDER_CONDITIONS"
     considered: str = "CONSIDERED"
     rejected: str = "REJECTED"
-    # Relationship types — typed Entity→Entity domain (decision 472). No writer mints
-    # these any more: the evidence sweep that proposed them (`relation_sweep.py`) and
-    # the confidence calibration that adjudicated them are both retired (v0.9.67/68).
-    # `MENTIONS` remains the explicit edge a save writes; these names survive only as
-    # the schema-compliance vocabulary for edges already in the graph.
+    # Typed Entity→Entity names: compliance only; saves write MENTIONS (decision:472).
     depends_on: str = "DEPENDS_ON"   # needs / requires (build/config dependency)
     part_of: str = "PART_OF"         # composition / belongs-to
     implements: str = "IMPLEMENTS"   # realises a concept / pattern
@@ -309,34 +292,7 @@ def sanitize_entity_names(raw_names: object) -> list[str]:
     return out
 
 
-# ── Genuinely-referenced entity (decision 890, fact 889's follow-up finding) ──
-# A shape/length-clean name is not the same question as "is this actually a
-# named entity". A Decision's own CONSIDERED/REJECTED/UNDER_CONDITIONS/
-# PRODUCES_INSIGHT targets are free-text provenance — deliberately allowed to
-# be arbitrary-length prose (rem_loop.py's registry gate, decision 718, already
-# stops NEW unregistered free phrases from minting a node via those relationship
-# types) — but legacy nodes of that shape predate 718 and carry no MENTIONS
-# edge at all. Anything that treats every :Entity node as an equally valid
-# alias/duplicate-resolution candidate (alias-writer's candidate generation,
-# entity-resolution evaluation, entity-graph telemetry, search-time ALIASES
-# expansion) must apply this SAME criterion, or the same node is "real" in one
-# read path and "provenance noise" in another — exactly the inconsistency this
-# ontology module exists to prevent.
-#
-# THE RULE, to be applied identically everywhere a consumer decides whether an
-# :Entity node is eligible for alias/duplicate consideration:
-#
-#   Eligible  IFF  it has >=1 incoming, non-superseded MENTIONS edge.
-#
-# Deliberately a POSITIVE check on MENTIONS (the one spine relationship whose
-# whole purpose is "content genuinely referenced this as a named entity"),
-# not an enumeration of provenance relationship types to exclude — a 5th
-# provenance-style relationship type added later cannot silently bypass this
-# check the way an exclusion list could. `coordinator.py` re-expresses this
-# SAME rule in its own Cypher (it cannot import a shared query — different
-# runtime/driver) — any consumer doing so must match this criterion exactly,
-# not approximate it. The offline `entity_resolution_eval.py` harness that
-# once shared the query is retired; nothing else currently applies this rule.
+# An :Entity counts as referenced only if it has at least one incoming live MENTIONS edge (decision:890).
 GENUINELY_REFERENCED_ENTITY_RULE = (
     "requires >=1 incoming, non-superseded MENTIONS edge — see ontology.py's "
     "GENUINELY_REFERENCED_ENTITY_RULE docstring (decision 890) before changing "
@@ -550,10 +506,7 @@ SPINE_LABELS: frozenset[str] = frozenset({
     ONT.reasoning_step, ONT.decision, ONT.human, ONT.ai_agent,
     ONT.project, ONT.domain, ONT.activity, ONT.milestone, ONT.retrospective,
 })
-# ⚠ NAMING TRAP, and it is worth the two lines: `DOMAIN_LABELS` below is the
-# CONFIGURABLE vocabulary — "domain" in the ontology sense of a subject area —
-# while `ONT.domain` is the belonging AXIS and is SPINE. The two senses of the
-# word sit three lines apart, so `:Domain` belongs in the set above, never here.
+# DOMAIN_LABELS = configurable subject types; ONT.domain (`:Domain`) is the spine section axis and is in SPINE_LABELS.
 DOMAIN_LABELS: frozenset[str] = frozenset({
     ONT.component, ONT.system, ONT.model, ONT.concept, ONT.document,
 })
@@ -579,76 +532,9 @@ KNOWN_RELATIONSHIPS: frozenset[str] = SPINE_RELATIONSHIPS | DOMAIN_RELATIONSHIPS
 
 
 def derived_belonging_cypher(hops: int = 4) -> str:
-    """Where a JUDGEMENT belongs, READ from the graph instead of written into it.
+    """Read-only Cypher: a judgement's project is its decision's PROJECT_OF; domains are the same-project union of own, grounded, and judged sections (decision:1736).
 
-    Successor to `canonical_fixpoint_entity_cypher`, which walked the same
-    shape to read a judgement's *entities* and had no caller left. This walks it
-    to answer the question `decision:1736` moved to the read side: a decision
-    and a retrospective carry only the sections their operator asserted on them,
-    so anything they belong to BY VIRTUE OF WHAT THEY REST ON has to be derived
-    at the moment it is asked for. Nothing here writes; nothing here is stored.
-
-    Binds `$pg_ids` (a list — one query serves a whole search's judgement hits)
-    and returns one row per resolvable judgement:
-
-        anchor_pg_id   the id that was asked about
-        project        the project NAME
-        domains        the section names, a SET — never a ranking
-
-    THE RULES IT IMPLEMENTS, each of which is a choice that could have gone the
-    other way (`decision:1736` (ii)/(iii)):
-
-    * **The anchor is the DECISION.** A retrospective follows `HAD_OUTCOME`
-      backwards to the decision it judges; a decision is its own anchor. A
-      verdict has no belonging of its own — it belongs where what it judges
-      belongs, plus wherever its own measurements were taken.
-    * **The project is the anchor's `PROJECT_OF`**, and a decision always
-      asserts one at ingress, so this resolves whenever the graph is complete.
-      No project, no rows: the answer is "not knowable from the graph", never a
-      name-keyed guess.
-    * **Domains = own ∪ judged ∪ grounded.** Three collections, all bound to
-      the same project node:
-
-        `own`       the sections asserted on the record or on its anchor
-        `judged`    the sections asserted on any live DECISION or
-                    RETROSPECTIVE reached on the grounding walk
-        `grounded`  the sections of the non-superseded FACTS reachable the
-                    same way
-
-      Multi-hop because a decision can ground on another judgement, and the
-      facts are what carry the axis.
-
-      ⛔ `judged` IS NOT AN OPTIMISATION, IT IS A MISSING HALF (v0.9.72,
-      `decision:1756` (4)). The walk always went THROUGH intermediate
-      judgements to reach facts, and collected nothing from them — yet a
-      decision's own sections are OPERATOR-ASSERTED, the strongest signal on
-      the path. Measured live: retro 1694 derived `[]` while decision 1678, on
-      its own grounding walk, asserts `architecture`. A judgement that rests on
-      a judgement was reading only the leaves of its evidence.
-
-      ⛔ AND `judged` SKIPS A SUPERSEDED JUDGEMENT, exactly as `grounded`
-      skips a superseded fact. A decision a retrospective REVERSED is not
-      where anything belongs: the reversal is what the supersession cascade
-      stamps, and the same predicate already excludes those nodes on both
-      sides of the insight gate. Collecting from one would let an overturned
-      decision keep filing later work under its sections.
-
-      ⚠ The three are UNIONED AS SETS. Each `collect` is DISTINCT, so no list
-      repeats a name internally, and each list is anti-joined against the ones
-      before it, so a section asserted on D2 and also carried by a fact appears
-      exactly ONCE. A plain `+` would not: list concatenation in Cypher does
-      not dedupe.
-    * ⛔ **DERIVATION NEVER CROSSES A PROJECT BOUNDARY.** A domain is a SECTION
-      OF A PROJECT, so a B-project decision grounded on A-project facts inherits
-      none of A's sections. Both halves are bound to the SAME `:Project` NODE
-      `p` — node identity, never a name comparison, because two projects can
-      carry the same section name and a string match would silently merge them.
-    * **"None" is a valid answer** for a decision that asserted nothing and
-      rests on facts filed elsewhere. An empty list is the honest result, not a
-      failure.
-
-    Bounded by construction: `hops` caps the walk, the pattern is anchored on
-    indexed `pg_id`, and the whole thing is one round trip for the batch.
+    A retrospective anchors through HAD_OUTCOME. Walks do not cross project nodes. Binds `$pg_ids`; hops cap the grounding walk.
     """
     rels = "|".join(GROUNDING_RELATIONS)
     return (

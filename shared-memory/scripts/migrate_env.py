@@ -1,11 +1,5 @@
 #!/usr/bin/env python3
-"""migrate_env.py — one-time (per install) migration of the framework's LLM
-routing config from implicit/legacy shapes to the explicit
-``LLM_BACKENDS_JSON`` form, per the W3 build spec
-(``Local_Documentation/ColdBriefs/W3_Env_Migration_Brief.md``, ``decision:1846``
-on ``fact:1845``). Spec: ``Backend_Declaration_Spec_2026-08-30.md`` §4 — an
-upgrade must never change a running install's behaviour, mechanically, not by
-operator memory.
+"""One-time migration of implicit LLM routing (CSV / default target) to explicit LLM_BACKENDS_JSON without changing what serves today (decision:1846).
 
 Standalone: no other module in this repo imports this one. Two top-level
 modes:

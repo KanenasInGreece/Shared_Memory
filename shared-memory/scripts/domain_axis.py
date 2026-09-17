@@ -1,25 +1,6 @@
-"""One domain resolution, shared by every reader — the project axis' sibling.
+"""Domain names are project-local sections; facts and decisions assert them, retrospectives do not, and NREM folds on (project, domain).
 
-A DOMAIN IS A SECTION OF ONE PROJECT. That single sentence decides everything
-here and is the reason this is not a copy of ``project_axis`` with the words
-changed:
-
-* **It is project-local.** ``operations`` under one project and ``operations``
-  under another are different sections that share a word. So every lookup takes
-  a project id, and a domain is never resolvable from its name alone.
-* **It is multi-valued.** A record belongs to exactly one project and may sit in
-  several of its sections. First write links to all of them.
-* **It is INHERITED by judgements, never self-named** (P17). A decision or a
-  retrospective takes the union of its grounding facts' domains; a client that
-  supplies one is refused, because a field that is silently dropped is a field
-  the caller will send forever.
-* **It gates nothing yet.** The project axis decides what folds; the domain axis
-  is capture and representation until the fold behaviour moves onto it. That is
-  why a missing identity here costs an edge rather than being rescued by a
-  name-keyed fallback — see ``domain_merge_cypher``.
-
-SERVER-SIDE ONLY. Never added to ``sync_skills.sh`` or ``shared-memory-skill/``
-— the skill is a thin HTTP client and resolution happens at ingress.
+Lookups take a project id. A record may list several sections. A missing domain identity writes no graph edge (no name-keyed fallback). Server-side only.
 """
 
 import os
@@ -220,25 +201,5 @@ DOMAIN_REGISTER_SQL = (
 
 
 def domain_merge_cypher(var: str = "d", id_param: str = "$domain_id") -> str:
-    """The MERGE that puts a domain node in the graph (migration 028).
-
-    ⛔ THERE IS NO NAME-KEYED FALLBACK, and the asymmetry with
-    ``project_merge_cypher`` is deliberate rather than an omission.
-
-    The project write path falls back to keying on the name when no identity is
-    available, because losing a ``PROJECT_OF`` edge violates the axis outright
-    and that axis already gates folding — a lost write there is worse than a
-    node keyed on something mutable.
-
-    Nothing gates on the domain axis yet, the value stays verbatim in the
-    record's Postgres metadata either way, and ``backfill_domain_of.py`` can
-    enqueue the edge later. So the honest answer to "no identity" is NO EDGE and
-    a log line. Minting a name-keyed ``:Domain`` would re-ship, on a brand-new
-    axis, the exact identity defect migration 027 was written to remove — and it
-    would do it silently, because a name-keyed node looks correct until two
-    projects use the same section name.
-
-    The caller is responsible for having an id: ingress refuses an unregistered
-    domain, so by the time a write happens the registry has answered.
-    """
+    """MERGE :Domain on registry id only; no name-keyed fallback, because the same section name in two projects must stay two nodes (migration 028)."""
     return f"MERGE ({var}:{ONT.domain} {{domain_id: {id_param}}})"

@@ -1,31 +1,6 @@
-"""THE v2 INSIGHT GATE — walk, components, ordering, identity (Dreaming Cycle
-Plan to v2, §2.2-§2.5). Replaces the pre-v2 1-hop shared-Entity gate wholesale:
-no entity anchor, no ≥2-distinct-projects rule, no hub-degree cap. See
-``Local_Documentation/Dreaming_Cycle_Plan_to_v2.md`` for the design this file
-implements — it is the authority; this module is the mechanism.
+"""Insight gate: from a fact-group seed, require a retrospective (G2) and a fresh judgement (G3), then componentise the reached set.
 
-G1 (the group must pass the FACT GATE) is deliberately NOT re-implemented
-here — it is ``nrem_gate.eligible_domain_level_clusters`` fed by
-``consolidation_loop._find_grounded_fact_groups``'s graph-native discovery.
-Callers pass this module the resulting group's grounded, non-superseded fact
-pg_ids as the walk's seed; this module answers G2 (>=1 Retrospective reached)
-and G3 (>=1 fresh/unconsolidated judgement reached), computes the reached
-judgement set's connected components (§2.4), orders them deterministically,
-and classifies a new reach against an existing insight's coverage (§2.5).
-
-⛔ DRIVER-FREE, LIKE nrem_gate.py — imports only ``ontology`` and stdlib. The
-shipped gateway service (coordinator.py's process) carries no ``psycopg2``
-and reaches this module via a TOP-LEVEL import (unlike ``nrem_gate``, which
-coordinator.py imports lazily) — see the nrem-telemetry-gauge fix
-(v0.8.65) for the failure class this avoids. The async walk driver below
-takes an ALREADY-CONSTRUCTED Neo4j driver object as a plain parameter
-(duck-typed: anything exposing ``.session()`` the way ``neo4j.AsyncDriver``
-does) rather than importing the ``neo4j`` package itself, so this module
-never needs to import a DB/network driver to do real graph I/O.
-``tests/test_insight_gate_import_purity.py`` enforces the source-level
-guarantee.
-
-SERVER-SIDE ONLY — never shipped in a skill.
+Imports only ontology and stdlib; the walk takes an already-built Neo4j driver as a parameter. Server-side only.
 """
 from ontology import ONT
 

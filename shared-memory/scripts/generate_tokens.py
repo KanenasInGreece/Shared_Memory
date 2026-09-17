@@ -132,8 +132,7 @@ import tempfile
 # removing a name from here must never revoke a credential already in use.
 AGENTS = ["claude", "gemini", "grok", "codex", "lm_studio", "antigravity"]
 
-# Read-only identities: registered like any agent, but confined to GET /health,
-# GET /memory/telemetry, and POST /memory/graph (read-only Cypher).
+# Read-only identities: GET /health, GET /memory/telemetry, POST /memory/search; /memory/graph is 403.
 #
 # ⛔ THE ROSTER LIVES IN agent_roles.py, NOT HERE. It used to be defined in this
 # file, which made the guarantee a minting convention: the gateway believed

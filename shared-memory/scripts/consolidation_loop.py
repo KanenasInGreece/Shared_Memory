@@ -1,73 +1,6 @@
-"""
-NREM consolidation daemon — Tier-3 synthesis (community summaries + insights).
+"""NREM daemon: fold (project, domain) clusters into community summaries and assemble insights from parsed slots (decision:1205).
 
-Loop discipline (fix wave, 2026-07):
-
-* Every LLM call is bounded (NREM_MAX_TOKENS_SUMMARY / NREM_MAX_TOKENS_INSIGHT)
-  and finish_reason='length' FAILS the unit: a truncated draft is discarded
-  before it is ever parsed into slots. Truncations are counted separately
-  (extra.truncation_failures / extra.truncation_failed). The bound is widened
-  ONCE (NREM_TRUNCATION_RETRY_FACTOR) and the call retried before the fold
-  fails — a fixed bound plus the dead-letter cap below would otherwise
-  exclude any legitimately-large cluster permanently and silently.
-
-* Insight payload BY CONSTRUCTION (decision:1205, v0.8.71): an insight's
-  `content` is assembled by CODE from each judgement's own pg_id/title —
-  the LLM never emits the final document. One LLM call fills bounded
-  per-judgement "SLOT <pg_id>: ..." distillates plus a closing
-  "PRINCIPLE: ..." paragraph, via a strictly-parsed delimited protocol
-  (`parse_insight_slots`); this REPLACES the old free-prose synthesis +
-  post-hoc preservation-anchor gate (preservation_anchor/summary_preserves/
-  corrective_block — retired, see git history before this version: the gate
-  caused a retry lottery and forced fabricated quoted titles into insight
-  prose). A slot still empty after parsing gets ONE bounded retry asking
-  only for the missing slot(s); still missing FAILS THE UNIT with the same
-  no-partial-write semantics truncation already uses — but it is counted
-  through its OWN extras (operator ruling, same PR): `extra.slot_failures` /
-  `extra.slot_failed`, kept separate from `extra.truncation_failures` /
-  `extra.truncation_failed` because the two name different causes — a
-  capacity problem (raise `NREM_MAX_TOKENS_INSIGHT`) versus a protocol
-  problem (fix the prompt/model) — and conflating them would hide which one
-  a repeat-failing cluster actually has.
-
-* Fold dead-letter cap: before folding a cluster, a CONTENT-DERIVED key —
-  the cluster's own member records as sorted qualified refs (decision 822's
-  fact:N / decision:N form; see record_ref.py and _fold_identity()) — is
-  checked against the consolidation_runs ledger. If it appears in
-  truncation_failed OR slot_failed extras NREM_FOLD_FAIL_CAP times (default
-  3) within the last NREM_FOLD_FAIL_WINDOW days (default 7), the cluster is
-  SKIPPED and a human-readable label (entity/domain or insight/entity) is
-  recorded in extra.fold_dead_letter for telemetry — BOTH live failure
-  classes dead-letter, the split above is for diagnosis, not for who gets
-  capped. Operator reset = time passing beyond the window, or manual
-  consolidation_runs cleanup (delete/backdate the failing rows). Keying on
-  member refs rather than the display label is deliberate (decision 882):
-  the label is a lexicographic-min alias chosen to stay STABLE across
-  cycles even as cluster membership grows (correct for the
-  community_summaries upsert key) — the opposite of what a failure ledger
-  needs, which is to recognise a genuinely different (e.g. alias-merged)
-  candidate as new rather than inherit a smaller pre-merge candidate's
-  failure history.
-  ⚠ Pre-v0.8.71 rows may still carry a `preservation_failed` extra from the
-  retired gate — deliberately NOT counted here (decision:1205); only
-  `truncation_failed`/`slot_failed` (both still-live failure modes) are
-  read, so historical preservation failures never suppress a fold the new
-  construction-based path would otherwise succeed at.
-
-* Slot arbitration with REM: consolidation never fires INTO a busy serial LLM
-  slot, but it must not defer forever either — REM re-arms faster and its solo
-  units run for minutes, which starved consolidation completely (zero folds in
-  4.6 days). When a cycle is due and the pool is busy, NREM takes the
-  NREM_PRIORITY_ADVISORY_LOCK_KEY advisory lock and waits up to
-  NREM_FORCED_SLOT_WAIT seconds (polling every 10s); REM sees that lock at
-  cycle start and yields its turn. The lock is held ONLY while waiting and is
-  session-scoped, so neither daemon can wedge or starve the other. If the wait
-  expires the cycle defers ('pool_busy' / 'pool_busy_forced') and a forced
-  backstop stays armed. The budget must exceed the longest REM unit or the
-  queue expires before the slot is ever released.
-
-* IDLE_THRESHOLD_SEC ships at its documented intent (900s, env-tunable via
-  NREM_IDLE_THRESHOLD_SEC); the shipped 60 was a testing value.
+Truncated or empty-slot drafts are discarded, not stored. Dead-letter keys are the cluster's member refs. When the LLM pool is busy, NREM waits on an advisory lock instead of stealing a mid-call slot. Historical preservation_failed extras are ignored.
 """
 import sys
 import os
@@ -493,32 +426,7 @@ def _crun_recover_and_prune():
 
 
 def fetch_fold_dead_letter_counts():
-    """Fold dead-letter gauge: {fold_key: n} — how many times each fold key
-    (a candidate's content-derived identity, _fold_identity()'s sorted
-    qualified refs — decision 882) appears in the truncation_failed OR
-    slot_failed extras of consolidation_runs rows started within the last
-    NREM_FOLD_FAIL_WINDOW days — BOTH live insight-fold failure classes
-    dead-letter; the split between them (operator ruling, same PR as
-    decision:1205) is for DIAGNOSIS — telling a capacity problem (raise
-    NREM_MAX_TOKENS_INSIGHT) apart from a protocol one (fix prompt/model) —
-    never for which one gets capped. At NREM_FOLD_FAIL_CAP the callers SKIP
-    the cluster (fold dead-letter) instead of burning an LLM fold on it
-    every cycle. Own short conn (instrumentation never shares the cycle's
-    conn); failsafe → {} on any DB error (fail open toward folding — a
-    broken ledger must not dead-letter healthy clusters).
-
-    ⛔ decision:1205 (v0.8.71) — this used to ALSO union `preservation_failed`
-    extras (the retired anchor-gate's failure list). That list is no longer
-    written by any current code (the insight path's payload-by-construction
-    redesign retired the gate entirely), but historical rows from before this
-    version may still carry it. Counting it here would let PRE-v0.8.71
-    failures keep dead-lettering a cluster the NEW construction-based fold
-    would now succeed at on the very first try — a stale rejection with no
-    live cause. Only `truncation_failed`/`slot_failed` (both still-live
-    failure modes) are read. `slot_failed` is the PROTOCOL-failure class,
-    split out of `truncation_failed` per the same operator ruling — kept
-    separate so the instrument distinguishes a capacity problem from a
-    protocol one, not because either one alone should dead-letter."""
+    """Count truncation_failed/slot_failed hits per member-ref key in the window; ignore retired preservation_failed (decision:1205). Fail open to {} on DB error."""
     try:
         c = psycopg2.connect(PG_CONN, connect_timeout=5)
         try:
@@ -882,9 +790,7 @@ async def _post_nrem(client: httpx.AsyncClient, payload: dict,
     return resp
 
 
-# Domain assigned to any fact that carries no project/domain/scope tag.
-# Untagged facts collapse to this single bucket, reproducing the historic
-# one-summary-per-entity behaviour until agents start tagging their saves.
+# Unused leftover; untagged facts are skipped by fold_eligible, not bucketed here.
 DEFAULT_DOMAIN = "general"
 
 
@@ -3291,15 +3197,7 @@ class ConsolidationDaemon:
                 )
             ]
 
-            # Fold dead-letter cap (see module docstring): keys that failed the
-            # preservation/truncation gates NREM_FOLD_FAIL_CAP times within the
-            # window are skipped, not re-folded every cycle. Own-conn fetch,
-            # failsafe {} — a broken ledger never dead-letters healthy clusters.
-            # Fetched BEFORE the coverage census (D1, fact:1189/decision:1121
-            # I7 — moved up from just above the fold loop): a permanently
-            # dead-lettered cluster must not count as eligible backlog, or the
-            # backlog this cycle reports (and _consolidation_stall_verdict,
-            # coordinator.py, reads) can never clear once one exists.
+            # Skip clusters whose member-ref key already hit truncation/slot fail cap; fetch before census so they are not counted as backlog (fact:1189).
             dead_letter = await loop.run_in_executor(None, fetch_fold_dead_letter_counts)
 
             # D1 — partition BEFORE the census, not inside the fold loop, so
