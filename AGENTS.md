@@ -67,7 +67,8 @@ Collect these answers before touching anything. Defaults in brackets are safe to
   everything else can be decided later: Q3/Q4 can be filled in after first start (dreaming simply
   waits), Q3b defaults to Q2's pair-wise choice if left unanswered (accepting "cpu" for both writes
   nothing extra — exactly today's behavior, never a blocker), Q5 agents can be added later (see the
-  *Add an agent later* runbook), Q7 is optional from day one. When the user defers, say exactly what
+  *Add an agent later* runbook), Q7 is optional from day one, Q8 defaults to loopback (this host
+  only; LAN clients wait until the operator sets `PROXY_BIND`). When the user defers, say exactly what
   will work in the meantime and what won't.
 - **"Can we pick this up after?" — yes, always.** Every phase is idempotent and ends with a check,
   so setup resumes cleanly from wherever it stopped: re-run the phase checks top to bottom and
@@ -84,6 +85,7 @@ Collect these answers before touching anything. Defaults in brackets are safe to
 | 5 | Which **agents** will use the memory? (Claude Code / Codex CLI / Grok / Antigravity CLI / LM Studio / a read-only monitor) | token minting + Phase 8 targets |
 | 6 | DB passwords: shall I generate strong random ones? (recommended) | `NEO4J_PASSWORD`, `PG_PASSWORD` |
 | 7 | *(optional)* Tavily API key for LM Studio web search? Backups from day one? | `TAVILY_API_KEY`, §Backup runbook |
+| 8 | Will **other machines** (a LAN workstation, a laptop, another VM) reach this gateway on `:8888`? Default is loopback — OpenCode on *this* host is enough with that. If yes: set `PROXY_BIND=0.0.0.0` in `shared-memory/.env` after Phase 1, and say so only on a trusted LAN or an encrypted overlay (Tailscale/WireGuard). Bearer tokens travel in plaintext HTTP. | `PROXY_BIND` |
 
 For question 2, the compose file expects this layout under `LLM_MODELS_DIR` (edit the two `command:` paths in `shared-memory/ops/postgres_neo4j_limits.yaml` if the user's files differ):
 
@@ -197,7 +199,13 @@ real id — the shipped default only suits servers that ignore the field. A sing
 non-default port is `LLM_DEFAULT_TARGET`. All framework and helper tooling reads `shared-memory/.env`
 first, with a repo-root `.env` honoured as a pre-0.6 fallback.
 
-**If Q3 turned up a backend needing a credential, use `LLM_BACKENDS_JSON` instead of `LLM_BACKENDS`.** This applies to a LOCAL backend behind a token (a llama-server on the LAN or tailnet) exactly as to a cloud API — same `token_env`, same key file under `~/.shared-memory/creds/<name>` (mode 600); tell the operator where to put the file and never ask for its contents. Plaintext `http` to a private address is accepted; to a public one the entry is excluded unless the operator sets `"plaintext_ok": true` (ops/README, "Reasoning-LLM backends"). The complete numbered walkthrough (encrypted store → `LoadCredential=` or a `<VAR_NAME>_FILE` runtime pointer → JSON entry with `token_env` plus the mandatory `private_ok`/`roles` choice → restart → verify on `/health`) and the full per-entry parameter table both live in `shared-memory/ops/README.md`, "Reasoning-LLM backends" — **follow them verbatim rather than improvising**; `.env.example` carries the short form beside `LLM_BACKENDS_JSON`. Three rules they encode: the literal key never goes in any file this framework writes — only the env-var **name**; the key at rest belongs in an encrypted store (`pass`/GPG/`systemd-creds`), with **`LoadCredential=` or a runtime `<VAR_NAME>_FILE`** (SEC-06, PR A4) preferred over `systemctl --user import-environment`, which is deprecated (readable by any same-uid process via `show-environment`, and inherited by every user unit); and a credentialed entry with neither `roles` nor an explicit `private_ok` is never selected under default-deny (safe by construction, but loudly warned about at startup and by `check_config.py`) — ask the operator which they want; never pick for them.
+**If Q3 turned up a backend needing a credential, use `LLM_BACKENDS_JSON` instead of `LLM_BACKENDS`.** Drive `bash shared-memory/ops/install_llm_backends.sh` rather than hand-writing the JSON. The JSON key is **`url`**, never OpenAI SDK's `base_url` — that alias is ignored, the entry is excluded, and the pool falls back to `localhost:5000` (dreaming looks down; saves/search do not use this pool). After the wizard (or any JSON edit), prove the shape **before** restarting the gateway:
+
+```bash
+python3 shared-memory/scripts/check_config.py --phase-a-only
+```
+
+A `⚠` line naming `base_url` or `no url` is the measured first-install failure — rename the key and re-run; do not keep restarting. The full (Phase B) census needs the daemon deps and is `uv run --no-project --with-requirements requirements-gateway.lock python3 shared-memory/scripts/check_config.py`. This applies to a LOCAL backend behind a token (a llama-server on the LAN or tailnet) exactly as to a cloud API — same `token_env`, same key file under `~/.shared-memory/creds/<name>` (mode 600); tell the operator where to put the file and never ask for its contents. Plaintext `http` to a private address is accepted; to a public one the entry is excluded unless the operator sets `"plaintext_ok": true` (ops/README, "Reasoning-LLM backends"). The complete numbered walkthrough (encrypted store → `LoadCredential=` or a `<VAR_NAME>_FILE` runtime pointer → JSON entry with `token_env` plus the mandatory `private_ok`/`roles` choice → restart → verify on `/health`) and the full per-entry parameter table both live in `shared-memory/ops/README.md`, "Reasoning-LLM backends" — **follow them verbatim rather than improvising**; `.env.example` carries the short form beside `LLM_BACKENDS_JSON`. Three rules they encode: the literal key never goes in any file this framework writes — only the env-var **name**; the key at rest belongs in an encrypted store (`pass`/GPG/`systemd-creds`), with **`LoadCredential=` or a runtime `<VAR_NAME>_FILE`** (SEC-06, PR A4) preferred over `systemctl --user import-environment`, which is deprecated (readable by any same-uid process via `show-environment`, and inherited by every user unit); and a credentialed entry with neither `roles` nor an explicit `private_ok` is never selected under default-deny (safe by construction, but loudly warned about at startup and by `check_config.py`) — ask the operator which they want; never pick for them.
 
 ### Phase 2 — Preflight
 
@@ -399,7 +407,11 @@ docker compose -f shared-memory/ops/postgres_neo4j_limits.yaml --env-file shared
 The one yaml carries **both** encoder pairs — CPU (`llama-retriever`/`llama-reranker`, the
 default) and Vulkan GPU (`llama-retriever-gpu`/`llama-reranker-gpu`, off by default). The
 choice is two lines in `shared-memory/.env`: `GPU_ENCODER_REPLICAS=1` + `CPU_ENCODER_REPLICAS=0`
-(exactly one pair nonzero — they share ports). **Put the choice to the operator, with the
+(exactly one pair nonzero — they share ports). **The GPU pair already uses
+`ghcr.io/ggml-org/llama.cpp:server-vulkan`.** Do not build a custom llama.cpp image unless that
+tag fails on this GPU. Q2 "existing endpoint" means something **already answering** on
+`EMBEDDER_URL`/`RERANKER_URL` — writing your own Dockerfiles and setting both replica pairs to 0
+is not that path. **Put the choice to the operator, with the
 compromise stated plainly:** a GPU with enough VRAM for their reasoning model is usually better
 spent on the model backend; a small card (~4 GB) is best spent on the encoders (~2 GB for the
 pair, repaid in search latency — measured numbers in README §17). Always the operator's call —
@@ -516,7 +528,10 @@ curl above:
   (W2, decision:1832) — a declared-nothing install now reads `degraded`, not `ok`, because nothing
   was declared and the implicit fallback (`LLM_DEFAULT_TARGET`) is what answered instead; this is
   expected and clears once backends are configured (`bash shared-memory/ops/install_llm_backends.sh`),
-  not a fault in this Phase.
+  not a fault in this Phase. ⚠ **A different degraded reason — `LLM_BACKENDS_JSON produced no usable
+  backend (every entry excluded)` — is not "nothing declared".** It is a JSON-shape miss (measured:
+  OpenAI SDK's `base_url` instead of `url`). Do not keep restarting. Run
+  `python3 shared-memory/scripts/check_config.py --phase-a-only`, rename the key, restart once.
 - **The full payload already, from the bare curl, unauthenticated** — dozens of keys, INCLUDING
   `"auth_required":false` spelled out in the JSON itself — means **auth is OFF**: no token has
   ever been minted (or `bootstrap_tokens.sh` was never run), and every caller who can reach `:8888`
@@ -604,9 +619,36 @@ applies it:
 
 | Host kind | The deliverable that applies | Who applies it |
 |---|---|---|
-| **Agent host** (its own constitution file: `~/.config/opencode/AGENTS.md`, …) | `CONSTITUTION_SNIPPET_MCP.md` — splice the marker-delimited block | Phase 8b, **ask first**, never silently |
+| **Agent host** (its own constitution file — **ask which file it actually loaded**; OpenCode first-install from `$HOME` is often `~/AGENTS.md`, not `~/.config/opencode/AGENTS.md`) | `CONSTITUTION_SNIPPET_MCP.md` — splice the marker-delimited block | Phase 8b, **ask first**, never silently |
 | **LLM server** (a system-prompt field — LM Studio) | `system-prompt.md` — paste into the model's system prompt | the operator, in that host's UI |
 | Both | the host's MCP config → the WALLED COPY's `vector-skill.py`, plus `VECTOR_SKILL_ENV` pointing at the walled `.env` | the operator or an installing agent |
+
+**OpenCode (1.18.x) — paste this shape into `~/.config/opencode/opencode.jsonc`, then `opencode mcp list` must print `shared-memory connected`.** Do not copy `mcp/mcp.json` (that is Cursor/Claude: `command` string + `args` + `env`). Do not nest servers under `mcp.servers` (OpenCode v2 only; 1.18 silently drops it and reports no MCP servers). `command` is one array; the env-var key is `environment`. Name `uv` by absolute path. Keep the token out of this file. Search can take tens of seconds, so set `timeout` well above OpenCode's 5 s default:
+
+```jsonc
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "shared-memory": {
+      "type": "local",
+      "command": [
+        "/usr/local/bin/uv",
+        "run",
+        "--no-project",
+        "/home/you/.config/opencode/shared-memory-mcp/vector-skill.py"
+      ],
+      "enabled": true,
+      "timeout": 180000,
+      "environment": {
+        "COORDINATOR_URL": "http://127.0.0.1:8888",
+        "VECTOR_SKILL_ENV": "/home/you/.config/opencode/shared-memory-mcp/.env"
+      }
+    }
+  }
+}
+```
+
+Substitute this host's `uv` (`command -v uv` / `readlink -f /usr/local/bin/uv`) and the walled directory from `--install-path`. Point at the **walled copy**, never the repo checkout's `mcp/vector-skill.py`.
 
 ⚠ **Name `uv` by ABSOLUTE path in the host's MCP config.** An MCP host spawns its stdio server from
 a non-interactive, non-login shell, and the recommended installer puts `uv` under
@@ -675,11 +717,22 @@ programmatic view of it), so treat the paths below as illustrative of the ones t
 ships a thin-client skill to, not exhaustive — nothing in this repo tracks a constitution-file path
 per agent centrally, only the skill-install path. Known constitution files: `~/.claude/CLAUDE.md`
 (Claude Code), `~/.grok/AGENTS.md` (Grok), `~/.codex/AGENTS.md` (Codex CLI), Antigravity's
-`~/.gemini/` equivalent, `~/.config/opencode/AGENTS.md` (opencode's own native global instruction
-file). *(This list drifted before: opencode was the first agent ever registered through the new
+`~/.gemini/` equivalent. OpenCode is **not** a single hidden path — see the OpenCode note
+below. *(This list drifted before: opencode was the first agent ever registered through the new
 `AGENT_INSTALLS` mechanism and was never added here — the roster mechanism stopped needing a
 release, the prose enumerating it did not follow.)* For an agent not listed here, ask the operator
 where that agent's own constitution/instructions file lives rather than guessing a path.
+
+**OpenCode — do not guess `~/.config/opencode/AGENTS.md`.** OpenCode loads (1) `AGENTS.md` walking
+up from the current directory (`/init` writes that file in the directory you started in) and
+(2) a global file at `~/.config/opencode/AGENTS.md` **only if it exists**. A first install
+launched from `$HOME` commonly uses **`~/AGENTS.md`** — a project file in the home directory, not
+a hidden config. Measured: that file was the live constitution while `~/.config/opencode/AGENTS.md`
+was absent, so splicing only the XDG path puts the MCP block in a file that session never reads.
+`ls ~/AGENTS.md ~/.config/opencode/AGENTS.md`, ask which one this session loaded, and splice
+**that**. Offer the XDG global as well if they want the block in every later project (a walk up
+from a git checkout stops at that repo and will not see `~/AGENTS.md`). Never splice into this
+framework checkout's own `AGENTS.md` — that is the operate runbook, not OpenCode's constitution.
 
 For every agent installed in Phase 8, **ask the user**: *"Would you like a short section in this
 agent's constitution describing the shared memory as its preferred depository of knowledge?"* If

@@ -4,6 +4,7 @@
 Phase A is stdlib-only (survives a coordinator import crash). Phase B needs daemon deps. Exit 0 = readable and would boot, 1 = readable but boot would refuse, 2 = could not render. Not wired into preflight.sh (different 0/1 contract; needs shared-memory/.env).
 """
 import argparse
+import json
 import os
 import sys
 
@@ -153,7 +154,53 @@ def phase_a_render() -> "tuple[list[str], bool]":
         has_cred = secure_env.get_secret(name) is not None
         lines.append(f"  {name:<20} has_credential={has_cred}")
 
+    shape_lines = _phase_a_json_shape_lines()
+    if shape_lines:
+        lines.append("")
+        lines.append("LLM_BACKENDS_JSON shape (no values rendered):")
+        lines.extend(shape_lines)
+
     return lines, True
+
+
+def _phase_a_json_shape_lines() -> "list[str]":
+    """Stdlib-only census of LLM_BACKENDS_JSON keys. Never prints a URL or
+    token — only whether each entry has the required `url` field. An OpenAI
+    SDK `base_url` key is the measured first-install trap: the loader used
+    to skip it silently and dreaming looked down."""
+    raw = os.environ.get("LLM_BACKENDS_JSON")
+    if raw is None or not raw.strip():
+        return []
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return ["  ⚠ not valid JSON — the gateway ignores it and falls back"]
+    if not isinstance(data, list):
+        return ["  ⚠ must be a JSON array of objects — the gateway ignores it and falls back"]
+    out: list[str] = []
+    for i, ent in enumerate(data):
+        if not isinstance(ent, dict):
+            out.append(
+                f"  ⚠ [{i}] is {type(ent).__name__}, not an object — excluded. "
+                "Each entry needs a url field (not OpenAI SDK's base_url)."
+            )
+            continue
+        keys = sorted(str(k) for k in ent)
+        url = str(ent.get("url", "")).rstrip("/")
+        if url:
+            continue
+        if "base_url" in ent or "baseURL" in ent:
+            alias = "base_url" if "base_url" in ent else "baseURL"
+            out.append(
+                f"  ⚠ [{i}] has {alias} but the field name is url — excluded; "
+                f"dreaming will look down. Rename the key to url. Keys: {keys}"
+            )
+        else:
+            out.append(
+                f"  ⚠ [{i}] has no url — excluded. The required field is url "
+                f"(not base_url). Keys: {keys}"
+            )
+    return out
 
 
 def _render_extra_body_suppression(extra_body) -> str:

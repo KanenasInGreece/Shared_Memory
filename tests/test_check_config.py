@@ -200,23 +200,21 @@ def test_role_config_error_leads_to_exit_1_would_refuse_to_start(tmp_path):
     assert "would boot" not in proc.stdout.lower()
 
 
-def test_malformed_llm_backends_json_array_of_strings_is_exit_2_no_traceback(tmp_path):
-    """Valid JSON, valid array — but each ENTRY is a string, not an object,
-    so hive_mind_proxy's own _load_llm_backends() raises AttributeError at
-    import time ('str' object has no attribute 'get'). Phase B must catch
-    this, never let it surface as a raw traceback. SEC-HIGH (fold round,
-    PR #347): AttributeError is NOT on the safe-message allowlist, so only
-    its TYPE NAME is shown — its own message ('has no attribute') never
-    is, even though this particular message happens to carry no secret;
-    the policy is type-based, not content-sniffed."""
+def test_malformed_llm_backends_json_array_of_strings_is_excluded_not_an_import_crash(tmp_path):
+    """Valid JSON, valid array — but each ENTRY is a string, not an object.
+    The loader used to AttributeError at import ('str' has no .get). It now
+    excludes the entry, falls back, and still boots — same class as a
+    missing url. Phase A names the shape; Phase B names the fallback.
+    Neither phase may print the string value (it can be a credentialed URL)."""
     proc = _run(env_overrides={"SECURE_ENV_FILE": "", "LLM_BACKENDS_JSON": '["http://a:5000"]'},
                 tmp_path=tmp_path)
-    assert proc.returncode == 2, proc.stdout + proc.stderr
-    assert "UNAVAILABLE" in proc.stdout
-    assert "AttributeError" in proc.stdout
-    assert "has no attribute" not in proc.stdout
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Phase A" in proc.stdout
+    assert "not an object" in proc.stdout
+    assert "DECLARED FLEET NOT USABLE" in proc.stdout or "no usable backend" in proc.stdout
+    assert "AttributeError" not in proc.stdout
+    assert "http://a:5000" not in proc.stdout
     assert "Traceback" not in proc.stderr
-    assert "Phase A" in proc.stdout  # Phase A output still printed
 
 
 def test_import_crash_bare_host_port_embedder_url_still_prints_phase_a_and_exit_2(tmp_path):
@@ -506,6 +504,28 @@ def test_extra_body_unrecognised_shape_renders_present_unrecognised_never_raw(tm
     assert "present, unrecognised shape" in proc.stdout
     assert "sk-should-never-appear" not in proc.stdout
     assert "some_future_key" not in proc.stdout
+
+
+def test_phase_a_flags_openai_base_url_key_without_printing_the_url(tmp_path):
+    """First-install trap: OpenAI SDK's base_url instead of url. Phase A
+    (stdlib, no gateway import) must name the wrong key and not echo the
+    value — a mistaken key can still carry a credentialed URL."""
+    proc = _run(
+        ["--phase-a-only"],
+        env_overrides={
+            "SECURE_ENV_FILE": "",
+            "LLM_BACKENDS_JSON": json.dumps([
+                {"base_url": "https://api.example.invalid/v1",
+                 "token_env": "DEEPSEEK_API_KEY", "private_ok": True},
+            ]),
+        },
+        tmp_path=tmp_path,
+        python_flags=["-S"],
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "base_url" in proc.stdout
+    assert "field name is url" in proc.stdout
+    assert "api.example.invalid" not in proc.stdout
 
 
 def test_check_config_module_contract_no_longer_says_extra_body_is_a_later_wave():
