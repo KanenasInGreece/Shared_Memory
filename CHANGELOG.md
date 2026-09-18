@@ -5,6 +5,17 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [Unreleased]
+
+### Fixed
+- An `LLM_BACKENDS_JSON` entry with no `url` (including OpenAI SDK's `base_url` used by mistake) is now logged and excluded instead of skipped silently. The pool still falls back; dreaming looks down until the key is renamed to `url`. Saves and search do not use this pool. A non-object JSON entry (a bare URL string) is excluded the same way instead of crashing import.
+- `check_config.py --phase-a-only` names a missing `url` / OpenAI `base_url` key without printing the URL value, so an installing agent can see the trap before restarting the gateway.
+
+### Changed
+- Install docs name the OpenCode 1.18 MCP config shape (`mcp.shared-memory`, `command` as one array, `environment`, absolute `uv`, `timeout` 180000) and warn against copying `mcp.json` or nesting under `mcp.servers`. `install_llm_backends.sh` prompt and `.env.example` say the JSON field is `url`, not `base_url`.
+- Phase 8b no longer assumes OpenCode's constitution is `~/.config/opencode/AGENTS.md`. A first install launched from `$HOME` commonly uses `~/AGENTS.md` (project file, not hidden); splice the file the session actually loaded.
+- Phase 0 asks whether other machines will reach `:8888` (`PROXY_BIND`). Phase 4 says the GPU pair already uses `llama.cpp:server-vulkan` — do not custom-build unless that tag fails, and do not treat "I'll write Dockerfiles" as Q2 existing-endpoint. After writing `LLM_BACKENDS_JSON`, run `check_config.py --phase-a-only`.
+
 ## [0.9.108] — 2026-09-17
 
 ### Fixed

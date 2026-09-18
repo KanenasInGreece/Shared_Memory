@@ -189,7 +189,7 @@ paid cloud API. Each entry is a URL plus an optional `token_env` — the
 
 | field | type | default | what it does |
 |---|---|---|---|
-| `url` | string | *(required)* | The backend's base URL. Trailing `/` is stripped; a base ending in `/v1` is probed without doubling it. |
+| `url` | string | *(required)* | The backend's API base. Trailing `/` is stripped; a base ending in `/v1` is probed without doubling it. The JSON key is `url`, not OpenAI SDK's `base_url` — that alias is ignored and the entry is excluded (logged). |
 | `token_env` | string | none | **Name** of the env var holding the API key — never the key itself. Resolved once at startup, sent as `Authorization` only to this backend. An unresolvable name excludes the backend (logged). |
 | `model` | string | none | Model id rewritten into every request body routed here — a cloud endpoint needs its real id, not the `local-model` clients send. |
 | `extra_body` | object | none | Merged into every chat payload routed here, overriding the caller's fields — provider-specific switches (e.g. disabling hybrid-model thinking) or as a spend ceiling (e.g. `{"max_tokens": 500}`). A non-object excludes the backend. |
@@ -235,7 +235,8 @@ the framework's own files never hold the key either way.
    resolution order is `$CREDENTIALS_DIRECTORY` > `<NAME>_FILE` > a plain
    env var, which is advisory-warned).
 3. **Write the backend entry** in `LLM_BACKENDS_JSON` with
-   `"token_env":"DEEPSEEK_API_KEY"` — the var **name** from step 2 — plus
+   `"url":"https://api.deepseek.com/v1"` (that key is `url`, not OpenAI SDK's
+   `base_url`) and `"token_env":"DEEPSEEK_API_KEY"` — the var **name** from step 2 — plus
    the mandatory routing choice: `"private_ok": true` (may serve everything)
    or `"roles": [...]` (per-function opt-in). A credentialed entry with
    neither is never selected under default-deny — safe by construction, but

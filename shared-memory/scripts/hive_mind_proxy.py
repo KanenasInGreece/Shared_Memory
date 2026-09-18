@@ -405,8 +405,28 @@ def _load_llm_backends() -> tuple[
         price_ins: dict[str, "float | None"] = {}
         price_outs: dict[str, "float | None"] = {}
         for entry in entries:
+            if not isinstance(entry, dict):
+                log.error(
+                    "LLM_BACKENDS_JSON entry is %s, not an object — excluding it. "
+                    "Each entry needs a url field (not OpenAI SDK's base_url).",
+                    type(entry).__name__)
+                continue
             url = str(entry.get("url", "")).rstrip("/")
             if not url:
+                keys = sorted(str(k) for k in entry)
+                alias = "base_url" if "base_url" in entry else (
+                    "baseURL" if "baseURL" in entry else None)
+                if alias:
+                    log.error(
+                        "LLM_BACKENDS_JSON entry has %s but the field name is url, "
+                        "not OpenAI SDK's base_url — excluding this backend. "
+                        "Rename the key to url. Keys present: %s",
+                        alias, keys)
+                else:
+                    log.error(
+                        "LLM_BACKENDS_JSON entry has no url — excluding this backend. "
+                        "The required field is url (not base_url). Keys present: %s",
+                        keys)
                 continue
             # SEC A (R-1, fatal): a URL that embeds its own credential in
             # userinfo — checked BEFORE every other per-entry validation

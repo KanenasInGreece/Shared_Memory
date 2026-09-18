@@ -304,7 +304,7 @@ entries=()
 while true; do
     echo
     echo "── Backend $((${#entries[@]} + 1)) ──"
-    url="$(ask_required "  Base URL (OpenAI-compatible, e.g. http://localhost:5000 or https://api.deepseek.com/v1)")"
+    url="$(ask_required "  URL (JSON field is url, not OpenAI SDK's base_url; e.g. http://localhost:5000 or https://api.deepseek.com/v1)")"
     url="${url%/}"
 
     weight="$(ask "  Capacity weight (a faster/larger backend can take more load)" "1")"

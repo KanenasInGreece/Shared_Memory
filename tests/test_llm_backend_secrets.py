@@ -233,6 +233,44 @@ def test_all_json_backends_excluded_falls_back_LOUDLY_and_health_says_so(monkeyp
     assert dep["state"] == "degraded" and "fallback" in dep["reason"]
 
 
+def test_json_entry_with_openai_base_url_key_is_excluded_loudly(monkeypatch, caplog):
+    """OpenAI SDK calls the field base_url. This schema's key is url.
+    A hand-written LLM_BACKENDS_JSON that uses the SDK name used to be
+    skipped with no log (empty url → continue), the pool fell back to
+    localhost:5000, and the operator saw a 'blocked' gateway with no
+    pointer at the typo. Exclude as before — but name the wrong key."""
+    import logging
+    monkeypatch.delenv("LLM_BACKENDS", raising=False)
+    monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
+        {"base_url": "https://api.deepseek.com/v1", "token_env": "DEEPSEEK_API_KEY",
+         "private_ok": True},
+    ]))
+    import hive_mind_proxy as g
+    with caplog.at_level(logging.ERROR, logger="hive-proxy"):
+        importlib.reload(g)
+
+    assert "https://api.deepseek.com/v1" not in g.LLM_BACKENDS
+    assert g.LLM_POOL_FALLBACK_REASON and "no usable backend" in g.LLM_POOL_FALLBACK_REASON
+    msgs = [r.getMessage() for r in caplog.records]
+    assert any("base_url" in m and "url" in m and "excluding" in m.lower() for m in msgs)
+    # Do not echo the value: a mistaken key can still carry a credentialed URL.
+    assert not any("api.deepseek.com" in m for m in msgs)
+
+
+def test_json_entry_missing_url_entirely_is_excluded_loudly(monkeypatch, caplog):
+    import logging
+    monkeypatch.delenv("LLM_BACKENDS", raising=False)
+    monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
+        {"token_env": "DEEPSEEK_API_KEY", "private_ok": True},
+    ]))
+    import hive_mind_proxy as g
+    with caplog.at_level(logging.ERROR, logger="hive-proxy"):
+        importlib.reload(g)
+
+    assert g.LLM_POOL_FALLBACK_REASON and "no usable backend" in g.LLM_POOL_FALLBACK_REASON
+    msgs = [r.getMessage() for r in caplog.records]
+    assert any("no url" in m and "excluding" in m.lower() for m in msgs)
+
 
 class _HealthProbeResp:
     status = 200

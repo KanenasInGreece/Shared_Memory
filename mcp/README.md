@@ -117,16 +117,30 @@ rotation. Re-home it with `--remint <agent> --mcp --install-path <walled-dir>/.e
 write-throughs the new token and touches nobody else. ⛔ Do not reach for `--reveal`: it prints a
 live token, so it is operator-only, run in the operator's own terminal, never through an agent.
 
-Then register it with the host — the **walled copy's** path, never the repo's:
+Then register it with the host — the **walled copy's** path, never the repo's.
+OpenCode 1.18.x wants this full file shape in `~/.config/opencode/opencode.jsonc`
+(keys directly under `mcp`, not `mcp.servers`; `command` is one array; env-var
+key is `environment`). Do not copy `mcp.json` (`command` string + `args` + `env`
+is Cursor/Claude; 1.18 reports no servers). Search can take tens of seconds, so
+set `timeout` above OpenCode's 5 s default:
 
 ```jsonc
-"shared-memory": {
-  "type": "local",
-  "command": ["/home/you/.local/bin/uv", "run", "--no-project",
-              "/home/you/.config/<host>/shared-memory-mcp/vector-skill.py"],
-  "environment": {
-    "COORDINATOR_URL": "http://localhost:8888",
-    "VECTOR_SKILL_ENV": "/home/you/.config/<host>/shared-memory-mcp/.env"
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "shared-memory": {
+      "type": "local",
+      "command": [
+        "/home/you/.local/bin/uv", "run", "--no-project",
+        "/home/you/.config/opencode/shared-memory-mcp/vector-skill.py"
+      ],
+      "enabled": true,
+      "timeout": 180000,
+      "environment": {
+        "COORDINATOR_URL": "http://127.0.0.1:8888",
+        "VECTOR_SKILL_ENV": "/home/you/.config/opencode/shared-memory-mcp/.env"
+      }
+    }
   }
 }
 ```
@@ -144,6 +158,8 @@ Finally, **apply the rules and restart both processes**:
 
 - **Agent host** (has its own constitution file): propose splicing the marker-delimited block from
   `CONSTITUTION_SNIPPET_MCP.md` — ask first (`AGENTS.md` Phase 8b), never write it silently.
+  For OpenCode, do not guess `~/.config/opencode/AGENTS.md`: a first install from `$HOME` often
+  uses `~/AGENTS.md`. Splice the file that session loaded.
 - **LLM server** (has a system-prompt field): paste `system-prompt.md` into the model's system
   prompt.
 - **Restart the MCP host fully** — an MCP server reads its environment once, at spawn.

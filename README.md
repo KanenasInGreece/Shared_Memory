@@ -1044,6 +1044,7 @@ smaller card, a big-context model on another machine, a paid cloud API kept for 
 local cards can't hold — each is useful, and each breaks the assumption that any backend can
 take any job. The `.env` lets you say so per backend, in `LLM_BACKENDS_JSON`:
 
+- **`url`** — the backend's API base. That is the JSON key. OpenAI SDK's `base_url` is a different name and is ignored (the entry is excluded; dreaming then looks down).
 - **`roles`** — which dreaming functions this backend may serve (`extract`,
   `judge`). Leave it out and the backend serves nothing until you also declare
   `private_ok: true` — saying what a backend is for is now part of declaring it.
@@ -1239,20 +1240,32 @@ the token out of that config entirely by pointing `VECTOR_SKILL_ENV` at a client
 that holds nothing but this agent's `AGENT_TOKEN`. Mint that token with the additive path
 (`bootstrap_tokens.sh --add <name> --mcp --install-path <dir>/.env`, `--role read` if the agent
 should only ever search) and the file lands at mode 600 without the value passing through
-anyone's hands. The shape, in opencode's `opencode.jsonc`:
+anyone's hands. The shape, in OpenCode 1.18.x `opencode.jsonc` (keys go **directly** under `mcp`, not under `mcp.servers`; `command` is one array; the env-var key is `environment`, not `env`; do not copy `mcp/mcp.json`'s Cursor/Claude `command`/`args`/`env` block — 1.18 drops that as "no MCP servers configured"):
 
 ```jsonc
-"mcp": {
-  "shared-memory": {
-    "type": "local",
-    "command": ["uv", "run", "--no-project", "/path/to/mcp/vector-skill.py"],
-    "environment": {
-      "COORDINATOR_URL": "http://localhost:8888",
-      "VECTOR_SKILL_ENV": "/path/to/private/dir/.env"
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "shared-memory": {
+      "type": "local",
+      "command": [
+        "/usr/local/bin/uv",
+        "run",
+        "--no-project",
+        "/home/you/.config/opencode/shared-memory-mcp/vector-skill.py"
+      ],
+      "enabled": true,
+      "timeout": 180000,
+      "environment": {
+        "COORDINATOR_URL": "http://127.0.0.1:8888",
+        "VECTOR_SKILL_ENV": "/home/you/.config/opencode/shared-memory-mcp/.env"
+      }
     }
   }
 }
 ```
+
+Name `uv` by absolute path (`command -v uv`). Point at the **walled copy**, never the checkout's `mcp/`. Search can take tens of seconds; OpenCode's default MCP timeout is 5 s. After writing: `opencode mcp list` must show `shared-memory connected`.
 
 Give the agent the search-first conduct from
 [`mcp/CONSTITUTION_SNIPPET_MCP.md`](mcp/CONSTITUTION_SNIPPET_MCP.md) in whatever instruction
