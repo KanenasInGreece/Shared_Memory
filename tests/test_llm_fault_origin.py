@@ -40,6 +40,21 @@ from aiohttp import web  # noqa: E402
 from yarl import URL  # noqa: E402
 
 
+class _ReqBodyStream:
+    """handle_encoder reads request.content via StreamReader.read(n)."""
+
+    def __init__(self, body: bytes):
+        self._buf = body
+
+    async def read(self, n: int) -> bytes:
+        if n < 0:
+            out, self._buf = self._buf, b""
+            return out
+        out = self._buf[:n]
+        self._buf = self._buf[n:]
+        return out
+
+
 # ── test doubles ──────────────────────────────────────────────────────────────
 
 class _FakeReq:
@@ -284,8 +299,12 @@ def test_embedding_400_attaches_overflow_without_provider_text(monkeypatch):
         can_read_body = True
         content_length = 40
 
+        def __init__(self):
+            self._raw = b'{"input":"hello","model":"bge-m3"}'
+            self.content = _ReqBodyStream(self._raw)
+
         async def read(self):
-            return b'{"input":"hello","model":"bge-m3"}'
+            return self._raw
 
     proxy = g.AsyncHiveMindProxy()
     proxy.session = _StatusBodySession(400, LIVE_VLLM_EMBED_400)
@@ -321,8 +340,12 @@ def test_reranking_400_has_no_overflow_key(monkeypatch):
         can_read_body = True
         content_length = 40
 
+        def __init__(self):
+            self._raw = b'{"query":"q","documents":["d"],"model":"bge-reranker"}'
+            self.content = _ReqBodyStream(self._raw)
+
         async def read(self):
-            return b'{"query":"q","documents":["d"],"model":"bge-reranker"}'
+            return self._raw
 
     proxy = g.AsyncHiveMindProxy()
     proxy.session = _StatusBodySession(400, LIVE_VLLM_EMBED_400)
@@ -353,8 +376,12 @@ def test_embedding_route_fault_also_gets_upstream_origin_header(monkeypatch):
         can_read_body = True
         content_length = 40
 
+        def __init__(self):
+            self._raw = b'{"input":"hello","model":"bge-m3"}'
+            self.content = _ReqBodyStream(self._raw)
+
         async def read(self):
-            return b'{"input":"hello","model":"bge-m3"}'
+            return self._raw
 
     proxy = g.AsyncHiveMindProxy()
     proxy.session = _StatusBodySession(500, b'{"error":"embedder down"}')

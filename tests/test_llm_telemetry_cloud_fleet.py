@@ -59,6 +59,21 @@ class _StreamReq:
         return b'{"messages":[],"model":"local-model","stream":true}'
 
 
+class _ReqBodyStream:
+    """handle_encoder reads request.content via StreamReader.read(n)."""
+
+    def __init__(self, body: bytes):
+        self._buf = body
+
+    async def read(self, n: int) -> bytes:
+        if n < 0:
+            out, self._buf = self._buf, b""
+            return out
+        out = self._buf[:n]
+        self._buf = self._buf[n:]
+        return out
+
+
 class _EmbedReq:
     """Mirrors test_llm_fault_origin.py's _EmbedReq — its own registered route,
     served by handle_encoder, so llm_backend stays None throughout: the
@@ -70,8 +85,12 @@ class _EmbedReq:
     can_read_body = True
     content_length = 40
 
+    def __init__(self):
+        self._raw = b'{"input":"hello","model":"bge-m3"}'
+        self.content = _ReqBodyStream(self._raw)
+
     async def read(self):
-        return b'{"input":"hello","model":"bge-m3"}'
+        return self._raw
 
 
 class _OneShotAsyncIter:

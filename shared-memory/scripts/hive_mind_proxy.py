@@ -172,11 +172,9 @@ CREDENTIALED_BACKEND_ALLOWED_ROUTES = frozenset({
 })
 # Mistyped/wrong-method framework paths must 404/405, never fall through to the LLM catch-all (fact:1535). Known routes come from the router (decision:1032).
 RESERVED_ROUTE_PREFIXES = ("/memory/", "/admin/")
-# Embeddings/reranking bodies at or under this size get buffered (not streamed),
-# which is what makes the stale-connection retry possible for them. Every real
-# caller (coordinator._embed) sends one text field capped at EMBED_MAX_CHARS
-# (24000 chars, ~24KB as JSON) — 1MB is a generous margin above that observed
-# traffic while still refusing to buffer something genuinely large.
+# Encoder/reranker POST copy policy. handle_encoder counts bytes while reading
+# and 413s above this; it never streams the encoder payload (decision:2651).
+# LLM traffic in handle_proxy is unrelated; its belt is client_max_size.
 EMBED_RERANK_BUFFER_CAP = int(os.environ.get("EMBED_RERANK_BUFFER_CAP", str(1024 * 1024)))
 # Fallback used ONLY when LLM_BACKENDS is unset. Deployments differ — LM Studio
 # defaults to :1234, llama.cpp servers commonly :8080 — so keep this overridable
@@ -1420,6 +1418,46 @@ def _strip_llm_steering_headers(headers) -> "CIMultiDict[str]":
 UPSTREAM_DISCONNECT = (ServerDisconnectedError,)
 
 
+class _EncoderBodyTooLarge(Exception):
+    """Counted encoder body exceeded EMBED_RERANK_BUFFER_CAP."""
+
+    def __init__(self, nbytes: int):
+        self.nbytes = nbytes
+        super().__init__(nbytes)
+
+
+async def _read_encoder_body_capped(stream, cap: int = EMBED_RERANK_BUFFER_CAP) -> bytes:
+    """Read an encoder request body, aborting at cap without a further pull.
+
+    Each pull is remaining_to_cap+1 (aiohttp StreamReader.read(n)). Never
+    read() / read(-1). handle_encoder is the only caller (decision:2651).
+    """
+    buf = bytearray()
+    while True:
+        remaining_to_cap = cap - len(buf)
+        n = remaining_to_cap + 1
+        chunk = await stream.read(n)
+        if not chunk:
+            break
+        buf += chunk
+        if len(buf) > cap:
+            raise _EncoderBodyTooLarge(len(buf))
+        if len(chunk) < n:
+            break
+    return bytes(buf)
+
+
+def _encoder_payload_too_large_response(nbytes: int) -> web.Response:
+    """413 the encoder caller; unread remainder is left for protocol close."""
+    resp = web.json_response(
+        {"error": f"Payload length {nbytes} exceeds buffer cap of {EMBED_RERANK_BUFFER_CAP} bytes"},
+        status=413,
+        headers={"X-SM-Fault-Origin": "gateway"},
+    )
+    resp.force_close()
+    return resp
+
+
 # --------------------------------------------------------------------------- #
 # Proxy
 # --------------------------------------------------------------------------- #
@@ -1835,50 +1873,49 @@ class AsyncHiveMindProxy:
         llm_body: bytes | None = None
         if request.can_read_body:
             content_length = request.content_length
-            if content_length is not None and content_length <= EMBED_RERANK_BUFFER_CAP:
-                raw_body = await request.read()
-                if len(raw_body) > EMBED_RERANK_BUFFER_CAP:
-                    return web.json_response(
-                        {"error": f"Payload length {len(raw_body)} exceeds buffer cap of {EMBED_RERANK_BUFFER_CAP} bytes"},
-                        status=413,
-                        headers={"X-SM-Fault-Origin": "gateway"},
-                    )
-                if raw_body:
-                    if request.rel_url.path_safe == "/v1/reranking":
-                        try:
-                            data = json.loads(raw_body)
-                        except (json.JSONDecodeError, UnicodeDecodeError):
-                            data = None
-                        if isinstance(data, dict):
-                            from dream_telemetry import prefix_rerank_doc, prefix_rerank_query
-                            modified = False
-                            q = data.get("query")
-                            pref_q = prefix_rerank_query(q)
-                            data["query"] = pref_q
-                            if pref_q != q:
-                                modified = True
-                            docs = data.get("documents")
-                            if isinstance(docs, list):
-                                new_docs = []
-                                for d in docs:
-                                    if isinstance(d, str):
-                                        pref_d = prefix_rerank_doc(data.get("query"), d)
-                                        if pref_d != d:
-                                            modified = True
-                                        new_docs.append(pref_d)
-                                    else:
-                                        new_docs.append(d)
-                                if modified:
-                                    data["documents"] = new_docs
-                            if modified:
-                                llm_body = json.dumps(data).encode("utf-8")
+            if content_length is not None and content_length > EMBED_RERANK_BUFFER_CAP:
+                return _encoder_payload_too_large_response(content_length)
+            try:
+                raw_body = await _read_encoder_body_capped(request.content)
+            except _EncoderBodyTooLarge as exc:
+                return _encoder_payload_too_large_response(exc.nbytes)
+            if not raw_body:
+                llm_body = b""
+            elif request.rel_url.path_safe == "/v1/reranking":
+                try:
+                    data = json.loads(raw_body)
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    data = None
+                if isinstance(data, dict):
+                    from dream_telemetry import prefix_rerank_doc, prefix_rerank_query
+                    modified = False
+                    q = data.get("query")
+                    pref_q = prefix_rerank_query(q)
+                    data["query"] = pref_q
+                    if pref_q != q:
+                        modified = True
+                    docs = data.get("documents")
+                    if isinstance(docs, list):
+                        new_docs = []
+                        for d in docs:
+                            if isinstance(d, str):
+                                pref_d = prefix_rerank_doc(data.get("query"), d)
+                                if pref_d != d:
+                                    modified = True
+                                new_docs.append(pref_d)
                             else:
-                                llm_body = raw_body
-                        else:
-                            llm_body = raw_body
+                                new_docs.append(d)
+                        if modified:
+                            data["documents"] = new_docs
+                    if modified:
+                        llm_body = json.dumps(data).encode("utf-8")
                     else:
-                        from encoder_window import clamp_encoder_payload
-                        llm_body = clamp_encoder_payload(raw_body)
+                        llm_body = raw_body
+                else:
+                    llm_body = raw_body
+            else:
+                from encoder_window import clamp_encoder_payload
+                llm_body = clamp_encoder_payload(raw_body)
         return await self._forward_upstream(
             request,
             target_base=target_base,

@@ -22,6 +22,21 @@ from dream_telemetry import (
 import hive_mind_proxy as g
 
 
+class _ReqBodyStream:
+    """handle_encoder reads request.content via StreamReader.read(n)."""
+
+    def __init__(self, body: bytes):
+        self._buf = body
+
+    async def read(self, n: int) -> bytes:
+        if n < 0:
+            out, self._buf = self._buf, b""
+            return out
+        out = self._buf[:n]
+        self._buf = self._buf[n:]
+        return out
+
+
 def test_pair_budget_and_reserve_invariant():
     """len(prefixed_q) + len(prefixed_doc) + special_reserve_chars <= RERANK_MAX_DOC_CHARS (I4)."""
     for q in ("", "short", "x" * 50000):
@@ -112,6 +127,7 @@ def test_handle_encoder_rerank_prefixes_query_and_documents():
                 "model": "bge-reranker-v2-m3",
             }).encode("utf-8")
             self.content_length = len(self._raw)
+            self.content = _ReqBodyStream(self._raw)
 
         async def read(self):
             return self._raw
@@ -186,6 +202,7 @@ def test_handle_encoder_rerank_invalid_json_forwarded_unchanged():
             self._payload_writer = AsyncMock()
             self._raw = raw_invalid
             self.content_length = len(self._raw)
+            self.content = _ReqBodyStream(self._raw)
 
         async def read(self):
             return self._raw
@@ -250,6 +267,7 @@ def test_handle_encoder_rerank_coerces_non_str_query_to_empty(non_str_query):
                 "model": "bge-reranker-v2-m3",
             }).encode("utf-8")
             self.content_length = len(self._raw)
+            self.content = _ReqBodyStream(self._raw)
 
         async def read(self):
             return self._raw
@@ -319,6 +337,7 @@ def test_handle_encoder_rerank_oversize_query_pins_pair_budget():
                 "model": "bge-reranker-v2-m3",
             }).encode("utf-8")
             self.content_length = len(self._raw)
+            self.content = _ReqBodyStream(self._raw)
 
         async def read(self):
             return self._raw

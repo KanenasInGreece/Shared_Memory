@@ -80,6 +80,20 @@ def _req(method: str, path: str, headers: dict | None = None, body: bytes = b"")
     r.can_read_body = True
     r.content_length = len(body)
 
+    class _Stream:
+        def __init__(self, data: bytes):
+            self._buf = data
+
+        async def read(self, n: int) -> bytes:
+            if n < 0:
+                out, self._buf = self._buf, b""
+                return out
+            out = self._buf[:n]
+            self._buf = self._buf[n:]
+            return out
+
+    r.content = _Stream(body)
+
     async def read():
         return body
     r.read = read
