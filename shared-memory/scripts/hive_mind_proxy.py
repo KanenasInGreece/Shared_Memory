@@ -1442,8 +1442,6 @@ async def _read_encoder_body_capped(stream, cap: int = EMBED_RERANK_BUFFER_CAP) 
         buf += chunk
         if len(buf) > cap:
             raise _EncoderBodyTooLarge(len(buf))
-        if len(chunk) < n:
-            break
     return bytes(buf)
 
 

@@ -393,6 +393,62 @@ def test_handle_encoder_chunked_over_cap_stops_after_first_oversize_pull(monkeyp
     assert "overflow" not in body
 
 
+def test_handle_encoder_chunked_under_cap_two_fills_clamps_embeddings_input():
+    """Under CAP two-fill embeddings body: split mid-JSON, pulls==3, clamp applied to concat."""
+    import asyncio
+    import hive_mind_proxy as g
+
+    raw = json.dumps({"input": ["x" * 50000], "model": "bge-m3"}).encode("utf-8")
+    assert len(raw) < g.EMBED_RERANK_BUFFER_CAP
+    mid = len(raw) // 2
+    part1 = raw[:mid]
+    part2 = raw[mid:]
+    with pytest.raises((json.JSONDecodeError, UnicodeDecodeError)):
+        json.loads(part1)
+    with pytest.raises((json.JSONDecodeError, UnicodeDecodeError)):
+        json.loads(part2)
+
+    stream = _QueuedStream([part1, part2])
+    req = _encoder_req("/v1/embeddings", stream, None)
+    session = _CaptureSession()
+    proxy = g.AsyncHiveMindProxy()
+    proxy.session = session
+    resp = asyncio.run(proxy.handle_encoder(req))
+    assert resp.status == 200
+    assert stream.pulls == 3
+    assert stream.remaining == []
+    assert stream.ns[0] == g.EMBED_RERANK_BUFFER_CAP + 1
+    expected = encoder_window.clamp_encoder_payload(part1 + part2)
+    assert session.sent_data == expected
+
+
+def test_handle_encoder_chunked_sum_past_cap_two_fills_aborts_at_cap(monkeypatch):
+    """First chunk 8 KiB, second chunk CAP: sum exceeds CAP on pull 2 -> 413, pulls==2, non-empty remaining."""
+    import asyncio
+    import hive_mind_proxy as g
+
+    loads_calls = _spy_json_loads(monkeypatch, g)
+    cap = g.EMBED_RERANK_BUFFER_CAP
+    first = b"a" * 8192
+    second = b"b" * cap
+    stream = _QueuedStream([first, second])
+    req = _encoder_req("/v1/embeddings", stream, None)
+    session = _CaptureSession()
+    proxy = g.AsyncHiveMindProxy()
+    proxy.session = session
+    resp = asyncio.run(proxy.handle_encoder(req))
+    assert resp.status == 413
+    assert resp.headers.get("X-SM-Fault-Origin") == "gateway"
+    assert stream.pulls == 2
+    assert stream.remaining != []
+    assert req.read_calls == 0
+    assert session.calls == []
+    assert loads_calls == []
+    body = json.loads(resp.body)
+    assert "overflow" not in body
+
+
+
 def test_handle_encoder_lying_cl_still_capped_by_helper(monkeypatch):
     """CL==CAP but read(n) yields CAP+1 → 413. request.read() is the tiny lie."""
     import asyncio
@@ -468,7 +524,7 @@ def test_handle_proxy_does_not_413_on_encoder_buffer_cap(monkeypatch):
     """LLM path keeps request.read(); encoder CAP must not 413 handle_proxy."""
     import asyncio
     import importlib
-    from aiohttp import web
+    from unittest.mock import AsyncMock
     from yarl import URL
 
     monkeypatch.delenv("LLM_BACKENDS", raising=False)
@@ -487,24 +543,26 @@ def test_handle_proxy_does_not_413_on_encoder_buffer_cap(monkeypatch):
         rel_url = URL("/v1/chat/completions", encoded=True)
         headers = {}
         can_read_body = True
+        keep_alive = False
         content_length = g.EMBED_RERANK_BUFFER_CAP + 1
+
+        def __init__(self):
+            self._payload_writer = AsyncMock()
 
         async def read(self):
             return chat_body
 
-    forwarded = {}
-
-    async def _spy(request, **kwargs):
-        forwarded["called"] = True
-        forwarded["llm_body"] = kwargs.get("llm_body")
-        return web.json_response({"ok": True}, status=200)
-
     proxy = g.AsyncHiveMindProxy()
-    proxy._forward_upstream = _spy
+    session = _CaptureSession()
+    proxy.session = session
     resp = asyncio.run(proxy.handle_proxy(_ChatReq()))
+    assert 200 <= resp.status < 300
     assert resp.status != 413
-    assert forwarded.get("called") is True
-    assert forwarded.get("llm_body") is not None
+    assert resp.status != 500
+    assert len(session.calls) == 1
+    assert session.calls[0]["data"] == chat_body
+    assert session.sent_data == chat_body
+
 
 
 def test_main_keeps_50_mib_client_max_size():
