@@ -19,6 +19,7 @@
 
 MANIFEST.txt
 SKILL.md
+USAGE.md
 CONSTITUTION_SNIPPET.md
 .env.example
 scripts/memory_bridge.py
