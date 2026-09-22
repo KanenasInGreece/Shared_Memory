@@ -59,6 +59,60 @@ Everything after them is operational detail, not another rule.
 as e.g. `rag-orchestrator` → `hybrid_search_and_rerank`, or `shared-memory_hybrid_search_and_rerank`
 — the same tool under the name your own tool list gives it.
 
+# CALLS
+
+Copy the call. The line under it is what it does.
+
+```
+hybrid_search_and_rerank("reranker cache-ram", 5, project="shared-memory-GitHub", domains=["delivery"], since="2026-09-01")
+```
+
+`domains` matches stored `metadata.domains` only. A miss returns nothing and attaches no insight: read-side belonging, a retrospective, a decision that omitted a section, a thematic summary's `metadata.domain` string. Filters are arguments, not words in the query. A row with no `ref` and `ranked: false` is keyword fallback. Do not pass it to `record_lineage`.
+
+```
+record_lineage("fact:2678")
+record_lineage("decision:2522")
+```
+
+A `fact:N` in an index is a pointer, not the record. Follow `superseded_by`, then rewrite the index line to the current id.
+
+```
+graph_query("MATCH (n:Fact) RETURN n.pg_id LIMIT 5")
+```
+
+`full` or `admin` only. `read` receives 403.
+
+```
+save_artifact("v0.9.110 shipped", "{\"source\":\"lm_studio\",\"project\":\"shared-memory-GitHub\",\"source_ref\":\"OPERATE.md\"}")
+```
+
+Omit `domain` and the record stores no section. It does not inherit one. `project` is required.
+
+```
+save_decision(title="Ship the skill index", decided_by="Xenofon", project="shared-memory-GitHub", rationale="In the context of a 70KB refusal, we chose a 15KB index over keeping the essay, accepting a second file.", source="lm_studio", grounded_in="2672:based_on", alternatives=["keep the 70KB file"], confidence="high")
+```
+
+Ids are bare. `fact:601` in `grounded_in` is dropped with no error. Confirm with the operator before this call. No entities.
+
+```
+save_retrospective(pg_id=2675, rating="validated", notes="The index loads.", source="lm_studio", grounded_in="2678")
+```
+
+No project, no domain, no entities. `rating="reversed"` is how a decision is overturned.
+
+```
+supersede(pg_id=2672, by=2678)
+review_hold(summary_id=411, pg_id=2672)
+check_memory_health()
+memory_telemetry()
+```
+
+```
+archive_reasoning_trace(session_id="s", task="t", steps=[{"thought":"…"}], project="shared-memory-GitHub")
+```
+
+Do not call it. It posts `type` `reasoning_trace`. Ingress returns `unknown_type`. Save the conclusion with `save_artifact`.
+
 # SEARCH-FIRST MANDATE
 **Before answering any question about this workstation or its projects — including whether
 something was ever tested, tried, rejected or done: those are questions about history, and the

@@ -1091,12 +1091,9 @@ async def archive_reasoning_trace(session_id: str, task: str, steps: list,
     project axis exists to remove, and defaulting it would park records without
     anyone deciding to. Ask the operator, or pass 'general_discussion' knowingly.
 
-    This used to CREATE ReasoningTrace/ReasoningStep nodes straight in Neo4j.
-    A client writing its own subgraph bypasses the outbox — which is what makes
-    a save atomic across Postgres and Neo4j — and bypasses read authorization,
-    so the trace was durable in one store only and visible to everyone. It is
-    now saved through the normal save path: one record, embedded, access-
-    controlled, searchable, and eligible for consolidation like any other.
+    Do not call this to keep a conclusion. The metadata type is
+    ``reasoning_trace``. Ingress returns ``unknown_type``. Save the conclusion
+    with ``save_artifact`` instead.
     """
     if not steps:
         return "Error: no steps to archive."
