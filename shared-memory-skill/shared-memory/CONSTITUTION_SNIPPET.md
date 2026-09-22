@@ -29,32 +29,25 @@ stale silently, the store does not.)
 (v4 -> v5: 'check' was not enough — the rule now prescribes the REPAIR: follow
 superseded_by to the current record and rewrite the index line, because an
 unrepaired index reproduces the same wrong answer at the next invocation.)
+(v5 -> v6: the block leads with the commands. The history trigger and the
+index repair are unchanged.)
 
 ALWAYS propose this block for the operator to confirm or adjust before
 writing it into their personal constitution file. Never write it silently.
 -->
 
-<!-- shared-memory:constitution-snippet v5 -->
+<!-- shared-memory:constitution-snippet v6 -->
 ## Shared Memory
-Use the shared memory skill proactively — to draw from it, not only save to
-it. Locally preloaded per-project notes are supplementary scratch space, not
-authoritative: for any question about project direction, a prior decision, a
-claim that may have been superseded — or whether something was ever tested,
-tried, rejected or done: those are questions about history, and the current
-state of files can only confirm an answer, never give one — the shared memory
-store is the source of truth, and searching it is a precondition before
-reasoning on that topic — not a judgment call to make first. After a
-discussion that sets project direction, propose recording the key facts, and
-confirm with the user before saving any decision — never auto-decide (facts
-can later be superseded; decision outcomes get recorded afterward as
-retrospectives).
-An id or claim hard-coded in a constitution file, a memory index, a resume or
-a handoff (`fact:N`) is a pointer, not the record. Before citing or acting on
-it, resolve it: `lineage <id>` says whether it is superseded and by what —
-follow `superseded_by` until a current record, or search the subject. If the
-pointer was stale, do not delete it and do not stop at checking: rewrite the
-index line to the current id and its corrected hook, so the next invocation
-starts from the right record — an unrepaired index reproduces the same wrong
-answer every session. The store retires superseded records from search; only
-the index decays.
+Before you answer a question about project direction, a prior decision, a claim that may have been superseded, or whether something was tested, tried, rejected or done:
+
+```
+search "was this tested, tried, rejected or done"
+lineage fact:N
+```
+
+The files can confirm an answer. They do not supply one. Local notes are scratch.
+
+After a discussion that sets direction, propose the facts. Confirm with the operator before `save_decision`. Do not auto-decide. Record the outcome with `save_retrospective`.
+
+A `fact:N` in a constitution, an index, a resume, or a handoff is a pointer, not the record. `lineage fact:N` says whether it is superseded and by what. Follow `superseded_by` to the current record, or search the subject. Then rewrite the index line to the current id. An unrepaired index repeats the wrong answer. The store drops superseded records from search. The index does not.
 <!-- /shared-memory:constitution-snippet -->

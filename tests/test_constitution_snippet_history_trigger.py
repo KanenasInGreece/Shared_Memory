@@ -35,20 +35,17 @@ def _read(path):
         return fh.read()
 
 
-def test_the_cli_snippet_carries_v5():
+def test_the_cli_snippet_carries_v6():
     text = _read(_CLI_SNIPPET)
-    assert "<!-- shared-memory:constitution-snippet v5 -->" in text, (
-        "the CLI snippet's marker did not advance to v5 — an installed block "
+    assert "<!-- shared-memory:constitution-snippet v6 -->" in text, (
+        "the CLI snippet's marker did not advance to v6 — an installed block "
         "will not read as drifted and Phase 8c will not re-propose it")
 
 
-def test_the_mcp_snippet_carries_v6():
-    # Pin moved v5 -> v6 for the graph_query role clarification (ADV-3):
-    # the snippet clarified role requirements for graph and named query shortcuts,
-    # so an installed v5 block must read as drifted and Phase 8c must re-propose it.
+def test_the_mcp_snippet_carries_v7():
     text = _read(_MCP_SNIPPET)
-    assert "<!-- shared-memory:mcp-constitution-snippet v6 -->" in text, (
-        "the MCP snippet's marker did not advance to v6 — an installed block "
+    assert "<!-- shared-memory:mcp-constitution-snippet v7 -->" in text, (
+        "the MCP snippet's marker did not advance to v7 — an installed block "
         "will not read as drifted and Phase 8c will not re-propose it")
 
 
