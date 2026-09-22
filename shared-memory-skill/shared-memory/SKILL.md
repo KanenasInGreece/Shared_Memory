@@ -56,31 +56,97 @@ A fact owns project, domain, and entities. A decision owns project and domain, n
 
 ## Patterns
 
-The cycle is search, then create, then edit. Each block is the command, then Do, Don't, and the practice that keeps the next session on the right id.
+Search, then create, then edit. Copy the command. The line under it is what that command does.
 
-**A — Search.** `search "<what>" [n] --project NAME --domain NAME --since ISO`
+**A — Search.**
 
-Do. Pass `--project`, `--domain`, and `--since` as flags. Repeat `--domain`. Read the hit's `ref`. On `stale_sources` or `stale_summaries`, `lineage` that ref before you rely on it, then rewrite the index line to the successor id.
+```
+search "reranker cache-ram" 5 --project shared-memory-GitHub --domain delivery --since 2026-09-01
+```
 
-Don't. Put those filters inside the query string. Treat `--domain` as read-side `belonging`, a retrospective, a decision that omitted a section, or a thematic summary's `metadata.domain` string. It matches stored `metadata.domains` only. No Tier-1 candidate means `[]` and no insight. Without `--project`, `--domain` is a literal across projects. More than 16 values is `filters_invalid`. An unregistered name matches nothing; it is not a refusal. Treat `score_normalized` 0.5 with no `ref` and no `ranked` as a rerank. Stderr `EMBEDDING UNAVAILABLE` means keyword fallback even when rows come back. Do not pass those rows to `lineage`. `ranked: false` is vector order, and Tier-3 rows are omitted. Force `fact:` onto a successor. `old` may be a fact, a decision, or a retrospective. A 404 names the real ref.
+→ hits carry `ref` `fact:2678`. Then:
 
-Practice. Tens of seconds is the reranker, not a hang. Filters combine and never fall back to an unfiltered search. `--since` is an ISO date or datetime.
+```
+lineage fact:2678
+```
 
-**B — Create.** `save` from the project directory. Decision: `save_decision --title --decided-by --rationale`. Retrospective: `save_retrospective --pg-id N --rating STATE --notes "…" --grounded-in "N"`.
+```
+query why-to-check --title "AGENTS.md recut"
+```
 
-Do. Let the client walk up to `.git`, `CLAUDE.md`, `AGENTS.md`, or `GEMINI.md`. It stops at `$HOME` and does not pass `$HOME`. `SHARED_MEMORY_PROJECT` overrides the walk. Empty project is `project_required`. Unknown name is `project_unknown`. Second submission is in `USAGE.md`: pick a proposal, re-send `new_project: true` after the operator confirms, or park on `general_discussion`. Declare a project once. `--domain` is a registered section; repeat the flag. Omit it and the record is filed under the project with no section. `"new_domain": true` (or `--new-domain`) only after the operator confirms. Entities are concept nouns the operator named. Mint with `new_entities` only after they confirm; every minted name is also in `entities`. A decision sends no entities. `--grounded-in` is `601:based_on` (bare id; roles `based_on`, `considered`, `rejected`, `under_conditions`, `informed_by`). `--alternatives` is one option per flag, stored verbatim. A retrospective sends no project, domain, or entities. `--source-ref` is the instrument that measured the outcome.
+Filters are flags. `search "reranker --project shared-memory-GitHub --domain delivery"` searches those words. It does not set the flags.
 
-Don't. Hand-type a project that differs from the folder. Re-send the same unknown name and expect success. Send `fact:601` as a grounding id. The parser drops a non-numeric id and does not error. If every id is dropped, the decision is stored ungrounded and only flagged. A bare id takes the fact-kind default. Put why-not inside `--alternatives`; that belongs in the rationale. Inherit a domain from the evidence. Omit stores no section. Auto-decide. Invent an entity.
+`--domain` matches stored `metadata.domains` only. A miss, and the call returns `[]` with no insight: read-side `belonging`, a retrospective, a decision that omitted a section, a thematic summary's `metadata.domain` string. `--domain delivery` with no `--project` is that literal in every project. A 17th `--domain` is `filters_invalid`. An unknown name matches nothing.
 
-Practice. Ask once for entities and accept none. `entities_provenance` is `operator` or `agent` per name when you know it. Omitting it still saves. Elicit a domain only when that project already has sections. The rationale is a Y-statement: in the context of X, we chose Y over Z, accepting W. Confirm with the operator before `save_decision`.
+Keyword fallback, do not `lineage` it. Stderr is `EMBEDDING UNAVAILABLE`. `ranked: false` drops Tier-3.
 
-**C — Edit.** `save … --supersedes OLD`, or `supersede --pg-id N`. Overturn a decision with `save_retrospective --pg-id N --rating reversed`.
+```json
+{"score_normalized": 0.5, "ranked": false}
+```
 
-Do. Supersede a fact whose content is now wrong. After `lineage`, rewrite the index pointer to the successor id.
+`stale_sources`: `old` may be a fact, a decision, or a retrospective. A 404 names the real ref.
 
-Don't. Re-save the same content onto another project, domain, or entity set (`axis_conflict`). Use `--supersedes` on a decision. A renamed section is not resolved on that re-save; supersede instead. Leave the old id in an index after you have the successor.
+```
+lineage decision:2522
+```
 
-Practice. `--rating reversed` removes the decision from Tier-1 search and keeps the verdict. A later retrospective on the same decision is the live verdict.
+Then rewrite the index line from `decision:2522` to the successor id.
+
+**B — Create.** Run from the project directory. The walk stops at `.git`, `CLAUDE.md`, `AGENTS.md`, or `GEMINI.md`, not `$HOME`. `SHARED_MEMORY_PROJECT=shared-memory-GitHub` overrides it.
+
+```
+save "v0.9.109 shipped" '{"source":"grok","source_ref":"OPERATE.md","domain":"delivery"}'
+```
+
+Omit `domain` and the record stores no section. It does not inherit one.
+
+Operator confirmed a new project:
+
+```
+save "first note" '{"source":"grok","project":"new-name","new_project":true}'
+```
+
+Empty project is `project_required`. The same unknown name again is `project_unknown` and does not succeed. Second submission is in `USAGE.md`.
+
+Operator named the concept:
+
+```
+save "lock order" '{"source":"grok","entities":["LockOrder"],"new_entities":["LockOrder"],"entities_provenance":{"LockOrder":"operator"}}'
+```
+
+Decision, after the operator confirms. Ids are bare. `fact:601` in this slot is dropped with no error; if every id is dropped the decision is stored ungrounded and only flagged.
+
+```
+save_decision --title "Ship the skill index" --decided-by "Xenofon" --rationale "In the context of a 70KB refusal, we chose a 15KB index over keeping the essay, accepting a second file." --grounded-in "2672:based_on" --alternatives "keep the 70KB file" --confidence high
+```
+
+`--new-domain` only after the operator confirms. No entities on this command.
+
+Retrospective. No project, no domain, no entities.
+
+```
+save_retrospective --pg-id 2675 --rating validated --notes "The index loads." --grounded-in "2678" --source-ref OPERATE.md
+```
+
+**C — Edit.**
+
+```
+save "the split shipped in v0.9.109" '{"source":"grok","source_ref":"OPERATE.md"}' --supersedes 2672
+```
+
+```
+supersede --pg-id 2672
+```
+
+```
+save_retrospective --pg-id 2522 --rating reversed --notes "The split shipped." --grounded-in "2678" --source-ref OPERATE.md
+```
+
+```
+review-hold --summary-id 411 --pg-id 2672
+```
+
+`save_decision --supersedes 2522` is not an overturn. Re-saving the same content onto other axes is `axis_conflict`. A renamed section is not resolved on that re-save. `--rating reversed` drops the decision from Tier-1 search and keeps the verdict. A later retrospective on the same `--pg-id` is the live verdict. After `lineage`, the index line uses the successor id.
 
 ## Capture index
 
