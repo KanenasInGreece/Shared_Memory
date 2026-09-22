@@ -1,9 +1,9 @@
 # AGENT.md
 
-**→ Read [`AGENTS.md`](AGENTS.md) — the canonical agent file for this repository.**
+**→ Install, update, or uninstall: [`OPERATE.md`](OPERATE.md).**
 
-It has one mission: **operate the framework** on the user's machine — interview-driven first install (writes `shared-memory/.env` from the template), start/stop/status, token issuance, installing the skill into each agent, upgrade, and backup. Quick start, maintenance, and updates.
+**→ Coding this repository: [`AGENTS.md`](AGENTS.md).**
 
-For architecture, internals, or changing the framework's own code, use [`README.md`](README.md) — the authoritative deep reference.
+**→ Architecture: [`README.md`](README.md).**
 
-This file exists only so agents that look for `AGENT.md` find their way; the two files previously carried duplicate guidance, which drifted. All operating content now lives in `AGENTS.md`.
+This file is a pointer. Do not paste procedures here. Codex loads `AGENTS.md` on its own. An install, update, or uninstall agent loads `OPERATE.md`.

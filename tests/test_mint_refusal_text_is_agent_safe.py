@@ -126,7 +126,7 @@ def test_the_bulk_mints_undeliverable_block_still_labels_reveal(tmp_path, capsys
 
 
 def test_no_runnable_reveal_command_in_agents_md_is_unlabelled():
-    """The same rule, one level up: AGENTS.md is the AGENT path.
+    """The same rule, one level up: OPERATE.md is the AGENT path.
 
     ⚠ SCOPED TO FENCED CODE BLOCKS ON PURPOSE, and the scope is the finding, not
     a convenience. A first cut asserted over every PARAGRAPH containing the
@@ -137,7 +137,7 @@ def test_no_runnable_reveal_command_in_agents_md_is_unlabelled():
     instruction, and an assertion that cannot tell them apart reports the
     document's shape rather than its safety.
     """
-    with open(os.path.join(_REPO, "AGENTS.md"), encoding="utf-8") as fh:
+    with open(os.path.join(_REPO, "OPERATE.md"), encoding="utf-8") as fh:
         lines = fh.read().splitlines()
 
     in_fence = False
@@ -154,7 +154,7 @@ def test_no_runnable_reveal_command_in_agents_md_is_unlabelled():
         if not re.search(r"operator|yourself|never through an agent", window, re.I):
             offenders.append(f"{i + 1}: {line.strip()}")
 
-    assert checked, "fixture stale: AGENTS.md has no runnable --reveal command at all"
+    assert checked, "fixture stale: OPERATE.md has no runnable --reveal command at all"
     assert not offenders, (
-        "AGENTS.md offers a runnable --reveal command with no operator-only "
+        "OPERATE.md offers a runnable --reveal command with no operator-only "
         "warning within twelve lines:\n  " + "\n  ".join(offenders))

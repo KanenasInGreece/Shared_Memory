@@ -5,7 +5,7 @@ retrospectives, agent-decisions) call query_graph() -> POST /memory/graph
 and return 403 for read tokens. Docs must not claim they hit
 search/telemetry or remain available to read.
 
-F-AU-001: user-facing read-role help (minter stdout, AGENTS.md, SECURITY.md,
+F-AU-001: user-facing read-role help (minter stdout, OPERATE.md, SECURITY.md,
 .env.example) must match gateway truth — a read token may reach
 GET /memory/telemetry, POST /memory/search, and GET /memory/status/{pg_id};
 POST /memory/graph is 403; /health is anonymous (not a read-role grant).
@@ -182,19 +182,19 @@ def test_add_monitor_stdout_names_search_and_does_not_grant_graph(tmp_path):
 
 
 def _agents_md_read_role_paragraph() -> str:
-    text = _read(os.path.join(_ROOT, "AGENTS.md"))
+    text = _read(os.path.join(_ROOT, "OPERATE.md"))
     start = text.find("A READ-ONLY IDENTITY IS ALWAYS MINTED READ-ONLY")
-    assert start != -1, "AGENTS.md is missing the read-only identity paragraph"
+    assert start != -1, "OPERATE.md is missing the read-only identity paragraph"
     rest = text[start:]
     end = rest.find("\n⚠")
-    assert end != -1, "AGENTS.md read-role paragraph has no following warning"
+    assert end != -1, "OPERATE.md read-role paragraph has no following warning"
     return rest[:end]
 
 
 def test_agents_md_read_role_sentence_matches_gateway():
     """Public installer: the read-role sentence matches gateway truth."""
     _assert_read_role_blurb_matches_gateway(
-        _agents_md_read_role_paragraph(), label="AGENTS.md read-role sentence",
+        _agents_md_read_role_paragraph(), label="OPERATE.md read-role sentence",
     )
 
 

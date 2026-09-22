@@ -1,4 +1,4 @@
-"""AGENTS.md ordering fix (decision:1473, grounded on fact:1472): a fresh
+"""OPERATE.md ordering fix (decision:1473, grounded on fact:1472): a fresh
 host with no agent skill directories present produced 0 minted tokens, 0
 digests, no file written, and an empty AGENT_TOKENS= line under the
 PREVIOUSLY documented order -- Phase 6 minted before Phase 8 (which
@@ -14,7 +14,7 @@ after installing that agent's skill package. Phase 7's verification must
 also stop reading an auth-OFF install's inevitable HTTP 200 as "auth
 verified".
 
-Every test here is purely structural -- it parses AGENTS.md prose and the
+Every test here is purely structural -- it parses OPERATE.md prose and the
 shipped scripts' SOURCE TEXT, and never imports or executes
 generate_tokens.py/bootstrap_tokens.sh (that execution path is
 categorically off-limits: generate_tokens.py's mint() resolves its
@@ -76,7 +76,7 @@ def test_phase6_does_not_claim_to_write_local_agent_tokens():
     it can actually deliver on a fresh host, and say where a local agent's
     token now comes from instead.
     """
-    agents_md = _read("AGENTS.md")
+    agents_md = _read("OPERATE.md")
     section = _section(agents_md, "### Phase 6", "### Phase 7")
 
     assert "writes each LOCAL agent's token straight into" not in section, (
@@ -107,7 +107,7 @@ def test_phase6_names_are_derived_from_generate_tokens_own_roster():
     remote_agents = [a for a in roster if a not in local_agents]
     assert remote_agents, "every roster agent has a local path -- update this test's premise"
 
-    agents_md = _read("AGENTS.md")
+    agents_md = _read("OPERATE.md")
     section = _section(agents_md, "### Phase 6", "### Phase 7")
 
     missing_remote = [a for a in remote_agents if a not in section]
@@ -143,7 +143,7 @@ def test_phase8_mints_each_local_agent_after_installing_its_package():
         "update this test before trusting it"
     )
 
-    agents_md = _read("AGENTS.md")
+    agents_md = _read("OPERATE.md")
     section = _section(agents_md, "### Phase 8 —", "### Phase 8b")
 
     code_block = re.search(r"```bash\n(.*?)```", section, re.S)
@@ -227,7 +227,7 @@ def test_phase7_check_keys_on_payload_shape_not_status_or_bare_auth_required_tru
         "AUTH_CONFIGURED_AT_STARTUP -- update this test before trusting it"
     )
 
-    agents_md = _read("AGENTS.md")
+    agents_md = _read("OPERATE.md")
     section = _section(agents_md, "### Phase 7", "### Phase 8")
 
     assert "auth_required" in section and re.search(r"auth_required.{0,10}false", section), (
@@ -264,16 +264,16 @@ def test_agents_md_has_no_export_agent_token_paste_shape():
     agent) to already HOLD the raw token value to paste in, which for an
     agent means reading it out of the skill .env first: `. file` EXECUTES
     the file rather than just reading it, and cat/grep puts the raw
-    credential in the agent's own transcript (fact:1499). AGENTS.md now
+    credential in the agent's own transcript (fact:1499). OPERATE.md now
     reads the value via `sed` into a shell variable, never sourcing the
     file and never printing the value anywhere. This test greps the whole
     document for any surviving `export AGENT_TOKEN=<`-shaped paste (the
     ellipsis/placeholder forms this fix removed), rather than pinning the
     two known line numbers, so a THIRD site introduced later fails here
     too."""
-    agents_md = _read("AGENTS.md")
+    agents_md = _read("OPERATE.md")
     assert not re.search(r"export AGENT_TOKEN=", agents_md), (
-        "AGENTS.md still has an `export AGENT_TOKEN=<value>`-shaped paste -- "
+        "OPERATE.md still has an `export AGENT_TOKEN=<value>`-shaped paste -- "
         "read it via the AGENT_ENV + sed shape instead (see Phase 9 / "
         "Upgrade), never `. file` (executes it) and never cat/grep it "
         "(fact:1499: a raw credential must never pass through an agent's "
@@ -281,7 +281,7 @@ def test_agents_md_has_no_export_agent_token_paste_shape():
     )
 
 
-# ── Fix round F9 (QA MED-4): the same no-paste grep, widened past AGENTS.md
+# ── Fix round F9 (QA MED-4): the same no-paste grep, widened past OPERATE.md
 #    to the rest of the agent-readable doc/script set. README.md:459 is
 #    deliberately excluded -- it is the human-voice Quick Start, which per
 #    this repo's own ground rules a builder never rewrites (a fix there is
@@ -294,14 +294,14 @@ def test_agents_md_has_no_export_agent_token_paste_shape():
 def test_doc_set_has_no_export_agent_token_paste_shape(relpath):
     """postflight.md's Quick Start and postflight.sh's own header comment +
     runtime A1 failure messages used to instruct the same unsafe paste
-    AGENTS.md's fix already closed -- an agent following postflight.md, or
+    OPERATE.md's fix already closed -- an agent following postflight.md, or
     reading postflight.sh's own error message after a failed run, would do
     exactly what fact:1499 forbids. Same grep, same property, different
     file."""
     text = _read(relpath)
     assert not re.search(r"export AGENT_TOKEN=", text), (
         f"{relpath} still has an `export AGENT_TOKEN=<value>`-shaped paste -- "
-        "read it via the AGENT_ENV + sed shape instead (see AGENTS.md Phase 9 "
+        "read it via the AGENT_ENV + sed shape instead (see OPERATE.md Phase 9 "
         "/ Upgrade for the pattern), never `. file` (executes it) and never "
         "cat/grep it (fact:1499)"
     )
@@ -312,7 +312,7 @@ def test_agents_md_agent_token_reads_use_the_non_executing_sed_shape():
     the `sed -n 's/^AGENT_TOKEN=//p' "$AGENT_ENV"` shape -- never `. file`
     (which EXECUTES the env file as shell) and never cat/grep the file
     (which would put the raw value in a tool-call transcript)."""
-    agents_md = _read("AGENTS.md")
+    agents_md = _read("OPERATE.md")
     occurrences = re.findall(
         r"""AGENT_TOKEN=\$\(sed -n 's/\^AGENT_TOKEN=//p' "\$AGENT_ENV" \| head -1\); export AGENT_TOKEN""",
         agents_md,
@@ -328,7 +328,7 @@ def test_agents_md_agent_token_reads_use_the_non_executing_sed_shape():
         f"Upgrade), found {len(occurrences)}"
     )
     assert not re.search(r"^\s*\.\s+\$?\{?AGENT_ENV\}?\s*$", agents_md, re.M), (
-        "AGENTS.md sources the skill .env with `. file` somewhere -- that "
+        "OPERATE.md sources the skill .env with `. file` somewhere -- that "
         "EXECUTES the credential file rather than reading one value out of "
         "it (ADV1-9)"
     )

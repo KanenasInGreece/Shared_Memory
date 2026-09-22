@@ -438,30 +438,30 @@ def test_every_script_the_upgrade_path_names_actually_exists():
     v0.8.45's verifiers came to be documented with a dependency they silently
     needed and never named.
     """
-    agents = _read("AGENTS.md")
+    agents = _read("OPERATE.md")
     referenced = set(re.findall(r"(shared-memory/(?:scripts|migrations|ops)/[\w./-]+\.(?:py|sh))",
                                 agents))
-    assert referenced, "no scripts referenced in AGENTS.md — the regex has rotted"
+    assert referenced, "no scripts referenced in OPERATE.md — the regex has rotted"
     missing = sorted(p for p in referenced
                      if not os.path.exists(os.path.join(_ROOT, p)))
     assert not missing, (
-        f"AGENTS.md names these scripts and they do not exist: {missing}")
+        f"OPERATE.md names these scripts and they do not exist: {missing}")
 
 
 def test_agents_md_states_postflights_actual_exit_condition():
-    """GROUP 5. AGENTS.md line ~272 said postflight "exits 0 iff assertions
+    """GROUP 5. OPERATE.md line ~272 said postflight "exits 0 iff assertions
     A1-A5 pass" through v0.9.24, when A8 shipped (a REAL reasoning-backend
     completion through the gateway proxy path) and postflight.md's own spec
     (the authoritative contract -- postflight.sh's header says so explicitly:
     "THE SPEC IS THE CONTRACT... where this script and that document
     disagree, the document wins") moved the exit condition to A1-A5 AND A8.
-    AGENTS.md was never updated, so an operating agent reading it would
+    OPERATE.md was never updated, so an operating agent reading it would
     believe an A8 failure (or a missing SKIP) does not affect the exit code.
 
-    This pins AGENTS.md's claim against postflight.md's own "Exit code:"
+    This pins OPERATE.md's claim against postflight.md's own "Exit code:"
     line rather than a hardcoded string, so the NEXT assertion added to the
     contract (A9, say) fails this test the same way A8 did, instead of
-    leaving AGENTS.md to drift silently again.
+    leaving OPERATE.md to drift silently again.
     """
     spec = _read("shared-memory", "Documentation", "postflight.md")
     m = re.search(r"\*\*Exit code:\*\*\s*`0`\s*iff assertions\s*\*\*([^*]+?)\*\*\s*all pass",
@@ -469,10 +469,10 @@ def test_agents_md_states_postflights_actual_exit_condition():
     assert m, "postflight.md's own Exit code line has changed shape — update the regex"
     exit_condition = m.group(1).strip()  # e.g. "A1–A5 and A8"
 
-    agents = _read("AGENTS.md")
+    agents = _read("OPERATE.md")
     assert exit_condition in agents, (
         f"postflight.md's spec now says the exit condition is {exit_condition!r}, "
-        "but AGENTS.md's Phase 9 section does not say the same thing -- "
+        "but OPERATE.md's Phase 9 section does not say the same thing -- "
         "it is quoting a stale assertion range again."
     )
 
@@ -485,7 +485,7 @@ def test_agents_md_states_postflights_actual_exit_condition():
 
 
 def test_agents_md_pipes_the_right_number_of_answers_into_install_framework():
-    """GROUP 5. AGENTS.md's Phase 1 no longer hand-mirrors install_framework.sh
+    """GROUP 5. OPERATE.md's Phase 1 no longer hand-mirrors install_framework.sh
     (D11 fix, fix round) -- it DRIVES it via piped stdin, feeding N
     newline-delimited answers in the order the script's prompts appear. That
     killed the "hand-copied step list drifts from what the script actually
@@ -499,11 +499,11 @@ def test_agents_md_pipes_the_right_number_of_answers_into_install_framework():
     script side by structurally counting its own `ask`/`ask_secret` call
     sites and top-level `read -r -p` calls (excluding the already-exists
     overwrite prompt, which fires ONLY when shared-memory/.env already
-    exists -- a path AGENTS.md's documented flow explicitly skips itself
+    exists -- a path OPERATE.md's documented flow explicitly skips itself
     for -- and excluding the `read` lines INSIDE the ask()/ask_secret()
     function BODIES, which are counted once per call site below instead of
     once per definition); the doc side by parsing the literal printf format
-    string AGENTS.md actually pipes into the script.
+    string OPERATE.md actually pipes into the script.
     """
     script = _read("shared-memory", "scripts", "install_framework.sh")
 
@@ -527,13 +527,13 @@ def test_agents_md_pipes_the_right_number_of_answers_into_install_framework():
         )
     assert script_sequence, "no prompts extracted from install_framework.sh — the regex has rotted"
 
-    agents = _read("AGENTS.md")
+    agents = _read("OPERATE.md")
     m = re.search(
         r"printf '([^']*)'[^\n]*\\\n\s*\|\s*bash shared-memory/scripts/install_framework\.sh",
         agents,
     )
     assert m, (
-        "AGENTS.md's Phase 1 no longer pipes a printf'd answer sequence into "
+        "OPERATE.md's Phase 1 no longer pipes a printf'd answer sequence into "
         "install_framework.sh the way this test expects — either update the "
         "regex, or Phase 1 has reverted to hand-mirroring the script again "
         "(the exact class the D11 fix this test guards exists to prevent)."
@@ -555,9 +555,9 @@ def test_agents_md_pipes_the_right_number_of_answers_into_install_framework():
 
     assert len(piped) == len(script_sequence), (
         f"install_framework.sh's fresh-.env path now issues {len(script_sequence)} "
-        f"prompts (types, in order: {script_sequence}), but AGENTS.md's Phase 1 "
+        f"prompts (types, in order: {script_sequence}), but OPERATE.md's Phase 1 "
         f"printf line pipes {len(piped)} answers into it. The script's prompt "
-        "sequence changed — update AGENTS.md's Phase 1 piped-answer line (and "
+        "sequence changed — update OPERATE.md's Phase 1 piped-answer line (and "
         "its explanatory prose) to match, in the same order, or an answer will "
         "silently land in the wrong field."
     )
@@ -571,13 +571,13 @@ def test_agents_md_pipes_the_right_number_of_answers_into_install_framework():
         if kind == "confirm":
             assert tok in ("y", "n"), (
                 f"prompt #{i + 1} in install_framework.sh is a y/n confirm, but "
-                f"AGENTS.md's Phase 1 printf line pipes {tok!r} into that slot "
+                f"OPERATE.md's Phase 1 printf line pipes {tok!r} into that slot "
                 "— expected a literal 'y' or 'n'."
             )
         elif kind == "value":
             assert tok == "%s", (
                 f"prompt #{i + 1} in install_framework.sh is a plain value "
-                f"prompt (ask()), but AGENTS.md's Phase 1 printf line pipes "
+                f"prompt (ask()), but OPERATE.md's Phase 1 printf line pipes "
                 f"{tok!r} into that slot — expected '%s' (a substituted "
                 "variable); an empty answer here would silently accept that "
                 "prompt's own default instead."
@@ -585,7 +585,7 @@ def test_agents_md_pipes_the_right_number_of_answers_into_install_framework():
         elif kind == "secret":
             assert tok in ("%s", ""), (
                 f"prompt #{i + 1} in install_framework.sh is a password prompt "
-                f"(ask_secret()), but AGENTS.md's Phase 1 printf line pipes "
+                f"(ask_secret()), but OPERATE.md's Phase 1 printf line pipes "
                 f"{tok!r} into that slot — expected '%s' or an empty line "
                 "(empty = ask_secret() generates the password internally, "
                 "W7 round 3, fact:1499)."
@@ -595,9 +595,9 @@ def test_agents_md_pipes_the_right_number_of_answers_into_install_framework():
     script_confirm_count = sum(1 for t in script_sequence if t == "confirm")
     assert piped_confirm_count == script_confirm_count, (
         f"install_framework.sh's fresh-.env path now asks {script_confirm_count} "
-        f"y/n-style questions, but AGENTS.md's Phase 1 printf line pipes "
+        f"y/n-style questions, but OPERATE.md's Phase 1 printf line pipes "
         f"{piped_confirm_count} literal y/n answers ('y'/'n', not '%s' or "
-        "empty) — update AGENTS.md's Phase 1 piped-answer line to match."
+        "empty) — update OPERATE.md's Phase 1 piped-answer line to match."
     )
 
 
@@ -652,16 +652,16 @@ def test_agents_md_download_command_carries_no_hardcoded_version():
     is correct on the day it ships and silently wrong at the next release —
     it would download a stale tag while the `cd` still happens to work.
 
-    AGENTS.md is deliberately NOT in _VERSION_PINS: adding it would make a
+    OPERATE.md is deliberately NOT in _VERSION_PINS: adding it would make a
     version bump land in five places, and the four-place rule is the operator's
     to change. So the command stays version-free and this guards that.
     """
-    src = _read("AGENTS.md")
+    src = _read("OPERATE.md")
     urls = re.findall(r"archive/refs/tags/(\S+?)\.tar\.gz", src)
-    assert urls, "the tarball download command vanished from AGENTS.md"
+    assert urls, "the tarball download command vanished from OPERATE.md"
     for tag in urls:
         assert not re.fullmatch(r"v\d+\.\d+\.\d+", tag), (
-            f"AGENTS.md pins the release tag '{tag}' in a download URL. Nothing "
+            f"OPERATE.md pins the release tag '{tag}' in a download URL. Nothing "
             f"bumps it, so it goes stale at the next release — use the vX.Y.Z "
             f"placeholder and point the reader at the releases page."
         )
@@ -829,23 +829,23 @@ def test_llm_backend_private_ok_default_source_pin():
 def test_vllm_runbooks_pin_max_model_len_8192():
     """decision:2540 Task 7: both runbooks for serving encoders with vLLM
     (README 'Serving the encoders with vLLM instead of llama.cpp' and
-    AGENTS.md 'Serve the encoders with vLLM') must require --max-model-len 8192
+    OPERATE.md 'Serve the encoders with vLLM') must require --max-model-len 8192
     to match EMBED_MAX_CONTEXT_TOKENS."""
-    agents = _read("AGENTS.md")
+    agents = _read("OPERATE.md")
     readme = _read("README.md")
 
     # Locate the vLLM sections
     agents_marker = "### Serve the encoders with vLLM"
     readme_marker = "#### Serving the encoders with vLLM instead of llama.cpp"
 
-    assert agents_marker in agents, f"AGENTS.md missing section {agents_marker!r}"
+    assert agents_marker in agents, f"OPERATE.md missing section {agents_marker!r}"
     assert readme_marker in readme, f"README.md missing section {readme_marker!r}"
 
     agents_section = agents[agents.index(agents_marker):agents.index(agents_marker) + 2000]
     readme_section = readme[readme.index(readme_marker):readme.index(readme_marker) + 2000]
 
     assert "--max-model-len 8192" in agents_section, (
-        "AGENTS.md's 'Serve the encoders with vLLM' section must require '--max-model-len 8192' "
+        "OPERATE.md's 'Serve the encoders with vLLM' section must require '--max-model-len 8192' "
         "to ensure the encoder window meets EMBED_MAX_CONTEXT_TOKENS (decision:2540)"
     )
     assert "--max-model-len 8192" in readme_section, (

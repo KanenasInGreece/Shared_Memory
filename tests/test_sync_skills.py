@@ -185,10 +185,10 @@ def test_update_reports_refreshed_distinctly_from_current():
     assert "already current" in text
 
 
-# ── AGENTS.md must not drift from the shipped package ────────────────────────
+# ── OPERATE.md must not drift from the shipped package ────────────────────────
 
 def test_agents_md_names_every_file_the_manifest_ships():
-    """AGENTS.md Phase 8 used to tell the operating agent to install SKILL.md and
+    """OPERATE.md Phase 8 used to tell the operating agent to install SKILL.md and
     memory_bridge.py only — 2 of 6 shipped files — which broke its OWN later
     phases: 8b copies from CONSTITUTION_SNIPPET.md in the skill dir, and 8c runs
     update_skill.sh from there. If a file joins the manifest, Phase 8 has to know.
@@ -198,11 +198,11 @@ def test_agents_md_names_every_file_the_manifest_ships():
     with open(manifest, encoding="utf-8") as f:
         shipped = [ln.strip() for ln in f
                    if ln.strip() and not ln.strip().startswith("#")]
-    with open(os.path.join(ROOT, "AGENTS.md"), encoding="utf-8") as f:
+    with open(os.path.join(ROOT, "OPERATE.md"), encoding="utf-8") as f:
         agents = f.read()
     missing = [rel for rel in shipped if os.path.basename(rel) not in agents]
     assert not missing, (
-        f"AGENTS.md does not mention shipped skill file(s): {missing} — Phase 8 "
+        f"OPERATE.md does not mention shipped skill file(s): {missing} — Phase 8 "
         f"would install an incomplete package"
     )
 

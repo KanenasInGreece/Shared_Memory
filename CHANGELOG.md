@@ -7,6 +7,12 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.9.109] — 2026-09-22
+
+### Changed
+- `SKILL.md` is an agent-sized index (commands, Always / Ask / Never, capture pins, patterns A–C). The essays live in `USAGE.md`, which is on the skill manifest.
+- Install, update, and uninstall moved from the auto-loaded `AGENTS.md` into `OPERATE.md`. `AGENTS.md` is the coding constitution. Paste fences do not chain a restore after an upgrade, or an irreversible uninstall after `service`.
+
 ### Fixed
 - An `LLM_BACKENDS_JSON` entry with no `url` (including OpenAI SDK's `base_url` used by mistake) is now logged and excluded instead of skipped silently. The pool still falls back; dreaming looks down until the key is renamed to `url`. Saves and search do not use this pool. A non-object JSON entry (a bare URL string) is excluded the same way instead of crashing import.
 - `check_config.py --phase-a-only` names a missing `url` / OpenAI `base_url` key without printing the URL value, so an installing agent can see the trap before restarting the gateway.

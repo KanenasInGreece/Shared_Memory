@@ -1,5 +1,5 @@
 """Fix D (corpus fact:1511/fact:1512): the detached-HEAD refusal names a
-concrete remedy, and AGENTS.md's upgrade runbook documents the case.
+concrete remedy, and OPERATE.md's upgrade runbook documents the case.
 
 MEASURED FINDING (context item 3): update_framework.sh's detached-HEAD
 refusal told an operator to "check out the release branch or tag you intend
@@ -15,7 +15,7 @@ so they cannot silently diverge:
      concretely (`git checkout main`) as the default remedy, while keeping
      the tag alternative for an operator who deliberately wants a pinned
      release rather than the moving branch.
-  2. AGENTS.md's upgrade runbook (## Upgrade (gateway host)) gains a
+  2. OPERATE.md's upgrade runbook (## Upgrade (gateway host)) gains a
      paragraph documenting the detached-HEAD case and the same recovery.
 
 README.md is explicitly OUT OF SCOPE for this fix (build brief: propose,
@@ -75,12 +75,12 @@ def test_the_old_unnamed_remedy_wording_does_not_survive_verbatim():
 
 
 def test_agents_md_documents_the_detached_head_case():
-    agents = _read("AGENTS.md")
+    agents = _read("OPERATE.md")
     # Scoped to the Upgrade runbook section specifically, not just anywhere
-    # in the file, per the build brief ("AGENTS.md's upgrade runbook gains a
+    # in the file, per the build brief ("OPERATE.md's upgrade runbook gains a
     # short row/paragraph").
     m = re.search(r"### Upgrade \(gateway host\)(.*?)\n## ", agents, re.S)
-    assert m, "could not find the '### Upgrade (gateway host)' section in AGENTS.md"
+    assert m, "could not find the '### Upgrade (gateway host)' section in OPERATE.md"
     section = m.group(1)
 
     assert "DETACHED HEAD" in section, (
@@ -97,7 +97,7 @@ def test_agents_md_and_the_script_name_the_same_remedy():
     future rename of the release branch cannot update one and silently leave
     the other stale."""
     script_text = _detached_head_refusal_text()
-    agents = _read("AGENTS.md")
+    agents = _read("OPERATE.md")
     m = re.search(r"### Upgrade \(gateway host\)(.*?)\n## ", agents, re.S)
     assert m
     section = m.group(1)
@@ -114,7 +114,7 @@ def test_agents_md_and_the_script_name_the_same_remedy():
     )
     assert script_remedy.group(1) == doc_remedy.group(1), (
         f"update_framework.sh recommends 'git checkout {script_remedy.group(1)}' "
-        f"but AGENTS.md recommends 'git checkout {doc_remedy.group(1)}' -- they "
+        f"but OPERATE.md recommends 'git checkout {doc_remedy.group(1)}' -- they "
         f"have diverged"
     )
 
