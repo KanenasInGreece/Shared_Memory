@@ -215,7 +215,7 @@ bash shared-memory/scripts/update_framework.sh --dry-run
 bash shared-memory/scripts/update_framework.sh
 ```
 
-`--from-restore` is a different entry. Run it only after `shared-memory/ops/restore.sh` has loaded a dump, and only after the operator has agreed. It overwrites both databases. Do not paste it into an upgrade.
+`--from-restore` is a different entry. Run it only after `shared-memory/ops/restore.sh` has loaded a dump, and only after the operator has agreed. The overwrite is `restore.sh`. This flag skips `git pull` and skips `backup.sh`, then migrates. Do not paste it into an upgrade.
 
 ```bash
 AGENT_ENV=${AGENT_ENV:-$HOME/.claude/skills/shared-memory/.env}
