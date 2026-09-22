@@ -114,10 +114,17 @@ archive_reasoning_trace(session_id="s", task="t", steps=[{"thought":"…"}], pro
 Do not call it. It posts `type` `reasoning_trace`. Ingress returns `unknown_type`. Save the conclusion with `save_artifact`.
 
 # SEARCH-FIRST MANDATE
+
+```
+hybrid_search_and_rerank("was this tested, tried, rejected or done", 5)
+record_lineage("fact:1234")
+graph_query("MATCH (n) RETURN n LIMIT 5")
+```
+
 **Before answering any question about this workstation or its projects — including whether
 something was ever tested, tried, rejected or done: those are questions about history, and the
 current state of files can only confirm an answer, never give one — call `rag-orchestrator` →
-`hybrid_search_and_rerank` first. No exceptions.**
+`hybrid_search_and_rerank` first. No exceptions.** `graph_query` is the next call only for graph depth, and only for role `full` or `admin`.
 
 An id or claim hard-coded in a constitution file, a memory index, a resume or
 a handoff (`fact:N`) is a pointer, not the record. Before citing or acting on
