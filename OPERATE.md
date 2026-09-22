@@ -128,16 +128,21 @@ One new local agent, in this order: `mkdir` the skill directory, then `--add`, t
 
 Say that you pinned dependencies with the lock. The unpinned `uv run --with` form is the operator's choice, not yours.
 
+The smoke test stays in the foreground. Stop it before the next command. It dies with the session, and nothing after it in the same paste will run.
+
 ```bash
 uv run --no-project --with-requirements requirements-gateway.lock \
   python shared-memory/scripts/hive_mind_proxy.py 8888
+```
+
+```bash
 bash shared-memory/ops/install_service.sh
 curl -s http://localhost:8888/health
 ```
 
 HTTP status codes never distinguish auth configured from auth off: both answer 200, and a rejected bearer still gets the anonymous body. Auth on, with no bearer, is exactly `status`, `version`, and `api_version` — no `auth_required` key. Auth off is the full payload and spells `auth_required:false`. Do not treat 200 as proof that auth is on. After a real token exists, an authenticated curl shows `"auth_required":true` plus the daemon fields. `"llm":"down"` blocks dreaming, not saves or search.
 
-Restart the gateway after every mint. Auth is read at startup.
+Auth is read at startup. A mint after this start is not visible until the restart in Phase 8.
 
 ### Phase 8 — Install the skill
 
@@ -149,7 +154,7 @@ bash shared-memory/scripts/bootstrap_tokens.sh --add <agent> --install-path <ski
 bash shared-memory/scripts/sync_skills.sh
 ```
 
-`--add` refuses a name already registered. That is expected on a re-run. Re-home with `--remint <name> --install-path <file>`. Use `--reveal` only when there is no local file, and only the operator runs it.
+`--add` refuses a name already registered. That refusal is expected on a re-run. Move on. `--remint` invalidates that agent's current token. Ask before it. Use `--reveal` only when there is no local file, and only the operator runs it.
 
 An MCP host on this machine uses a walled directory and `--mcp`, in the same order:
 
@@ -159,7 +164,13 @@ bash shared-memory/scripts/bootstrap_tokens.sh --add <agent> --mcp --install-pat
 bash shared-memory/scripts/sync_skills.sh
 ```
 
-`--install-path` is the `.env` file, not the directory. `MANIFEST.txt` is the list of what a skill install ships: `SKILL.md`, `USAGE.md`, `CONSTITUTION_SNIPPET.md`, `.env.example`, `memory_bridge.py`, `update_skill.sh`, and `schema.md`. An `mcp` install receives `vector-skill.py`, `CONSTITUTION_SNIPPET_MCP.md`, and `system-prompt.md` instead, never `mcp/mcp.json`. Spawn that connector with `uv run --no-project` and an absolute `uv`. The host config shape is `mcp/README.md`. Restart the gateway after the mint.
+`--install-path` is the `.env` file, not the directory. `MANIFEST.txt` is the list of what a skill install ships: `SKILL.md`, `USAGE.md`, `CONSTITUTION_SNIPPET.md`, `.env.example`, `memory_bridge.py`, `update_skill.sh`, and `schema.md`. An `mcp` install receives `vector-skill.py`, `CONSTITUTION_SNIPPET_MCP.md`, and `system-prompt.md` instead, never `mcp/mcp.json`. Spawn that connector with `uv run --no-project` and an absolute `uv`. The host config shape is `mcp/README.md`.
+
+Restart after the mint, before `doctor` or `postflight.sh`. The running gateway still has the previous registry.
+
+```bash
+systemctl --user restart hive-mind-gateway.service
+```
 
 Smoke from a project directory, not the skill directory. The first save in an empty corpus needs `new_project: true` and `new_entities`.
 
@@ -216,11 +227,33 @@ bash shared-memory/scripts/update_framework.sh --from-restore
 |---|---|---|
 | 2 | `shared-memory/ops/backup.sh` | The script runs this before migrating. `--skip-backup` is not for a host holding the only copy of the data. |
 
-Do not run `shared-memory/scripts/backfill_domain_of.py` before the restarted gateway is new enough. An older worker can blank record content. `update_framework.sh` already orders that step.
+Do not run `shared-memory/scripts/backfill_domain_of.py` before the restarted gateway is new enough. An older worker can blank record content. A plain `update_framework.sh` skips that step. Pass `--domain-backfill` only when existing records already carry a domain.
 
 Stack reconcile is separate and recreates database containers. Ask first. Show `bash shared-memory/scripts/reconcile_stack.sh --dry-run`. Run `bash shared-memory/scripts/reconcile_stack.sh` only on the operator's word.
 
 If a constitution snippet's version marker moved after sync, propose the new block. Do not overwrite it silently.
+
+## Start, stop, backup
+
+Start brings the stores and the gateway up. It does not install or mint.
+
+```bash
+docker compose -f shared-memory/ops/postgres_neo4j_limits.yaml --env-file shared-memory/.env up -d
+systemctl --user start hive-mind-gateway.service
+```
+
+Stop releases the gateway and the containers. It does not remove skill directories or data.
+
+```bash
+systemctl --user stop hive-mind-gateway.service
+docker compose -f shared-memory/ops/postgres_neo4j_limits.yaml --env-file shared-memory/.env stop
+```
+
+Backup captures Postgres and Neo4j together. It needs a `backup:admin` token already available to the script. Do not paste that token.
+
+```bash
+bash shared-memory/ops/backup.sh
+```
 
 ## Uninstall
 
