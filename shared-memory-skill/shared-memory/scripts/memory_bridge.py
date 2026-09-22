@@ -2006,13 +2006,9 @@ async def main() -> None:
         p.add_argument("--project",     default="",     help="Project context (default: project folder name)")
         p.add_argument("--domain", action="append", default=None, metavar="NAME",
                        help="a registered SECTION of this project; REPEAT for "
-                            "several. A decision asserts its OWN sections rather "
-                            "than inheriting them, because a decision reaches "
-                            "further than the fact that prompted it — a fact about "
-                            "how agents write to the graph is infrastructure, while "
-                            "the decision on who may write is about access. Omit it "
-                            "and the decision takes its grounding facts' sections as "
-                            "a default, which any explicit value replaces.")
+                            "several. Omit stores no section. It does not take "
+                            "the grounding facts' sections. `belonging` is "
+                            "read-side only.")
         p.add_argument("--new-domain", action="store_true",
                        help="THE OPERATOR HAS CONFIRMED these sections are new and "
                             "registers them. Ask first — the registry exists so a "
