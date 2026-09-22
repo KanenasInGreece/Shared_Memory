@@ -7,6 +7,12 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.9.111] — 2026-09-23
+
+### Changed
+- `USAGE.md` and the CLI constitution snippet (v6) teach with commands. The MCP chapter left the CLI package.
+- `system-prompt.md` leads with one call per connector tool. `CONSTITUTION_SNIPPET_MCP.md` is v7. `archive_reasoning_trace`'s docstring names the `unknown_type` refusal. `tests/test_vector_skill_current.py` fails when the connector version, that docstring, or a missing call drifts.
+
 ## [0.9.110] — 2026-09-22
 
 ### Changed
