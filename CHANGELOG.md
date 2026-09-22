@@ -7,6 +7,11 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.9.110] — 2026-09-22
+
+### Changed
+- `SKILL.md` description is the load hook: every memory search, a past decision, a `fact:N` / `decision:N`, lineage, and status. Patterns A–C are commands to copy. The MCP tool catalogue left this file; MCP installs do not receive it.
+
 ## [0.9.109] — 2026-09-22
 
 ### Changed

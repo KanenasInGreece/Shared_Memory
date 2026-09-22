@@ -1,6 +1,6 @@
 ---
 name: shared-memory
-description: Search, save, and query the shared three-tier memory. Use it before reasoning about history, prior decisions, or whether something was tested, tried, rejected, or done (search first), and after significant work (save facts, decisions, and retrospectives).
+description: Use before every memory search and before answering from memory — prior work, a past decision, whether something was tried or rejected, "what did we decide", a fact:N or decision:N, lineage, or status. Search this store first; do not answer those from the chat or from local notes. Also use it to save a fact, a decision, or a retrospective after the operator confirms.
 ---
 
 # Shared Memory
@@ -56,19 +56,97 @@ A fact owns project, domain, and entities. A decision owns project and domain, n
 
 ## Patterns
 
-**A — Search.** The query is the what. `--project NAME` keeps records that belong to that project. `--domain NAME` (repeatable, OR) matches stored `metadata.domains` only — not read-side `belonging`, a retrospective (no stored section), a decision that omitted domain, or a thematic summary (`metadata.domain`, a string) — and if that filter leaves no Tier-1 candidates the search returns `[]` and does not attach an insight. `--domain` without `--project` is a literal string across projects, not one project's section. `--since ISO` (date or datetime) keeps rows created at or after it. Filters combine. They never fall back to an unfiltered search. An unregistered name is not refused on the read path; it matches nothing. More than 16 `--domain` values is `filters_invalid`. Use the qualified `ref` on each hit. Tens of seconds is the reranker, not a hang. `ranked: false` is vector order, and Tier-3 rows are omitted. `EMBEDDING UNAVAILABLE` on stderr means keyword fallback even when rows come back. Those rows have `score_normalized` 0.5, no `ref`, and no `ranked`. Do not treat 0.5 as a rerank and do not pass them to `lineage`. `stale_sources`: `old` may be a fact, a decision, or a retrospective. Pass `lineage` the qualified ref. A 404 names the real ref. Do not force `fact:`. `stale_summaries` is a moved thematic summary under an insight. `lineage` the successor, then repair the index pointer.
+Search, then create, then edit. Copy the command. The line under it is what that command does.
 
-**B — Create.** Run `save` from the project directory. The client walks up to `.git`, `CLAUDE.md`, `AGENTS.md`, or `GEMINI.md`, stops at `$HOME`, and does not pass `$HOME`. `SHARED_MEMORY_PROJECT` overrides the walk. Do not hand-type a project that differs from that folder. Empty project is `project_required`. An unregistered name is `project_unknown` (with `proposals`). Second submission: pick a proposal, re-send with `new_project: true` after the operator confirms, or park on `general_discussion`. Re-sending the same unknown name does not succeed. Declare a new project once; later saves use the registered name and need no flag.
+**A — Search.**
 
-`--domain` is a registered section. Repeat the flag. Elicit one only when that project already has sections. A record with no domain is filed under its project. `"new_domain": true` (or `--new-domain` on `save_decision`) only after the operator confirms.
+```
+search "reranker cache-ram" 5 --project shared-memory-GitHub --domain delivery --since 2026-09-01
+```
 
-Entities are concept nouns the operator named (`LockOrder`, not a sentence and not the project). Ask once and accept none. Mint with `new_entities` only after they confirm; every minted name must also be in `entities`. Stamp `entities_provenance` as `operator` or `agent` per name when you know it. Omitting it still saves.
+→ hits carry `ref` `fact:2678`. Then:
 
-A decision sends no entities. Confirm with the operator before the call. The rationale is a Y-statement: in the context of X, we chose Y over Z, accepting W. `--grounded-in` is `pg_id:role` pairs (`based_on`, `considered`, `rejected`, `under_conditions`, `informed_by`). Ids are bare integers (`601:based_on`). `fact:601` is for `lineage` and for search refs. The grounding parser drops a non-numeric id and does not error. If every id is dropped, the decision is stored ungrounded and only flagged. A bare id takes the fact-kind default. `--alternatives` is one option per flag, stored verbatim. Naming no `--domain` stores no section. A decision does not inherit its evidence's sections.
+```
+lineage fact:2678
+```
 
-A retrospective names the decision's `--pg-id` and no project, domain, or entities. `--rating` is an outcome state. `--grounded-in` cites the facts that measured the outcome. `--source-ref` is that instrument.
+```
+query why-to-check --title "AGENTS.md recut"
+```
 
-**C — Edit.** Correct a fact with `save … --supersedes OLD`, or retract it with `supersede --pg-id`. Do not re-save the same content onto a different project, domain, or entity set (`axis_conflict`). A renamed section is not resolved on that re-save; supersede instead. Overturn a decision only with a retrospective `--rating reversed` (the decision leaves Tier-1 search; the verdict stays). A later retrospective on the same decision is the live verdict. After `lineage`, rewrite the index pointer to the successor id.
+Filters are flags. `search "reranker --project shared-memory-GitHub --domain delivery"` searches those words. It does not set the flags.
+
+`--domain` matches stored `metadata.domains` only. A miss, and the call returns `[]` with no insight: read-side `belonging`, a retrospective, a decision that omitted a section, a thematic summary's `metadata.domain` string. `--domain delivery` with no `--project` is that literal in every project. A 17th `--domain` is `filters_invalid`. An unknown name matches nothing.
+
+Keyword fallback, do not `lineage` it. Stderr is `EMBEDDING UNAVAILABLE`. `ranked: false` drops Tier-3.
+
+```json
+{"score_normalized": 0.5, "ranked": false}
+```
+
+`stale_sources`: `old` may be a fact, a decision, or a retrospective. A 404 names the real ref.
+
+```
+lineage decision:2522
+```
+
+Then rewrite the index line from `decision:2522` to the successor id.
+
+**B — Create.** Run from the project directory. The walk stops at `.git`, `CLAUDE.md`, `AGENTS.md`, or `GEMINI.md`, not `$HOME`. `SHARED_MEMORY_PROJECT=shared-memory-GitHub` overrides it.
+
+```
+save "v0.9.109 shipped" '{"source":"grok","source_ref":"OPERATE.md","domain":"delivery"}'
+```
+
+Omit `domain` and the record stores no section. It does not inherit one.
+
+Operator confirmed a new project:
+
+```
+save "first note" '{"source":"grok","project":"new-name","new_project":true}'
+```
+
+Empty project is `project_required`. The same unknown name again is `project_unknown` and does not succeed. Second submission is in `USAGE.md`.
+
+Operator named the concept:
+
+```
+save "lock order" '{"source":"grok","entities":["LockOrder"],"new_entities":["LockOrder"],"entities_provenance":{"LockOrder":"operator"}}'
+```
+
+Decision, after the operator confirms. Ids are bare. `fact:601` in this slot is dropped with no error; if every id is dropped the decision is stored ungrounded and only flagged.
+
+```
+save_decision --title "Ship the skill index" --decided-by "Xenofon" --rationale "In the context of a 70KB refusal, we chose a 15KB index over keeping the essay, accepting a second file." --grounded-in "2672:based_on" --alternatives "keep the 70KB file" --confidence high
+```
+
+`--new-domain` only after the operator confirms. No entities on this command.
+
+Retrospective. No project, no domain, no entities.
+
+```
+save_retrospective --pg-id 2675 --rating validated --notes "The index loads." --grounded-in "2678" --source-ref OPERATE.md
+```
+
+**C — Edit.**
+
+```
+save "the split shipped in v0.9.109" '{"source":"grok","source_ref":"OPERATE.md"}' --supersedes 2672
+```
+
+```
+supersede --pg-id 2672
+```
+
+```
+save_retrospective --pg-id 2522 --rating reversed --notes "The split shipped." --grounded-in "2678" --source-ref OPERATE.md
+```
+
+```
+review-hold --summary-id 411 --pg-id 2672
+```
+
+`save_decision --supersedes 2522` is not an overturn. Re-saving the same content onto other axes is `axis_conflict`. A renamed section is not resolved on that re-save. `--rating reversed` drops the decision from Tier-1 search and keeps the verdict. A later retrospective on the same `--pg-id` is the live verdict. After `lineage`, the index line uses the successor id.
 
 ## Capture index
 
@@ -121,11 +199,11 @@ Graph expansion on a judgement hit returns `belonging`: `{project, domains}`. Th
 Worked contract. Anonymous `/health`, then `--version`:
 
 ```json
-{"status":"ok","version":"0.9.109","api_version":4}
+{"status":"ok","version":"0.9.110","api_version":4}
 ```
 
 ```json
-{"version": "0.9.109", "api_version": 4, "tool": "shared-memory-framework"}
+{"version": "0.9.110", "api_version": 4, "tool": "shared-memory-framework"}
 ```
 
 `doctor` compares this client's `api_version` with the gateway and names which side to upgrade.
@@ -136,12 +214,6 @@ Run `doctor`. If `compat` is not `ok`, run `bash <skill-dir>/scripts/update_skil
 
 ## Load when needed
 
-- `USAGE.md` — elicitation, the Y-statement, second submission, search and lineage, MCP examples.
+- `USAGE.md` — elicitation, the Y-statement, second submission, search and lineage.
 - `Documentation/schema.md` — store schema (labels, tables). Not the field contract.
 - `CONSTITUTION_SNIPPET.md` — the standing block. Ask before splicing it into a constitution file.
-
-## Two surfaces
-
-CLI is `memory_bridge.py` in `<skill-dir>`. MCP is the host's connector `vector-skill.py`, in that host's own install, not this file. Hosts are OpenClaw, LM Studio, Claude, Codex, Grok, and agy. Each has its own install path. This file implies none of them.
-
-MCP tools: `hybrid_search_and_rerank`, `save_artifact`, `archive_reasoning_trace`, `save_decision`, `save_retrospective`, `supersede`, `review_hold`, `check_memory_health`, `memory_telemetry`, `record_lineage`, `graph_query`. Named CLI `query` shortcuts have no MCP twin. `graph_query` is the raw Cypher form and requires `full` or `admin`. `check_memory_health` reads `/health`. `memory_telemetry` reads `/memory/telemetry`. CLI `status` prints both. CLI `doctor` is the compat check. `archive_reasoning_trace` posts `type` `reasoning_trace`, which ingress refuses as `unknown_type`. Do not retry it. Save the conclusion as a fact.
