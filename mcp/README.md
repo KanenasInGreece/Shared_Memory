@@ -157,7 +157,7 @@ already wrote; a token in a config file is a token in whatever backs that file u
 Finally, **apply the rules and restart both processes**:
 
 - **Agent host** (has its own constitution file): propose splicing the marker-delimited block from
-  `CONSTITUTION_SNIPPET_MCP.md` — ask first (`AGENTS.md` Phase 8b), never write it silently.
+  `CONSTITUTION_SNIPPET_MCP.md` — ask first (`OPERATE.md` Phase 8b), never write it silently.
   For OpenCode, do not guess `~/.config/opencode/AGENTS.md`: a first install from `$HOME` often
   uses `~/AGENTS.md`. Splice the file that session loaded.
 - **LLM server** (has a system-prompt field): paste `system-prompt.md` into the model's system

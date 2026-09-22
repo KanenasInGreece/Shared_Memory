@@ -4,7 +4,7 @@ before needing it.
 The flag is parsed at `update_framework.sh:157` and today appears only in
 failure prose (visible only AFTER a backup has already failed) — not in the
 `--help` header block (awk-extracted from the top-of-file comment, lines
-2-40ish) and not in `AGENTS.md`'s update-path table. This test closes D2
+2-40ish) and not in `OPERATE.md`'s update-path table. This test closes D2
 against recurrence: it asserts the flag AND its safety condition ("never on a
 host holding the only copy of the data") appear in both places.
 """
@@ -15,7 +15,7 @@ import sys
 
 REPO_ROOT = os.path.join(os.path.dirname(__file__), "..")
 UPDATE_SCRIPT = os.path.join(REPO_ROOT, "shared-memory", "scripts", "update_framework.sh")
-AGENTS_MD = os.path.join(REPO_ROOT, "AGENTS.md")
+AGENTS_MD = os.path.join(REPO_ROOT, "OPERATE.md")
 
 
 def _help_text():
@@ -63,10 +63,10 @@ def test_skip_backup_actually_prints_via_the_help_flag():
 
 
 def _update_path_table_rows():
-    """The rows of AGENTS.md's numbered update-step table.
+    """The rows of OPERATE.md's numbered update-step table.
 
     W7/F10-rest: the original assertion accepted `--skip-backup` ANYWHERE in
-    AGENTS.md, so a mention buried in unrelated prose — or left behind in a
+    OPERATE.md, so a mention buried in unrelated prose — or left behind in a
     section a reader following the update path never opens — would have kept
     it green. D2 is specifically about the table a reader consults BEFORE
     running the upgrade, so that is where it is now required. The table is
@@ -81,7 +81,7 @@ def _update_path_table_rows():
             anchor = i
             break
     assert anchor is not None, (
-        "AGENTS.md no longer has an update-step table row for ops/backup.sh — "
+        "OPERATE.md no longer has an update-step table row for ops/backup.sh — "
         "the update-path table this test is about has moved or been rewritten"
     )
     start = anchor
@@ -97,14 +97,14 @@ def test_skip_backup_appears_in_agents_md_update_table():
     rows = _update_path_table_rows()
     table_text = "\n".join(rows)
     assert "--skip-backup" in table_text, (
-        "AGENTS.md's update-step table does not mention --skip-backup (D2). A "
+        "OPERATE.md's update-step table does not mention --skip-backup (D2). A "
         "mention elsewhere in the file does not count: this is the table a "
         "reader consults before running the upgrade."
     )
     # The safety condition must accompany the flag, not just the bare name.
     flag_rows = [row for row in rows if "--skip-backup" in row]
     assert any("only copy" in row for row in flag_rows), (
-        "AGENTS.md's update table names --skip-backup but not its safety "
+        "OPERATE.md's update table names --skip-backup but not its safety "
         "condition (never on a host holding the only copy of the data) in the "
         f"same row: {flag_rows!r}"
     )

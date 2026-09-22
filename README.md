@@ -102,8 +102,8 @@ owns Postgres (vectors + facts) and Neo4j (the graph), and runs the REM/NREM sle
 turns saved facts into shared knowledge.
 
 > **The fast path — hand it to an agent.** Open your coding agent (Claude Code, Codex CLI,
-> Antigravity CLI, Grok, opencode …) at the repo root and say: *"Read `AGENTS.md` and set up the
-> framework."* Phase 0 of [`AGENTS.md`](AGENTS.md) interviews you for the required choices — data
+> Antigravity CLI, Grok, opencode …) at the repo root and say: *"Read `OPERATE.md` and set up the
+> framework."* Phase 0 of [`OPERATE.md`](OPERATE.md) interviews you for the required choices — data
 > folders, model files, your reasoning-LLM address and port, if local, or the URL of your provider, if online LLM is used.
 > You decide which agents get tokens to use the framework— then the agent drives the same
 > steps 1–10 below for you: writing `.env` from the template, minting tokens,
@@ -450,7 +450,7 @@ A fresh gateway host goes from clone to running with five helper scripts in
    stored forever** ([§19](#19-tokens-and-agents)). One distinct token per
    agent — never shared.
 
-   **Two things the mint can report instead of success, and their recoveries** (`AGENTS.md`
+   **Two things the mint can report instead of success, and their recoveries** (`OPERATE.md`
    Phase 6/8 has the full detail): **`REFUSED`** — the named agent's skill directory does not
    exist yet on this machine (nothing to fix here; Phase 8 mints it right after installing
    that agent's package, or create the directory yourself and re-run with
@@ -500,7 +500,7 @@ A fresh gateway host goes from clone to running with five helper scripts in
 Nothing below is a failure the shipped defaults produce on their own: every entry was met on a
 real install by a person or an agent, and each one has since been given a guard — a preflight
 line, a refusal with the remedy in it, or a documented step. This table exists so that when the
-guard speaks, you recognise what it is telling you. **An agent following [`AGENTS.md`](AGENTS.md)
+guard speaks, you recognise what it is telling you. **An agent following [`OPERATE.md`](OPERATE.md)
 handles every install-time entry here on its own** — it has, on each of the installs these rows
 came from: the Docker source, `uv` on the agent's PATH, the Neo4j ownership and password shape,
 the small-host preset, the restart after minting, roles, project registration and the migration
