@@ -202,10 +202,15 @@ AGENT_ENV=${AGENT_ENV:-$HOME/.claude/skills/shared-memory/.env}
 AGENT_TOKEN=$(sed -n 's/^AGENT_TOKEN=//p' "$AGENT_ENV" | head -1); export AGENT_TOKEN
 bash shared-memory/scripts/update_framework.sh --dry-run
 bash shared-memory/scripts/update_framework.sh
-bash shared-memory/scripts/update_framework.sh --from-restore
 ```
 
-`--from-restore` is this same script after `shared-memory/ops/restore.sh` has loaded a dump. Ask before a restore. It overwrites both databases.
+`--from-restore` is a different entry. Run it only after `shared-memory/ops/restore.sh` has loaded a dump, and only after the operator has agreed. It overwrites both databases. Do not paste it into an upgrade.
+
+```bash
+AGENT_ENV=${AGENT_ENV:-$HOME/.claude/skills/shared-memory/.env}
+AGENT_TOKEN=$(sed -n 's/^AGENT_TOKEN=//p' "$AGENT_ENV" | head -1); export AGENT_TOKEN
+bash shared-memory/scripts/update_framework.sh --from-restore
+```
 
 | # | Step | Note |
 |---|---|---|
@@ -224,8 +229,22 @@ If a constitution snippet's version marker moved after sync, propose the new blo
 ```bash
 bash shared-memory/scripts/uninstall_framework.sh --level service --dry-run
 bash shared-memory/scripts/uninstall_framework.sh --level service
-bash shared-memory/scripts/uninstall_framework.sh --level data
-bash shared-memory/scripts/uninstall_framework.sh --level all
 ```
 
-`service` stops the gateway and removes skill directories. It is reversible. `data` and `all` are not reversible. They refuse unless a backup set exists, unless the operator passes `--no-backup`. The script never removes `~/.shared-memory` or the checkout. It prints the checkout removal for the operator to run.
+`service` stops the gateway and removes skill directories. It is reversible. `data` and `all` are not. They refuse unless a backup set exists, unless the operator passes `--no-backup`. Each level is its own command. The script never removes `~/.shared-memory` or the checkout. It prints the checkout removal for the operator to run.
+
+```bash
+bash shared-memory/scripts/uninstall_framework.sh --level data --dry-run
+```
+
+```bash
+bash shared-memory/scripts/uninstall_framework.sh --level data
+```
+
+```bash
+bash shared-memory/scripts/uninstall_framework.sh --level all --dry-run
+```
+
+```bash
+bash shared-memory/scripts/uninstall_framework.sh --level all
+```
