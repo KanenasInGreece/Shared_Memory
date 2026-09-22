@@ -975,10 +975,9 @@ async def save_artifact(content: str, metadata_json: str = "{}") -> str:
 
     ⛔ A RETROSPECTIVE MUST NOT CARRY ONE (400
     "domain_not_allowed_on_judgement"). Facts and decisions assert their own
-    project and domain; a retrospective inherits BOTH from the decision it
-    judges. A decision that names no domain inherits its grounding facts'
-    sections as a default — never a ceiling, because a decision routinely
-    reaches further than the fact that prompted it.
+    project and domain. Omit on a decision stores no section. It does not
+    take the grounding facts' sections. `belonging` is read-side only. A
+    retrospective does not store sections.
 
     Supersede-on-save: include "supersedes": <old_pg_id> in metadata_json to save
     this as a CORRECTION that retires an older fact in one call (the old fact is
@@ -1171,9 +1170,8 @@ async def save_decision(
 
     `domain` names the SECTION(S) of the project this decision belongs to —
     a list, or one name. A decision asserts its own sections just as it asserts
-    its own project; it does NOT inherit them from its evidence, because a
-    decision reaches further than the fact that prompted it. Naming none means
-    "take my grounding facts' sections", which is a default, never a ceiling.
+    its own project. Naming none stores no section. It does not take the
+    grounding facts' sections. `belonging` is read-side only.
     Each must already be registered, or pass new_domain=True after the operator
     confirms. A RETROSPECTIVE may never carry one.
 
@@ -1257,10 +1255,9 @@ async def save_decision(
     # a decision's project is checked against the registry, and that check only
     # means something if declaring a new project is a deliberate act.
     # The SECTIONS of the project this decision belongs to — a list, or one
-    # name. A decision ASSERTS these exactly as it asserts its project: it does
-    # not inherit them from its evidence, because a decision reaches further
-    # than the fact that prompted it. Naming none is fine and means "take my
-    # evidence's sections", which is a default and never a ceiling.
+    # name. A decision ASSERTS these exactly as it asserts its project.
+    # Naming none stores no section. It does not take the grounding facts'
+    # sections. `belonging` is read-side only.
     _domains = ([d.strip() for d in domain if isinstance(d, str) and d.strip()]
                 if isinstance(domain, list)
                 else [d.strip() for d in (domain or "").split(",") if d.strip()])

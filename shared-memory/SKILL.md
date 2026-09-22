@@ -30,13 +30,13 @@ The gateway is `:8888`. Never call the embedder `:8070` or the reranker `:8071`.
 | Named structural lookup | `query why-to-check\|who-decided\|agent-decisions\|retrospectives` plus that template's flags |
 | Raw read-only Cypher | `graph "<cypher>"` |
 
-Named templates: `why-to-check` (`--title` required, optional `--project`), `who-decided` (`--title`, `--project`), `agent-decisions` (`--assisted-by`, `--project`), `retrospectives` (`--rating`). They call `POST /memory/graph`. They do not hit search or telemetry. `graph` and named CLI `query` templates require `full` or `admin`. `search`, `lineage`/`status`, and `telemetry` remain for `read`. `/health` is anonymous, not a read-role grant: a bare curl returns only `status`, `version`, and `api_version`.
+Named templates: `why-to-check` (`--title` required, optional `--project`), `who-decided` (`--title`, `--project`), `agent-decisions` (`--assisted-by`, `--project`), `retrospectives` (`--rating`). They call `POST /memory/graph`. They do not hit search or telemetry. `graph` and named CLI `query` templates require `full` or `admin`. `search`, `lineage`/`status`, and `telemetry` remain for `read`. `/health` is anonymous, not a read-role grant. When auth is configured, a bare curl is only `status`, `version`, and `api_version`. A full payload that includes `"auth_required": false` means auth is off.
 
 `save` has no `--project` flag. The client derives the project, or you set `"project"` in the metadata JSON. An explicit value wins.
 
 ## Always / Ask / Never
 
-**Always.** Search before reasoning about history, prior decisions, or whether something was tested, tried, rejected, or done. Pass `--project`, `--domain`, and `--since` as flags, never as words inside the query string. Quote `fact:N`, `decision:N`, `summary:N`. A bare number to `lineage` means the facts table. On `stale_sources` or `stale_summaries`, run `lineage` before relying, then repair the stale index pointer: rewrite the line that cited the old id to the current id. Checking without rewriting leaves the next session on the stale id.
+**Always.** Search before reasoning about history, prior decisions, or whether something was tested, tried, rejected, or done. Pass `--project`, `--domain`, and `--since` as flags, never as words inside the query string. Quote `fact:N`, `decision:N`, `summary:N` for `lineage` and for index pointers. That form is not a `--grounded-in` id. A bare number to `lineage` means the facts table. On `stale_sources` or `stale_summaries`, run `lineage` before relying, then repair the stale index pointer: rewrite the line that cited the old id to the current id. Checking without rewriting leaves the next session on the stale id.
 
 **Ask.** An unregistered project or domain. Confirm the spelling; pass `new_project` or `new_domain` only after the operator says so. `new_entities`, only after the operator says the concept is new. Every `save_decision`. A retrospective's `--rating` and the facts in `--grounded-in`.
 
@@ -56,7 +56,7 @@ A fact owns project, domain, and entities. A decision owns project and domain, n
 
 ## Patterns
 
-**A — Search.** The query is the what. `--project NAME` keeps records that belong to that project. `--domain NAME` (repeatable, OR) keeps those sections. `--since ISO` (date or datetime) keeps rows created at or after it. Filters combine. They never fall back to an unfiltered search. An unregistered name is not refused on the read path; it matches nothing. More than 16 `--domain` values is `filters_invalid`. Use the qualified `ref` on each hit. Tens of seconds is the reranker, not a hang. `ranked: false` is vector order, and Tier-3 rows are omitted. An empty list plus `EMBEDDING UNAVAILABLE` on stderr means the embedder is down, not that nothing is known. `stale_sources` is a superseded source fact (`old`, `superseded_by`). `stale_summaries` is a moved thematic summary under an insight. `lineage` the successor, then repair the index pointer.
+**A — Search.** The query is the what. `--project NAME` keeps records that belong to that project. `--domain NAME` (repeatable, OR) matches stored `metadata.domains` only — not read-side `belonging`, a retrospective (no stored section), a decision that omitted domain, or a thematic summary (`metadata.domain`, a string) — and if that filter leaves no Tier-1 candidates the search returns `[]` and does not attach an insight. `--domain` without `--project` is a literal string across projects, not one project's section. `--since ISO` (date or datetime) keeps rows created at or after it. Filters combine. They never fall back to an unfiltered search. An unregistered name is not refused on the read path; it matches nothing. More than 16 `--domain` values is `filters_invalid`. Use the qualified `ref` on each hit. Tens of seconds is the reranker, not a hang. `ranked: false` is vector order, and Tier-3 rows are omitted. `EMBEDDING UNAVAILABLE` on stderr means keyword fallback even when rows come back. Those rows have `score_normalized` 0.5, no `ref`, and no `ranked`. Do not treat 0.5 as a rerank and do not pass them to `lineage`. `stale_sources`: `old` may be a fact, a decision, or a retrospective. Pass `lineage` the qualified ref. A 404 names the real ref. Do not force `fact:`. `stale_summaries` is a moved thematic summary under an insight. `lineage` the successor, then repair the index pointer.
 
 **B — Create.** Run `save` from the project directory. The client walks up to `.git`, `CLAUDE.md`, `AGENTS.md`, or `GEMINI.md`, stops at `$HOME`, and does not pass `$HOME`. `SHARED_MEMORY_PROJECT` overrides the walk. Do not hand-type a project that differs from that folder. Empty project is `project_required`. An unregistered name is `project_unknown` (with `proposals`). Second submission: pick a proposal, re-send with `new_project: true` after the operator confirms, or park on `general_discussion`. Re-sending the same unknown name does not succeed. Declare a new project once; later saves use the registered name and need no flag.
 
@@ -64,7 +64,7 @@ A fact owns project, domain, and entities. A decision owns project and domain, n
 
 Entities are concept nouns the operator named (`LockOrder`, not a sentence and not the project). Ask once and accept none. Mint with `new_entities` only after they confirm; every minted name must also be in `entities`. Stamp `entities_provenance` as `operator` or `agent` per name when you know it. Omitting it still saves.
 
-A decision sends no entities. Confirm with the operator before the call. The rationale is a Y-statement: in the context of X, we chose Y over Z, accepting W. `--grounded-in` is `pg_id:role` pairs (`based_on`, `considered`, `rejected`, `under_conditions`, `informed_by`). A bare id takes the fact-kind default. `--alternatives` is one option per flag, stored verbatim. Naming no `--domain` stores no section. A decision does not inherit its evidence's sections.
+A decision sends no entities. Confirm with the operator before the call. The rationale is a Y-statement: in the context of X, we chose Y over Z, accepting W. `--grounded-in` is `pg_id:role` pairs (`based_on`, `considered`, `rejected`, `under_conditions`, `informed_by`). Ids are bare integers (`601:based_on`). `fact:601` is for `lineage` and for search refs. The grounding parser drops a non-numeric id and does not error. If every id is dropped, the decision is stored ungrounded and only flagged. A bare id takes the fact-kind default. `--alternatives` is one option per flag, stored verbatim. Naming no `--domain` stores no section. A decision does not inherit its evidence's sections.
 
 A retrospective names the decision's `--pg-id` and no project, domain, or entities. `--rating` is an outcome state. `--grounded-in` cites the facts that measured the outcome. `--source-ref` is that instrument.
 
@@ -94,7 +94,7 @@ Refusals. Branch on `error`. One recovery; the second-submission essays are in `
 | `axis_conflict` | Axes are fixed at first write. Supersede. Do not re-save the same content onto other axes. |
 | `cypher_rejected` | Neo4j rejected the Cypher. Fix the query. Retrying it unchanged will not succeed. |
 | `domain_confusable` | Ask. If it is a different section, re-send `confirm_distinct_from` naming the near match. Otherwise use the existing name. |
-| `domain_not_allowed_on_judgement` | A retrospective must not name a domain. Fix the section on the decision. |
+| `domain_not_allowed_on_judgement` | Do not send a domain. A retrospective does not store sections, and the decision's axes do not move onto it. |
 | `domain_spelling_variant` | It is that registered section. Save under that spelling. It cannot be confirmed as new. |
 | `domain_unknown` | Ask. Pick a proposal, or re-send `new_domain: true` after the operator confirms. Omitting the domain is valid. |
 | `domain_unnameable` | Name the section with at least one letter or digit. |
@@ -104,7 +104,7 @@ Refusals. Branch on `error`. One recovery; the second-submission essays are in `
 | `entities_provenance_invalid` | Object only. Each key must be in `entities`. Each value must be `operator` or `agent`. |
 | `entity_confusable` | Ask. Confirm with `confirm_distinct_from` naming the near match, or save the existing name. |
 | `entity_name_too_long` | A concept noun, not a sentence. The cap is `ENTITY_NAME_MAX_LEN` (default 200). |
-| `entity_reserved` | Schema or axis vocabulary is not an entity. Name the concept, or drop it. |
+| `entity_reserved` | Schema or axis vocabulary is not an entity. Also a registered project name, including this record's own project. Name the concept, or drop it. |
 | `entity_unknown` | Ask. Re-send `new_entities` listing exactly those names, each also in `entities`, or use the registered canonical. |
 | `filters_invalid` | The search `--domain` list is over the 16-entry cap. Narrow it. |
 | `graph_row_cap_exceeded` | Read-only Cypher returned more than `GRAPH_QUERY_ROW_CAP` rows (default 10000). Narrow the query. |

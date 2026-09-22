@@ -34,7 +34,7 @@ A bare id takes a default from that fact's `fact_kind` (`discussion` → `inform
 
 A decision may be ungrounded only when it really was made on experience before the project had evidence. The gateway flags that. It does not refuse it. Topics arrive later from the retrospective that measures it. Everywhere else, if nobody can name a fact, say so. Search, or save the fact first. A retrospective with no `--grounded-in` is refused. A verdict that measured nothing has nothing to report.
 
-`--alternatives` is one option per flag. The value is stored verbatim and is never split, so a comma inside an option is safe. Write each option as a sentence that includes why it lost. MCP takes a list, one entry per option. A single string is one option, not a packed list.
+`--alternatives` is one option per flag. The value is stored verbatim and is never split, so a comma inside an option is safe. MCP takes a list, one entry per option. A single string is one option, not a packed list.
 
 ## Entities
 
@@ -66,7 +66,7 @@ A domain is a section of one project. The same word under two projects is two se
 
 A new project and its first section may be declared on the same save. The section is registered against the project intent. It still needs the operator's confirmation. Do not invent a placeholder spelling to get the save through.
 
-Naming no domain on a decision stores no section. Nothing copies the evidence's sections onto the decision at write time. The read-side key `belonging` (see `SKILL.md`) can still show same-project sections reached through grounding. That is not a stored axis. A search `--domain` filter matches stored sections, so a decision that asserted none does not satisfy the filter on its own, and neither does a retrospective.
+Naming no domain on a decision stores no section. Nothing copies the evidence's sections onto the decision at write time. The read-side key `belonging` (see `SKILL.md`) can still show same-project sections reached through grounding. That is not a stored axis. A search `--domain` filter matches stored sections, so a decision that asserted none does not satisfy the filter on its own, and neither does a retrospective. It also misses a thematic summary (`metadata.domain`, a string, not `metadata.domains`). If the filter leaves no Tier-1 candidates, the search returns `[]` and does not attach an insight.
 
 `registry_unavailable` (503) means the registry could not be read. Nothing was written. Retry. It is not an unknown name.
 
@@ -88,7 +88,7 @@ Rows are ranked together. A summary or insight sits where its score puts it, whi
 
 `stale_sources`: `[{"old": N, "superseded_by": M}]` on a summary or insight. A null `superseded_by` is a retraction or a reversed decision with no replacement. Fetch the successor with `lineage fact:M` and compare before relying. If the change does not matter, `review-hold --summary-id S --pg-id N` stops the re-flag. If it matters, save the corrected understanding. `stale_summaries`: `[{"summary_id": Y, "superseded_reason": "…"}]` on an insight. The insight's own facts may still be fine. The narrative under it moved. `lineage summary:Y` before relying.
 
-A community summary's `source_pg_ids` are fact ids. An insight's `source_pg_ids` are decision ids.
+A community summary's `source_pg_ids` are fact ids. Thematic summary ids are facts. An insight's `source_pg_ids` are decisions and retrospectives, not decision ids only.
 
 ## Lineage
 
