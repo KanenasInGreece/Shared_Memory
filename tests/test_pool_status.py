@@ -11,6 +11,21 @@ from yarl import URL
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "shared-memory", "scripts"))
 
 
+class _ReqBodyStream:
+    """handle_encoder reads request.content via StreamReader.read(n)."""
+
+    def __init__(self, body: bytes):
+        self._buf = body
+
+    async def read(self, n: int) -> bytes:
+        if n < 0:
+            out, self._buf = self._buf, b""
+            return out
+        out = self._buf[:n]
+        self._buf = self._buf[n:]
+        return out
+
+
 def _auth_off_gateway(monkeypatch):
     """SEC-A5-01/03 (PR A5 fix round): /pool/status's roster/pool-state now
     gates on AUTH_CONFIGURED_AT_STARTUP, so these tests (which pass request=
@@ -190,8 +205,13 @@ def test_embed_body_buffered_under_cap_is_retry_eligible(monkeypatch):
         headers = {}
         can_read_body = True
         content_length = 40               # small, well under EMBED_RERANK_BUFFER_CAP
+
+        def __init__(self):
+            self._raw = b'{"input":"hello","model":"bge-m3"}'
+            self.content = _ReqBodyStream(self._raw)
+
         async def read(self):
-            return b'{"input":"hello","model":"bge-m3"}'
+            return self._raw
 
     proxy = g.AsyncHiveMindProxy()
     session = _ResetOnceThenBoomSession(g.ClientConnectionResetError, g.ClientError)

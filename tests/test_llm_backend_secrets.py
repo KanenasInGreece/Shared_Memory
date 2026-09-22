@@ -15,6 +15,21 @@ from yarl import URL
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "shared-memory", "scripts"))
 
 
+class _ReqBodyStream:
+    """handle_encoder reads request.content via StreamReader.read(n)."""
+
+    def __init__(self, body: bytes):
+        self._buf = body
+
+    async def read(self, n: int) -> bytes:
+        if n < 0:
+            out, self._buf = self._buf, b""
+            return out
+        out = self._buf[:n]
+        self._buf = self._buf[n:]
+        return out
+
+
 class _HeaderCaptureSession:
     """Records the headers/body handed to .request() then aborts before any
     real network call — mirrors _BoomSession in test_pool_status.py."""
@@ -441,8 +456,12 @@ def test_embedder_target_never_gets_authorization_either(monkeypatch):
         can_read_body = True
         content_length = 40
 
+        def __init__(self):
+            self._raw = b'{"input":"hello","model":"bge-m3"}'
+            self.content = _ReqBodyStream(self._raw)
+
         async def read(self):
-            return b'{"input":"hello","model":"bge-m3"}'
+            return self._raw
 
     proxy = g.AsyncHiveMindProxy()
     session = _HeaderCaptureSession()
