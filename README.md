@@ -141,8 +141,8 @@ it; on skew it names which side to upgrade.
 
 ### Resources & prerequisites
 
-Everything in this chapter is **measured on a machine we ran**, and says so; nothing here is a
-projection. The numbers are minimums for the **deployment alone** — databases, gateway, daemons,
+The tables in this chapter were measured on a machine we ran. Rows marked untested, and the
+list under *To be tested*, are not measurements. The numbers are minimums for the **deployment alone** — databases, gateway, daemons,
 encoders, with headroom. The agents that *use* the memory, and a desktop if the box has one, are
 not in them: budget those separately. Two front doors share the deployment — the CLI skill and
 the MCP connector ([§21](#21-the-mcp-install-any-mcp-host-one-connector)) — and both are thin
@@ -153,14 +153,14 @@ HTTP clients, so a client costs the host nothing beyond a Python process.
 | Setup | Where the pieces run | Least we ran it on — with the shipped defaults |
 |---|---|---|
 | **CPU only** | both encoders on CPU · reasoning LLM online, or none | 6–8 threads · **16 GB RAM** (the reranker settles at ~8 GiB RSS and the embedder at ~5–6 GiB at full 8192-token geometry; ~16–17 GB with the stores and gateway) · 30 GB disk |
-| **Small GPU (~4 GB)** | embedder on the card (**~0.7 GB VRAM**), reranker on CPU · LLM online | 6 cores · **16 GB RAM — stretched**: 13.5–13.9 GB in use on a 15 GB box, swap engaged · ≥2 GB VRAM · 30 GB disk. Both encoders on a card this size held only short (~1,500-token) payloads and collapsed at full-length texts — measured, do not try it |
+| **Small GPU (~4 GB)** | embedder on the card (**~0.7 GB VRAM**), reranker on CPU · LLM online. This split is a tested working install (d9400). Both encoders on a 4 GB card at full 8192 did not hold | 6 cores · **16 GB RAM — stretched**: 13.5–13.9 GB in use on a 15 GB box, swap engaged · ≥2 GB VRAM · 30 GB disk |
 | **External LLM** | either encoder layout above · reasoning LLM at an online provider (`LLM_BACKENDS_JSON`, one entry) | adds nothing to the host: an overnight of dreaming measured ~18,000 tokens, under a cent. With no LLM configured nothing dies — saves, search and the graph keep working; summaries and insights queue until a backend appears |
 | **All external** *(partially tested)* | embedder served by another host on the LAN · LLM online · **reranker still local on CPU** | 6 vCPU · **14 GB RAM** · no GPU · 30 GB disk — holds with ~2 GB headroom. Only the embedder has been served remotely: the LAN host we used (LM Studio) exposes no rerank endpoint, so a fully external encoder pair is **untested** |
 
 **The hard floor under all four: ~8 GB RAM.** Neo4j checks its configured memory against
 physical RAM at startup; the shipped 2 GB heap + 2 GB pagecache refuse to boot under ~4 GB, and
-the CPU stack's working set lands near 6 GB. Measured, not projected: the 14 GB VM below was
-rebooted at 8 GB and passed the full install verification with the defaults untouched — 5.0 GB
+the CPU stack's working set lands near 6 GB. Measured, not projected: a VM rebooted at 8 GB
+passed the full install verification with the defaults untouched — 5.0 GB
 peak during the save burst, search stretching from ~7 to ~12 s under the tighter caches. What
 8 GB does *not* buy is sustained search: an overnight run — bulk ingest, the full dreaming cycle
 through to an insight, then a query barrage — grew the reranker's cache past what the box could
@@ -169,8 +169,8 @@ order — unranked, with the Tier-3 summaries dropping out of the results. That 
 the real price. For search-heavy use give it the 16 GB, a GPU for the encoders, or cap the
 reranker's cache (`RERANK_MAX_DOC_CHARS`, [§17](#17-inference-the-encoders-and-the-reasoning-llm)).
 
-**Everything local — a fourth shape we also run.** A local reasoning LLM beside the encoders:
-**16 GB RAM and one 12 GB card run the whole thing.** A fully offloaded model's host-side
+**Main workstation configuration 3 — local reasoning model, tested.** A local reasoning LLM beside the encoders:
+**16 GB RAM and one 12 GB card ran the whole thing.** This is not the layout in use. A fully offloaded model's host-side
 footprint measured a fifth of a gigabyte; VRAM is dominated by model and context — our 14B at Q4
 with a 64K context measured 11.2 GB by itself, so on one 12 GB card trim the context or run a
 7–8B and fit the encoders beside it. With two cards the split states itself: the model takes the
@@ -180,8 +180,8 @@ VRAM · 40 GB disk.* More RAM (32 GB) is comfort for a box that also runs agents
 
 #### Serving the encoders with vLLM instead of llama.cpp
 
-The shipped default serves both encoders with `llama-server`, and every number above was measured
-on that. vLLM serves the same two models on any accelerator it supports; the only framework-side
+The shipped default serves both encoders with `llama-server`. The CPU-only row and the d9400
+encoder times were measured on that. vLLM serves the same two models on any accelerator it supports; the only framework-side
 piece is a small path shim for the reranker, described here because anyone serving the reranker
 with vLLM needs it, whatever the card.
 
@@ -217,7 +217,7 @@ upgrade. Moving **only the reranker** has no such cost: a reranker stores nothin
 
 #### A measured example of that — Intel Arc B580
 
-This is the shape we run on the reference workstation, and the numbers are read off it. Same two
+This is Main workstation configuration 2, and the numbers are read off it. Same two
 models, same payloads, only the serving engine different:
 
 | | `llama-server` (Q8 GGUF, Vulkan) | vLLM (FP16, Level Zero) |
@@ -228,7 +228,7 @@ models, same payloads, only the serving engine different:
 | a search end to end, through the delivered client | 8.53 s | **0.68 s** median |
 | four searches at once | — | 1.35 s median |
 | VRAM, both encoders | 1.3 GB | 5.2 GB of 11.9 |
-| host RAM per encoder process | 6.6–7.8 GiB, up to the 8 GiB cache ceiling | flat: +35 MiB across 105 full-size reranks |
+| host RAM per encoder process | 6.6–7.8 GiB while running; 7.82 and 7.96 GiB RSS at stop, against the 8 GiB cache ceiling | flat: +35 MiB across 105 full-size reranks |
 
 The last row is the `llama-server` prompt cache, held in host RAM (`--cache-ram`, 8192 MiB by
 default) and of little use to encoders, whose input differs on nearly every request; the two
@@ -244,9 +244,9 @@ pass that directory and without it oneCCL cannot enumerate the GPU and the engin
 **ceiling, not a reservation**, for a pooling model — there is no KV cache to fill, so 0.3 and 0.6
 produced an identical footprint. Set it low if the card is shared; it will not be claimed.
 
-⚠ **Per-card, not per-vendor.** Measured on a B580 only; the A770 in the same machine is parked for
-an unrelated driver fault and was not tried. This is not a general "Arc" answer, and it does nothing
-for an AMD card or a CPU-only host.
+⚠ **Per-card, not per-vendor.** Measured on the Arc B580 (12 GB), the card that serves both
+encoders on the Main workstation. This is not a general "Arc" answer, and it does nothing for an
+AMD card or a CPU-only host.
 
 ⚠ **`nvtop` counts only the GPU work it is allowed to see.** It reads each GPU-holding process's
 `/proc/<pid>/fdinfo`, and a container's processes run as root by default — so `nvtop` run as your
@@ -266,21 +266,24 @@ cleaner fix in any case.
 
 #### The machines behind the numbers
 
-Four deployment shapes are exercised continuously, and the table above is read off them. A
-*server* here means the gateway host; *clients* are wherever the skill or the MCP connector runs
+A *server* here means the gateway host; *clients* are wherever the skill or the MCP connector runs
 — the same box, or any machine with a route to `:8888` (a tunnel from a laptop on the road is a
-tested client path).
+tested client path). OpenClaw runs the skill as a client and has been used against a live gateway.
 
-- **Same workstation, server and clients together — the reference install.** Fedora, Intel Arc
-  B580 12 GB serving both encoders (`llama-server`, Vulkan, full 8192 geometry: 20 × 6K-char
-  documents reranked in 4.7 s), a second card for a local 14B reasoning model, 1,300-record
-  corpus, every CLI agent on the box as a client. The "everything local" numbers and the
-  CPU-only encoder footprints were measured here.
-- **The same workstation again, encoders served by vLLM — a second, separately tested shape.**
-  Same Fedora box and the same B580, but both encoders served by `intel/vllm:0.21.0-xpu` (two
-  containers, one model each) instead of `llama-server`, with `rerank_shim.py` in front of the
-  reranker. The llama.cpp shape above remains valid and is what the table's numbers come from;
-  this one is the alternative, measured alongside it. Reranking a real 22-document candidate set:
+Every configuration below was run. A machine you have will sit between two of them: read the
+latency across the row, then between the rows. Putting both encoders on the GPU is the layout to
+use when the card holds them. A layout with only one encoder on the GPU, or with neither, was
+also run and is a working install.
+
+- **Main workstation configuration 1.** Fedora 44, AMD Ryzen 9 5900X (12 cores), 64 GB RAM.
+  Intel Arc B580, 12 GB, serves both encoders with llama.cpp (Vulkan). The reasoning LLM is
+  online. Full 8192 geometry: 20 × 6K-char documents reranked in 4.7 s. The CPU-only encoder
+  footprints were measured on this machine too, on a 1,300-record corpus, with the CLI agents
+  on the box as clients.
+- **Main workstation configuration 2.** The same machine and the same B580. Both encoders are
+  served by `intel/vllm:0.21.0-xpu` (two containers, one model each), with `rerank_shim.py` in
+  front of the reranker. The reasoning LLM is online. This is the pair serving on that box now.
+  Configuration 1 remains the source of the llama.cpp column in the table above. Reranking a real 22-document candidate set:
   **0.47 s against 9.43 s**. A search end to end through the delivered client: **0.68 s median
   against 8.53 s**, and 1.35 s with four searches running at once. **The RAM difference is the
   larger story:** `llama-server` had been holding roughly **8 GiB per encoder process** in a
@@ -289,41 +292,32 @@ tested client path).
   we measured directly rather than inferred: **+8.06 GiB** and **+12.29 GiB** of available memory
   against RSS figures of 7.96 and 7.82 GiB, while an untouched third `llama-server` on the other
   card did not move a byte. The vLLM pair holds a fixed footprint instead — **+35 MiB across 105
-  maximum-size reranks**, and VRAM unchanged to the megabyte through a 319-second barrage. Net on
-  this box: **~16 GB of system RAM returned**, VRAM up from 1.3 to 5.2 GB of 11.9.
-
-- **Small GPU, external LLM — a 2019 desktop as server, an MCP coding agent as client on the
-  same host.** Intel i5-9400F (6 cores), 15 GB RAM + 16 GB swap, AMD Radeon RX 580 4 GB, Docker.
-  Embedder on the card (~672 MB VRAM; 500/3,000/6,000-char embeds in 0.06/0.19/0.38 s), reranker
-  on CPU (~106 s per 20 × 5.8K-char documents; RSS steps once from 3.9 to 7.9 GiB under a search
-  battery and stays there, swap +1 GB — a high-water mark, not a leak), reasoning at DeepSeek.
-  A night's battery: 21 saves at ~0.3 s each, REM and NREM through to completion, zero OOM,
-  zero restarts. opencode mounts the memory here through the MCP connector, read-only role.
-- **CPU only with a remote embedder — a deliberately old VM as server, remote clients.** 6 vCPU
-  of a 2013 Xeon E3-1230 v3, **14 GB RAM**, no swap, no GPU, 30 GB disk, Ubuntu Server 26.04
-  with Docker. Reranker on CPU, embedder served by an LM Studio box on the LAN (BGE-M3 Q8, the
-  same fixed model contract: cosine 0.9995–0.9997 against the local encoder on identical text;
-  ~5× faster on 6K-char inputs). Holds with 2.0–2.2 GB available through a full search battery,
-  zero OOM, zero restarts — at 11 GB the same VM restarted its reranker twice and lost the local
-  embedder to the OOM killer once, which is why the row says 14. Search: ~1.3 s in unranked
-  vector order, 79–81 s with the reranker scoring the full default payload. The client sizes
-  its wait from the gateway's own projection, so a slow host answers late rather than never.
-- **GPU-less VM, both encoders and the LLM on one LAN box — a small reasoning model is enough.**
-  The setup above taken one step further: the same LM Studio box on the LAN serves not only the
-  BGE-M3 embedder but the reasoning model too — a small quantized Gemma (~2B parameters, ~7K
-  context). The gateway host then runs no GPU and no local LLM at all; Postgres, Neo4j and the
-  CPU reranker are its whole footprint, and one modest LAN box does every embedding and every
-  generation. Declared as a single uncredentialed `LLM_BACKENDS_JSON` entry — `private_ok: true`,
-  a LAN `url`, an `n_ctx` so the fit check knows the small window — with `EMBEDDER_URL` pointed at
-  the same box and the reranker left on CPU (LM Studio serves the embedding model but no rerank
-  endpoint the gateway can drive). Verified end to end: postflight passes — A8's live completion
-  crosses the proxy on a *thinking* model that returns its answer as reasoning tokens (the reason
-  A8 grades that as proof of life) — saves and search round-trip, and REM summarisation runs
-  against the small model and returns a clean, faithful summary. Evidence that the reasoning
-  backend need not be large or online, only an OpenAI-compatible endpoint the gateway can reach.
-  (Fold-to-insight, the other LLM path, needs a decision-and-retrospective set to exercise and has
-  not been run on this box.)
-- **Below the floor — a 2018 budget laptop, for the record.** Two AMD cores, 3.2 GB usable RAM,
+  maximum-size reranks**, and VRAM unchanged to the megabyte through a 319-second barrage. The
+  two llama.cpp processes had been holding about 16 GB of RSS (7.96 and 7.82 GiB); available
+  memory rose by 8.06 GiB and 12.29 GiB when they stopped. VRAM went from 1.3 to 5.2 GB of 11.9.
+- **d9400 — embedder on the GPU, reranker on the CPU.** The small-card example. Intel i5-9400F
+  (6 cores), 15 GB RAM + 16 GB swap, AMD Radeon RX 580 4 GB. Embedder on the card (~672 MB
+  VRAM; 500/3,000/6,000-char embeds in 0.06/0.19/0.38 s). Reranker on the CPU (~106 s per
+  20 × 5.8K-char documents; RSS steps once from 3.9 to 7.9 GiB and stays there). Reasoning LLM
+  online. A night's battery: 21 saves at ~0.3 s each, REM and NREM through to completion, zero
+  OOM, zero restarts. The knobs are the four replica lines in
+  [§17](#17-inference-the-encoders-and-the-reasoning-llm).
+- **glxvm — production gateway.** Ubuntu 26.04, 6 vCPU on a Xeon E3-1230 v3, 20 GB RAM,
+  AMD Radeon RX 580 with 8 GB. Both encoders run on that card (llama.cpp, Vulkan,
+  `--flash-attn on`), with RAM left over for the stores and the gateway. The reasoning LLM is
+  online. Postgres and Neo4j run on the same host
+  ([§17](#17-inference-the-encoders-and-the-reasoning-llm)).
+- **Tested: CPU only, remote embedder.** 6 vCPU of a Xeon E3-1230 v3, 14 GB RAM, no swap, no
+  GPU, 30 GB disk, Ubuntu Server 26.04. Reranker on CPU, embedder served by an LM Studio box on
+  the LAN (BGE-M3 Q8, cosine 0.9995–0.9997 against the local encoder on identical text; ~5×
+  faster on 6K-char inputs). Held with 2.0–2.2 GB available through a full search battery. At
+  11 GB the same VM restarted its reranker twice and lost the local embedder to the OOM killer
+  once, which is why that row says 14. Search: ~1.3 s in unranked vector order, 79–81 s with the
+  reranker scoring the full default payload.
+- **Tested: GPU-less VM, encoders and the LLM on one LAN box.** The same VM, with the LAN box
+  also serving a small quantized Gemma (~2B, ~7K context) as the reasoning model. Postflight
+  passed, including a live completion on a thinking model, and REM returned a faithful summary.
+- **Below the floor — a 2018 budget laptop, tested.** Two AMD cores, 3.2 GB usable RAM,
   integrated graphics. Not a supported configuration; a measured account of what breaks and in
   what order. The stack would not start as shipped (Neo4j's RAM check); with the small-host
   values in `.env.example` the whole storage layer fits in about a gigabyte. The CPU encoders
@@ -333,10 +327,24 @@ tested client path).
   eleven-second success — with the caveat that an iGPU's memory *is* system RAM, pinned. Every
   refusal on the way down was explicit and every degradation visible in telemetry.
 
-**Search latency is the number to watch on CPU hosts.** Reranking the full default payload
-(22 candidates, uncapped documents) costs ~5 s per document on a 6-core CPU and under a quarter
-second on a 12 GB card. `RERANK_MAX_DOC_CHARS` is the dial; the gateway reports its own capacity
-projection on `/health` and the client waits accordingly.
+**Latency, so a neighbouring machine can be placed.** The rows are the configs above. A 6-core
+CPU rerank of 20 × 5.8K-character documents is about 106 s (d9400). The same 20 × 6K set on the
+12 GB card under llama.cpp is 4.7 s. The full window (22 × 24,576 characters) was measured on
+vLLM at 2.5 s, and was not measured on llama.cpp.
+
+| Config | Embedder | Reranker | Measured |
+|---|---|---|---|
+| Main workstation configuration 2 | B580, vLLM | B580, vLLM | rerank 0.47 s (22 docs, 100,941 chars); search 0.68 s median |
+| Main workstation configuration 1 | B580, llama.cpp | B580, llama.cpp | rerank 4.7 s (20 × 6K chars); search 8.53 s |
+| glxvm | RX 580 8 GB, flash attention on | same card | both encoders on the card; 20 GB RAM; online LLM |
+| d9400 | RX 580 4 GB | CPU, 6 cores | embed 0.06 / 0.19 / 0.38 s at 500 / 3,000 / 6,000 chars; rerank ~106 s for 20 × 5.8K |
+| 12-core desktop, both encoders on CPU | CPU | CPU | search 28–33 s |
+| 14 GB VM | remote embedder | CPU | search ~1.3 s unranked; 79–81 s with the reranker on the full default payload |
+
+Moving the reranker from the CPU (d9400, ~106 s) onto a 12 GB card (configuration 1, 4.7 s, or
+configuration 2, 0.47 s) is the gain. Moving only the embedder, which is what a 4 GB card can
+hold, is already the difference between a save that waits on a CPU embed and the 0.06–0.38 s
+embeds on d9400.
 
 #### To be tested
 
@@ -360,10 +368,10 @@ is).
 (recommended — every command here uses it; or Python 3.11+ with `pip`) · a server for your
 reasoning LLM on `:5000` (LM Studio, `llama-server`, or any OpenAI-compatible endpoint), or an
 online provider — the embedder and reranker run as Docker containers from the compose file · at
-least one consumer: a CLI agent through the skill (Claude Code, Antigravity CLI, Grok, Codex CLI)
-and/or an MCP host through the connector (LM Studio, opencode — [§21](#21-the-mcp-install-any-mcp-host-one-connector)).
+least one consumer: a CLI agent through the skill (Claude Code, Antigravity CLI, Grok, Codex CLI,
+OpenClaw) and/or an MCP host through the connector (LM Studio, opencode — [§21](#21-the-mcp-install-any-mcp-host-one-connector)).
 
-**Runtime components — the shipped, pinned baseline (rechecked 2026-09-23).** The compose file names
+**Runtime components — the shipped, pinned baseline (pins rechecked 2026-09-23, not a postflight of 5.26.31).** The compose file names
 exact image tags, never floating ones, and these are requirements in their own right:
 
 | Component | Shipped pin | Floor, and why |
@@ -380,7 +388,7 @@ cycle. The policy, the licence position on each component and the current check 
 
 Both come from the vendors' own instructions rather than your distribution's packages — one baseline
 that behaves the same across Debian, Ubuntu and Fedora, and the default these steps assume. A distro
-package may work (Fedora's `moby-engine` is what this project's own reference workstation runs), but
+package may work (Fedora's `moby-engine` is what the Main workstation runs), but
 it is a different version and layout. Switching an existing machine from a distro package to the
 vendor's repository is its own exercise — do it before installing the framework, not after.
 ⚠ uv's installer puts it in `$HOME/.local/bin`. That is on *your* PATH, but not necessarily on the
@@ -479,9 +487,9 @@ A fresh gateway host goes from clone to running with five helper scripts in
 9. **Verify the install.** Back on the gateway host:
    export `AGENT_TOKEN` by reading it out of a write-capable agent's skill `.env` from step 6 (the
    `AGENT_ENV` + `sed` idiom at the top of `postflight.md` — never a pasted export), then
-   `bash shared-memory/scripts/postflight.sh` — exits 0 iff assertions **A1–A5, A8 and A9** all pass, proving the stack end to
-   end, from health payload shapes to a canary save traced into both stores, a real completion
-   driven through the reasoning backend, and a baseline JSON of this hardware's save/search
+   `bash shared-memory/scripts/postflight.sh` — exits 0 when assertions **A1–A5, A8 and A9** pass. A8 is skipped, not failed, when no reasoning backend is healthy. The run proves the stack end to
+   end, from health payload shapes to a canary save traced into both stores, a completion
+   through the reasoning backend when one is up, and a baseline JSON of this hardware's save/search
    timings for later comparison. The contract it checks
    is [`shared-memory/Documentation/postflight.md`](shared-memory/Documentation/postflight.md);
    re-run it after every upgrade.
@@ -513,13 +521,13 @@ Neo4j plugins, and the reranker dial, which is tuning after the install is prove
 | **The skill "works for me" but not for the agent** — it answers from memory or saves nothing, with no error | `uv` was installed the upstream way, so it lives in `$HOME/.local/bin` and is only on the PATH when your shell profile loads; an agent spawning a profile-free shell cannot see it. This is the normal outcome of a correct install, not a misconfiguration. | Symlink `uv` onto the system PATH (`sudo ln -s "$(command -v uv)" /usr/local/bin/uv`) or set PATH in that agent's own configuration. Preflight warns about exactly this. |
 | **Neo4j crash-loops: "/import is not accessible"** | The container steps down to uid 7474 and cannot write — or, on a modern Fedora, cannot even traverse a `0700` home directory to reach — its mounted dirs. | `install_framework.sh` chowns `import` and `plugins` (the image fixes `data` and `logs` itself) and preflight verifies them; by hand: `sudo chown -R 7474:7474 $NEO4J_HOST_DIR/{data,logs,import,plugins}` (§14). |
 | **Neo4j crash-loops: "neo4j/… is invalid"** | The password contains `/` (base64 output does), which `NEO4J_AUTH=neo4j/<password>` cannot carry. | Generate hex (`openssl rand -hex 20`), update `.env`, recreate the container. The installer's prompts refuse a Neo4j password containing `/`, and refuse any typed password of 8 characters or fewer. An **empty** answer depends on which path you are on: on a **first install** it generates a strong hex password inside the script — never displayed, never logged, written straight to `shared-memory/.env` at mode 600 — while on an **overwrite** of an existing `.env` it re-prompts instead, because Postgres and Neo4j were already initialised with the old password and a new one would lock you out of both. |
-| **Neo4j: "Invalid memory configuration — exceeds physical memory"** | Host RAM is below the shipped heap + pagecache (~8 GB is the no-override floor). | Set the small-host preset (`NEO4J_HEAP_INITIAL/MAX`, `NEO4J_PAGECACHE`) from `.env.example`; preflight's RAM check tells you which tier you are on. |
+| **Neo4j: "Invalid memory configuration — exceeds physical memory"** | Host RAM is below the shipped heap max plus pagecache (2G + 2G). The ~8 GB figure in the table above is the whole-stack floor, not this check. | Set the small-host preset (`NEO4J_HEAP_INITIAL/MAX`, `NEO4J_PAGECACHE`) from `.env.example`; preflight's RAM check tells you which tier you are on. |
 | **Neo4j does not come up on first boot, no network** | `NEO4J_PLUGINS` fetches APOC and Graph Data Science at container start — first boot needs internet, and a crash-loop refetches on every retry. | Give the host a route out for the first start, or pre-place the plugin jars in `plugins/`. |
 | **401 Unauthorized** | `AGENT_TOKEN` missing from the agent's skill `.env`, or minted after the gateway last started — the registry is read at startup. A **re-minted** token is a third case: rotating an identity replaces its registered digest, so a client still holding the previous token now fails auth on **every** request, reads included, until it re-reads the file. | `doctor` names which side is at fault. Restart the gateway after minting (`bootstrap_tokens.sh` says so). A client reads its token once at startup, so after a re-mint make it re-read: respawn the memory **MCP server** — a full host restart, or disabling then re-enabling just that server where the host supports per-server reload (§19, §21) — or restart a long-running CLI agent; a one-shot CLI invocation already picks it up on its next run. |
 | **"Gateway refused this request (HTTP 403): Read-only token…"** on save | The token is valid but minted with `--role read`; the gateway refuses the write and says why. | Use a write-capable identity for that agent, or accept that this one only searches. (Older clients reported this as "coordinator unreachable" — upgrade the skill if you see that.) |
 | **First save refused: `project_unknown`** | A fresh corpus has no registered projects; the gateway never registers one on the strength of a save. | Answer the refusal: confirm the spelling and re-send with `new_project` (the skill asks you first — see `SKILL.md`). Expected on every new install — it is the guard against a typo becoming a project. |
 | **503 on save/search** | Embedder or reranker down or `unhealthy` — usually a wrong model path. | `docker compose ps` first, then `curl :8888/health` (§15, §17). Saves abort rather than store a record without a vector. |
-| **Search answers, but slowly, or unranked** | On a CPU reranker the full default payload costs ~5 s per document; under load the gateway serves vector order and marks scores null rather than invent them. | `RERANK_MAX_DOC_CHARS` is the dial; `/health` shows the capacity projection the client sizes its wait from (§3 Resources, §17). |
+| **Search answers, but slowly, or unranked** | On a 6-core CPU reranker, 20 documents of about 5.8K characters took ~106 s. Under load the gateway serves vector order and marks scores null rather than invent them. | `RERANK_MAX_DOC_CHARS` is the dial; `/health` shows the capacity projection the client sizes its wait from (§3 Resources, §17). |
 | **Upgrade runs `apply.py` and the migration ledger is empty** | An install older than v0.9.44 created the schema without recording which migrations it embodied. | `apply.py --adopt` once; `init_db.sh` now adopts at creation, so a fresh install never sees this. |
 | **Silent DB failures (Fedora)** | inotify limits, or a mount missing its `:z` label under SELinux. | §14, §15. |
 | *Bonus:* **the agent "doesn't know" earlier facts** | The skill was never invoked. | Activate it and ask the agent to search shared memory first. |
@@ -750,23 +758,13 @@ versions?*
 > reverse index from a fact to every decision it later influenced is only as complete as the
 > grounding people recorded.
 
-## 12. The lifecycle, told once
+## 12. The lifecycle
 
-An agent debugging a deployment discovers the proxy fails when two writers race, and saves the
-fact — cited to the failing test, so it carries the weight of something tested. That evening the
-operator decides: writes go through a single queue; the alternatives are recorded with the
-reasons they lost; confidence high; grounded in the afternoon's fact. Weeks later a different
-tool on a different machine is asked about the proxy — and finds the decision, its reasoning,
-its evidence, and the fact that started it, none of which it witnessed. A month on, the
-retrospective lands: the queue held under load, *validated*, grounded in the load-test results.
-In idle time the framework folds the section's facts into its index card, and the tested chain
-into an insight stating the principle. A year later the constraint changes; a new decision
-replaces the old; a retrospective marks the reversal; the insight retires and is rebuilt
-without the overturned claim — and every step of that history stays walkable, source by source,
-verdict by verdict.
-
-That is the whole idea: the reasoning survives the session, crosses the tools, and answers for
-itself later.
+A fact is saved, a decision is grounded in it, and a retrospective rates that decision after
+there is an outcome. An idle cycle folds the section into a summary and, when the chain is
+strong enough, an insight. A later decision can supersede the earlier one; the old record stays
+walkable. The commands and fields are [`USAGE.md`](shared-memory/USAGE.md). Search, create, and
+edit are the [patterns](shared-memory/SKILL.md#patterns).
 
 ## 13. What to save
 
@@ -806,7 +804,7 @@ Keep the `:z` suffixes on the compose volume mounts — SELinux needs them.
 Fedora ships **podman**, not docker, and the helper scripts call the docker CLI. Install Docker
 Engine + Compose v2 from [Docker's own instructions](https://docs.docker.com/engine/install/) —
 that is the default this project recommends. Fedora's own repos are also a working route, and are
-in fact what this project's reference workstation runs (`sudo dnf install moby-engine
+in fact what the Main workstation runs (`sudo dnf install moby-engine
 docker-compose` provides the `docker compose` v2 subcommand; enable with
 `sudo systemctl enable --now docker` and add your user to the `docker` group).
 
@@ -886,8 +884,9 @@ bash shared-memory/scripts/update_framework.sh --from-restore
 
 You are not stuck on the version you installed, and you are not stuck with the installation.
 Both directions are scripts the framework ships and runs on its own test hosts at every release — the
-last update, which moved the database image pins, ended with postflight passing on both test hosts and
-the reference workstation ([§23](#23-testing)):
+released pin move to PostgreSQL 17.11, pgvector 0.8.6 and Neo4j 5.26.30 ended with postflight
+passing on the test hosts and the Main workstation ([§23](#23-testing)). Neo4j `5.26.31-community`
+is the image running now. That move is not a release, and postflight has not been run for it.
 
 - **Update** (`update_framework.sh`) takes a backup first (quiesced when an admin token is set,
   online otherwise — it says which), pulls the released code, applies the Postgres migrations and
@@ -938,29 +937,67 @@ connection whenever the installed pgvector is >= 0.8 — with it, the minority f
 22 rows in 217 ms at 296,800 rows instead of 0 — and reports the installed pgvector version and
 whether iterative scan is active on authenticated `/health`. The bundled compose image is pinned
 to `pgvector/pgvector:0.8.6-pg17` for that floor. CPU-host latencies are unmeasured — the numbers
-above are from the 12-core reference workstation (Postgres itself uses no GPU).
+above are from the 12-core Main workstation (Postgres itself uses no GPU).
 
 ## 17. Inference: the encoders and the reasoning LLM
 
 Two small encoders serve the write and search paths — BGE-M3 embeds, BGE-Reranker-v2-m3 ranks —
-and they came up with the compose stack. As packaged they run on CPU, which works everywhere and
-costs time; the same compose file also carries a Vulkan GPU pair for them (one image covers
-Intel, AMD and NVIDIA), off by default — the choice is two `.env` lines, `GPU_ENCODER_REPLICAS=1`
-and `CPU_ENCODER_REPLICAS=0`, and what you run never diverges from what ships. If you have one
-GPU to allocate, the compromise is plain: a card with enough VRAM for your reasoning model is
-usually better spent on the model backend, while a small card — 4 GB, say — is best spent on
-the embedder, which needs about 0.7 GB at full geometry and repays it in search latency — not
-the reranker, whose 8192-token context does not fit beside it there (measured below). Your
-call, always. A third option exists on hardware vLLM
-supports: serve the encoders with **vLLM** rather than `llama-server`. The embedder needs nothing
-extra, but **vLLM serving the reranker needs `shared-memory/scripts/rerank_shim.py`** in front of
-it — vLLM answers on `/v1/rerank` and the gateway posts to `/v1/reranking`, and the shim rewrites
-that path and nothing else. See *Serving the encoders with vLLM instead of llama.cpp* in
-[§3](#resources--prerequisites) for the contract and the measured Arc example. That
-pair-wise switch moves both encoders together; `EMBEDDER_GPU_REPLICAS`/`EMBEDDER_CPU_REPLICAS`
-and `RERANKER_GPU_REPLICAS`/`RERANKER_CPU_REPLICAS` move one at a time instead, for a card too
-small for both — measured on a 4 GB card, the embedder fits (671 MB) but the reranker's
-8192-token context window does not (`shared-memory/.env.example` has the full knob list).
+and they came up with the compose stack. Put them on the GPU when the card can hold them. Both
+on one card is tested at 12 GB (Main workstation configurations 1 and 2) and at 8 GB with flash
+attention on (glxvm). A card that cannot hold both is still a working install: d9400 keeps the
+embedder on a 4 GB RX 580 and the reranker on the CPU, and that ran a night of saves and a full
+dream cycle. CPU-only, and a remote embedder with the reranker left on the CPU, were tested too.
+The shipped default is CPU, which works and costs time. The Vulkan pair is in the same compose
+file, off until the lines below are set.
+
+Both encoders on the GPU (12 GB, or 8 GB with `--flash-attn on`):
+
+```
+GPU_ENCODER_REPLICAS=1
+CPU_ENCODER_REPLICAS=0
+```
+
+Embedder on the GPU, reranker on the CPU — the tested 4 GB layout, d9400. Set all four, so a
+later edit of the pair-wise lines cannot move the reranker onto the card:
+
+```
+EMBEDDER_GPU_REPLICAS=1
+EMBEDDER_CPU_REPLICAS=0
+RERANKER_GPU_REPLICAS=0
+RERANKER_CPU_REPLICAS=1
+```
+
+On a host under about 8 GB of RAM, Neo4j's shipped heap plus pagecache will refuse to boot.
+The small-host preset that did boot:
+
+```
+NEO4J_HEAP_INITIAL=256M
+NEO4J_HEAP_MAX=512M
+NEO4J_PAGECACHE=256M
+```
+
+`RERANK_MAX_DOC_CHARS` defaults to the embedding window (24570). It is the latency knob for a
+CPU reranker: narrowing a 20-candidate set to 2000 characters took it from 64 s to 30 s and kept
+about half of reranking's gain over plain vector order. `RERANK_MIN_CHARS_S` ships at 800, which
+is a CPU floor; raise it when the reranker is on a GPU. `LLAMA_CPU_THREADS` is per encoder
+container. The full list is `shared-memory/.env.example`.
+
+A third option, on hardware vLLM supports, is to serve the encoders with **vLLM** rather than
+`llama-server`. The embedder needs nothing extra, but **vLLM serving the reranker needs
+`shared-memory/scripts/rerank_shim.py`** in front of it — vLLM answers on `/v1/rerank` and the
+gateway posts to `/v1/reranking`, and the shim rewrites that path and nothing else. See
+*Serving the encoders with vLLM instead of llama.cpp* in
+[§3](#resources--prerequisites) for the contract and Main workstation configuration 2.
+
+**Flash attention on is the GPU encoder's RAM lever.** With it off, an Arc B580 allocated about
+a 1.9 GB compute buffer against about 0.2 GB with it on, and a Radeon RX 580 climbed from about
+1.2 GB to about 2.9 GB during one rerank; with it on that card stayed near 1.3 GB. The GPU
+services in [`shared-memory/ops/postgres_neo4j_limits.yaml`](shared-memory/ops/postgres_neo4j_limits.yaml)
+pass `--flash-attn on`. If that server exits with a status other than 0, SIGINT, or SIGTERM,
+[`encoder_gpu_or_cpu.sh`](shared-memory/ops/encoder_gpu_or_cpu.sh) restarts it in the same
+container on CPU and drops the flag — on CPU the flag raises resident memory, so the CPU
+services in that file do not set it. glxvm (20 GB RAM, online LLM) runs both encoders that way on an 8 GB RX 580.
+
 On CPU, `RERANK_MAX_DOC_CHARS` bounds what the
 reranker scores — a concession, not a free win: capping at 2,000 chars kept about half of
 reranking's improvement in our measurements. Run the encoders however you please — Docker, bare
@@ -1007,22 +1044,16 @@ graceful fallback.
 
 ### What a small GPU buys the encoders — measured
 
-The encoders are where a cheap GPU pays for itself, and we measured it rather than assumed it.
-Both models are 0.6 GiB Q8_0 files; with full offload and the 8K context above, the pair ran
-side by side on one 12 GB card using roughly a gigabyte each including buffers. **A 4 GB card
-does not hold both** — we thought it should, and then ran it: on a Radeon RX 580 the pair held
-only short (~1,500-token) payloads and collapsed at the framework's own full-length texts — the
-8192-token batch buffers overflowed device memory, ggml fell back to host RAM (reranker at
-7.9 GB resident, swap engaged) and every consolidation fold failed at the vectorise step while
-search still answered. The split that holds on that card is the embedder on the GPU (672 MB of
-VRAM, flat; 500/3,000/6,000-char embeds in 0.06/0.19/0.38 s) and the reranker on the CPU
-(~106 s per 20 × 5.8K-char documents on six cores) — one `.env` line each. Against the CPU
-containers on a 12-core desktop, end-to-end search fell from
-28–33 seconds to a **4.7-second mean over an 11-hour soak** — 102 searches, every 20 minutes,
-zero failures, zero drift — with the embedder at roughly 5× throughput and the reranker, which
-on a loaded CPU can time out outright, answering in under a second. Same vectors, too: CPU and
-GPU embeddings of the same text agree to cosine 0.9996, so the swap changes nothing about the
-stored space.
+The encoders are where a GPU pays for itself. Both models are 0.6 GiB Q8_0 files. On the 12 GB
+card the pair ran side by side. Search with both encoders on a 12-core CPU was 28–33 s.
+Configuration 1, both encoders on that card under llama.cpp, searched in 8.53 s, and reranked
+20 × 6K-character documents in 4.7 s. d9400 is the step down from that: the embedder stays on the 4 GB card (672 MB, flat;
+500/3,000/6,000-char embeds in 0.06/0.19/0.38 s) and the reranker stays on the six CPU cores
+(~106 s per 20 × 5.8K-char documents). That split completed a night of saves and a full dream
+cycle. Putting both encoders on that 4 GB card at the full 8192 geometry did not: the batch
+buffers overflowed, the reranker fell back to host RAM at 7.9 GB resident, and consolidation
+failed at the vectorise step while search still answered. CPU and GPU embeddings of the same
+text agree to cosine 0.9996, so moving the embedder onto the card does not move the stored space.
 
 One honest wrinkle from sharing a card: called solo, each service is a metronome (the reranker's
 latency varied by ~1 ms). Called concurrently, means rise modestly — reranker ×1.2, embedder
@@ -1183,6 +1214,7 @@ Installing a client is copying the skill package (every file `MANIFEST.txt` list
 | Antigravity CLI | `~/.gemini/skills/shared-memory/` | `/activate shared-memory` |
 | LM Studio / MCP hosts | `mcp/mcp.json` → `mcp/vector-skill.py` | MCP tools |
 | opencode | **skill:** reads `~/.claude/skills/shared-memory/` (Claude Code's directory, by opencode's design) · **MCP:** connector in `opencode.jsonc` ([§21](#21-the-mcp-install-any-mcp-host-one-connector)) | `/shared-memory` via the skill · MCP tools |
+| OpenClaw | the CLI skill, the same package as the other agents | exercised as a client against a live gateway |
 
 **opencode, tested three ways.** As a *skill* client it reads Claude Code's skill directory by design
 — exercised on a test host where opencode is the only agent, and that is the condition: on a host
@@ -1191,8 +1223,8 @@ write records as `claude`. Measured, and the containment is three layers deep: s
 `OPENCODE_DISABLE_CLAUDE_CODE=1` in opencode's environment, deny skills in its config
 (`"skill": {"*": "deny"}`), and deny reads of `~/.claude/**` (and every other agent's home and
 `~/.shared-memory/**`) in its permissions — then give it its own identity through the *MCP*
-connector, which is the second tested path (reference workstation and the test host, read-only and
-write roles). As an *installer* it set the framework up on the bare-metal test host from `AGENTS.md`,
+connector, which is the second tested path (Main workstation and the test host, read-only and
+write roles). As an *installer* it set the framework up on the bare-metal test host from `OPERATE.md`,
 ran the documented upgrade there later, and verified the fixes by inspecting state rather than
 trusting output.
 
@@ -1327,6 +1359,8 @@ uv run --with pytest --with pytest-asyncio --with fastmcp \
        pytest tests/ -v
 ```
 
+The pre-PR run is that command plus `--with numpy`.
+
 Every `uv run --with` in this README resolves dependencies fresh, which is fine for trying
 things out. To reproduce the exact dependency versions this framework is developed and tested
 against, `requirements.lock` pins the full runtime tree (hashes included, audited for known
@@ -1337,7 +1371,7 @@ CVEs at generation time): `uv venv && uv pip sync requirements.lock`. The floors
 install** ([§3](#3-quick-start) step 9): liveness and payload shape, the client/gateway contract,
 fresh-install schema parity against the live database, the write and read paths, a performance
 baseline, and a real completion through the reasoning backend (skipped, never failing, where none is
-configured). It is run on the reference workstation and on both test hosts at every release; after
+configured). It is run on the Main workstation and on both test hosts at every release; after
 the v0.9.55–0.9.57 releases — which moved the database images to PostgreSQL 17.11, pgvector 0.8.6
 and Neo4j 5.26.30 and added the axis-filter indexes — it passed on all three (2026-08-25), in
 re-baseline mode on the two test hosts whose corpora already carry live summaries. The token it needs
@@ -1360,54 +1394,38 @@ chain and its verifiers under `shared-memory/migrations/`, the client contract i
 
 ## 25. Honest state
 
-A working system with known edges, named rather than polished over. This list is re-checked
-against the code on every documentation pass — the last pass found three of five entries
-stale, two of them claiming something as missing that had shipped — so read it as a dated
-statement, not a permanent one.
-
-- **External content: the boundary is the agent, and the framework hardens what it can.**
-  The gateway has no fetch path of its own; a record exists only because an authenticated
-  agent read something and chose to save it. From there the synthesis passes treat content as
-  data-not-instructions, the insight builder neutralises protocol-shaped lines before a model
-  sees them, the graph refuses labels and relationships outside its known set, and the entity
-  gate stops a record from minting vocabulary on its own. What the framework does **not** do,
-  by design, is edit a record: raw facts return verbatim from search, because Tier 1 *is* the
-  record. So treat every retrieved record as data, save web-retrieved content deliberately and
-  never at volume, and know the limit: a protocol-shaped line can be flagged at the door, but
-  prose that reads like an instruction cannot be told from a quoted finding about one — this
-  corpus holds such findings. Flagging (never rewriting) marker lines at save time is the one
-  narrow ingestion-side measure still open.
-- **Consolidation is reproducible and preserving.** Thematic folds are deterministic — 
-  byte-identical on identical inputs — so structural faithfulness holds by construction. 
-  A pre-v1.0.0 audit sampled the live database and verified that **insights** adhere to a machine-owned scaffold 
-  (verbatim titles and PG IDs injected by code, limiting LLM synthesis to one-sentence distillates and a closing principle), 
-  and that **thematic summaries** act as zero-inference Zettelkasten concatenations. The measurement proved that folds are a 
-  **sharp abstraction** that preserves the originating intent, not a lossy blur.
+- **External content stays the record the agent saved.** The gateway has no fetch path of its
+  own. Synthesis passes treat that content as data, the insight builder neutralises
+  protocol-shaped lines before a model sees them, the graph refuses labels and relationships
+  outside its known set, and the entity gate stops a record from minting vocabulary on its own.
+  Raw facts return verbatim from search, because Tier 1 is the record.
+- **Consolidation is reproducible and preserving.** Thematic folds are deterministic —
+  byte-identical on identical inputs — so structural faithfulness holds by construction.
+  A pre-v1.0.0 audit sampled the live database and verified that **insights** adhere to a machine-owned scaffold
+  (verbatim titles and PG IDs injected by code, limiting LLM synthesis to one-sentence distillates and a closing principle),
+  and that **thematic summaries** are concatenations of the records they were built from.
+  Titles and ids in an insight are inserted by the code; the model writes the one-sentence distillate and the closing principle.
 - **The entity vocabulary is gated at save.** A save naming an entity outside the registry is
   refused with the exact protocol for minting it, and minting is the operator's act — a new
-  concept enters the graph only when someone says so, and a misspelling never becomes one. That
-  is what is in force on every install; nothing about it depends on history.
+  concept enters the graph only when someone says so, and a misspelling never becomes one.
 - **Authentication is bearer-token plus kernel-attested person identity.** Agents present a
   token the gateway knows by digest. On the local socket the gateway also reads the
   connecting person from the kernel (`SO_PEERCRED`) and stamps it server-side — never
-  claimed by the client — and can be told to require it for writes. What is still ahead is
-  proof-of-possession keys over the network, and the audit trail promoted to a durable,
-  non-repudiable record behind them.
-- **Retrieval is measured at the floor, not yet at the ceiling.** Asked for a record by a
+  claimed by the client — and can be told to require it for writes. Credential use is written
+  to `~/.shared-memory/logs/credential-audit.jsonl` as it happens. A full backup of both
+  stores runs daily at 03:30 local when `shared-memory-backup.timer` is enabled.
+- **Retrieval returns the record you asked for by its own text.** Asked for a record by a
   verbatim fragment of itself, the live corpus returns it in the top ten 93% of the time from its
   opening lines and 85% from its middle, at rank one a little over half the time; when it misses,
   what wins is a neighbour on the same subject in the same project, not a stranger. Every result of
   a project, domain or date filter satisfied the filter, no superseded record came back for its own
   text, and every result carried a qualified reference — 1,200 results across 120 queries, all
-  through the reranked path, half a second each. What has no number yet is relevance on open
-  questions: whether the best answer to a question nobody has phrased before is the one that comes
-  back. That needs judged queries, and has not been run.
+  through the reranked path, half a second each.
 
 
 ## 26. Direction
 
-Proof-of-possession authentication · durable audit · ingestion sanitisation and a counterfactual
-check before synthesis commits · retrieval relevance on judged open questions.
+Proof-of-possession authentication over the network.
 History lives in the [CHANGELOG](CHANGELOG.md), not here.
 
 ## 27. References
