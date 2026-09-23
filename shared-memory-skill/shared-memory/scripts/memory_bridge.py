@@ -43,9 +43,7 @@ API_VERSION = 4
 # Outcome states, not valence: 'reversed' drives the supersession cascade; nuance goes in notes.
 RETRO_RATINGS = ("validated", "mixed", "refined", "pending", "reversed")
 CLIENT_VERSION_HEADER = "X-SM-Api-Version"
-# Framework build, distinct from the wire API_VERSION. Two clients can share api_version 4 and
-# still be releases apart.
-# The gateway counts this header as clients.versions_seen so that skew is visible.
+# Framework build, separate from api_version, so two clients on the same wire contract can still be counted apart in clients.versions_seen.
 CLIENT_BUILD_HEADER = "X-Shared-Memory-Client"
 
 # Only this skill's scripts/.env then ../.env; never walk toward $HOME.
@@ -53,25 +51,15 @@ _ENV_CANDIDATES = [
     os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"),
     os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env"),
 ]
-# SECURE_ENV_FILE matches secure_env._select_env_file: a path is the exact file, empty loads
-# none, unset keeps the walk.
-# Empty is the test pin. In admin mode the second candidate is the live gateway .env, and
-# importing it would setdefault secrets into os.environ.
+# SECURE_ENV_FILE is the exact file, empty loads none, and unset keeps the walk, because the second candidate in admin mode is the live gateway .env.
 _secure_env_file = os.environ.get("SECURE_ENV_FILE")
 if _secure_env_file is not None:
     _ENV_CANDIDATES = [_secure_env_file.strip()] if _secure_env_file.strip() else []
 
-# AGENT_TOKEN stays in this private variable and is never copied into os.environ, where /proc
-# and child processes would see it.
-# An operator export still wins, checked before any file. Tests clear _AGENT_TOKEN_FROM_FILE to
-# ignore a real on-disk .env.
+# AGENT_TOKEN from the file stays in this variable, never in os.environ, and an operator export still wins.
 _AGENT_TOKEN_FROM_FILE = ""
 
-# Duplicated from secure_env.is_secret_key because this client ships alone. Admin mode's second
-# candidate is the gateway .env, so a missed name leaks into os.environ; AGENT_TOKEN stays on
-# its own path.
-# test_client_secret_mirror_parity.py pins these lists to the server copies, including PG_CONN
-# and the _SECRET/_KEY/_CREDENTIAL suffixes.
+# Same secret names as the server, pinned by test_client_secret_mirror_parity.py, because this client ships alone and a missed name would land in os.environ.
 _CLIENT_KNOWN_SECRET_NAMES = {
     "PG_PASSWORD", "NEO4J_PASSWORD", "TAVILY_API_KEY", "AGENT_TOKENS",
     "BACKUP_ADMIN_TOKEN", "PG_CONN",
@@ -83,15 +71,7 @@ _CLIENT_SECRET_SUFFIXES = (
 
 
 def _client_key_norm(name: str) -> str:
-    """Fix round F11 (SEC1 MED-7 + LOW-8): shared client-side key
-    normaliser — mirrors secure_env._normalize_key() exactly (duplicated,
-    not imported: this client ships alone and may not depend on a
-    server-only module). BOM (U+FEFF) + whitespace stripped from both
-    ends, in EITHER order and any interleaving, then upper-cased. A single
-    fixed-order strip (e.g. .strip().lstrip(BOM)) only handles ONE of the
-    two orderings a raw line can carry — probed by SEC1: "﻿ AGENT_TOKENS"
-    (BOM then space) and " ﻿AGENT_TOKENS" (space then BOM) each defeat
-    exactly one fixed order."""
+    """Strip a leading or trailing BOM and whitespace in either order, then upper-case, matching the server key normaliser."""
     s = name
     while s and (s[0].isspace() or s[0] == "﻿"):
         s = s[1:]
@@ -104,9 +84,7 @@ _EXPORT_PREFIX_RE = re.compile(r"^export\s+", re.IGNORECASE)
 
 
 def _strip_export_prefix(key: str) -> str:
-    """Fix round F5 (SEC1 HIGH-3 + MED-5): strip an optional leading shell
-    `export ` keyword (case-insensitive) from a raw .env line's key text,
-    at parse time. Mirrors secure_env._strip_export_prefix() exactly."""
+    """Drop a leading shell ``export`` from a .env key so ``export AGENT_TOKENS`` is still classified as a secret."""
     s = key
     while s and (s[0].isspace() or s[0] == "﻿"):
         s = s[1:]
@@ -117,31 +95,14 @@ def _strip_export_prefix(key: str) -> str:
 
 
 def _strip_balanced_quotes(value: str) -> str:
-    """S16g (HYG round, R-G'): a `.env` VALUE wrapped in ONE balanced pair of
-    surrounding quotes — `"v"` or `'v'` — has that pair stripped; everything
-    else (an unbalanced leading quote with no matching trailing one, a bare
-    quote embedded in the value, mismatched quote characters, or no quotes
-    at all) is kept VERBATIM. Same rule, independently duplicated in
-    secure_env.py and mcp/vector-skill.py — none of the three may import from
-    another (Group 1: the client/server surface split)."""
+    """Strip one matching pair of surrounding quotes from a .env value, and leave every other quote untouched."""
     if len(value) >= 2 and value[0] == value[-1] and value[0] in ('"', "'"):
         return value[1:-1]
     return value
 
 
 def _is_client_secret_key(name: str) -> bool:
-    """True if `name` must never be exported into this client's own
-    os.environ (mirrors secure_env.is_secret_key(), narrowed to what this
-    client can ever encounter). AGENT_TOKEN is excluded -- it has its own
-    private-variable path and is never routed through this predicate.
-
-    Fix round F11 (SEC1 MED-7): normalises internally via
-    _client_key_norm(), so ANY caller — pre-normalised or raw — classifies
-    correctly. Before this fix, `_is_client_secret_key("agent_tokens")` was
-    False (exact-match-only against the upper-cased name list, no internal
-    normalisation) — defused today only because every call site happens to
-    pass an already-`.upper()`d key; a future caller passing a raw key
-    would silently re-open a live `agent_tokens=` export."""
+    """True when this name must stay out of os.environ; AGENT_TOKEN is excluded because it has its own private variable, and the check normalises the name first."""
     key_norm = _client_key_norm(name)
     if key_norm == "AGENT_TOKEN":
         return False
@@ -151,16 +112,7 @@ def _is_client_secret_key(name: str) -> bool:
 
 
 def _read_env_file(path: str) -> None:
-    """Parse one skill-scoped `.env` into this client's config.
-
-    The ONE parser this client has — the same rules the gateway applies to its
-    own env (secure_env.py), duplicated rather than imported because this
-    client ships alone (Group 1: the client/server surface split). A VALUE is
-    read verbatim to the end of its line: an inline `# comment` after a value
-    is part of the value, and a line with an unbalanced quote is kept as
-    written and never swallows the next line. Multi-line values, `${VAR}`
-    interpolation and `\\n` escapes are not a form any shipped or minted `.env`
-    uses and are not supported."""
+    """Parse one skill `.env` with the gateway's rules: a value runs to the end of its line, an inline hash stays in the value, and an unbalanced quote does not swallow the next line."""
     global _AGENT_TOKEN_FROM_FILE
     try:
         # utf-8-sig, matching mcp/vector-skill.py: a BOM would stick to the first key, and later
@@ -177,10 +129,7 @@ def _read_env_file(path: str) -> None:
                 _v = _strip_balanced_quotes(_v.strip())
                 if not _k:
                     continue
-                # One normalisation for both the AGENT_TOKEN check and the secret check,
-                # matching mcp/vector-skill.py.
-                # Export _k, not _k_norm: this changes what counts as secret, never the stored
-                # name's casing.
+                # One normalised form classifies the key, and the stored name keeps the caller's casing.
                 _k_norm = _client_key_norm(_k)
                 if _k_norm == "AGENT_TOKEN":
                     if not _AGENT_TOKEN_FROM_FILE:
@@ -200,8 +149,7 @@ for _env in _ENV_CANDIDATES:
 COORDINATOR_BASE = os.environ.get("COORDINATOR_URL", "http://localhost:8888")
 AGENT_ID         = os.environ.get("AGENT_ID", "memory_bridge")
 
-# Search wait is derived from /health backend_capability (and capacity when present), not a
-# fixed 30s (fact:1112).
+# The search wait comes from /health projections, not a fixed 30s (fact:1112: the shipped client still used a fixed wait and reported a live gateway as down).
 HEALTH_PROBE_TIMEOUT_S    = float(os.environ.get("HEALTH_PROBE_TIMEOUT_S", "3"))
 SEARCH_TIMEOUT_S          = float(os.environ.get("SEARCH_TIMEOUT_S", "0") or 0)
 SEARCH_TIMEOUT_FLOOR_S    = float(os.environ.get("SEARCH_TIMEOUT_FLOOR_S", "30"))
@@ -220,24 +168,7 @@ PROJECT_ROOT_MARKERS = tuple(
 
 
 def derive_project(start: str | None = None) -> str:
-    """Derive the canonical project tag from the working directory.
-
-    The canonical project is the PROJECT FOLDER NAME, so that every session on a
-    project produces the same tag no matter which agent wrote the record. The
-    gateway cannot do this — it is a server and never sees a client's working
-    directory — but skill runners execute from the user's project directory, so
-    the client can, identically for every agent.
-
-    Walks up from `start` to the first directory holding a project-root marker and
-    returns its basename. Walking (rather than taking the bare basename of the cwd)
-    is the whole point: a save issued from `<project>/tests` must tag `<project>`,
-    not `tests`. Stops at the filesystem root and never ascends past $HOME, so a
-    save issued from a home directory or an unmarked scratch dir derives nothing
-    and returns "" — an empty tag is strictly better than a confidently wrong one.
-
-    `SHARED_MEMORY_PROJECT` overrides the walk entirely, for callers whose working
-    directory is not a meaningful project boundary (daemons, CI, cron).
-    """
+    """Return the folder name of the nearest project-root marker, stopping at $HOME, unless SHARED_MEMORY_PROJECT is set."""
     override = os.environ.get("SHARED_MEMORY_PROJECT", "").strip()
     if override:
         return override
@@ -262,11 +193,7 @@ def derive_project(start: str | None = None) -> str:
 
 
 def _uds_path() -> str | None:
-    """The gateway Unix socket to connect over, so the gateway can read this client's
-    OS account via SO_PEERCRED (the person axis). Explicit COORDINATOR_UDS wins;
-    otherwise auto-detect the per-user default if it exists. Empty string disables it
-    (force TCP). Connecting over the UDS is what lets the gateway stamp the principal;
-    over TCP there is no kernel credential and the save is recorded with no principal."""
+    """The Unix socket that lets the gateway read this account via SO_PEERCRED, or None when COORDINATOR_UDS is empty or the default socket is absent."""
     p = os.environ.get("COORDINATOR_UDS")
     if p is None:
         base = os.environ.get("XDG_RUNTIME_DIR") or "/tmp"
@@ -290,10 +217,7 @@ def _sync_client(timeout: float) -> "httpx.Client":
 
 
 def search_ceiling(capability: dict | None, capacity: dict | None = None) -> float:
-    """Seconds to wait for search: max of /health projections, with SEARCH_TIMEOUT_FALLBACK_S if any encoder is unknown or failing (fact:1560).
-
-    SEARCH_TIMEOUT_S overrides. Absent/empty/non-dict blocks count as unknown. Capacity derived fields only raise the ceiling.
-    """
+    """Seconds to wait for a search are the published projections, or SEARCH_TIMEOUT_FALLBACK_S when an encoder has no usable number, and SEARCH_TIMEOUT_S overrides both (fact:1560: a failing probe with no projection dropped that wait to 30 seconds and the client aborted while the gateway kept working)."""
     if SEARCH_TIMEOUT_S > 0:
         return SEARCH_TIMEOUT_S
 
@@ -338,30 +262,12 @@ def search_ceiling(capability: dict | None, capacity: dict | None = None) -> flo
 
 _CAPABILITY_CACHE: dict | None = None
 _CAPACITY_CACHE: dict | None = None
-# Two searches can both see an unfilled cache and both call /health; the lock makes one fill
-# win.
-# Constructed at import: asyncio.Lock() does not need a running loop on the Python versions this
-# project targets.
+# One in-flight /health fill per process; the lock is created at import because this Python does not need a running loop for that.
 _HEALTH_FETCH_LOCK = asyncio.Lock()
 
 
 async def _fetch_health_blocks() -> None:
-    """GET /health once per process and cache both ``backend_capability`` and
-    ``capacity`` from it — ONE request feeds both caches, never two.
-
-    Never raises. An unreachable or slow gateway leaves both caches at their
-    "tried and got nothing" state and callers fall back to a constant ceiling —
-    sizing the search must never be the thing that fails the search. The
-    gateway caches its own probe, so this costs a few ms.
-
-    Sends this client's own auth headers (S-10, PR A5): ``backend_capability``
-    moved behind auth along with the rest of /health's operational detail, so
-    an unauthenticated call here would always land on the anonymous-slim shape
-    (no ``backend_capability``/``capacity`` keys at all) and silently fall back
-    to the constant ceiling on every authenticated install — the exact "unknown
-    cost" case ``search_ceiling`` already degrades safely for, just permanently
-    rather than only when the gateway is genuinely old/unreachable/unprobed.
-    """
+    """Fetch /health once per process, with this client's token, and cache capability and capacity; a miss stays empty so search uses the fallback instead of failing."""
     global _CAPABILITY_CACHE, _CAPACITY_CACHE
     if _CAPABILITY_CACHE is not None:
         return   # already attempted this process — do not retry
@@ -388,22 +294,13 @@ async def _gateway_capability() -> dict | None:
 
 
 async def _gateway_capacity() -> dict | None:
-    """The cached ``capacity`` block — see ``_fetch_health_blocks``. None on an
-    older/unreachable gateway, or one with no derivation yet."""
+    """The cached capacity block, or None when this process has not measured one."""
     await _fetch_health_blocks()
     return _CAPACITY_CACHE
 
 
 def _request_headers() -> dict:
-    """Headers attached to every coordinator request.
-
-    Always advertises this client's API_VERSION so the gateway can log skew
-    (see coordinator._check_client_version). Adds the Bearer token when
-    AGENT_TOKEN is set — checked fresh on every call so an operator export
-    or a test's monkeypatch.setenv always wins, falling back to the value
-    this module parsed out of its own .env at import time (never itself
-    exported to os.environ — see _AGENT_TOKEN_FROM_FILE above).
-    """
+    """Send the API and build headers on every request, plus a Bearer token from the environment or the file parsed at import."""
     headers = {CLIENT_VERSION_HEADER: str(API_VERSION),
                CLIENT_BUILD_HEADER: VERSION}
     token = os.environ.get("AGENT_TOKEN", "").strip() or _AGENT_TOKEN_FROM_FILE
@@ -413,26 +310,12 @@ def _request_headers() -> dict:
 
 
 def _token_presented() -> bool:
-    """Whether this client actually sent a credential on a request just now.
-
-    Derived from _request_headers() rather than re-reading AGENT_TOKEN, so the
-    two can never disagree about what was on the wire — the equality is asserted
-    against the real header, not against a second copy of the lookup (fact:1309).
-    """
+    """True when the header just built carried a credential (fact:1309: a test that only checked two expressions were equal stayed green when both were changed to the wrong column)."""
     return "Authorization" in _request_headers()
 
 
 def _auth_error() -> dict:
-    """The ONE 401 reply, phrased for the failure that actually happened.
-
-    A 401 with NO Authorization header sent is a MISSING credential, not a
-    rejected one: this client never presented anything for the gateway to
-    reject. Saying "rejected" in that case sends the operator off to compare a
-    token value against the gateway's AGENT_TOKENS registry, when the real
-    answer is that no token was configured at all — a different fix, in a
-    different file. Both branches still name AGENT_TOKEN and this agent's own
-    .env, because that is the remedy either way.
-    """
+    """Say the token was rejected only when one was sent, and otherwise say none was configured."""
     if _token_presented():
         return {"status": "error",
                 "message": ("Coordinator rejected this agent's token. Check that AGENT_TOKEN "
@@ -444,8 +327,7 @@ def _auth_error() -> dict:
 
 
 def _auth_log_hint() -> dict:
-    """Log payload for the 401 sites that record one. Which sites log is
-    deliberately UNCHANGED here; only the wording follows the branch above."""
+    """The audit hint for a 401, using the same missing-versus-rejected split as the operator message."""
     if _token_presented():
         return {"hint": "Check AGENT_TOKEN in .env matches an entry in gateway AGENT_TOKENS"}
     return {"hint": "No AGENT_TOKEN was sent; this gateway requires auth — set it in this agent's .env"}
@@ -492,24 +374,7 @@ def _append_log(tool: str, min_level: int, event: str, data: dict, content: str 
 # ── Coordinator HTTP helpers ──────────────────────────────────────────────────
 
 class GatewayReplyError(Exception):
-    """The gateway ANSWERED, and its answer was not a 2xx JSON payload.
-
-    Carries the client-facing error dict so every call site returns one shape.
-    It exists so that a reply which is not a success payload can never be
-    mistaken for a transport failure: it is raised INSIDE the request's
-    ``try``, and every site catches it BEFORE the generic handler that reports
-    an unreachable gateway.
-
-    ``logged_event`` names the audit event the RAISE SITE already wrote, or is
-    None when it wrote nothing. Centralising the decode moved some logging
-    inside ``_reply_json``, and a catch block that logs unconditionally would
-    then record ONE refused call TWICE — a 401 as both ``auth_failed`` and
-    ``save_failed``, where before it was a single ``auth_failed`` line. The
-    catch block therefore asks the exception what has already been recorded.
-    Deliberately an ATTRIBUTE and not a phrase read back out of the message:
-    keying the audit trail on message text would tie it to wording that exists
-    to be improved.
-    """
+    """The gateway answered with a non-success payload, so the caller must not report it as unreachable; ``logged_event`` is the audit line already written, if any."""
 
     def __init__(self, payload: dict, *, logged_event: str | None = None):
         super().__init__(payload.get("message", ""))
@@ -518,11 +383,7 @@ class GatewayReplyError(Exception):
 
 
 def _body_snippet(r, limit: int = 200) -> str:
-    """A short, whitespace-collapsed piece of the response body, or "".
-
-    Never raises: this runs on the error path, where a second failure would
-    replace a diagnosis with a traceback.
-    """
+    """A short collapsed piece of the response body, or an empty string, and never raises."""
     try:
         # Gateway-controlled text, including a non-JSON error page, is heading for a terminal or
         # log, so strip controls before collapsing and capping it.
@@ -531,22 +392,12 @@ def _body_snippet(r, limit: int = 200) -> str:
         return ""
 
 
-# Gateway text reaches the audit log and the terminal, and COORDINATOR_BASE is env-overridable,
-# so it is not trusted.
-# 600 keeps the longest deployed refusal (378 characters) whole and cuts only a body no deployed
-# path emits.
+# Gateway text is untrusted, and 600 keeps the longest deployed refusal whole.
 _GATEWAY_MESSAGE_MAX = 600
 
 
 def _clean_gateway_text(msg: str) -> str:
-    """Strip ASCII control characters (newline and tab kept) and cap the length.
-
-    A message printed to a terminal is not inert: an ANSI escape can clear the
-    screen or rewrite the line the operator is reading, and a BEL is not a
-    diagnosis. Stripping runs BEFORE the cap so the cap counts characters the
-    reader will actually see rather than characters that were about to be
-    removed.
-    """
+    """Drop ASCII controls other than newline and tab, then cap the length, because gateway text is printed to the operator's terminal."""
     cleaned = "".join(
         ch for ch in msg
         if ch in ("\n", "\t") or (ord(ch) >= 32 and ord(ch) != 127)
@@ -555,15 +406,7 @@ def _clean_gateway_text(msg: str) -> str:
 
 
 def _gateway_message(r) -> str | None:
-    """The gateway's own ``message`` when the body is JSON and carries one.
-
-    Guarded end to end: the whole point of this module's error contract is
-    that a decode failure is a RESULT here, never an exception that escapes
-    into the transport handler.
-
-    The message is capped and control-stripped on the way out — see
-    ``_clean_gateway_text``.
-    """
+    """Return the gateway's JSON ``message`` or ``error`` after control-stripping, or None when the body is not that shape."""
     try:
         body = r.json()
     except Exception:
@@ -577,7 +420,7 @@ def _gateway_message(r) -> str | None:
 
 def _reply_json(r, *, log_auth: bool = False,
                 accept_status: tuple = ()) -> dict:
-    """Decode JSON only after the status class is known; pass accept_status to keep a non-2xx body (fact:1503)."""
+    """Decode the body only after the HTTP status is known, and pass accept_status to keep a non-2xx body such as a 503 health verdict (fact:1503: a 403 read-only refusal was decoded before the status check and reported as the coordinator being unreachable)."""
     # The catch block is told the event name this branch just wrote, so a second literal cannot
     # drift away from the audit line.
     if r.status_code == 401:
@@ -616,7 +459,7 @@ def _reply_json(r, *, log_auth: bool = False,
 
 
 def _coordinator_unavailable(exc: Exception, ceiling: float | None = None) -> dict:
-    """Timeout vs refused vs unreachable are different messages; a GatewayReplyError is never 'unreachable' (fact:1112, fact:1503)."""
+    """A timeout means the gateway is slow, a GatewayReplyError means it answered, and only a failed connection is unreachable (fact:1112: a fixed wait reported a live gateway as down; fact:1503: a 403 was decoded and reported as unreachable)."""
     if isinstance(exc, GatewayReplyError):
         return exc.payload
     if isinstance(exc, httpx.TimeoutException):
@@ -643,13 +486,7 @@ ROLE_REPORTING_MIN_VERSION = "0.9.54"  # authenticated /health reports role from
 
 
 def _gateway_predates(version: str | None, minimum: str = ROLE_REPORTING_MIN_VERSION) -> bool | None:
-    """Whether ``version`` names a gateway release strictly before ``minimum``.
-
-    ``None`` when ``version`` cannot be parsed as dotted integers — an old,
-    pre-version-contract gateway or a malformed string. The caller treats that
-    the same as "predates": a gateway too old to even report a parseable
-    version is certainly too old to report `role` (T-04, PR #310 review).
-    """
+    """True when ``version`` is a dotted release older than ``minimum``, and None when it cannot be parsed."""
     try:
         parsed = tuple(int(p) for p in str(version).split("."))
         floor = tuple(int(p) for p in minimum.split("."))
@@ -659,21 +496,7 @@ def _gateway_predates(version: str | None, minimum: str = ROLE_REPORTING_MIN_VER
 
 
 def _role_diagnosis(h: dict) -> str:
-    """T-04 (PR #310 review): THREE distinguishable reasons `role` can be
-    missing from a /health payload, not one generic "unknown" — the old single
-    fallback text asserted a version floor even when `gateway_version` in the
-    SAME payload said the gateway was current, which is a false diagnosis
-    exactly when it matters most (an operator running `doctor` to find out
-    why their own token isn't working).
-
-      1. `role` present → surfaced verbatim.
-      2. `role` absent AND the gateway's own reported version predates
-         ROLE_REPORTING_MIN_VERSION (or reports no parseable version at all)
-         → the gateway genuinely never sends this field.
-      3. `role` absent AND the gateway version is current → this caller's
-         token was not accepted, so the gateway served the anonymous-slim
-         /health shape, which has no `role` key regardless of gateway age.
-    """
+    """Return the role when /health sent one, 'token not accepted' when a current gateway omitted it, and 'predates' when the gateway is too old to send the field."""
     if "role" in h:
         return h.get("role")
     predates = _gateway_predates(h.get("version"))
@@ -686,12 +509,7 @@ def _role_diagnosis(h: dict) -> str:
 
 
 async def check_gateway_compat() -> dict:
-    """GET /health and compare the wire contract. Pure diagnostic; never raises.
-
-    Returns a dict with a ``compat`` field of "ok" | "incompatible" | "unknown",
-    plus a human-readable ``warning`` when the client and gateway disagree on
-    API_VERSION. Used by the ``doctor`` command and to enrich error messages.
-    """
+    """Compare this client's api_version with /health and return compat ok, incompatible, or unknown, without raising."""
     try:
         async with _async_client(3.0) as client:
             h = _reply_json(await client.get(f"{COORDINATOR_BASE}/health",
@@ -737,10 +555,7 @@ async def check_gateway_compat() -> dict:
 
 
 async def _warn_on_skew(result: dict) -> dict:
-    """When a request failed, probe /health and append a version-skew hint.
-
-    Only runs on the failure path, so the happy path pays no extra round trip.
-    """
+    """On an error result, attach a version-skew warning from /health when the two sides disagree."""
     if not isinstance(result, dict) or result.get("status") != "error":
         return result
     diag = await check_gateway_compat()
@@ -787,10 +602,7 @@ async def save_artifact(content: str, metadata_json: str = "{}") -> dict:
             )
             result = _reply_json(r, log_auth=True)
     except GatewayReplyError as exc:
-        # A 401 was already logged as auth_failed inside _reply_json; a save_failed here would
-        # double-count it.
-        # Every other answered refusal logs save_failed. Those used to be recorded as
-        # coordinator_down, which was a gateway that had answered.
+        # A 401 was already logged as auth_failed, and every other answered refusal is save_failed rather than coordinator_down.
         if exc.logged_event is None:
             _append_log("memory_bridge", 2, "save_failed",
                         {"response": exc.payload, "content_preview": content[:100]}, content)
@@ -805,9 +617,7 @@ async def save_artifact(content: str, metadata_json: str = "{}") -> dict:
         _append_log("memory_bridge", 3, "save_success",
                     {"pg_id": pg_id, "source": metadata.get("source"), "entity_count": len(entities)},
                     content)
-        # A fact with no entities never reaches synthesis. A decision or retrospective mints
-        # none and inherits topics from its grounding, so empty grounded_in is the defect there,
-        # not no_entities.
+        # no_entities is a coverage log only: entities never gate consolidation, and a judgement mints none (decision:1664: only a fact carries entities; a decision or retrospective takes its topics from grounded_in).
         if metadata.get("type") in ("decision", "retrospective"):
             if not metadata.get("grounded_in"):
                 _append_log("memory_bridge", 1, "no_grounding",
@@ -822,8 +632,7 @@ async def save_artifact(content: str, metadata_json: str = "{}") -> dict:
 
 
 async def supersede_fact(pg_id: int, by: int | None = None) -> dict:
-    """Retract an existing fact without saving a replacement (decision 381/384).
-    With `by`, point it at an existing successor fact."""
+    """Retract a fact without a replacement, or point `--by` at a successor (decision 381: the old fact is kept and hidden from search; decision 384: the successor is applied when the record is read)."""
     payload: dict = {"pg_id": pg_id}
     if by is not None:
         payload["by"] = by
@@ -843,8 +652,7 @@ async def supersede_fact(pg_id: int, by: int | None = None) -> dict:
 
 
 async def review_hold(summary_id: int, pg_id: int) -> dict:
-    """Mark a summary's flagged stale source as reviewed-and-held (decision 384, 8e):
-    stop surfacing the supersession of `pg_id` for summary `summary_id`."""
+    """Stop summary `summary_id` from raising the supersession of `pg_id` again (decision 384: a superseded fact is only marked, and dependents learn that when they are read)."""
     try:
         async with _async_client(30.0) as client:
             r = await client.post(
@@ -862,14 +670,7 @@ async def review_hold(summary_id: int, pg_id: int) -> dict:
 
 async def _search_payload(query: str, limit: int = 5, project: str = None,
                            domains: list = None, since: str = None) -> dict:
-    """The raw gateway payload for one search call — the HTTP call and error
-    handling `search_and_rerank()` used to inline, pulled out so a caller
-    that needs more than the bare results list (v0.9.62: the keyword-fallback
-    headline, `_fallback_warning`) can derive it from the SAME call instead
-    of a second HTTP round trip. Always a dict: the decoded success payload,
-    or this client's own error dict (`exc.payload` / `_coordinator_unavailable`
-    already return one) — never the bare results list `search_and_rerank`
-    unwraps it into."""
+    """One search call's raw payload, success or this client's error dict, so the fallback warning and the result list come from the same response."""
     # The reranker dominates this call and its cost tracks the payload, so the wait comes from
     # the gateway's published ceiling, not a constant.
     ceiling = search_ceiling(await _gateway_capability(), await _gateway_capacity())
@@ -904,20 +705,7 @@ async def search_and_rerank(query: str, limit: int = 5, project: str = None,
 
 
 def _unranked_warning(results) -> str | None:
-    """One line for stderr when some rows in a search result are vector-order,
-    not reranked — the gateway marks each row ``ranked: false`` when the
-    reranker timed out and it served candidate/vector order instead. A
-    positional result printed silently in that state reads as ranked when it
-    is not; the JSON to stdout carries the per-row truth already, this is
-    just the operator-facing headline. None when ``results`` is not a list of
-    rows (an error payload, an empty result) or nothing is unranked.
-
-    T-07 (PR #310 review): the returned SENTENCE (no leading/trailing
-    decoration) is the shared core both front doors present — MCP's
-    equivalent ``vector_skill._unranked_warning`` must return the identical
-    string for the identical input; a parity test holds the two in step
-    exactly like ``search_ceiling``'s S5. Each door decorates it in its own
-    idiom (a bare stderr line here, a ``NOTE: …`` prefix there)."""
+    """One sentence when some rows are vector order because the reranker timed out, or None when there is nothing unranked, and the sentence must match vector_skill for the same input."""
     if not isinstance(results, list):
         return None
     unranked = sum(1 for row in results if isinstance(row, dict) and row.get("ranked") is False)
@@ -928,25 +716,7 @@ def _unranked_warning(results) -> str | None:
 
 
 def _fallback_warning(payload: object) -> str | None:
-    """One line for stderr when the gateway served a KEYWORD (substring)
-    fallback because the embedder was unavailable — `coordinator.py` answers
-    that case honestly with ``{"status":"success","fallback":"keyword",
-    "results":[...]}`` rather than failing the search, but until this both
-    clients silently stripped the envelope and only the results list reached
-    the operator. A natural-language query almost never ILIKE-matches, so the
-    common shape of that silence was an EMPTY list reading as "nothing
-    known" — this MUST fire on ``results: []`` too, which is the one case
-    `_unranked_warning` (rows marked ``ranked: false``) can never catch (fact:1609).
-
-    Input is the RAW gateway payload (a dict, e.g. from `_search_payload`),
-    not the unwrapped results list `_unranked_warning` takes — the
-    ``fallback`` marker lives one level up from ``results``. None unless
-    `payload` is a dict with ``fallback == "keyword"``.
-
-    Mirrors `_unranked_warning`'s parity discipline (T-07, PR #310 review):
-    the returned SENTENCE is the shared core both front doors present —
-    `vector_skill._fallback_warning` must return the identical string for
-    the identical input; a parity test holds the two in step."""
+    """One sentence when the payload says ``fallback`` is ``keyword``, including an empty result list, or None otherwise (fact:1609: that empty list used to look like nothing was known), and the sentence must match vector_skill for the same input."""
     if not isinstance(payload, dict) or payload.get("fallback") != "keyword":
         return None
     results = payload.get("results")
@@ -957,12 +727,7 @@ def _fallback_warning(payload: object) -> str | None:
 
 
 def _stale_projection_note(capability: dict | None) -> str | None:
-    """B1/T-02 (PR #310 review): a backend whose block carries
-    ``projection_stale: true`` still has its number USED by ``search_ceiling``
-    when it has one (only a `status: "failing"`/stale block with NO number is
-    treated as unknown-cost) — but nothing said so out loud. This names which
-    backend and, when the gateway reports ``projection_age_s`` (PR-A), for how
-    long. None when nothing is stale — the common case pays nothing."""
+    """Name each encoder whose projection is stale, with its age when the gateway sent one, or None when nothing is stale (fact:1560: a failing probe with no number dropped the wait to 30 seconds while the gateway kept working)."""
     if not isinstance(capability, dict):
         return None
     notes = []
@@ -979,11 +744,7 @@ def _stale_projection_note(capability: dict | None) -> str | None:
 
 
 def _search_argparser() -> "argparse.ArgumentParser":
-    """T-08 (PR #310 review): pulled out of ``main()``'s inline dispatch so a
-    test can call ``.format_help()``/read ``.description`` directly, rather
-    than the B4 documentation unit (SEARCH_TIMEOUT_S mention below) having
-    zero test coverage because nothing could reach the parser without also
-    running the search action."""
+    """The search argument parser, separate from main so a test can read its help without running a search."""
     p = argparse.ArgumentParser(
         prog="memory_bridge.py search", add_help=False,
         description="Search shared memory. The wait is sized from the "
@@ -1013,7 +774,7 @@ def _search_argparser() -> "argparse.ArgumentParser":
 
 
 def _save_argparser() -> "argparse.ArgumentParser":
-    """T-08 (PR #310 review): see ``_search_argparser`` — same reason."""
+    """The save argument parser, separate from main so a test can read its help without saving."""
     p = argparse.ArgumentParser(
         prog="memory_bridge.py save",
         description="Save a fact, optionally superseding an existing one. "
@@ -1075,34 +836,18 @@ def get_telemetry() -> dict:
 
 
 def get_health_payload() -> dict | None:
-    """The gateway's /health payload, or None if it could not be fetched.
-
-    Separate from ``check_gateway_compat`` (which reads only the three keys an
-    anonymous caller receives) because this one wants the AUTHENTICATED shape:
-    ``dependencies`` and ``warnings`` are operational detail about the
-    deployment and are not served anonymously.
-
-    Never raises: `status` is a diagnostic command, and a report that refuses to
-    print because one of its two sources was unreachable is worse than a report
-    that prints the half it has.
-    """
+    """The authenticated /health body, including a 503 encoder verdict, or None when the call fails, so status can still print telemetry."""
     try:
         with _sync_client(HEALTH_PROBE_TIMEOUT_S) as client:
             r = client.get(f"{COORDINATOR_BASE}/health", headers=_request_headers())
-        # /health answers 503 when an encoder is down, and that body is the verdict this
-        # renders, so 503 is kept rather than discarded (fact:1503).
+        # A 503 from /health is the encoder verdict, so that body is kept (fact:1503: an answered non-2xx used to be thrown away and reported as unreachable).
         return _reply_json(r, accept_status=(503,))
     except Exception:
         return None
 
 
 def _age_phrase(ts: str | None) -> str:
-    """Render an ISO-8601 telemetry timestamp as an age, or '—' when absent.
-
-    Kept a pure function so a mutation check can bite it. Absence is rendered
-    honestly rather than as "0s ago": a null last_ts means the event has not
-    happened in the gateway's current process, which is a different statement
-    from "it happened just now"."""
+    """An age for an ISO timestamp, or an em dash when the event has not happened in this gateway process."""
     if not ts:
         return "—"
     try:
@@ -1121,19 +866,7 @@ def _age_phrase(ts: str | None) -> str:
 
 
 def format_health_verdict(health: dict | None) -> list[str]:
-    """The /health verdict lines: one enum per dependency, then any warnings.
-
-    ⛔ THE VERDICT COMES FROM THE GATEWAY, NOT FROM HERE. Before v0.9.74 every
-    consumer derived its own health from telemetry numbers — the monitor had one
-    opinion about when the outbox was unwell, this client had none, and a third
-    consumer would have invented a third. The threshold now lives server-side
-    and this function only renders what it was told.
-
-    A pure function so a mutation check can bite it, and tolerant of an OLDER
-    gateway: no `dependencies` key means a pre-0.9.74 server, which is not an
-    error — it is a server that cannot answer the question yet, and saying
-    nothing is better than inventing a verdict on its behalf.
-    """
+    """Render the gateway's dependency enums and warnings, and return nothing when an older gateway sent no dependencies key."""
     if not isinstance(health, dict):
         return []
     deps = health.get("dependencies")
@@ -1159,12 +892,7 @@ def format_health_verdict(health: dict | None) -> list[str]:
 
 
 def format_status(payload: dict, health: dict | None = None) -> str:
-    """Render the telemetry snapshot as a compact human-readable report.
-
-    `health` is the /health payload, rendered FIRST when supplied: the numbers
-    below are the detail, and the question an operator opens this with is
-    whether the system is usable at all.
-    """
+    """The status report, with the /health verdict first and the telemetry counts under it."""
     if payload.get("status") != "success":
         return json.dumps(payload, indent=2)
     t  = payload["telemetry"]
@@ -1211,8 +939,7 @@ def format_status(payload: dict, health: dict | None = None) -> str:
             lines.append(f"  REM enrichment: {_failing} retrying | "
                          f"{_dead} DEAD-LETTERED at {rem.get('max_attempts','?')} "
                          f"attempts{_warn}")
-        # Printed only once passed-over or starved climbs above zero; both stay 0 until the solo
-        # backlog is large enough to matter (decision 890).
+        # Printed only once passed-over or starved is above zero (decision 894: a solo record skipped often enough is promoted and drained ahead of the batch).
         _passed_over = rem.get("passed_over", 0) or 0
         _starved = rem.get("starved_pending", 0) or 0
         if _passed_over or _starved:
@@ -1281,8 +1008,7 @@ def format_status(payload: dict, health: dict | None = None) -> str:
                 parts.append(f"{c['consecutive_failures']} fails")
             if c.get("last_error"):
                 _err = c["last_error"]
-                # A crash superseded by a later success is history, not a current error. Older
-                # gateways omit "superseded", so absence stays the bare err line (fact:1609).
+                # A crash later followed by success is history, and an older gateway that omits "superseded" keeps the bare error line (fact:1636: the gateway added superseded and age_seconds so a past crash is not the current failure).
                 if _err.get("superseded"):
                     _err_age = _err.get("age_seconds")
                     _err_age_s = f"{_err_age}s ago" if _err_age is not None else "—"
@@ -1311,10 +1037,7 @@ def format_status(payload: dict, health: dict | None = None) -> str:
             lines.append(f"    {ct}: " + ", ".join(parts))
     elif "error" in cn:
         lines.append(f"  consolidation: ERROR {cn['error']}")
-    # Credential failures are printed only when non-zero, same as the enrichment and fairness
-    # lines. A healthy run would otherwise be noise.
-    # Each count carries the age of its own last event. The counters reset on gateway restart,
-    # so a diff of polls would read that as no failures.
+    # Credential counts print only when non-zero, each with the age of its own last event, because the counters reset when the gateway restarts.
     cr = t.get("credentials", {})
     if cr and "error" not in cr:
         _tvf = cr.get("token_verify_failed", 0) or 0
@@ -1369,24 +1092,7 @@ def format_status(payload: dict, health: dict | None = None) -> str:
 # ── Decision shortcut ─────────────────────────────────────────────────────────
 
 def alternatives_list(alternatives) -> list[str]:
-    """One value in, ONE alternative out — verbatim, and never split.
-
-    This used to be ``alternatives.split(",")``. A well-written alternative
-    contains commas — *"use explicit Neo4j transactions for atomicity (APOC not
-    available, auto-commit is the existing pattern)"* — so it was stored as two
-    fragments that do not stand alone, in Postgres AND in the graph's ADR
-    properties, with no warning. Measured across the corpus: 21% of the
-    decisions carrying alternatives held at least one fragment, and nothing in
-    the record said which pieces had once been a single entry.
-
-    A capture surface must not accept a value it cannot faithfully represent,
-    so the separator is gone rather than replaced. Repeat the flag once per
-    alternative; a value that arrives as one string is one alternative, which is
-    at worst under-split and never invents an option nobody wrote.
-
-    Accepts a list (the CLI's repeated flag, or a JSON array over the wire) or a
-    lone string. Blank entries are dropped — an empty value is an absence.
-    """
+    """Return each alternative verbatim, never comma-split, dropping blanks, because a comma inside an option used to become a second option nobody wrote."""
     if alternatives is None:
         return []
     if isinstance(alternatives, str):
@@ -1411,11 +1117,7 @@ def build_decision_metadata(
     domains=None,
     new_domain: bool = False,
 ) -> tuple:
-    """Build (content, metadata) for a decision save.
-
-    Returns a (content_str, metadata_dict) tuple ready for save_artifact().
-    Pure function — no I/O, no side effects.
-    """
+    """The content string and metadata dict for one decision save, with no I/O."""
     content = f"{title}\n\n{rationale}"
     decision = {
         "title": title,
@@ -1435,18 +1137,13 @@ def build_decision_metadata(
     metadata = {
         "type": "decision",
         "source": source or AGENT_ID,
-        # Top-level project is the operator-asserted value, the same one as in the blob. Readers
-        # of Postgres trust this key.
-        # Left unset, save_artifact fills it from the cwd (`.claude` under ~/.claude, nothing
-        # from ~) and the two fields disagree (fact:1757).
+        # The operator's project is written here and inside the decision as the same value.
         "project": project,
         "entities": [e.strip() for e in entities.split(",") if e.strip()],
         "decision": decision,
     }
-    # grounded_in is the pg ids this rests on, written as ROLE edges; include at least the
-    # conversation fact (decision 552).
-    # A role after the colon is optional; a bare id lets fact_kind pick the default
-    # (decision 582). Roles: based_on, considered, rejected, under_conditions, informed_by.
+    # grounded_in names the records this rests on and should include the conversation fact (decision 552: a decision is grounded at least in the conversation it came from).
+    # A role after the colon is optional (decision 582: a bare id takes fact_kind's default role, and that default is advisory rather than a silent rewrite). Roles: based_on, considered, rejected, under_conditions, informed_by.
     gi: list[int] = []
     grounded_roles: dict[str, str] = {}
     for tok in grounded_in.split(","):
@@ -1465,18 +1162,14 @@ def build_decision_metadata(
         metadata["grounded_in"] = gi
     if grounded_roles:
         metadata["grounded_roles"] = grounded_roles
-    # elicited means the spine fields were asked of the operator. An elicited null is
-    # deliberate, and coverage telemetry counts the ask (decision 559).
+    # elicited records that the operator was asked (decision 559: spine telemetry tracks whether the required fields were filled).
     if elicited:
         metadata["elicited"] = True
     # new_project registers a name the operator confirmed. It is not inferred: an agent setting
     # it to clear a rejection turns a typo into a permanent project.
     if new_project:
         metadata["new_project"] = True
-    # Domains are asserted, not inherited from evidence, and they go in the decision blob beside
-    # project. That is the half the gateway reads a judgement's axes from.
-    # --domain was parsed and dropped for one release, so the record silently inherited its
-    # evidence's sections and looked correct.
+    # Sections are stored on the decision itself, beside project (fact:1074: --domain was parsed and never written, and the record looked right because inheritance agreed with it).
     if domains:
         decision["domains"] = list(domains)
     if new_domain:
@@ -1501,17 +1194,7 @@ def build_retrospective_payload(
     source_ref: str = "",
     elicited: bool = False,
 ) -> dict:
-    """Build the JSON payload for POST /memory/retrospective (API v2 —
-    retro-as-record: the gateway mints a full searchable record and returns
-    its own pg_id).
-
-    grounded_in uses the same "pgid[:role],pgid" grammar as save_decision —
-    the facts that MEASURED this outcome (test-grounded retrospectives,
-    decision 542). A retrospective carries no entities — only facts do
-    (decision:1664) — so this never sends the field; the gateway inherits
-    its topics from the grounding facts. Pure function — no I/O, no side
-    effects.
-    """
+    """Payload for POST /memory/retrospective, using the same pgid[:role] grammar as a decision (decision 542: a decision taken from tests needs a retrospective that cites those tests and the measured change; decision:1664: only a fact carries entities, so this payload sends none)."""
     payload = {
         "pg_id": pg_id,
         "rating": rating.strip().lower(),
@@ -1572,20 +1255,14 @@ async def save_retrospective_artifact(
             return _reply_json(r, log_auth=True)
     except GatewayReplyError as exc:
         return exc.payload
-    except httpx.ConnectError as exc:
-        return _coordinator_unavailable(exc)
+    except Exception as exc:
+        return await _warn_on_skew(_coordinator_unavailable(exc))
 
 
 # ── Named query templates ─────────────────────────────────────────────────────
 
 def _build_query(template: str, args) -> str:
-    """Return a read-only Cypher string for the named provenance template.
-
-    Filter values are scrubbed to [A-Za-z0-9 _.-] before interpolation —
-    prevents quote-escape injection and avoids false-positive hits against
-    the coordinator's write-keyword guard on strings like 'delete'.
-    Pure function — no I/O, no side effects.
-    """
+    """Return read-only Cypher for one named template, with filter text reduced to letters, digits, space, and ``_.-`` so a quote or the word delete cannot be interpolated."""
     def _safe(v: str) -> str:
         return re.sub(r"[^A-Za-z0-9 _.\-]", "", v or "")
 
@@ -1700,10 +1377,8 @@ async def main() -> None:
             print(format_status(payload, health))
         return
     elif action == "lineage":
-        # Record state, dream-cycle stamps, and what it consolidated into. Joins stay
-        # gateway-side (ADR-014); this only calls the endpoint.
-        # A bare id or a qualified reference (fact:816, summary:87). An id is unique only within
-        # its table, so a bare summary id resolves against the wrong table.
+        # The gateway returns dream-cycle stamps and what the record folded into (ADR-014 keeps those joins server-side).
+        # fact:816 and summary:87 are examples of a qualified ref, not a claim about those records: the same number in another table is a different record, so a bare summary id is read from the facts table.
         if len(sys.argv) < 3:
             print(json.dumps({"error": "Usage: memory_bridge.py lineage <pg_id|type:id>"}))
             sys.exit(1)
@@ -1728,8 +1403,8 @@ async def main() -> None:
                 print(json.dumps(_reply_json(r), indent=2))
         except GatewayReplyError as exc:
             print(json.dumps(exc.payload, indent=2))
-        except httpx.ConnectError as exc:
-            print(json.dumps(_coordinator_unavailable(exc)))
+        except Exception as exc:
+            print(json.dumps(await _warn_on_skew(_coordinator_unavailable(exc))))
         return
     elif action in ("doctor", "health"):
         diag = await check_gateway_compat()
