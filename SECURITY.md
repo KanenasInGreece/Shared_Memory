@@ -65,17 +65,13 @@ A crafted `Host` header containing `/`, `?`, or `#` causes Starlette to misparse
 
 ---
 
-### Neo4j 5.26.30-community CVE-2026-1337 (LOW) — accepted
+### Neo4j image (2026-09-23)
 
-**Status: accepted; no image bump in this release.**
+`neo4j:5.26.30-community` is now `neo4j:5.26.31-community` on the same 5.26 LTS: the query log escapes the unicode CVE-2026-1337 would turn into HTML, and Jackson moves to 2.22.2 for CVE-2026-68497 (high, CPU exhaustion on a crafted Duration), CVE-2026-19032, and CVE-2026-83557; Cypher and the store format do not change, the bundled GDS plugin moves 2.13.12 to 2.13.13 and APOC to 5.26.31, and this pin does not recreate the running container.
 
-CVE-2026-1337 is classified LOW severity for `neo4j:5.26.30-community`. The framework's dependency-currency check (`Component Security Updates` above) prioritises stability on the Neo4j 5.26 LTS line. Because this vulnerability carries LOW impact under the gateway's isolated container environment (container network isolation, non-root user execution, and authenticated access), the risk is accepted without forcing an immediate image tag bump or database container rebuild.
+### PostgreSQL, pgvector, and the Python locks (2026-09-23)
 
-If the operator or a future release updates the pinned Neo4j tag in `shared-memory/ops/postgres_neo4j_limits.yaml`, run `reconcile_stack.sh` to reconcile the running container against the updated compose pin:
-
-```bash
-bash shared-memory/scripts/reconcile_stack.sh --yes
-```
+PostgreSQL stays at 17.11 inside `pgvector/pgvector:0.8.6-pg17` and pgvector stays at 0.8.6, both still the current releases, and `pip-audit` reports no advisory on `requirements.lock`, `requirements-gateway.lock`, or `requirements-mcp.lock`, whose floors already match those pins.
 
 ---
 

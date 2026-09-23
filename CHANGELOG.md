@@ -7,6 +7,10 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Security
+- Neo4j image pin `5.26.30-community` → `5.26.31-community` (same LTS): query-log escaping for CVE-2026-1337, and Jackson 2.22.2 for CVE-2026-68497, CVE-2026-19032, and CVE-2026-83557. The running container stays on 5.26.30 until `reconcile_stack.sh`.
+- GPU encoder services pass `--flash-attn on`. If that server exits on its own, `encoder_gpu_or_cpu.sh` restarts it on CPU with the flag removed. The CPU services do not set the flag.
+
 ## [0.9.111] — 2026-09-23
 
 ### Changed

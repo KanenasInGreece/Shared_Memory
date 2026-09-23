@@ -363,14 +363,14 @@ online provider — the embedder and reranker run as Docker containers from the 
 least one consumer: a CLI agent through the skill (Claude Code, Antigravity CLI, Grok, Codex CLI)
 and/or an MCP host through the connector (LM Studio, opencode — [§21](#21-the-mcp-install-any-mcp-host-one-connector)).
 
-**Runtime components — the shipped, pinned baseline (checked 2026-08-25).** The compose file names
+**Runtime components — the shipped, pinned baseline (rechecked 2026-09-23).** The compose file names
 exact image tags, never floating ones, and these are requirements in their own right:
 
 | Component | Shipped pin | Floor, and why |
 |---|---|---|
 | PostgreSQL | **17.11** via `pgvector/pgvector:0.8.6-pg17` | 17.x; 17.11 carries the 2026-08-13 security release (`pg_dump` CVE-2026-19385, `psql \unrestrict` CVE-2026-18408 — paths the backup and restore scripts exercise) |
 | pgvector | **0.8.6** (same image) | **≥ 0.8** — `hnsw.iterative_scan` is what keeps a selective `--project`/`--domain` filter from returning nothing at scale ([§16](#16-databases-initialise-verify-upgrade)); ≥ 0.8.4 for the HNSW-vacuum corruption fixes. The gateway reads the installed version at startup and reports it on authenticated `/health` |
-| Neo4j | **5.26.30** Community, `neo4j:5.26.30-community` | the 5.26 **LTS** line (supported to 2028-06); APOC and Graph Data Science load at container start |
+| Neo4j | **5.26.31** Community, `neo4j:5.26.31-community` | the 5.26 **LTS** line (supported to 2028-06); APOC and Graph Data Science load at container start |
 | llama.cpp server images | `ghcr.io/ggml-org/llama.cpp:server` / `:server-vulkan` | still floating — pinned after an encoder-host test |
 
 A pin moves only deliberately, and every move is recorded in the `CHANGELOG` with its reason; a
@@ -825,7 +825,7 @@ verifies it; by hand it is
 ## 15. The stack: Docker Compose
 
 `shared-memory/ops/postgres_neo4j_limits.yaml` defines six services, four of them on by default: **postgres** (pgvector, pinned
-`0.8.6-pg17`), **neo4j** (pinned `5.26.30-community`, with APOC + the required GDS plugin), and the two
+`0.8.6-pg17`), **neo4j** (pinned `5.26.31-community`, with APOC + the required GDS plugin), and the two
 llama.cpp inference containers —
 **retriever-api** (BGE-M3 embedder, `:8070`) and **reranker-api** (BGE-Reranker-v2-m3, `:8071`).
 The file is `${VAR}`-parametrized: host paths and passwords come from `shared-memory/.env`

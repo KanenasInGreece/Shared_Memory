@@ -144,3 +144,32 @@ def test_per_service_var_overrides_pairwise_even_when_pairwise_disagrees(tmp_pat
     # reranker untouched by the per-service override — still follows the pair
     assert r["reranker-api"] == 1
     assert r["reranker-api-gpu"] == 0
+
+
+def test_gpu_services_set_flash_attn_and_cpu_services_do_not(tmp_path):
+    """GPU command carries flash attention. CPU command does not: on CPU the
+    flag raises resident memory, and the GPU entrypoint is what fails over."""
+    base = {
+        "NEO4J_HOST_DIR": str(tmp_path / "neo4j"),
+        "PG_DATA_DIR": str(tmp_path / "pg"),
+        "NEO4J_PASSWORD": "x",
+        "PG_PASSWORD": "x",
+    }
+    env_file = tmp_path / "compose.env"
+    env_file.write_text("".join(f"{k}={v}\n" for k, v in base.items()))
+    proc = subprocess.run(
+        ["docker", "compose", "-f", COMPOSE_FILE, "--env-file", str(env_file),
+         "config", "--format", "json"],
+        capture_output=True, text=True, timeout=30,
+    )
+    assert proc.returncode == 0, proc.stderr
+    doc = json.loads(proc.stdout)
+    for name in ("retriever-api-gpu", "reranker-api-gpu"):
+        svc = doc["services"][name]
+        assert "--flash-attn" in svc["command"]
+        assert "on" in svc["command"]
+        assert "encoder_gpu_or_cpu.sh" in " ".join(svc["entrypoint"])
+    for name in ("retriever-api", "reranker-api"):
+        cmd = doc["services"][name]["command"]
+        assert "--flash-attn" not in cmd
+        assert "-fa" not in cmd
