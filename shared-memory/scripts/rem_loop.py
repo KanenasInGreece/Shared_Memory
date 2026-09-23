@@ -40,8 +40,7 @@ load_split_env()
 NEO4J_URI    = "bolt://localhost:7687"
 NEO4J_USER   = "neo4j"
 NEO4J_PASS   = get_secret("NEO4J_PASSWORD", "")
-# Bound the driver pool — this daemon shares Neo4j with live gateway traffic;
-# an unbounded default pool can queue indefinitely under contention.
+# Bound driver pool to prevent indefinite queueing against live gateway traffic.
 NEO4J_MAX_POOL        = int(os.environ.get("NEO4J_MAX_POOL", "50"))
 NEO4J_ACQUIRE_TIMEOUT = float(os.environ.get("NEO4J_ACQUIRE_TIMEOUT", "30"))
 _pg_pass     = get_secret("PG_PASSWORD", "")
@@ -54,8 +53,7 @@ REASONER_URL   = "http://localhost:8888/v1/chat/completions"
 LLM_MODEL      = os.environ.get("LLM_MODEL", "local-model")
 AUDIT_LOG_PATH = os.environ.get("AUDIT_LOG_PATH", "").strip() or None
 
-# Authenticates this daemon only; it does not change Fact.source.
-# The proxy passes it on a pipe fd; get_secret is the fallback when this file is run by hand and no fd exists.
+# Authenticates daemon via pipe fd, falling back to get_secret for manual runs.
 _AGENT_TOKEN = read_daemon_token_from_fd() or get_secret("AGENT_TOKEN", "").strip() or None
 
 
@@ -67,12 +65,10 @@ def _auth_headers() -> dict:
 
 
 def _routing_refusal(resp) -> dict | None:
-    """Recognize a gateway routing refusal — 422 ``no_eligible_backend`` or 503
-    ``backend_at_capacity`` (Model_Attributes_Routing_Plan_2026-08-18 F-1/F-2),
-    both stamped ``X-SM-Fault-Origin: gateway``. Keys on the STRUCTURED BODY +
-    that header, never on status alone — a real provider 422/503 passed
-    through the proxy must never be misread as the gateway declining to place
-    the job. Returns ``{"error", "constraint", "role"}`` or None."""
+    """Recognize a gateway routing refusal (422 ``no_eligible_backend`` or 503
+    ``backend_at_capacity``) via body and ``X-SM-Fault-Origin: gateway`` header.
+    Returns ``{"error", "constraint", "role"}`` or None.
+    """
     if resp.status_code not in (422, 503):
         return None
     if resp.headers.get("X-SM-Fault-Origin") != "gateway":
@@ -88,10 +84,9 @@ def _routing_refusal(resp) -> dict | None:
 
 
 def _require_db_credentials() -> None:
-    """Wraps secure_env.require_db_credentials() with this daemon's own
-    resolved values — called ONLY from the __main__ guard below (review fix
-    #4). See that function's docstring for why this must never run at bare
-    import time."""
+    """Wraps secure_env.require_db_credentials() with resolved daemon values;
+    called only from __main__ to avoid failing bare imports.
+    """
     require_db_credentials(
         pg_password=_pg_pass, pg_conn=_pg_conn_explicit,
         neo4j_password=NEO4J_PASS, daemon_name="rem_loop",
@@ -126,9 +121,8 @@ BACKUP_ADVISORY_LOCK_KEY = int(os.environ.get("BACKUP_ADVISORY_LOCK_KEY", "87653
 
 
 def _take_shared_backup_lock(conn) -> bool:
-    """Non-blocking SHARED acquire of the backup advisory lock on an existing
-    autocommit conn. Returns True if taken (no backup running), False if the
-    gateway holds it EXCLUSIVE. Session-scoped — auto-releases when conn closes.
+    """Non-blocking SHARED acquire of session-scoped backup advisory lock on an
+    autocommit conn; returns False if gateway holds EXCLUSIVE.
     """
     with conn.cursor() as cur:
         cur.execute("SELECT pg_try_advisory_lock_shared(%s)", (BACKUP_ADVISORY_LOCK_KEY,))
@@ -140,10 +134,9 @@ NREM_PRIORITY_ADVISORY_LOCK_KEY = int(
 
 
 def _nrem_is_queuing(conn) -> bool:
-    """True when NREM holds the priority lock (it is waiting for the slot), so
-    this REM cycle should yield. Probe by try-acquire + immediate release: if
-    we get it, nobody was queuing. Fail-open — a probe error never blocks
-    enrichment, it just means this cycle proceeds unarbitrated."""
+    """Probe if NREM holds the priority lock by try-acquire and immediate release;
+    fails open (False) on probe errors so enrichment is not blocked.
+    """
     try:
         with conn.cursor() as cur:
             cur.execute("SELECT pg_try_advisory_lock(%s)",
@@ -196,9 +189,8 @@ logger = logging.getLogger("REMDaemon")
 
 # consolidation_loop.py has its own copy of these two helpers; keep them in agreement.
 def _finish_reason(resp_json) -> str | None:
-    """choices[0].finish_reason of an OpenAI-compatible completion response
-    ('stop' | 'length' | ...). llama.cpp always sets it and the gateway passes
-    it through; None when the shape is unexpected."""
+    """Return choices[0].finish_reason from completion response, or None if
+    malformed."""
     try:
         return (resp_json.get("choices") or [{}])[0].get("finish_reason")
     except (AttributeError, IndexError, TypeError):
@@ -206,18 +198,16 @@ def _finish_reason(resp_json) -> str | None:
 
 
 def _truncated(resp_json) -> bool:
-    """True when generation hit the max_tokens bound (finish_reason='length').
-    Semantics are FAIL-THE-UNIT: the response body must not be parsed,
-    repaired, persisted, or fed to any downstream gate."""
+    """True when generation hit max_tokens (finish_reason='length'); truncated
+    bodies must never be parsed, repaired, or persisted.
+    """
     return _finish_reason(resp_json) == "length"
 
 
 def _completion_text(resp_json) -> str:
-    """Best-effort raw completion body — used ONLY for truncation
-    classification/specimen capture (L0-a/b), never for parsing or
-    persisting. Defensive against an unexpected envelope shape; empty string
-    on anything it can't read, which is exactly what truncation_is_degenerate
-    fails open on."""
+    """Extract raw completion text for truncation classification or specimen
+    logging only; returns empty string if unreadable so classifiers fail open.
+    """
     try:
         content = (resp_json.get("choices") or [{}])[0].get("message", {}).get("content")
     except (AttributeError, IndexError, TypeError):
@@ -233,24 +223,14 @@ _LONG_STRING_RE = re.compile(r'"([^"]{30,})"')
 
 
 def truncation_is_degenerate(body: str) -> bool:
-    """True when a truncated completion body shows LOOP repetition rather
-    than legitimately running out of room (L0-b, fact:1329/1330, pre-build
-    review fact:1346 F-1/F-4/F-6). Either of two independent rules firing
-    calls it degenerate; empty/garbage/non-JSON text fails OPEN (False) — the
-    classifier only shortcuts an ALREADY-truncated call, it never gates one.
-
-    OBJECT rule: any flat `{...}` object (whitespace-normalised) occurring
-    >=3 times. Measured on the probe-2 specimen: 120 of 123 repeated objects
-    were exact duplicates of 22 distinct ones, the worst repeated x12.
-
-    LONG-STRING rule: any single quoted string >=30 chars occurring >=3
-    times — catches a summary repetition loop the OBJECT rule structurally
-    cannot see.
-
-    Both thresholds are operator-accepted as conservative-but-unmeasured
-    (fact:1338): re-measure against the specimen corpus this change
-    accumulates (the dream-metrics `specimen` key) before tightening or
-    loosening either one.
+    """Detects loop repetition in truncated completions when a flat `{...}` object
+    appears >=3 times (probe-2 measured 120 of 123 repeated objects duplicate 22
+    distinct ones, worst x12) or a quoted string >=30 chars repeats >=3 times, failing
+    open on non-JSON text. Distinguishes loops from exhaustion (fact:1329 — diagnosis
+    that release-trace facts dead-lettered at rem_attempts >= 5 from degenerate loops;
+    decision:1330 — REM_MAX_TOKENS_SOLO stays 1500 as dream ceiling; fact:1346 —
+    pre-build architecture review against live code), with thresholds unmeasured per
+    fact:1338 — an unmeasured default must say that it is unmeasured.
     """
     if not body or not body.strip():
         return False
@@ -270,18 +250,13 @@ def truncation_is_degenerate(body: str) -> bool:
 
 
 def _truncation_specimen(body: str) -> str:
-    """Bounded, single-line tail of a truncated completion body for the
-    journal WARN and the dream-metrics `specimen` key — never the full body.
-    Last REM_TRUNCATION_SPECIMEN_CHARS characters (the array elements a max-
-    tokens cut lands on), newlines collapsed so it stays one log line.
-
-    Zero or negative means DISABLED and must yield the empty string — slicing
-    with `[-0:]` is `[0:]`, so without this guard the value an operator picks
-    to turn specimens OFF would log the ENTIRE body (security review
-    fact:1347 S-1, executed: a 44,000-char body logged whole at CHARS=0).
-    Non-printables beyond whitespace (ESC/CSI, NUL, BS) are replaced so
-    crafted model output cannot smuggle terminal control sequences into
-    journalctl (S-4); the JSONL sink is safe either way (json.dumps)."""
+    """Returns the sanitized, single-line tail of the last
+    REM_TRUNCATION_SPECIMEN_CHARS characters of a truncated body for logging,
+    replacing non-printables to prevent terminal escape injection. Non-positive
+    values return empty string to avoid `[-0:]` logging the full body (fact:1347 —
+    security review finding that specimen bounds could overexpose; logged 44,000
+    chars at CHARS=0).
+    """
     n = REM_TRUNCATION_SPECIMEN_CHARS
     if n <= 0:
         return ""
@@ -290,9 +265,9 @@ def _truncation_specimen(body: str) -> str:
 
 
 def _drop_final_nonempty_line(raw: str) -> str:
-    """Remove the FINAL non-empty line of a truncated JSONL response — it is
-    the line the max_tokens knife cut, and even a strictly-parseable prefix of
-    it can be a silently incomplete record."""
+    """Drop the final non-empty line of a truncated JSONL response to avoid
+    silently accepting an incomplete record cut by max_tokens.
+    """
     lines = raw.splitlines()
     for i in range(len(lines) - 1, -1, -1):
         if lines[i].strip():
@@ -302,13 +277,10 @@ def _drop_final_nonempty_line(raw: str) -> str:
 
 
 def _parse_llm_json(candidate: str):
-    """Parse the LLM's JSON, salvaging Gemma-4's common slips (unescaped quotes /
-    newlines inside long summary strings) with json_repair when strict parsing
-    fails (decision 491). Returns the dict, or None if even repair can't produce
-    usable JSON. json_repair is imported lazily so the module stays importable
-    without the dependency; the salvage path only runs when json.loads already
-    failed, so it can never regress a currently-valid parse. A salvage is logged
-    (WARNING 'salvaged via json_repair') so the salvage rate is measurable."""
+    """Parse LLM JSON, falling back to lazy-imported json_repair for syntax slips
+    (such as unescaped quotes or newlines) if strict parsing fails. Returns dict or
+    None if unrepairable.
+    """
     try:
         return json.loads(candidate)
     except json.JSONDecodeError as exc:
@@ -331,11 +303,10 @@ def _parse_llm_json(candidate: str):
 # ── Prompts ───────────────────────────────────────────────────────────────────
 
 def build_single_prompt(content: str, kind: str) -> str:
-    """Summarisation prompt for one Decision/Retrospective/solo Fact — a summary
-    and nothing else (`decision:1664`).
-
-    Only reached for a record OVER REM_SUMMARY_THRESHOLD: a shorter one is asked
-    for nothing, so it never reaches an LLM call at all (see _llm_process)."""
+    """Summarisation prompt for records over REM_SUMMARY_THRESHOLD (decision:1664 —
+    entities are human-only: the graph receives a record's entity and attribution edges
+    at first write only, so REM writes no edges and no labels and only summarises).
+    """
     content_label = {KIND_DECISION: "DECISION", KIND_RETRO: "RETROSPECTIVE"}.get(kind, "FACT")
     return (
         "You are a technical knowledge curator summarising a record for a shared memory graph.\n"
@@ -370,11 +341,8 @@ class REMDaemon:
 
     @staticmethod
     def _open_pg_conn():
-        """Open a single AUTOCOMMIT psycopg2 connection for a REM cycle.
-
-        AUTOCOMMIT is used throughout: all REM Postgres writes are independent
-        single-statement operations that do not need multi-statement transactions.
-        Each statement commits immediately; no explicit conn.commit() calls needed.
+        """Open an AUTOCOMMIT psycopg2 connection for single-statement operations
+        without manual commits.
         """
         conn = psycopg2.connect(PG_CONN, connect_timeout=5)
         conn.set_isolation_level(psycopg2.extensions.ISOLATION_LEVEL_AUTOCOMMIT)
@@ -385,48 +353,11 @@ class REMDaemon:
     async def _fetch_non_rem_batch(
         self,
     ) -> tuple[list[int], dict[int, int], dict[int, str], dict[int, int]]:
-        """Non-REM anchor pg_ids, pickups-first then attempts then oldest-first.
-
-        Ordering `coalesce(rem_pickups,0) ASC, coalesce(rem_attempts,0) ASC,
-        pg_id ASC`. TWO counters, because rotation and retirement are different
-        questions with opposite accounting rules and one counter cannot answer
-        both (819):
-
-        * ``rem_pickups`` — FAIRNESS. Monotonic, never reset, incremented the
-          moment a record is picked up for processing regardless of outcome.
-          It is what makes the queue ROTATE: a record that was picked up moves
-          behind the ones that were not, so the tail is reachable within one
-          pass. Ordering on it is what fixes tail starvation — with a
-          failure-only counter the head was deterministic, so the arbiter's
-          record-boundary yield always cut at the same place and the tail was
-          structurally unreachable while the head was slow.
-        * ``rem_attempts`` — RETIREMENT. Incremented only on record-chargeable
-          failure classes, cleared to 0 on success, and the SOLE input to the
-          dead-letter cap below. Keying the cap on it alone is what makes it
-          structurally impossible for a backend outage to retire an otherwise
-          healthy record, however many times that record is picked up.
-
-        A high ``rem_pickups`` with ``rem_attempts`` still at 0 is the stranded
-        signal — picked up repeatedly, never succeeded, never blamed — i.e. the
-        ABANDONMENT case, which was invisible to every safety mechanism here
-        while both questions shared one counter.
-
-        Records at REM_MAX_ATTEMPTS or more are DEAD-LETTERED: excluded here,
-        their count logged once per cycle (operator reset =
-        `SET n.rem_attempts = 0`). Dead-lettering deletes nothing — the record
-        keeps its row, its node and its searchability; it only stops being
-        enriched.
-
-        Returns (pg_ids, {pg_id: rem_attempts}, {pg_id: selected label},
-        {pg_id: rem_passed_over}). The attempt map drives the batch→solo
-        demotion in run_cycle; the LABEL map drives the identity check (820) —
-        REM selects a NODE but resolves everything after that from the pg_id,
-        so the label it selected must be carried forward and checked against
-        the label the Postgres record kind implies, or the node marked
-        processed may not be the node selected. The passed-over map drives the
-        starved sub-queue promotion (STEP 3, decision 890's REM half) — a
-        scheduling-event counter, distinct from rem_pickups/rem_attempts,
-        which both describe what happened TO the record.
+        """Fetch non-REM candidate pg_ids ordered by ``rem_pickups`` (fair queue
+        rotation), ``rem_attempts`` (chargeable retirement capped at REM_MAX_ATTEMPTS;
+        reset via `SET n.rem_attempts = 0`), and ``pg_id`` (oldest-first). Returns
+        ``(pg_ids, attempts, sel_labels, passed_over)`` to drive batch-to-solo
+        demotion, node-to-Postgres label validation, and starvation promotion.
         """
         base = (
             f"MATCH (n)"
@@ -498,20 +429,10 @@ class REMDaemon:
             logger.warning("REM: rem_attempts bump failed for %s: %s", pg_ids, exc)
 
     async def _bump_rem_pickups(self, pg_ids: list[int]) -> None:
-        """Durable FAIRNESS counter (819): +1 the moment a record is picked up
-        for processing, written BEFORE the expensive call so a crash, an early
-        return or an abandoned cycle all still account. Monotonic — never
-        reset, never refunded, and never an input to the dead-letter cap, so
-        charging a pickup can not retire a healthy record and the batch/solo
-        distinction that F1 turned on does not apply here.
-
-        Bumping every selected record at selection time would be wrong: a solo
-        record the arbiter yield never reaches was not picked up, and rotating
-        it would hide the tail it is meant to expose. Call sites bump the
-        batch in bulk (all its members really are handed to the call) and each
-        solo record individually, AFTER the yield check.
-
-        Best-effort: the bump must never mask the work it precedes."""
+        """Increment monotonic ``rem_pickups`` (and reset ``rem_passed_over``) prior
+        to processing to ensure fair queue rotation without affecting dead-letter caps.
+        Bumps batches in bulk and solo records individually after yield checks.
+        """
         if not pg_ids:
             return
         try:
@@ -529,20 +450,9 @@ class REMDaemon:
             logger.warning("REM: rem_pickups bump failed for %s: %s", pg_ids, exc)
 
     async def _bump_rem_passed_over(self, pg_ids: list[int]) -> None:
-        """Scheduling-event counter (STEP 3, decision 890): +1 the moment the
-        yield fires on a solo record that WOULD have been selected this cycle
-        absent the yield — the set is `remaining[solo_done:]`, already
-        computed at the point the yield check trips, so this charges exactly
-        the records the arbiter skipped, no more.
-
-        Distinct from rem_pickups/rem_attempts, which both describe what
-        happened TO the record; this describes what the SCHEDULER did (the
-        exact distinction that keeps this clear of the 819 overloading
-        mistake). Reset only on successful pickup (see `_bump_rem_pickups`),
-        never by time — a persistently-queuing NREM cannot be waited out by
-        the clock, only by actually processing the record.
-
-        Best-effort: the bump must never mask the yield it's counting."""
+        """Increment ``rem_passed_over`` for remaining solo records when yielding to
+        NREM, tracking starvation until reset by a pickup.
+        """
         if not pg_ids:
             return
         try:
@@ -558,19 +468,11 @@ class REMDaemon:
             logger.warning("REM: rem_passed_over bump failed for %s: %s", pg_ids, exc)
 
     async def _mark_node_invalid(self, pg_id: int, label: str, reason: str) -> None:
-        """Retire ONE structurally invalid node from the queue (820).
-
-        REM selects a node but resolves the rest of the cycle from its pg_id,
-        so a node whose label disagrees with the Postgres record kind — or that
-        has no Postgres record at all — can never be the node the cycle marks
-        processed. It is unprocessable BY CONSTRUCTION and would otherwise be
-        re-selected every cycle forever, holding a queue slot no work can free.
-
-        The MATCH is LABEL-QUALIFIED: the invalid node and the real record
-        share a pg_id, so an unqualified match would retire the healthy twin.
-        Nothing is deleted — the node keeps its properties and edges for audit
-        — and no attempt is charged, because a corrupt write is not evidence
-        about the record."""
+        """Retire a structurally invalid node (missing Postgres row or label mismatch)
+        by setting ``rem_invalid=true`` and ``rem_processed=true`` without charging
+        an attempt. Uses a label-qualified MATCH to avoid retiring a healthy twin
+        sharing the same pg_id.
+        """
         if not label:
             logger.error(
                 "REM: pg_id=%d invalid node (%s) carries no record label — cannot "
@@ -599,11 +501,10 @@ class REMDaemon:
             )
 
     async def _revert_rem_mark(self, pg_id: int, kind: str) -> None:
-        """F5 stranded rows: a post-write failure (consistency mismatch or
-        outbox-mark error) must not strand the record at rem_processed=true
-        while its outbox row sits at 'applied'. One SET reverts the mark AND
-        counts the attempt, so the record re-enters the queue under the
-        attempt cap instead of disappearing from both worklists."""
+        """Revert ``rem_processed=false`` and increment ``rem_attempts`` when a
+        post-write consistency or outbox failure occurs. Ensures the record re-enters
+        the queue under the attempt cap rather than stranding in limbo.
+        """
         anchor = {KIND_DECISION: ONT.decision,
                   KIND_RETRO:    ONT.retrospective}.get(kind, ONT.fact)
         try:
@@ -621,12 +522,8 @@ class REMDaemon:
             )
 
     async def _fact_is_consistent(self, pg_id: int, expected_content: str) -> bool:
-        """Verify the Fact node's content matches the REM-written value.
-
-        Since the non-destructive policy (retro-as-node session) the expected value
-        is the ORIGINAL content verbatim (capped at 2000 on write), not the summary.
-        Compares the full stored string against the full expected value (not a prefix)
-        so a shared prefix cannot produce a false positive.
+        """Verify the Fact node's stored content matches the original text (capped at
+        2000 characters) across the full string to avoid false positives.
         """
         async with self.driver.session() as session:
             result = await session.run(
@@ -648,13 +545,8 @@ class REMDaemon:
         conn,
         loop: asyncio.AbstractEventLoop,
     ) -> list[int]:
-        """Return pg_ids whose Neo4j write is confirmed.
-
-        Two cases are accepted:
-          1. Most-recent outbox row has status='applied' — coordinator confirmed write.
-          2. No outbox row exists for this pg_id — pre-coordinator save written via
-             the old direct-write path; the Fact node already exists in Neo4j.
-        Facts with most-recent outbox row status pending/in_progress are deferred.
+        """Filter pg_ids to those confirmed in Neo4j: latest outbox status is
+        'applied'/'rem_reviewed', or no outbox row exists (legacy direct-write).
         """
         def _query() -> list[int]:
             with conn.cursor() as cur:
@@ -684,9 +576,9 @@ class REMDaemon:
         conn,
         loop: asyncio.AbstractEventLoop,
     ) -> dict[int, dict]:
-        """Fetch content + the record kind for each pg_id in one query.
-        created_at is carried so the caller can derive poll_ms (created_at →
-        REM pickup) for the durable rem_timing summary (decision 570)."""
+        """Fetch content, record kind, and created_at for each pg_id in one query,
+        providing created_at to derive poll_ms for rem_timing.
+        """
         def _fetch() -> dict[int, dict]:
             with conn.cursor() as cur:
                 cur.execute(
@@ -741,20 +633,10 @@ class REMDaemon:
         loop: asyncio.AbstractEventLoop,
         kind: str = KIND_FACT,
     ) -> None:
-        """Mark the most-recent applied outbox row as rem_reviewed.
-
-        rem_reviewed = REM has enriched this record and verified consistency.
-        The dream-cycle ledger (consolidation_loop) handles the final
-        'consolidated' → DELETE transitions.
-        No explicit commit needed — connection is in AUTOCOMMIT mode.
-
-        Type filter by anchor kind: for fact/decision anchors, LEGACY
-        retrospective rows are excluded — a legacy retro shares its target
-        decision's pg_id with a HIGHER row id, so without the filter REM's mark
-        lands on the retro row instead of the decision row — mis-stamping the
-        re-fold trigger and leaving the decision row at 'applied' (fact pg_id
-        269 gotcha). For a Retrospective anchor (v2: the row carries the
-        retro's OWN pg_id) the row to mark IS the retrospective-typed one.
+        """Mark the latest applied outbox row as 'rem_reviewed' on the autocommit conn.
+        Filters by anchor kind to prevent legacy retrospectives (which share the
+        decision's pg_id with a higher row id) from receiving the mark instead of the
+        decision row.
         """
         type_filter = (
             "= 'retrospective'" if kind == KIND_RETRO else "!= 'retrospective'"
@@ -780,11 +662,9 @@ class REMDaemon:
         conn,
         loop: asyncio.AbstractEventLoop,
     ) -> None:
-        """Persist the REM per-call timing summary onto the DURABLE technical_docs row
-        (decision 570) so it survives the outbox row's deletion on NREM consolidation.
-        Best-effort: a timing-write failure must never fail an already-enriched fact —
-        the enrichment (Neo4j + rem_reviewed) has already committed by the time we get
-        here, so we log and move on. No explicit commit needed (AUTOCOMMIT conn)."""
+        """Persist per-call timing into technical_docs.rem_timing so it survives outbox
+        deletion on NREM consolidation; failures log without failing the enriched fact.
+        """
         def _write() -> None:
             with conn.cursor() as cur:
                 cur.execute(
@@ -798,8 +678,9 @@ class REMDaemon:
 
     @staticmethod
     def _poll_ms(pickup_wall: float, created_at) -> float | None:
-        """created_at → REM pickup, in ms (daemon cadence). created_at is a tz-aware
-        datetime from Postgres; None or a clock skew yields None rather than a negative."""
+        """Calculate created_at to REM pickup latency in ms; returns None if missing
+        or negative due to clock skew.
+        """
         if created_at is None:
             return None
         try:
@@ -811,11 +692,8 @@ class REMDaemon:
     async def _recent_write_happened(
         self, conn, loop: asyncio.AbstractEventLoop
     ) -> bool:
-        """Return True if any fact was saved within the last WRITE_QUIESCE_SEC seconds.
-
-        When agents are actively saving, REM should yield — starting enrichment
-        during a write burst resets NREM's idle timer and can delay synthesis.
-        Configurable via WRITE_QUIESCE_SEC env var (default 30 s).
+        """Return True if any fact was saved within WRITE_QUIESCE_SEC seconds so REM
+        can yield during active write bursts.
         """
         def _query() -> bool:
             with conn.cursor() as cur:
@@ -834,10 +712,8 @@ class REMDaemon:
         conn,
         loop: asyncio.AbstractEventLoop,
     ) -> None:
-        """Send pg_notify so NREM re-evaluates this record.
-
-        Safe on the AUTOCOMMIT connection — pg_notify fires immediately
-        without needing an explicit commit.
+        """Send pg_notify on the autocommit connection so NREM re-evaluates this
+        record.
         """
         def _notify() -> None:
             with conn.cursor() as cur:
@@ -854,11 +730,7 @@ class REMDaemon:
         outbox_row: dict,
         loop: asyncio.AbstractEventLoop,
     ) -> None:
-        """Append outbox row to AUDIT_LOG_PATH as JSON-lines (no-op if disabled).
-
-        Format: {"ts": ISO-8601, "outbox_id": int, "pg_id": int,
-                  "cypher_params": {...}, "created_at": str, "applied_at": str}
-        """
+        """Append outbox row to AUDIT_LOG_PATH as JSON-lines if enabled."""
         if not AUDIT_LOG_PATH:
             return
         entry = json.dumps({"ts": datetime.now(timezone.utc).isoformat(), **outbox_row})
@@ -874,23 +746,17 @@ class REMDaemon:
         kind: str = KIND_FACT,
         original_content: str = "",
     ) -> None:
-        """Write all REM output to Neo4j in a single driver session.
-
-        REM writes NO edges and NO labels (`decision:1664`): the only statement
-        this issues is the NON-DESTRUCTIVE content policy, which marks
-        rem_processed = true LAST so a failed write leaves the record
-        unprocessed and it is retried next cycle. A Fact's content becomes the
-        ORIGINAL text verbatim [:2000]; rem_summary is stored only above
-        REM_SUMMARY_THRESHOLD (and is only requested then). Decision keeps its
-        rationale and Retrospective its notes; each takes the summary in
-        rem_summary only when one was produced.
+        """Update record content and rem_summary in Neo4j without adding edges or labels
+        (decision:1664 — entities are human-only: the graph receives a record's entity
+        and attribution edges at first write only, so REM writes no edges and no labels
+        and only summarises). Marks rem_processed=true last to ensure failed writes are
+        retried.
         """
         anchor = {KIND_DECISION: ONT.decision,
                   KIND_RETRO:    ONT.retrospective}.get(kind, ONT.fact)
 
         async with self.driver.session() as session:
-            # Decision and Retrospective keep their own text; a Fact is rewritten from the original, and rem_summary is stored only when one was produced.
-            # Success clears rem_attempts so old failures do not linger.
+            # Facts rewrite original content; rem_summary is stored only if produced, and success clears rem_attempts.
             if kind in (KIND_DECISION, KIND_RETRO):
                 if summary:
                     await session.run(
@@ -928,13 +794,10 @@ class REMDaemon:
         kind: str,
         pg_id: int | None = None,
     ) -> tuple[dict | None, str]:
-        """Main summarisation round-trip for one record → (result, model).
-
-        A summary is requested only above REM_SUMMARY_THRESHOLD, and nothing
-        else is requested at all (`decision:1664`). model = the gateway's
-        X-SM-LLM-Backend response header when present, else 'local-model'.
-
-        Result shape: {} — plus "summary" when one was requested.
+        """Execute summarisation round-trip for one record over REM_SUMMARY_THRESHOLD
+        (decision:1664 — entities are human-only: the graph receives a record's entity
+        and attribution edges at first write only, so REM writes no edges and no labels
+        and only summarises); returns (result_dict, model_name).
         """
         if len(content) <= REM_SUMMARY_THRESHOLD:
             # Under the threshold REM asks for nothing, so {} is the whole answer and still gets marked processed (decision:1664).
@@ -948,12 +811,9 @@ class REMDaemon:
         model = "local-model"
 
         async def _attempt(max_tokens: int):
-            """One round-trip → (resp_json | None, model, failure, degenerate).
-            failure is None when a complete (untruncated) body came back.
-            `degenerate` is only meaningful when failure == LLM_FAIL_TRUNCATED
-            — classified on the RAW completion text via truncation_is_degenerate,
-            never on resp_json, so N3 holds structurally: a truncated body is
-            classified but never parsed."""
+            """Execute one round-trip, returning (resp_json, model, failure,
+            degenerate) with degenerate status classified on raw text without parsing.
+            """
             nonlocal model
             _start = time.monotonic()
             try:
@@ -1111,25 +971,13 @@ class REMDaemon:
     async def _llm_process_batch(
         self, items: list[dict],
     ) -> tuple[dict[int, dict] | None, dict | None, str]:
-        """Summarise N regular facts in ONE LLM call. items = [{pg_id, content}].
-        Returns ({pg_id: result}, call_timing, model): the results map (a
-        missing/invalid line is omitted → that fact retries next cycle;
-        decisions are NOT batched), the shared per-call timing summary
-        (decision 570) — None when no LLM call ran or it failed — and the
-        backend model id.
-
-        The results map is **None** (not {}) when the CALL ITSELF failed —
-        transport error, HTTP non-200, unparseable envelope. The caller must
-        not charge an attempt to any record in that case: a pool 503 is not
-        evidence about five facts (F1). An empty dict means the call succeeded
-        but no line was usable, which IS chargeable per record. The
-        timing is per-CALL: every parsed fact in the batch shares the same
-        service_ms/contention_ms (per-fact cost = service_ms / batch_size).
-
-        A fact at or below REM_SUMMARY_THRESHOLD is asked for nothing
-        (`decision:1664`), so it is NOT sent: its result is {} and it never
-        costs a round-trip. Every fact that IS sent must carry a summary, and is
-        dropped for solo retry when its line is missing it."""
+        """Summarise multiple facts exceeding REM_SUMMARY_THRESHOLD in one JSONL call,
+        returning ``({pg_id: result}, call_timing, model)``. Sub-threshold facts return
+        ``{}`` without LLM calls (decision:1664 — entities are human-only: the graph
+        receives a record's entity and attribution edges at first write only, so REM
+        writes no edges and no labels and only summarises); call-level failures return
+        None without charging attempts.
+        """
         if not items:
             return {}, None, "local-model"
         sent = [it for it in items if len(it["content"]) > REM_SUMMARY_THRESHOLD]
@@ -1148,8 +996,7 @@ class REMDaemon:
         idx_to_pg = {i: it["pg_id"] for i, it in enumerate(sent)}
         require_summary = set(idx_to_pg)
         prompt = self._build_batch_prompt(sent)
-        # Budget scales with the ask: a line per fact sent, plus a summary
-        # allowance for each (every fact sent was asked for one).
+        # Budget scales with count: one JSONL line plus summary allowance per fact sent.
         _max_tokens = (REM_MAX_TOKENS_PER_FACT * len(sent)
                        + REM_MAX_TOKENS_PER_SUMMARY * len(sent))
         _ceiling = adaptive_ceiling(len(prompt), units=len(sent))
@@ -1264,18 +1111,10 @@ class REMDaemon:
         require_summary: set[int] = frozenset(),
         truncated: bool = False,
     ) -> dict[int, dict]:
-        """Parse JSONL line-by-line (json_repair per line), match by echoed idx,
-        map to pg_id. Alignment is idx-echo only. Only idx in
-        `require_summary` (facts over REM_SUMMARY_THRESHOLD) must carry a
-        non-empty summary — those lines are dropped when it is missing so the
-        fact retries next cycle. Malformed / missing lines are skipped likewise.
-        Only idx in the requested set are accepted.
-
-        `truncated` (finish_reason='length') switches to the FAIL-THE-UNIT
-        salvage: the FINAL non-empty line is unconditionally dropped (it is the
-        one under the knife) and the rest are accepted only under strict
-        json.loads — json_repair NEVER runs on a length-finish, because it can
-        turn a half-emitted record into a plausibly complete dict."""
+        """Parse JSONL responses by echoed idx, dropping facts missing required
+        summaries for solo retry. On truncation, drops the cut final line and parses
+        remaining lines strictly without json_repair to avoid salvaging partial records.
+        """
         if truncated:
             raw = _drop_final_nonempty_line(raw)
         out: dict[int, dict] = {}
@@ -1318,10 +1157,8 @@ class REMDaemon:
         conn,
         loop: asyncio.AbstractEventLoop,
     ) -> bool:
-        """Full REM pipeline for one record. Returns True on success.
-        RECORD-CHARGEABLE failure classes count a durable rem_attempts on the
-        anchor (poison-record escape hatch); a TRANSPORT failure does not —
-        it says nothing about this record (F1).
+        """Run full REM pipeline for a record; charges rem_attempts only on
+        record-chargeable failures, returning True on success.
         """
         self._last_llm_failure = None
         result, _model = await self._llm_process(content, kind, pg_id=pg_id)
@@ -1349,11 +1186,9 @@ class REMDaemon:
         loop: asyncio.AbstractEventLoop,
         original_content: str = "",
     ) -> bool:
-        """Write one summarisation result (from the single OR batched LLM call)
-        to Neo4j + outbox + NREM notify. Shared by both paths. True on success.
-
-        Sequence: single-session Neo4j write (rem_processed last) → consistency
-        check → outbox mark → NREM notify."""
+        """Apply summarisation result via Neo4j write, consistency verification, outbox
+        update, and NREM notification; returns True on success.
+        """
         want_summary = len(original_content) > REM_SUMMARY_THRESHOLD
         summary = (result.get("summary") or "").strip()
         if want_summary and not summary:
@@ -1431,11 +1266,9 @@ class REMDaemon:
     # ── Batch cycle ───────────────────────────────────────────────────────────
 
     async def run_cycle(self) -> tuple[int, int]:
-        """One full REM scan cycle. Returns (processed, attempted):
-        processed = records enriched successfully; attempted = records actually
-        handed to an LLM path this cycle. The caller needs BOTH to tell idle
-        (nothing to do → back off) from failure (work existed but failed → keep
-        BASE cadence; poison loops must not masquerade as idleness)."""
+        """Execute one REM scan cycle, returning ``(processed, attempted)`` counts so
+        the caller can distinguish idleness (backing off) from failures (keeping BASE).
+        """
         candidates, attempts_map, label_map, passed_over_map = await self._fetch_non_rem_batch()
         if not candidates:
             return 0, 0
@@ -1486,8 +1319,7 @@ class REMDaemon:
 
             processed = 0
             attempted = 0
-            # Facts batch; decisions and retrospectives stay solo because their anchors do not share a prompt.
-            # A fact that already failed once goes solo too, so it cannot poison the shared call.
+            # Facts batch; decisions, retrospectives, and previously-failed facts run solo.
             fact_items: list[dict] = []
             solo_ids: list[tuple[int, str]] = []   # (pg_id, kind) — decisions/retros + demoted facts
             kind_to_label = {KIND_FACT:     ONT.fact,
