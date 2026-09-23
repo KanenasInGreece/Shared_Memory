@@ -7,6 +7,12 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.9.113] — 2026-09-23
+
+### Changed
+- Arc B580 encoders ship as `shared-memory/ops/intel-arc-b580.yaml`: two `intel/vllm:0.21.0-xpu` services and `rerank_shim.py`. The default image stays llama.cpp. An agent that sees PCI `8086:e20b` may use that file. Set `EMBEDDER_URL=http://127.0.0.1:8091` and `RERANKER_URL=http://127.0.0.1:8092`, and leave the llama.cpp encoder replicas at 0.
+- Comments under `shared-memory` are one or two sentences. `fact:`, `decision:`, and `retrospective:` ids stay, each with one sentence. Code is unchanged.
+
 ## [0.9.112] — 2026-09-23
 
 ### Security
