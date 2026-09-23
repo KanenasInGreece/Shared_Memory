@@ -236,7 +236,11 @@ processes held ~14 GiB of it between them. vLLM's footprint is fixed and does no
 a 319-second barrage of 105 maximum-size reranks (56.8 million characters), 288 embeds and 24 real
 searches left VRAM unchanged to the megabyte, with no errors and no kernel GPU resets.
 
-**The Intel-specific parts.** The image is `intel/vllm:0.21.0-xpu` (28.8 GB on disk; vLLM 0.21.1,
+**The Intel-specific parts.** This is not the default image. The file to copy is
+[`shared-memory/ops/intel-arc-b580.yaml`](shared-memory/ops/intel-arc-b580.yaml):
+two `intel/vllm:0.21.0-xpu` services and `rerank_shim.py` as a third service.
+An agent that sees an Arc B580 (`8086:e20b`) may use that file. The default
+stack stays llama.cpp. The image is `intel/vllm:0.21.0-xpu` (28.8 GB on disk; vLLM 0.21.1,
 torch 2.11 with native XPU support, no IPEX). Pass **`--device /dev/dri` *and*
 `-v /dev/dri/by-path:/dev/dri/by-path`** — the second is not optional, because `--device` does not
 pass that directory and without it oneCCL cannot enumerate the GPU and the engine never starts; add

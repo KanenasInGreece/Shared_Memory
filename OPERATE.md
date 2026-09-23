@@ -196,7 +196,9 @@ Point `AGENT_ENV` at the agent just installed when it is not Claude.
 
 ### Serve the encoders with vLLM
 
-Optional, and only when the operator asks. Do not switch the embedder silently. Each server needs `--max-model-len 8192`. The reranker needs `shared-memory/scripts/rerank_shim.py` in front of it. Point `RERANKER_URL` at the shim. The embedder needs no shim.
+The default image stays llama.cpp (`postgres_neo4j_limits.yaml`). Do not switch the embedder silently on any other card.
+
+An Intel Arc B580 (`8086:e20b`, 12 GB) may use the packaged file `shared-memory/ops/intel-arc-b580.yaml`. That is Main workstation configuration 2: both encoders on `intel/vllm:0.21.0-xpu`, and `rerank_shim.py` in front of the reranker. Leave the llama.cpp encoder replicas at 0. Set `EMBEDDER_URL=http://127.0.0.1:8091` and `RERANKER_URL=http://127.0.0.1:8092`. Each server already passes `--max-model-len 8192`. The embedder needs no shim. Do not use that file for a different Arc card.
 
 ## Update
 
