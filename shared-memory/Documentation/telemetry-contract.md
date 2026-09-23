@@ -3,7 +3,7 @@
 
 # The Telemetry Contract
 
-Contract version **0.9.113**. Every key the gateway emits on `GET /health` and `GET /memory/telemetry`, what it means, what it is measured in, when it arrived, and where it is going.
+Contract version **0.9.114**. Every key the gateway emits on `GET /health` and `GET /memory/telemetry`, what it means, what it is measured in, when it arrived, and where it is going.
 
 ## The roles
 
@@ -609,6 +609,7 @@ The envelope is `{"status": "success", "telemetry": {…}}`; paths below are rel
 | `consolidation.*.folds_succeeded_24h` | int | — | <=0.9.73 | — | — | `health.nrem_daemon` | — |
 | `consolidation.*.idle_24h` | int | — | <=0.9.73 | — | — | — | — |
 | `consolidation.*.in_flight` | bool | — | <=0.9.73 | — | — | — | — |
+| `consolidation.*.insight_gate_skips` | int/null | — | 0.9.114 | — | — | — | groups the insight gate skipped; null until a cycle records it; not backlog |
 | `consolidation.*.last_deferred_reason` | str/null | — | <=0.9.73 | — | — | — | — |
 | `consolidation.*.last_error` | null | — | <=0.9.73 | — | — | — | null when no error is on record |
 | `consolidation.*.last_error.age_seconds` | int/null | _seconds | <=0.9.73 | — | — | — | — |

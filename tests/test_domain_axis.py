@@ -401,6 +401,62 @@ async def test_an_explicit_row_still_replaces_the_asserted_set():
         assert "asserted_by" not in q, (
             "the stamp is gone — nothing may filter a delete on it any more")
     assert any(f"-[:{ONT.domain_of}]->(d)" in q for q, _ in queries)
+    assert any("MERGE" in q and "domain_id" in q for q, _ in queries)
+
+
+@pytest.mark.asyncio
+async def test_unresolved_domain_of_does_not_clear_edges():
+    """A name the registry cannot resolve must not DELETE DOMAIN_OF and then drop the row."""
+    c = _coord()
+    c._domain_identity = AsyncMock(return_value=None)
+    queries = []
+
+    async def run(q, **kw):
+        queries.append((q, kw))
+        res = MagicMock()
+        res.single = AsyncMock(return_value={"n": 1})
+        return res
+
+    session = MagicMock()
+    session.run = run
+    ctx = MagicMock()
+    ctx.__aenter__ = AsyncMock(return_value=session)
+    ctx.__aexit__ = AsyncMock(return_value=False)
+    c._neo4j = MagicMock()
+    c._neo4j.session = MagicMock(return_value=ctx)
+
+    await c._apply_domain_of_outbox_row(
+        1, 42, {"type": "domain_of", "project": "p", "domains": ["missing"]})
+
+    assert queries == []
+    sql = c._acquire.return_value.__aenter__.return_value.execute.call_args.args[0]
+    assert "status='failed'" in sql
+    assert "DELETE FROM neo4j_outbox" not in sql
+
+
+@pytest.mark.asyncio
+async def test_domain_of_without_a_spine_node_keeps_the_row():
+    """A repair whose MATCH finds no spine node must not delete the outbox row."""
+    c = _coord()
+    c._domain_identity = AsyncMock(return_value=41)
+
+    async def run(q, **kw):
+        res = MagicMock()
+        res.single = AsyncMock(return_value=None)
+        return res
+
+    session = MagicMock()
+    session.run = run
+    ctx = MagicMock()
+    ctx.__aenter__ = AsyncMock(return_value=session)
+    ctx.__aexit__ = AsyncMock(return_value=False)
+    c._neo4j = MagicMock()
+    c._neo4j.session = MagicMock(return_value=ctx)
+
+    with pytest.raises(RuntimeError, match="no spine node"):
+        await c._apply_domain_of_outbox_row(
+            1, 42, {"type": "domain_of", "project": "p", "domains": ["architecture"]})
+    c._acquire.return_value.__aenter__.return_value.execute.assert_not_awaited()
 
 
 def test_the_backfill_never_gives_a_retrospective_an_asserted_row():

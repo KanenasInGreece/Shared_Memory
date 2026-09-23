@@ -126,7 +126,7 @@ def _short(value: Any, cap: int = 200) -> str:
 
 
 # FRAMEWORK_VERSION is the build string and may drift. API_VERSION is the wire contract with memory_bridge.py; bump it only when shape, auth, or routes break older clients.
-FRAMEWORK_VERSION = "0.9.113"
+FRAMEWORK_VERSION = "0.9.114"
 # API v2: retrospective is a full record. v4: unregistered project is 400 (proposal / new_project / sentinel).
 API_VERSION = 4
 CLIENT_VERSION_HEADER = "X-SM-Api-Version"
@@ -2049,6 +2049,36 @@ def _matched_entities(query: str, metadata: dict | None) -> list[str]:
     return [e for e in metadata.get("entities", []) if isinstance(e, str) and e.lower() in q]
 
 
+def _ilike_contains(query: str) -> str:
+    """A contains-pattern in which % and _ are literal. The escape character is backslash."""
+    escaped = (
+        query.replace("\\", "\\\\")
+        .replace("%", "\\%")
+        .replace("_", "\\_")
+    )
+    return f"%{escaped}%"
+
+
+def _keyword_hit(row, query: str) -> dict:
+    """One keyword-fallback hit. ranked is false so a client cannot read the 0.5 as a rerank score."""
+    meta = row["metadata"] if isinstance(row["metadata"], dict) else {}
+    rtype = doc_record_type(meta)
+    pg_id = row["id"]
+    return {
+        "tier": "fact",
+        "pg_id": pg_id,
+        "record_type": rtype,
+        "ref": make_ref(rtype, pg_id),
+        "content": row["content"],
+        "ranked": False,
+        "score": 0.0,
+        "score_normalized": 0.5,
+        "matched_entities": _matched_entities(query, meta),
+        "metadata": meta,
+        "graph_context": [],
+    }
+
+
 def _rerank_doc_text(content: str, metadata: dict | None, created_at) -> str:
     """The text the reranker scores. For decisions and retrospectives the
     recording date is prepended so recency is VISIBLE to relevance scoring —
@@ -3508,12 +3538,8 @@ class MemoryCoordinator:
     async def _write_typed_grounding(
         session, anchor_label: str, pg_id: int, grounded: list
     ) -> None:
-        """Write the typed grounding ROLE edges (decision 582) from an anchor
-        record (Decision or Retrospective) to its REAL targets across labels
-        (Fact OR Decision — no shadow-Fact stub, bug 578). apoc supplies the
-        dynamic label + relation type; every edge records asserted_by
-        (operator | system_default). Shared by the decision and retrospective
-        projections so the two writers can never drift."""
+        """Write grounding role edges (decision 582) from a Decision or Retrospective onto the target's real label (Fact, Decision, or Retrospective).
+        apoc supplies that label and the relation; every edge records asserted_by. The decision and retrospective projections share this writer."""
         if not grounded:
             return
         await session.run(
@@ -3805,23 +3831,42 @@ class MemoryCoordinator:
             )
             return
         project_id = await self._project_identity(params.get("project"))
+        names = [n.strip() for n in (params.get("domains") or [])
+                 if isinstance(n, str) and n.strip()]
         domain_ids = await self._domain_identities(
-            pg_id, project_id, params.get("domains"))
+            pg_id, project_id, names)
+        resolved = {d["name"] for d in domain_ids}
+        # An unresolved name used to clear every DOMAIN_OF edge and delete the row. Fail the row instead; the edges stay until a later repair can write them all.
+        if project_id is None or not names or any(n not in resolved for n in names):
+            log.warning(
+                "outbox: domain_of pg_id=%s project_id=%s names=%s resolved=%s "
+                "— not applied; existing edges kept",
+                pg_id, project_id, names, sorted(resolved),
+            )
+            await self._fail_outbox_immediately(outbox_id)
+            return
         async with self._neo4j.session() as session:
-            # One statement because FOREACH cannot MATCH. An empty domain list still clears, and repair mints no Domain nodes.
-            await session.run(
+            # One transaction: clear, then MERGE every requested node and edge. domains is non-empty here, so the UNWIND cannot commit a clear and then write nothing.
+            result = await session.run(
                 f"MATCH (n:{self._SPINE}) WHERE n.pg_id = $pg_id"
                 f" OPTIONAL MATCH (n)-[stale:{ONT.domain_of}]->()"
                 f" DELETE stale"
                 f" WITH DISTINCT n"
                 f" UNWIND $domains AS row"
-                f" MATCH (d:{ONT.domain} {{domain_id: row.id}})"
+                f" {domain_merge_cypher(id_param='row.id')}"
                 f" SET d.name = row.name"
+                f" WITH n, d"
+                f" {project_merge_cypher(project_id)}"
+                f" MERGE (d)-[:{ONT.project_of}]->(p)"
                 f" MERGE (n)-[:{ONT.domain_of}]->(d)"
-                f" MERGE (dp:{ONT.project} {{project_id: $project_id}})"
-                f" MERGE (d)-[:{ONT.project_of}]->(dp)",
+                f" RETURN n.pg_id AS matched",
                 pg_id=pg_id, domains=domain_ids, project_id=project_id,
+                project=(params.get("project") or "").strip(),
             )
+            matched = await result.single()
+            if matched is None:
+                # No spine node: the statement wrote nothing. Leave the row so the next attempt can retry.
+                raise RuntimeError(f"domain_of: no spine node for pg_id={pg_id}")
             written = len(domain_ids)
         async with self._acquire() as conn:
             await conn.execute("DELETE FROM neo4j_outbox WHERE id=$1", outbox_id)
@@ -3830,8 +3875,11 @@ class MemoryCoordinator:
             ONT.domain_of, pg_id, written, outbox_id,
         )
 
-    async def _wait_for_outbox(self, pg_id: int) -> bool:
-        """Poll the dream-cycle outbox row until the graph is present, failed, or CONSISTENCY_TIMEOUT."""
+    async def _wait_for_outbox(self, pg_id: int) -> str:
+        """Poll the dream-cycle outbox row. Returns applied, failed, or timeout.
+
+        applied covers rem_reviewed, consolidated, and a row that is already gone.
+        """
         loop = asyncio.get_running_loop()
         deadline = loop.time() + CONSISTENCY_TIMEOUT
         while loop.time() < deadline:
@@ -3845,14 +3893,14 @@ class MemoryCoordinator:
             if row is None:
                 # Fast worker: applied (and NREM-deleted) before the first poll,
                 # or vanished after we had seen the dream-cycle row.
-                return True
+                return "applied"
             status = row["status"]
             if status in _OUTBOX_GRAPH_PRESENT:
-                return True
+                return "applied"
             if status == "failed":
-                return False
+                return "failed"
             await asyncio.sleep(0.25)
-        return False
+        return "timeout"
 
     # ── POST /memory/save ─────────────────────────────────────────────────────
 
@@ -5108,7 +5156,7 @@ class MemoryCoordinator:
             "status": "error",
             "error": "entities_not_allowed_on_judgement",
             "message": (
-                f"a {kind} may not carry {offending} (decision:1664). Only "
+                f"a {kind} may not carry {offending}. Only "
                 "FACTS name entities: a judgement reaches its topics by "
                 "walking to the facts it is grounded in, so an entity named "
                 "here is never written to the graph and only adds an unvetted "
@@ -6167,10 +6215,8 @@ class MemoryCoordinator:
             )
 
         # Neo4j is applied asynchronously by the outbox worker.
-        # ?consistency=neo4j blocks until the row is marked applied.
         if request.rel_url.query.get("consistency") == "neo4j":
-            applied = await self._wait_for_outbox(pg_id)
-            neo4j_status = "applied" if applied else "timeout"
+            neo4j_status = await self._wait_for_outbox(pg_id)
         else:
             neo4j_status = "pending"
 
@@ -7153,33 +7199,33 @@ class MemoryCoordinator:
 
             if q_vec is None:
                 # Keyword fallback when the embedder is down. The axis filter still applies.
-                vis_sql, vis_params = _visibility_filter(viewer, scope, 3)
+                pattern = _ilike_contains(query)
+                args: list = [pattern, limit]
+                vis_sql, vis_params = _visibility_filter(viewer, scope, len(args) + 1)
+                args.extend(vis_params)
+                scope_sql = ""
+                if scope:
+                    args.append(scope)
+                    scope_sql = f"AND scope = ${len(args)}"
                 axis_sql, axis_params = _axis_filter_predicate(
-                    3 + len(vis_params), project_values, domain_values, since_dt)
+                    len(args) + 1, project_values, domain_values, since_dt)
+                args.extend(axis_params)
                 async with self._acquire() as conn:
                     rows = await conn.fetch(
                         f"""
                         SELECT id, content, metadata FROM technical_docs
                         WHERE NOT superseded
-                          AND (content ILIKE $1 OR metadata::text ILIKE $1)
-                          AND {vis_sql} {axis_sql}
+                          AND (content ILIKE $1 ESCAPE '\\' OR metadata::text ILIKE $1 ESCAPE '\\')
+                          AND {vis_sql} {scope_sql} {axis_sql}
                         LIMIT $2
                         """,
-                        f"%{query}%", limit, *vis_params, *axis_params,
+                        *args,
                     )
                 return web.json_response(_with_filters_resolved({
                     "status": "success",
                     "fallback": "keyword",
                     "results": [
-                        {
-                            "tier": "fact",
-                            "content": r["content"],
-                            "score": 0.0,
-                            "score_normalized": 0.5,
-                            "matched_entities": _matched_entities(query, r["metadata"]),
-                            "metadata": r["metadata"],
-                            "graph_context": [],
-                        }
+                        _keyword_hit(r, query)
                         for r in rows
                     ],
                 }, filters_resolved))
@@ -8441,7 +8487,11 @@ class MemoryCoordinator:
               -- never an alias for eligible_clusters. None = no cycle has
               -- written this key yet (pre-fix rows), not zero.
               (array_agg((extra->>'singleton_clusters')::int ORDER BY started_at DESC)
-                  FILTER (WHERE extra ? 'singleton_clusters'))[1] AS singleton_clusters
+                  FILTER (WHERE extra ? 'singleton_clusters'))[1] AS singleton_clusters,
+              -- Groups the insight gate skipped. Same NULL-until-recorded
+              -- contract. Not backlog, so it does not move the stall verdict.
+              (array_agg((extra->>'insight_gate_skips')::int ORDER BY started_at DESC)
+                  FILTER (WHERE extra ? 'insight_gate_skips'))[1] AS insight_gate_skips
             FROM ranked GROUP BY cycle_type
         """
         async with self._acquire() as conn:
@@ -8500,6 +8550,10 @@ class MemoryCoordinator:
                 "singleton_clusters": (
                     int(r["singleton_clusters"])
                     if r and r["singleton_clusters"] is not None else None),
+                # Insight groups that failed G2 or G3. None means not recorded yet. Not backlog.
+                "insight_gate_skips": (
+                    int(r["insight_gate_skips"])
+                    if r and r["insight_gate_skips"] is not None else None),
                 # Latest truncation and slot failures. None means not recorded yet. A slot failure is a protocol miss, not only a capacity one.
                 "truncation_failures": (
                     int(r["truncation_failures"])

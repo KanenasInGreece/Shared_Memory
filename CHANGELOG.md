@@ -7,6 +7,17 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.9.114] — 2026-09-23
+
+### Fixed
+- A `domain_of` repair with an unresolved name, an empty list, or no spine node no longer deletes `DOMAIN_OF` edges and drops the outbox row. A complete repair is one statement that merges the Domain node, then writes the edges.
+- Thematic coverage supersession stays inside one project and one domain, including a blank section against a named one. An insight still supersedes across domains inside one project, and not across projects.
+- An embedding that returns nothing is counted as `embed_failed` and dead-letters after the existing fold cap.
+- An insight group that fails the gate is logged. `consolidation.*.insight_gate_skips` is on `/memory/telemetry`. It is not backlog and does not move the stall verdict.
+- Keyword search, used when the embedder is down, returns `pg_id`, `ref`, `record_type`, and `ranked: false`. `%` and `_` are literal. A requested `scope` filters the same way the vector path does.
+- `?consistency=neo4j` returns `neo4j: "failed"` when the dream-cycle outbox row has failed. Only the wait deadline returns `"timeout"`.
+- The judgement-entities 400 no longer includes a private store id.
+
 ## [0.9.113] — 2026-09-23
 
 ### Changed

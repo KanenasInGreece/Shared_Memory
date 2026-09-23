@@ -163,10 +163,14 @@ async def test_domain_of_apply_is_one_statement_with_optional_delete_and_unwind(
     assert "UNWIND" in q
     assert "FOREACH" not in q or "MATCH" not in q.split("FOREACH", 1)[-1]
     assert "UNWIND" in q and "MATCH" in q
+    # Mutation: restore MATCH (d:Domain {domain_id}) and drop the MERGE of the node. The edge MERGE does not contain "MERGE (d:".
+    assert "MERGE (d:" in q
+    assert "MATCH (d:" not in q
 
 
 @pytest.mark.asyncio
-async def test_domain_of_empty_domains_is_still_one_statement():
+async def test_domain_of_empty_domains_does_not_clear_edges():
+    """An empty domain list used to DELETE every DOMAIN_OF edge and drop the row."""
     c, conn, session = _coord_outbox()
     c._domain_identities = AsyncMock(return_value=[])
     queries = []
@@ -178,9 +182,10 @@ async def test_domain_of_empty_domains_is_still_one_statement():
     session.run = run
     await c._apply_domain_of_outbox_row(
         1, 42, {"type": "domain_of", "project": "p", "domains": []})
-    assert len(queries) == 1, queries
-    assert "OPTIONAL MATCH" in queries[0] and "DELETE stale" in queries[0]
-    assert "UNWIND" in queries[0]
+    assert queries == []
+    sqls = [call.args[0] for call in conn.execute.await_args_list]
+    assert any("status='failed'" in sql for sql in sqls)
+    assert not any("DELETE FROM neo4j_outbox" in sql for sql in sqls)
 
 
 @pytest.mark.asyncio
@@ -344,12 +349,12 @@ async def test_wait_treats_rem_reviewed_and_consolidated_as_success():
     now = {"t": 0.0}
     p_loop, p_sleep = _patch_wait_clock(c, now)
     with p_loop, p_sleep:
-        assert await c._wait_for_outbox(9) is True
+        assert await c._wait_for_outbox(9) == "applied"
     conn.fetchrow = AsyncMock(return_value={"status": "consolidated"})
     now["t"] = 0.0
     p_loop, p_sleep = _patch_wait_clock(c, now)
     with p_loop, p_sleep:
-        assert await c._wait_for_outbox(9) is True
+        assert await c._wait_for_outbox(9) == "applied"
 
 
 @pytest.mark.asyncio
@@ -360,7 +365,7 @@ async def test_wait_applied_then_rem_reviewed_is_success():
     now = {"t": 0.0}
     p_loop, p_sleep = _patch_wait_clock(c, now)
     with p_loop, p_sleep:
-        assert await c._wait_for_outbox(9) is True
+        assert await c._wait_for_outbox(9) == "applied"
 
 
 @pytest.mark.asyncio
@@ -370,12 +375,12 @@ async def test_wait_vanish_after_observed_row_is_success():
     now = {"t": 0.0}
     p_loop, p_sleep = _patch_wait_clock(c, now)
     with p_loop, p_sleep:
-        assert await c._wait_for_outbox(9) is True
+        assert await c._wait_for_outbox(9) == "applied"
     conn.fetchrow = AsyncMock(side_effect=[{"status": "pending"}, None])
     now["t"] = 0.0
     p_loop, p_sleep = _patch_wait_clock(c, now)
     with p_loop, p_sleep:
-        assert await c._wait_for_outbox(9) is True
+        assert await c._wait_for_outbox(9) == "applied"
 
 
 @pytest.mark.asyncio
@@ -386,7 +391,7 @@ async def test_wait_first_poll_empty_is_fast_worker_success():
     now = {"t": 0.0}
     p_loop, p_sleep = _patch_wait_clock(c, now)
     with p_loop, p_sleep:
-        assert await c._wait_for_outbox(9) is True
+        assert await c._wait_for_outbox(9) == "applied"
     assert now["t"] == 0.0
 
 
@@ -406,7 +411,7 @@ async def test_wait_ignores_pending_oneshot_when_dream_cycle_row_applied():
     now = {"t": 0.0}
     p_loop, p_sleep = _patch_wait_clock(c, now)
     with p_loop, p_sleep:
-        assert await c._wait_for_outbox(9) is True
+        assert await c._wait_for_outbox(9) == "applied"
 
 
 @pytest.mark.asyncio
@@ -416,7 +421,7 @@ async def test_wait_failed_returns_false_without_spinning():
     now = {"t": 0.0}
     p_loop, p_sleep = _patch_wait_clock(c, now)
     with p_loop, p_sleep:
-        assert await c._wait_for_outbox(9) is False
+        assert await c._wait_for_outbox(9) == "failed"
     assert now["t"] == 0.0
 
 
@@ -436,6 +441,23 @@ async def test_handle_save_consistency_neo4j_maps_rem_reviewed_to_applied():
     body = json.loads(resp.text)
     assert body["status"] == "success"
     assert body["neo4j"] == "applied"
+
+
+@pytest.mark.asyncio
+async def test_handle_save_consistency_neo4j_maps_failed_to_failed():
+    """A permanently failed dream-cycle row is neo4j='failed', not 'timeout'."""
+    c, conn = _save_coord(stored_metadata=None)
+    conn.fetchrow = AsyncMock(side_effect=lambda sql, *a: (
+        {"status": "failed"} if "neo4j_outbox" in sql and "SELECT" in sql
+        else {"id": 99}))
+    with patch.object(c, "_embed", new=AsyncMock(return_value=[0.1] * 1024)):
+        resp = await c.handle_save(_request(
+            {"content": "fresh words for a failed outbox row",
+             "metadata": {"source": "claude-code", "project": "alpha"}},
+            consistency="neo4j"))
+    assert resp.status == 200
+    body = json.loads(resp.text)
+    assert body["neo4j"] == "failed"
 
 
 def test_handle_status_selects_dream_cycle_rows_only():
