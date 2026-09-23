@@ -103,6 +103,7 @@ def _no_census_row(cycle_type):
         # Singleton-component deferral (operator ruling 2026-08-16) — same
         # NULL-until-recorded contract as dead_lettered_clusters.
         "singleton_clusters": None,
+        "insight_gate_skips": None,
     }
 
 
@@ -276,6 +277,28 @@ async def test_singleton_clusters_surfaced_per_cycle_type():
     assert out["insight"]["singleton_clusters"] == 2
     # fact_consolidation got no row at all this pass — None, not 0.
     assert out["fact_consolidation"]["singleton_clusters"] is None
+
+
+@pytest.mark.asyncio
+async def test_insight_gate_skips_surfaced_per_cycle_type():
+    """The insight gate skip count is read from extra, same shape as singleton_clusters.
+    It is not backlog. A cycle type with no row reads None."""
+    coord = co.MemoryCoordinator()
+    row = dict(_no_census_row("insight"), eligible_clusters=4,
+               insight_gate_skips=3)
+    conn = MagicMock()
+    conn.fetch = AsyncMock(return_value=[row])
+    acq = MagicMock()
+    acq.__aenter__ = AsyncMock(return_value=conn)
+    acq.__aexit__ = AsyncMock(return_value=False)
+    coord._acquire = MagicMock(return_value=acq)
+
+    out = await coord._compute_consolidation_health()
+
+    assert out["insight"]["insight_gate_skips"] == 3
+    assert out["insight"]["eligible_clusters"] == 4
+    assert out["insight"]["backlog"] == 4
+    assert out["fact_consolidation"]["insight_gate_skips"] is None
 
 
 # ── last_error: age + superseded (fact:1609 companion, live 2026-08-26) ──────

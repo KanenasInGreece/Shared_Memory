@@ -350,7 +350,8 @@ def test_judgement_entities_refusal_shape(kind):
         {"type": kind, "entities": ["Kubernetes"]})
     assert err is not None
     assert err["error"] == "entities_not_allowed_on_judgement"
-    assert "decision:1664" in err["message"]
+    assert "decision:1664" not in err["message"]
+    assert "may not carry" in err["message"]
     assert kind in err["message"]
 
 

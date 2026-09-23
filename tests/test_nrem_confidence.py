@@ -651,6 +651,7 @@ async def test_thematic_fold_content_is_deterministic_concatenation_no_llm(monke
     assert finish["kwargs"]["extra"] == {
         "truncation_failures": 0,
         "slot_failures": 0,
+        "embed_failures": 0,
         "dead_lettered_clusters": 0,
         "unchanged_clusters": 0,
         "singleton_clusters": 0,
@@ -679,6 +680,8 @@ async def test_thematic_fold_embedding_failure_requeues(monkeypatch):
     assert session.calls == []
     assert daemon.pending_pg_ids == {1, 2}
     assert finish["args"][2:5] == (1, 0, 1)
+    assert finish["kwargs"]["extra"]["embed_failures"] == 1
+    assert finish["kwargs"]["extra"]["embed_failed"] == [cl._fold_identity("fact", [1, 2])]
 
 
 @pytest.mark.asyncio
@@ -889,6 +892,7 @@ def test_a_census_that_ran_reports_its_zeros_rather_than_vanishing():
     assert r.extra() == {
         "truncation_failures": 0,
         "slot_failures": 0,
+        "embed_failures": 0,
         "dead_lettered_clusters": 0,
         "unchanged_clusters": 0,
         "singleton_clusters": 0,
@@ -926,6 +930,7 @@ def test_cyclerec_extra_carries_stage5_fields_no_preservation_keys():
         # contract: always present once extra() is non-None; 0 when this
         # cycle deferred no singleton components.
         "singleton_clusters": 0,
+        "embed_failures": 0,
         "truncation_failed": ["decision:1,decision:2"],
         "slot_failed": ["decision:3,decision:4"],
     }
@@ -989,11 +994,12 @@ def test_fold_dead_letter_query_unions_truncation_and_slot_never_preservation(mo
     assert "preservation_failed" not in sql
     assert "truncation_failed" in sql
     assert "slot_failed" in sql
-    # Both COALESCEs are combined into ONE set the GROUP BY sees together —
-    # not two separate reads.
+    assert "embed_failed" in sql
+    # The three live classes are one union the GROUP BY sees together.
     assert re.search(
         r"COALESCE\(extra->'truncation_failed'.*?\)\s*\|\|\s*"
-        r"COALESCE\(extra->'slot_failed'.*?\)", sql)
+        r"COALESCE\(extra->'slot_failed'.*?\)\s*\|\|\s*"
+        r"COALESCE\(extra->'embed_failed'.*?\)", sql)
 
 
 def test_fold_dead_letter_counts_reads_whatever_the_unioned_query_returns(monkeypatch):

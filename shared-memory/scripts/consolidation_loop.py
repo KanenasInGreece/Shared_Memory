@@ -77,7 +77,7 @@ NREM_TRUNCATION_RETRY_FACTOR = float(
 
 # After one SLOT/PRINCIPLE call, a still-empty slot gets one hardcoded retry for only the missing slots (decision:1205).
 
-# Skip a cluster after this many truncation_failed or slot_failed hits in the window.
+# Skip a cluster after this many truncation, slot, or embed failures in the window.
 NREM_FOLD_FAIL_WINDOW = int(os.environ.get("NREM_FOLD_FAIL_WINDOW", "7"))   # days
 NREM_FOLD_FAIL_CAP    = int(os.environ.get("NREM_FOLD_FAIL_CAP", "3"))
 # Cap each judgement body (decision text after the title line, or the full retrospective) before the insight prompt (decision:1205).
@@ -292,7 +292,7 @@ def _crun_recover_and_prune():
 
 
 def fetch_fold_dead_letter_counts():
-    """Count truncation_failed/slot_failed hits per member-ref key in the window; ignore retired preservation_failed (decision:1205). Fail open to {} on DB error."""
+    """Count truncation_failed, slot_failed, and embed_failed hits per member-ref key in the window. Ignore retired preservation_failed (decision:1205). Fail open to {} on DB error."""
     try:
         c = psycopg2.connect(PG_CONN, connect_timeout=5)
         try:
@@ -301,7 +301,8 @@ def fetch_fold_dead_letter_counts():
                     "SELECT k, count(*) FROM consolidation_runs,"
                     " LATERAL jsonb_array_elements_text("
                     "   COALESCE(extra->'truncation_failed', '[]'::jsonb)"
-                    "   || COALESCE(extra->'slot_failed', '[]'::jsonb)) AS k"
+                    "   || COALESCE(extra->'slot_failed', '[]'::jsonb)"
+                    "   || COALESCE(extra->'embed_failed', '[]'::jsonb)) AS k"
                     " WHERE started_at > now() - make_interval(days => %s)"
                     " GROUP BY k",
                     (NREM_FOLD_FAIL_WINDOW,))
@@ -421,6 +422,8 @@ class _CycleRec:
                  # decision:1205 retired preservation_* with the anchor gate. truncation_* is finish_reason=length; slot_* is a SLOT/PRINCIPLE still missing after one retry; fold_dead_letter is keys the cap skipped.
                  "truncation_failures", "truncation_failed",
                  "slot_failures", "slot_failed", "fold_dead_letter",
+                 "embed_failures", "embed_failed",
+                 "insight_gate_skips",
                  # Re-fold would rewrite the active summary byte-identically, so nothing is embedded. Excluded from eligible_clusters and counted on its own.
                  "unchanged_clusters",
                  # decision:1121: judgement reach of exactly 1 cannot fold an insight, so it is excluded from eligible_clusters and counted on its own.
@@ -440,6 +443,10 @@ class _CycleRec:
         self.slot_failures = 0
         self.slot_failed = []
         self.fold_dead_letter = []
+        self.embed_failures = 0
+        self.embed_failed = []
+        # None until an insight cycle runs the gate. A fact cycle must not invent a zero.
+        self.insight_gate_skips = None
         self.unchanged_clusters = 0
         # Singleton components (judgement reach of exactly 1) are partitioned out before the census. 0 once a census has run.
         self.singleton_clusters = 0
@@ -472,9 +479,9 @@ class _CycleRec:
         calibration layer was retired this held by accident: every insight
         cycle fetched a calibration snapshot, and that non-None field alone
         kept `extra` present."""
-        if self.eligible_clusters is None and not (
-            self.truncation_failures or self.slot_failures
-            or self.truncation_failed or self.slot_failed
+        if self.eligible_clusters is None and self.insight_gate_skips is None and not (
+            self.truncation_failures or self.slot_failures or self.embed_failures
+            or self.truncation_failed or self.slot_failed or self.embed_failed
             or self.fold_dead_letter
             or self.dead_lettered_clusters
             or self.unchanged_clusters
@@ -485,6 +492,7 @@ class _CycleRec:
             "truncation_failures": self.truncation_failures,
             # decision:1205: a missing SLOT/PRINCIPLE after one retry is a protocol failure, not a capacity failure.
             "slot_failures": self.slot_failures,
+            "embed_failures": self.embed_failures,
             # fact:1189, decision:1121: clusters the census excluded. Not an alias for eligible_clusters.
             "dead_lettered_clusters": self.dead_lettered_clusters,
             # Byte-identical re-folds this cycle. Not eligible backlog, or a current corpus reads as stalled.
@@ -496,6 +504,10 @@ class _CycleRec:
             out["truncation_failed"] = self.truncation_failed
         if self.slot_failed:
             out["slot_failed"] = self.slot_failed
+        if self.embed_failed:
+            out["embed_failed"] = self.embed_failed
+        if self.insight_gate_skips is not None:
+            out["insight_gate_skips"] = self.insight_gate_skips
         if self.fold_dead_letter:
             out["fold_dead_letter"] = self.fold_dead_letter
         return out
@@ -1376,7 +1388,8 @@ def write_insight_summary(conn, content, metadata_json, embedding, src_ids, outb
     return summary_id
 
 
-def supersede_covered_summaries(conn, summary_id, src_ids, level=None, kind="thematic"):
+def supersede_covered_summaries(conn, summary_id, src_ids, level=None, kind="thematic",
+                                 project=None, domain=None):
     """Mark active summaries whose source_pg_ids the new summary covers
     (subset OR equal — an exact-set re-fold supersedes its predecessor).
 
@@ -1399,6 +1412,12 @@ def supersede_covered_summaries(conn, summary_id, src_ids, level=None, kind="the
     ``level`` is ``None`` (the insight caller), level is not compared at
     all — kind isolation is what protects it now, not the level check.
     Commit is the caller's job. Returns the superseded summary ids.
+
+    A thematic fold passes project and domain. A different non-empty project or
+    domain is not the same summary, so a fact that sits in two sections cannot
+    retire the sibling. An insight passes project only: its identity is the
+    judgement set, and a second domain in the same project still supersedes
+    by subset (fact:1149).
     """
     new_src_set = set(src_ids)
     superseded = []
@@ -1406,17 +1425,24 @@ def supersede_covered_summaries(conn, summary_id, src_ids, level=None, kind="the
         cur.execute(
             "SELECT id, source_pg_ids,"
             "       COALESCE(metadata->>'level', %s) AS lvl,"
-            "       COALESCE(metadata->>'kind', 'thematic') AS kind"
+            "       COALESCE(metadata->>'kind', 'thematic') AS kind,"
+            "       COALESCE(metadata->>'project', '') AS project,"
+            "       COALESCE(metadata->>'domain', '') AS domain"
             "  FROM community_summaries"
             " WHERE NOT superseded AND id != %s"
             "   AND source_pg_ids IS NOT NULL",
             (LEVEL_ENTITY, summary_id),
         )
-        for old_id, old_src, old_level, old_kind in cur.fetchall():
+        for old_id, old_src, old_level, old_kind, old_project, old_domain in cur.fetchall():
             # Kind isolation is unconditional, not gated on whether level was passed.
             if old_kind != kind:
                 continue
             if level is not None and old_level != level:
+                continue
+            # Empty is its own value. A missing section must not match a named one.
+            if project is not None and (project or "") != (old_project or ""):
+                continue
+            if domain is not None and (domain or "") != (old_domain or ""):
                 continue
             if old_src and set(old_src) <= new_src_set:
                 cur.execute(
@@ -1950,6 +1976,7 @@ def merge_logs(log_dir: str) -> None:
 class ConsolidationDaemon:
     def __init__(self):
         self.pending_pg_ids = set()
+        self._insight_gate_skips = 0
         self.last_activity = datetime.now()
         self.first_notification_time = None
         # A due sweep with no free slot waits this long instead of probing every listen tick.
@@ -2803,8 +2830,8 @@ class ConsolidationDaemon:
                     dead_lettered_count += 1
                     rec.fold_dead_letter.append(label)
                     logger.error(
-                        "NREM fold dead-letter: '%s' failed preservation/truncation "
-                        "%d time(s) within %dd (cap %d) — SKIPPING this cluster. "
+                        "NREM fold dead-letter: '%s' hit the truncation, slot, or embed "
+                        "cap %d time(s) within %dd (cap %d) — SKIPPING this cluster. "
                         "Operator reset = window expiry or consolidation_runs cleanup.",
                         label, dead_letter[fold_key], NREM_FOLD_FAIL_WINDOW,
                         NREM_FOLD_FAIL_CAP)
@@ -2886,6 +2913,8 @@ class ConsolidationDaemon:
                 if not embedding:
                     logger.error("Failed to vectorize summary for %s. Re-queueing IDs.",
                                  label)
+                    rec.embed_failures += 1
+                    rec.embed_failed.append(_fold_identity("fact", pg_ids))
                     rec.fold(False)
                     self._requeue(pg_ids)
                     continue
@@ -2962,7 +2991,9 @@ class ConsolidationDaemon:
                     superseded_ids = await loop.run_in_executor(
                         None,
                         lambda: supersede_covered_summaries(
-                            conn, summary_pg_id, pg_ids, level=_level),
+                            conn, summary_pg_id, pg_ids, level=_level,
+                            project=project or "",
+                            domain=section or SECTION_NONE),
                     )
 
                     await loop.run_in_executor(None, conn.commit)
@@ -3143,6 +3174,7 @@ class ConsolidationDaemon:
         surviving member of its component), left UNRESOLVED per the plan;
         see this PR's HANDOFF.md for the escalation.
         """
+        self._insight_gate_skips = 0
         rows = await self._find_grounded_fact_groups()
         if not rows:
             return []
@@ -3166,10 +3198,17 @@ class ConsolidationDaemon:
         )
 
         clusters = []
+        gate_skips = 0
         for (project, section), _contents, fact_ids in groups:
             labels, consolidated, components = await walk_group_reached_set(
                 self.driver, fact_ids)
             if not passes_insight_gate(labels, consolidated):  # G2 + G3
+                gate_skips += 1
+                logger.warning(
+                    "Insight gate: %s/%s failed G2 or G3 — skipped, not folded "
+                    "(insight_gate_skips=%d).",
+                    project, section, gate_skips,
+                )
                 continue
             for comp in order_components(components, labels):  # §2.4
                 decision_ids = [i for i in comp if labels.get(i) == ONT.decision]
@@ -3192,6 +3231,7 @@ class ConsolidationDaemon:
                     "judgement_types": {i: labels.get(i) for i in comp},
                     "has_retrospective": has_retro,
                 })
+        self._insight_gate_skips = gate_skips
         return clusters
 
     # The pre-C4 edge fetches are gone. Insight text is each judgement's title and rationale; edge detail stays in insight_cypher_query, and _fold_insight does not open a Neo4j session.
@@ -3248,8 +3288,8 @@ class ConsolidationDaemon:
                     if dead_letter.get(key, 0) >= NREM_FOLD_FAIL_CAP:
                         rec.fold_dead_letter.append(label)
                         logger.error(
-                            "NREM fold dead-letter: '%s' failed preservation/"
-                            "truncation %d time(s) within %dd (cap %d) — SKIPPING. "
+                            "NREM fold dead-letter: '%s' hit the truncation, slot, or embed "
+                            "cap %d time(s) within %dd (cap %d) — SKIPPING. "
                             "Operator reset = window expiry or consolidation_runs cleanup.",
                             label, dead_letter[key], NREM_FOLD_FAIL_WINDOW,
                             NREM_FOLD_FAIL_CAP)
@@ -3279,6 +3319,7 @@ class ConsolidationDaemon:
                         folded.update(src_ids)
 
                 clusters = await self._find_fresh_insight_clusters()
+                rec.insight_gate_skips = self._insight_gate_skips
 
                 # Identity is the set of judgement pg_ids. 'same' appends onto the existing insight; 'covered' adds nothing; the other classes fold, and subset supersession resolves 'supersedes' at write time.
                 existing_insights = await loop.run_in_executor(
@@ -3520,7 +3561,13 @@ class ConsolidationDaemon:
 
         embedding = await self.get_embedding(insight)
         if not embedding:
-            logger.error(f"Failed to vectorise insight for '{entity}' — ledger rows stay open; next sweep retries.")
+            cyc.embed_failures += 1
+            cyc.embed_failed.append(fold_key)
+            logger.error(
+                "Failed to vectorise insight for '%s' — ledger rows stay open; "
+                "the embed failure counts toward the fold cap (embed_failures=%d).",
+                entity, cyc.embed_failures,
+            )
             return False
 
         metadata_json = json.dumps({
@@ -3544,7 +3591,8 @@ class ConsolidationDaemon:
                 sid = write_insight_summary(
                     conn, insight, metadata_json, embedding, src_ids, row_ids, run_id=run_id
                 )
-                sup = supersede_covered_summaries(conn, sid, src_ids, kind="insight")
+                sup = supersede_covered_summaries(
+                    conn, sid, src_ids, kind="insight", project=resolved_project or "")
                 return sid, sup
             summary_id, superseded_ids = await loop.run_in_executor(None, _write)
             await loop.run_in_executor(None, conn.commit)
@@ -3577,22 +3625,10 @@ class ConsolidationDaemon:
 
     async def _mark_insight_in_graph(self, judgement_ids, summary_pg_id, entity,
                                      superseded_ids=None):
-        """Neo4j side of an insight fold: flag the source JUDGEMENTS
-        consolidated, upsert the CommunitySummary node (kind='insight'), link
-        SUMMARIZED_BY and SUPERSEDES edges. Idempotent — also used by
-        reconciliation.
-
-        ⛔ CRITERION C — THE PR #226 SEAM, FIXED: this used to match
-        ``:Decision`` only. Feeding it a Retrospective pg_id (as C4 now
-        does — ``judgement_ids`` is the FULL ordered component, decisions
-        AND retrospectives, per §3.2's judgement-inclusive ``source_pg_ids``)
-        would silently never set ``consolidated`` on that node, leaving G3
-        (freshness — ``insight_gate.py``'s ``passes_insight_gate``) reading
-        it as permanently fresh and re-triggering a redundant re-fold every
-        cycle. Widened to match either label, mirroring the exact pattern
-        ``run_lineage_invalidation_pass`` already uses to CLEAR the same
-        flag on retirement (``(d:Decision OR d:Retrospective) AND d.pg_id =
-        did``) — one predicate, both directions of the same property."""
+        """Neo4j side of an insight fold: flag the source judgements
+        consolidated, upsert the CommunitySummary node, and link
+        SUMMARIZED_BY and SUPERSEDES. Idempotent, so reconciliation can
+        re-apply it. The match is Decision or Retrospective."""
         async with self.driver.session() as session:
             await session.run(
                 f"UNWIND $judgement_ids as jid"

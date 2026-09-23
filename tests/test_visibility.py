@@ -191,6 +191,42 @@ async def test_keyword_fallback_is_gated():
     assert "claude_code" in _all_bound_params(mock_conn)
 
 
+@pytest.mark.asyncio
+async def test_keyword_fallback_hit_carries_id_and_ranked_false():
+    """The id is selected and must come back. ranked false keeps the 0.5 from reading as a rerank score."""
+    c, mock_conn = _coordinator_with_mocks()
+    mock_conn.fetch = AsyncMock(return_value=[{
+        "id": 42,
+        "content": "the proxy retries",
+        "metadata": {"type": "fact", "entities": ["Proxy"]},
+    }])
+    with patch.object(c, "_embed", new=AsyncMock(side_effect=RuntimeError("embedder down"))):
+        req = _make_request({"query": "proxy"}, authenticated_agent="claude_code")
+        resp = await c.handle_search(req)
+    hit = json.loads(resp.text)["results"][0]
+    assert hit["pg_id"] == 42
+    assert hit["ref"] == "fact:42"
+    assert hit["record_type"] == "fact"
+    assert hit["ranked"] is False
+    assert hit["score_normalized"] == 0.5
+
+
+@pytest.mark.asyncio
+async def test_keyword_fallback_escapes_wildcards_and_applies_scope():
+    """A query of % must not match every row, and a scope filter must match the vector path."""
+    c, mock_conn = _coordinator_with_mocks()
+    mock_conn.fetch = AsyncMock(return_value=[])
+    with patch.object(c, "_embed", new=AsyncMock(side_effect=RuntimeError("embedder down"))):
+        resp = await c.handle_search(_make_request(
+            {"query": "100%", "scope": "ops"}, authenticated_agent="claude_code"))
+    assert resp.status == 200
+    sql, *params = mock_conn.fetch.call_args.args
+    assert "ESCAPE" in sql
+    assert "AND scope = $" in sql
+    assert params[0] == "%100\\%%"
+    assert "ops" in params
+
+
 # ── S4: handle_save visibility validation ─────────────────────────────────────
 
 @pytest.mark.asyncio

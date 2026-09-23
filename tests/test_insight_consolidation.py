@@ -21,6 +21,7 @@ seam fix).
 All Postgres/Neo4j/LLM I/O is stubbed — no live infrastructure required.
 """
 import json
+import logging
 import os
 import sys
 from unittest.mock import AsyncMock, MagicMock
@@ -356,8 +357,9 @@ def test_insight_write_no_rows_skips_flip():
 # ── supersede_covered_summaries ───────────────────────────────────────────────
 
 def _supersession_conn(old_rows):
-    return StubConn(script=[{"rowcount": len(old_rows), "rows": old_rows}]
-                    + [{"rowcount": 1, "rows": []} for _ in old_rows])
+    padded = [row if len(row) == 6 else (*row, "", "") for row in old_rows]
+    return StubConn(script=[{"rowcount": len(padded), "rows": padded}]
+                    + [{"rowcount": 1, "rows": []} for _ in padded])
 
 
 def test_equal_source_set_supersedes_prior_insight():
@@ -403,6 +405,63 @@ def test_kind_isolation_default_is_thematic():
     conn = _supersession_conn([(70, [245, 267], "domain", "insight")])
     assert supersede_covered_summaries(conn, 77, [245, 267], level="domain") == []
     assert conn.commits == 0
+
+
+def test_coverage_call_sites_pass_project_and_the_gate_skip_is_recorded():
+    """Dropping the axis arguments, or the cycle-record copy, stays green in the unit tests otherwise."""
+    src = open(os.path.join(os.path.dirname(__file__), "..",
+                            "shared-memory", "scripts", "consolidation_loop.py"),
+               encoding="utf-8").read()
+    assert "domain=section or SECTION_NONE" in src
+    assert 'project=resolved_project or ""' in src
+    assert "rec.insight_gate_skips = self._insight_gate_skips" in src
+
+
+@pytest.mark.asyncio
+async def test_fold_insight_embed_none_counts_toward_the_cap(monkeypatch):
+    monkeypatch.setenv("MOCK_LLM", "1")
+    daemon, _session = daemon_with_fake_graph()
+    daemon.get_embedding = AsyncMock(return_value=None)
+    cyc = cl._CycleRec()
+    assert await daemon._fold_insight(
+        conn_from := StubConn(script=_fold_script()),
+        "OutboxPattern", [245, 267], cyc=cyc) is False
+    assert cyc.embed_failures == 1
+    assert cyc.embed_failed
+    assert not any(s.startswith("INSERT INTO community_summaries") for s, _ in conn_from.executed)
+
+
+def test_blank_domain_is_not_the_same_section():
+    conn = _supersession_conn([
+        (70, [1], "domain", "thematic", "alpha", ""),
+    ])
+    assert supersede_covered_summaries(
+        conn, 99, [1, 2], level="domain",
+        project="alpha", domain="architecture") == []
+
+
+def test_thematic_coverage_stays_inside_one_section():
+    """A fact in two sections must not let the larger fold retire the sibling."""
+    conn = _supersession_conn([
+        (70, [1], "domain", "thematic", "alpha", "development"),
+        (71, [1], "domain", "thematic", "alpha", "architecture"),
+        (72, [1], "domain", "thematic", "beta", "architecture"),
+    ])
+    assert supersede_covered_summaries(
+        conn, 99, [1, 2, 3], level="domain",
+        project="alpha", domain="architecture") == [71]
+
+
+def test_insight_coverage_crosses_domains_inside_one_project():
+    """fact:1149: an insight's identity is the judgement set, so a second domain
+    in the same project still supersedes. A different project does not."""
+    conn = _supersession_conn([
+        (70, [245], "entity", "insight", "alpha", "architecture"),
+        (71, [245], "entity", "insight", "alpha", "development"),
+        (72, [245], "entity", "insight", "beta", "architecture"),
+    ])
+    assert supersede_covered_summaries(
+        conn, 77, [245, 267], kind="insight", project="alpha") == [70, 71]
 
 
 def test_p12_same_level_only_when_level_passed():
@@ -503,7 +562,7 @@ async def test_fresh_insight_clusters_returns_shape_for_a_gating_group():
 
 
 @pytest.mark.asyncio
-async def test_fresh_insight_clusters_skips_a_group_with_no_retrospective_reached():
+async def test_fresh_insight_clusters_skips_a_group_with_no_retrospective_reached(caplog):
     """G2: a gating group whose walk reaches only Decisions yields nothing —
     however many decisions it has (I6, exercised end-to-end here; the pure
     predicate itself is mutation-checked in test_insight_gate.py)."""
@@ -515,8 +574,15 @@ async def test_fresh_insight_clusters_skips_a_group_with_no_retrospective_reache
         ]),
         FakeResult([]),
     ])
-    out = await daemon._find_fresh_insight_clusters()
+    with caplog.at_level(logging.WARNING, logger="ConsolidationDaemon"):
+        out = await daemon._find_fresh_insight_clusters()
     assert out == []
+    assert daemon._insight_gate_skips == 1
+    assert "failed G2 or G3" in caplog.text
+    rec = cl._CycleRec()
+    rec.eligible_clusters = 0
+    rec.insight_gate_skips = daemon._insight_gate_skips
+    assert rec.extra()["insight_gate_skips"] == 1
 
 
 @pytest.mark.asyncio
@@ -581,8 +647,9 @@ def _fold_script():
         {"rowcount": 1, "rows": [(77,)]},
         # 5. write_insight_summary ledger flip
         {"rowcount": 2, "rows": []},
-        # 6. supersession SELECT (id, source_pg_ids, level, kind) — PR 7 shape
-        {"rowcount": 1, "rows": [(70, [245, 267], "entity", "insight")]},
+        # 6. supersession SELECT (id, source_pg_ids, level, kind, project, domain)
+        {"rowcount": 1, "rows": [(70, [245, 267], "entity", "insight",
+                                   "shared-memory-GitHub", "")]},
         # 7. supersession UPDATE
         {"rowcount": 1, "rows": []},
         # 8. close_ledger_rows_by_id DELETE

@@ -404,7 +404,7 @@ def test_i11_reverse_lookup_retires_what_subset_coverage_structurally_cannot():
     requires: "must fail if the explicit lineage path is removed EVEN
     THOUGH a refold still succeeds"."""
     # Mechanism A cannot do it:
-    conn_a = StubConn(script=[{"rowcount": 1, "rows": [(70, [1, 2, 3], "", "insight")]}])
+    conn_a = StubConn(script=[{"rowcount": 1, "rows": [(70, [1, 2, 3], "", "insight", "", "")]}])
     assert supersede_covered_summaries(conn_a, 99, [1, 2], kind="insight") == []
 
     # Mechanism B (this unit) retires it directly, by reverse lookup.
@@ -470,7 +470,7 @@ async def test_i12_nothing_retired_touches_neither_store_further(monkeypatch):
 #          test_insight_consolidation.py, beside the function's other tests) ──
 
 def test_i13_kind_param_defaults_to_thematic_and_is_always_checked():
-    conn = StubConn(script=[{"rowcount": 1, "rows": [(70, [1, 2], "", "insight")]}])
+    conn = StubConn(script=[{"rowcount": 1, "rows": [(70, [1, 2], "", "insight", "", "")]}])
     # Default kind ("thematic", the fact-fold caller's own kind) must not
     # match a stored insight row even with a covering subset and no level.
     assert supersede_covered_summaries(conn, 99, [1, 2]) == []
@@ -569,7 +569,7 @@ def test_coverage_retirement_stamps_superseded_at_not_only_the_reason():
     # retirement indistinguishable from a pre-031 row to "what was retired
     # since the stamp existed?" — the only question the pair answers.
     conn = StubConn(script=[
-        {"rowcount": 1, "rows": [(9, [1], None, "thematic")]},   # candidate scan
+        {"rowcount": 1, "rows": [(9, [1], None, "thematic", "", "")]},   # candidate scan
         {"rowcount": 1, "rows": []},                              # UPDATE
     ])
     assert supersede_covered_summaries(conn, 10, [1, 2]) == [9]

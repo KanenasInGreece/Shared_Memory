@@ -83,7 +83,7 @@ __all__ = [
 ]
 
 #: Not a free-running today: this is the fifth version pin, so a missed bump is visible (decision:1832).
-VERSION = "0.9.113"
+VERSION = "0.9.114"
 
 
 def _version_tuple(v: str) -> tuple:
@@ -161,6 +161,8 @@ INTRODUCED_0_9_88 = "0.9.88"
 INTRODUCED_0_9_97 = "0.9.97"
 #: The 0.9.104 stamp: decision:2540 encoder window contract.
 INTRODUCED_0_9_104 = "0.9.104"
+#: insight_gate_skips on the consolidation roll-up. VERSION is not bumped in this change.
+INTRODUCED_0_9_114 = "0.9.114"
 #: Frozen release at which the v0.9.74 /health copies stop being served. A later drop gets its own stamp.
 DUAL_EMIT_DROP_TARGET = "0.9.90"
 #: Telemetry copies stay one release longer because the monitor still reads the old homes (fact:1989).
@@ -1165,6 +1167,9 @@ TELEMETRY: dict[str, dict] = {
     "consolidation.*.dead_lettered_clusters": _k("int", "nrem/consolidation"),
     "consolidation.*.unchanged_clusters": _k("int", "nrem/consolidation"),
     "consolidation.*.singleton_clusters": _k("int", "nrem/consolidation"),
+    "consolidation.*.insight_gate_skips": _k(
+        "int|null", "nrem/consolidation", since=INTRODUCED_0_9_114,
+        note="groups the insight gate skipped; null until a cycle records it; not backlog"),
     "consolidation.*.truncation_failures": _k("int", "nrem/consolidation"),
     "consolidation.*.slot_failures": _k("int", "nrem/consolidation"),
     "consolidation.*.last_deferred_reason": _k("str|null", "nrem/consolidation"),
