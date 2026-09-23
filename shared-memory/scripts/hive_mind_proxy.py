@@ -4169,6 +4169,11 @@ LLM_PROBE_INTERVAL_CREDENTIALED_S = max(
 _llm_last_probe_at: dict[str, float] = {}
 
 
+def _fresh_probe_map() -> dict:
+    """The probe map for one pass, keyed off LLM_BACKENDS and never off the previous cache, so no entry can outlive the pool it describes; a backend still inside its own interval carries its last verdict forward rather than being dropped, which would read as never probed."""
+    return {b: _llm_status_cache.get(b, "unknown") for b in LLM_BACKENDS}
+
+
 def _probe_interval_for(backend: str) -> float:
     """How long to leave `backend` alone between probes: the credentialed interval when a provider key is attached, else the ordinary one."""
     if LLM_BACKEND_TOKENS.get(backend) is not None:
@@ -4205,8 +4210,7 @@ async def _llm_probe_daemon(proxy, stop_event) -> None:
     """Background loop to probe LLM backends (S7), off the request path."""
     global _llm_status_cache
     while not stop_event.is_set():
-        # Keyed off LLM_BACKENDS, never off the previous cache, so no entry can outlive the pool it describes; a backend still inside its own interval carries its last verdict forward rather than being dropped, which would read as never probed.
-        new_status = {b: _llm_status_cache.get(b, "unknown") for b in LLM_BACKENDS}
+        new_status = _fresh_probe_map()
         now = time.monotonic()
         for b in LLM_BACKENDS:
             last = _llm_last_probe_at.get(b)
