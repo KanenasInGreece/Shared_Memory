@@ -598,6 +598,9 @@ def _apply_backend_body_overrides(body: bytes, model: "str | None",
 
 # Per-backend fail/cooldown changes future routing; the only retry is one same-target replay of a buffered body on a stale socket (S12).
 LLM_FAIL_THRESHOLD = int(os.environ.get("LLM_FAIL_THRESHOLD", "2"))
+# Transport failures and HTTP failures get separate thresholds because they mean different things: a refused connection is one backend event, while a hosted provider emits 429s and transient 5xx as part of normal operation, so the transport threshold of 2 would cool a healthy provider for LLM_COOLDOWN on a routine blip.
+# fact:1338 (a proposed parameter value is a measurement claim in disguise): 5 is UNMEASURED — no rate has been observed against a real provider here, so tune it rather than trusting it.
+LLM_HTTP_FAIL_THRESHOLD = max(1, int(os.environ.get("LLM_HTTP_FAIL_THRESHOLD", "5")))
 LLM_FAIL_WINDOW = float(os.environ.get("LLM_FAIL_WINDOW", "60"))
 LLM_COOLDOWN = float(os.environ.get("LLM_COOLDOWN", "300"))
 
@@ -622,6 +625,13 @@ _llm_inflight: dict[str, int] = {b: 0 for b in LLM_BACKENDS}
 # Inflight count cannot tell busy from stuck. Record start times so status can flag suspect_wedged after a lazy health probe.
 _llm_inflight_started: dict[str, list[float]] = {b: [] for b in LLM_BACKENDS}
 LLM_WEDGE_SUSPECT_AGE = float(os.environ.get("LLM_WEDGE_SUSPECT_AGE", "900"))
+
+
+# ⚠ The two sides of the cap deliberately disagree for an UNDECLARED backend, and only this reporting side defaults to 1.
+# Routing's own `_at_cap` treats an absent max_inflight as no limit at all, which is long-standing behaviour no request should have changed under it; here an absent value keeps meaning one slot, which is exactly what this function reported before the declared cap was read at all.
+def _reported_max_inflight(backend: str) -> int:
+    """The concurrency /pool/status measures `available` against: the backend's declared max_inflight, or 1 when it declared none (which reproduces the old inflight == 0 test exactly)."""
+    return LLM_BACKEND_MAX_INFLIGHT.get(backend) or 1
 
 
 def _oldest_inflight_age(backend: str, now: float) -> float | None:
@@ -1003,17 +1013,25 @@ def _record_llm_latency(backend: str, elapsed_s: float, failed: bool) -> None:
         log.warning("latency accounting failed for %s: %s", scrub_url_credentials(backend), exc)
 
 
-def _llm_mark_fail(backend: str) -> None:
-    """Record a backend failure; trip the cooldown if it fails too often."""
+def _llm_mark_fail(backend: str, threshold: "int | None" = None) -> None:
+    """Record a backend failure and trip the cooldown once it fails too often, counting against `threshold` (LLM_FAIL_THRESHOLD for a transport failure, LLM_HTTP_FAIL_THRESHOLD for an upstream 429 or 5xx)."""
     now = time.monotonic()
+    limit = LLM_FAIL_THRESHOLD if threshold is None else max(1, threshold)
     _llm_fail_total[backend] = _llm_fail_total.get(backend, 0) + 1
     fails = [t for t in _llm_fail_times.get(backend, []) if now - t < LLM_FAIL_WINDOW]
     fails.append(now)
     _llm_fail_times[backend] = fails
-    if len(fails) >= LLM_FAIL_THRESHOLD:
+    if len(fails) >= limit:
         _llm_unhealthy_until[backend] = now + LLM_COOLDOWN
         _llm_fail_times[backend] = []
-        log.warning("LLM backend %s in cooldown for %.0fs (%d fails)", scrub_url_credentials(backend), LLM_COOLDOWN, LLM_FAIL_THRESHOLD)
+        log.warning("LLM backend %s in cooldown for %.0fs (%d fails)", scrub_url_credentials(backend), LLM_COOLDOWN, limit)
+
+
+# An upstream status that is a verdict on the BACKEND, not on the request: 429 says it is refusing load and every 5xx says it failed to serve.
+# Every other 4xx is about this request (400 model_mismatch, 401/403 a rejected key, 404 a path it does not serve) and must not cool a backend down: those do not heal on a timer, so a cooldown would hide the cause and cost availability for nothing.
+def _http_status_faults_backend(status: int) -> bool:
+    """True iff this upstream status should count toward the backend's fail streak."""
+    return status == 429 or status >= 500
 
 
 def _llm_mark_ok(backend: str) -> None:
@@ -1859,6 +1877,11 @@ class AsyncHiveMindProxy:
                                         "credential-fault classification failed for %s: %s",
                                         scrubbed_target_url, type(exc).__name__)
 
+                            # A 429 or 5xx is the only failure signal a hosted provider gives: it reports its faults as HTTP status, never as a dropped connection, so without this the fail streak stays clean forever and the backend is never taken out of rotation.
+                            # Worse than merely staying in: a fast error returns its inflight slot at once, so least-in-flight selection then PREFERS the failing backend over a healthy one mid-generation.
+                            if llm_backend is not None and _http_status_faults_backend(upstream.status):
+                                _llm_mark_fail(llm_backend, threshold=LLM_HTTP_FAIL_THRESHOLD)
+
                             headers = {"X-SM-Fault-Origin": "upstream"}
                             if llm_backend is not None:
                                 headers["X-SM-LLM-Backend"] = scrub_url_credentials(llm_backend)
@@ -2448,7 +2471,8 @@ async def handle_pool_status(request: web.Request) -> web.Response:
     _session = _app["proxy"].session if _app is not None and "proxy" in _app else None
     backends, free = {}, 0
     for b in LLM_POOL:
-        avail = (_llm_inflight.get(b, 0) == 0
+        # Available means "has spare capacity", not "is idle": a hosted backend that declares max_inflight 32 has 31 slots free while one request is in flight, and reading it as busy stalled every dream cycle for the length of every request.
+        avail = (_llm_inflight.get(b, 0) < _reported_max_inflight(b)
                  and _llm_unhealthy_until.get(b, 0.0) <= now
                  and b not in _llm_reserved)
         age = _oldest_inflight_age(b, now)
@@ -4134,26 +4158,72 @@ def _coordinator_health_keys(coordinator) -> dict:
 
 _llm_status_cache: dict[str, str] = {}
 
+# Probe cadence, env-overridable because a metered endpoint and a loopback one cost nothing alike (the portability rule: our layout is one valid configuration, never the only one).
+LLM_PROBE_INTERVAL_S = max(0.5, float(os.environ.get("LLM_PROBE_INTERVAL_S", "3.0")))
+# A credentialed backend is probed far less often: at the 3 s loop cadence a hosted provider takes about 28,800 authenticated GET /v1/models per day, which can exhaust a request quota on liveness alone and invites the rate limiting that used to read as an outage.
+# fact:1338: 30 s is UNMEASURED — no provider quota was sampled to derive it.
+LLM_PROBE_INTERVAL_CREDENTIALED_S = max(
+    LLM_PROBE_INTERVAL_S,
+    float(os.environ.get("LLM_PROBE_INTERVAL_CREDENTIALED_S", "30.0")))
+# Last probe time per backend, so a credentialed backend can be skipped on a loop pass without slowing the loop for everyone else.
+_llm_last_probe_at: dict[str, float] = {}
+
+
+def _probe_interval_for(backend: str) -> float:
+    """How long to leave `backend` alone between probes: the credentialed interval when a provider key is attached, else the ordinary one."""
+    if LLM_BACKEND_TOKENS.get(backend) is not None:
+        return LLM_PROBE_INTERVAL_CREDENTIALED_S
+    return LLM_PROBE_INTERVAL_S
+
+
+def _classify_probe_status(status: int) -> str:
+    """The liveness verdict for a probe response.
+
+    429 is the one 4xx that means healthy: the backend is up and rate-limiting
+    this probe, and it will serve real traffic, so reading it as not-ok made a
+    working hosted provider report a dead pool.
+
+    ⛔ EVERY OTHER 4xx STAYS NOT-OK, AND 404 ESPECIALLY. A 404 is the signature
+    of a mistyped backend URL, and this daemon — unlike `_probe_backend_alive`,
+    which falls through to a second path — asks for exactly one path and has no
+    other evidence the backend serves anything. Calling that alive would pair
+    with `_http_status_faults_backend` (which deliberately ignores 404, because
+    a config fault does not heal on a cooldown timer) to leave a typo'd backend
+    reading healthy AND never cooling down, absorbing traffic indefinitely.
+    The probe is the signal for a configuration fault; the cooldown is the
+    signal for a load fault. 401 and 403 stay not-ok for the same reason: they
+    say this gateway's key is rejected (fact:1794 — a bare probe of a
+    credentialed backend always 401s, which is why the probe carries the
+    bearer), which an operator must see.
+    """
+    if status < 400 or status == 429:
+        return "ok"
+    return f"http_{status}"
+
+
 async def _llm_probe_daemon(proxy, stop_event) -> None:
     """Background loop to probe LLM backends (S7), off the request path."""
     global _llm_status_cache
     while not stop_event.is_set():
-        new_status = {}
+        # Keyed off LLM_BACKENDS, never off the previous cache, so no entry can outlive the pool it describes; a backend still inside its own interval carries its last verdict forward rather than being dropped, which would read as never probed.
+        new_status = {b: _llm_status_cache.get(b, "unknown") for b in LLM_BACKENDS}
+        now = time.monotonic()
         for b in LLM_BACKENDS:
+            last = _llm_last_probe_at.get(b)
+            if last is not None and now - last < _probe_interval_for(b):
+                continue
+            _llm_last_probe_at[b] = now
             try:
                 async with proxy.session.get(_v1_models_probe_url(b), timeout=ClientTimeout(total=2.0),
                                              headers=_probe_headers(b), allow_redirects=False) as r:
-                    if r.status < 400:
-                        new_status[b] = "ok"
-                    else:
-                        new_status[b] = f"http_{r.status}"
+                    new_status[b] = _classify_probe_status(r.status)
             except asyncio.TimeoutError:
                 new_status[b] = "timeout"
             except Exception:
                 new_status[b] = "down"
         _llm_status_cache = new_status
         try:
-            await asyncio.wait_for(stop_event.wait(), timeout=3.0)
+            await asyncio.wait_for(stop_event.wait(), timeout=LLM_PROBE_INTERVAL_S)
         except asyncio.TimeoutError:
             pass
 
