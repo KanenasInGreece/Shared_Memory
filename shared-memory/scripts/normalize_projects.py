@@ -168,17 +168,7 @@ def rename_statements(old: str, new: str) -> list:
          "   SET metadata = jsonb_set(metadata, '{decision,project}', to_jsonb(%s::text))"
          " WHERE metadata->'decision'->>'project' = %s",
          (new, old)),
-        # concat_ws skips NULLs, so a row with no note gets the trail alone
-        # rather than a leading separator.
-        #
-        # ⚠ BOTH LEDGER COLUMNS MOVE, AND THEY MOVE FOR DIFFERENT REASONS
-        # (migration 027). `to_project_id` is re-pointed because the identity it
-        # named is about to be deleted and the foreign key would otherwise veto
-        # the rename. `to_project` is re-pointed because a promotion's target is
-        # a name a reader looks up — and the name it originally carried is
-        # preserved in the note, which is the trade this statement has always
-        # made. The id does not make the note redundant: the note says what the
-        # target was CALLED, the id says which project it IS.
+        # concat_ws skips NULL, so a missing note does not grow a leading separator. Both columns move (migration 027): the id or the foreign key vetoes the rename, and the old name survives only in the note.
         ("UPDATE project_promotions"
          "   SET to_project = %s,"
          "       to_project_id = (SELECT id FROM projects WHERE name = %s),"

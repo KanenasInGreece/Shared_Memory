@@ -1,29 +1,12 @@
 #!/usr/bin/env bash
 #
-# backup.sh — consistent, quiesced backup of the Shared Memory stores.
+# backup.sh — quiesced backup of both stores on the gateway host. Postgres is the source of truth; Neo4j holds non-derivable HAD_OUTCOME edges, so a Postgres-only dump cannot rebuild the graph.
+# Quiesce sheds writes and fences the daemons, then the outbox drains so the snapshots match. A trap resumes the gateway, and its TTL does too if this script dies. A partial dump is never promoted.
 #
-# Captures BOTH stores (Postgres source-of-truth + Neo4j, which holds non-derivable
-# HAD_OUTCOME retrospective edges) as one set:
-#   - Postgres : pg_dump -Fc (online, MVCC-consistent)
-#   - Neo4j    : APOC apoc.export.cypher.all to /import (online; needs the
-#                NEO4J_apoc_export_file_enabled=true compose flag)
-#
-# Consistency: before dumping it asks the gateway to QUIESCE — client writes shed
-# (503 + Retry-After) and the REM/NREM daemons are fenced by a Postgres advisory
-# lock — then drains the outbox so the two stores are caught up. A trap resumes the
-# gateway on ANY exit, and the gateway's own TTL auto-resumes if this script dies.
-#
-# This is an OPERATIONS-surface script: it runs on the single gateway host, never
-# from a skill dir. Policy (schedule/retention/destination/encryption) is the
-# admin's — set it in the private .env; the cron/systemd cadence is the admin's too.
-#
-#   bash shared-memory/ops/backup.sh                 # full quiesced backup
-#   bash shared-memory/ops/backup.sh --dry-run       # sizes/space/retention, no writes
-#   bash shared-memory/ops/backup.sh --verify        # integrity-check the latest set
-#   bash shared-memory/ops/backup.sh --verify NAME   # integrity-check a named set
+#   bash shared-memory/ops/backup.sh
+#   bash shared-memory/ops/backup.sh --dry-run
+#   bash shared-memory/ops/backup.sh --verify [NAME]
 #   bash shared-memory/ops/backup.sh --env /path/.env
-#
-# Exit 0 on success; non-zero on failure (a partial dump is never promoted).
 
 set -uo pipefail
 
@@ -33,11 +16,7 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 # ── CLI ──────────────────────────────────────────────────────────────────────
 MODE="backup"
 VERIFY_TARGET=""
-# Framework env lives at shared-memory/.env (v0.6+); the repo-root path is the
-# pre-0.6 fallback — the same resolution init_db.sh and the maintenance scripts
-# use. backup.sh was the lone outlier: with only the repo-root path it silently
-# found NO env file, so BACKUP_DIR fell back to $HOME/.shared-memory (local disk,
-# not the configured destination) and BACKUP_ADMIN_TOKEN was empty (no quiesce).
+# shared-memory/.env first, then a pre-0.6 repo-root fallback. The repo-root path alone found no file, so backups landed on local disk with no quiesce token.
 ENV_FILE="$REPO_ROOT/shared-memory/.env"
 [[ -f "$ENV_FILE" ]] || ENV_FILE="$REPO_ROOT/.env"
 while [[ $# -gt 0 ]]; do
@@ -114,13 +93,7 @@ command -v "$DOCKER"   >/dev/null || die "'$DOCKER' not found"
 command -v python3     >/dev/null || die "python3 not found (needed for JSON parsing)"
 command -v sha256sum   >/dev/null || die "sha256sum not found"
 
-# Pull one scalar out of a JSON object on stdin (dotted path). Empty on any
-# miss/parse error, OR on a key that is genuinely absent — robust to an empty
-# or non-JSON response (no stack trace) AND indistinguishable from "this
-# manifest predates the field", which is deliberate: callers must treat
-# absence as unknown, never coerce it to a false/zero value. bool is a
-# subclass of int in Python, so it is special-cased to "true"/"false" text —
-# without this, a JSON `false` would print as the ambiguous Python "False".
+# Empty on a miss, a parse error, or a genuinely absent key. Callers must treat that as unknown, never as false or zero. A JSON bool is printed as text because Python's False is not the JSON spelling.
 json_get() { python3 -c 'import sys,json
 try:
     d=json.load(sys.stdin)
@@ -134,43 +107,11 @@ except Exception:
     print("")' "$1" 2>/dev/null; }
 
 dcurl() { curl -s --max-time 15 "$@"; }
-# The quiesce handshake BLOCKS for up to BACKUP_QUIESCE_MAX_SECONDS while the
-# gateway fences the dream daemons, so it needs its own, longer budget. With the
-# 15s dcurl the client always timed out first, so every backup silently ran
-# UNQUIESCED whenever a REM/NREM generation was in flight (which, with the ~22-30K
-# token grounding prompt, is most of the time).
+# The handshake blocks for the whole drain. The 15s client timed out first, so backups ran unquiesced whenever a dream was in flight.
 qcurl() { curl -s --max-time "$(( BACKUP_QUIESCE_MAX_SECONDS + 30 ))" "$@"; }
 
-# C1 + QF-1 (fix round 1): BACKUP_ADMIN_TOKEN and BOTH database passwords off
-# argv AND off the docker CLIENT's own argv on the GATEWAY HOST.
-#
-# QF-1 (why this is no longer a function called from inside $(...)): the
-# original cut called `auth_header_file()` only as `-H "@$(auth_header_file)"`
-# — command substitution runs in a SUBSHELL, so the function's variable
-# assignments (_AUTH_HEADER_DIR/_AUTH_HEADER_FILE) never reached the PARENT
-# shell. Every call therefore minted a NEW tmpdir holding the token, the
-# parent's own copies of those variables stayed empty forever, and the exit
-# trap — which only ever saw the parent's empty variables — cleaned up
-# NOTHING. Token files leaked into /tmp indefinitely after every run. Fixed
-# by creating everything EAGERLY, as a plain statement (never inside
-# `$(...)`), so the assignment lands in the shell that will later run the
-# cleanup trap.
-#
-# C1 (why docker exec -e is gone): `-e KEY=VALUE` is an argument to the
-# `docker` CLIENT process running on the GATEWAY HOST — `ps aux` (or
-# /proc/<pid>/cmdline, world-readable on a host with no hidepid) shows it to
-# every same-uid process, and on this host to every user, for the whole
-# `docker exec` lifetime (minutes, for pg_dump). `docker exec --env-file
-# <file>` reads KEY=VALUE lines from a file instead — confirmed present on
-# this host's docker (`docker exec --help` → "--env-file list  Read in a
-# file of environment variables"). It carries NEO4J_PASSWORD/PGPASSWORD
-# straight into the container's env with no host-side argv exposure at all.
-#
-# ONE private 0700 mktemp -d directory holds all three files (the curl auth
-# header, and one --env-file each for Postgres/Neo4j) — one dir, one trap
-# cleanup, created once per run. init_secrets_dir() is idempotent (a second
-# call is a no-op) and MUST be called as a bare statement, never inside
-# `$(...)`, or QF-1 recurs.
+# Token and both passwords stay off the host's argv. `docker exec -e` is visible in ps for the whole dump; --env-file is not.
+# Create the 0700 directory as a bare statement. Inside `$(...)` the assignments die with the subshell, the trap sees empty paths, and the token files leak in /tmp.
 _SECRETS_DIR=""
 _AUTH_HEADER_FILE=""
 _NEO4J_ENV_FILE=""
@@ -192,52 +133,18 @@ cleanup_secrets_dir() {
   _SECRETS_DIR=""; _AUTH_HEADER_FILE=""; _NEO4J_ENV_FILE=""; _PG_ENV_FILE=""
 }
 
-# NEW-5 (fix round 2, probe-confirmed): QUIESCED must be defined BEFORE the
-# trap is installed below, not after. Under `set -u` (line 28), a signal
-# landing in the window between `trap on_exit …` and a later `QUIESCED=0`
-# would make on_exit()'s call to resume() read an UNBOUND variable
-# (`[[ "$QUIESCED" -eq 1 ]]`) and abort — inside a trap handler, on the
-# exact path meant to release the gateway's quiesce fence. Every other
-# variable on_exit()'s path reads (GATEWAY_URL, BACKUP_ADMIN_TOKEN, and
-# _SECRETS_DIR/_AUTH_HEADER_FILE/_NEO4J_ENV_FILE/_PG_ENV_FILE above) is
-# already defined earlier in the script — QUIESCED was the one gap.
+# Defined before the trap. Under `set -u`, a signal in the gap would make resume() read an unbound QUIESCED and abort instead of releasing the fence.
 QUIESCED=0
-# Set alongside QUIESCED, by quiesce() below, so the manifest can record HOW
-# a quiesced backup was quiesced: "full" (200 — daemons drained cleanly) or
-# "timeout" (202 — the drain wait ran out; a daemon MAY have written during
-# the dump). Empty when QUIESCED=0 (quiesce never engaged at all). resume()
-# does not touch this — do_backup reads it before resume() runs, same as it
-# must read QUIESCED itself before resume() zeroes that.
+# "full" means the daemons drained; "timeout" means a daemon may have written during the dump. do_backup reads this before resume() clears QUIESCED.
 QUIESCE_MODE=""
-# Set by quiesce() on every path that returns 1 (skipped/failed), so the
-# "proceeding WITHOUT quiesce" message can say WHICH of the three distinct
-# reasons it was — measured on a documented upgrade run: the message used to
-# fold "gateway unreachable" and "no admin token" into one string, and an
-# operator reading it afterward could not tell which had actually happened,
-# or whether they had a token at all vs. one that was simply rejected.
-# Declared here (defined before the trap, `set -u`) for the same reason
-# QUIESCED/QUIESCE_MODE are — do_backup reads it, never on_exit, but keeping
-# every variable that flow can reach defined this early costs nothing.
+# Which of the three skip reasons happened. The old message folded "no token" and "unreachable" into one string. Defined here so `set -u` cannot trip the trap.
 QUIESCE_SKIP_REASON=""
 
-# One trap, active for the whole script (not just do_backup): resume() is a
-# no-op unless quiesce() actually succeeded (QUIESCED guard), and
-# cleanup_secrets_dir is a no-op unless init_secrets_dir ever ran — so this
-# is safe to install unconditionally, before mode dispatch, and covers
-# --dry-run too (which also touches docker).
+# One trap for the whole script. Both cleanups no-op if they never started, so --dry-run is safe too.
 on_exit() { resume; cleanup_secrets_dir; }
 trap on_exit EXIT INT TERM
 
-# ── Quiesce handshake ────────────────────────────────────────────────────────
-# Three DISTINCT ways this can fail to engage, each needing a different
-# operator fix — quiesce() names which one in QUIESCE_SKIP_REASON before
-# returning 1, so do_backup's "proceeding WITHOUT quiesce" message can say it:
-#   (1) no admin token           — BACKUP_ADMIN_TOKEN was never set
-#   (2) gateway unreachable      — the curl call itself failed (down host,
-#                                   wrong GATEWAY_URL, network)
-#   (3) token lacks the role     — a token WAS presented and the gateway WAS
-#                                   reachable, but it answered 401 (rejected/
-#                                   expired) or 403 (valid, not admin-role)
+# Three different failures, named in QUIESCE_SKIP_REASON: no token, curl failed, or 401/403 (token present but not admin).
 # >>> QUIESCE_FN
 quiesce() {
   if [[ -z "$BACKUP_ADMIN_TOKEN" ]]; then
@@ -271,35 +178,7 @@ resume() {
   QUIESCED=0
 }
 
-# Wait until the outbox is empty so Neo4j is caught up with Postgres before the
-# snapshot. The gate reads GET /admin/outbox (v0.9.92), not /memory/telemetry —
-# the backup token is confined to /admin/* (auth_middleware refuses an
-# admin-role token on any route outside it), so a gate that polled telemetry
-# was 403'd on every single poll and could only ever run out the timeout.
-# The served key is the single `outbox.pending`, which the coordinator builds
-# as census pending + in_progress — there is no `outbox.in_progress` key to
-# read alongside it.
-#
-# ⛔ NO `:-0` DEFAULT ON THIS READ. It used to read the dual-emitted
-# telemetry.postgres.outbox.{pending,in_progress} with `${pend:-0}` / `${prog:-0}`,
-# so once those copies were dropped from the served body json_get returned empty,
-# both defaulted to 0, and the very first poll printed "✓ outbox drained"
-# unconditionally — a snapshot taken with Neo4j arbitrarily behind Postgres,
-# under a green line. An ABSENT key means the gate cannot answer: say so and keep
-# polling to the timeout (best-effort, as below), never "drained".
-#
-# On a pre-0.9.92 gateway (or a build that forgot to register the route as
-# admin-only) GET /admin/outbox itself answers 403 with the confinement
-# message — `outbox.pending` is then just as absent as it would be from any
-# other malformed body, but printing the gateway's own refusal text (once)
-# lets an operator tell "pre-0.9.92 gateway / wrong role" apart from "route
-# present, key absent" at a glance. `dcurl` is `curl -s --max-time 15` with no
-# `-f`, so it exits 0 on 403/404 (`|| break` fires only on a transport
-# failure) and `json_get` on either error shape below yields '' for a missing
-# key — that is the whole mechanism, no special-casing of the status code
-# needed. The coordinator's own refusals key their text `message`
-# (coordinator.py `_error_body`); the proxy's route guard keys it `error`
-# (hive_mind_proxy.py) — read whichever is present.
+# Drain via GET /admin/outbox. The backup token is confined to /admin/*, so a telemetry poll is always 403 and can only time out. Do not default a missing outbox.pending to 0: that printed "drained" while Neo4j was still behind. A 403 body is printed once so a pre-0.9.92 gateway is not mistaken for a missing key.
 drain_outbox() {
   local waited=0 pend warned=0
   while (( waited < BACKUP_DRAIN_MAX_SECONDS )); do
@@ -323,19 +202,7 @@ drain_outbox() {
   ylw "  ! outbox not fully drained after ${BACKUP_DRAIN_MAX_SECONDS}s — proceeding (restore self-heals on replay)"
 }
 
-# ── Dump primitives ──────────────────────────────────────────────────────────
-# C1 (fix round 1): NEITHER password is on the docker CLIENT's own argv.
-# `docker exec -e KEY=VALUE` (the PR's original "fix") is an argument to the
-# `docker` process running on the GATEWAY HOST — that IS argv, visible to
-# `ps aux` for the whole `docker exec` lifetime, regardless of what
-# cypher-shell/pg_dump themselves do with it once inside the container. Every
-# site below now uses `--env-file "$_NEO4J_ENV_FILE"` /
-# `--env-file "$_PG_ENV_FILE"` instead — a 600-mode file under the private
-# secrets dir `init_secrets_dir()` creates, read by the docker CLIENT itself,
-# never placed on its own command line. `-u`/NEO4J_USER stays on argv — a
-# username is not a secret. (Still true, unaffected by this fix: cypher-shell
-# itself takes no `-p`, reading NEO4J_PASSWORD from the CONTAINER's env,
-# which --env-file populates exactly like -e did.)
+# Passwords go through --env-file, not `docker exec -e`, which stays visible in ps on the gateway host for the whole dump. The username is not a secret and stays on argv.
 neo4j_count() {  # $1 = cypher count query → integer (or empty)
   $DOCKER exec --env-file "$_NEO4J_ENV_FILE" "$NEO4J_CONTAINER" \
     cypher-shell -u "$NEO4J_USER" --format plain "$1" 2>/dev/null | tail -n1
@@ -347,19 +214,7 @@ dump_postgres() {  # $1 = dest path
     && mv "$1.tmp" "$1" || { rm -f "$1.tmp"; return 1; }
 }
 
-# List a .pgdump archive's table-of-contents entry count via the CONTAINER's
-# pg_restore. This does NOT run pg_restore on the host: Postgres runs only in
-# $PG_CONTAINER, the host carries no postgres client tools, and the previous
-# form of this check (`command -v pg_restore` on the host) always failed —
-# silently falling through to a hardcoded 0 in every manifest this framework
-# has ever written (measured: a real set's manifest said 0, listing the same
-# dump inside the container reported 189). The archive lives on the HOST
-# filesystem (dump_postgres streams pg_dump's stdout out of the container to
-# a host path), so it is piped IN via stdin (`docker exec -i`) rather than
-# passed as a path pg_restore would have to find inside the container.
-# --list only parses the archive's header/TOC — it opens no database
-# connection and needs no credentials, so this needs no --env-file, unlike
-# every other Postgres call in this script.
+# Count TOC entries with the container's pg_restore. A host `command -v` always failed and every manifest recorded 0. The archive is on the host, so it is piped in; --list needs no credentials.
 pgdump_toc() {  # $1 = path to a .pgdump file → TOC entry count on stdout, or empty on failure
   $DOCKER exec -i "$PG_CONTAINER" pg_restore --list < "$1" 2>/dev/null | grep -cvE '^;|^$'
 }
@@ -450,25 +305,12 @@ do_verify() {
     echo "  i no logs artifact in this set (predates log capture, or disabled)"
   fi
 
-  # pg_restore --list runs via the CONTAINER, same as the manifest's own
-  # pg_toc_entries computation (pgdump_toc, above) — the host carries no
-  # postgres client tools, so a host-side `command -v pg_restore` check here
-  # always failed and this archive-readable check silently never ran on any
-  # of our own installs. Re-derive the count live and, when the manifest
-  # carries one (a manifest written before this fix has none — absence is
-  # unknown, never treated as a mismatch), cross-check it: a live count that
-  # disagrees with what was recorded at backup time is a real integrity
-  # signal now that both sides come from the same tool.
+  # Same container pg_restore as the manifest. A host check never found the tool, so this cross-check never ran. An absent manifest count is unknown, not a mismatch.
   local live_toc manifest_toc
   live_toc="$(pgdump_toc "$base.pgdump")"
   manifest_toc="$(json_get pg_toc_entries < "$manifest")"
   if [[ "$live_toc" =~ ^[0-9]+$ ]]; then
-    # A recorded "0" is not a genuinely observed zero-entry archive — it is
-    # the ONLY value the pre-fix host-side check could ever write (`command
-    # -v pg_restore` always failed on the host, so the `|| echo 0` branch
-    # always fired), so it means the same thing absence does: this manifest
-    # predates a working count. Treating it as a real recorded value would
-    # turn every backup set made before this fix into a false MISMATCH.
+    # A recorded 0 is the old host-side fallback, not a real empty archive. Treating it as observed would mismatch every set written before the container count.
     if [[ -n "$manifest_toc" && "$manifest_toc" != "0" ]]; then
       if [[ "$live_toc" == "$manifest_toc" ]]; then
         grn "  ✓ pgdump archive readable, TOC entries $live_toc (matches manifest)"
@@ -482,11 +324,7 @@ do_verify() {
     red "  ✗ pgdump archive unreadable (container pg_restore --list failed)"; fail=1
   fi
 
-  # 3. quiesce state — informational only, never fails verification (an
-  # unquiesced backup is a valid, restorable backup; restore.sh's own
-  # closing message already says a count mismatch "can be normal if the
-  # backup ran without full quiesce" — this makes that possibility visible
-  # up front instead of only after a confusing post-restore count).
+  # Informational only. An unquiesced backup is still restorable; the mismatch shows up here instead of only after restore.
   local quiesced quiesce_mode
   quiesced="$(json_get quiesced < "$manifest")"
   quiesce_mode="$(json_get quiesce_mode < "$manifest")"
@@ -534,18 +372,7 @@ do_backup() {
 
   # Manifest LAST — its presence marks the set complete (verify keys off it).
   local pg_sha neo_sha pg_toc
-  # ── The framework logs are the FOURTH artifact ─────────────────────────────
-  #
-  # A set used to be exactly the two stores, which meant a restored host came up
-  # with the corpus and NO operational history: the credential audit trail, the
-  # gateway audit trail, the dreaming metrics and the daily logs all live only in
-  # $LOG_DIR and were in no backup. The monitor reads that directory directly
-  # (its logs_reader), so a restored deployment showed a healthy corpus and could
-  # not surface a single warning — it had nothing to read.
-  #
-  # 2.4 MB against a 21 MB dump on a real install: the cost is not the reason
-  # this was ever left out. Opt out with BACKUP_INCLUDE_LOGS=0 for a deployment
-  # that does not want audit trails leaving the host.
+  # Logs are the fourth artifact. Without them a restored host has the corpus and nothing for the monitor to warn from. Opt out with BACKUP_INCLUDE_LOGS=0 when audit trails must not leave the host.
   logs_sha=""; logs_bytes=""
   if [[ "$BACKUP_INCLUDE_LOGS" == "1" && -d "$LOG_DIR" ]]; then
     if tar czf "$base.logs.tar.gz" -C "$(dirname "$LOG_DIR")" "$(basename "$LOG_DIR")" 2>/dev/null; then

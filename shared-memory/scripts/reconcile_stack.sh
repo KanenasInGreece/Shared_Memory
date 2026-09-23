@@ -1,8 +1,6 @@
 #!/usr/bin/env bash
 #
-# reconcile_stack.sh — show, and on your say-so close, the gap between the
-# image pins in postgres_neo4j_limits.yaml and the containers actually
-# running on this host.
+# reconcile_stack.sh — show the gap between the image pins in postgres_neo4j_limits.yaml and the containers on this host, and close it only when you say so.
 #
 #   bash shared-memory/scripts/reconcile_stack.sh              # table, then prompt if there is drift
 #   bash shared-memory/scripts/reconcile_stack.sh --dry-run    # table only, never prompts, changes nothing
@@ -10,36 +8,18 @@
 #
 # Env overrides: GATEWAY_URL, COMPOSE_FILE.
 #
-# WHY THIS SCRIPT EXISTS. update_framework.sh moves code, schema and skills
-# forward, but never the containers: a compose image pin moving (v0.9.55
-# repinned pgvector and neo4j) leaves a host running an updated gateway
-# against OLD store images until someone runs `docker compose ... pull &&
-# up -d` by hand. The operator ruled this stays a STANDALONE script the
-# operator runs when they choose, never a step the update path takes on its
-# own — a host may have other legacy problems to work through first, and
-# recreating a database container is not a step to take silently.
+# update_framework.sh never recreates containers, so a moved compose pin leaves old store images running until you run this standalone script on purpose.
 #
-# WHAT THIS NEVER DOES: edit shared-memory/.env, run a migration, or restart
-# the gateway. The gateway is a separate process that reconnects to
-# Postgres/Neo4j on its own once they come back — this script only prints
-# the /health line to check that happened.
+# It does not edit shared-memory/.env, run a migration, or restart the gateway. It only prints /health so you can see the gateway reconnect.
 #
-# Exit 0 when there is no drift (or after a reconcile that removed it all).
-# --dry-run exits 2 when drift is present, 0 when it is not, and runs
-# nothing else. A real (non-dry-run) run exits 1 if drift remains after
-# reconciling. A "floating" row (a pinned tag with no version in it — the
-# llama.cpp images today) never counts as drift: there is no pin to
-# reconcile it to.
+# Exit 0 when there is no drift, or after a reconcile that removed it. --dry-run exits 2 when drift is present and 0 when it is not. A real run exits 1 if drift remains. A floating tag, with no version in it, never counts as drift.
 
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
-# Same candidate order as every other loader in this project (apply.py's
-# _load_env(), uninstall_framework.sh, sync_skills.sh): shared-memory/.env,
-# falling back to the pre-0.6 repo-root path. Never a single hardcoded path,
-# never an imported parser.
+# shared-memory/.env first, then the pre-0.6 repo-root .env, matching the other loaders. One hardcoded path would miss a host still on the old file.
 _ENV_CANDIDATES=("$REPO_ROOT/shared-memory/.env" "$REPO_ROOT/.env")
 ENV_FILE="${_ENV_CANDIDATES[0]}"
 [[ -f "$ENV_FILE" ]] || ENV_FILE="${_ENV_CANDIDATES[1]}"
@@ -63,20 +43,12 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# Read one key from .env without sourcing it via the shared Python parser
-# (secure_env.read_env_value / read_env_key.py) — no bash quote-matching.
+# Read one key without sourcing .env. The shared parser does not do bash quote-matching.
 read_env() { python3 "$SCRIPT_DIR/read_env_key.py" "$ENV_FILE" "$1"; }
 
 [[ -f "$COMPOSE_FILE" ]] || die "compose file not found: $COMPOSE_FILE"
 
-# ── Read this host's own reality out of the SHIPPED yaml, never a copy ───────
-#
-# container_name: and image: are read per service rather than hardcoded here,
-# so a fork that renames a container still gets a correct table. Each helper
-# scopes its awk scan to one service's block (the "  <service>:" line until
-# the next line at that same 2-space indent), the same block-scoped grep
-# idiom uninstall_framework.sh's compose_down_and_verify() already uses for
-# container_name: — never a generic YAML parser.
+# Read container_name and image from the shipped yaml, so a renamed container still matches this host. The awk stays inside one service block, the same way uninstall_framework.sh finds container_name.
 _yaml_service_field() {
     local svc="$1" field="$2"
     awk -v svc="$svc" -v field="$field" '
@@ -118,12 +90,7 @@ _yaml_postgres_db() {
     ' "$COMPOSE_FILE"
 }
 
-# ── Effective replicas — the SAME nested-default chain preflight.sh already
-# computes ("EFFECTIVE replicas" section there), so this script's picture of
-# what is actually deployed matches what `docker compose up` actually does,
-# per-service override included. Duplicated rather than sourced: preflight.sh
-# is not a library, and the six variable names are fixed by the shipped yaml,
-# not something a generic parser would do more honestly.
+# Duplicate preflight's nested replica defaults so this table matches what `docker compose up` will start. preflight.sh is not a library to source.
 _cpu_reps="$(read_env CPU_ENCODER_REPLICAS)"; _cpu_reps="${_cpu_reps:-1}"
 _gpu_reps="$(read_env GPU_ENCODER_REPLICAS)"; _gpu_reps="${_gpu_reps:-0}"
 _emb_cpu="$(read_env EMBEDDER_CPU_REPLICAS)"; _emb_cpu="${_emb_cpu:-$_cpu_reps}"
@@ -133,13 +100,7 @@ _rer_gpu="$(read_env RERANKER_GPU_REPLICAS)"; _rer_gpu="${_rer_gpu:-$_gpu_reps}"
 
 _is_int() { [[ "$1" =~ ^[0-9]+$ ]]; }
 
-# Whether SERVICE is active on this host, given the .env's *_REPLICAS vars.
-# neo4j and postgres carry no `replicas:` key at all (deploy: is limits-only
-# for them) — no replicas key means always-on. A value that fails to
-# normalise to a plain integer is reported active with a warning rather than
-# silently skipped: compose itself will fail loudly on it at `up` time
-# (preflight.sh already checks this ahead of time), and this table must never
-# go quiet about a service it could not evaluate.
+# Postgres and neo4j have no replicas key, so they are always on. A non-integer count stays visible as active, because going quiet would hide a value compose will reject.
 _service_active() {
     local svc="$1" reps
     case "$svc" in
@@ -158,12 +119,7 @@ _service_active() {
     [[ "$reps" != "0" ]] && echo 1 || echo 0
 }
 
-# Tag off the last path component; "no digit anywhere in the tag" is what
-# distinguishes an exact pin (0.8.6-pg17, 5.26.30-community) from a floating
-# tag (server, server-vulkan — the llama.cpp images today, verified against
-# the shipped yaml). A floating tag can never be "in sync" — there is no
-# specific version to compare against — and can never be reconciled TO a pin
-# by this script, because there isn't one.
+# A tag with no digit is floating, like the llama.cpp images. There is no pin to compare or reconcile to.
 _image_tag() {
     local img="$1" path
     path="${img##*/}"
@@ -212,8 +168,7 @@ print_table() {
         printf '%-22s %-11s %-38s %-38s\n' "$svc" "$status" "$image" "$running"
     done
 
-    # ── pgvector extension row — only meaningful once the postgres container
-    # actually exists to ask.
+    # The extension row can be asked only once the postgres container exists.
     if [[ "$_PG_ACTIVE" == "1" ]]; then
         local pg_running_rc pg_ext_sql pg_ext_file pg_ext_img status
         docker inspect "$_PG_CNAME" >/dev/null 2>&1

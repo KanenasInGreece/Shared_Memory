@@ -117,13 +117,7 @@ class AsyncLineWriter:
         self._q: asyncio.Queue[str] = asyncio.Queue(maxsize=maxsize)
         self._task: asyncio.Task | None = None
         self.dropped = 0
-        # When the most recent drop happened. `dropped` alone answers "have we
-        # lost audit lines?" but not "is this still happening?" — and the count
-        # resets with the process, so a consumer cannot recover the timing by
-        # diffing polls (a restart makes the delta read as "never dropped").
-        # Stamped at the drop site for the same reason the insight census pairs
-        # its age with the row that produced it: an age derived somewhere other
-        # than where the event happened goes stale silently.
+        # A count that resets on restart cannot say whether drops are still happening. The timestamp is taken where the line is dropped.
         self.last_dropped_ts: str | None = None
 
     def _ensure_task(self) -> None:

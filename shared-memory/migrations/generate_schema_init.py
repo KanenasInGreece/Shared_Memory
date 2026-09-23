@@ -33,11 +33,8 @@ SCHEMA_FILE = MIGRATIONS_DIR / "schema_init.sql"
 
 
 def _load_env() -> None:
-    # The framework env is shared-memory/.env; the repo root is the FALLBACK.
-    # Same candidate order as apply.py — these two are always run back to back
-    # (apply, then regenerate), and reading different files made the second half
-    # of that pair die on `fe_sendauth: no password supplied` on an install that
-    # keeps credentials only where the documented setup puts them.
+    # shared-memory/.env, then the repo root — the same order as apply.py.
+    # A different file made regeneration fail with no password supplied.
     candidates = [MIGRATIONS_DIR.parent / ".env", MIGRATIONS_DIR.parent.parent / ".env"]
     env_path = next((p for p in candidates if p.exists()), None)
     if env_path is None:
@@ -49,9 +46,8 @@ def _load_env() -> None:
         key, _, val = line.partition("=")
         key = key.strip()
         if not key:
-            # A pasted banner line ("=== ... ===") has no key, and
-            # os.environ.setdefault("", ...) raises OSError [Errno 22].
-            # Skip it, exactly as secure_env.py's loader does.
+            # A banner line ("=== ... ===") has no key; setdefault("", ...)
+            # raises OSError. Skip it, as secure_env.py does.
             continue
         os.environ.setdefault(key, val.strip())
 
@@ -302,8 +298,7 @@ def render_functions(cur) -> list[str]:
         "-- these, and the whole file is a single transaction.",
         "",
     ]
-    # pg_get_functiondef already emits CREATE OR REPLACE, so this is
-    # re-runnable without a guard.
+    # pg_get_functiondef already emits CREATE OR REPLACE, so no guard is needed.
     out.extend(f"{fn};\n" for fn in functions)
     return out
 
@@ -374,20 +369,14 @@ def render_column(cur, table: str, col: dict, pk_cols: set[str]) -> str:
     ctype = col_type(cur, table, col)
     default = col["column_default"] or ""
 
-    # Collapse SERIAL/BIGSERIAL back from the sequence default.
+    # information_schema expands SERIAL to a nextval default; collapse it back.
     if "nextval" in default:
         ctype = "BIGSERIAL" if ctype == "BIGINT" else "SERIAL"
         default = ""
 
-    # ⚠ AN IDENTITY COLUMN HAS NO `column_default` — it is generated, not
-    # defaulted, and information_schema reports it in two separate columns. A
-    # renderer that reads only the default emits a bare `BIGINT PRIMARY KEY`,
-    # which is valid DDL, applies without error, and leaves a fresh install
-    # unable to INSERT a single row: every write must then supply the key it was
-    # the database's job to issue. That is the THIRD class of DDL this generator
-    # has been found dropping — after every CHECK and every FOREIGN KEY — and
-    # all three shared one shape: invisible to the whole suite, because the only
-    # thing that reads this file is an install nobody re-inspects.
+    # Identity is not column_default; information_schema reports it separately.
+    # A bare BIGINT PRIMARY KEY leaves a fresh install unable to INSERT without
+    # supplying the key. Same class of drop as CHECK and FOREIGN KEY.
     identity = ""
     if col.get("is_identity") == "YES":
         identity = f"GENERATED {col.get('identity_generation') or 'BY DEFAULT'} AS IDENTITY"
@@ -416,7 +405,7 @@ def render_table(cur, table: str) -> str:
 def render_indexes(cur, table: str) -> list[str]:
     out = []
     for idx in fetch_indexes(cur, table):
-        if idx["name"] == f"{table}_pkey":   # PK index is implied by the column def
+        if idx["name"] == f"{table}_pkey":   # implied by the PRIMARY KEY column
             continue
         defn = idx["def"]
         defn = defn.replace("CREATE UNIQUE INDEX ", "CREATE UNIQUE INDEX IF NOT EXISTS ")
@@ -463,10 +452,9 @@ def generate(conn) -> str:
         for ext in exts:
             sections.append(f"CREATE EXTENSION IF NOT EXISTS {ext};\n")
 
-    # ⛔ SECTION ORDER IS LOAD-BEARING: functions → tables+indexes → foreign
-    # keys → triggers. A function must exist before an index whose expression
-    # calls it; a trigger must come after the table it is on. See
-    # render_functions() for the fresh-install failure the old order produced.
+    # Order is load-bearing: functions, then tables and indexes, then foreign
+    # keys, then triggers. An index expression may call a function; a trigger
+    # must follow its table. See render_functions().
     sections.extend(render_functions(cur))
 
     for table in fetch_tables(cur):
@@ -490,7 +478,6 @@ def main() -> None:
     dry_run = "--dry-run" in sys.argv
     maint_dsn, scratch_dsn, scratch_name = _dsns()
 
-    # 1. Create a clean scratch database.
     maint = psycopg2.connect(maint_dsn)
     maint.autocommit = True
     try:
@@ -501,7 +488,6 @@ def main() -> None:
         maint.close()
 
     try:
-        # 2. Apply the migration chain, then introspect.
         scratch = psycopg2.connect(scratch_dsn)
         try:
             _apply_migrations(scratch)
@@ -509,7 +495,6 @@ def main() -> None:
         finally:
             scratch.close()
     finally:
-        # 3. Always drop the scratch database.
         maint = psycopg2.connect(maint_dsn)
         maint.autocommit = True
         try:

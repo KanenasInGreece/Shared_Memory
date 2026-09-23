@@ -15,7 +15,6 @@ class DiagnosticProxy(http.server.SimpleHTTPRequestHandler):
         post_data = self.rfile.read(content_length)
         print(f"Body: {post_data.decode('utf-8', errors='ignore')[:200]}...")
 
-        # Determine target
         if "/embeddings" in self.path:
             target = "http://localhost:8070" + self.path
         else:

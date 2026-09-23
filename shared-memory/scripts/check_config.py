@@ -14,13 +14,7 @@ from framework_defaults import FRAMEWORK_DEFAULTS  # noqa: E402
 import secure_env  # noqa: E402
 from log_hygiene import scrub_url_credentials  # noqa: E402
 
-# Env-overridable settings Phase A can meaningfully render a
-# declared/present-but-empty/inherited verdict for — i.e. an actual
-# os.environ-reading site exists for each. Every one of these rows carries
-# its OWN "idiom" field in framework_defaults.py now (fold-round item 4;
-# PROXY_BIND's idiom lives there too, even though its "kind" stays
-# documented-only — no W1 code change at that site — precisely so this
-# script never needs a second, hand-written idiom table of its own).
+# Only names with a real os.environ read. Each row's idiom lives in framework_defaults so this file does not keep a second table.
 ENV_ROW_ORDER = (
     "EMBEDDER_URL",
     "RERANKER_URL",
@@ -39,15 +33,7 @@ ENV_ROW_ORDER = (
 
 _SAFE_TO_SHOW_MESSAGE = (ImportError, ModuleNotFoundError)
 _PHASE_A_EXCEPTION_HINT = "inspect shared-memory/.env for a malformed or unreadable line"
-# H3 (HYG round S2): names the measured-common cause alongside the two that
-# were already here -- a malformed EMBEDDER_URL/RERANKER_URL (not a valid
-# http:// or https:// URL) fails coordinator._encoder_url()'s own
-# import-time validation, and hive_mind_proxy.py imports coordinator before
-# anything else, so THAT failure is what most often lands here. Worded to
-# avoid two exact substrings other tests pin as ABSENT from this hint:
-# "has no attribute" (AttributeError's own message) and "must be an http(s)
-# URL" (_encoder_url's own message) -- see tests/test_check_config.py near
-# :208 and :227.
+# A bad encoder URL is the usual import crash, because the proxy imports the coordinator first. This hint must not repeat that validator's own wording.
 _PHASE_B_EXCEPTION_HINT = ("inspect LLM_BACKENDS_JSON, or EMBEDDER_URL/RERANKER_URL (each must "
                            "be a valid http:// or https:// URL -- a malformed one fails "
                            "coordinator's own import-time validation), or run with the daemon's "
@@ -282,28 +268,14 @@ def phase_b_render() -> "tuple[list[str], int]":
     lines.append("")
     lines.append("== Phase B — backends ==")
 
-    # QA Q2 (fold round, the substantive finding): a PARSE-ERROR
-    # LLM_BACKENDS_JSON ('{not json', or valid JSON that is simply not a
-    # list) is caught INSIDE hive_mind_proxy._load_llm_backends() and
-    # silently replaced by the legacy LLM_BACKENDS/LLM_DEFAULT_TARGET
-    # fallback — import succeeds, the guard functions below pass, and
-    # without this line the report would look like a clean, intended
-    # single-backend roster. Ruled: exit code stays 0 (the gateway DOES
-    # boot) — this is a prominent WARNING line, never a second meaning for
-    # exit 1.
+    # A bad LLM_BACKENDS_JSON is swallowed into the legacy fallback, so import still succeeds. Exit stays 0; this line is the warning, not a second meaning for exit 1.
     fallback_reason = getattr(proxy, "LLM_POOL_FALLBACK_REASON", None)
     if fallback_reason:
         lines.append("⚠ DECLARED FLEET NOT USABLE — the gateway would boot on the "
                      "legacy fallback: " + scrub_url_credentials(str(fallback_reason)))
         lines.append("")
 
-    # W3 build item (Backend_Declaration_Spec_2026-08-30 §4 / R-A): the OTHER
-    # half of D1's pair, rendered as its own flagged line so the instrument
-    # migrate_env.py itself leans on (the non-interactive report line's
-    # "see GET /health" pointer) shows the same state here too. Mutually
-    # exclusive with LLM_POOL_FALLBACK_REASON by construction (D1) — nothing
-    # was declared at all here, vs. a declared fleet that got excluded above
-    # — so this never doubles up with the warning block just printed.
+    # Nothing was declared, as opposed to a declared fleet that was excluded above. The two warnings are mutually exclusive.
     config_empty = getattr(proxy, "LLM_POOL_CONFIG_EMPTY", False)
     if config_empty:
         # Remedy honesty (§6.5): migrate_env.py's same-generation gate means
@@ -351,15 +323,7 @@ def phase_b_render() -> "tuple[list[str], int]":
                 "    ⚠ R-B (W4): role-less traffic no longer reaches this backend — "
                 "add \"private_ok\": true to opt back in."
             )
-        # M-5' announce (QA HIGH-1, fix round): mirrors
-        # require_valid_llm_routing_config()'s own predicate exactly — a
-        # credentialed backend with NEITHER `roles` NOR an explicit
-        # `private_ok` is configured but will NEVER be selected under
-        # default-deny. The gateway boots (a WARNING, never a refusal) —
-        # this is the per-entry rendering the brief named as the SECOND
-        # of the two instruments for this check, alongside the startup
-        # log line. SEC M-1: the credential is still probed on every
-        # /health cycle even though the backend can serve nothing.
+        # Credentialed, and neither roles nor an explicit private_ok: default-deny never selects it, but the key is still sent on every health probe. A warning, not a refusal.
         if has_credential and roles is None and not explicit:
             any_degraded_warnings = True
             lines.append(
@@ -369,15 +333,7 @@ def phase_b_render() -> "tuple[list[str], int]":
                 "nothing (SEC M-1) — remove the entry if you did not mean to "
                 "attach the key."
             )
-        # P-5' announce (QA HIGH-1 / SEC H-1, fix round): mirrors
-        # require_valid_llm_routing_config()'s own narrowed predicate — auth
-        # is OFF (AGENT_TOKENS unset) and this entry's private_ok was
-        # EXPLICITLY set false. SEC H-1: "safe by construction" is true only
-        # for the roles-ABSENT subset (no roles + private_ok=false really
-        # does serve nothing); a `roles`-carrying entry in this state still
-        # serves every caller those roles — auth off means the gateway
-        # cannot tell callers apart — so this is said honestly, not
-        # papered over as a blanket safety claim.
+        # Auth is off and private_ok was set false. That serves nothing only when roles are also absent; with roles, every caller of those roles is still served.
         if not proxy.AUTH_CONFIGURED_AT_STARTUP and explicit and not private_ok:
             any_degraded_warnings = True
             if roles:

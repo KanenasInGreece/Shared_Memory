@@ -65,9 +65,7 @@ from project_alias import ALIAS_RESOLVE_SQL, ACTIVE_ALIASES_SQL
 from secure_env import get_secret
 from framework_defaults import FRAMEWORK_DEFAULTS
 from telemetry_instruments import LatencyRing, Counter, safe
-# THE CONTRACT DECIDES WHAT /memory/telemetry SERVES: a key whose `removed_in`
-# this release has reached comes off the response in handle_telemetry. A leaf
-# module — its only import is `__future__.annotations`.
+# A key whose removed_in this release has reached is stripped in handle_telemetry. Leaf module: its only import is annotations, so it cannot cycle back here.
 from telemetry_contract import TELEMETRY as TELEMETRY_CONTRACT, strip_dropped
 
 log = logging.getLogger("coordinator")
@@ -75,9 +73,7 @@ log = logging.getLogger("coordinator")
 try:
     from gpu_load import inference_busy_state, probe_status
 except Exception as _gpu_exc:  # pragma: no cover - import-time safety only
-    # The busy signal is observability, never load-bearing: if gpu_load can't be
-    # imported the gateway must still serve. Fall back to "unknown" so the monitor
-    # never renders a false "idle" (it cannot tell, and says so).
+    # Observability only: a missing gpu_load must not stop the gateway, and "unknown" is not a false idle.
     log.warning("gpu_load.inference_busy_state unavailable (%s) — "
                 "inference_busy will report 'unknown'", _gpu_exc)
 
@@ -129,21 +125,12 @@ def _short(value: Any, cap: int = 200) -> str:
     return text[:cap] + "…[truncated]"
 
 
-# ── Version contract ────────────────────────────────────────────────────────────
-# FRAMEWORK_VERSION is the informational build/semver — it changes every release.
-# API_VERSION is the wire contract between memory_bridge.py (the thin client that
-# ships with the skill) and this coordinator. Bump it ONLY when the request or
-# response shape, auth scheme, or routes change in a way that breaks older clients.
-# Client and server build-versions are allowed to drift; their API_VERSION must agree.
+# FRAMEWORK_VERSION is the build string and may drift. API_VERSION is the wire contract with memory_bridge.py; bump it only when shape, auth, or routes break older clients.
 FRAMEWORK_VERSION = "0.9.112"
 # API v2: retrospective is a full record. v4: unregistered project is 400 (proposal / new_project / sentinel).
 API_VERSION = 4
 CLIENT_VERSION_HEADER = "X-SM-Api-Version"
-#: The client's own FRAMEWORK VERSION (e.g. "0.9.74"), distinct from the wire
-#: API_VERSION above: two clients can speak api_version 4 while one of them is
-#: forty releases behind on behaviour, and only this header can tell them apart.
-#: Advertised by memory_bridge.py (both copies) and mcp/vector-skill.py from
-#: 0.9.74; a pre-0.9.74 client sends nothing and is simply not counted.
+#: Client build, not API_VERSION. The same wire version can hide an older build, and a client that omits the header is not counted.
 CLIENT_BUILD_HEADER = "X-Shared-Memory-Client"
 
 # A record id is unique only inside its table; qualify as fact:N / summary:N (bare ints still mean technical_docs) (decision:882).
@@ -355,20 +342,10 @@ def _lookup_agent_by_token(token: str) -> "str | None":
     return None
 
 
-# ── Read-only roles (e.g. the telemetry monitor) ────────────────────────────────
-#
-# Routes a "read" role may reach. Everything else — saves, retrospectives,
-# graph, and the LLM/embeddings proxy passthrough — returns 403 for a read
-# token. /health is unauthenticated for everyone (see _UNPROTECTED_PATHS).
-# /memory/graph is excluded: full and admin roles keep the route, while a
-# read token gets 403 (S1 confine route).
+# A read role may reach only this set. Saves, graph, and the LLM proxy are 403; /memory/graph stays off so a read token cannot traverse it (S1).
 _READ_ROLE_ROUTES: set[tuple[str, str]] = {
     ("GET",  "/memory/telemetry"),
-    # Search is a READ — this file's own quiesce classification already says so
-    # ("Reads (search/telemetry/status) and /health always flow"). Admitting
-    # search lets read-only clients query knowledge safely without granting
-    # arbitrary graph traversal or query execution (/memory/graph is confined
-    # to full and admin roles; S1).
+    # Search is a read: a monitor can query knowledge without /memory/graph, which stays full or admin (S1).
     ("POST", "/memory/search"),
 }
 
@@ -381,22 +358,13 @@ _WRITE_ROUTES: set[tuple[str, str]] = {
     ("POST", "/memory/review_hold"),
 }
 
-# Admin-only routes — reachable ONLY by an "admin"-role token, which in turn can
-# reach nothing else (least privilege: a leaked backup token can only pause/resume
-# backups and read the outbox census). Backup quiesce/resume is the first such
-# route. The second is the outbox census the backup drain gate needs (v0.9.92,
-# fact:2022): the admin token is confined to /admin/*, so a drain gate that
-# polled /memory/telemetry was 403'd on every poll and could only ever time
-# out — this route is read-only and lets that gate actually read live.
+# An admin token reaches only these routes, so a leaked backup token cannot save. fact:2022: polling /memory/telemetry was 403, so this census is the read the drain gate can finish.
 _ADMIN_ROUTES: set[tuple[str, str]] = {
     ("POST", "/admin/backup"),
     ("GET", "/admin/outbox"),
 }
 
-# When set, write routes require a kernel-attested principal — i.e. the client must
-# connect over the AF_UNIX listener (SO_PEERCRED), not TCP. OFF by default so the TCP
-# path keeps working during rollout; turn ON once every writer is on the UDS to
-# guarantee every stored fact carries a non-repudiable person identity.
+# When set, writes require an AF_UNIX SO_PEERCRED principal. Off by default so TCP writers still work until every writer is on the socket.
 GATEWAY_REQUIRE_PRINCIPAL = os.environ.get(
     "GATEWAY_REQUIRE_PRINCIPAL", ""
 ).strip().lower() in ("1", "true", "yes", "on")
@@ -436,9 +404,7 @@ def _load_agent_roles() -> dict[str, str]:
 _AGENT_ROLES: dict[str, str] = _load_agent_roles()
 
 
-# Mirrors aiohttp's own DynamicResource pattern for a `{name}` path segment
-# (`web_urldispatcher.DynamicResource.GOOD = "[^{}/]+"`) so this check only ever
-# grants what the registered `/memory/status/{pg_id}` route can actually match.
+# One path segment, the same shape aiohttp's DynamicResource grants, so this matches only /memory/status/{pg_id}.
 _MEMORY_STATUS_RE = re.compile(r"/memory/status/[^{}/]+")
 
 
@@ -602,10 +568,7 @@ def _supersession_target_error(pg_id: int, record_type: object) -> str | None:
     return None
 
 
-# entities_provenance (fact:1215): who named each entity — "operator" (an
-# explicit, human-chosen concept) or "agent" (proposed without that
-# confirmation). Closed enum; a value outside it is a shape error, not a new
-# spelling to accommodate.
+# fact:1215: entities_provenance is who named each entity, operator or agent. Anything else is a shape error, not a new spelling.
 ENTITIES_PROVENANCE_VALUES = ("operator", "agent")
 
 # Only facts carry entities; judgements inherit topics from grounded facts. Ask via is_judgement_type(), never a raw-string tuple (decision:1664, fact:970).
@@ -744,10 +707,7 @@ ENTITY_RESERVED_PROJECT_SQL = (
     " WHERE pa.active AND axis_normalize(a.name) = ANY($1::text[])"
 )
 
-# Axis keys reserved against entity names that no `projects` row can carry.
-# `general_discussion` is the parked-record sentinel: it is a legitimate value on
-# the PROJECT axis and is excluded from the registry by a CHECK constraint, so a
-# registry query can never answer for it.
+# general_discussion is a project-axis sentinel the projects CHECK excludes, so the registry query cannot reserve that name.
 RESERVED_ENTITY_AXIS_KEYS: dict[str, str] = {
     axis_key(SENTINEL): SENTINEL,
 }
@@ -845,13 +805,9 @@ _gateway_client_disconnects_total = 0
 _gateway_by_status: dict[str, int] = {
     "2xx": 0, "4xx": 0, "5xx": 0, "401": 0, "403": 0, "409": 0, "503": 0,
 }
-#: {client VERSION string: requests seen}. Fed by the X-Shared-Memory-Client
-#: header both front doors send from 0.9.74; a pre-0.9.74 client sends none and
-#: is simply not counted — an absent client is not a version, and inventing
-#: "unknown" as a bucket would put every old client into one made-up release.
+#: Requests per client build. A missing header is not a version; do not invent an "unknown" bucket for old clients.
 _client_versions_seen: dict[str, int] = {}
-#: How many DISTINCT client versions may be tracked. A header is caller-supplied
-#: text, so the map is a caller-controlled allocation without a bound.
+#: Cap on distinct client builds. The header is caller-supplied, so the map is unbounded without this.
 CLIENT_VERSIONS_MAX = int(os.environ.get("CLIENT_VERSIONS_MAX", "64"))
 
 
@@ -939,12 +895,7 @@ class _TimedAcquire:
         try:
             conn = await self._ctx.__aenter__()
         except asyncio.CancelledError:
-            # ⛔ CANCELLATION IS NOT A POOL FAILURE. A task cancelled while
-            # waiting — shutdown, a client disconnect, an outer timeout — says
-            # nothing about whether the pool could have served it. Counting it
-            # would make an orderly gateway restart look like a burst of
-            # database errors, which is exactly the false alarm this counter
-            # exists to avoid raising.
+            # Cancellation is not a pool failure: shutdown or disconnect says nothing about the pool, and counting it would look like a database outage.
             raise
         except BaseException:
             self._ring.record_error()
@@ -962,10 +913,7 @@ def _record_client_version(request: web.Request) -> None:
         raw = request.headers.get(CLIENT_BUILD_HEADER)
         if not raw:
             return
-        # Bounded and sanitised: this is caller-supplied text on an
-        # unauthenticated-reachable path, and it ends up in a JSON payload an
-        # operator reads. A version string is short and boring; anything else is
-        # not a version.
+        # Caller-supplied and copied into telemetry: keep only a short version-shaped string.
         v = raw.strip()[:32]
         if not v or not all(c.isalnum() or c in "._-+" for c in v):
             return
@@ -978,19 +926,11 @@ def _record_client_version(request: web.Request) -> None:
 # Backup quiesce sheds client writes (503 Retry-After); reads flow. Daemons take the advisory lock SHARED and skip if the gateway holds it EXCLUSIVE.
 _backup_quiesce: bool = False
 
-# Single well-known advisory-lock key shared by the gateway (exclusive) and the
-# REM/NREM daemons (shared). MUST match BACKUP_ADVISORY_LOCK_KEY in rem_loop.py and
-# consolidation_loop.py. Postgres drops session advisory locks on disconnect, so a
-# crashed gateway or daemon never wedges the others.
+# Shared with REM and NREM; the key must match both daemons. A disconnect drops the session lock, so a crash cannot wedge the others.
 BACKUP_ADVISORY_LOCK_KEY    = _env_int("BACKUP_ADVISORY_LOCK_KEY", 8765309)
-# Read-only mirror of rem_loop.REM_MAX_ATTEMPTS — the gateway never enforces the
-# cap, it only needs the threshold to report how many records REM has given up
-# on. MUST match the daemon's default.
+# Mirror of rem_loop.REM_MAX_ATTEMPTS for the give-up count. The gateway does not enforce it, so the default must match the daemon.
 REM_MAX_ATTEMPTS            = _env_int("REM_MAX_ATTEMPTS", 5)
-# Read-only mirror of rem_loop.REM_STARVED_THRESHOLD (decision 890, STEP 3) —
-# the gateway never runs the starved-drain itself, it only needs the threshold
-# to report how many pending records are AT the promotion point. MUST match
-# the daemon's default.
+# Mirror of rem_loop.REM_STARVED_THRESHOLD (decision 890). The gateway only reports how many pending rows are at the promotion point, so the default must match the daemon.
 REM_STARVED_THRESHOLD        = _env_int("REM_STARVED_THRESHOLD", 3)
 # Seconds the gateway waits for in-flight daemon cycles to release their shared lock
 # before reporting drain_timeout. Bounds the quiesce handshake.
@@ -1042,9 +982,7 @@ def _audit(agent: str, method: str, path: str, status: int,
             "latency_ms": round(latency_ms, 1),
             "request_id": request_id,
         }
-        # Person axis: the kernel-attested OS account + connection fingerprint. None
-        # on the TCP transport. Server-derived (SO_PEERCRED) — never a client claim,
-        # so the operator can neither forge nor repudiate it.
+        # Kernel SO_PEERCRED account and fingerprint. Absent on TCP, and never taken from the client.
         if principal:
             record["principal"]      = principal.get("user")
             record["connected_from"] = {
@@ -1067,9 +1005,7 @@ _llm_fault_counters: dict[str, dict] = {}
 _credential_counters: dict[str, int] = {
     "token_verify_failed": 0,
     "daemon_tokens_issued": 0,
-    # S-04 (PR A5): a request that would have carried a provider key but
-    # whose method+path is not one of the framework's own endpoints —
-    # see hive_mind_proxy.record_credentialed_route_denied.
+    # S-04: a provider key was offered on a path that is not a framework endpoint.
     "credentialed_route_denied": 0,
 }
 # Credential counters stamp last-moved at increment (no-token 401 is unlogged; a restart would invert a poll-delta).
@@ -1107,11 +1043,7 @@ def _classify_llm_fault(status: int, error_type: str | None) -> str:
     return "transient"
 
 
-# Security review (2026-08-15, R-2/R-4): the parse boundary is where both
-# bugs are fixed at once — refuse a chunk this large before touching
-# json.loads (removes a synchronous parse of an attacker-sized buffer from
-# the streaming hot path), and coerce+bound whatever the body claims its
-# error code/type is before it can reach telemetry or a log line.
+# Refuse a body this large before json.loads, and bound the claimed error code before it reaches telemetry or a log (R-2/R-4).
 _ERROR_BODY_PARSE_CAP = 65536       # bytes — R-2
 _ERROR_TYPE_LABEL_CAP  = 120         # chars — R-2/R-4, matches _short()'s spirit
 
@@ -1152,10 +1084,7 @@ def _parse_upstream_error_type(body: bytes) -> str | None:
 
 _DECOMPRESS_PREFIX_CAP = 8192  # bytes of DECOMPRESSED output — bounds a hostile expansion ratio too
 
-# Single source of truth for which Content-Encoding values either decompression
-# helper below understands. Referenced by hive_mind_proxy.py's usage-capture
-# gate too, so the two paths (fault-body peek, usage-body decompress) can never
-# drift apart on what "supported" means.
+# Encodings both decompress helpers accept. hive_mind_proxy's usage gate imports this so the two paths cannot drift.
 SUPPORTED_CONTENT_ENCODINGS = {"gzip", "deflate", "br"}
 
 
@@ -1195,13 +1124,7 @@ def _decompress_prefix_for_parse(body: bytes, content_encoding: str | None) -> b
     return body
 
 
-# Ceiling on the DECOMPRESSED output of `_decompress_full_for_usage` below —
-# the R-3 rationale on `_DECOMPRESS_PREFIX_CAP` above ("bounds a hostile
-# expansion ratio too") applies to this path's peer identically. Default is
-# 32× the compressed-side cap (2 MiB × 32 = 64 MiB): measured on real
-# LLM-shaped JSON, gzip compresses ~2.9:1, so a max-cap body decompresses to
-# ~6 MiB — this leaves >10× headroom over that while cutting the worst-case
-# amplification from the measured 1028:1 down to 32:1.
+# Decompressed-output cap for usage capture. Measured gzip is about 2.9:1, so 32× the 2 MiB compressed cap stays above real bodies and cuts the measured 1028:1 worst case.
 LLM_USAGE_DECOMPRESS_CAP_BYTES = int(os.environ.get(
     "LLM_USAGE_DECOMPRESS_CAP_BYTES", str(64 * 1024 * 1024)))
 
@@ -1230,8 +1153,7 @@ def _decompress_full_for_usage(body: bytes, content_encoding: str) -> bytes:
     if enc == "gzip":
         import io
         import zlib
-        # wbits=16+MAX_WBITS reads the gzip framing; decompressobj honours
-        # max_length so an over-cap body never allocates past cap+1.
+        # 16+MAX_WBITS is the gzip header. max_length stops an over-cap body past cap+1.
         out = zlib.decompressobj(16 + zlib.MAX_WBITS).decompress(body, cap + 1)
     elif enc == "deflate":
         import zlib
@@ -1253,12 +1175,7 @@ def _decompress_full_for_usage(body: bytes, content_encoding: str) -> bytes:
 CREDENTIAL_AUDIT_LOG_PATH = os.environ.get(
     "CREDENTIAL_AUDIT_LOG_PATH", "~/.shared-memory/logs/credential-audit.jsonl",
 )
-# ON by default (unlike GATEWAY_AUDIT_LOG_PATH — see the "Config" section
-# further below in this file) — credential-use auditing is a baseline
-# control, not an opt-in diagnostic. Set the env var to an empty string to
-# disable it explicitly. Rotation is already handled — the shipped
-# logrotate config globs *-audit.jsonl, which this filename matches (see
-# shared-memory/ops/README.md and shared-memory/.env.example).
+# On unless the env is empty, unlike GATEWAY_AUDIT_LOG_PATH. The filename matches the shipped *-audit.jsonl logrotate glob.
 _credential_audit_writer = (
     AsyncLineWriter(os.path.expanduser(CREDENTIAL_AUDIT_LOG_PATH))
     if CREDENTIAL_AUDIT_LOG_PATH.strip() else None
@@ -1294,13 +1211,7 @@ def _write_credential_audit_line(event: str, *, origin: str, **fields) -> None:
         log.warning("credential-audit write failed: %s", exc)
 
 
-# Token-bucket rate limit for token_verify_failed LOG LINES (security review
-# C-1): an unauthenticated caller controls this event's volume entirely — a
-# no-token 401 in a loop, or a fresh random token every attempt — so the
-# counter (credentials.token_verify_failed, unthrottled, the complete signal)
-# and the LOG LINE (throttled, the detail) are deliberately decoupled.
-# Continuous refill: capacity TOKEN_VERIFY_FAILED_LOG_RATE tokens,
-# replenished evenly over TOKEN_VERIFY_FAILED_LOG_WINDOW seconds.
+# Throttle token_verify_failed log lines only (C-1). The caller controls the volume, so the counter stays complete and the log is a separate bucket refilled over the window.
 TOKEN_VERIFY_FAILED_LOG_RATE   = _env_int("TOKEN_VERIFY_FAILED_LOG_RATE", 60)     # burst / lines per window
 TOKEN_VERIFY_FAILED_LOG_WINDOW = _env_float("TOKEN_VERIFY_FAILED_LOG_WINDOW", 60.0)  # seconds
 
@@ -1370,11 +1281,7 @@ def _record_token_verify_failed(request: web.Request, presented_token: str | Non
     global _tvf_suppressed_count, _tvf_suppressed_since
     _credential_counters["token_verify_failed"] += 1
     _token_verify_failure_ring.append(time.monotonic())
-    # Stamped before the C-1 early return, so the no-token class — the one
-    # that never produces a log line — still carries a "when". This is the
-    # single piece of information the byte-identical line would have added,
-    # and it costs no disk write, so it does not re-open C-1's amplification
-    # argument.
+    # Stamp last-moved before the C-1 early return so an unlogged no-token 401 still has a time, without a disk write.
     _credential_last_ts["token_verify_failed"] = datetime.now(timezone.utc).isoformat()
     if presented_token is None:
         return
@@ -1410,11 +1317,7 @@ def _record_token_verify_failed(request: web.Request, presented_token: str | Non
     _write_credential_audit_line("token_verify_failed", origin="gateway", **fields)
 
 
-# F (S4, ADV1-16): a SEPARATE token bucket for verify failures observed on
-# an UNPROTECTED path (/health, /pool/status). Same shape and rate as
-# _tvf_bucket_* above, but kept as independent state — a caller flooding
-# /health with a bad bearer must not be able to exhaust the budget the
-# protected-path forensic lines above depend on (bucket isolation).
+# Separate bucket for verify failures on /health and /pool/status, so a flood there cannot exhaust the protected-path log budget.
 _tvf_unprotected_bucket_tokens: float = float(TOKEN_VERIFY_FAILED_LOG_RATE)
 _tvf_unprotected_bucket_last_refill: float = time.monotonic()
 _tvf_unprotected_suppressed_count: int = 0
@@ -1596,11 +1499,7 @@ def _credentials_snapshot() -> dict:
     that it happened at an unknown time — which is what makes the pair usable
     as an age (`now - last_ts`) instead of a poll-delta that inverts on
     restart."""
-    # Bound ONCE, not read twice off the global: the count and its timestamp
-    # must come from the same writer. Reading the global per entry lets a swap
-    # or a disable land between them and produce a non-zero count beside a null
-    # stamp — the exact pair-disagreement this section exists to rule out.
-    # (Code-quality review I1.)
+    # Read the writer once. A swap between two reads can pair a non-zero drop count with a null stamp (I1).
     writer = _credential_audit_writer
     return {
         "token_verify_failed": _credential_counters["token_verify_failed"],
@@ -1653,21 +1552,12 @@ async def auth_middleware(request: web.Request, handler):
 
     # Load-shed is the first gate (ahead of auth-off and unprotected exemptions) so anonymous /health floods still count.
     if GATEWAY_INFLIGHT_MAX and _inflight >= GATEWAY_INFLIGHT_MAX:
-        # Counted HERE, not in the `finally` below: a shed request is never
-        # admitted, so it never reaches the audit line and would otherwise be
-        # the one 503 the gateway serves that nothing can see. `gateway.shed_
-        # 503_total` is the number; /health raises the warning off it.
+        # Counted here: a shed request never reaches the audit line, so this is the only 503 /health can see.
         try:
             _gateway_shed_503_total += 1
         except Exception:
             pass
-        # D2 (OBS round): a shed request is never admitted, so it never
-        # reaches the deep `finally` below either — this is the ONLY place
-        # it can be counted into gateway.requests_total/by_status.503 at
-        # all. No latency ring entry (R-C): this exit never takes
-        # `started`, and `by_status.503` from here is now only
-        # `>= shed_503_total`, not equal-by-construction on the shed class
-        # alone (see MEANING_CHANGES).
+        # Only place a shed 503 enters requests_total. Pass None: this exit never takes started, so it stays out of the latency ring (R-C).
         _record_gateway_request(503, None)
         raise web.HTTPServiceUnavailable(
             reason="gateway at capacity", headers={"Retry-After": "1"},
@@ -1677,9 +1567,7 @@ async def auth_middleware(request: web.Request, handler):
 
     _inflight += 1
     try:
-        # Gate on the STARTUP truth (finding 1), not on whether _AGENT_TOKENS
-        # happens to be non-empty right now -- see AUTH_CONFIGURED_AT_STARTUP's
-        # docstring above for why the two diverge after a daemon token is minted.
+        # Use the boot snapshot. A later daemon mint fills _AGENT_TOKENS and would flip an auth-off install.
         if not AUTH_CONFIGURED_AT_STARTUP:
             _status = 500
             try:
@@ -1709,47 +1597,26 @@ async def auth_middleware(request: web.Request, handler):
 
         agent_name = resolve_identity(request)
         if not agent_name:
-            # RFC 6750 §3: a token was PRESENTED but rejected gets
-            # error="invalid_token"; no token at all gets the bare challenge —
-            # and only the former has a digest worth logging (PR A3). This is
-            # the gateway's OWN 401 (its own door), never an upstream one.
+            # RFC 6750: a presented-but-rejected token gets error=invalid_token and a digest; no token gets the bare challenge. This 401 is the gateway's, not upstream.
             presented = _extract_bearer_token(request)
             _record_token_verify_failed(request, presented)
             www_authenticate = 'Bearer error="invalid_token"' if presented else "Bearer"
-            # D2 (OBS round): the gateway's own 401 used to be invisible to
-            # gateway.requests_total/by_status — only the D1 ring and
-            # credentials.token_verify_failed saw it. No latency ring entry
-            # (R-C): this exit never takes `started`.
+            # Count the gateway's own 401. Pass None: this exit never takes started (R-C).
             _record_gateway_request(401, None)
             raise web.HTTPUnauthorized(
                 reason="Authorization: a valid Bearer token is required",
-                # X-SM-Fault-Origin alongside the RFC 6750 challenge (security
-                # review O-5): the header is otherwise set only on the three
-                # LLM-path gateway errors, so a client distinguished a gateway-
-                # origin 401 from an upstream one only by the header's ABSENCE —
-                # and absence is exactly what a stripping intermediary produces.
+                # Presence, not absence, marks a gateway 401. A stripping proxy would otherwise make it look upstream (O-5).
                 headers={"WWW-Authenticate": www_authenticate, "X-SM-Fault-Origin": "gateway"},
                 **_error_body("Authorization: a valid Bearer token is required."),
             )
         request["authenticated_agent"] = agent_name
-        # Person axis: stamp the kernel-attested principal (OS account + connection
-        # fingerprint) from SO_PEERCRED. None on the TCP transport — never inferred from
-        # the agent. Every handler and the audit hook read it from here, spoof-proof.
+        # Handlers read the kernel principal from here. None on TCP, and never inferred from the agent name.
         principal = _peer_identity(request)
         request["principal"] = principal
-        # Role + governance gate. Read-only roles are confined to telemetry/search
-        # (graph stays 403 — do not add /memory/graph to _READ_ROLE_ROUTES); admin-role tokens are confined to /admin/* (and no other role may
-        # reach an admin route); and while a backup quiesce is active the write routes
-        # shed 503 + Retry-After so the dump sees a quiet DB. Reads always flow — so a
-        # leaked monitor token cannot save/supersede/proxy, and a leaked backup token
-        # can only pause/resume backups.
+        # Read stays off /memory/graph; admin stays on /admin/*; quiesce sheds writes so the dump sees a quiet database. Reads still flow.
         role  = effective_role(agent_name, _AGENT_ROLES.get(agent_name))
         route = (request.method, request.path.rstrip("/") or "/")
-        # D2 (OBS round): every HTTPException `auth_middleware` raises itself
-        # (this one and the four below) used to be invisible to
-        # gateway.requests_total/by_status — only the deep `finally` at the
-        # bottom of this function ever recorded anything. No latency ring
-        # entry on any of them (R-C): none of these exits take `started`.
+        # Each refusal below is counted here. Pass None: these exits never take started, so they stay out of the latency ring (R-C).
         if role == "read" and not _read_role_permits(request):
             _record_gateway_request(403, None)
             raise web.HTTPForbidden(
@@ -1777,8 +1644,7 @@ async def auth_middleware(request: web.Request, handler):
                                   "for this route."),
                 )
             if _backup_quiesce and route in _WRITE_ROUTES:
-                # Also feeds gateway.by_status.503 alongside the shed valve
-                # and pool-saturated — see MEANING_CHANGES.
+                # This 503 is quiesce, not the shed valve. by_status.503 counts both (MEANING_CHANGES).
                 _record_gateway_request(503, None)
                 raise web.HTTPServiceUnavailable(
                     reason="backup in progress — writes are briefly paused",
@@ -1801,10 +1667,7 @@ async def auth_middleware(request: web.Request, handler):
         started    = asyncio.get_running_loop().time()
         request_id = uuid.uuid4().hex[:12]
         status     = 500
-        # Stashed so a downstream handler (hive_mind_proxy.handle_proxy) can
-        # correlate its own gateway_fault/upstream_credential_fault credential-
-        # audit lines with this same request (PR A3) — mirrors request["principal"]
-        # above.
+        # The proxy correlates credential-audit lines to this request (PR A3).
         request["request_id"] = request_id
         try:
             resp = await handler(request)
@@ -1828,10 +1691,7 @@ async def auth_middleware(request: web.Request, handler):
                    request_id, request.get("principal"),
                    backend=request.get("backend"),
                    key_attached=bool(request.get("key_attached")))
-            # The same numbers the audit line just wrote, aggregated in memory
-            # so a consumer does not have to parse the JSONL to get a p95.
-            # Deliberately AFTER _audit: the durable record is written first,
-            # and this call cannot raise (see _record_gateway_request).
+            # After the durable audit line. This call cannot raise, so it cannot skip the write.
             _record_gateway_request(status, latency_ms)
     finally:
         _inflight -= 1
@@ -1845,9 +1705,7 @@ PG_DSN   = get_secret(
 NEO4J_URI  = "bolt://localhost:7687"
 NEO4J_AUTH = ("neo4j", get_secret("NEO4J_PASSWORD", ""))
 
-# Bound the Neo4j driver pool so a burst of concurrent searches (or daemon
-# traffic sharing this driver) cannot queue indefinitely. acquisition_timeout
-# fails fast instead of blocking forever when the pool is saturated.
+# Cap the shared driver so a search burst fails the acquire instead of queueing forever.
 NEO4J_MAX_POOL        = _env_int("NEO4J_MAX_POOL", 50)
 NEO4J_ACQUIRE_TIMEOUT = _env_float("NEO4J_ACQUIRE_TIMEOUT", 30.0)
 
@@ -1923,9 +1781,7 @@ def _encoder_url(env_name: str, default_base: str, path: str) -> str:
             f"{env_name} must be an http(s) URL, got {base!r} "
             f"(scheme {parsed.scheme!r}) — check {env_name} in shared-memory/.env"
         )
-    # Build the endpoint by setting the PATH component on the parsed base, not
-    # by f"{base}{path}" — a proxy prefix on the base ('/api') must be joined
-    # as a path, not concatenated as a string.
+    # Set the path on the parsed base. String-joining would glue a proxy prefix such as /api onto the wrong place.
     endpoint = urllib.parse.urlunsplit(
         (parsed.scheme, parsed.netloc, parsed.path + path, "", "")
     )
@@ -1980,69 +1836,32 @@ from dream_telemetry import (EMBED_CHARS_PER_TOKEN, EMBED_MAX_CHARS,  # noqa: E4
                              embed_ceiling, rerank_ceiling)
 
 
-# Read-contract graph expansion cap: how many edges surface per anchored record
-# in search results. Env-tunable. Ordering (in the expansion Cypher) puts
-# provenance-bearing edges (r.asserted_by set) and typed relations ahead of bare
-# MENTIONS, so the highest-signal context survives the cap — context without
-# relation properties is noise disguised as fact.
+# Edges shown per search hit. The Cypher orders asserted and typed relations ahead of bare MENTIONS so the cap keeps the signal.
 GRAPH_EXPANSION_LIMIT = _env_int("GRAPH_EXPANSION_LIMIT", 15)
 
 # Row cap on read-only Cypher queries submitted to /memory/graph. Rejects
 # oversized result sets with HTTP 400 before serialization.
 GRAPH_QUERY_ROW_CAP = _env_int("GRAPH_QUERY_ROW_CAP", 10000)
 
-# Tier-1 candidates fetched for the reranker when the caller asks for few. A
-# FLOOR, not a cap: the effective pool is max(this, the caller's limit), so a
-# request for 100 results retrieves 100 candidates rather than silently
-# collapsing to this number. Retrieve-then-rerank depends on the pool being
-# wider than the result set — the reranker can only reorder what it is handed.
+# Floor, not a cap: the pool is max(this, the caller's limit). A request for 100 must not collapse to this number, or the reranker has nothing extra to reorder.
 SEARCH_CANDIDATE_FLOOR = _env_int("SEARCH_CANDIDATE_FLOOR", 20)
 
-# Security review, PR 235: the `domains` search filter binds straight into a
-# jsonb `?|` operator with a caller-controlled array — an authenticated caller
-# sending thousands of entries per request is a DoS vector (unbounded work per
-# row scanned). Capped, not silently truncated: a search that silently dropped
-# entries past the cap would still return 200 with an incomplete filter, and an
-# empty result would then read as authoritative when it was really partial.
+# Cap the domains filter. A silent truncate would return 200 for a partial filter and an empty result would look authoritative (PR 235).
 SEARCH_DOMAINS_FILTER_CAP = _env_int("SEARCH_DOMAINS_FILTER_CAP", 16)
 
-# ⛔ RELATION_ASSERTED_INHERITED IS GONE (`decision:1736`). It stamped a COPY of
-# an edge some other record already had, so an inherited naming could be told
-# apart from a first-write one. Nothing writes such a copy any more — belonging
-# is derived on READ (`derived_belonging_cypher`) — so the stamp has no writer
-# and, with the inherit-mode outbox branch retired, no reader either. The
-# `'inherited'` edges already in the live graph are LEGACY DATA, retired by a
-# one-time ledgered operation, not by framework code.
+# decision:1736: RELATION_ASSERTED_INHERITED is gone. Belonging is derived on read, so nothing writes that copied edge; leftover inherited edges are legacy data, not framework code.
 
-# Pool sizing is a SYSTEM budget, not just a coordinator knob: Postgres
-# max_connections must cover this pool + REM (1 conn) + NREM (per-op) + the
-# LISTEN connection + headroom. POOL_ACQUIRE_TIMEOUT bounds how long a request
-# waits for a free connection — on expiry the request sheds (503 + Retry-After)
-# via auth_middleware instead of hanging the gateway under concurrent load.
+# Postgres max_connections must cover this pool plus REM, NREM, LISTEN, and headroom. POOL_ACQUIRE_TIMEOUT sheds 503 instead of hanging.
 POOL_MIN = _env_int("POOL_MIN", 2)
 POOL_MAX = _env_int("POOL_MAX", 20)
 POOL_ACQUIRE_TIMEOUT = _env_float("POOL_ACQUIRE_TIMEOUT", 5.0)
 
-# Bounded startup wait for Postgres (fact:1609): at boot the gateway can start
-# before Postgres is accepting connections yet, and the unguarded pool create
-# used to crash on the FIRST attempt -- Restart=on-failure then just replays
-# the same race every time. PG_STARTUP_WAIT_S bounds how long start() retries
-# a "not ready yet" connection failure before giving up and re-raising, so
-# systemd's Restart= stays the real backstop instead of masking a boot-order
-# problem as a crash loop.
+# fact:1609: at boot Postgres may not be accepting yet. An immediate pool create crashed, and Restart=on-failure replayed that race, so start() retries only until this wait.
 PG_STARTUP_WAIT_S  = _env_float("PG_STARTUP_WAIT_S", 60.0)
-# Clamped to a 0.1s floor: an operator-set 0 or negative value must not spin
-# the retry loop with no pacing at all (a busy-loop against a down DB) — see
-# _connect_with_startup_wait, which sleeps min(PG_STARTUP_RETRY_S, remaining).
+# Floor at 0.1s so a 0 or negative operator value cannot busy-loop a down database.
 PG_STARTUP_RETRY_S = max(0.1, _env_float("PG_STARTUP_RETRY_S", 2.0))
 
-# The pgvector floor for `hnsw.iterative_scan` (decision:1584, fact:1583).
-# Below it a selective axis filter (--project/--domain) can return ZERO rows
-# past ~75k-300k records: HNSW returns its ef_search candidates and the SQL
-# WHERE post-filter then removes them, and a selective filter can empty that
-# set entirely. Migration 036's expression index fixes the Seq-Scan regression
-# that shows up from ~15k rows; this session setting is the other half —
-# see start()'s version probe and _init_connection below.
+# decision:1584, fact:1583: below this pgvector version a selective project or domain filter can empty the HNSW candidates and return zero rows. The session setting is the other half of migration 036.
 PGVECTOR_ITERATIVE_SCAN_MIN = (0, 8)
 
 
@@ -2066,10 +1885,7 @@ OUTBOX_BATCH_SIZE    = 20    # rows processed per cycle
 OUTBOX_MAX_RETRIES   = 5     # row marked 'failed' after this many Neo4j errors
 CONSISTENCY_TIMEOUT  = 15.0  # seconds to wait for ?consistency=neo4j
 
-# Per-row exponential backoff for failed outbox rows. Without it, a down Neo4j
-# turns the 2 s drain cycle into a retry storm (BATCH_SIZE rows × every poll).
-# A failed row's next_attempt_at is pushed out by base·2^retries (capped),
-# jittered, so a Neo4j outage backs off instead of hammering.
+# Push a failed outbox row's next_attempt_at out by base·2^retries. Without it a down Neo4j retries the whole batch every poll.
 OUTBOX_BACKOFF_BASE = _env_float("OUTBOX_BACKOFF_BASE", 2.0)   # seconds
 OUTBOX_BACKOFF_MAX  = _env_float("OUTBOX_BACKOFF_MAX", 300.0)  # seconds (cap)
 
@@ -2080,21 +1896,13 @@ ALT_VECTOR_BATCH_SIZE    = _env_int("ALT_VECTOR_BATCH_SIZE", 32)
 # OUTBOX_MAX_RETRIES gives up on a permanently unapplicable Cypher; a still-pending row is retried, never abandoned.
 ALT_VECTOR_FAILING_AFTER = _env_int("ALT_VECTOR_FAILING_AFTER", 5)
 
-# Per-entity write-lock registry size. Locks are kept only for keys in active
-# use; idle locks are evicted LRU once the registry exceeds this bound, so the
-# map cannot grow unbounded with unique entity names over months of operation.
+# Evict idle per-entity locks once the registry passes this, so unique names cannot grow it without bound.
 LOCKS_MAX_SIZE = _env_int("LOCKS_MAX_SIZE", 4096)
 
-# Outer load-shed valve: cap concurrent in-flight requests at the auth seam.
-# 100 (default), 0 = disabled. Complements POOL_ACQUIRE_TIMEOUT — the semaphore caps
-# total requests (incl. those parked on embeddings/LLM that hold no DB conn);
-# the pool timeout protects the DB connection budget specifically.
+# Cap in-flight requests at the auth seam (0 disables). The pool timeout only covers requests that hold a database connection.
 GATEWAY_INFLIGHT_MAX = _env_int("GATEWAY_INFLIGHT_MAX", 100)
 
-# Thin per-request observability audit log (JSON-lines, append-only, OFF the DB
-# hot path). Records {ts, agent, role, method, path, status, latency_ms,
-# request_id}. Unset = disabled. Identity is the verified agent name — when PoP
-# auth lands, the same rows become non-repudiable with no schema change.
+# JSON-lines request audit, off the database path. Unset disables it. The identity is the verified agent name.
 GATEWAY_AUDIT_LOG_PATH = os.environ.get("GATEWAY_AUDIT_LOG_PATH", "").strip()
 
 # Off-event-loop writer for the audit log (None = auditing disabled). Created at
@@ -2103,60 +1911,34 @@ _audit_writer = AsyncLineWriter(GATEWAY_AUDIT_LOG_PATH) if GATEWAY_AUDIT_LOG_PAT
 
 # NREM dream-cycle backlog gauge: pending (project, domain) cycles from graph edges, using the same density/insight thresholds as the fold; untagged facts are skipped.
 
-# ── Consolidation health signal (ADR-018) ───────────────────────────────────
-# The coordinator rolls up the daemon's consolidation_runs ledger into a cached
-# snapshot that /health and /memory/telemetry read. /health is polled frequently
-# and must stay DB-free, so a background task refreshes the snapshot rather than
-# querying per probe. STALL threshold defaults to 2.5× the NREM sweep interval
-# (the insight cycle rides every sweep) so a single deferred/failed sweep never
-# trips it; two consecutive failures do.
+# /health must stay database-free, so a background task caches the consolidation_runs rollup. The stall threshold is 2.5× the sweep so one failed sweep does not trip it.
 _NREM_SWEEP_INTERVAL_SEC = int(os.environ.get("NREM_SWEEP_INTERVAL_SEC", "3600"))
 CONSOLIDATION_STALL_THRESHOLD_SEC = int(os.environ.get(
     "CONSOLIDATION_STALL_THRESHOLD_SEC", str(int(2.5 * _NREM_SWEEP_INTERVAL_SEC))))
 CONSOLIDATION_HEALTH_REFRESH_SEC = int(os.environ.get("CONSOLIDATION_HEALTH_REFRESH_SEC", "60"))
-# An in-flight run row older than this is treated as a dead-mid-fold orphan, not
-# a live fold — so a crashed daemon cannot peg in_flight=true forever (the daemon
-# also reaps these on restart; this is the read-side backstop).
+# An in-flight row older than this is a dead fold, so a crashed daemon cannot leave in_flight true forever.
 CONSOLIDATION_ORPHAN_TIMEOUT_SEC = int(os.environ.get("CONSOLIDATION_ORPHAN_TIMEOUT_SEC", "1800"))
 
 # Telemetry tunables: every default is unmeasured unless its comment says otherwise (decision:1785, fact:1338).
 TELEMETRY_CACHE_S = float(os.environ.get("TELEMETRY_CACHE_S", "15"))
 #: Observation window for the encoder latency rings. UNMEASURED.
 ENCODER_LATENCY_WINDOW = int(os.environ.get("ENCODER_LATENCY_WINDOW", "200"))
-#: F9 — the Postgres-pool-wait and Neo4j rings get their OWN windows, defaulting
-#: to the encoder one. They were sharing ENCODER_LATENCY_WINDOW, which meant a
-#: name that said "encoder" silently sized three unrelated instruments: an
-#: operator widening the encoder window to chase a slow reranker would have
-#: moved the Neo4j percentiles underneath themselves at the same time, and
-#: nothing in the name would have warned them. ⚠ Both UNMEASURED.
+#: Own window for the pool-wait and Neo4j rings. Sharing the encoder window let one rename move three instruments. Both unmeasured.
 POOL_WAIT_WINDOW = int(os.environ.get("POOL_WAIT_WINDOW", str(ENCODER_LATENCY_WINDOW)))
 NEO4J_LATENCY_WINDOW = int(os.environ.get("NEO4J_LATENCY_WINDOW", str(ENCODER_LATENCY_WINDOW)))
-#: Encoder p95 above this raises a /health warning. Default None → DERIVED
-#: per-encoder from backend_capability.<encoder>.ceiling_s, which IS measured
-#: (the capability probe times a fixed representative payload). Set the env only
-#: to pin a flat ceiling instead.
+#: Encoder p95 warning. None means derive it from the measured capability ceiling; set the env only to pin a flat one.
 _ENCODER_WARN_RAW = os.environ.get("ENCODER_LATENCY_WARN_MS", "").strip()
 ENCODER_LATENCY_WARN_MS = float(_ENCODER_WARN_RAW) if _ENCODER_WARN_RAW else None
-#: An outbox row pending longer than this raises a /health warning and marks the
-#: outbox dependency degraded. UNMEASURED — one hour is a round number, not an
-#: observation about this pipeline's normal drain time.
+#: Pending-outbox age that marks the dependency degraded. Unmeasured: one hour is a round number, not an observed drain time.
 OUTBOX_AGE_WARN_S = int(os.environ.get("OUTBOX_AGE_WARN_S", "3600"))
 #: token_verify_failed climbing faster than this raises a /health warning.
 #: UNMEASURED.
 TOKEN_VERIFY_WARN_PER_MIN = float(os.environ.get("TOKEN_VERIFY_WARN_PER_MIN", "10"))
-#: NREM is DEGRADED when it attempted at least this many folds in 24 h and
-#: succeeded at none. UNMEASURED — the shape of the condition (attempted ≫
-#: succeeded) is the ruling; the number is a floor to keep one unlucky fold from
-#: raising an alarm.
+#: NREM is degraded after this many folds in 24h with none succeeding. Unmeasured floor so one unlucky fold does not alarm.
 NREM_FOLD_ATTEMPT_WARN = int(os.environ.get("NREM_FOLD_ATTEMPT_WARN", "5"))
 #: Guard the rem_timing ts cast: one unparseable JSONB value aborts the whole REM telemetry query.
 REM_TS_NUMERIC_RE = r"^[0-9]+(\.[0-9]+)?$"
-#: Top-N for the two REGISTRY-BACKED breakdowns (projects, domains). ⚠
-#: UNMEASURED as a value; what IS measured is that the previous hard-coded 12
-#: truncated both on this corpus (38 projects, 15 domain names in use,
-#: 2026-08-28). 50 is headroom above the registry, not a tuned number.
-#: `agents`/`sources` keep their own top-12 — those are unbounded populations
-#: where a top-N is the answer rather than a truncation.
+#: Top-N for registry-backed project and domain breakdowns. A hard-coded 12 hid entries on this corpus; agents and sources stay at 12 because those populations are unbounded.
 BREAKDOWN_AXIS_TOP_N = int(os.environ.get("BREAKDOWN_AXIS_TOP_N", "50"))
 
 
@@ -2227,11 +2009,7 @@ def _consolidation_rollup(by_type: dict, any_stalled: bool, started_at: dict,
             and by_type[ct]["last_success_age_seconds"] is not None]
     freshest = min(ages) if ages else (None, None)
 
-    # "Most recent activity" orders on the RAW started_at datetimes, never on
-    # their ISO strings: string ordering is only correct while every value
-    # carries the same UTC offset, which is true of one timestamptz column
-    # today and silently wrong the day it is not. A type that never ran has no
-    # timestamp and must not win by sorting as empty.
+    # Order on the raw started_at values. ISO strings sort only while every offset matches, and a type that never ran must not sort as empty.
     started = [(started_at[ct], ct)
                for ct in cycle_types
                if started_at.get(ct) is not None]
@@ -2634,9 +2412,7 @@ def render_rem_by_model(rows) -> list[dict]:
     return out
 
 
-# Module attribute (not a bare `time.monotonic` call inline) so a test can
-# monkeypatch `coordinator._monotonic` directly instead of faking elapsed
-# time by counting mocked sleeps.
+# A module attribute so a test can patch coordinator._monotonic instead of counting mocked sleeps.
 _monotonic = time.monotonic
 
 
@@ -2729,22 +2505,16 @@ class MemoryCoordinator:
         self._neo4j: Any = None
         self._locks = BoundedKeyedLocks(LOCKS_MAX_SIZE)
         self._outbox_task: asyncio.Task | None = None
-        # pgvector extension version, and whether hnsw.iterative_scan applies
-        # (decision:1584/fact:1583) — probed once in start(), BEFORE the pool
-        # exists (see there for why). None/False until that probe runs.
+        # decision:1584/fact:1583: whether iterative_scan applies. Probed in start() before the pool exists; None until that probe runs.
         self.pgvector_version: str | None = None
         self.hnsw_iterative_scan: bool = False
 
         # Work-path instruments go through telemetry_instruments (never await). Encoder per-call latency is observed here, not the 600s probe.
         self._embed_ring = LatencyRing(ENCODER_LATENCY_WINDOW)
         self._rerank_ring = LatencyRing(ENCODER_LATENCY_WINDOW)
-        # Postgres pool wait — how long `_acquire` blocked before handing over a
-        # connection. Saturation was only ever visible as the 503 it eventually
-        # produced; this is the number that climbs BEFORE that.
+        # How long _acquire blocked. This climbs before saturation becomes a 503.
         self._pool_wait_ring = LatencyRing(POOL_WAIT_WINDOW)
-        # Neo4j query latency + failure counters. `cypher_rejected` is the
-        # CALLER's fault (a query the database refused) and `tx_failures` is
-        # ours; counting them together would make a user typo read as an outage.
+        # cypher_rejected is a query the caller wrote wrong; tx_failures is ours. Together, a typo would read as an outage.
         self._neo4j_ring = LatencyRing(NEO4J_LATENCY_WINDOW)
         self._cypher_rejected_total = 0
         self._neo4j_tx_failures_total = 0
@@ -2756,43 +2526,21 @@ class MemoryCoordinator:
         self._registry_census_last_good: dict | None = None
         self._registry_census_as_of: str | None = None
         self._registry_census_ok: bool | None = None
-        # Ingress refusal counters (0.9.69 shipped every one of these gates
-        # UNINSTRUMENTED — a refusal was visible to the one caller who got it
-        # and to nobody else). The seven keys are the contract's; several
-        # aggregate a family of refusal codes, and telemetry_contract.py's own
-        # note for each says exactly which.
+        # These gates shipped uncounted, so a refusal was visible only to the caller who got it. telemetry_contract.py says which codes each key aggregates.
         self._registry_refusals = Counter((
             "entity_reserved", "entity_confusable", "entity_unknown",
             "axis_conflict", "entities_not_allowed_on_judgement",
             "new_project_refused", "new_domain_refused",
         ))
-        # Rerank outcome counters. The reranker is a separate process on the
-        # search path with a FALLBACK, so its total failure is silent by
-        # construction — it degrades to vector order and still answers. These
-        # make that visible: a rising failure count against a flat success count
-        # is a reranker that is up (it answers /health) but cannot serve.
+        # The reranker falls back to vector order and still answers, so a failure is silent unless failures rise against a flat success count.
         self._rerank_successes = 0
         self._rerank_failures = 0
-        # When the fallback last fired. Stamped beside _rerank_failures at the
-        # same increment (never derived from the log) so the pair can never
-        # disagree — same contract as _credential_last_ts. ISO-8601 UTC, None
-        # until the first fallback in this process.
+        # Stamped with _rerank_failures, never taken from the log, so the pair cannot disagree. None until the first fallback.
         self._rerank_fallback_last_ts: str | None = None
-        # Axis registry reads that FAILED (PR-C). A failed read is not a quiet
-        # degrade: by-key resolution stops answering and a search filter matches
-        # only the literal string, so the answer CHANGES while looking exactly
-        # like the ordinary "that name is not registered" case. This is the only
-        # signal that separates the two from outside one request — the paired
-        # `filters_resolved.error` says it inside one. Same flat-additive shape
-        # and reset-on-restart contract as the rerank pair above (fact:1314).
+        # fact:1314: a failed axis read changes the answer while looking like an unregistered name. This counter is the only signal of that outside one request, and it resets on restart like the rerank pair.
         self._axis_registry_read_failures = 0
         self._axis_registry_read_failure_last_ts: str | None = None
-        # Payload-size instrument (fact:1441) — cumulative chars/docs actually
-        # handed to the reranker across every search this process has served,
-        # regardless of outcome (a fallback still counts what it WOULD have
-        # sent). No paired "measured" counter: that count is already
-        # _rerank_successes + _rerank_failures (see handle_search), and
-        # writing it twice would duplicate a derivable value.
+        # fact:1441: cumulative chars and docs handed to the reranker, including what a fallback would have sent. Successes plus failures already count the calls.
         self._rerank_payload_chars_total = 0
         self._rerank_payload_docs_total = 0
         # Observed-max rerank payload (monotonic this process) for the capacity signal, updated with the cumulative pair (fact:1441).
@@ -2801,27 +2549,13 @@ class MemoryCoordinator:
         # (None = not held), plus the TTL auto-resume task.
         self._quiesce_conn: Any = None
         self._quiesce_timer: asyncio.Task | None = None
-        # ADR-018 consolidation health: cached snapshot refreshed by a background
-        # task so /health stays DB-free. Defaults read as "unknown" until the
-        # first refresh lands (stalled is never asserted on no data).
-        # Whole-payload cache for /memory/telemetry (v0.9.74) + its single-flight
-        # lock. See _telemetry_cached for why the lock is not optional.
+        # Cached consolidation snapshot so /health stays database-free; stalled is not asserted on no data. The telemetry lock is single-flight; see _telemetry_cached.
         self._telemetry_cache: dict = {"snap": None, "ts": 0.0}
         self._telemetry_lock = asyncio.Lock()
-        # Set by hive_mind_proxy at startup: a zero-argument callable returning
-        # the blocks that live in the PROXY's module state (the llm_* family,
-        # the capability/capacity snapshots, the resolved config). A callback
-        # rather than an import because hive_mind_proxy imports THIS module —
-        # importing back would be a cycle. None on a coordinator running without
-        # a proxy (every unit test), and the sections simply do not appear.
+        # Proxy-owned telemetry blocks. Importing hive_mind_proxy back would cycle; None means those sections are absent.
         self.telemetry_extras_provider = None
 
-        # ── The DB-free dependency snapshot /health reads (v0.9.74) ──────────
-        # ⛔ EVERY STATE STARTS "unknown", NEVER "ok". A never-probed dependency
-        # that reads healthy is the exact failure decision:374/fact:375 named,
-        # and the one this block exists to avoid repeating for Postgres, Neo4j,
-        # the outbox and the registry — four dependencies that, before 0.9.74,
-        # had no representation on /health at all.
+        # decision:374/fact:375: a never-probed dependency that reads healthy is the failure this avoids. Every state starts unknown, not ok.
         self._dependency_health: dict = {
             "postgres": {"state": "unknown", "reason": "not yet probed"},
             "neo4j": {"state": "unknown", "reason": "not yet probed"},
@@ -2835,19 +2569,13 @@ class MemoryCoordinator:
                                              "last_success_age_seconds": None,
                                              "last_success_cycle_type": None,
                                              "stalled_types": [],
-                                             # None (not 0) until the first refresh:
-                                             # "not yet probed" must never read as
-                                             # "verified clean" (decision 928).
+                                             # decision 928: None until the first refresh. Not yet probed must not read as verified clean.
                                              "graph_invalid_nodes": None,
-                                             # Same rule for the identity gauge:
-                                             # "not yet probed" must never read
-                                             # as "upgrade complete".
+                                             # Not yet probed must not read as upgrade complete.
                                              "project_identity": None,
                                              "domain_identity": None,
                                              "inference_busy": "unknown",
-                                             # Same "not yet probed" rule as the
-                                             # gauges above: None until the first
-                                             # refresh, never a fabricated "ok".
+                                             # None until the first refresh, never a fabricated ok.
                                              "gpu_probe": None, "fresh": False}
         self._consolidation_health_task: asyncio.Task | None = None
         self._alt_vector_task: asyncio.Task | None = None
@@ -2855,13 +2583,7 @@ class MemoryCoordinator:
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
     async def start(self) -> None:
-        # M1 (PR #308 review): logged HERE, not at module import — this only
-        # ever runs from the real gateway startup path, strictly after
-        # hive_mind_proxy.py's logging.basicConfig() has configured the root
-        # logger, so the INFO line is actually visible in the journal. See
-        # log_encoder_endpoints()'s docstring for the import-time defect this
-        # replaces (a caplog-forced test hid it: the fixture installs its own
-        # handler, so it never observed the real, unconfigured logger).
+        # Logged here, after hive_mind_proxy's basicConfig, so the INFO line reaches the journal. An import-time log was dropped.
         log_encoder_endpoints()
         # Probe pgvector on a standalone connection before create_pool so pool warm-up connections already have hnsw_iterative_scan set.
         _pg_startup_deadline = _monotonic() + PG_STARTUP_WAIT_S
@@ -2912,10 +2634,7 @@ class MemoryCoordinator:
         self._outbox_task = asyncio.create_task(self._outbox_worker(), name="outbox-worker")
         self._consolidation_health_task = asyncio.create_task(
             self._consolidation_health_refresher(), name="consolidation-health")
-        # No startup recovery step, unlike the outbox above: pending work here
-        # is `embedding IS NULL`, a state the row was committed in rather than
-        # one a running process moved it to. There is nothing for a restart to
-        # put back.
+        # No startup recovery: pending work is embedding IS NULL, the state the row was committed in, so a restart has nothing to put back.
         self._alt_vector_task = asyncio.create_task(
             self._alternative_vector_worker(), name="alternative-vector-worker")
         log.info("coordinator ready (pool %d–%d, outbox + alternative-vector workers running)",
@@ -2925,10 +2644,7 @@ class MemoryCoordinator:
                 "coordinator auth enabled — %d agent(s): %s",
                 len(_AGENT_TOKENS), ", ".join(sorted(_AGENT_TOKENS.values())),
             )
-            # Log the roles ACTUALLY APPLIED, not the ones declared. A roster
-            # identity is confined even with no AGENT_ROLES entry, and a startup
-            # line showing only the file's contents would tell the operator a
-            # read-only agent is unconfined at the exact moment they check.
+            # Log the role actually applied. A roster identity is confined even with no AGENT_ROLES entry.
             _applied = {n: effective_role(n, _AGENT_ROLES.get(n))
                         for n in set(_AGENT_TOKENS.values()) | set(_AGENT_ROLES)}
             _confined = {n: r for n, r in _applied.items() if r != "full"}
@@ -3047,17 +2763,11 @@ class MemoryCoordinator:
             log.warning("embed input %d chars > %d — truncating to fit BGE-M3 8192-ctx "
                         "(full text kept in Tier 1)", len(text), EMBED_MAX_CHARS)
             text = text[:EMBED_MAX_CHARS]
-        # Per-request timeout sized on the clamped input, overriding the shared
-        # client's default. Embedding cost is superlinear in length, so a
-        # constant that suits a short fact under-provisions a long decision or a
-        # maximally-sized summary — the client default of 30s did not even cover
-        # this function's own clamp.
+        # Timeout follows the clamped length. A constant sized for a short fact under-provisions a long decision, and the 30s client default missed this clamp.
         ceiling = embed_ceiling(len(text))
         reserved_snap = int((EMBED_MAX_CONTEXT_TOKENS - EMBED_SPECIAL_TOKEN_RESERVE) * EMBED_CHARS_PER_TOKEN)
         for attempt in range(1, EMBED_RETRIES + 1):
-            # ⛔ ONE ATTEMPT, ONE OBSERVATION. Timing the whole retry loop would
-            # fold the backoff sleeps into "how long the embedder takes", which
-            # is a statement about our retry policy, not about the encoder.
+            # Time one attempt. The retry loop's sleeps are the retry policy, not the encoder.
             _t0 = time.monotonic()
             try:
                 r = await client.post(EMBED_URL, json={"input": text, "model": "bge-m3"},
@@ -3110,10 +2820,7 @@ class MemoryCoordinator:
                         )
                 r.raise_for_status()
                 vec = r.json()["data"][0]["embedding"]
-                # `safe` (not a bare call) because the recorder must tolerate a
-                # partially-constructed or stubbed owner too: an instrument that
-                # can AttributeError is an instrument that can break the embed
-                # path, which is the one thing it may never do.
+                # safe() so a stubbed owner cannot AttributeError the embed path.
                 safe(lambda: self._embed_ring.record(
                     (time.monotonic() - _t0) * 1000.0, payload_chars=len(text)))
                 return vec
@@ -3126,9 +2833,7 @@ class MemoryCoordinator:
                     raise
                 safe(lambda: self._embed_ring.record_error())
                 if attempt == EMBED_RETRIES:
-                    # The encoder URL is operator-supplied and may carry
-                    # userinfo; an httpx error renders the full URL, and this
-                    # message is the client-visible 503 body — scrub it.
+                    # The encoder URL may carry userinfo, and this text is the client-visible 503, so scrub it.
                     raise RuntimeError(
                         f"Embedding failed after {EMBED_RETRIES} attempts at the "
                         f"embedder {scrub_url_credentials(EMBED_URL)} — is it "
@@ -3289,9 +2994,7 @@ class MemoryCoordinator:
             await asyncio.sleep(OUTBOX_POLL_INTERVAL)
 
     async def _drain_outbox(self) -> None:
-        # Atomically claim rows by flipping status to 'in_progress' before releasing
-        # the lock. A concurrent coordinator instance SKIP LOCKs these rows and moves on.
-        # Any rows stuck in 'in_progress' after a crash are reset to 'pending' by start().
+        # Claim rows as in_progress before releasing the lock so a peer SKIP LOCKs them. start() resets rows left in_progress by a crash.
         async with self._acquire() as conn:
             async with conn.transaction():
                 rows = await conn.fetch(
@@ -3345,13 +3048,7 @@ class MemoryCoordinator:
     async def _apply_outbox_row(
         self, outbox_id: int, pg_id: int, params: dict, retries: int, conn=None
     ) -> None:
-        # F6/F7: the outbox apply is the OTHER Neo4j caller, and B2 asked for
-        # both. Timing only the graph route would have made `neo4j.query_p95_ms`
-        # describe read-only ad-hoc Cypher while the write path — the one that
-        # actually blocks the pipeline — stayed invisible; counting only the
-        # graph route's failures would have made `tx_failures_total` read as
-        # "Neo4j is fine" through a Neo4j outage that was failing every apply.
-        # One clock read on either side, and the recorders cannot raise.
+        # Time this apply too. The graph route alone would hide the write path that blocks the pipeline, and its failures would hide an apply outage.
         _t0 = time.monotonic()
         try:
             row_type = params.get("type")
@@ -3448,17 +3145,10 @@ class MemoryCoordinator:
                             "INSERT INTO entity_registry (name, registered_by) VALUES ($1, 'fact_ingress') ON CONFLICT (name) DO NOTHING",
                             [(e,) for e in clean_entities],
                         )
-                # Fact supersession mirror (decision 381/384), piggybacked on this
-                # fact's row: flag the old Fact node so REM/NREM exclude it, and
-                # link (new)-[:SUPERSEDES]->(old) — same relationship + direction
-                # community-summary supersession uses. MATCH-only on old so a
-                # missing node (pre-coordinator fact) is a no-op, never a phantom.
+                # decision 381/384: flag the old Fact and link SUPERSEDES on this row. MATCH-only so a missing pre-coordinator node is a no-op, not a phantom.
                 supersedes = params.get("supersedes")
                 if supersedes is not None:
-                    # MERGE (not MATCH) on old: the outbox worker may apply the new
-                    # fact's row before the old fact's own row, so the old node may
-                    # not exist yet. MERGE marks it (stub if needed); the old fact's
-                    # later row-apply only SETs content, never clearing superseded.
+                    # MERGE the old node: this row can apply before the old fact's own row. The later apply sets content and does not clear superseded.
                     await session.run(
                         f"MERGE (old:{ONT.fact} {{pg_id: $old_id}})"
                         f" SET old.superseded = true"
@@ -3488,9 +3178,7 @@ class MemoryCoordinator:
                     pg_id, retries + 1, OUTBOX_MAX_RETRIES, exc,
                 )
             else:
-                # OURS, not the caller's — the same discriminator the graph route
-                # uses: `cypher_rejected_total` is a query the DATABASE refused
-                # because the CALLER wrote it wrong, and there is no caller here.
+                # Counted as ours. cypher_rejected is a query the caller wrote wrong, and there is no caller on this path.
                 safe(lambda: setattr(self, "_neo4j_tx_failures_total",
                                      self._neo4j_tx_failures_total + 1))
                 log.warning(
@@ -3627,9 +3315,7 @@ class MemoryCoordinator:
                 " SELECT $1, o, t FROM unnest($2::int[], $3::text[]) AS x(o, t)"
                 " ON CONFLICT (decision_pg_id, ordinal) DO UPDATE"
                 "    SET text = EXCLUDED.text,"
-                # A changed alternative is a DIFFERENT alternative: its old
-                # vector describes text nobody wrote any more, so the row goes
-                # back to pending rather than keeping a stale embedding.
+                # A changed alternative is different text, so the old vector goes back to pending.
                 "        embedding = NULL, embedded_at = NULL,"
                 "        attempts = 0, last_error = NULL, next_attempt_at = NULL"
                 "  WHERE decision_alternatives.text IS DISTINCT FROM EXCLUDED.text"
@@ -3650,9 +3336,7 @@ class MemoryCoordinator:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                # FAILURE ≠ IDLE. A sweep that dies quietly leaves a table full
-                # of pending rows and a worker that looks like it has nothing to
-                # do; the loop survives, and the error is on the record.
+                # A dead sweep is not an idle one: pending rows remain, and the error stays on the record.
                 log.error("alternative-vector worker error: %s", exc, exc_info=True)
             await asyncio.sleep(ALT_VECTOR_POLL_INTERVAL)
 
@@ -3696,11 +3380,7 @@ class MemoryCoordinator:
                         "   SET embedding = $2::vector, embedded_at = now(),"
                         "       attempts = 0, last_error = NULL,"
                         "       next_attempt_at = NULL"
-                        # The row may have been reset to a NEW text while this
-                        # batch was in flight (a re-save mid-sweep). Writing the
-                        # old vector onto it would attach an embedding to text
-                        # it does not describe, so the update is conditioned on
-                        # the row still being the one that was read.
+                        # A re-save can change the text mid-batch. The update matches the text that was read so the old vector cannot land on new text.
                         " WHERE id = $1 AND text = $3 AND embedding IS NULL",
                         row["id"], str(vec), row["text"],
                     )
@@ -3867,10 +3547,7 @@ class MemoryCoordinator:
         grounded = params.get("grounded") or []
         grounded_in_flat = params.get("grounded_in", [])
         project_id = await self._project_identity(decision.get("project"))
-        # A decision SELF-ASSERTS its sections, exactly as it self-asserts its
-        # project — it is an axis-asserting record, not an inheriting one. What
-        # it inherits is what it is ABOUT (entities, below), never where it
-        # belongs. Ingress has already registry-checked every name here.
+        # A decision asserts its own sections, the same way it asserts its project. It inherits what it is about, not where it belongs.
         domain_ids = await self._domain_identities(
             pg_id, project_id, params.get("domains"))
         async with self._neo4j.session() as session:
@@ -3889,10 +3566,7 @@ class MemoryCoordinator:
                 f" WITH d"
                 f" {project_merge_cypher(project_id)}"
                 f" MERGE (d)-[:{ONT.project_of}]->(p)"
-                # The decision's own sections, in the same round-trip. `d` is the
-                # Decision here, so the Domain node is bound as `dm` — and the
-                # project node is re-merged inside the FOREACH because a variable
-                # bound outside one is not usable as a MERGE target within it.
+                # Bind the Domain as dm because d is the Decision. Re-merge the project inside FOREACH: a variable bound outside it cannot be a MERGE target.
                 + (
                     f" WITH d"
                     f" FOREACH (row IN $domains |"
@@ -3927,9 +3601,7 @@ class MemoryCoordinator:
                 )
                 await self._fail_outbox_immediately(outbox_id)
                 return
-            # Typed decision→fact grounding (decision 582): shared writer — see
-            # _write_typed_grounding. Legacy flat GROUNDED_IN is the fallback for
-            # outbox rows queued before this shipped (no 'grounded').
+            # decision 582: typed grounding via _write_typed_grounding. Rows queued before that, with no grounded list, keep flat GROUNDED_IN.
             if grounded:
                 await self._write_typed_grounding(session, ONT.decision, pg_id, grounded)
             elif grounded_in_flat:
@@ -3948,13 +3620,7 @@ class MemoryCoordinator:
                     f"   MERGE (d)-[:{ONT.grounded_in}]->(existing) )",
                     pg_id=pg_id, grounded_in=grounded_in_flat,
                 )
-            # ⛔ NO INHERITED SECTIONS. A decision's DOMAIN_OF edges are exactly
-            # the ones the operator asserted on THIS record, written by the
-            # projection above; a decision that named none carries none
-            # (`decision:1736`). Its belonging is still ANSWERABLE — read side,
-            # by traversal (`derived_belonging_cypher`) — it is simply not
-            # materialised, because a value a reader can reach by walking is a
-            # value nothing should write twice (`decision:1032`).
+            # decision:1736: a decision's DOMAIN_OF edges are only the names it asserted. decision:1032: belonging is derived on read, so a walkable value is not written twice.
         async with self._acquire() as conn:
             await conn.execute(
                 "UPDATE neo4j_outbox SET status='applied', applied_at=now() WHERE id=$1",
@@ -3983,10 +3649,7 @@ class MemoryCoordinator:
         Decision surfaces as a no-op rather than a phantom node.
         """
         retro = params.get("retrospective", {})
-        # Reversal (decision 276): the cascade is decision-level only — the
-        # graph node mirrors technical_docs.superseded so the insight gate's
-        # fresh-cluster query can exclude reversed decisions cheaply. Insights
-        # are never invalidated here; the re-fold supersedes them instead.
+        # decision 276: reversal marks the decision node so the insight gate can skip it. Insights are superseded by the re-fold, not invalidated here.
         reversal = bool(retro.get("superseded"))
         async with self._neo4j.session() as session:
             if params.get("v") == 2:
@@ -4016,9 +3679,7 @@ class MemoryCoordinator:
                     )
                     await self._fail_outbox_immediately(outbox_id)
                     return
-                # HAD_OUTCOME trigger edge from the target Decision (+ reversal
-                # mirror) — separate statement: a missing decision is a no-op
-                # for the edge but never loses the Retrospective record.
+                # Separate statement so a missing decision drops the edge and still keeps the Retrospective.
                 await session.run(
                     f"MATCH (d:{ONT.decision} {{pg_id: $target}})"
                     f" MATCH (r:{ONT.retrospective} {{pg_id: $pg_id}})"
@@ -4026,9 +3687,7 @@ class MemoryCoordinator:
                     + (" SET d.superseded = true" if reversal else ""),
                     target=target_pg_id, pg_id=pg_id, date=retro.get("date", ""),
                 )
-                # Typed grounding ROLE edges (decision 582) — a retrospective
-                # grounds in the evidence that measured the outcome
-                # (test-grounded retrospectives, decision 542, now structural).
+                # decision 582: role edges to the evidence that measured the outcome. decision 542 made test-grounded retrospectives structural.
                 await self._write_typed_grounding(
                     session, ONT.retrospective, pg_id, params.get("grounded") or []
                 )
@@ -4149,9 +3808,7 @@ class MemoryCoordinator:
         domain_ids = await self._domain_identities(
             pg_id, project_id, params.get("domains"))
         async with self._neo4j.session() as session:
-            # One statement: OPTIONAL MATCH/DELETE stale, then UNWIND to MATCH
-            # existing Domain nodes (FOREACH cannot contain MATCH). Empty
-            # $domains still clears and stops. Repair mints no Domain/spine nodes.
+            # One statement because FOREACH cannot MATCH. An empty domain list still clears, and repair mints no Domain nodes.
             await session.run(
                 f"MATCH (n:{self._SPINE}) WHERE n.pg_id = $pg_id"
                 f" OPTIONAL MATCH (n)-[stale:{ONT.domain_of}]->()"
@@ -4351,19 +4008,11 @@ class MemoryCoordinator:
         to carry an advisory would make forty call sites unpack a tuple to learn
         nothing they asked for.
         """
-        # Scope: RETROSPECTIVES only. They arrive on their own endpoint and
-        # inherit the project of the decision they judge, which passed this
-        # check itself — so re-checking here would demand a value the caller
-        # never supplies. DECISIONS were excluded alongside them until v0.8.44
-        # and should not have been: presence was mistaken for validity, and an
-        # unregistered name reached the graph as a project node. See the call
-        # site in handle_save.
+        # Retrospectives inherit the project of the decision they judge, so this check would demand a value the caller never sends. Decisions stay in the check: an unregistered name used to become a project node.
         if metadata.get("type") == "retrospective":
             return None
 
-        # ⚠ The check is on `project`, never on a chain. A record carrying only a
-        # `domain` is NOT accepted as tagged: a domain is a SECTION of a project,
-        # so accepting it would let a part vouch for the whole.
+        # Check project, not a domain chain. A section must not vouch for the project it belongs to.
         supplied = resolve_project(metadata)
         if not supplied:
             return await self._project_rejection("project_required", None)
@@ -4378,11 +4027,7 @@ class MemoryCoordinator:
 
         # new_project is accepted only as a true claim of absence (after exact-registry); a retired or variant spelling is refused, never quietly resolved.
         if metadata.get("new_project") is True:
-            # ⛔ A DECLARATION IS NOT A DEFENCE. The agent that sets this flag is
-            # the same agent that makes the spelling error, so accepting the
-            # claim on its own guards nothing: the operator says "go ahead with
-            # this idea", meaning THIS project, and a plausible variant becomes a
-            # second one. So the claim faces the checks below before it registers.
+            # new_project is not proof. The same agent can misspell it, so the claim still faces the checks below.
             refusal = await self._new_project_refusal(supplied, metadata)
             if refusal is not None:
                 return refusal
@@ -4390,12 +4035,7 @@ class MemoryCoordinator:
             self._defer_project_registration(report, supplied, agent_id, metadata)
             return None
 
-        # A retired spelling resolves to the name that replaced it, and the
-        # record is stored under the CANONICAL name. This is what makes a rename
-        # durable: a folder on another machine still carries the old name, and
-        # without this the next save from it recreates the variant the merge
-        # just removed. Rewriting here rather than resolving in every reader is
-        # the same choice PROJECT_SQL made — one resolution, at ingress.
+        # Store the canonical name. A folder that still carries the retired spelling would otherwise recreate the variant the merge removed.
         canonical = await self._resolve_project_alias(supplied)
         if canonical is not None:
             log.info("project alias: %r → %r (record stored as the canonical name)",
@@ -4456,9 +4096,7 @@ class MemoryCoordinator:
         which is not a refusal an agent can act on. A gate the database enforces
         and the ingress does not is a 500 waiting to be reported as an outage.
         """
-        # ⛔ FIRST, AND BEFORE ANY QUERY. It needs no registry: a name with no
-        # key is not a near-match of anything, cannot be confirmed distinct from
-        # anything, and has nothing to propose.
+        # Before any query: a name with no axis key cannot be a near-match and has nothing to propose.
         if not axis_key(supplied):
             log.info("project registry: refused %r — normalizes to nothing",
                      supplied)
@@ -4476,21 +4114,9 @@ class MemoryCoordinator:
         async with self._acquire() as conn:
             rows = await conn.fetch(CONFUSABLE_SQL, supplied,
                                     CONFUSABLE_SIMILARITY, PROPOSAL_LIMIT)
-            # ⚠ THE SPELLING CHECK RUNS OVER THE WHOLE REGISTRY, NOT OVER `near`.
-            # It used to read the trigram neighbours, which silently made an
-            # EXACT rule conditional on a FUZZY one: a separator/case variant was
-            # refused only when it also scored above the similarity floor.
-            # Measured live — `testing` vs `Test_Ing` scores 0.545 against a
-            # floor of 0.6 — so a pure spelling variant registered as new,
-            # which is precisely the event this guard exists to prevent.
+            # Check the whole registry, not the trigram neighbours. A separator variant can score under the floor (testing vs Test_Ing was 0.545) and still be the same project.
             all_names = [r["name"] for r in await conn.fetch(PROJECT_NAMES_SQL)]
-            # ⚠ AND OVER THE RETIRED SPELLINGS TOO. A name that was aliased away
-            # is a name this deployment has ALREADY adjudicated, so a variant of
-            # it is the same mistake as a variant of a live name — and it is the
-            # likelier one, because the retired spelling is what the machine that
-            # still carries the old folder name will send. The refusal points at
-            # the project the alias resolves to, never at the alias, because the
-            # alias is not somewhere a record may be saved.
+            # Include retired spellings. A machine still using the old folder name will send that variant, and the refusal names the canonical project, not the alias.
             alias_map = {r["alias"]: r["canonical"]
                          for r in await conn.fetch(ACTIVE_ALIASES_SQL)}
         near = [r["name"] for r in rows]
@@ -4609,9 +4235,7 @@ class MemoryCoordinator:
         if not supplied:
             return None
 
-        # The sentinel parks a record OUTSIDE any project, so it has no sections
-        # to be a member of. Refusing here rather than looking up a registry that
-        # cannot answer keeps the message about the real mistake.
+        # The sentinel is outside every project, so it has no sections. The registry cannot answer for it.
         project = resolve_project(metadata)
         if project == SENTINEL:
             return {
@@ -4663,12 +4287,7 @@ class MemoryCoordinator:
         if await self._domain_registered(project_id, name):
             return None
 
-        # The `new_domain` claim is answered HERE, after the registry and before
-        # every other step — the project axis' ordering rule, for the same
-        # reason. Declaring a section NEW while naming a retired spelling of one,
-        # or a separator/case variant of a live or retired one, is a false claim
-        # about the registry, and the caller is told rather than quietly
-        # corrected.
+        # Answer new_domain before the other steps. A retired or separator variant claimed as new is a false claim, and the caller is told rather than quietly corrected.
         if metadata.get("new_domain") is True:
             refusal = await self._new_domain_refusal(name, project, project_id, metadata)
             if refusal is not None:
@@ -4687,13 +4306,7 @@ class MemoryCoordinator:
             self._note_domain_resolved(report, name, canonical, VIA_ALIAS)
             return None
 
-        # Steps 3 and 4, scoped to this project's sections — the project axis'
-        # by-key resolution, on the axis where it matters MORE. A section name is
-        # an ordinary word typed by different people at different times, so
-        # `graph-quality` and `graph quality` are the same section far more often
-        # than `Alpha-Service` and `alpha service` are the same project. Same
-        # ordering rule: exact answers first, and a `new_domain` declaration is
-        # answered above so a false claim is told rather than silently resolved.
+        # Resolve by key inside this project. A section name is an ordinary word, so graph-quality and graph quality are the same section more often than those spellings are the same project.
         registered, aliases, _err = await self._domain_spellings(project_id, name)
         resolved, via = resolve_axis_value(name, registered, aliases)
         if resolved is not None:
@@ -4778,10 +4391,7 @@ class MemoryCoordinator:
             # see the identical note on the project axis above.
             all_names = [r["name"]
                          for r in await conn.fetch(DOMAIN_NAMES_SQL, project_id)]
-            # The project axis' rule, for the same reason: a section that was
-            # aliased away has already been adjudicated on this project, so a
-            # variant of the retired spelling is the same mistake as a variant
-            # of a live one.
+            # A retired section spelling was already adjudicated, so a variant of it is the same mistake as a variant of a live name.
             alias_map = {r["alias"]: r["canonical"]
                          for r in await conn.fetch(DOMAIN_ALIASES_SQL, project_id)}
         near = [r["name"] for r in rows]
@@ -5039,12 +4649,7 @@ class MemoryCoordinator:
 
     # Entity vocabulary is minted only on facts (fact:1375, migration 033); judgements are refused by `_judgement_entities_error` before this gate.
 
-    #: Which refusal CODE lands in which contract counter. Several counters
-    #: aggregate a family: the contract documents one key per KIND of refusal an
-    #: operator acts on, not one per error string — "a project name was refused"
-    #: is the actionable fact, and which of the three naming rules refused it is
-    #: in the refusal the caller already received. Any code not listed here is
-    #: deliberately uncounted rather than silently folded into a neighbour.
+    #: One counter per kind of refusal an operator acts on, not per error string. A code missing here is uncounted, not folded into a neighbour.
     _REFUSAL_COUNTER: dict[str, str] = {
         "entity_reserved": "entity_reserved",
         "entity_confusable": "entity_confusable",
@@ -5464,9 +5069,7 @@ class MemoryCoordinator:
 
         existing_project = resolve_project(stored)
         if axis_key(existing_project) != axis_key(project):
-            # The keys differ — which is what a RENAME looks like from here.
-            # Resolve the stored spelling once (one hop, never a walk, A3)
-            # before calling it a conflict.
+            # Different keys look like a rename. Resolve the stored spelling one hop before calling it a conflict.
             resolved_stored = (await self._resolve_project_alias(existing_project)
                                if existing_project else None)
             if resolved_stored is None or \
@@ -5474,13 +5077,7 @@ class MemoryCoordinator:
                 return _refusal("project", existing_project, project)
 
         existing_domains = resolve_domains(stored)
-        # ⚠ DOMAINS ARE COMPARED BY KEY BUT NOT ALIAS-RESOLVED. A domain alias
-        # resolves only INSIDE a project identity, and looking one up here would
-        # put `_project_identity` — which now RAISES on a registry blip — on the
-        # re-save path, turning a transient database problem into a refused
-        # save. So a section RENAME (a genuinely different name, not a
-        # respelling) still conflicts on re-save until that is designed; it is
-        # recorded as a known gap rather than closed with a call that can fail.
+        # Compare domains by key, not by alias. An alias lookup calls _project_identity, which raises on a registry blip and would turn that into a refused re-save. A real section rename still conflicts; that gap stays open.
         if {axis_key(d) for d in existing_domains} != \
                 {axis_key(d) for d in (domains or [])}:
             return _refusal("domains", existing_domains, list(domains or []))
@@ -5717,9 +5314,7 @@ class MemoryCoordinator:
         its counterpart in `entities` correctly rather than silently failing
         to match.
         """
-        # ⚠ RETURNED ONLY BESIDE A REFUSAL, where the caller never reads it. A
-        # SUCCESS path must build its own `canonical` — see the no-candidates
-        # return below for what happens when it does not.
+        # Returned only beside a refusal, which the caller does not read. A success path must build its own canonical list.
         empty_plan: dict = {"resolved": {}, "to_mint": [], "canonical": []}
 
         raw_entities = metadata.get("entities") or []
@@ -5788,13 +5383,7 @@ class MemoryCoordinator:
                 if unnameable is not None:
                     return unnameable, empty_plan
 
-        # A PROJECT NAME IS AN AXIS, NEVER AN ENTITY (item 2b, v0.9.69;
-        # `fact:1215`). Compared on `axis_key`, so `Shared_Memory`,
-        # `shared-memory` and `SHARED MEMORY` are one answer — the same key the
-        # registry itself is unique on. It runs BEFORE resolution deliberately:
-        # a name that is a project must be refused whether or not the
-        # vocabulary already knows it, because the legacy vocabulary DOES carry
-        # such names and resolving one would launder it back in.
+        # fact:1215: a project name is an axis, never an entity. Compared on axis_key, and before resolution, because the legacy vocabulary already holds those names and resolving one would let it back in.
         reserved = await self._entity_reserved_project_error(candidates, metadata)
         if reserved is not None:
             return reserved, empty_plan
@@ -5809,9 +5398,7 @@ class MemoryCoordinator:
             if still_unknown:
                 return self._entity_unknown_rejection(still_unknown), empty_plan
 
-            # E1 — a name about to be minted must not be a typo of one the
-            # vocabulary already holds. Last of the validations, because it is
-            # the only one that needs to know WHICH names will be minted.
+            # Last check: it needs the names that will actually be minted, and a near-match of one already held is refused.
             confusable = await self._entity_confusable_error(to_mint, metadata)
             if confusable is not None:
                 return confusable, empty_plan
@@ -5819,9 +5406,7 @@ class MemoryCoordinator:
         plan = {
             "resolved": resolved,
             "to_mint": to_mint,
-            # A name about to be minted canonicalizes to ITSELF — the one
-            # exception is the mint race `_entity_vocab_mint` arbitrates, which
-            # can only substitute an equivalent spelling of the same key.
+            # A name about to be minted canonicalizes to itself. The mint race can only substitute another spelling of the same key.
             "canonical": self._canonical_entity_list(
                 metadata, resolved | {n: n for n in to_mint}),
         }
@@ -6145,22 +5730,13 @@ class MemoryCoordinator:
         visibility, scope = vis_res
 
 
-        # Server-side identity enforcement — verified agent name overrides client claim.
-        # body["metadata"] is explicitly reattached; dict.get() returns an independent
-        # dict when the key is absent, so the mutation would otherwise be discarded.
-        # The agent_id COLUMN is stamped from the same verified identity — the client
-        # defaults it to the script name ("memory_bridge"), so trusting the body left
-        # every authenticated save recorded under that placeholder instead of the real
-        # token identity. Source and agent_id now agree and are both spoof-proof.
+        # The verified agent overrides the client claim, and the metadata dict is reattached because a missing key would drop the mutation. agent_id uses that same name: the body defaults it to memory_bridge.
         if request.get("authenticated_agent"):
             metadata["source"] = request["authenticated_agent"]
             agent_id = request["authenticated_agent"]
             body["metadata"] = metadata
 
-        # Person-axis enforcement — DETERMINISTIC, never agent-supplied. The operator
-        # identity + connection fingerprint are stamped from the kernel-attested
-        # principal (auth_middleware → SO_PEERCRED); any client claim is stripped. See
-        # _apply_principal / decision 347.
+        # decision 347: stamp the kernel principal and strip the client claim. The operator cannot supply this.
         if isinstance(metadata, dict):
             _apply_principal(metadata, request.get("principal"))
             body["metadata"] = metadata
@@ -6205,17 +5781,11 @@ class MemoryCoordinator:
                 status=400,
             )
 
-        # Decision saves require structured provenance fields — validated at ingress
-        # before the row touches the outbox WAL.  Bad data from an LLM is rejected
-        # here rather than replayed on every restart from a corrupt outbox entry.
+        # Reject a bad decision shape here. A corrupt outbox row would replay it on every restart.
         if metadata.get("type") == "decision":
             decision_data = metadata.get("decision")
             decision_data = decision_data if isinstance(decision_data, dict) else {}
-            # Required AND textual. A non-string that happens to be truthy (a JSON
-            # client sending decided_by as a list) used to pass this check and then
-            # be silently discarded by _normalise_decided_by, which can only keep a
-            # string claim. Rejecting it here means the claim is never destroyed:
-            # the caller is told the shape is wrong while it still has the value.
+            # decided_by must be text. A truthy list used to pass and then be discarded, so the caller lost the value.
             missing = [
                 f for f in ("decided_by", "project", "rationale")
                 if not isinstance(decision_data.get(f), str)
@@ -6234,9 +5804,7 @@ class MemoryCoordinator:
                     },
                     status=400,
                 )
-            # Canonicalise the person axis onto the attested principal — AFTER the
-            # required-field check, so omitting decided_by still fails loudly
-            # rather than being silently filled in from the socket.
+            # After the required-field check, so a missing decided_by still fails instead of being filled from the socket.
             if _normalise_decided_by(metadata):
                 log.info("decision ingress: decided_by normalised to principal %r "
                          "(claim %r preserved)", metadata["decision"]["decided_by"],
@@ -6253,21 +5821,13 @@ class MemoryCoordinator:
                 {"status": "error", "message": "metadata.entities must be a list"},
                 status=400,
             )
-        # ⛔ ONLY FACTS CARRY ENTITIES (item 3, v0.9.69; ruled R1 on
-        # decision:1664). A judgement naming any is refused here — before the
-        # gate, before the axes, before any write — and never reaches the
-        # vocabulary at all. An empty list is accepted permanently.
+        # decision:1664: only facts carry entities. A judgement that names any is refused before any write; an empty list stays allowed.
         if is_judgement_type(metadata.get("type")):
             judgement_error = self._judgement_entities_error(metadata)
             if judgement_error is not None:
                 self._count_refusal(judgement_error)
                 return web.json_response(judgement_error, status=400)
-            # ⛔ NOTHING IS ADDED TO `metadata` HERE. An earlier spelling called
-            # `setdefault("entities", [])`, which PERSISTED a key the caller
-            # never sent — the storage half of the very rule this gate enforces
-            # ("a judgement carries no entities in any store"). Every reader
-            # below already defaults it: `metadata.get("entities", [])` feeds
-            # the locks loop, and the outbox row omits the key outright.
+            # Do not setdefault entities. That persisted a key the caller never sent, and a judgement must carry none in any store.
             entity_plan: dict = {"resolved": {}, "to_mint": [], "canonical": []}
         else:
             entity_refusal, entity_plan = await self._entity_ingress_validate(metadata)
@@ -6303,10 +5863,7 @@ class MemoryCoordinator:
             self._count_refusal(project_error)
             return web.json_response(project_error, status=400)
 
-        # Disclose the rewrite the caller did not ask for. When the ingress
-        # ALSO moved the name (an alias, a key variant), its canonical is the
-        # value actually stored, so it wins for `to` — the caller is told one
-        # destination, not two.
+        # Tell the caller about a rewrite they did not ask for. If ingress also moved the name, that canonical is the one destination.
         if decision_project_rewrite is not None:
             _ingress = axis_report.get("project_resolved") or {}
             if _ingress.get("canonical"):
@@ -6344,12 +5901,7 @@ class MemoryCoordinator:
             if decision_domains:
                 metadata["domains"] = decision_domains
 
-        # Fact supersession (decision 381, refined by 384): an optional
-        # `supersedes` pointer marks an existing fact superseded by THIS save.
-        # Validated at ingress — target must exist and not already be superseded —
-        # before the embed/WAL work. Propagation to dependent summaries/decisions
-        # is LAZY (resolved at retrieval, decision 384), so nothing else fires here
-        # beyond flagging the old row; the Neo4j mirror + REM/NREM exclusion follow.
+        # decision 381, refined by 384: supersedes is checked before embed, and dependents are flagged at retrieval rather than rewritten here.
         supersedes = metadata.get("supersedes")
         if supersedes is not None:
             if isinstance(supersedes, bool) or not isinstance(supersedes, int):
@@ -6424,9 +5976,7 @@ class MemoryCoordinator:
                         },
                         status=400,
                     )
-        # An entity named with no stated provenance is not an error — it is an
-        # honest gap the response surfaces (see `entities_provenance_note`
-        # below) so it is seen at capture time rather than only on inspection.
+        # Missing provenance is not an error. The response says so at capture time instead of leaving it for later inspection.
         entities_provenance_missing = bool(entities) and entities_provenance is None
 
         # Cheap hash pre-check before mint/embed; the authoritative axis_conflict is the FOR UPDATE re-read inside the transaction.
@@ -6448,19 +5998,11 @@ class MemoryCoordinator:
                 self._count_refusal(conflict)
                 return web.json_response(conflict, status=409)
 
-        # ⛔ THE AXIS REGISTRY WRITES LAND HERE (P4′, v0.9.72) — after every
-        # 400-capable validation above and after the 409 axis-conflict check,
-        # immediately before the entity mint and the embed. The project and
-        # domain gates ACCEPTED these names where they always did; this is
-        # where the acceptance becomes a row, so a save refused anywhere above
-        # leaves `projects` and `project_domains` exactly as it found them.
-        # Same ordering rule as the mint below, same reason (decision:1413).
+        # decision:1413: registry rows are written after every 400 and the 409, and before the mint. A refused save must not leave a project or domain row.
         try:
             await self._commit_axis_registrations(axis_report, agent_id)
         except ProjectIdentityUnavailable as exc:
-            # The project row was just written and its id could not be read
-            # back, so its sections cannot be filed. Same answer the domain
-            # gate gives: a record that cannot be filed correctly is not saved.
+            # The project row's id could not be read back, so its sections cannot be filed. A record that cannot be filed is not saved.
             log.error("save refused while committing axis registrations: %s", exc)
             return web.json_response(
                 {
@@ -6485,12 +6027,7 @@ class MemoryCoordinator:
             self._count_refusal(entity_error)
             return web.json_response(entity_error, status=400)
         entities = metadata.get("entities", [])
-        # S-6 (security review fact:1412): a caller must be able to see what
-        # was actually stored when the gate changed anything — an alias/
-        # case-variant rewrite, or a mint substituting a race's winning
-        # spelling (S-6/S-12) — never silently. `None` when nothing moved,
-        # so the ordinary case (no entities, or every name already
-        # canonical) adds no noise to the response.
+        # fact:1412: report a rewrite when the gate changed a name. None when nothing moved, so an already-canonical list adds no field noise.
         entities_rewritten = entities if entities != entities_before else None
 
         # Embedding — hard mandate; no save without a vector
@@ -6500,11 +6037,7 @@ class MemoryCoordinator:
         except RuntimeError as exc:
             return web.json_response({"status": "error", "message": str(exc)}, status=503)
 
-        # Acquire per-entity write locks (sorted to prevent deadlocks across concurrent saves).
-        # Get-and-acquire each in the sorted loop: merging the fetch with the acquire keeps
-        # the lock at MRU and taken immediately, so the bounded registry can never evict a
-        # lock this save is about to hold. Track only locks actually acquired: if acquire()
-        # is cancelled mid-list, the finally releases only what we hold.
+        # Sort, then get and acquire together, so the bounded registry cannot evict a lock this save is about to hold. Release only what was acquired if the list is cancelled.
         acquired: list[asyncio.Lock] = []
         alt_stats: dict | None = None
         try:
@@ -6514,12 +6047,7 @@ class MemoryCoordinator:
                 acquired.append(lk)
             async with self._acquire() as conn:
                 async with conn.transaction():
-                    # P1, AUTHORITATIVELY (item 4, v0.9.69). The pre-check
-                    # above saved the mint and the embed; THIS one is the
-                    # guard, because only a row lock stops a concurrent save
-                    # of the same content from landing between a read and the
-                    # INSERT. `FOR UPDATE` on a hash that matches nothing
-                    # locks nothing and costs an index probe.
+                    # The pre-check is not the guard. Only FOR UPDATE stops a concurrent save of the same content between the read and the insert.
                     prior = await conn.fetchval(
                         "SELECT metadata FROM technical_docs"
                         " WHERE content_hash = $1 FOR UPDATE",
@@ -6552,12 +6080,7 @@ class MemoryCoordinator:
                     )
                     pg_id = row["id"]
 
-                    # Typed decision→fact grounding (decision 582): resolve each
-                    # grounded pg_id's node label + fact_kind from the durable store
-                    # and pick the ROLE relation (an operator role → asserted_by=
-                    # operator; else the fact_kind default → system_default). Advisory,
-                    # no silent rewrite. Drives the cross-type writer; the flat
-                    # grounded_in list is kept for telemetry/back-compat.
+                    # decision 582: pick the role from the stored label and fact_kind. Advisory only; the flat grounded_in list stays for telemetry.
                     grounded_ids = [
                         g for g in (metadata.get("grounded_in") or [])
                         if isinstance(g, int) and not isinstance(g, bool)
@@ -6566,61 +6089,38 @@ class MemoryCoordinator:
                         conn, grounded_ids, metadata.get("grounded_roles") or {}
                     )
 
-                    # Caller 1 of the promotion writer: a parked fact cited as
-                    # evidence inherits the project its citing judgements agree
-                    # on. Fires here because this is where grounded pg_ids are
-                    # already resolved to real records with real labels.
+                    # A parked fact cited as evidence inherits the project its citing judgements agree on. The pg_ids are already resolved to real records here.
                     await self._promote_grounded_parked_facts(
                         conn, grounded_typed, agent_id, pg_id
                     )
 
-                    # Outbox row written atomically with the fact.
-                    # The Phase 2 outbox worker drains this table.
+                    # Outbox row for this fact, in the same transaction. The outbox worker drains it.
                     outbox_params = {
                             "content_snippet": content[:200],
                             "source": metadata.get("source", "coordinator"),
-                            # ⛔ FACTS ONLY (item 3, v0.9.69). A judgement
-                            # carries no entities at all now, so the key is
-                            # OMITTED rather than sent empty — the projection
-                            # already defaults it, and a key that is always
-                            # empty is a promise the row should stop making.
+                            # A judgement carries no entities, so the key is omitted rather than sent empty.
                             **({} if is_judgement_type(metadata.get("type"))
                                else {"entities": entities}),
                             "agent_id": agent_id,
                             # Fact provenance edges (person/agent/project) are derived and written only when present (decision:912).
                             "person": metadata.get("principal"),
-                            # P3 + P8 — the resolved PROJECT, never a section and
-                            # never a chain, and never the SENTINEL: a :Project node
-                            # must be a project. A parked record saves, searches and
-                            # enriches normally but puts no placeholder into the
-                            # project set, where the insight gate's ">= 2 distinct
-                            # projects" rule would count it as a subject.
+                            # The resolved project, never a section and never the sentinel. A parked record must not count as a project in the insight gate.
                             "project": project_for_graph(metadata),
                             # Outbox carries domain NAMES (resolved at apply); judgements never reach here with a value.
                             "domains": resolve_domains(metadata),
                             "type": _outbox_row_type(metadata.get("type")),
                             "decision": metadata.get("decision", {}),
                             "source_ref": metadata.get("source_ref") or None,
-                            # fact_kind: soft epistemic tag, DERIVED from source_ref
-                            # (decision 553), stamped as a :Fact property at first
-                            # write. observation | discussion | tested | measured |
-                            # researched. Deterministic, never elicited separately.
+                            # decision 553: fact_kind is derived from source_ref at first write, not asked separately.
                             "fact_kind": fact_kind_from_source_ref(
                                 metadata.get("source_ref")
                             ),
-                            # Fact-grounding (decision 550): pg_ids of the Fact(s) this
-                            # record rests on. Deterministic 1-1 → GROUNDED_IN edges at
-                            # first write (id match, no alias pressure). Facts-only
-                            # source_ref stays the fact's own origin; grounded_in points
-                            # a Decision/record at its evidence facts.
+                            # decision 550: grounded_in is the evidence facts, written 1-1 at first write. source_ref stays the fact's own origin.
                             "grounded_in": grounded_ids,
                             # Typed roles + asserted_by for the cross-type writer
                             # (decision 582): [{pg_id, rel, asserted_by, label}].
                             "grounded": grounded_typed,
-                            # Piggyback the supersession mirror onto THIS fact's row
-                            # (no separate outbox row to pollute the census): when it
-                            # applies, the worker also marks the old Fact node
-                            # superseded and writes (new)-[:SUPERSEDES]->(old).
+                            # Mirror supersession on this row so the census does not gain a second outbox type.
                             "supersedes": (
                                 supersedes if (supersedes is not None
                                                and supersedes != pg_id) else None
@@ -6636,12 +6136,7 @@ class MemoryCoordinator:
                         outbox_params,
                     )
 
-                    # Flag the superseded predecessor in the SAME transaction as
-                    # its replacement (atomic: the correction and the retirement
-                    # commit together). superseded_by powers the read-time
-                    # stale_sources annotation (decision 384) as a pure Postgres
-                    # join. The id != pg_id guard covers the degenerate case where
-                    # identical content hash-collides onto the target row itself.
+                    # decision 384: retire the predecessor in the same transaction. The id guard skips a hash collision onto this row itself.
                     if supersedes is not None and supersedes != pg_id:
                         await conn.execute(
                             "UPDATE technical_docs"
@@ -6650,11 +6145,7 @@ class MemoryCoordinator:
                             supersedes, pg_id,
                         )
 
-                    # Per-alternative rows, written with the record they belong
-                    # to (migration 026). Text only — the embedding is filled by
-                    # the background worker, so a decision that weighed eight
-                    # options costs the same one embedding call on the save path
-                    # as one that weighed none.
+                    # Store alternative text with the record. The background worker embeds them, so the save path stays one embedding call.
                     alt_stats = await self._reconcile_decision_alternatives(
                         conn, pg_id, metadata
                     )
@@ -6668,9 +6159,7 @@ class MemoryCoordinator:
             for lk in acquired:
                 lk.release()
 
-        # Every durable row leaves a log line: a table that gained or lost rows
-        # silently is one nobody can explain later. Logged after commit, so the
-        # line means the rows are actually there.
+        # Log after commit so a line means the alternative rows are actually there.
         if alt_stats and (alt_stats["written"] or alt_stats["removed"]):
             log.info(
                 "alternatives: pg_id=%d wants %d row(s) — %d written pending, %d removed",
@@ -6694,12 +6183,7 @@ class MemoryCoordinator:
         sup_msg = (
             f" Superseded fact {superseded_pg_id}." if superseded_pg_id is not None else ""
         )
-        # entities_provenance_note (fact:1215): a separate advisory field, not
-        # folded into `warn`/`message` — it answers a different question ("who
-        # named these entities?") from the consolidation-eligibility note above,
-        # and conflating the two would put a Tier-3 question and a provenance
-        # question behind the same string. Present (non-null) only when the
-        # save named entities but stated no provenance for any of them.
+        # fact:1215: who named these entities is a different question from Tier-3 eligibility, so it is its own field. Set only when entities were named and none have provenance.
         entities_provenance_note = (
             "no entities_provenance stated — each named entity's origin"
             " (operator-named vs agent-added) is unknown."
@@ -6712,17 +6196,9 @@ class MemoryCoordinator:
             "superseded": superseded_pg_id,
             "message": f"Artifact stored with ID {pg_id}.{sup_msg}{warn}",
             "entities_provenance_note": entities_provenance_note,
-            # S-6 (security review fact:1412): non-null only when the entity
-            # vocabulary gate changed something the caller sent — an alias/
-            # case-variant rewritten to its canonical, or a name substituted
-            # by a mint race's winner (S-6/S-12) — so a caller can always see
-            # what was actually stored, never infer it.
+            # fact:1412: non-null only when the vocabulary gate rewrote a name the caller sent.
             "entities_rewritten": entities_rewritten,
-            # The axis twins of `entities_rewritten` (PR-C). Non-null only when
-            # the gateway stored the record under a DIFFERENT spelling from the
-            # one supplied — a retired name resolved through an alias, or a
-            # separator/case variant resolved on the axis key. A caller sending
-            # the canonical value already sees null and has nothing to reconcile.
+            # Non-null only when the stored project or domain spelling differs from the one supplied.
             "project_resolved": axis_report.get("project_resolved"),
             "domains_resolved": axis_report.get("domains_resolved") or None,
         })
@@ -6786,10 +6262,7 @@ class MemoryCoordinator:
                         {"status": "error", "message": f"successor {by} not found"},
                         status=400,
                     )
-                # A stale multi-hop chain (A -> B -> C where B is itself already
-                # superseded) leaves a consumer told "A is stale, see B" with no
-                # signal that B is ALSO stale — mirrors the existing check on
-                # pg_id above and the parallel check in handle_save's `supersedes`.
+                # A successor that is itself superseded must say so. Otherwise the caller is sent from A to a stale B.
                 if succ["superseded"]:
                     return web.json_response(
                         {"status": "error",
@@ -6952,19 +6425,12 @@ class MemoryCoordinator:
                 status=400,
             )
 
-        # P17 on this endpoint too. It reads differently here and that is exactly
-        # why it is needed: this handler BUILDS its own metadata from named body
-        # fields, so a client-supplied domain never reaches storage anyway — it
-        # is dropped on the floor with no complaint. Silence is what the rule is
-        # against. A retrospective inherits the domains of the facts it grounds
-        # in; being told so once is what stops an agent sending the field forever.
+        # This handler builds metadata from named fields, so a client domain would be dropped with no complaint. Say so: a retrospective inherits domains from the facts it grounds.
         if names_a_domain(body):
             return web.json_response(
                 self._domain_on_judgement_rejection("retrospective"), status=400)
 
-        # Reversal (decision 276): rating 'reversed' is the structural rating —
-        # it marks the DECISION superseded in both stores (Tier-1 filter +
-        # fresh-cluster exclusion).
+        # decision 276: rating reversed marks the decision superseded in both stores.
         is_reversal = rating == "reversed"
         retro_payload = {"rating": rating, "date": date}
 
@@ -7013,9 +6479,7 @@ class MemoryCoordinator:
             metadata["grounded_roles"] = roles
         _apply_principal(metadata, request.get("principal"))
 
-        # Cheap indexed existence pre-check BEFORE the GPU embedding — a typoed
-        # pg_id must not occupy the embedder just to 404. The FOR SHARE re-check
-        # inside the transaction below remains authoritative.
+        # Check the target exists before the embedding. A typo must not occupy the embedder just to 404; the later FOR SHARE is the real lock.
         async with self._acquire() as conn:
             exists = await conn.fetchval(
                 "SELECT 1 FROM technical_docs WHERE id=$1", pg_id
@@ -7034,10 +6498,7 @@ class MemoryCoordinator:
         metadata.pop("new_entities", None)
         entities_rewritten = None
 
-        # Embedding — hard mandate, same as every record; no save without a vector.
-        # Identity: a retrospective is (target, date, rating, notes) — the target is
-        # part of the hash, so identical boilerplate notes on two DIFFERENT decisions
-        # stay two records, and a reversed rating is not the same record as validated.
+        # No save without a vector. The hash includes the target, so the same notes on two decisions stay two records.
         content_hash = hashlib.sha256(
             f"retrospective:{pg_id}:{date}:{rating}:{notes}".encode()
         ).hexdigest()
@@ -7047,9 +6508,7 @@ class MemoryCoordinator:
         except RuntimeError as exc:
             return web.json_response({"status": "error", "message": str(exc)}, status=503)
 
-        # Per-entity write locks — same discipline as handle_save: entity MERGEs
-        # must be serialized (the locks are the only uniqueness guarantee for
-        # Entity nodes), and a retro's elicited entities reach the same projection.
+        # Same per-entity locks as handle_save. They are the only uniqueness guarantee for Entity merges.
         acquired: list[asyncio.Lock] = []
         try:
             for e in sorted(set(metadata["entities"])):
@@ -7094,17 +6553,12 @@ class MemoryCoordinator:
                         conn, grounded_ids, metadata.get("grounded_roles") or {}
                     )
 
-                    # Caller 1, retrospective side — a retrospective is a
-                    # judgement too, and the plan is explicit that both kinds
-                    # supply a project to the facts they cite.
+                    # A retrospective is a judgement too, so the facts it cites can inherit its project.
                     await self._promote_grounded_parked_facts(
                         conn, grounded_typed, agent_id, retro_pg_id
                     )
 
-                    # Outbox row under the RETRO'S OWN pg_id — ordinary record
-                    # lifecycle (applied → rem_reviewed → consolidated → deleted
-                    # after the insight fold). 'v': 2 selects the node projection;
-                    # target_pg_id keys the insight triggers.
+                    # Outbox row under the retrospective's own pg_id. v 2 selects the node projection; target_pg_id keys the insight triggers.
                     _retro_outbox = {
                             "v": 2,
                             "type": "retrospective",
@@ -7114,10 +6568,7 @@ class MemoryCoordinator:
                             "content_snippet": notes[:200],
                             "source": agent_id,
                             "agent_id": agent_id,
-                            # ⛔ No `entities` key: a retrospective carries none
-                            # (item 3, v0.9.69). It never produced a MENTIONS
-                            # edge; the empty list was a promise this row should
-                            # stop making.
+                            # Omit entities. A retrospective carries none and never wrote MENTIONS.
                             "source_ref": source_ref,
                             "fact_kind": fact_kind_from_source_ref(source_ref),
                             "grounded_in": grounded_ids,
@@ -7205,10 +6656,7 @@ class MemoryCoordinator:
                     " FROM technical_docs WHERE id = ANY($1::bigint[])",
                     wanted,
                 )
-            # Row handling lives INSIDE the guard on purpose: a helper that
-            # fetches cannot be fail-open only for the fetch. Anything raised
-            # while reading a row would otherwise propagate out of the
-            # expansion — which is the whole failure mode being avoided.
+            # Keep the row read inside the guard. A raise while reading would escape the expansion this guard exists to contain.
             payload = {
                 row["id"]: _decision_payload_props(
                     row["alternatives"], row["confidence"])
@@ -7225,9 +6673,7 @@ class MemoryCoordinator:
                 len(wanted), exc,
             )
 
-    # Anchors whose belonging has to be DERIVED rather than read off their own
-    # edges. A fact's sections are its own bare edges and need nothing;
-    # a CommunitySummary has no belonging edges at all.
+    # Judgement labels whose belonging is derived. A fact already has its own edges; a summary has none.
     _DERIVED_BELONGING_LABELS = (ONT.decision, ONT.retrospective)
 
     async def _derived_belonging(self, session, pg_ids: list) -> dict:
@@ -7341,13 +6787,7 @@ class MemoryCoordinator:
                 "        left(coalesce(related.content, related.title,"
                 "                      related.rationale, related.notes,"
                 "                      related.rem_summary), 120) AS snippet,"
-                # Evidence weight already sitting on this one-hop neighbor, so a
-                # summary hit carries a folded fact's fact_kind/source_ref with
-                # no second query (decision 909). A DECISION's confidence and
-                # alternatives are NOT projected here — they are payload, and
-                # `_attach_decision_payload` dereferences them from Postgres by
-                # the pg_id this row already carries. Null on neighbors that do
-                # not carry them; folded into `adr_props` below only when set.
+                # decision 909: the neighbor already carries fact_kind and source_ref, so no second query. A decision's confidence stays in Postgres and is attached by pg_id.
                 "        related.fact_kind AS adr_fact_kind,"
                 "        related.source_ref AS adr_source_ref,"
                 "        aliases",
@@ -7379,19 +6819,14 @@ class MemoryCoordinator:
         except Exception:
             return []
         await self._attach_decision_payload(ctx)
-        # A judgement hit also carries WHERE IT BELONGS, derived (`decision:1736`).
-        # Facts are untouched: their belonging is their own bare edges, already
-        # above. Skipped entirely when no judgement label is anchored on, so a
-        # summary expansion pays for nothing.
+        # decision:1736: a judgement hit also carries where it belongs, derived. Facts already have their own edges, and a summary-only expansion skips this.
         if any(lbl in self._DERIVED_BELONGING_LABELS for lbl in anchor_labels):
             belonging = await self._derived_belonging(session, [pg_id])
             if pg_id in belonging:
                 ctx.append(self._belonging_entry(belonging[pg_id]))
         return ctx
 
-    # Ratings that QUALIFY a decision — the reader needs the verdict's reasoning,
-    # not just its name. `validated`/`pending` say the decision stands as written,
-    # so the rating alone is enough.
+    # Ratings whose verdict the reader must weigh. validated and pending stand as written, so the word alone is enough.
     _QUALIFYING_RATINGS = ("refined", "mixed", "reversed")
 
     async def _resolve_decision_lifecycle(self, session, pg_ids: list[int]) -> dict:
@@ -7475,10 +6910,7 @@ class MemoryCoordinator:
                 f"     }}"
                 "   WITH n, r, related, labels(related) AS labels,"
                 "        collect(DISTINCT al.name) AS aliases"
-                # Lifecycle edges rank by TYPE — see the note on the
-                # single-anchor query above; inheritance stamped MENTIONS and
-                # those legacy edges remain, so keying the first sort on
-                # asserted_by buried HAD_OUTCOME.
+                # Rank lifecycle edges by type. Legacy inherited MENTIONS still exist, so sorting on asserted_by first buried HAD_OUTCOME.
                 f"   ORDER BY CASE WHEN type(r) IN ['{ONT.had_outcome}','{ONT.supersedes}',"
                 f"                                  '{ONT.grounded_in}','{ONT.informed_by}'] THEN 0"
                 "                 WHEN r.asserted_by IS NOT NULL THEN 1 ELSE 2 END,"
@@ -7492,9 +6924,7 @@ class MemoryCoordinator:
                 "          left(coalesce(related.content, related.title,"
                 "                        related.rationale, related.notes,"
                 "                        related.rem_summary), 120) AS snippet,"
-                # Evidence weight on the one-hop neighbor — see the single-anchor
-                # form above (decision 909). Same projection, batched; a
-                # decision's payload is dereferenced from Postgres, not here.
+                # decision 909: same neighbor projection as the single-anchor query, batched. Decision payload stays in Postgres.
                 "          related.fact_kind AS adr_fact_kind,"
                 "          related.source_ref AS adr_source_ref,"
                 "          aliases"
@@ -7531,9 +6961,7 @@ class MemoryCoordinator:
         # this function exists for would be undone by a query per anchor.
         await self._attach_decision_payload(
             [entry for entries in out.values() for entry in entries])
-        # Derived belonging for the judgement anchors, in ONE more round trip
-        # for the whole batch — see `_derived_belonging` on why it is not per
-        # hit. Anchors that are facts simply come back with no row.
+        # One more round trip for the whole batch, not one per hit. Fact anchors come back with no row.
         if any(lbl in self._DERIVED_BELONGING_LABELS for lbl in anchor_labels):
             for pid, belonging in (
                     await self._derived_belonging(session, list(pg_ids))).items():
@@ -7591,12 +7019,7 @@ class MemoryCoordinator:
         resolved: dict = {}
         project_values = None
         canonical = None
-        # ⛔ A FAILED REGISTRY READ IS DISCLOSED, NOT SWALLOWED. When it fails the
-        # filter degrades to the literal string, which is indistinguishable from
-        # a genuinely unregistered name — so the reason is carried into the
-        # response beside the resolution it silently changed. One key for both
-        # axes: what a reader needs to know is that this answer is not
-        # authoritative, and which registry could not be read is in the value.
+        # A failed registry read degrades to the literal string, which looks like an unregistered name. The response says which registry failed.
         errors: list = []
         if project:
             registered, aliases, err = await self._project_spellings(project)
@@ -7613,11 +7036,7 @@ class MemoryCoordinator:
 
         domain_values = None
         if domains:
-            # A READER DEGRADES, never 500s (item 6, ruled R3). Without an
-            # identity the domain half of the filter resolves to nothing —
-            # which looks exactly like "nobody registered that section", so
-            # the degrade is REPORTED (counter + `filters_resolved.error`)
-            # rather than left to be read as an empty answer.
+            # A reader degrades instead of 500. An unresolved domain looks like an unregistered section, so the miss is counted and reported.
             try:
                 project_id = (await self._project_identity(canonical)
                               if canonical is not None else None)
@@ -7636,9 +7055,7 @@ class MemoryCoordinator:
                            if d_canonical is not None else [name])
                 entries.append({"supplied": name, "canonical": d_canonical,
                                 "matched": matched})
-                # ONE flat array for the `?|` operator, which is OR over the
-                # whole set — so every spelling of every requested section goes
-                # in together and the filter's OR semantics are unchanged.
+                # One flat array: ?| is OR over the whole set, so every spelling of every requested section goes in together.
                 for spelling in matched:
                     if spelling not in values:
                         values.append(spelling)
@@ -7646,10 +7063,7 @@ class MemoryCoordinator:
             resolved["domains"] = entries
 
         if errors:
-            # A STRING, not a boolean, and not a nested object: it says which
-            # registry could not be read, it is absent on the ordinary path, and
-            # it never restructures the keys beside it (fact:1314). The counted
-            # twin is telemetry `axis_registry_read_failures_total`.
+            # fact:1314: a string naming the registry that failed, absent on the ordinary path, so it does not restructure the keys beside it.
             resolved["error"] = "; ".join(dict.fromkeys(errors))
         return project_values, domain_values, resolved
 
@@ -7678,11 +7092,7 @@ class MemoryCoordinator:
                 {"status": "error", "message": "query is required"}, status=400
             )
 
-        # Axis filters (v0.8.74) — a named place/time is a FILTER, not query
-        # text. All three optional and additive; validated lightly (shape
-        # only) — an unknown project/domain name is NOT refused here (the
-        # read path never blocks on registry state), it simply matches
-        # nothing via `_axis_filter_predicate` below.
+        # A named project or domain is a filter, not query text. An unknown name is not refused on the read path; it matches nothing.
         project = body.get("project")
         if project is not None and not isinstance(project, str):
             return web.json_response(
@@ -7700,10 +7110,7 @@ class MemoryCoordinator:
                      "message": "domains must be a list of strings"},
                     status=400,
                 )
-            # Security (PR 235): capped at ingress, not silently truncated — a
-            # caller sending thousands of entries binds straight into the `?|`
-            # operator (DoS vector), and a silent drop would let a partial
-            # filter's empty result read as authoritative.
+            # Cap at ingress. A silent drop would let a partial filter's empty result look authoritative (PR 235).
             if len(domains_filter) > SEARCH_DOMAINS_FILTER_CAP:
                 return web.json_response(
                     {"status": "error", "error": "filters_invalid",
@@ -7734,10 +7141,7 @@ class MemoryCoordinator:
                     status=400,
                 )
 
-        # Resolve what the searcher TYPED to what the corpus HOLDS — once, here,
-        # for every candidate query below. The cap above is deliberately applied
-        # to the SUPPLIED list, before this line: what is bounded is what an
-        # untrusted caller can ask for, not what the server's own registry adds.
+        # Resolve typed names once, for every query below. The cap applies to the supplied list, before the registry adds spellings.
         project_values, domain_values, filters_resolved = \
             await self._resolve_search_filters(project, domains_filter)
 
@@ -7748,9 +7152,7 @@ class MemoryCoordinator:
                 q_vec = None
 
             if q_vec is None:
-                # Keyword fallback when the embedding service is unavailable.
-                # Axis filters apply here too — a filtered search must not
-                # silently drop its filter just because the embedder is down.
+                # Keyword fallback when the embedder is down. The axis filter still applies.
                 vis_sql, vis_params = _visibility_filter(viewer, scope, 3)
                 axis_sql, axis_params = _axis_filter_predicate(
                     3 + len(vis_params), project_values, domain_values, since_dt)
@@ -7783,17 +7185,9 @@ class MemoryCoordinator:
                 }, filters_resolved))
 
             async with self._acquire() as conn:
-                # Tier 3 — nearest active insight (cross-project principle,
-                # decision 276) surfaces ABOVE the nearest thematic summary.
-                # Disjoint queries, both filtered to non-superseded rows.
-                # Same read-authorization predicate gates Tier-3: a private/scoped
-                # fact's synthesized narrative must not leak where the fact itself
-                # is filtered. Params start at $2 ($1 is the query vector).
+                # decision 276: the nearest active insight is a separate query from the thematic summary. The same visibility predicate applies, or a private fact's narrative would leak.
                 vis_t3, vis_t3_params = _visibility_filter(viewer, scope, 2)
-                # Same axis predicate as Tier-1, computed once and reused by
-                # every Tier-3 variant below (insight, thematic, and the
-                # pre-006 fallback) — each is an independent query starting
-                # its own $1, so the same fragment/params apply to all three.
+                # Computed once and reused. Each Tier-3 query starts its own $1, so the same fragment applies to all three.
                 t3_axis_sql, t3_axis_params = _axis_filter_predicate(
                     2 + len(vis_t3_params), project_values, domain_values, since_dt)
                 insight = None
@@ -7809,9 +7203,7 @@ class MemoryCoordinator:
                 except Exception:
                     insight = None  # pre-006 schema — thematic guard below warns
 
-                # Thematic summary. Guard: if migration 006 has not been
-                # applied, fall back to the unsupervised query so search
-                # continues to work (with a warning).
+                # If migration 006 is missing, fall back to the unsupervised query so search still works.
                 try:
                     summary = await conn.fetchrow(
                         "SELECT id, content, metadata, source_pg_ids FROM community_summaries"
@@ -7827,11 +7219,7 @@ class MemoryCoordinator:
                         "run migrations: uv run --with psycopg2-binary "
                         "python shared-memory/migrations/apply.py"
                     )
-                    # Same rule as the Tier-1 fallback: the `kind` column may
-                    # predate migration 006, but supersession is never dropped.
-                    # PROVEN before this change — querying with a superseded
-                    # summary's own text returned that summary from this branch
-                    # while the guarded query correctly returned a live one.
+                    # kind may predate migration 006; superseded must not be dropped. This branch used to return the retired summary the guarded query refused.
                     summary = await conn.fetchrow(
                         "SELECT id, content, metadata, source_pg_ids FROM community_summaries"
                         f" WHERE NOT superseded AND {vis_t3} {t3_axis_sql}"
@@ -7865,13 +7253,7 @@ class MemoryCoordinator:
                         *args,
                     )
                 except asyncpg.UndefinedColumnError:
-                    # PRE-MIGRATION SCHEMA ONLY, and it FAILS CLOSED on the
-                    # supersession guard: `created_at` may be absent on an old
-                    # install, but `superseded` is not optional — a search that
-                    # returns nothing is visibly broken, while one that quietly
-                    # serves retired records is invisibly wrong. The previous
-                    # bare `except` caught every error and dropped the guard
-                    # with it, so any transient fault served superseded rows.
+                    # Fail closed on superseded. created_at may be absent on an old install; dropping the guard on any error served retired rows.
                     candidates = await conn.fetch(
                         f"""
                         SELECT id, content, metadata FROM technical_docs
@@ -7880,12 +7262,7 @@ class MemoryCoordinator:
                         """,
                         *args,
                     )
-                    # ⚠ Known gap, out of scope: a `since` filter needs
-                    # `created_at` too, so it raises the same
-                    # UndefinedColumnError a second time here, uncaught, on a
-                    # schema this old. `since` is a brand-new v0.8.74 filter
-                    # and migration 015 predates the whole axis system it
-                    # filters on.
+                    # Known gap: since also needs created_at, so on this old schema it raises again, uncaught.
 
             if not candidates:
                 return web.json_response(_with_filters_resolved(
@@ -7902,12 +7279,7 @@ class MemoryCoordinator:
             t3_rows = [r for r in (insight, summary) if r is not None]
             n_t3 = len(t3_rows)
 
-            # ONE candidate list: summaries first BY INDEX ONLY (so a hit can be
-            # dispatched back to its kind), never by rank. Each document is
-            # clamped to the relevance window before it is sent — the full text
-            # is still what search RETURNS, only what the reranker SCORES is
-            # bounded, the same relationship EMBED_MAX_CHARS has with
-            # embed_ceiling.
+            # Summaries come first by index so a hit can be mapped back, not by rank. Clamp what the reranker scores; search still returns the full text.
             rerank_docs = [
                 prefix_rerank_doc(query, r["content"] or "") for r in t3_rows
             ] + [
@@ -7920,9 +7292,7 @@ class MemoryCoordinator:
             # Cumulative rerank payload totals; searches-measured is successes+failures, not a third counter.
             self._rerank_payload_chars_total += rerank_payload_chars
             self._rerank_payload_docs_total += rerank_payload_docs
-            # Same increment site as the pair above -- see this counter's
-            # __init__ comment for why a max (not just the sum/count mean)
-            # matters for a capacity signal.
+            # Track the max beside the sum. A mean cannot show the worst payload a capacity signal needs.
             if rerank_payload_chars > self._rerank_payload_chars_max:
                 self._rerank_payload_chars_max = rerank_payload_chars
             reranked = False
@@ -7930,12 +7300,7 @@ class MemoryCoordinator:
             try:
                 rr = await client.post(
                     RERANK_URL,
-                    # `top_n` is what llama.cpp's /v1/reranking honours; `top_k`
-                    # was silently IGNORED, so the server returned all 20
-                    # candidates and the caller's limit was enforced only by the
-                    # failure path. Both are sent because other reranking servers
-                    # spell it differently — but neither is TRUSTED: the slice
-                    # below is what actually enforces the contract.
+                    # llama.cpp honours top_n and ignored top_k. Both are sent; neither is trusted. The slice below enforces the limit.
                     json={"query": prefix_rerank_query(query), "documents": rerank_docs,
                           "top_n": limit, "top_k": limit},
                     # Derived from the payload, never constant — a constant
@@ -7978,18 +7343,10 @@ class MemoryCoordinator:
                 ]
             else:
                 self._rerank_successes += 1
-            # The caller's limit is enforced HERE, never delegated to the
-            # reranking server. A server that ignores its truncation parameter
-            # must not be able to inflate the result set.
+            # Enforce the caller's limit here. A server that ignores its truncation parameter must not inflate the result.
             ranked = ranked[:limit]
 
-        # Retrieval-time supersession check (decision 384) — the PRIMARY mechanism.
-        # A summary/insight outlives its sources, so flag any returned narrative
-        # whose provenance touches a superseded fact (or a reversed decision —
-        # decisions set `superseded` too, with a NULL successor). Cheap PG join via
-        # the superseded_by pointer (migration 013); no LLM, no Neo4j hop. The
-        # consumer judges materiality on the spot (8b) and may trigger an on-demand
-        # re-fold / retrospective (8c) — propagation is never eager.
+        # decision 384: flag a returned narrative whose sources were superseded or reversed. The join is the check; nothing is rewritten here.
         prov_ids: set[int] = set()
         if insight:
             prov_ids.update(insight.get("source_pg_ids") or [])
@@ -8006,12 +7363,7 @@ class MemoryCoordinator:
                     )
                 stale_map = {r["id"]: r["superseded_by"] for r in srows}
             except Exception as e:
-                # FAILURE != IDLE — same reasoning as `stale_summaries` below:
-                # a transient DB fault must not read as "no superseded
-                # sources" with zero trace. Search still degrades (the
-                # annotation is advisory, never load-bearing for the result
-                # itself), but the degrade is now visible in the log — CQ-02
-                # (v0.8.75) closed the asymmetry the parity note used to flag.
+                # A database fault must not read as no superseded sources. The annotation is advisory, and the miss is logged.
                 log.warning(
                     "stale_sources annotation degraded (%s: %s) — "
                     "%d source ids unchecked",
@@ -8020,9 +7372,7 @@ class MemoryCoordinator:
                 stale_map = {}  # column missing (pre-013) — degrade to no annotation
 
         def _stale_sources(source_pg_ids, meta) -> list[dict]:
-            # 8e: suppress supersessions already reviewed-and-held for this summary
-            # (metadata.reviewed_supersessions = [{old, by}, ...]). A later, distinct
-            # supersession of a different source is a new pair, so still surfaces.
+            # Hide a pair the operator already held. A later supersession of a different source is a new pair and still surfaces.
             m = _coerce_jsonb_obj(meta) if not isinstance(meta, dict) else meta
             acked = {
                 e["old"] for e in (m or {}).get("reviewed_supersessions", [])
@@ -8052,10 +7402,7 @@ class MemoryCoordinator:
                     )
                 stale_summary_map = {r["id"]: r["superseded_reason"] for r in ssrows}
             except Exception as e:
-                # FAILURE != IDLE — a transient DB fault must not read as "no
-                # superseded summaries" with zero trace. Search still degrades
-                # (the annotation is advisory, never load-bearing for the
-                # result itself), but the degrade is now visible in the log.
+                # A database fault must not read as no superseded summaries. The annotation is advisory, and the miss is logged.
                 log.warning(
                     "stale_summaries annotation degraded (%s: %s) — "
                     "%d summary_ids unchecked",
@@ -8072,9 +7419,7 @@ class MemoryCoordinator:
                 if sid in stale_summary_map
             ]
 
-        # Neo4j relational expansion. `final` is built in the RERANKER'S ORDER,
-        # summaries and facts interleaved — no tier is inserted ahead of the
-        # ranking and none is appended after it.
+        # Build final in the reranker's order. No tier is inserted ahead of that ranking or appended after it.
         final: list[dict] = []
 
         async with self._neo4j.session() as session:
@@ -8087,9 +7432,7 @@ class MemoryCoordinator:
                 (ONT.community_summary,),
             )
 
-            # Same batching for the Tier-1 hits' graph context. Anchor on ALL
-            # record labels — Decision and Retrospective rows get graph context
-            # too, not just Facts (read contract).
+            # Anchor every record label. Decisions and retrospectives get graph context too, not only facts.
             fact_pg_ids = [ids[h["index"] - n_t3] for h in ranked
                            if h["index"] >= n_t3]
             fact_ctx = await self._expand_graph_context_batch(
@@ -8100,34 +7443,22 @@ class MemoryCoordinator:
                 raw_score = hit["relevance_score"]
 
                 if hit["index"] < n_t3:
-                    # A Tier-3 narrative that EARNED this position. It now
-                    # carries a score like anything else — the null score that
-                    # used to mark it was a consequence of never being ranked,
-                    # not a property of the tier.
+                    # This narrative earned its rank, so it carries a score. A null score used to mean it was never ranked.
                     row  = t3_rows[hit["index"]]
                     meta = row["metadata"]
                     rtype = summary_record_type(meta)
                     res = {
-                        # `insight_summary` still names the cross-project kind,
-                        # but it no longer implies a position: an insight and a
-                        # thematic summary are now ranked against each other and
-                        # against the facts, on the same scale.
+                        # insight_summary names the kind, not a reserved position. It is ranked on the same scale as the other hits.
                         "tier": ("insight_summary" if rtype == "insight"
                                  else "community_summary"),
-                        # A DIFFERENT id namespace from the fact tier — same
-                        # field name, independent sequence. record_type/ref
-                        # disambiguate it.
+                        # Same field name, a different id sequence from the fact tier. record_type and ref say which.
                         "record_type": rtype,
                         "ref": make_ref(rtype, row.get("id")),
-                        # .get: tolerant of pre-change callers/stubs without the
-                        # id column — pg_id (community_summaries.id = the
-                        # CommunitySummary node key) enables the walk above.
+                        # .get so a stub without the id column still works. The id is the CommunitySummary node key the walk uses.
                         "pg_id": row.get("id"),
                         "content": row["content"],
                         "ranked": reranked,
-                        # Per-search payload instrument (fact:1441), repeated
-                        # on every row exactly the way `ranked` is — see the
-                        # fact-tier branch below for the full rationale.
+                        # fact:1441: the same per-search payload numbers on every row, matching the fact-tier branch.
                         "rerank_payload_chars": rerank_payload_chars,
                         "rerank_payload_docs": rerank_payload_docs,
                         "score": raw_score,
@@ -8135,10 +7466,7 @@ class MemoryCoordinator:
                                              if raw_score is not None else None),
                         "matched_entities": [],
                         "metadata": meta,
-                        # Surface the summary's provenance so an agent can trace
-                        # a Tier-3 narrative back to the exact Tier-1 facts it
-                        # was synthesised from — drill down via /memory/graph or
-                        # status/{pg_id}.
+                        # The facts this narrative was synthesised from, so the caller can open them.
                         "source_pg_ids": row["source_pg_ids"],
                         "graph_context": (summary_ctx.get(row.get("id"), [])
                                           if row.get("id") is not None else []),
@@ -8156,10 +7484,7 @@ class MemoryCoordinator:
                 idx   = hit["index"] - n_t3
                 pg_id = ids[idx]
                 ctx = fact_ctx.get(pg_id, [])
-                # `tier` says WHERE the hit came from; `record_type` says WHAT it
-                # is. They are not the same: the Tier-1 "fact" tier carries
-                # decisions and retrospectives too, and the id namespace is keyed
-                # on the record type, not the tier.
+                # tier is where the hit came from; record_type is what it is. The fact tier also carries decisions and retrospectives.
                 rtype = doc_record_type(metas[idx])
                 final.append({
                     "tier": "fact",
@@ -8167,10 +7492,7 @@ class MemoryCoordinator:
                     "record_type": rtype,
                     "ref": make_ref(rtype, pg_id),
                     "content": contents[idx],
-                    # `ranked` says whether these positions mean anything. When
-                    # the reranker is unreachable the rows are in VECTOR order
-                    # and carry NO score — a fabricated 1.0 made a dead reranker
-                    # indistinguishable from a confident one.
+                    # False means vector order and no score. A fabricated 1.0 made a dead reranker look confident.
                     "ranked": reranked,
                     # Search-level rerank chars/docs (same on every row; fallback still carries what would have been sent) (fact:1441).
                     "rerank_payload_chars": rerank_payload_chars,
@@ -8196,9 +7518,7 @@ class MemoryCoordinator:
                         session, decision_ids)
             except Exception:
                 lifecycle = {}
-            # Pull the retrospective's OWN TEXT for the ratings that qualify the
-            # decision — `refined`/`mixed`/`reversed` mean the reader must weigh
-            # the verdict, and a rating word alone does not carry the reasoning.
+            # Fetch the retrospective text for refined, mixed, and reversed. The rating word does not carry the reasoning.
             wanted = [v["retrospective_pg_id"] for v in lifecycle.values()
                       if v["rating"] in self._QUALIFYING_RATINGS
                       and v.get("retrospective_pg_id") is not None]
@@ -8220,9 +7540,7 @@ class MemoryCoordinator:
                     continue
                 entry = {
                     "rating": state["rating"],
-                    # A record reference the caller can fetch directly — the same
-                    # qualified form used everywhere else, because a bare integer
-                    # resolves against the wrong table (decision 822).
+                    # decision 822: a qualified ref, because a bare integer resolves against the wrong table.
                     "ref": make_ref("retrospective", state["retrospective_pg_id"]),
                     "retrospective_pg_id": state["retrospective_pg_id"],
                 }
@@ -8281,9 +7599,7 @@ class MemoryCoordinator:
                 records = await session.execute_read(_read_tx)
             safe(lambda: self._neo4j_ring.record((time.monotonic() - _t0) * 1000.0))
         except ClientError as exc:
-            # A REJECTION IS THE CALLER'S, NOT OURS — counted separately from
-            # tx_failures for exactly that reason. Rolling a syntax error into
-            # a failure count makes a user's typo read as a database outage.
+            # A rejected query is the caller's. Counting it with tx_failures would make a typo look like an outage.
             safe(lambda: setattr(self, "_cypher_rejected_total",
                                  self._cypher_rejected_total + 1))
             # neo4j.exceptions.ClientError is 400 cypher_rejected (caller's invalid Cypher), not 500 query failed.
@@ -8338,9 +7654,7 @@ class MemoryCoordinator:
         insight (the FORM, via the source_pg_ids reverse lookup) and the coarse
         fact→summary latency when both timestamps exist. Backwards-compatible: the old
         `neo4j`/`retries`/`applied_at` fields are retained."""
-        # Accepts a qualified reference (`fact:816`, `summary:87`) or a bare
-        # integer. The bare form still means technical_docs — the compatibility
-        # concession, and the one place the namespace ambiguity survives.
+        # A qualified ref such as fact:816 or summary:87, or a bare integer. The bare form still means technical_docs.
         try:
             record_type, pg_id = parse_ref(request.match_info["pg_id"])
         except ValueError as exc:
@@ -8350,10 +7664,7 @@ class MemoryCoordinator:
                 status=400,
             )
 
-        # A summary id resolved against technical_docs is the exact wrong answer
-        # this qualification exists to prevent: the sequences are independent, so
-        # the lookup would succeed and return an unrelated record. Route it to
-        # the table it actually names.
+        # The sequences are independent, so a summary id looked up in technical_docs would succeed and return the wrong record.
         if record_type in REF_TYPES_SUMMARIES:
             return await self._status_of_summary(pg_id, record_type)
 
@@ -8380,10 +7691,7 @@ class MemoryCoordinator:
         if rec is None and ob is None:
             return web.json_response({"pg_id": pg_id, "exists": False, "neo4j": "unknown"})
 
-        # A qualified ref that names the wrong type is a caller error worth
-        # surfacing: the id resolved, but not to the record the caller meant.
-        # Silently returning the row is how a mismatched reference becomes a
-        # confident wrong answer.
+        # The id resolved, but not to the type the caller named. Returning the row would be a confident wrong answer.
         actual_type = doc_record_type({"type": rec["type"]} if rec else None)
         if record_type and record_type != actual_type:
             return web.json_response(
@@ -8528,9 +7836,7 @@ class MemoryCoordinator:
         actually built, and `timestamp` when it was served.
         """
         snap = await self._telemetry_cached()
-        # THE DROP, at the response boundary. ⛔ Never on `snap` itself — it is
-        # the TTL cache, shared by every caller inside the window; strip_dropped
-        # returns a fresh object and leaves it whole.
+        # Strip dropped keys on the response, never on snap. The cache is shared, and strip_dropped returns a fresh object.
         return web.json_response(
             {"status": "success",
              "telemetry": strip_dropped(snap, TELEMETRY_CONTRACT)})
@@ -8559,11 +7865,7 @@ class MemoryCoordinator:
 
     async def _build_telemetry(self) -> dict:
         """Build the telemetry payload from scratch. See ``handle_telemetry``."""
-        # `generated_at` is stamped HERE and `timestamp` at SERVE time, so the
-        # two differ by exactly the cache age. The age itself is deliberately
-        # NOT a third key: a reader who wants it subtracts two timestamps it
-        # already has, and writing it would be the derived-value duplication
-        # decision:1032 forbids.
+        # decision:1032: generated_at is stamped here and timestamp at serve time. The age is their difference, so it is not stored again.
         snap: dict = {"generated_at": datetime.now(timezone.utc).isoformat()}
 
         # Postgres — outbox status, doc + summary counts
@@ -8572,9 +7874,7 @@ class MemoryCoordinator:
                 outbox = await conn.fetch(
                     "SELECT status, count(*) AS n FROM neo4j_outbox GROUP BY status"
                 )
-                # Dead-letter age: how long the oldest permanently-failed row has
-                # been stuck. A non-null, growing value means Neo4j writes are
-                # being abandoned — the signal a dashboard alerts on.
+                # Age of the oldest permanently failed row. A growing value means Neo4j writes are being abandoned.
                 failed_age = await conn.fetchval(
                     "SELECT EXTRACT(EPOCH FROM now() - min(created_at))::int"
                     " FROM neo4j_outbox WHERE status='failed'"
@@ -8594,9 +7894,7 @@ class MemoryCoordinator:
             snap["postgres"] = {
                 "technical_docs": docs,
                 "technical_docs_superseded": docrow["superseded"],
-                # ⚠ MOVED (removed in 0.9.75) — see the `outbox` section below.
-                # This census OMITS a status with zero rows, so `outbox.failed`
-                # went missing exactly when it read zero.
+                # Moved in 0.9.75. This census omits a zero status, so outbox.failed disappeared exactly when it was zero.
                 "outbox": {r["status"]: r["n"] for r in outbox},
                 "outbox_failed_oldest_age_seconds": failed_age,
                 "community_summaries": {
@@ -8604,13 +7902,9 @@ class MemoryCoordinator:
                     "superseded": summ["superseded"],
                     "insight": summ["insight"],
                 },
-                # Pool gauges (0.9.74) — saturation was previously visible only
-                # as the 503 it eventually produced; these climb before that.
-                # asyncpg exposes both, so nothing here is derived twice.
+                # These climb before saturation becomes a 503. asyncpg exposes both, so neither is derived twice.
                 **self._pool_gauges(),
-                # pgvector, moved off /health: it is a Postgres FACT, and it was
-                # only ever on /health because that is where the startup probe's
-                # result happened to be surfaced.
+                # A Postgres fact. It was on /health only because that is where the startup probe's result was surfaced.
                 "pgvector": {
                     "version": self.pgvector_version,
                     "iterative_scan": bool(self.hnsw_iterative_scan),
@@ -8619,10 +7913,7 @@ class MemoryCoordinator:
         except Exception as exc:
             snap["postgres"] = {"error": str(exc)}
 
-        # Outbox (0.9.74) — its own section, with EVERY status always present
-        # and the two latency numbers DERIVED from the columns the writer
-        # already stamps (created_at, applied_at) rather than duplicated into an
-        # in-memory ring that would reset on restart (decision:1032).
+        # decision:1032: every outbox status is present, and latency comes from created_at and applied_at rather than a ring that resets on restart.
         try:
             snap["outbox"] = await self._outbox_telemetry()
         except Exception as exc:
@@ -8645,10 +7936,7 @@ class MemoryCoordinator:
                     f"        coalesce(d.superseded,false) AS superseded, count(*) AS n"
                 )
                 decisions = await dres.data()
-                # REM attempt/dead-letter gauge: a record at the attempt cap is
-                # excluded from REM's queue but still counts as rem_pending, so
-                # without this the backlog just sits there with no way to tell
-                # "waiting its turn" from "given up on and never retried again".
+                # A record at the attempt cap is still rem_pending. Without this gauge that looks like waiting, not given up.
                 ares = await session.run(
                     f"MATCH (n) WHERE (n:{ONT.fact} OR n:{ONT.decision}"
                     f"                 OR n:{ONT.retrospective})"
@@ -8662,25 +7950,17 @@ class MemoryCoordinator:
             _cap = REM_MAX_ATTEMPTS
             snap["neo4j"] = {
                 "facts_total":          sum(r["n"] for r in facts),
-                # Superseded records are permanently excluded from REM's own
-                # candidacy query (rem_loop.py:_fetch_non_rem_batch) — counting
-                # them here inflates "pending" with a backlog REM will never
-                # touch and no operator action can ever clear.
+                # Superseded rows are excluded from REM's candidacy query, so counting them here inflates a backlog nothing can clear.
                 "facts_rem_pending":    sum(r["n"] for r in facts if not r["rem"] and not r["superseded"]),
                 "facts_unconsolidated": sum(r["n"] for r in facts if r["rem"] and not r["con"]),
                 "decisions_total":      sum(r["n"] for r in decisions),
                 "decisions_rem_pending": sum(r["n"] for r in decisions if not r["rem"] and not r["superseded"]),
-                # Records REM has given up on: excluded from its queue until an
-                # operator resets n.rem_attempts. Non-zero means enrichment is
-                # silently losing records — investigate before it grows.
+                # Excluded from REM's queue until n.rem_attempts is reset. Non-zero means enrichment is dropping records.
                 "rem_dead_lettered":    sum(r["n"] for r in attempts if r["a"] >= _cap),
                 # Pending records carrying at least one failed attempt.
                 "rem_failing":          sum(r["n"] for r in attempts if 0 < r["a"] < _cap),
                 "rem_max_attempts":     _cap,
-                # STEP 3 (decision 890) fairness gauge — ships dormant (reads 0
-                # until the solo backlog is large enough to re-exercise the
-                # batch-vs-solo yield path; baseline: 8/15 yields at 0 solo
-                # records handled, 2026-07-20 12:28-22:41, before this fix).
+                # decision 890: fairness gauge for the batch-versus-solo yield. It reads 0 until a solo backlog re-exercises that path.
                 "rem_passed_over_total": sum(r["n"] * r["p"] for r in attempts),
                 "rem_starved_pending":  sum(r["n"] for r in attempts
                                             if r["p"] >= REM_STARVED_THRESHOLD),
@@ -8693,17 +7973,13 @@ class MemoryCoordinator:
         except Exception as exc:
             snap["neo4j"] = {"error": str(exc)}
 
-        # REM (0.9.74) — the four backlog numbers that were living under
-        # `neo4j.*` because that is where the query ran, plus the throughput the
-        # durable rem_timing clock can answer and nothing was asking.
+        # The backlog numbers that used to sit under neo4j because that is where the query ran, plus what rem_timing can already answer.
         try:
             snap["rem"] = await self._rem_telemetry()
         except Exception as exc:
             snap["rem"] = {"error": str(exc)}
 
-        # Registry (0.9.74) — row counts and the ingress refusal counters. Every
-        # one of these gates shipped in 0.9.69 UNINSTRUMENTED: a refusal was
-        # visible to the one caller who received it and to nobody else.
+        # Row counts and ingress refusals. Those gates shipped uncounted, so a refusal was visible only to the caller who got it.
         try:
             snap["registry"] = self._registry_telemetry()
         except Exception as exc:
@@ -8717,84 +7993,55 @@ class MemoryCoordinator:
         else:
             snap["nrem"] = {"error": "not yet computed", "as_of": dep.get("as_of")}
 
-        # Metadata breakdown — drill-down distributions a dashboard renders
-        # (record types, agents, sources, domains, summary kinds). Cheap GROUP
-        # BYs over technical_docs + community_summaries; surfaced here so the
-        # monitor needs no direct Postgres connection for its breakdown panels.
+        # Dashboard distributions. Surfaced here so the monitor does not need its own Postgres connection.
         try:
             snap["breakdown"] = await self._metadata_breakdown()
         except Exception as exc:
             snap["breakdown"] = {"error": str(exc)}
 
-        # Entity-graph shape (ADR-017) — the live, cheap counterpart to the
-        # offline ER calibration harness this framework once shipped (retired).
-        # Surfaces fragmentation and alias coverage. The O(n²) cosine over-merge
-        # analysis stays OUT of the hot path; only aggregates here.
+        # Fragmentation and alias coverage. The pairwise cosine over-merge stays off this path; only the aggregates are here.
         try:
             snap["entity_graph"] = await self._entity_graph()
         except Exception as exc:
             snap["entity_graph"] = {"error": str(exc)}
 
-        # Schema compliance — node labels / relationship types in the live graph
-        # outside the ontology vocabulary (legacy or foreign drift the inbound
-        # gates now prevent but cannot retroactively remove). Predicate
-        # distribution is the supporting census.
+        # Labels and relationship types outside the ontology. Ingress now refuses them and cannot remove the ones already stored.
         try:
             snap["compliance"] = await self._graph_compliance()
         except Exception as exc:
             snap["compliance"] = {"error": str(exc)}
 
-        # Graph integrity (decision 928) — REM's label_mismatch verdict, which it
-        # has always computed and nothing ever read. A write-path defect signal,
-        # not a backlog: non-zero means a writer is producing nodes under the
-        # wrong label and someone must fix it.
+        # decision 928: REM's label_mismatch verdict, which nothing else read. Non-zero means a writer is using the wrong label.
         try:
             snap["graph_integrity"] = await self._graph_integrity()
         except Exception as exc:
             snap["graph_integrity"] = {"error": str(exc)}
 
-        # Consolidation signal (ADR-018) — the dream-cycle liveness rollup from
-        # the daemon's consolidation_runs ledger: per-cycle-type last outcome,
-        # success age, in-flight, last error, plus the derived stall verdict.
-        # Computed fresh here (telemetry is auth-scoped and already heavier); the
-        # cheaper /health subset reads the cached snapshot instead.
+        # Fresh rollup of consolidation_runs. /health reads the cached subset so a probe stays off the database.
         try:
             snap["consolidation"] = await self._consolidation_telemetry()
         except Exception as exc:
             snap["consolidation"] = {"error": str(exc)}
 
-        # refold_ledger breakdown (O1, fact:1189) — a lone backlog number
-        # misleads: dropped/below_density and dropped/out_of_scan (I7,
-        # decision:1121) must be distinguishable from a genuinely open row.
-        # Also the insight-kind reconciliation read (O2, I17, decision:1181)
-        # — the durable record's only visibility, since nothing else reads
-        # insight-kind rows.
+        # fact:1189: a lone backlog number hides why a row was dropped. decision:1121: below_density and out_of_scan must not look like an open row. decision:1181: nothing else reads insight-kind ledger rows.
         try:
             snap["refold_ledger"] = await self._refold_ledger_telemetry()
         except Exception as exc:
             snap["refold_ledger"] = {"error": str(exc)}
 
-        # Spine coverage (decision 559) — required-field completeness + the elicited
-        # rate + emergent (captured-but-unprojected) fields + alias-adjudication
-        # volume. The data behind the first-write-quality push; the monitor samples
-        # this over time for the trend.
+        # decision 559: which required fields were present at first write, and which captured fields were never projected.
         try:
             snap["spine"] = await self._spine_telemetry()
         except Exception as exc:
             snap["spine"] = {"error": str(exc)}
 
-        # Latency (decisions 568/570/571) — REM service/contention per model (durable,
-        # ungated, model/hardware) + the NREM whole-cycle compute window alongside it.
-        # Never fact→summary (gate-dominated, survivorship-biased — fact 567).
+        # decisions 568/570/571: REM service and contention per model, plus the NREM cycle window. Not fact-to-summary: that interval is gate-dominated (fact 567).
         try:
             snap["latency"] = await self._latency_telemetry()
         except Exception as exc:
             snap["latency"] = {"error": str(exc)}
 
-        # Inference/GPU-busy signal (tri-state: "busy"|"idle"|"unknown"). Read the
-        # cached value the consolidation refresher already probed so telemetry never
-        # shells out to nvtop itself. "unknown" (nvtop absent) is surfaced verbatim
-        # so the monitor never shows a false "idle".
+        # Read the cached probe so telemetry does not shell out to nvtop. unknown stays unknown, not a false idle.
         snap["inference_busy"] = self._consolidation_health.get("inference_busy", "unknown")
 
         # Rerank success/fallback counters (in-process); fallback still answers 200 so this is the only outside-the-log signal (fact:1314).
@@ -8810,19 +8057,10 @@ class MemoryCoordinator:
         # Cumulative rerank chars/docs this process; divide for mean chars/doc (fact:1441).
         snap["rerank_payload_chars_total"] = self._rerank_payload_chars_total
         snap["rerank_payload_docs_total"] = self._rerank_payload_docs_total
-        # NEW (operator ruling, 2026-08-23): observed maximum, not just the
-        # sum -- a capacity signal needs the worst real payload seen, which
-        # a sum+count mean cannot give. Monotonic non-decreasing for this
-        # process's lifetime (see the counter's own __init__ comment) —
-        # this is the safe direction for a capacity signal, never a defect.
+        # The worst payload this process has seen. A sum-and-count mean cannot show it, and the max only moves up.
         snap["rerank_payload_chars_max"] = self._rerank_payload_chars_max
 
-        # Credential-use audit trail signal (PR A3) — in-process counters, no
-        # I/O, so no try/except: same reset-on-restart contract as the
-        # existing _llm_routed counters. Detail lives in the separate
-        # credential-events log; this is the operator-attention SIGNAL only.
-        # ⚠ MOVED to `llm.faults` (removed in 0.9.75) — dual-emitted here so the
-        # monitor migrates without a flag day.
+        # In-process counters, so no try. Detail stays in the credential log. Also emitted as llm.faults until 0.9.75 removes this copy.
         snap["llm_faults"] = _llm_faults_snapshot()
         snap["credentials"] = {
             **_credentials_snapshot(),
@@ -8830,9 +8068,7 @@ class MemoryCoordinator:
             "token_verify_warn_per_min": TOKEN_VERIFY_WARN_PER_MIN,
         }
 
-        # ── In-memory sections (0.9.74) — no I/O, so no try/except needed on
-        # the calls themselves; the assembly is guarded anyway because a
-        # telemetry section must never be the reason the endpoint 500s.
+        # No I/O, so the calls need no try. The assembly is still guarded: a telemetry section must not 500 the endpoint.
         snap["encoders"] = safe(self._encoders_telemetry, default={"error": "unavailable"})
         snap["gateway"] = safe(self._gateway_telemetry, default={"error": "unavailable"})
         snap["clients"] = {"versions_seen": dict(_client_versions_seen)}
@@ -8843,9 +8079,7 @@ class MemoryCoordinator:
             if isinstance(extras, dict):
                 snap.update(extras)
 
-        # gpu_probe + the two identity probes, moved off /health. Read from the
-        # coordinator's OWN cached snapshot — the same value /health's
-        # consolidation block carries, not a second probe.
+        # Moved off /health. Read the cached snapshot /health already carries, not a second probe.
         snap["gpu_probe"] = self._consolidation_health.get("gpu_probe")
         snap["axes"] = {
             "project_identity": self._consolidation_health.get("project_identity"),
@@ -8864,11 +8098,7 @@ class MemoryCoordinator:
         elicited saves*; (B) emergent = metadata keys captured but NOT first-write
         projected (promotion candidates); (C) alias-adjudication volume (does the
         deterministic projection keep the graph clean). No hot-path counters."""
-        # Keys that ARE first-write projected, so they must NOT be reported as
-        # promotion candidates in family (B). `rating` and `target_pg_id` joined
-        # this set when the retrospectives block below started projecting them —
-        # leaving them in the emergent list would advertise, as an unmet
-        # opportunity, the very measurement that now exists.
+        # Already projected at first write, so they are not promotion candidates. rating and target_pg_id joined this set when retrospectives started projecting them.
         PROJECTED = {"source", "type", "entities", "decision", "source_ref",
                      "supersedes", "grounded_in", "fact_kind", "elicited",
                      "rating", "target_pg_id"}
@@ -8886,12 +8116,7 @@ class MemoryCoordinator:
                 " FROM technical_docs"
                 " WHERE metadata->>'type'='decision' AND NOT superseded"
             )
-            # `facts` means FACTS. It used to mean "everything that is not a
-            # decision", which silently absorbed every retrospective into the
-            # total — so retrospective first-write quality was unmeasurable and
-            # the facts figure was diluted by records held to different required
-            # fields. Retrospectives now have their own block below, and the two
-            # totals no longer double-count the same records.
+            # Facts only. Counting every non-decision row absorbed retrospectives, which have different required fields and their own block below.
             frow = await conn.fetchrow(
                 "SELECT count(*) AS n,"
                 " count(*) FILTER (WHERE metadata ? 'source_ref') AS sref,"
@@ -8901,10 +8126,7 @@ class MemoryCoordinator:
                 "        OR metadata->>'type' NOT IN ('decision', 'retrospective'))"
                 "   AND NOT superseded"
             )
-            # Retrospectives carry their spine fields at the TOP level of metadata
-            # (`rating`, `target_pg_id`), not nested under a per-type object the way
-            # a decision's alternatives/confidence are — so these are direct `?`
-            # checks, matching how the write path actually stores them.
+            # rating and target_pg_id sit at the top of metadata, not under a nested object, so the checks are direct.
             rrow = await conn.fetchrow(
                 "SELECT count(*) AS n,"
                 " count(*) FILTER (WHERE metadata ? 'rating') AS rating,"
@@ -8927,10 +8149,7 @@ class MemoryCoordinator:
                     " count(*) FILTER (WHERE embedding IS NULL AND attempts >= $1)"
                     "     AS failing,"
                     " count(DISTINCT decision_pg_id) AS decisions,"
-                    # FILTER belongs to the AGGREGATE, not to the expression
-                    # wrapping it: `extract(...) FILTER (...)` parses as a
-                    # filter on a non-aggregate and is a syntax error. Caught
-                    # only by running it — the suite stubs every query.
+                    # FILTER attaches to the aggregate. extract(...) FILTER is a syntax error, and the suite stubs this query so it would not catch it.
                     " extract(epoch FROM now() -"
                     "     min(created_at) FILTER (WHERE embedding IS NULL))"
                     "     AS oldest_pending_age_s"
@@ -8950,9 +8169,7 @@ class MemoryCoordinator:
                     ),
                 }
             except Exception as exc:
-                # Reported, never raised: this block is a measurement inside a
-                # read endpoint, and a telemetry query that propagates would take
-                # the whole rollup down with it.
+                # Report the error. A raised telemetry query would blank the whole rollup.
                 alt_vectors = {"error": str(exc)}
 
         # Telemetry no longer carries `alias` (retired adjudication ledger); axis alias tables stay.
@@ -8974,12 +8191,7 @@ class MemoryCoordinator:
                 "source_ref_pct": pct(frow["sref"], fn),
                 "elicited_pct": pct(frow["elicited"], fn),
             },
-            # A retrospective's required fields are its own: the outcome state it
-            # reports (`rating`), the decision it judges (`target_pg_id`), and the
-            # records that MEASURED that outcome (`grounded_in`). The first two are
-            # set by every write path, so they read as a regression alarm rather
-            # than a trend; grounded_in is the one that carries signal — a
-            # retrospective without it asserts an outcome nothing backs.
+            # rating and target_pg_id are set by every write, so a miss is a regression. grounded_in is the signal: an outcome nothing backs.
             "retrospectives": {
                 "total": rn,
                 "rating_pct": pct(rrow["rating"], rn),
@@ -9042,11 +8254,7 @@ class MemoryCoordinator:
                 " WHERE rem_timing IS NOT NULL AND (rem_timing->>'wall_ms') IS NOT NULL"
                 " GROUP BY rem_timing->>'model' ORDER BY n DESC"
             )
-            # NREM whole-cycle compute window (kept alongside REM, decision 568).
-            # ONLY cycles that actually synthesised (folds_succeeded > 0): deferred and
-            # no-op sweeps open+close a row instantly (~0s) and otherwise swamp p50/p95
-            # to zero — the same meaningless-denominator trap that fact 567 warns about.
-            # Same gate as last_success in _compute_consolidation_health.
+            # decision 568: only cycles that synthesised. A deferred sweep closes in about 0s and would swamp the percentiles, the trap fact 567 names.
             cyc = await conn.fetchrow(
                 "SELECT count(*) AS n,"
                 "  percentile_cont(0.5)  WITHIN GROUP (ORDER BY EXTRACT(EPOCH FROM (finished_at-started_at))) AS p50,"
@@ -9248,10 +8456,7 @@ class MemoryCoordinator:
             age = r["last_success_age"] if r else None
             in_flight = bool(r["inflight"]) if r else False
             elig = r["eligible_clusters"] if r else None
-            # I7 (decision:1121): backlog must match the gate the cycle
-            # ACTUALLY folds on — the recorded eligible_clusters, and NOTHING
-            # else. No fallback to a looser density count when no census has
-            # been recorded; see _consolidation_backlog's docstring.
+            # decision:1121: the backlog is the recorded eligible_clusters, not a looser density count when no census exists.
             started_at[ct] = r["last_started"] if r else None
             backlog_count = _consolidation_backlog(elig)
             has_backlog = backlog_count > 0
@@ -9263,19 +8468,11 @@ class MemoryCoordinator:
                 last_error_at = r["last_error_at"]
                 # Crash-superseded uses last_completed_at (outcome=completed), never last_success (a crash after a fold can stamp that).
                 last_completed_at = r["last_completed_at"]
-                # superseded: a real success has landed AFTER this crash — the
-                # crash is history, not a current condition. NOT the same test
-                # as `stalled` above (that gates on age vs threshold + backlog;
-                # this gates on ORDER relative to the crash alone), and not the
-                # same population as consec_fail (crashes SINCE last success,
-                # already 0 in exactly this case) — this is about how the ONE
-                # most-recent crash, however old, should ever be *displayed*.
+                # A success after this crash means the crash is history. That is order, not the stall test and not consec_fail.
                 superseded = bool(
                     last_completed_at is not None and last_error_at is not None
                     and last_completed_at > last_error_at)
-                # O9: age computed in SQL (EXTRACT(EPOCH ...) against the same
-                # DB clock last_success_age already uses), not a second,
-                # Python-side `now() - last_error_at` subtraction.
+                # Age in SQL on the same clock as last_success_age, not a second Python now().
                 age_seconds = (
                     int(r["last_error_age"]) if r["last_error_age"] is not None else None)
                 err = {"class": r["last_error_class"], "msg": r["last_error_msg"],
@@ -9288,44 +8485,22 @@ class MemoryCoordinator:
                 "backlog": backlog_count,
                 "stalled": stalled,
                 "last_error": err,
-                # Coverage census (PR-2): latest gate snapshot the daemon recorded.
-                # R1 fix (review finding): eligible_oldest_age is pulled from
-                # the SAME row as eligible_clusters (both filtered on
-                # `eligible_clusters IS NOT NULL` in the query above), so a
-                # census that reports eligible_clusters=0 reports its own
-                # eligible_oldest_age_seconds honestly — NULL, not a stale
-                # non-null value carried over from an earlier row.
+                # eligible_oldest_age comes from the same row as eligible_clusters. A zero census must report its own age as null, not a stale value from an earlier row.
                 "eligible_clusters": elig,
                 "eligible_oldest_age_seconds": (r["eligible_oldest_age"] if r else None),
-                # D1 (fact:1189, decision:1121/I7) — clusters this cycle
-                # excluded from `eligible_clusters` because they were
-                # dead-lettered (NREM_FOLD_FAIL_CAP). NEW key; None means no
-                # census has recorded this yet (pre-D1 rows), NOT zero.
+                # fact:1189, decision:1121: clusters left out of eligible_clusters because they were dead-lettered. None means no census has recorded it yet, not zero.
                 "dead_lettered_clusters": (
                     int(r["dead_lettered_clusters"])
                     if r and r["dead_lettered_clusters"] is not None else None),
-                # Output-identity skips (operator ruling 2026-08-11) — latest
-                # count of clusters whose re-fold would have rewritten the
-                # active summary byte-identically and was skipped without
-                # embedding or write. Same None-means-not-yet-recorded
-                # contract as dead_lettered_clusters above.
+                # Clusters skipped because the re-fold matched the active summary byte for byte. None means not recorded yet, not zero.
                 "unchanged_clusters": (
                     int(r["unchanged_clusters"])
                     if r and r["unchanged_clusters"] is not None else None),
-                # Singleton-component deferrals (operator ruling 2026-08-16) —
-                # latest count of clusters excluded from `eligible_clusters`
-                # because their judgement reach was exactly 1 (one-judgement
-                # reach cannot fold an insight) and never attempted. Same
-                # None-means-not-yet-recorded contract as dead_lettered_clusters
-                # above.
+                # Left out of eligible_clusters because judgement reach was exactly 1, so no insight can fold. None means not recorded yet, not zero.
                 "singleton_clusters": (
                     int(r["singleton_clusters"])
                     if r and r["singleton_clusters"] is not None else None),
-                # AR-01 (v0.8.75): latest recorded truncation_failures/
-                # slot_failures, same None-means-not-yet-recorded contract as
-                # dead_lettered_clusters above — a protocol failure (slot_failed)
-                # is now as visible as a capacity one (truncation_failed) always
-                # should have been.
+                # Latest truncation and slot failures. None means not recorded yet. A slot failure is a protocol miss, not only a capacity one.
                 "truncation_failures": (
                     int(r["truncation_failures"])
                     if r and r["truncation_failures"] is not None else None),
@@ -9335,16 +8510,12 @@ class MemoryCoordinator:
                 # Why the most-recent deferral happened (None if never deferred);
                 # only meaningful when last_outcome == "deferred".
                 "last_deferred_reason": (r["last_deferred_reason"] if r else None),
-                # Per-type cost + throughput. cycle_seconds_avg is the mean of
-                # COMPLETED runs in the last 24h — the per-type price a slot
-                # allocator needs; the whole-cycle timer cannot supply it.
+                # Mean of completed runs in 24h. The whole-cycle timer cannot price one cycle type.
                 "cycle_seconds_avg": (
                     round(float(r["cycle_seconds_avg"]), 1)
                     if r and r["cycle_seconds_avg"] is not None else None),
                 "runs_24h": int(r["runs_24h"]) if r and r["runs_24h"] is not None else 0,
-                # Non-runs, reported separately so runs_24h stays a price the
-                # slot allocator can divide by: the cycle was due and skipped
-                # (deferred), or its gate ran and found nothing (idle).
+                # Kept out of runs_24h so that count stays divisible. Deferred means skipped; idle means the gate found nothing.
                 "deferred_24h": (
                     int(r["deferred_24h"]) if r and r["deferred_24h"] is not None else 0),
                 "idle_24h": int(r["idle_24h"]) if r and r["idle_24h"] is not None else 0,
@@ -9354,9 +8525,7 @@ class MemoryCoordinator:
                 "folds_attempted_24h": (
                     int(r["folds_attempted_24h"])
                     if r and r["folds_attempted_24h"] is not None else 0),
-                # AR-01: 24h sums, same zero-means-none-occurred contract as the
-                # folds_* pair above (unlike the latest-value keys, absence over
-                # a real window is a true zero, not missing evidence).
+                # Sums over 24h. Unlike the latest-value keys, absence in a real window is zero, not missing evidence.
                 "truncation_failures_24h": (
                     int(r["truncation_failures_24h"])
                     if r and r["truncation_failures_24h"] is not None else 0),
@@ -9567,9 +8736,7 @@ class MemoryCoordinator:
                 rec = await res.single()
                 stuck_ids = set((rec["stuck_ids"] if rec else None) or [])
 
-        # O2 counts LEDGER ROWS (decision:1181: "open insight-kind ledger
-        # rows whose judgement nodes are still consolidated=true"), not
-        # distinct pg_ids — a pg_id can carry more than one open row.
+        # decision:1181: count open insight-kind ledger rows whose judgements are still consolidated, not distinct pg_ids. One pg_id can hold more than one open row.
         stuck_row_count = 0
         if stuck_ids:
             async with self._acquire() as conn:
@@ -9760,44 +8927,27 @@ class MemoryCoordinator:
         while True:
             try:
                 full = await self._compute_consolidation_health()
-                # Probe the GPU here (background, ~CONSOLIDATION_HEALTH_REFRESH_SEC)
-                # so /health reads a cached value and never shells out to nvtop per
-                # request. Tri-state: "unknown" when nvtop is absent — surfaced as-is
-                # so the monitor never shows a false "idle".
+                # Probe here so /health reads a cache and never shells out per request. unknown stays unknown, not a false idle.
                 inference_busy = await inference_busy_state()
-                # Graph integrity rides the same background refresh (decision
-                # 928) so /health stays a cached read and never queries Neo4j
-                # per request. Only the COUNT is carried here — the by_reason /
-                # by_label breakdown stays on /memory/telemetry, which is
-                # auth-scoped and already heavier.
+                # decision 928: refresh with the rest of the cache so /health never queries Neo4j per request. Only the count is carried; the breakdown stays on telemetry.
                 try:
                     integrity = await self._graph_integrity()
                     invalid_nodes = integrity["invalid_nodes"]
                 except Exception:
-                    # Never let an integrity probe blank the whole snapshot and
-                    # report the system as unknown — the same tolerance the
-                    # roll-up keys get below.
+                    # A failed integrity probe must not blank the snapshot and report the system as unknown.
                     invalid_nodes = None
                 try:
                     domain_identity = await self._domain_identity_health()
                 except Exception:
-                    # Same tolerance, same reason as the project probe below: a
-                    # metric about registry drift must never present as a
-                    # stalled system.
+                    # Registry drift must not present as a stalled system.
                     domain_identity = None
                 try:
                     project_identity = await self._project_identity_health()
                 except Exception:
-                    # Same tolerance, and the same reason it must be guarded at
-                    # all: a probe that raises inside the refresher would take
-                    # the whole cached snapshot down with it, so a metric about
-                    # an incomplete upgrade would present as a stalled system.
+                    # An incomplete upgrade must not present as a stalled system if this probe raises.
                     project_identity = None
                 try:
-                    # probe_status() is pure module state (fact:1645) -- this
-                    # can't actually raise today, but it shares the module with
-                    # inference_busy_state() above, so it gets the same
-                    # tolerance as its three siblings rather than a bare call.
+                    # fact:1645: probe_status is pure module state and does not raise today. It still shares this guard so one probe cannot blank the snapshot.
                     gpu_probe = probe_status()
                 except Exception:
                     gpu_probe = None
@@ -9808,12 +8958,7 @@ class MemoryCoordinator:
                     "domain_identity": domain_identity,
                     "last_outcome": full["last_outcome"],
                     "last_success_age_seconds": full["last_success_age_seconds"],
-                    # Which type the headline age belongs to, and who is
-                    # actually stalled — without these two the compact /health
-                    # snapshot cannot be read correctly when the types disagree.
-                    # Read tolerantly: a missing roll-up key must degrade this
-                    # one field, never abort the refresh and blank the whole
-                    # snapshot (which would report the system as unknown).
+                    # Which cycle the headline age belongs to, and which type is stalled. A missing key degrades this field and must not blank the snapshot.
                     "last_success_cycle_type": full.get("last_success_cycle_type"),
                     "stalled_types": full.get("stalled_types", []),
                     "inference_busy": inference_busy,
@@ -9823,19 +8968,11 @@ class MemoryCoordinator:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                # Never let the snapshot assert a stall on a compute failure —
-                # mark it stale so a reader can tell it is not current. Keep the
-                # prior inference_busy rather than inventing "idle" on failure.
+                # Mark the snapshot stale instead of asserting a stall. Keep the previous inference_busy rather than inventing idle.
                 log.warning("consolidation health refresh failed: %s", exc)
                 self._consolidation_health = {**self._consolidation_health, "fresh": False}
 
-            # ── The dependency snapshot (v0.9.74) ────────────────────────────
-            # Its own try/except, NOT folded into the block above: a failing
-            # Postgres probe must not blank the consolidation snapshot, and a
-            # failing consolidation rollup must not blank the liveness enums.
-            # Each sub-probe is guarded on its own for the same reason — this is
-            # the block that answers "is anything up", and it is worth nothing
-            # if one dead component can take the whole answer down with it.
+            # Its own try. A dead Postgres probe must not blank consolidation, and a dead rollup must not blank the liveness enums.
             try:
                 postgres = await self._probe_postgres()
                 neo4j = await self._probe_neo4j()
@@ -9849,13 +8986,7 @@ class MemoryCoordinator:
                 except Exception:
                     rem = None
                 try:
-                    # ⭐ MOVED OUT OF THE REQUEST PATH (B4, measured 2026-08-28
-                    # on this corpus): the insight walk is 149 SEQUENTIAL Neo4j
-                    # round-trips — 8 gating groups at density>=3, each walked
-                    # over 9-26 BFS layers — and the walk is unbounded by
-                    # construction (I3: no hop cap, no edge cap). It grows with
-                    # the corpus, so no per-request cap would be honest either.
-                    # Computed here, served from cache with `as_of`.
+                    # Off the request path. The insight walk is unbounded sequential Neo4j hops and grows with the corpus, so it is cached with as_of.
                     nrem = await self._nrem_cycle_counts()
                 except Exception as exc:
                     nrem = {"error": str(exc)}
@@ -9897,13 +9028,7 @@ class MemoryCoordinator:
         top level and the shipped gateway service does not carry psycopg2;
         see the v0.8.65 nrem-telemetry-gauge fix this pattern follows).
         """
-        # Neo4j: the SAME graph-native walk consolidation_loop's
-        # _find_grounded_fact_groups folds on — GROUNDED_IN -> DOMAIN_OF ->
-        # PROJECT_OF, never MENTIONS/Entity. project/domain now come straight
-        # off these graph edges, so no separate Postgres round-trip is needed
-        # to resolve them (a DOMAIN_OF/PROJECT_OF edge only exists for a
-        # REGISTERED section — coordinator._domain_identities never writes one
-        # otherwise — so edge presence already proves registration).
+        # The same walk the fold uses: GROUNDED_IN, then DOMAIN_OF, then PROJECT_OF, never MENTIONS. An edge exists only for a registered section, so presence already proves registration.
         async with self._neo4j.session() as session:
             fres = await session.run(
                 f"MATCH (j) WHERE j:{ONT.decision} OR j:{ONT.retrospective}"
@@ -9931,22 +9056,13 @@ class MemoryCoordinator:
             registered_sections.add((r["project"], r["domain"]))
         pg_ids_all = list(project_map)
 
-        # `fact_cycles` IS the fact gate now — there is no second level to sum
-        # it against (v2, C1/C1b). A separate, always-equal
-        # "domain_level_cycles" field would be a duplicate a future reader
-        # could wrongly assume differs; one number, named for what it
-        # measures.
+        # This is the fact gate. A second always-equal domain_level_cycles field would look like a different number.
         fact_cycles = count_domain_level_cycles(
             pg_ids_all, project_map, domains_map,
             ONT.density_threshold, registered_sections,
         ) if pg_ids_all else 0
 
-        # decision_cycles (v2, C2): count GATING groups, not decisions. G1's
-        # groups (density >= ONT.density_threshold) are the same call
-        # fact_cycles makes; each is then walked (I3: undirected, unbounded,
-        # over the closed relation set) and G2+G3 checked on its full reach —
-        # one small Neo4j round-trip per candidate group (order 1-5 groups on
-        # this corpus), acceptable for a periodic health-refresh gauge.
+        # Count gating groups, not decisions. Each candidate is one small walk on the refresh, not on the request.
         groups = eligible_domain_level_clusters(
             [""] * len(pg_ids_all), pg_ids_all, project_map, domains_map,
             ONT.density_threshold, registered_sections,
@@ -10027,10 +9143,7 @@ class MemoryCoordinator:
         """
         async with self._acquire() as conn:
             row = await conn.fetchrow(
-                # The regex guard makes the cast SAFE: `ts` is written by one
-                # code path as a float, but this column is JSONB on a table with
-                # rows older than that writer, and one unparseable value would
-                # abort the whole query rather than skip a row.
+                # The regex makes the cast safe. One older unparseable JSONB value would abort the query instead of skipping the row.
                 "SELECT count(*)::int AS n FROM technical_docs"
                 " WHERE rem_timing IS NOT NULL"
                 f"   AND rem_timing->>'ts' ~ '{REM_TS_NUMERIC_RE}'"
@@ -10077,11 +9190,7 @@ class MemoryCoordinator:
             "as_of": self._registry_census_as_of,
             # The SEARCH-path counter: a filter that could not be resolved.
             "read_failures_total": self._axis_registry_read_failures,
-            # The CENSUS counter, deliberately separate. A failed census means
-            # this telemetry is stale; a failed axis read means a SEARCH
-            # silently answered from the literal string. Same subsystem, two
-            # different consequences, and summing them would let an operator
-            # read a stale gauge as a broken retrieval path.
+            # Separate from axis-read failures. A stale census and a search that answered from the literal string are not the same fault.
             "census_failures_total": self._registry_census_failures,
             "refusals": self._registry_refusals.snapshot(),
         }
@@ -10152,10 +9261,7 @@ class MemoryCoordinator:
             "inflight": _inflight,
             "inflight_max": GATEWAY_INFLIGHT_MAX,
             "shed_503_total": _gateway_shed_503_total,
-            # D9 (OBS round): incremented from hive_mind_proxy.py via
-            # record_llm_client_disconnect() — see that function's docstring
-            # for why the counter is stored here rather than assembled on
-            # the proxy side.
+            # Incremented from record_llm_client_disconnect. A client abort is not a backend fault, so it is counted under gateway.
             "client_disconnects_total": _gateway_client_disconnects_total,
         }
 
@@ -10176,22 +9282,13 @@ class MemoryCoordinator:
                 "SELECT COALESCE(metadata->>'source','(none)') AS key,"
                 " count(*)::int AS count FROM technical_docs GROUP BY 1 ORDER BY count DESC LIMIT 12"
             )
-            # ⚠ THE AXIS BREAKDOWNS GET THEIR OWN, LARGER LIMIT. `agents` and
-            # `sources` are unbounded populations where a top-12 IS the answer.
-            # Projects and domains are REGISTRY-BACKED: truncating them below
-            # the number of registered entries silently hides whole sections,
-            # and a reader has no way to tell a section with no records from a
-            # section that fell off the end of a LIMIT. Live 2026-08-28: 38
-            # projects and 15 distinct domain names in use against a top-12.
+            # Projects and domains are registry-backed, so a top-12 hid whole sections. Agents and sources stay at 12 because those populations are unbounded.
             projects = await conn.fetch(
                 f"SELECT COALESCE({PROJECT_SQL}, '(none)') AS key,"
                 " count(*)::int AS count FROM technical_docs"
                 " GROUP BY 1 ORDER BY count DESC LIMIT $1", BREAKDOWN_AXIS_TOP_N
             )
-            # ⚠ THE REAL DOMAIN DISTRIBUTION (0.9.74). `domains` is a JSON ARRAY
-            # on the record — one record belongs to several sections — so the
-            # counts here SUM TO MORE than the record count, unlike every other
-            # breakdown in this payload. That is the axis, not a defect.
+            # domains is an array, so one record belongs to several sections and these counts sum past the record count.
             domains = await conn.fetch(
                 "SELECT d AS key, count(*)::int AS count"
                 "  FROM technical_docs,"
@@ -10220,11 +9317,7 @@ class MemoryCoordinator:
             "record_types": kv(record_types),
             "agents": kv(agents),
             "sources": kv(sources),
-            # ⚠ `domains` CHANGED MEANING IN 0.9.74 (enumerated in
-            # telemetry_contract.MEANING_CHANGES, per fact:1626). It used to
-            # carry the PROJECT distribution — it was built from PROJECT_SQL,
-            # under a name that said domain. The project distribution now has
-            # its own correct name; `domains` finally means domains.
+            # fact:1626: domains used to be built from PROJECT_SQL. The project distribution now has its own name, and domains means domains.
             "projects": kv(projects),
             "domains": kv(domains),
             "records_with_domains": coverage["records_with_domains"],
@@ -10235,10 +9328,7 @@ class MemoryCoordinator:
             ],
         }
 
-    # Anticipated ADR-017 alias edge type. Kept as a literal (a valid Cypher
-    # identifier) until ADR-017 lands and formalises it in ontology.yaml; MATCHing
-    # a relationship type that doesn't exist yet returns 0, not an error — so this
-    # honestly reads 0 alias edges today rather than failing.
+    # A literal until ADR-017 names it in the ontology. Matching a type that does not exist yet returns 0, not an error.
     _ALIAS_REL = "ALIASES"
 
     async def _entity_graph(self) -> dict:
@@ -10377,11 +9467,7 @@ class MemoryCoordinator:
         total = sum(r["c"] for r in rows)
 
         def _rollup(key: str, fallback: str) -> dict:
-            # SUM per key — the query groups by (label, reason), so one label
-            # spans several reasons and vice versa. Building the dict directly
-            # from the rows would let a later row overwrite an earlier one and
-            # silently UNDER-report the defect, which is the one direction an
-            # integrity metric must never fail in.
+            # Sum per key. The query groups by label and reason, so a direct dict would let a later row overwrite an earlier one and under-report.
             acc: dict[str, int] = {}
             for r in rows:
                 acc[r[key] or fallback] = acc.get(r[key] or fallback, 0) + r["c"]

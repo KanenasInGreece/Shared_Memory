@@ -1,24 +1,7 @@
--- Migration 038: drop the relation adjudication ledger.
---
--- Migration 020 created `relation_adjudications` as the calibration substrate
--- for machine-minted relation edges: every machine verdict landed here with its
--- quantitative signals, the operator labelled a stratified sample, and
--- per-family reliability curves decided whether that family's edges could feed
--- synthesis.
---
--- Nothing mints a machine-asserted edge any more, so nothing is scored,
--- calibrated, reviewed or labelled: the ledger has no writer and no reader.
--- Synthesis consumes the operator's first-write edges (and legacy unstamped
--- ones) directly.
---
--- Dropping the table also drops the objects 020 built ON it — the BIGSERIAL
--- primary key's sequence and the three indexes below — but each is named
--- explicitly here so a reader of this file can see exactly what leaves, and so
--- a partially-applied 020 still converges. 020 created no trigger and no
--- function.
---
--- IDEMPOTENT: apply.py re-runs the whole chain; every statement is a no-op once
--- the objects are gone.
+-- Migration 038: nothing mints machine-asserted relation edges anymore, so
+-- the calibration ledger from 020 has no writer and no reader. The sequence
+-- and indexes are named so a partial 020 still converges. 020 created no
+-- trigger or function.
 
 BEGIN;
 

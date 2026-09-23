@@ -39,16 +39,13 @@ VERSION = "0.9.112"
 # Must match GET /health api_version; v4 refuses unregistered project on fact save.
 API_VERSION = 4
 
-# Retrospective outcome-state ratings — MUST mirror ontology.RETRO_RATINGS on
-# the gateway (the thin client never imports server modules). Outcome STATES,
-# not valence: 'reversed' drives the supersession cascade; nuance goes in notes.
+# Must mirror ontology.RETRO_RATINGS on the gateway; this client never imports server modules.
+# Outcome states, not valence: 'reversed' drives the supersession cascade; nuance goes in notes.
 RETRO_RATINGS = ("validated", "mixed", "refined", "pending", "reversed")
 CLIENT_VERSION_HEADER = "X-SM-Api-Version"
-# This client's own FRAMEWORK VERSION, distinct from the wire API_VERSION: two
-# clients can speak api_version 4 while one of them is forty releases behind on
-# behaviour, and only this header tells them apart. The gateway counts it as
-# `clients.versions_seen` so a fleet-wide version skew is observable at all —
-# before 0.9.74 nothing on either side recorded the caller's build.
+# Framework build, distinct from the wire API_VERSION. Two clients can share api_version 4 and
+# still be releases apart.
+# The gateway counts this header as clients.versions_seen so that skew is visible.
 CLIENT_BUILD_HEADER = "X-Shared-Memory-Client"
 
 # Only this skill's scripts/.env then ../.env; never walk toward $HOME.
@@ -56,59 +53,25 @@ _ENV_CANDIDATES = [
     os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"),
     os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env"),
 ]
-# SECURE_ENV_FILE — same contract as the server loader (secure_env.
-# _select_env_file): a path names the EXACT env file this process loads, the
-# empty string loads none at all (the test suite's hermeticity pin — in admin
-# mode candidate 2 IS the live gateway .env, and importing this module from a
-# test would otherwise setdefault its config, LLM_BACKENDS_JSON included,
-# into the whole process's os.environ), and unset keeps the candidate walk.
+# SECURE_ENV_FILE matches secure_env._select_env_file: a path is the exact file, empty loads
+# none, unset keeps the walk.
+# Empty is the test pin. In admin mode the second candidate is the live gateway .env, and
+# importing it would setdefault secrets into os.environ.
 _secure_env_file = os.environ.get("SECURE_ENV_FILE")
 if _secure_env_file is not None:
     _ENV_CANDIDATES = [_secure_env_file.strip()] if _secure_env_file.strip() else []
 
-# AGENT_TOKEN is read into a private variable and NEVER exported into this
-# process's own os.environ (A1-deferred, S-18 follow-up): the client used to
-# load its whole .env — AGENT_TOKEN included — into os.environ, the same
-# "secret sitting in a long-lived process's own environment" class PR A1
-# closed server-side (visible via this process's own /proc/<pid>/environ
-# and to any child it might exec). An operator's own real
-# `export AGENT_TOKEN=...` still wins — checked FIRST, before any file is
-# parsed, mirroring secure_env.get_secret()'s precedence on the gateway.
-# _AGENT_TOKEN_FROM_FILE is populated once below, from the file only, and
-# is the seam tests use to neutralise a real on-disk .env during isolated
-# runs (monkeypatch.setattr(memory_bridge, "_AGENT_TOKEN_FROM_FILE", "")).
+# AGENT_TOKEN stays in this private variable and is never copied into os.environ, where /proc
+# and child processes would see it.
+# An operator export still wins, checked before any file. Tests clear _AGENT_TOKEN_FROM_FILE to
+# ignore a real on-disk .env.
 _AGENT_TOKEN_FROM_FILE = ""
 
-# Required fix (A2 security review, finding 7): a small, standalone mirror
-# of secure_env.is_secret_key() (the GATEWAY's classification) -- duplicated
-# rather than imported, because this client ships alone and must never
-# depend on a server-only module (Group 1: the client/server surface
-# split). Candidate 2 (_ENV_CANDIDATES[1], the skill root .env) IS the
-# gateway .env when this same file is invoked in admin mode from the repo
-# root, so without this predicate PG_PASSWORD/NEO4J_PASSWORD/AGENT_TOKENS/
-# every provider key would land in setdefault() below and leak into this
-# client process's own os.environ -- the identical class of leak S-18
-# already closed for AGENT_TOKEN specifically, one level broader. AGENT_TOKEN
-# itself is exempt here: it keeps its own dedicated _AGENT_TOKEN_FROM_FILE
-# path above, never routed through os.environ either way. Everything else
-# this predicate catches is simply skipped -- the client has no use for any
-# of these values, so unlike the server there is no config-name allowlist
-# carve-out and no dynamic token_env discovery to widen it.
-#
-# R6 (fix round 1, Opus review, probe-confirmed): this "mirror" had drifted
-# from what it mirrors. secure_env.KNOWN_SECRET_NAMES gained PG_CONN in
-# secure_env's OWN review round (a full DSN embeds the Postgres password
-# verbatim -- postgresql://postgres:<pw>@host/db) and _SECRET_SUFFIXES was
-# widened past _PASSWORD/_TOKEN/_API_KEY to also catch _SECRET/_KEY/
-# _CREDENTIAL(S) -- neither change was ever brought over here. Probe-
-# confirmed live: PG_CONN, a DEEPSEEK_SECRET-suffixed name, and an
-# OPENROUTER_CREDENTIAL-suffixed name all landed in THIS client's own
-# os.environ from a scratch shared-memory/.env with the environment
-# pre-cleared -- exactly the class S-18/A2 finding 7 closed, reopened by
-# drift. Both sets below are now IN SYNC with secure_env.py's own
-# KNOWN_SECRET_NAMES / _SECRET_SUFFIXES; keep them that way (a contract test
-# -- test_client_secret_mirror_parity.py -- pins the two lists against each
-# other so the next drift fails loudly instead of needing a probe to find).
+# Duplicated from secure_env.is_secret_key because this client ships alone. Admin mode's second
+# candidate is the gateway .env, so a missed name leaks into os.environ; AGENT_TOKEN stays on
+# its own path.
+# test_client_secret_mirror_parity.py pins these lists to the server copies, including PG_CONN
+# and the _SECRET/_KEY/_CREDENTIAL suffixes.
 _CLIENT_KNOWN_SECRET_NAMES = {
     "PG_PASSWORD", "NEO4J_PASSWORD", "TAVILY_API_KEY", "AGENT_TOKENS",
     "BACKUP_ADMIN_TOKEN", "PG_CONN",
@@ -200,38 +163,24 @@ def _read_env_file(path: str) -> None:
     uses and are not supported."""
     global _AGENT_TOKEN_FROM_FILE
     try:
-        # utf-8-sig (D.3, ADV1-20): aligns this parser's file encoding with
-        # mcp/vector-skill.py's own — a file saved as UTF-8-with-BOM otherwise
-        # decodes a leading U+FEFF onto the FIRST key, which the per-key
-        # normalisation below also catches (belt and braces) but should not
-        # have to rely on alone.
+        # utf-8-sig, matching mcp/vector-skill.py: a BOM would stick to the first key, and later
+        # normalisation must not be the only catch.
         with open(path, encoding="utf-8-sig") as _f:
             for _line in _f:
                 _line = _line.strip()
                 if not _line or _line.startswith("#") or "=" not in _line:
                     continue
                 _k, _, _v = _line.partition("=")
-                # F5 (SEC1 HIGH-3/MED-5): strip an optional leading
-                # "export "/"EXPORT " prefix before classification —
-                # without this, the stored key for an "export
-                # AGENT_TOKENS=..." line was the literal "export
-                # AGENT_TOKENS", matching neither the AGENT_TOKEN
-                # diversion nor _is_client_secret_key's exact-name list,
-                # exporting the registry straight into os.environ.
+                # Strip a leading export before classification, or "export AGENT_TOKENS" matches
+                # neither secret check and lands in os.environ.
                 _k = _strip_export_prefix(_k).strip()
                 _v = _strip_balanced_quotes(_v.strip())
                 if not _k:
                     continue
-                # D.3 (SEC round, ADV1-1/H-1 twin fix — mirrors
-                # mcp/vector-skill.py's _load_env_manually exactly): key_norm
-                # is computed ONCE per key and used for BOTH the AGENT_TOKEN
-                # diversion check AND the _is_client_secret_key() call. Two
-                # checks that normalise differently (one case-sensitive, one
-                # upper-cased) let a lowercase `agent_token=` or a
-                # BOM-prefixed key slip past one but not the other, in either
-                # order. `_k` — never `_k_norm` — is what gets exported when
-                # the key isn't filtered: this only changes what counts as
-                # secret/AGENT_TOKEN, never the exported name's casing.
+                # One normalisation for both the AGENT_TOKEN check and the secret check,
+                # matching mcp/vector-skill.py.
+                # Export _k, not _k_norm: this changes what counts as secret, never the stored
+                # name's casing.
                 _k_norm = _client_key_norm(_k)
                 if _k_norm == "AGENT_TOKEN":
                     if not _AGENT_TOKEN_FROM_FILE:
@@ -251,7 +200,8 @@ for _env in _ENV_CANDIDATES:
 COORDINATOR_BASE = os.environ.get("COORDINATOR_URL", "http://localhost:8888")
 AGENT_ID         = os.environ.get("AGENT_ID", "memory_bridge")
 
-# Search wait is derived from /health backend_capability (and capacity when present), not a fixed 30s (fact:1112).
+# Search wait is derived from /health backend_capability (and capacity when present), not a
+# fixed 30s (fact:1112).
 HEALTH_PROBE_TIMEOUT_S    = float(os.environ.get("HEALTH_PROBE_TIMEOUT_S", "3"))
 SEARCH_TIMEOUT_S          = float(os.environ.get("SEARCH_TIMEOUT_S", "0") or 0)
 SEARCH_TIMEOUT_FLOOR_S    = float(os.environ.get("SEARCH_TIMEOUT_FLOOR_S", "30"))
@@ -260,9 +210,8 @@ SEARCH_TIMEOUT_FALLBACK_S = float(os.environ.get("SEARCH_TIMEOUT_FALLBACK_S", "1
 SEARCH_SAFETY_FACTOR      = float(os.environ.get("SEARCH_SAFETY_FACTOR", "1.5"))
 SEARCH_OVERHEAD_S         = float(os.environ.get("SEARCH_OVERHEAD_S", "15"))
 
-# Markers that identify a project root, in priority order. `.git` first because a
-# repository root is the least ambiguous boundary; the agent-instruction files are
-# the fallback for project directories that are not repositories.
+# Names that mark a project root. Any match stops the walk; `.git` is the least ambiguous, and
+# the instruction files cover directories that are not repositories.
 PROJECT_ROOT_MARKERS = tuple(
     m for m in os.environ.get(
         "PROJECT_ROOT_MARKERS", ".git,CLAUDE.md,AGENTS.md,GEMINI.md"
@@ -300,8 +249,8 @@ def derive_project(start: str | None = None) -> str:
     home = os.path.abspath(os.path.expanduser("~"))
 
     while True:
-        # $HOME itself is a boundary, not a project: it commonly holds a CLAUDE.md
-        # and would otherwise tag every stray save with the account name.
+        # $HOME is a boundary, not a project: it often holds a CLAUDE.md and would tag every
+        # stray save with the account name.
         if cur == home:
             return ""
         if any(os.path.exists(os.path.join(cur, m)) for m in PROJECT_ROOT_MARKERS):
@@ -367,9 +316,8 @@ def search_ceiling(capability: dict | None, capacity: dict | None = None) -> flo
     if not probed:
         derived = SEARCH_TIMEOUT_FALLBACK_S
     else:
-        # Postgres vector search, the graph traversal and response assembly sit
-        # outside both probes, so they are ADDED rather than scaled — they do
-        # not grow with encoder throughput.
+        # Vector search, the graph walk, and response assembly sit outside both probes, so that
+        # overhead is added rather than scaled with encoder throughput.
         floor = SEARCH_TIMEOUT_FALLBACK_S if unknown else SEARCH_TIMEOUT_FLOOR_S
         derived = max(floor, projected * SEARCH_SAFETY_FACTOR + SEARCH_OVERHEAD_S)
 
@@ -390,11 +338,10 @@ def search_ceiling(capability: dict | None, capacity: dict | None = None) -> flo
 
 _CAPABILITY_CACHE: dict | None = None
 _CAPACITY_CACHE: dict | None = None
-# CQ-03 (PR #310 review): guards the fetch-and-fill below against the race
-# where two searches start in the same instant, both see an empty cache, and
-# both fire a /health request. Module-level construction is safe without a
-# running loop on the Python versions this project targets — the gateway's
-# own equivalent (hive_mind_proxy._health_probe_lock) does the same.
+# Two searches can both see an unfilled cache and both call /health; the lock makes one fill
+# win.
+# Constructed at import: asyncio.Lock() does not need a running loop on the Python versions this
+# project targets.
 _HEALTH_FETCH_LOCK = asyncio.Lock()
 
 
@@ -525,9 +472,8 @@ def _append_log(tool: str, min_level: int, event: str, data: dict, content: str 
                     f"content is {len(content.encode())} bytes"
                     " — reduce log level to avoid large logs"
                 )
-        # Create 0600 if absent and tighten an existing world-readable file —
-        # logs may carry agent activity; keep them owner-only. (merge_logs rotates
-        # these per-tool logs daily; the gateway-side logs use log_hygiene.)
+        # Logs may carry agent activity, so create them 0600 and tighten a world-readable file.
+        # merge_logs rotates these; gateway logs use log_hygiene.
         log_path = os.path.join(log_dir, f"{tool}.log")
         if not os.path.exists(log_path):
             os.close(os.open(log_path, os.O_CREAT | os.O_WRONLY, 0o600))
@@ -578,23 +524,17 @@ def _body_snippet(r, limit: int = 200) -> str:
     replace a diagnosis with a traceback.
     """
     try:
-        # Same hazard as _gateway_message: this is gateway-controlled text on
-        # its way to a terminal or log — strip control characters before the
-        # whitespace collapse and the cap (the non-JSON error page is exactly
-        # the attacker-shaped body this path exists for).
+        # Gateway-controlled text, including a non-JSON error page, is heading for a terminal or
+        # log, so strip controls before collapsing and capping it.
         return " ".join(_clean_gateway_text(r.text or "").split())[:limit]
     except Exception:
         return ""
 
 
-# The gateway's own words are reflected into this agent's audit log and into
-# the operator's terminal — and COORDINATOR_BASE is an env-overridable default,
-# so the endpoint that produced them is not axiomatically trusted. Two limits
-# apply before the string is used anywhere.
-#
-# MEASURED, not guessed: the longest message any deployed middleware refusal
-# emits is 378 characters, so a 600-character cap preserves every legitimate
-# message whole and truncates only a body no deployed path can produce.
+# Gateway text reaches the audit log and the terminal, and COORDINATOR_BASE is env-overridable,
+# so it is not trusted.
+# 600 keeps the longest deployed refusal (378 characters) whole and cuts only a body no deployed
+# path emits.
 _GATEWAY_MESSAGE_MAX = 600
 
 
@@ -638,19 +578,16 @@ def _gateway_message(r) -> str | None:
 def _reply_json(r, *, log_auth: bool = False,
                 accept_status: tuple = ()) -> dict:
     """Decode JSON only after the status class is known; pass accept_status to keep a non-2xx body (fact:1503)."""
-    # ONE name for the line written and the line reported: the event the catch
-    # block is told about IS the event this branch wrote, never a second literal
-    # that could drift away from it.
+    # The catch block is told the event name this branch just wrote, so a second literal cannot
+    # drift away from the audit line.
     if r.status_code == 401:
         logged = "auth_failed" if log_auth else None
         if logged:
             _append_log("memory_bridge", 2, logged, _auth_log_hint())
         raise GatewayReplyError(_auth_error(), logged_event=logged)
 
-    # The gateway's OWN words come FIRST, before this client's framing. Readers
-    # downstream truncate (postflight A5 slices a search error to 200 chars), and
-    # a preamble long enough to push the actual refusal past the cut restores the
-    # defect one level up — the operator still cannot see WHY.
+    # The gateway's own words come first. Downstream readers truncate (postflight slices a
+    # search error to 200 characters), and a long preamble hides the refusal.
     if r.status_code == 403:
         detail = _gateway_message(r) or _body_snippet(r)
         head = f"Gateway refused this request (HTTP 403): {detail}" if detail else \
@@ -702,8 +639,7 @@ def _coordinator_unavailable(exc: Exception, ceiling: float | None = None) -> di
     }
 
 
-ROLE_REPORTING_MIN_VERSION = "0.9.54"  # R2-01: the server half (agent/role
-# on authenticated /health) does not exist on 0.9.52 -- it ships in PR #311.
+ROLE_REPORTING_MIN_VERSION = "0.9.54"  # authenticated /health reports role from 0.9.54; 0.9.52 does not.
 
 
 def _gateway_predates(version: str | None, minimum: str = ROLE_REPORTING_MIN_VERSION) -> bool | None:
@@ -761,8 +697,8 @@ async def check_gateway_compat() -> dict:
             h = _reply_json(await client.get(f"{COORDINATOR_BASE}/health",
                                              headers=_request_headers()))
     except GatewayReplyError as exc:
-        # The gateway ANSWERED — `reachable` says so, or `doctor` would send the
-        # operator to restart a service that is running and merely refusing.
+        # The gateway answered. Marking this unreachable would send doctor to restart a service
+        # that is only refusing.
         return {"reachable": True, "error": exc.payload.get("message", str(exc)),
                 "compat": "unknown"}
     except Exception as exc:
@@ -777,11 +713,8 @@ async def check_gateway_compat() -> dict:
         "server_api_version": srv,
         "client_api_version": API_VERSION,
     }
-    # `agent`/`role` ride on the AUTHENTICATED /health payload (a server change
-    # this PR does not build) — sent here so doctor can surface them once a
-    # token is configured; an anonymous/older gateway simply omits both.
-    # `role`'s three-way diagnosis is `_role_diagnosis` — see its docstring
-    # (T-04, PR #310 review).
+    # agent and role are present only on authenticated /health; an anonymous or older gateway
+    # omits them. A missing role is read by _role_diagnosis.
     if "agent" in h:
         diag["agent"] = h.get("agent")
     diag["role"] = _role_diagnosis(h)
@@ -831,26 +764,13 @@ async def save_artifact(content: str, metadata_json: str = "{}") -> dict:
         _append_log("memory_bridge", 2, "bad_metadata_type", {"got": type(metadata).__name__, "content_preview": content[:100]}, content)
         return {"status": "error", "message": f"Metadata must be a JSON object, got {type(metadata).__name__}"}
 
-    # Derive the project tag when the caller supplied none. An explicit value always
-    # wins — this fills the gap, it does not override intent. Untagged facts are not
-    # merely untidy: the consolidation key falls back for them, so they fragment
-    # away from their own project's cluster and never reach a summary.
+    # Fill project only when the caller left it empty. An untagged fact uses the consolidation
+    # fallback, so it fragments away from its project's cluster and never reaches a summary.
     if not metadata.get("project"):
         derived = derive_project()
         if not derived:
-            # Second chance, and only a deterministic one: when the working
-            # directory is not inside any project root but the record cites an
-            # ABSOLUTE path, that path is itself evidence of where the record
-            # belongs — walk up from it exactly as the cwd walk does.
-            #
-            # Its honest value is forward-looking: on this corpus it rescues 0 of
-            # 127 untagged records, because none of their refs are absolute. It is
-            # correct for records written from now on, and that is the whole claim.
-            #
-            # NO relative-prefix inference. A ref like "scripts/foo.py" names no
-            # filesystem location, so guessing a project from its first segment is
-            # the entity vote wearing a different hat — a plausible wrong project,
-            # which is worse than none.
+            # If the cwd is not a project, walk an absolute source_ref the same way. A relative
+            # ref names no location, and a guessed project is worse than none.
             ref = metadata.get("source_ref")
             if isinstance(ref, str) and os.path.isabs(ref):
                 derived = derive_project(os.path.dirname(ref))
@@ -867,14 +787,10 @@ async def save_artifact(content: str, metadata_json: str = "{}") -> dict:
             )
             result = _reply_json(r, log_auth=True)
     except GatewayReplyError as exc:
-        # ONE refused save is ONE audit line. A 401 was already written as
-        # `auth_failed` inside _reply_json, which is exactly what this path
-        # logged before the decode was centralised; adding `save_failed` behind
-        # it would double-count every rejected credential in the audit trail.
-        # Every OTHER class — 403, other 4xx, 5xx, a malformed 2xx — logs
-        # `save_failed` here, and that IS new signal: those replies used to be
-        # logged as `coordinator_down`, which was a lie about a gateway that
-        # had answered.
+        # A 401 was already logged as auth_failed inside _reply_json; a save_failed here would
+        # double-count it.
+        # Every other answered refusal logs save_failed. Those used to be recorded as
+        # coordinator_down, which was a gateway that had answered.
         if exc.logged_event is None:
             _append_log("memory_bridge", 2, "save_failed",
                         {"response": exc.payload, "content_preview": content[:100]}, content)
@@ -889,12 +805,9 @@ async def save_artifact(content: str, metadata_json: str = "{}") -> dict:
         _append_log("memory_bridge", 3, "save_success",
                     {"pg_id": pg_id, "source": metadata.get("source"), "entity_count": len(entities)},
                     content)
-        # What "unreachable by synthesis" MEANS depends on the record type, so the
-        # warning has to follow it. A fact mints its own topics, so an empty
-        # `entities` is the defect. A judgement mints none by design — it inherits
-        # from the facts it cites — so the equivalent defect is empty grounding,
-        # and warning `no_entities` there would fire on every decision saved
-        # exactly as instructed, training the operator to ignore the log.
+        # A fact with no entities never reaches synthesis. A decision or retrospective mints
+        # none and inherits topics from its grounding, so empty grounded_in is the defect there,
+        # not no_entities.
         if metadata.get("type") in ("decision", "retrospective"):
             if not metadata.get("grounded_in"):
                 _append_log("memory_bridge", 1, "no_grounding",
@@ -957,12 +870,12 @@ async def _search_payload(query: str, limit: int = 5, project: str = None,
     or this client's own error dict (`exc.payload` / `_coordinator_unavailable`
     already return one) — never the bare results list `search_and_rerank`
     unwraps it into."""
-    # Sized from the gateway's own published cost, never from a constant — the
-    # reranker dominates this call and its cost tracks the candidate payload.
+    # The reranker dominates this call and its cost tracks the payload, so the wait comes from
+    # the gateway's published ceiling, not a constant.
     ceiling = search_ceiling(await _gateway_capability(), await _gateway_capacity())
     body = {"query": query, "limit": limit, "agent_id": AGENT_ID}
-    # Additive only — an unfiltered call sends exactly what it always sent.
-    # A named place/time is a FILTER, not query text.
+    # Extra fields are filters, not query text. An unfiltered call must send the same body it
+    # always sent.
     if project:
         body["project"] = project
     if domains:
@@ -1079,13 +992,12 @@ def _search_argparser() -> "argparse.ArgumentParser":
                     "explicit override instead.",
     )
     p.add_argument("limit", nargs="?", type=int, default=5)
-    # Same flag pattern as save's --domain: repeatable, never comma-split,
-    # OR semantics at the gateway.
     p.add_argument("--project", default=None, metavar="NAME",
                    help="restrict to records BELONGING to this project — a "
                         "named place is a FILTER, not query text. An "
                         "unregistered name is not refused, it simply "
                         "matches nothing.")
+    # Repeatable and never comma-split, same as save's --domain. The gateway ORs the names.
     p.add_argument("--domain", action="append", default=None, metavar="NAME",
                    dest="domains",
                    help="restrict to records in this SECTION of the "
@@ -1115,9 +1027,8 @@ def _save_argparser() -> "argparse.ArgumentParser":
     p.add_argument("--supersedes", type=int, default=None,
                    help="pg_id of an existing fact this save supersedes "
                         "(soft-retire: old fact kept, flagged, hidden from search)")
-    # Repeatable, never comma-split. A separator that can occur inside a
-    # value is not a delimiter — the lesson --alternatives taught, applied
-    # before this surface can repeat it.
+    # Repeatable and never comma-split. A separator that can occur inside a section name is not
+    # a delimiter — the same trap --alternatives taught.
     p.add_argument("--domain", action="append", default=None, metavar="NAME",
                    help="a registered SECTION of this project, e.g. --domain "
                         "operations. REPEAT the flag for several; the value is "
@@ -1178,11 +1089,8 @@ def get_health_payload() -> dict | None:
     try:
         with _sync_client(HEALTH_PROBE_TIMEOUT_S) as client:
             r = client.get(f"{COORDINATOR_BASE}/health", headers=_request_headers())
-        # 503 IS ENUMERATED, not decoded blindly (fact:1503). /health answers
-        # 503 when an encoder is down, and that response carries the very
-        # verdict this function exists to render — treating it as an error
-        # would discard the payload in exactly the state an operator runs
-        # `status` to see. The decode stays inside _reply_json.
+        # /health answers 503 when an encoder is down, and that body is the verdict this
+        # renders, so 503 is kept rather than discarded (fact:1503).
         return _reply_json(r, accept_status=(503,))
     except Exception:
         return None
@@ -1200,17 +1108,14 @@ def _age_phrase(ts: str | None) -> str:
     try:
         when = datetime.fromisoformat(ts)
     except (ValueError, TypeError):
-        # TypeError, not just ValueError: a gateway that ever sends a non-string
-        # here (an epoch number, a nested object) must not take the whole status
-        # report down with it. This renderer is the operator's health dashboard —
-        # degrading one field beats denying the page. (Security review REV-04.)
+        # TypeError as well as ValueError: a non-string timestamp must not take down the status
+        # report. Render the field and continue.
         return str(ts)
     now = datetime.now(when.tzinfo) if when.tzinfo else datetime.now()
     delta = int((now - when).total_seconds())
     if delta < 0:
-        # Clock skew between gateway and client, or a backward time jump on the
-        # gateway after stamping. "-15s ago" reads as a bug in the framework;
-        # naming the cause is more useful than a negative number.
+        # A negative age is clock skew or a backward jump, not a framework bug, so name the
+        # cause instead of printing a negative.
         return f"{ts} (clock skew: stamp is {abs(delta)}s in the future)"
     return f"{delta}s ago"
 
@@ -1244,8 +1149,7 @@ def format_health_verdict(health: dict | None) -> list[str]:
             lines.append(f"    {name}: {d['state']}"
                          + (f" ({reason})" if reason else ""))
     else:
-        # Named rather than silent: "9 dependencies ok" is a measurement, and an
-        # empty section would read as "nothing was checked".
+        # Name the all-ok count. An empty section would read as nothing checked.
         lines.append(f"    all {len(deps)} dependencies ok")
     for w in warnings:
         if isinstance(w, dict):
@@ -1275,10 +1179,8 @@ def format_status(payload: dict, health: dict | None = None) -> str:
         _sup = pg.get('technical_docs_superseded', 0)
         lines.append(f"  technical_docs:      {pg.get('technical_docs','?')}"
                      + (f" (superseded {_sup})" if _sup else ""))
-        # The outbox is its own telemetry section, and a 12-key section is a
-        # dump, not a status line — so this renders the same four-count census
-        # the line has always shown. A count the gateway did not report is
-        # omitted rather than printed as 0: absence is not zero.
+        # Only the four census counts fit a status line. A count the gateway did not report is
+        # omitted, not printed as 0.
         _ob = t.get("outbox")
         _ob = _ob if isinstance(_ob, dict) else {}
         _census = {k: _ob[k] for k in ("pending", "applied", "rem_reviewed", "failed")
@@ -1294,16 +1196,14 @@ def format_status(payload: dict, health: dict | None = None) -> str:
                      f"unconsolidated {nj.get('facts_unconsolidated','?')}")
         lines.append(f"  decisions: {nj.get('decisions_total','?')} total | "
                      f"REM pending {nj.get('decisions_rem_pending','?')}")
-    # REM is its own section, computed independently of the graph census above,
-    # so it carries its own error branch — a failed Neo4j query must not take
-    # the enrichment verdict down with it, and vice versa.
+    # REM is computed apart from the graph census, so a Neo4j error and an enrichment error stay
+    # on their own lines.
     rem = t.get("rem", {})
     if "error" in rem:
         lines.append(f"  rem: ERROR {rem['error']}")
     else:
-        # Enrichment health: a record at the attempt cap is still counted as
-        # "REM pending" but has been dropped from REM's queue — without this
-        # line a dead-lettered backlog is indistinguishable from a waiting one.
+        # A record at the attempt cap still counts as REM pending but has left the queue, so a
+        # dead-lettered backlog needs its own line.
         _dead = rem.get("dead_lettered", 0) or 0
         _failing = rem.get("failing", 0) or 0
         if _dead or _failing:
@@ -1311,17 +1211,15 @@ def format_status(payload: dict, health: dict | None = None) -> str:
             lines.append(f"  REM enrichment: {_failing} retrying | "
                          f"{_dead} DEAD-LETTERED at {rem.get('max_attempts','?')} "
                          f"attempts{_warn}")
-        # Fairness gauge (decision 890, STEP 3) — ships dormant (both read 0
-        # until the solo backlog is large enough to re-exercise the
-        # batch-vs-solo yield path); only printed once either climbs above 0,
-        # matching the enrichment-health line's pattern above.
+        # Printed only once passed-over or starved climbs above zero; both stay 0 until the solo
+        # backlog is large enough to matter (decision 890).
         _passed_over = rem.get("passed_over", 0) or 0
         _starved = rem.get("starved_pending", 0) or 0
         if _passed_over or _starved:
             lines.append(f"  REM fairness: {_passed_over} passed-over event(s) | "
                          f"{_starved} record(s) at/above starvation threshold")
-    # Entity-graph shape (ADR-017). singletons = mentioned by one fact only
-    # (fragmentation proxy); aliases climb from 0 once the alias layer ships.
+    # Entity-graph shape (ADR-017). Singletons are entities mentioned by one fact, a
+    # fragmentation proxy.
     eg = t.get("entity_graph", {})
     if eg and "error" not in eg:
         _tot = eg.get("entities_total", 0) or 0
@@ -1330,9 +1228,8 @@ def format_status(payload: dict, health: dict | None = None) -> str:
                      f"| referenced {eg.get('genuinely_referenced_entities',0)}")
     elif "error" in eg:
         lines.append(f"  entities: ERROR {eg['error']}")
-    # Graph integrity — nodes REM retired because their label contradicted the
-    # record their id names. A WRITE-PATH defect, not a backlog: it does not
-    # drain on its own, so anything above 0 names a writer that needs fixing.
+    # Nodes REM retired because their label contradicted the record their id names. They do not
+    # drain, so a count above zero names a writer to fix.
     gi = t.get("graph_integrity", {})
     if gi and "error" not in gi:
         _bad = gi.get("invalid_nodes", 0) or 0
@@ -1351,21 +1248,19 @@ def format_status(payload: dict, health: dict | None = None) -> str:
                      f"(facts {nr.get('fact_cycles',0)}, decisions {nr.get('decision_cycles',0)})")
     elif "error" in nr:
         lines.append(f"  nrem: ERROR {nr['error']}")
-    # Inference/GPU-busy signal (tri-state). "unknown" = nvtop absent / SLOT_AWARE
-    # off — shown verbatim so the LLM is never reported falsely idle.
+    # Tri-state GPU signal. "unknown" (nvtop absent or SLOT_AWARE off) is shown verbatim so the
+    # LLM is never reported falsely idle.
     ib = t.get("inference_busy")
     if ib is not None:
         lines.append(f"  inference (LLM/GPU): {ib}")
-    # Consolidation liveness/coverage signal (ADR-018). stalled = eligible backlog
-    # but no fold succeeded within the threshold and nothing in-flight.
+    # Consolidation liveness (ADR-018): stalled means an eligible backlog, no fold within the
+    # threshold, and nothing in flight.
     cn = t.get("consolidation", {})
     if cn and "error" not in cn:
         age = cn.get("last_success_age_seconds")
         age_s = f"{age}s ago" if age is not None else "—"
-        # Name the cycle type behind the headline age and behind the stall.
-        # A bare "STALLED, last success 456107s ago" reads as "consolidation is
-        # dead" even when a sibling type folded minutes ago — it was one type's
-        # number wearing the whole system's label.
+        # Name the cycle type on the age. A bare stalled age reads as the whole system being
+        # dead when only one type is old.
         if cn.get("last_success_cycle_type"):
             age_s += f" ({cn['last_success_cycle_type']})"
         stalled_types = cn.get("stalled_types") or []
@@ -1386,10 +1281,8 @@ def format_status(payload: dict, health: dict | None = None) -> str:
                 parts.append(f"{c['consecutive_failures']} fails")
             if c.get("last_error"):
                 _err = c["last_error"]
-                # fact:1609 companion — a crash superseded by a later success
-                # is history, not a current condition (older gateways never
-                # send "superseded", so absence reads as "not superseded" —
-                # today's bare "err <class>" behaviour, unchanged).
+                # A crash superseded by a later success is history, not a current error. Older
+                # gateways omit "superseded", so absence stays the bare err line (fact:1609).
                 if _err.get("superseded"):
                     _err_age = _err.get("age_seconds")
                     _err_age_s = f"{_err_age}s ago" if _err_age is not None else "—"
@@ -1401,20 +1294,16 @@ def format_status(payload: dict, health: dict | None = None) -> str:
                 if c.get("eligible_oldest_age_seconds") is not None:
                     cov += f" (oldest {c['eligible_oldest_age_seconds']}s)"
                 parts.append(cov)
-            # Per-type cost + throughput: what this cycle type actually costs a
-            # slot, and what it returned for it. Only shown once the type has
-            # run in the window — a bare "0 folds" from no runs would read as
-            # failure rather than absence.
+            # Cost and folds are shown only after this type has run in the window. A zero from
+            # no runs would read as failure rather than absence.
             if c.get("runs_24h"):
                 thru = f"{c['runs_24h']} runs/24h"
                 if c.get("cycle_seconds_avg") is not None:
                     thru += f" avg {c['cycle_seconds_avg']}s"
                 thru += f", folds {c.get('folds_succeeded_24h', 0)}/{c.get('folds_attempted_24h', 0)}"
                 parts.append(thru)
-            # Non-runs, shown beside the run count so the rate cannot be read as
-            # the whole story: deferred = due but the slot was busy, idle = the
-            # gate ran and found nothing. Omitted when both are zero rather than
-            # printing noise on a healthy cycle.
+            # Deferred means the slot was busy; idle means the gate found nothing. Both zero is
+            # a healthy cycle, so that line is omitted.
             if c.get("deferred_24h") or c.get("idle_24h"):
                 parts.append(
                     f"non-runs {c.get('deferred_24h', 0)} deferred"
@@ -1422,16 +1311,10 @@ def format_status(payload: dict, health: dict | None = None) -> str:
             lines.append(f"    {ct}: " + ", ".join(parts))
     elif "error" in cn:
         lines.append(f"  consolidation: ERROR {cn['error']}")
-    # Credential custody (PR A3). The gateway has attached this section since
-    # v0.9.4 and nothing rendered it — telemetry is the only non-monitor
-    # surface a client sees, so an operator running `status` could not see a
-    # credential fault or a lost audit line without reading raw --json.
-    # Shown only when an attention signal is non-zero, matching the enrichment
-    # and fairness lines above: daemon token mints are routine (one per daemon
-    # per boot) and would be noise on every healthy run. Each count is printed
-    # with the age of its OWN last event — the counters reset with the gateway
-    # process, so a reader diffing polls instead would read a restart as "no
-    # failures ever".
+    # Credential failures are printed only when non-zero, same as the enrichment and fairness
+    # lines. A healthy run would otherwise be noise.
+    # Each count carries the age of its own last event. The counters reset on gateway restart,
+    # so a diff of polls would read that as no failures.
     cr = t.get("credentials", {})
     if cr and "error" not in cr:
         _tvf = cr.get("token_verify_failed", 0) or 0
@@ -1442,10 +1325,8 @@ def format_status(payload: dict, health: dict | None = None) -> str:
                          f"| last {_age_phrase(cr.get('token_verify_failed_last_ts'))} "
                          f"(since gateway start)")
         if _crd:
-            # Q-1 (PR A5 fix round): S-04's allowlist gate was otherwise
-            # invisible from the client surface — an operator watching
-            # `status` had no way to see it firing (Group-3 obligation:
-            # every refusal visible working AND failing).
+            # Allowlist denials are otherwise invisible on status, so a non-zero count is
+            # printed here.
             lines.append(f"  credentials: {_crd} credentialed-route denial(s) "
                          f"| last {_age_phrase(cr.get('credentialed_route_denied_last_ts'))} "
                          f"(since gateway start)")
@@ -1455,9 +1336,8 @@ def format_status(payload: dict, health: dict | None = None) -> str:
                          f"— the audit trail is incomplete")
     elif "error" in cr:
         lines.append(f"  credentials: ERROR {cr['error']}")
-    # Per-backend credential/transient faults (PR A3). `credential` is the
-    # fix-the-key signal (401/403/quota); `transient` retries on its own, so it
-    # is reported but not flagged.
+    # Per-backend LLM faults. credential (401/403/quota) is the fix-the-key signal; transient
+    # retries on its own and is reported without a flag.
     _llm_section = t.get("llm")
     lf = _llm_section.get("faults", {}) if isinstance(_llm_section, dict) else {}
     if isinstance(lf, dict):
@@ -1465,10 +1345,8 @@ def format_status(payload: dict, health: dict | None = None) -> str:
             if not isinstance(f, dict):
                 continue
             parts = []
-            # `or {}` is not enough to make .get() safe — a non-dict truthy value
-            # (a bare string from a drifted or hostile gateway) passes straight
-            # through it and then raises AttributeError, taking the whole status
-            # report down. Type-check instead. (Code-quality review C1.)
+            # `or {}` lets a truthy non-dict through, and a string from a drifted gateway would
+            # then raise and take down the report. Type-check instead.
             _llm = f.get("llm")
             _llm = _llm if isinstance(_llm, dict) else {}
             for label, sub in (("credential", _llm.get("credential")),
@@ -1557,24 +1435,18 @@ def build_decision_metadata(
     metadata = {
         "type": "decision",
         "source": source or AGENT_ID,
-        # ⛔ THE SAME VALUE, IN BOTH PLACES, AND ONLY EVER THIS ONE. A decision
-        # has ONE project — the one the operator asserted — and it has to be at
-        # the top level as well as in the blob, because that is the key every
-        # reader inspecting Postgres directly trusts. Leaving it unset let
-        # `save_artifact` fill it from the cwd walk instead, which yields
-        # `.claude` when the save is run from under `~/.claude/...` and nothing
-        # at all from `~` — so a decision's two project fields disagreed, and
-        # 12 live records were repaired for exactly this (`fact:1757`).
+        # Top-level project is the operator-asserted value, the same one as in the blob. Readers
+        # of Postgres trust this key.
+        # Left unset, save_artifact fills it from the cwd (`.claude` under ~/.claude, nothing
+        # from ~) and the two fields disagree (fact:1757).
         "project": project,
         "entities": [e.strip() for e in entities.split(",") if e.strip()],
         "decision": decision,
     }
-    # grounded_in: pg_ids of the facts this decision rests on — materialised at
-    # first write as typed (:Decision)-[:ROLE]->(:Fact|:Decision) edges. Always
-    # include at least the conversation fact (grounding floor, decision 552).
-    # Per-fact ROLE is optional: "534:considered,573,575:rejected" — a bare pg_id
-    # lets fact_kind pick the default role (decision 582). Roles: based_on,
-    # considered, rejected, under_conditions, informed_by.
+    # grounded_in is the pg ids this rests on, written as ROLE edges; include at least the
+    # conversation fact (decision 552).
+    # A role after the colon is optional; a bare id lets fact_kind pick the default
+    # (decision 582). Roles: based_on, considered, rejected, under_conditions, informed_by.
     gi: list[int] = []
     grounded_roles: dict[str, str] = {}
     for tok in grounded_in.split(","):
@@ -1593,41 +1465,24 @@ def build_decision_metadata(
         metadata["grounded_in"] = gi
     if grounded_roles:
         metadata["grounded_roles"] = grounded_roles
-    # elicited: the spine fields were asked of the operator (decision 559). An
-    # elicited null is a deliberate choice; coverage telemetry counts the ask.
+    # elicited means the spine fields were asked of the operator. An elicited null is
+    # deliberate, and coverage telemetry counts the ask (decision 559).
     if elicited:
         metadata["elicited"] = True
-    # new_project: the OPERATOR has confirmed this project is new, so the save
-    # registers it instead of being refused. It is deliberately not a default
-    # and deliberately not inferred: from v0.8.44 a decision's project is
-    # checked against the registry, which only means anything if declaring a new
-    # one is a deliberate act. An agent that sets this to clear its own
-    # rejection has converted a typo into a permanent project.
+    # new_project registers a name the operator confirmed. It is not inferred: an agent setting
+    # it to clear a rejection turns a typo into a permanent project.
     if new_project:
         metadata["new_project"] = True
-    # confirm_distinct_from: the registered projects this new one is deliberately
-    # NOT. The gateway refuses a new name that is confusable with an existing one
-    # until they are named, because naming the neighbour is something an agent
-    # cannot do without having looked at it — which is what puts the choice in
-    # front of the operator instead of inside the agent.
-    # domains: the SECTIONS of the project this decision belongs to. A decision
-    # ASSERTS these, exactly as it asserts its project — it does not inherit them
-    # from its evidence, because a decision reaches further than the fact that
-    # prompted it. They go inside the decision blob, beside `project`, because
-    # that is the half the gateway resolves a judgement's axes from; putting them
-    # at the top level would leave a decision's project and its domain coming
-    # from different halves of one record.
-    #
-    # ⚠ Threaded through EXPLICITLY. The flag existed for one release while this
-    # line did not, so `--domain` parsed cleanly, was dropped on the floor, and
-    # the decision silently fell back to inheriting its evidence's sections. It
-    # read as correct because the inherited answer happened to match what was
-    # asked for — a field the CLI accepts and the record never carries is the
-    # capture defect that hides longest.
+    # Domains are asserted, not inherited from evidence, and they go in the decision blob beside
+    # project. That is the half the gateway reads a judgement's axes from.
+    # --domain was parsed and dropped for one release, so the record silently inherited its
+    # evidence's sections and looked correct.
     if domains:
         decision["domains"] = list(domains)
     if new_domain:
         metadata["new_domain"] = True
+    # Registered projects this new name is deliberately not. The gateway refuses a confusable
+    # name until they are named, which an agent cannot do without looking.
     df = [d.strip() for d in (distinct_from or "").split(",") if d.strip()]
     if df:
         metadata["confirm_distinct_from"] = df
@@ -1699,8 +1554,8 @@ async def save_retrospective_artifact(
     source_ref: str = "",
     elicited: bool = False,
 ) -> dict:
-    # Client-side enum check — a friendlier error than the gateway's 400, and
-    # the doc surface for what a rating IS.
+    # Reject an unknown rating here, naming the outcome states, rather than waiting for the
+    # gateway's 400.
     if rating.strip().lower() not in RETRO_RATINGS:
         return {"status": "error",
                 "message": (f"rating must be one of {list(RETRO_RATINGS)} — outcome "
@@ -1769,11 +1624,8 @@ def _build_query(template: str, args) -> str:
         )
         return "\n".join(lines)
 
-    # Retrospective payload lives on the RECORD node since the retro-as-record
-    # change; pre-conversion installs still carry it as edge properties. Both
-    # templates therefore read BOTH shapes: node fields when the target is a
-    # Retrospective, edge fields otherwise (same tolerance the consolidation
-    # daemon uses).
+    # The payload lives on the record node now; older installs still keep it on the edge. Read
+    # node fields for a Retrospective, edge fields otherwise.
     _RETRO_FIELDS = (
         "WITH d, o, t,"
         " CASE WHEN t:Retrospective THEN t.rating ELSE o.rating END AS rating,"
@@ -1839,27 +1691,19 @@ async def main() -> None:
         return
     elif action == "status":
         payload = get_telemetry()
-        # /health as well as /memory/telemetry (v0.9.74): the dependency enums
-        # and the warnings answer "is it usable", which is the question this
-        # command is opened with, and only the telemetry payload was ever
-        # fetched. Best-effort — an unreachable or older /health simply
-        # contributes no lines rather than failing the whole report.
+        # status also reads /health: dependency enums and warnings say whether it is usable. A
+        # missing /health adds no lines rather than failing the report.
         health = get_health_payload()
-        # --json for machine-readable; default is the compact human report.
         if "--json" in sys.argv:
             print(json.dumps({**payload, "health": health}, indent=2))
         else:
             print(format_status(payload, health))
         return
     elif action == "lineage":
-        # "What happened to pg_id N?" — record state + in-flight dream-cycle stamps +
-        # what it consolidated into (which summary/insight, the form, fact→summary
-        # latency). All joins done gateway-side (ADR-014); this only calls the endpoint.
-        # Accepts a bare id or a QUALIFIED reference (`fact:816`, `summary:87`).
-        # A record id is unique only within its table — technical_docs and
-        # community_summaries run independent sequences — so a bare id lifted
-        # off a summary search result would resolve against the wrong table and
-        # return a confident, unrelated record. Qualify it and it cannot.
+        # Record state, dream-cycle stamps, and what it consolidated into. Joins stay
+        # gateway-side (ADR-014); this only calls the endpoint.
+        # A bare id or a qualified reference (fact:816, summary:87). An id is unique only within
+        # its table, so a bare summary id resolves against the wrong table.
         if len(sys.argv) < 3:
             print(json.dumps({"error": "Usage: memory_bridge.py lineage <pg_id|type:id>"}))
             sys.exit(1)
@@ -2000,9 +1844,8 @@ async def main() -> None:
         )
         p.add_argument("--title",       required=True,  help="Short decision title")
         p.add_argument("--decided-by",  required=True,  help="Human who made the decision")
-        # Not required: defaults to the project folder name (see derive_project).
-        # Still mandatory at the gateway, so a save from outside any project root
-        # fails loudly rather than recording a decision with no project.
+        # Optional here: derive_project fills the folder name. The gateway still requires a
+        # project, so a save outside any root fails instead of storing none.
         p.add_argument("--project",     default="",     help="Project context (default: project folder name)")
         p.add_argument("--domain", action="append", default=None, metavar="NAME",
                        help="a registered SECTION of this project; REPEAT for "

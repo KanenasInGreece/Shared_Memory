@@ -1,24 +1,11 @@
 #!/usr/bin/env bash
 #
-# restore.sh — ground-up restore of the Shared Memory stores from a backup set.
+# restore.sh — restore both stores from a backup.sh set. Stop the gateway first. Postgres (source of truth) is restored before Neo4j, and a non-empty store is refused unless --force.
+# The set's sha256 is checked before anything is touched.
 #
-# Restores BOTH stores from a set produced by backup.sh:
-#   - Postgres : pg_restore (custom format) into $PG_DB
-#   - Neo4j    : replay the APOC cypher export via cypher-shell
-#
-# Use after rebuilding a host: bring the Postgres + Neo4j containers up EMPTY
-# (docker compose up -d), STOP the gateway so nothing writes, then run this.
-#
-# SAFETY: refuses to restore over a non-empty store unless --force, verifies the
-# set's sha256 + integrity before touching anything, and restores Postgres (the
-# source of truth) before Neo4j.
-#
-#   bash shared-memory/ops/restore.sh                 # restore the LATEST set
-#   bash shared-memory/ops/restore.sh NAME            # restore a named set
-#   bash shared-memory/ops/restore.sh --force         # overwrite a non-empty store
+#   bash shared-memory/ops/restore.sh [NAME]
+#   bash shared-memory/ops/restore.sh --force
 #   bash shared-memory/ops/restore.sh --env /path/.env
-#
-# Exit 0 on success; non-zero on any failure (verification or restore).
 
 set -uo pipefail
 
@@ -27,13 +14,7 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
 TARGET=""
 FORCE=0
-# Item 9(c), fix round 1: shared-memory/.env FIRST — the standing env-loader
-# candidate order (CLAUDE.md Group 4 / apply.py / backup.sh's own fix for the
-# same gap). This file previously tried the repo-root path ONLY, so on a
-# correctly-installed machine (credentials live at shared-memory/.env, the
-# v0.6+ location) it silently found no env at all and ran with empty
-# passwords — backup.sh fixed this exact gap in an earlier release; restore.sh
-# was the last holdout.
+# shared-memory/.env first. The repo-root path alone found nothing on a normal install and restored with empty passwords.
 ENV_FILE="$REPO_ROOT/shared-memory/.env"
 [[ -f "$ENV_FILE" ]] || ENV_FILE="$REPO_ROOT/.env"
 while [[ $# -gt 0 ]]; do
@@ -96,18 +77,7 @@ try:
 except Exception:
     print("")' "$1" 2>/dev/null; }
 
-# C1, fix round 1 (this file had NO tmpdir/trap handling at all before this
-# fix — backup.sh's own C1 fix is the model, copied here in full): NEITHER
-# database password may sit on the docker CLIENT's own argv on this host.
-# `docker exec -e KEY=VALUE` — what this file originally used, and what
-# S-08's own comment incorrectly called "not argv" — is an argument to the
-# `docker` process running HERE, on the gateway/restore host, visible to
-# `ps aux` for the whole `docker exec` lifetime. `docker exec --env-file
-# <file>` reads KEY=VALUE from a file instead. ONE private 0700 mktemp -d
-# directory holds both database env-files; created EAGERLY as a bare
-# statement (never inside `$(...)`, which runs in a subshell and would lose
-# the assignment — see backup.sh's QF-1 comment for the failure mode this
-# avoids) right after config loads, with a trap that removes it on any exit.
+# Passwords stay off the host argv. `docker exec -e` is visible in ps; --env-file is not. Create the 0700 directory as a bare statement, or the subshell loses the path and the trap cannot clean it up.
 _SECRETS_DIR=""
 _NEO4J_ENV_FILE=""
 _PG_ENV_FILE=""
@@ -128,10 +98,7 @@ cleanup_secrets_dir() {
 trap cleanup_secrets_dir EXIT INT TERM
 init_secrets_dir
 
-# cypher-shell itself takes no `-p` — it reads NEO4J_PASSWORD from the
-# CONTAINER's own environment, which --env-file populates exactly like -e
-# did (verified live: `docker exec … cypher-shell --help` → "-p PASSWORD …
-# Can also be specified using the environment variable NEO4J_PASSWORD").
+# cypher-shell has no -p. It reads NEO4J_PASSWORD from the container env that --env-file sets.
 neo4j_q() {
   $DOCKER exec --env-file "$_NEO4J_ENV_FILE" "$NEO4J_CONTAINER" \
     cypher-shell -u "$NEO4J_USER" --format plain "$1" 2>/dev/null | tail -n1
@@ -166,42 +133,11 @@ if [[ "$FORCE" -ne 1 && ( "$pg_rows" != "0" || "$neo_nodes" != "0" ) ]]; then
 fi
 [[ "$FORCE" -eq 1 ]] && ylw "  ! --force: overwriting existing data (technical_docs=$pg_rows, neo4j nodes=$neo_nodes)"
 
-# ── Neo4j: --force must REPLACE, exactly as it already does for Postgres ─────
-#
-# pg_restore runs with --clean --if-exists, so the Postgres half genuinely
-# replaces what is there. The Neo4j half did not, and that asymmetry produced
-# two failures that only appear on a target that is not empty — i.e. precisely
-# the target --force exists for:
-#
-#   1. The APOC export emits bare `CREATE CONSTRAINT <name> FOR …` and
-#      `CREATE [RANGE|POINT|…] INDEX FOR …` with no IF NOT EXISTS. Replaying
-#      onto a store that already has them aborts the open transaction with
-#      "An equivalent constraint already exists" — and it aborts AFTER Postgres
-#      has been overwritten, leaving the two stores divergent. That is the exact
-#      state quiescing a backup exists to prevent, manufactured during a restore.
-#   2. Even with the schema statements fixed, the replay never CLEARED the graph,
-#      so a forced restore MERGED the incoming graph into the existing one
-#      instead of replacing it. Node counts would then exceed the manifest and
-#      the closing comparison below would report a mismatch it could not explain.
-#
-# Measured on a real set (2615 nodes / 9560 rels, 38 schema statements): the
-# rewrite guards 38 of 38, changes no data line, and is idempotent.
-#
-# ⛔ ORDERING: THE DESTRUCTIVE PREPARATION HAPPENS BEFORE ANYTHING IS OVERWRITTEN.
-# The clear used to sit next to the Neo4j replay, i.e. AFTER pg_restore had
-# already replaced Postgres. A clear that then failed — a timeout, a dropped
-# connection, heap pressure part-way through the batches — left Postgres holding
-# the restored corpus and Neo4j holding a partly-emptied old one, and the script
-# died there. That is the split-brain a quiesced backup exists to prevent,
-# manufactured by the restore itself.
-# Doing it here means the only failure this can produce is "nothing was
-# overwritten yet", which is recoverable by re-running.
+# --force must replace Neo4j the way pg_restore --clean replaces Postgres. A bare CREATE CONSTRAINT aborts after Postgres is already overwritten, and a replay that does not clear first merges the two graphs.
+# Clear before any overwrite. A failed clear used to leave Postgres restored and Neo4j half-emptied.
 if [[ "$FORCE" -eq 1 && "$neo_nodes" != "0" ]]; then
   echo "Clearing Neo4j before replay (--force) ..."
-  # Batched: one transaction holding a whole corpus is how a restore runs the
-  # heap out on a large graph. Constraints and indexes are deliberately LEFT
-  # ALONE — the export recreates the ones it owns, and dropping the rest would
-  # discard schema this set never knew about.
+  # One transaction of the whole corpus exhausts the heap. Leave constraints alone; the export recreates the ones it owns.
   $DOCKER exec -i --env-file "$_NEO4J_ENV_FILE" "$NEO4J_CONTAINER" \
     cypher-shell -u "$NEO4J_USER" \
     'CALL { MATCH (n) DETACH DELETE n } IN TRANSACTIONS OF 10000 ROWS' \
@@ -218,9 +154,7 @@ $DOCKER exec -i --env-file "$_PG_ENV_FILE" "$PG_CONTAINER" \
 
 
 echo "Restoring Neo4j (replaying cypher export) ..."
-# The schema statements are made idempotent IN STREAM rather than at export
-# time, deliberately: a fix in backup.sh would only help sets taken after it,
-# and every set already on disk would stay unrestorable onto a live host.
+# Made idempotent here, not in backup.sh. A fix at export time would leave every set already on disk unrestorable.
 gunzip -c "$BASE.cypher.gz" \
   | sed -E '/^CREATE (CONSTRAINT|([A-Z]+ )?INDEX)/ { /IF NOT EXISTS/! s/ FOR / IF NOT EXISTS FOR /; }
 s/^DROP CONSTRAINT ([^ ;]+);/DROP CONSTRAINT \1 IF EXISTS;/' \
@@ -228,54 +162,24 @@ s/^DROP CONSTRAINT ([^ ;]+);/DROP CONSTRAINT \1 IF EXISTS;/' \
   cypher-shell -u "$NEO4J_USER" \
   && grn "  ✓ neo4j restored" || die "cypher-shell replay failed"
 
-# ── Restore the framework logs BESIDE the live ones, never into them ─────────
-#
-# ⛔ LOG FILES ARE PER-HOST HISTORY, NOT SHARED STATE. The stores are replaced
-# wholesale because the corpus is the same corpus wherever it runs. Logs are not:
-# they are this machine's record of what happened on it. Unpacking another host's
-# credential and gateway audit trails into the live files would interleave a
-# different machine's events as if they were local — an audit trail that contains
-# events that never happened here is worse than one that is merely short, because
-# it is confidently wrong.
-#
-# So they land in a sidecar the monitor can read and a human can distinguish. The
-# live logs are untouched.
+# Logs are this host's history, not the corpus. Unpacking another machine's audit trail into the live files would record events that never happened here. They land in a sidecar.
 logs_sha="$(json_get logs_sha256 < "$MANIFEST")"
 if [[ -n "$logs_sha" && -f "$BASE.logs.tar.gz" ]]; then
   if [[ "$(sha256sum "$BASE.logs.tar.gz" | awk '{print $1}')" != "$logs_sha" ]]; then
     die "logs archive sha256 mismatch — refusing to unpack a corrupt artifact"
   fi
-  # ⛔ NOT INSIDE THE LIVE LOG DIRECTORY. A sidecar under $LOG_DIR/restored/ was
-  # the first idea and it is wrong: the monitor's logs_reader and logrotate both
-  # work over that directory, so restored files could be read as live ones — the
-  # exact contamination the sidecar exists to prevent, just one level down.
+  # Not under the live log directory. The monitor and logrotate scan that tree, so a nested sidecar would still be read as local.
   _live_logs="${SHARED_MEMORY_LOG_DIR:-$HOME/.shared-memory/logs}"
   _logs_dest="$(dirname "$_live_logs")/restored-logs/$(basename "${MANIFEST%.manifest.json}")"
   mkdir -p "$_logs_dest"
   if tar xzf "$BASE.logs.tar.gz" -C "$_logs_dest" 2>/dev/null; then
-    # ...and every file carries the prefix too, so a file that is ever COPIED
-    # out of here still says what it is. A directory name only labels a file
-    # while the file stays in the directory.
+    # Prefix the file itself. A directory name stops labelling it the moment it is copied out.
     while IFS= read -r -d '' f; do
       _b="$(basename "$f")"
       case "$_b" in restored-*) continue ;; esac
       mv "$f" "$(dirname "$f")/restored-$_b" 2>/dev/null || true
     done < <(find "$_logs_dest" -type f -print0 2>/dev/null)
-    # ── A CONTRACT THE MONITOR CAN CODE AGAINST ──────────────────────────
-    #
-    # Keeping restored logs out of the live directory stops them being read as
-    # local events — and, on its own, also stops them being read at ALL. The
-    # monitor's logs_reader scans the live directory; it has no reason to guess
-    # this path. So the location is made discoverable and self-describing rather
-    # than merely safe:
-    #
-    #   <state>/restored-logs/latest        -> the most recent restored set
-    #   <state>/restored-logs/<set>/RESTORED.json
-    #
-    # A reader follows `latest`, reads RESTORED.json to learn these are another
-    # host's events and when they were restored, and labels them accordingly.
-    # ⛔ Anything reading this MUST present it as restored history, never as this
-    # machine's own — that distinction is the whole reason it is not merged.
+    # The monitor only scans the live directory, so the sidecar would be invisible without a stable path: restored-logs/latest and RESTORED.json. Readers must present that as another host's history.
     python3 - "$_logs_dest/RESTORED.json" "$(basename "${MANIFEST%.manifest.json}")" \
              "$MANIFEST" <<'PYJSON' 2>/dev/null || true
 import json, sys, datetime
@@ -327,16 +231,7 @@ else
   ylw "Restore complete — verify node counts above (a mismatch can be normal if the backup ran without full quiesce)."
 fi
 
-# ── The restore is HALF the operation ────────────────────────────────────────
-#
-# The data is back, but it is back at whatever schema level the dump was taken
-# at — and that is very unlikely to be the level the gateway about to read it
-# expects. `schema_migrations` travels INSIDE the dump, so the database now
-# states its own level correctly; nothing has yet moved it forward to the code.
-#
-# Saying nothing here is how a restored deployment ends up running an older
-# schema under a newer gateway with no error anywhere: this script's last line
-# used to read "Restore complete", which an operator reasonably takes as done.
+# The dump carries its own schema level. "Restore complete" used to be the last line, so a newer gateway ran an older schema with no error.
 echo
 ylw "⚠ The data is restored, but NOT yet migrated to the running code's level."
 ylw "  A dump carries its own schema_migrations ledger, so this database is at the"

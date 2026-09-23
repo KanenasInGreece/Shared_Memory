@@ -53,23 +53,7 @@ import shutil
 
 log = logging.getLogger("gpu_load")
 
-# Defaults for the tunable knobs. The live probe re-reads os.environ at CALL time
-# (not import time) so daemons that load .env after importing this module — and
-# tests that monkeypatch env — see the right values. Documented env vars:
-#   SLOT_AWARE=0                    disable GPU-aware dreaming entirely
-#   NVTOP_BIN=nvtop                 path/name of the nvtop binary
-#   GPU_BUSY_PERCENT=50             a gated GPU at/above this util (%) counts as busy
-#   GPU_INDICES=0,1                 gate only these GPU positions; default is every GPU
-#   NVTOP_TIMEOUT_SEC=5.0           snapshot subprocess timeout
-#   NVTOP_KILL_WAIT_SEC=1.0         how long to wait for a SIGKILLed nvtop child to
-#                                   actually exit before counting it as leaked
-#                                   (D-state, unreapable)
-#   NVTOP_MAX_CONSECUTIVE_HANGS=3   consecutive snapshot timeouts (any cycle
-#                                   that ends in anything other than a
-#                                   snapshot timeout resets the count) before
-#                                   the probe disables itself for the process
-#                                   lifetime (UNMEASURED default — see
-#                                   fact:1645)
+# Re-read at call time, not import, so a late .env load is visible. NVTOP_MAX_CONSECUTIVE_HANGS is an unmeasured default (fact:1645).
 DEFAULT_GPU_BUSY_PERCENT = 50
 
 _warned = False  # rate-limit the "nvtop unavailable" warning to once per process
@@ -175,17 +159,7 @@ async def _reap_after_timeout(proc, timeout: float, exc: Exception) -> None:
         try:
             await asyncio.wait_for(proc.wait(), timeout=kill_wait)
         except asyncio.TimeoutError:
-            # Still unresponsive after SIGKILL — D state (GPU-fence wait). This
-            # is an OS-level fact, not something in-process retains: proc and
-            # its transport are local objects that get garbage-collected
-            # normally, and the kernel process table entry simply stays in D
-            # state until the machine reboots. Count it and never await it
-            # again -- but the cap bounds CONSECUTIVE timeouts only; an
-            # alternating hang/garbage-output pattern is not bounded by it, so
-            # _leaked_children is unbounded across that pattern. A ceiling on
-            # _leaked_children would be a separate trigger (not implemented;
-            # operator finding, decision:1656 follow-up). Read-then-write, no
-            # await in between: the capability-probe task shares this module.
+            # Still in D state after SIGKILL; the kernel keeps it until reboot. Count it and do not await it again. The hang cap does not bound an alternating pattern (decision:1656 follow-up).
             reaped = False
             _leaked_children += 1
 
@@ -282,16 +256,7 @@ async def inference_gpu_busy() -> bool:
         _consecutive_hangs = 0
         return False
     finally:
-        # F2 (fix round): asyncio.CancelledError is a BaseException, so it is
-        # NOT caught by either except clause above -- a task cancellation
-        # (e.g. gateway shutdown) mid create_subprocess_exec/communicate would
-        # otherwise leave the child un-killed and silently propagate past this
-        # function. Best-effort only: no `await` (an await here would itself
-        # be immediately cancelled and re-raise before doing anything) and no
-        # counting (a cancellation is not a hang -- inference_gpu_busy() never
-        # gets to observe or log about it). proc.returncode is already set
-        # once communicate() or _reap_after_timeout's own wait() succeeded, so
-        # this is a no-op on every normal exit path (return or exception).
+        # CancelledError is a BaseException, so the excepts above miss a shutdown mid-spawn and leave the child. Do not await here; that await would be cancelled too.
         if proc is not None and proc.returncode is None:
             try:
                 proc.kill()

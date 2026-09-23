@@ -1,113 +1,20 @@
--- 035 — ONE normalization key for the project and domain axes, in the database.
---
--- WHAT WAS WRONG. Both axis registries answered on EXACT STRINGS. `projects`
--- has a UNIQUE on `name` and `project_domains` a UNIQUE on (project_id, name),
--- so `Orbit_Relay` and `orbit-relay` were two legal, unrelated rows — two
--- projects, as far as the schema was concerned, differing only in punctuation.
--- The gateway has always known better: `axis_key()` (in
--- `scripts/project_axis.py`) reduces both to one key and refuses the second as
--- a SPELLING of the first. But that guard lives entirely in Python and fires
--- only on the `new_project`/`new_domain` path, so the constraint the whole axis
--- design depends on — two registered names never share a key — was never
--- something the database could state, let alone enforce.
---
--- WHAT THIS DOES.
---
---   1. `axis_normalize(text)` — the key, as SQL, so the triggers below and any
---      reader in any language get the same answer as the gateway.
---   2. A TRIGGER-MAINTAINED `normalized_key` COLUMN on each registry, with a
---      plain UNIQUE constraint on it — `projects (normalized_key)` and
---      `project_domains (project_id, normalized_key)`. That is the new
---      invariant made structural: **two registered names never share a key.**
---   3. A BACKFILL, then a PRE-CHECK that names the colliding PAIR before the
---      constraint is added, so a collision produces an answerable message
---      instead of Postgres' key-only `DETAIL`.
---   4. An apply-time SELF-CHECK against the SAME fixture list the Python side
---      is asserted on, so the two definitions cannot drift apart silently.
---   5. Enforcement of the alias rules on the KEY, in BOTH directions: an
---      apply-time pre-check over the rows ALREADY in the tables, and continuous
---      enforcement of every future write, by extending the trigger functions
---      migrations 024 and 028 already own. They are complements — a trigger
---      cannot see a violation that predates it, and a pre-check cannot see one
---      written tomorrow.
---   6. A pre-check for any legacy name that normalizes to the EMPTY string,
---      before the trigger that would reject it can fire, so the operator gets a
---      message about the row they hold rather than one aimed at a caller.
---
--- ⛔ WHY A TRIGGER-MAINTAINED COLUMN AND NOT A UNIQUE FUNCTIONAL INDEX. The
--- functional index was the first shape of this migration and it was wrong twice
--- over, both reasons found in review:
---
---   * `generate_schema_init.py` emits indexes with their table and functions
---     AFTER every table, so a fresh install built from a regenerated
---     `schema_init.sql` would have hit `axis_normalize(text) does not exist` —
---     and the file is one transaction, so it would have created NOTHING. (The
---     generator's ordering is fixed in this same change; the schema still
---     should not depend on that fix to be installable.)
---   * An `IMMUTABLE` function over locale-dependent `[:alnum:]` backing a
---     UNIQUE INDEX is a latent trap: a collation, ICU or `pg_upgrade` change
---     silently splits old index entries from new ones, the invariant quietly
---     stops holding, and nothing re-checks. A stored column re-derives only
---     when a row is written, and a `REINDEX` cannot resurrect a stale key.
---
--- Migration 033 hit exactly this and chose the column; its own comment says why
--- a `GENERATED … STORED` column is not an option here either (the generator
--- introspects `information_schema.columns`, which does not report a generation
--- expression, so it would render as a bare unpopulated column). A BEFORE
--- INSERT/UPDATE trigger uses the function-and-trigger path the generator DOES
--- faithfully reproduce. This migration follows that precedent exactly.
---
--- ⚠ WHY `axis_normalize` REPEATS `entity_normalize`'s BODY (033) INSTEAD OF
--- CALLING IT. Same generator property: nothing orders one function before
--- another, so a wrapper could be emitted before its callee. The body is
--- repeated and the two are pinned together LOUDLY instead — the self-check
--- below asserts they agree on every fixture and fails the migration if a future
--- edit moves one of them. The separate name is right regardless: an axis key
--- and an entity key are different concepts that share a rule today, and this is
--- where a divergence would get written down rather than discovered.
---
--- ⚠ `[:alnum:]` IS LOCALE-DEPENDENT, exactly as 033 records: under a UTF-8
--- database with a non-`C` collation, accented and non-Latin letters survive
--- normalization; under `C` it behaves like `[a-zA-Z0-9]`. On a `C`-locale
--- deployment the SQL key and the Python key DISAGREE for any non-ASCII name —
--- which is why the self-check runs a fixture containing accented Latin and
--- Greek letters and RAISES rather than warns.
---
--- ⛔ AND WHY THERE IS NO KEY-UNIQUE CONSTRAINT ON `aliases`. It is a shared
--- string-intern table: migration 024 states, in the table's own comment, that
--- "the same spelling can legitimately alias on more than one axis — a word that
--- names a project here can name a section of a different project there". A
--- global key-unique constraint would forbid that by construction — not because
--- the data collides, but because the DESIGN allows what it would refuse. What
--- must actually hold is narrower: within one axis and one scope, a key must
--- never resolve to two different canonicals. That is a cross-table rule no
--- constraint can see, so it is enforced in two places instead: a pre-check over
--- the EXISTING rows (which an `ADD CONSTRAINT` would have done for free, had
--- there been a constraint to add) and the trigger functions 024 and 028 already
--- own, extended here to compare on the key for every future write.
---
--- MEASURED on the live deployment 2026-08-25, BEFORE this migration: 38
--- projects, 18 active project aliases, 0 key COLLISIONS; `project_domains` 0
--- collisions within any project; `domain_aliases` 0 rows. Every statement below
--- is expected to be a no-op on that data — and if it is not, that is the news,
--- which is why nothing here is written to skip quietly.
---
--- ⚠ WHAT THAT MEASUREMENT DOES **NOT** COVER, said plainly rather than left to
--- be assumed: nobody counted registered names that normalize to the EMPTY
--- string, on that deployment or any other. The pre-check for them below is
--- therefore written to be answerable rather than to confirm an expectation —
--- fact:1338, a number nobody measured is not a number this file may claim.
---
--- IDEMPOTENT: every statement is re-runnable. The backfill is an UPDATE
--- restricted to rows whose key is already wrong, so a re-run touches zero rows.
+-- Migration 035: a stored normalized_key so two registered names cannot share
+-- an axis key. The Python guard only ran on the new-name path. Not a unique
+-- functional index: an IMMUTABLE index over locale-dependent [:alnum:] can
+-- split when the collation changes, and a function used to be emitted after
+-- the index that calls it. Not GENERATED STORED: the schema generator would
+-- drop the expression (033). axis_normalize copies entity_normalize's body
+-- because nothing orders one function before another; the fixture check fails
+-- the migration if they disagree, including on non-ASCII where a C locale
+-- would not match Python. aliases has no key-unique constraint: one spelling
+-- may alias on more than one axis (024). Existing rows are pre-checked;
+-- later writes use the widened triggers.
+-- nobody counted registered names that normalize to the EMPTY string (fact:1338).
 
 BEGIN;
 
--- ─── axis_normalize() — THE axis key, as SQL ─────────────────────────────────
---
--- IMMUTABLE because the trigger and the constraint machinery both want a stable
--- answer for a stable input. STRICT so a NULL name keys to NULL rather than to
--- the empty string.
+-- IMMUTABLE so the stored key is stable. STRICT so a NULL name stays NULL
+-- rather than becoming the empty string.
 CREATE OR REPLACE FUNCTION axis_normalize(name text)
 RETURNS text
 LANGUAGE sql
@@ -118,13 +25,8 @@ AS $$
     SELECT regexp_replace(lower(name), '[^[:alnum:]]', '', 'g');
 $$;
 
--- ─── The self-check: this file and project_axis.py agree, or nothing applies ──
---
--- The pairs below are `AXIS_KEY_FIXTURES` in `scripts/project_axis.py`, verbatim
--- and in the same order. The suite asserts the Python side against them; this
--- block asserts the SQL side against them at apply time. Neither implementation
--- can move without the other unless someone edits BOTH lists — which is the
--- point, because that edit is a deliberate act and a silent drift is not.
+-- Same list as AXIS_KEY_FIXTURES in project_axis.py, same order. Also pins
+-- axis_normalize to entity_normalize so the two copies cannot drift quietly.
 DO $$
 DECLARE
     fixture   text[][] := ARRAY[
@@ -157,8 +59,7 @@ BEGIN
                 'not share.',
                 fixture[i][1], got, fixture[i][2];
         END IF;
-        -- The second pin: this schema now states one normalization rule under
-        -- two names, and the ONLY thing keeping them one rule is this line.
+        -- The two copies of the rule. Editing one without the other fails here.
         IF got IS DISTINCT FROM entity_normalize(fixture[i][1]) THEN
             RAISE EXCEPTION
                 'axis_normalize(%) and entity_normalize(%) disagree — one of the '
@@ -169,37 +70,15 @@ BEGIN
 END;
 $$;
 
--- ─── The column, and the trigger that maintains it ───────────────────────────
---
--- Nullable at first: the column has to exist before the backfill can fill it,
--- and NOT NULL is added below once every row has a value.
+-- Nullable until the backfill below; NOT NULL is added once every row has a key.
 ALTER TABLE projects        ADD COLUMN IF NOT EXISTS normalized_key text;
 ALTER TABLE project_domains ADD COLUMN IF NOT EXISTS normalized_key text;
 
--- ─── The unnameable-row pre-check — BEFORE the trigger can ever fire ─────────
---
--- ⛔ IT RUNS HERE, ABOVE THE TRIGGER, AND THE POSITION IS THE WHOLE POINT. A
--- legacy name every character of which is punctuation — `---`, `...`, `___` —
--- normalizes to the empty string. Nothing stopped one being registered:
--- `projects` carries no blank-name CHECK at all (only the sentinel reservation),
--- and `project_domains`' `btrim(name) <> ''` does not catch `---`, which is not
--- blank. Left to the backfill, such a row fires the new BEFORE trigger and
--- aborts the migration with the trigger's message — which is written for a
--- CALLER registering a name ("name it with at least one letter or digit") and is
--- useless to an OPERATOR holding a row that already exists and has records
--- filed under it.
---
--- So the row is found first and reported the way a collision is (see the
--- collision pre-check below, which established this shape): the name, the id,
--- what has to be decided, and the query that lists the rest. And, as there, it
--- REPAIRS NOTHING — renaming a project is an operation with a ledger, never a
--- side effect of a migration.
---
--- ⚠ HOW MANY SUCH ROWS EXIST HERE IS NOT MEASURED. The header's "expected to be
--- a no-op" covers key COLLISIONS, which were counted; no count of names keying
--- to empty was taken on any deployment, and this check does not claim one
--- (fact:1338 — an unmeasured number is a measurement claim in disguise). It is
--- written to be a no-op if there are none and to be answerable if there are.
+-- The unnameable-row pre-check runs before the trigger, whose message is
+-- written for a caller, not for an operator who already holds the row.
+-- `---` is not blank, so the existing CHECKs do not catch it, and this block
+-- renames nothing. fact:1338 — an unmeasured number is not a count this file
+-- may claim.
 DO $$
 DECLARE
     bad_name text;
@@ -235,13 +114,8 @@ BEGIN
 END;
 $$;
 
--- ONE function for both registries. They enforce the same rule on the same
--- column, and two functions would be two rules the day one of them is edited —
--- the same reasoning `spelling_variant_of` follows on the Python side.
---
--- It re-derives from `NEW.name` on every write, so a rename can never leave a
--- stale key behind, and a caller cannot set the column to something the name
--- does not normalize to: whatever it sends is overwritten.
+-- One function for both registries. It overwrites NEW.normalized_key from
+-- NEW.name, so a caller cannot store a key the name does not normalize to.
 CREATE OR REPLACE FUNCTION axis_registry_before_write()
 RETURNS trigger AS $$
 BEGIN
@@ -269,10 +143,7 @@ CREATE TRIGGER trg_project_domains_axis_key
     BEFORE INSERT OR UPDATE ON project_domains
     FOR EACH ROW EXECUTE FUNCTION axis_registry_before_write();
 
--- ─── Backfill ────────────────────────────────────────────────────────────────
---
--- Restricted to rows whose stored key is not already the right one, so a re-run
--- updates nothing at all rather than rewriting every row to itself.
+-- A re-run updates nothing: only a key that is already wrong is rewritten.
 UPDATE projects
    SET normalized_key = axis_normalize(name)
  WHERE normalized_key IS DISTINCT FROM axis_normalize(name);
@@ -281,18 +152,8 @@ UPDATE project_domains
    SET normalized_key = axis_normalize(name)
  WHERE normalized_key IS DISTINCT FROM axis_normalize(name);
 
--- ─── The collision pre-check — name the PAIR, and the query ──────────────────
---
--- Adding the UNIQUE constraint below would already fail on a collision, and
--- would roll the whole migration back, which is the correct shape. What it
--- would NOT do is say WHICH TWO NAMES collided: Postgres reports the duplicated
--- key and leaves the operator to write the join, at exactly the moment they are
--- mid-migration and the data question is urgent. So the pair is found first,
--- and the message carries both names and the query that lists the rest.
---
--- ⛔ IT DOES NOT REPAIR ANYTHING. Which of two spellings is the project, and
--- what happens to the records filed under the other, is a data judgement with
--- history hanging off it — never something a migration may answer by picking.
+-- Name the colliding pair. ADD CONSTRAINT would report only the key.
+-- Which spelling wins is never something a migration may answer by picking.
 DO $$
 DECLARE
     a_name text;
@@ -342,15 +203,9 @@ BEGIN
 END;
 $$;
 
--- ─── The invariant, structurally ─────────────────────────────────────────────
---
--- Projects are global; a section is identified WITHIN its project, so its key
--- is unique per (project_id, key) and nowhere wider — two projects may both
--- have a `graph-quality` section and they are different sections.
---
--- DROP-then-ADD rather than a guarded ADD: a constraint may exist from an
--- earlier partial run under a different definition, and re-adding validates the
--- existing rows, which is the point.
+-- Projects are global. A section key is unique per project, so two projects
+-- may share a section name. Drop then add: a partial run may have left a
+-- different definition, and re-adding validates the rows already there.
 ALTER TABLE projects ALTER COLUMN normalized_key SET NOT NULL;
 ALTER TABLE projects DROP CONSTRAINT IF EXISTS projects_normalized_key_unique;
 ALTER TABLE projects
@@ -363,25 +218,9 @@ ALTER TABLE project_domains
     ADD CONSTRAINT project_domains_normalized_key_unique
     UNIQUE (project_id, normalized_key);
 
--- ─── The alias rules over EXISTING rows — the other half, restored ───────────
---
--- ⛔ A TRIGGER AND A PRE-CHECK ARE COMPLEMENTS, NOT SUBSTITUTES, and an earlier
--- draft of this migration traded one away. The widened triggers below fire on
--- WRITES: they stop a colliding alias being created tomorrow and say nothing
--- about one that is already in the table. A deployment holding a violating pair
--- would have applied this migration cleanly and kept the violation — silently,
--- until someone happened to rewrite that row — while the gateway's by-key
--- resolution answered it by luck in the meantime.
---
--- The registries do not have this gap: they get a backfill, a pre-check AND an
--- `ADD CONSTRAINT`, and adding a constraint VALIDATES the rows already there.
--- Aliases have no constraint to add — the key rule is cross-table, which is why
--- it lives in a trigger at all — so the existing-row half has to be this block.
---
--- Four shapes, the two ambiguities on each axis, each reported the way a
--- collision is (C-5's pattern): both names, the shared key, what has to be
--- decided, and the query that lists the rest. Nothing is repaired: which
--- spelling means what is a data judgement with records hanging off it.
+-- The alias rules over EXISTING rows. The triggers below only see later
+-- writes, and there is no constraint to add: the rule crosses tables, so a
+-- violating pair already stored would otherwise survive this file.
 DO $$
 DECLARE
     a_name text;
@@ -490,33 +329,11 @@ BEGIN
 END;
 $$;
 
--- ─── The alias rules, on the KEY, enforced CONTINUOUSLY ──────────────────────
---
--- ⛔ AN APPLY-TIME CHECK IS NOT AN INVARIANT. The first shape of this migration
--- asserted the alias rules once, in a DO block, and stopped: after it applied,
--- nothing prevented a colliding alias being written the next day. The schema
--- already owns the continuous mechanism for the EXACT-STRING form of these very
--- rules — 024's `assert_alias_namespaces_disjoint()` and 028's
--- `assert_domain_alias_namespaces_disjoint()`, on four triggers — so the fix is
--- to widen those from the string to the key, not to add a second mechanism.
---
--- Each keeps its original exact-string rule UNCHANGED and gains a key rule
--- beside it. The two are separate statements rather than one widened comparison
--- for a reason found while writing them:
---
--- ⛔ THE KEY RULE MUST EXCLUDE THE ALIAS'S OWN TARGET, AND THE EXACT RULE MUST
--- NOT. Retiring a spelling is exactly the operation that produces an alias
--- keying like a live project — renaming `Orbit_Relay` to `orbit-relay` demotes
--- the old name to an alias of the new one, and those two ARE one key. Widening
--- the original comparison in place would have refused every such rename, which
--- is the one operation this whole alias mechanism exists to support. The
--- ambiguity being guarded is "one key, two DIFFERENT answers"; an alias keying
--- like the project it already points at has one answer and is merely redundant.
---
--- ⚠ They call `axis_normalize(...)` rather than reading `normalized_key`, so
--- they carry NO dependency on which BEFORE trigger fires first. Firing order is
--- alphabetical by trigger name and is not something a rule this important
--- should rest on.
+-- Key comparisons exclude the alias's own target; the exact-string rule does
+-- not. A rename demotes the old spelling to an alias of the new name, and
+-- those two share a key — refusing that would block the rename. They call
+-- axis_normalize rather than reading normalized_key so trigger order does
+-- not matter.
 
 CREATE OR REPLACE FUNCTION assert_alias_namespaces_disjoint()
 RETURNS trigger AS $$
@@ -594,9 +411,7 @@ BEGIN
         IF NOT NEW.active THEN
             RETURN NEW;
         END IF;
-        -- NEW.project_id, not a lookup through domain_id: the composite foreign
-        -- key already guarantees the two agree, so re-deriving it here would
-        -- only add a way for this rule and that key to disagree.
+        -- NEW.project_id, not a lookup: the composite FK already makes them agree.
         SELECT name INTO v_alias FROM aliases WHERE id = NEW.alias_id;
         -- 028's original rule, on the exact string, unchanged.
         IF EXISTS (
@@ -609,9 +424,7 @@ BEGIN
                 'alias and a canonical name must never be the same string '
                 'within one project (A1)', v_alias;
         END IF;
-        -- The same rule on the KEY, excluding the section this alias points at
-        -- — retiring a spelling is exactly what produces an alias keying like a
-        -- live section, and that rename must stay possible.
+        -- Same rule on the key, excluding this alias's own section, so a rename stays possible.
         IF EXISTS (
             SELECT 1 FROM project_domains d
              WHERE d.project_id = NEW.project_id

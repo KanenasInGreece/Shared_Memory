@@ -8,92 +8,34 @@ import os
 
 from ontology import ONT
 
-# The canonical resolution, as SQL. Judgements carry their project inside the
-# decision blob; facts carry it at the top level. NULL when neither is present
-# — callers decide what an unresolvable project means, and from PR 2 that
-# answer is "folds nothing", never a shared bucket.
+# Judgements store the project inside the decision blob; facts store it at the top level. NULL means the caller folds nothing, not a shared bucket.
 PROJECT_SQL = "COALESCE(metadata->'decision'->>'project', metadata->>'project')"
 
-# Where a project may be WRITTEN, as a predicate over one parameter.
-#
-# This is NOT the resolution and must never be substituted for it. A migration
-# tool rewriting a legacy spelling has to touch every field the value can live
-# in, including the shadowed one: a row carrying the old name in
-# ``decision.project`` AND the new name at the top level is a row that still
-# needs rewriting, but PROJECT_SQL resolves it to the new name and would skip
-# it. Sharing the definition of *where projects live* is the point; sharing
-# COALESCE precedence with a writer would silently under-reach.
+# Where a project may be written. Do not substitute PROJECT_SQL: COALESCE would skip a row that still holds the old spelling in the shadowed field.
 PROJECT_MATCH_SQL = (
     "(metadata->>'project' = {p} OR metadata->'decision'->>'project' = {p})"
 )
 
-# The parked-project sentinel (used from PR 3, reserved from now). A record
-# whose project cannot be established saves, searches and enriches normally but
-# is excluded from folding — it is never a topic and never mints a :Project
-# node. The name is reserved: no real project may be called this.
+# Parked records still save and search, but they must not fold or mint a :Project. The name is reserved.
 SENTINEL = "general_discussion"
 
 
-# ── The registry (migration 022) ─────────────────────────────────────────────
-# A project used to be whatever string a client sent, so there was nothing for a
-# value to be unknown AGAINST: a typo and a new project were the same event, and
-# both entered the corpus silently. These two statements are what make an
-# unrecognised value loud instead of merely new.
+# Registry (migration 022). Without it a typo and a new project are the same event and both enter silently.
 
 PROJECT_EXISTS_SQL = "SELECT 1 FROM projects WHERE name = $1"
 
-# EVERY registered name, for the spelling-key comparison below.
-#
-# ⚠ IT IS NOT FILTERED, and that is the whole point. The spelling check used to
-# run only over the TRIGRAM NEIGHBOURS a confusable query returned, which meant a
-# separator-and-case variant was refused only when it also happened to score
-# above the similarity floor. It frequently does not: measured on a live
-# registry, `testing` vs `Test_Ing` scores 0.545 against a floor of 0.6, so a
-# pure spelling variant registered as a brand-new value — the exact event the
-# guard exists to prevent, slipping past because a SEPARATE, softer heuristic
-# did not fire. A spelling is an EXACT equality on a normalised key; it must
-# never be gated behind a fuzzy score.
-#
-# The comparison is done in Python with `same_spelling` rather than as a
-# normalising SQL expression, deliberately: a registry is tens of rows, and
-# re-expressing `spelling_key` in SQL would create a second definition of the key
-# that can drift from the one every other caller uses.
+# Every name, unfiltered. A trigram neighbour list let `testing` vs `Test_Ing` (0.545, under the 0.6 floor) register as new. The key is compared in Python so SQL does not grow a second definition.
 PROJECT_NAMES_SQL = "SELECT name FROM projects"
 
-# The by-key lookup, and the by-name lookup, in ONE indexed statement.
-#
-# ⚠ IT READS THE STORED COLUMN, not a normalising expression over `name`.
-# Migration 035 maintains `projects.normalized_key` with a BEFORE INSERT/UPDATE
-# trigger and puts a UNIQUE constraint on it, so the key is a value the database
-# owns, indexed, and re-derived only when a row is written. Computing the key in
-# the WHERE clause instead would scan, and would make this query's answer depend
-# on the SERVER's current locale rather than on what was stored when the name was
-# registered — which is exactly the drift a stored column removes.
-#
-# The key parameter is computed by `axis_key` on this side. That keeps ONE Python
-# definition of the key (the comparison stays where `same_spelling` lives) while
-# the MATCH happens against the database's own materialised value.
-#
-# Both halves in one statement because they answer one question — "what does this
-# spelling mean?" — and splitting them would cost a second round trip on the
-# ingress path for no gain. At most two rows come back: the exact row and the key
-# row, which are the same row whenever the caller sent the canonical name.
+# Reads the stored normalized_key, not an expression over name. A WHERE-clause key would follow the server locale and drift from the value stored at registration. Both lookups are one statement so ingress does not pay a second round trip.
 PROJECT_NAME_OR_KEY_SQL = (
     "SELECT name FROM projects WHERE name = $1 OR normalized_key = $2"
 )
 
-# The registry IDENTITY behind a name (migration 027). The name is a label a
-# client asserts and an operator types; this is the thing that does not move
-# when the label does, and it is what the graph node is keyed on.
+# The id does not move when the label is renamed, and the graph node is keyed on it (migration 027).
 PROJECT_ID_SQL = "SELECT id FROM projects WHERE name = $1"
 
-# Proposals for a value that missed. TRIGRAM FIRST, and that ordering is a
-# dependency decision, not a ranking preference: trigram needs no embedder, so
-# registration cannot be taken down by an embedding outage. A vector signal over
-# name + description is added for DOMAINS, where an operator typing `crypto`
-# should reach a section named `security` whose description mentions key
-# handling — names alone cannot carry that, and descriptions are what make it
-# work. Project names are short and typo-shaped, so trigram carries them.
+# Trigram first so registration still works when the embedder is down. Project names are short and typo-shaped; description matching belongs on the domain axis.
 PROJECT_PROPOSALS_SQL = (
     "SELECT name FROM projects"
     " WHERE similarity(name, $1) >= $2"
@@ -101,23 +43,12 @@ PROJECT_PROPOSALS_SQL = (
     " LIMIT $3"
 )
 
-# Deliberately loose. A rejected save is a dead end unless the proposals are
-# usable, and a near-miss on a hyphenated name scores lower than intuition
-# suggests ("shared memory" vs "shared-memory-GitHub").
+# Loose on purpose. A hyphenated near-miss scores lower than it looks, and a rejected save with no proposals is a dead end.
 PROPOSAL_SIMILARITY = 0.25
 PROPOSAL_LIMIT = 5
 
 
-# ── Declaring a NEW project: the two ways it is really a typo ────────────────
-#
-# A registry only stops a misspelling from becoming a project if declaring a new
-# project is harder than mistyping an old one. It is the agent that sets the
-# "this is new" flag, and it is the agent that makes the spelling error, so a
-# flag alone guards nothing: the operator says "go ahead with this idea" meaning
-# THIS project, and a plausible variant silently becomes a second one. Every
-# retired spelling this corpus carries arrived exactly that way.
-#
-# So the same claim faces two checks, and only the second is overridable.
+# A "this is new" flag is set by the same agent that mistypes. The spelling check is not overridable; the confusable check is.
 
 def axis_key(name) -> str:
     """THE normalisation key for both axes: lowercase, letters and digits only.
@@ -142,27 +73,11 @@ def axis_key(name) -> str:
     return "".join(ch for ch in name.lower() if ch.isalnum())
 
 
-# The historical name, kept because it is what the spelling guard (fact:1047)
-# is documented under throughout this module. ONE function, two names — the
-# guard asks "are these two names the same spelling?", the axis resolver asks
-# "what is the key of this name?", and they must never be able to answer
-# differently.
+# Same function as axis_key. The spelling guard (fact:1047) is documented under this name, and the two must not diverge.
 spelling_key = axis_key
 
 
-# The agreement fixture. Each pair is (input, expected key), and BOTH
-# implementations are asserted against it — Python in the suite, SQL at
-# migration-apply time.
-#
-# ⚠ WHAT IS DELIBERATELY NOT IN HERE. Python's ``str.isalnum()`` is true for
-# Unicode NUMERIC characters that are not digits (``½``, ``²`` — categories No
-# and Nl), while Postgres' POSIX ``[:alnum:]`` under a UTF-8 locale generally is
-# not. Those characters therefore have no agreed answer and no fixture claims
-# one; a name containing them would key differently in the two stores. It has
-# never occurred in a registered name on any deployment we can see, and closing
-# it means changing ``axis_key``'s behaviour — which is fact:1047's guard, so it
-# is a ruling and not a builder's edit. Letters (Latin, accented, Greek) and
-# ASCII digits DO agree and are fixtured below.
+# Both the Python key and the SQL key are asserted against this list. Unicode numeric characters such as ½ are omitted because str.isalnum and POSIX [:alnum:] disagree, and changing that is fact:1047's guard.
 AXIS_KEY_FIXTURES: tuple[tuple[str, str], ...] = (
     ("orbit-relay", "orbitrelay"),
     ("Orbit_Relay", "orbitrelay"),
@@ -187,16 +102,7 @@ def same_spelling(a, b) -> bool:
     return bool(key) and key == spelling_key(b)
 
 
-# Above this trigram similarity a proposed new name is CONFUSABLE with a
-# registered one and must be confirmed as deliberately distinct.
-#
-# ⚠ Derived from a live registry, not guessed, and env-overridable because the
-# right floor depends on how a deployment names things: measured over every pair
-# of 37 registered projects, the closest legitimately DISTINCT pair scored 0.500
-# and NO pair reached 0.6 — while realistic typos of a registered name scored
-# 0.78 to 1.00. The gap between those two populations is where this sits. Too
-# low and every new project needs an override, which trains the reflex to
-# override; too high and the check never fires.
+# Distinct registered pairs topped out at 0.500 and typos started at 0.78, so 0.6 sits in the gap. Too low trains operators to override; too high never fires.
 CONFUSABLE_SIMILARITY = float(os.environ.get("PROJECT_CONFUSABLE_SIMILARITY", "0.6"))
 
 CONFUSABLE_SQL = (
@@ -233,30 +139,7 @@ def spelling_variant_of(candidate, registered):
                 None)
 
 
-# ── Resolving a supplied value to the canonical one ──────────────────────────
-#
-# THE ONE RESOLUTION FOR BOTH AXES. A project is registered globally and a
-# domain is registered within one project, but *how* a supplied spelling becomes
-# a canonical one is the same question on both, and two loops would be two rules
-# the day one of them is edited — the same reasoning that made
-# `spelling_variant_of` shared. Scoping is the CALLER's job: it hands in the
-# registered names and the alias map that are in scope, and nothing here knows
-# which axis it is serving.
-
-# What `via` reports, and what each token means to a caller reading it back:
-#
-#   exact       the string they sent is the registered name — nothing changed
-#   alias       the string is a registered RETIRED spelling, resolved through
-#               the alias junction
-#   normalised  the string matched nothing verbatim; it was the axis KEY that
-#               matched, so their spelling differs from every registered and
-#               aliased string on this axis
-#
-# ⚠ THE KEY STEPS COLLAPSE INTO ONE TOKEN ON PURPOSE. Steps 3 and 4 look up the
-# registry and the alias table respectively, but what a caller needs to know is
-# the same in both cases — *the literal string you sent is not on file* — and
-# splitting it would report an implementation detail as if it were a difference
-# that mattered to them.
+# One resolver for both axes; the caller passes the names in scope. `via` is exact, alias (a retired spelling), or normalised (the key matched). Registry and alias key hits share normalised because the caller only needs to know the literal string was not on file.
 VIA_EXACT = "exact"
 VIA_ALIAS = "alias"
 VIA_NORMALISED = "normalised"

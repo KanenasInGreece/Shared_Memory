@@ -145,12 +145,7 @@ async def promote_record(
 
     target = target.strip()
 
-    # The value is written to the TOP-LEVEL `project` field, always. The
-    # resolution reads the decision blob first and falls back to this one, so a
-    # top-level write resolves correctly for every record type — and a parked
-    # record by definition has neither field set, so there is no shadowing to
-    # worry about. One rule beats a per-type branch that has to stay in step
-    # with the resolution.
+    # Always the top-level field. Resolution reads the decision blob first, and a parked record has neither, so one write covers every type.
     await conn.execute(
         "UPDATE technical_docs"
         "   SET metadata = jsonb_set(COALESCE(metadata, '{}'::jsonb),"
@@ -166,18 +161,7 @@ async def promote_record(
         pg_id, json.dumps({"type": "project_of", "project": target}),
     )
 
-    # The durable ledger row. Its CHECK constraints re-assert both halves of the
-    # transition, so a caller that somehow bypassed `promotion_refusal` is
-    # refused by the database rather than silently recorded.
-    #
-    # BOTH the name and the identity are recorded, and they answer different
-    # questions (migration 027). `to_project` is EVIDENCE — the name this record
-    # was actually moved onto, on the day it moved, which a later rename must
-    # never rewrite. `to_project_id` is the durable POINTER, so the row still
-    # resolves to the right project after that rename. The sub-select is the
-    # whole reason the column is NOT NULL: a promotion onto a name with no
-    # registry row fails here, in the same transaction as the record's own
-    # update, instead of writing a ledger row that points at nothing.
+    # The CHECK refuses a transition that skipped promotion_refusal. `to_project` is the name on that day (migration 027); `to_project_id` still points at the project after a rename. A missing registry row fails in this same transaction.
     await conn.execute(
         "INSERT INTO project_promotions"
         " (pg_id, from_project, to_project, to_project_id, method, actor, note)"

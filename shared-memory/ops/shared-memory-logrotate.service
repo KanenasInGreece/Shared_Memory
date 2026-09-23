@@ -4,28 +4,13 @@ Documentation=https://github.com/KanenasInGreece/Shared_Memory
 
 [Service]
 Type=oneshot
-# Per-user logrotate with a user-owned state file — no root, no /etc/logrotate.d.
-# %h is the user's home; the config is generated from ops/shared-memory.logrotate.
+# Per-user logrotate, no root. The config is generated from ops/shared-memory.logrotate into the home directory.
 ExecStart=/usr/bin/logrotate --state %h/.shared-memory/logrotate.state %h/.config/shared-memory/logrotate.conf
-# S-17 (Credential_Custody_Plan PR A4): NoNewPrivileges only — UMask is left
-# at the system default here because logrotate itself sets the rotated
-# files' mode from shared-memory.logrotate's own `create` stanza, which
-# already names an explicit mode; a unit-level UMask would be redundant, not
-# wrong, so it is omitted rather than adding a second, easily-forgotten place
-# that mode is decided. ProtectHome is not evaluated here — logrotate's whole
-# job is writing under $HOME (%h), so it is obviously incompatible.
+# No unit UMask: rotated-file mode comes from the logrotate `create` stanza, and a second place to set it would drift. ProtectHome is incompatible because the job is writing under the home directory.
 NoNewPrivileges=yes
 
-# S16 (HYG round) — LimitCORE=0: same reasoning as hive-mind-gateway.service.
-# logrotate itself loads no framework secret, but the directive is applied
-# unconditionally across all three units as defense in depth. See
-# ops/README.md's "Hardening" section for the temporary lift procedure.
+# Same core ban as the other two units, even though logrotate loads no framework secret.
 LimitCORE=0
 
-# ProtectSystem=full (HYG round): every write path of THIS unit is confirmed
-# under %h — the --state file (%h/.shared-memory/logrotate.state above), the
-# rotated files themselves (%h/.shared-memory/logs/*-audit.jsonl, per
-# shared-memory.logrotate's __SM_LOG_DIR__ substitution), and their .gz
-# siblings logrotate's own `compress` writes alongside them. /usr, /boot and
-# /etc are read-only for this unit from here on.
+# Every write this unit makes is under the home directory, so making /usr, /boot, and /etc read-only does not block rotation.
 ProtectSystem=full

@@ -1,16 +1,8 @@
--- Migration 041: whitelist neo4j_outbox cypher_params->>'type'.
---
--- Unknown outbox types used to fall through to Fact MERGE and SET f.content
--- from a missing content_snippet (blanking the node). The worker now
--- fail-closes those rows; this CHECK is the schema half so a direct INSERT
--- cannot enqueue one. NULL / missing / empty type is the historical Fact
--- default and stays allowed.
---
--- Do not UNIQUE neo4j_outbox.pg_id — a pg_id may have a dream-cycle row and a
--- later one-shot (project_of / domain_of / supersede) at once.
---
--- If this ADD CONSTRAINT fails, inspect rows whose type is not in the
--- whitelist; this migration does not rewrite or DELETE them.
+-- Migration 041: reject an unknown neo4j_outbox type. Those rows used to fall
+-- through to Fact MERGE and blank content from a missing snippet. NULL or
+-- empty type stays the historical Fact default. Do not unique pg_id: a
+-- dream-cycle row and a later one-shot may coexist. A failing check names
+-- the bad type; this file does not rewrite or delete those rows.
 
 BEGIN;
 

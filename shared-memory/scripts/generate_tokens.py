@@ -108,38 +108,11 @@ import sys
 import tempfile
 
 
-# The DEFAULT roster for a first-ever bulk mint (no AGENT_INSTALLS/AGENT_TOKENS
-# registry on disk yet). NOT the whole story any more (install-path hardening,
-# D19/roster fix): a bulk mint after that point rolls in every name already
-# registered in the gateway .env's AGENT_TOKENS too (see _resolve_roster()
-# below), so an agent added later via --add is never silently dropped from a
-# --force rotation just because it is absent from this fixed list.
-#
-# ⛔ "monitor" IS DELIBERATELY ABSENT (ruled). It used to sit here, and the
-# result was that EVERY fresh install registered a digest for it that
-# structurally could not be delivered: the monitor dashboard lives in a sibling
-# repo, so it has no LOCAL_SKILL_ENV_PATHS entry and is classified REMOTE, and
-# the documented bulk invocation carries no --reveal — so its plaintext was
-# discarded at birth while its digest landed in AGENT_TOKENS. That is D19's own
-# rule broken by the default path ("never mint a token into a digest registry
-# that nobody actually received, which is worse than not minting at all"), and
-# it was unrecoverable by --add afterwards (already registered → refused).
-# The monitor is now minted ON DEMAND, when the operator actually wants one:
-#     generate_tokens.py --add monitor --reveal monitor
-# ⚠ This changes only what a FRESH registry gets by default. An install that
-# ALREADY has monitor registered keeps it across a --force rotation, because
-# _resolve_roster() unions this list with every name already in AGENT_TOKENS —
-# removing a name from here must never revoke a credential already in use.
+# First-mint roster only. A later bulk mint also keeps every name already in AGENT_TOKENS, so dropping a name here never revokes a live credential.
+# monitor is absent: a fresh install cannot deliver it, and a digest nobody received is worse than not minting.
 AGENTS = ["claude", "gemini", "grok", "codex", "lm_studio", "antigravity"]
 
-# Read-only identities: GET /health, GET /memory/telemetry, POST /memory/search; /memory/graph is 403.
-#
-# ⛔ THE ROSTER LIVES IN agent_roles.py, NOT HERE. It used to be defined in this
-# file, which made the guarantee a minting convention: the gateway believed
-# whatever AGENT_ROLES said, and an identity registered before the rule was
-# honoured — or a line rewritten by an older tool — kept full access silently.
-# The gateway now enforces the same roster on every request, so this module and
-# the gateway can no longer disagree about who is read-only.
+# The read-only roster lives in agent_roles.py, and the gateway enforces that same list. A mint-only list let an old AGENT_ROLES line keep full access.
 from agent_roles import (                                    # noqa: E402
     READ_ONLY_AGENTS, VALID_ROLES, read_only_agents,
     role_for_mint, enforce_roster,
@@ -148,27 +121,8 @@ from agent_roles import (                                    # noqa: E402
 # Kept as a module-local alias: this name is the one the CLI and the tests call.
 role_for = role_for_mint
 
-# SEED DEFAULTS offered at first bootstrap ONLY — one per CLI agent this
-# framework ships a thin-client skill to (mirrors sync_skills.sh's default
-# AGENTS list: ~/.claude, ~/.codex, ~/.gemini, ~/.grok). Deliberately does NOT
-# include every name in AGENTS: LM Studio takes AGENT_TOKEN from mcp.json's
-# own env block, never a skill .env; "antigravity" and "gemini" both
-# plausibly resolve to ~/.gemini/skills/shared-memory — ambiguous, so left
-# OUT rather than guessed (a wrong guess here writes a token into the wrong
-# install). "monitor" (the dashboard) lives in a sibling repo whose install
-# path this script has no visibility into — which is exactly why it is no
-# longer on the default AGENTS roster either (see that constant): a name with
-# no path here and no --reveal is minted UNDELIVERABLE.
-#
-# Install-path hardening (D19/roster fix, ruled): an install path is OWNED
-# information about a host, not something a naming convention can be trusted
-# to reproduce — so this dict is consulted exactly ONCE, the very first time
-# mint() runs against a gateway .env with no AGENT_INSTALLS line at all (see
-# _load_agent_installs_registry()). That one seeding is itself recorded back
-# into AGENT_INSTALLS as an explicit registration; every mint after that reads
-# ONLY the registry — an agent absent from it is REMOTE, full stop, never
-# re-guessed from its name. --reveal is the only way to deliver a remote
-# agent's token.
+# First bootstrap only, and only for CLI skill installs this script can see. lm_studio has no skill .env, and antigravity is not guessed onto gemini's path.
+# That one seed is recorded in AGENT_INSTALLS. Later mints read only the registry; a name with no path is remote, and --reveal is the only delivery.
 LOCAL_SKILL_ENV_PATHS = {
     "claude": os.path.expanduser("~/.claude/skills/shared-memory/.env"),
     "codex":  os.path.expanduser("~/.codex/skills/shared-memory/.env"),
@@ -176,9 +130,7 @@ LOCAL_SKILL_ENV_PATHS = {
     "grok":   os.path.expanduser("~/.grok/skills/shared-memory/.env"),
 }
 
-# Gateway .env candidate order — matches every other loader in this family
-# (apply.py / secure_env.py / bootstrap_tokens.sh): shared-memory/.env
-# first, the repo-root .env as the pre-0.6 fallback.
+# Same order as the other loaders: shared-memory/.env, then the repo-root .env.
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _DEFAULT_GATEWAY_ENV = os.path.join(_HERE, "..", ".env")
 if not os.path.exists(_DEFAULT_GATEWAY_ENV):
@@ -217,25 +169,7 @@ def _read_env_raw_value(env_path: str, key: str) -> "str | None":
     return None
 
 
-# Characters that can never appear in a registered agent NAME or install
-# PATH (security-review findings F2/F2b, ruled I-A8): AGENT_TOKENS and
-# AGENT_INSTALLS are comma-separated name:value pairs, so a `,` forges a
-# second entry and a `:` (beyond the one splitting name from value) forges
-# a bogus value -- reproduced: --install-path
-# "/legit/.env,victim:/attacker/victim.env" made a SECOND registry entry,
-# "victim", pointing at an attacker-controlled path, which the next bulk
-# rotation would write a real agent's fresh token straight into (token
-# theft). A newline forges a WHOLE SECOND .env assignment line -- this same
-# file is passed to `docker compose --env-file`. A NUL byte terminates a C
-# string early in anything that eventually shells out to it.
-#
-# Validated at INPUT, before anything is minted, written, or registered --
-# CLAUDE.md's own rule applies here verbatim ("a separator that can occur
-# in the data is not a delimiter, on either side"): an ESCAPE scheme would
-# need a matching UNESCAPE in _parse_agent_installs, in bootstrap_tokens.sh's
-# own grep/cut handling of these lines, and in any future reader -- one of
-# those would eventually be missed. Refusing the character outright has no
-# distributed contract to keep in sync.
+# Comma, colon, newline, and NUL are refused, not escaped. These lines are comma-separated name:value pairs and also a compose env file, and an escape would need every reader to agree.
 _FORBIDDEN_REGISTRY_CHARS = (",", ":", "\n", "\r", "\x00")
 
 
@@ -294,35 +228,8 @@ def _same_registered_file(path_a: str, path_b: str) -> bool:
     return os.path.realpath(path_a) == os.path.realpath(path_b)
 
 
-# ── Install KINDS: what a registered path is a path TO ───────────────────────
-#
-# An AGENT_INSTALLS entry is `name:path` (two fields) or `name:kind:path`
-# (three). The two-field form parses as kind="skill" FOREVER — it is not a
-# legacy spelling to be migrated, it is the shorthand for the default kind, and
-# nothing in this framework ever rewrites an existing line to add ":skill:".
-# That is why _format_agent_installs() below EMITS the two-field form for the
-# default kind: a bulk mint re-prints the whole registry, and a mint that
-# gratuitously restyled every entry would make a rotation look like a schema
-# change in the operator's own `git diff` of their .env.
-#
-# The kinds differ in what the registered path IS and therefore in what
-# sync_skills.sh must DELIVER to it:
-#   skill — a CLI agent's skill .env; its parent dir receives the thin-client
-#           skill package (SKILL.md, memory_bridge.py, …), driven by MANIFEST.txt.
-#   mcp   — an MCP connector's WALLED DIRECTORY .env; its parent dir receives
-#           the connector package (vector-skill.py, CONSTITUTION_SNIPPET_MCP.md,
-#           system-prompt.md) and NEVER the CLI package. Delivering the CLI
-#           package into an MCP install is a real, measured hazard, not a
-#           hypothetical: the registry cannot tell the two apart without this
-#           field, so it dumped SKILL.md and memory_bridge.py into a connector's
-#           walled directory.
-#
-# ⚠ Disambiguation is unambiguous BY CONSTRUCTION, not by luck: a registered
-# path can never contain ':' at all (_validate_registry_field refuses it as a
-# delimiter), so a three-field entry's middle field is a kind or the entry is
-# malformed. A pre-validation legacy path that DOES carry a colon still parses
-# whole, because a middle field that is not a known kind is treated as part of
-# the path — see _split_install_entry().
+# Two fields means skill, forever. The default kind is emitted without ":skill:" so a bulk reprint is not a schema change in the operator's diff.
+# skill delivers the CLI package; mcp delivers the connector and never the CLI package. A colon cannot appear in a path, so the middle field is the kind.
 INSTALL_KINDS = ("skill", "mcp")
 DEFAULT_INSTALL_KIND = "skill"
 
@@ -611,14 +518,7 @@ def _write_agent_token_file(path: str, token: str) -> bool:
     skill_dir = os.path.dirname(path)
     leaf = os.path.basename(path)
     if not leaf:
-        # Defensive guard (L1) — every known caller validates a
-        # directory-shaped path BEFORE reaching this shared writer
-        # (add_agent()'s _validate_registry_field block), so this should
-        # be unreachable in practice. It exists because this function is
-        # the shared writer for every mint path: an empty leaf must raise
-        # a clear, named error here rather than reach `os.rename(tmp, "")`,
-        # which raises a bare FileNotFoundError after a temp file was
-        # already created in `skill_dir`.
+        # An empty leaf must fail here, before os.rename onto an empty name, because this writer is shared by every mint path.
         raise ValueError(
             f"install path {path!r} names a directory, not a file — "
             "refused before any write"
@@ -632,12 +532,7 @@ def _write_agent_token_file(path: str, token: str) -> bool:
         return False
 
     try:
-        # Refuse a symlinked LEAF explicitly (rather than letting the
-        # rename below silently clobber it) — lstat here is relative to
-        # the already-verified, already-open dir_fd, so this is not a
-        # fresh check-then-use window: dir_fd cannot itself be swapped for
-        # something else by another process (a process can only replace a
-        # directory ENTRY, not the inode an already-open fd refers to).
+        # Refuse a symlinked leaf. lstat is on the already-open dir_fd, so this is not a fresh check-then-use window.
         try:
             leaf_stat = os.stat(leaf, dir_fd=dir_fd, follow_symlinks=False)
         except FileNotFoundError:
@@ -745,10 +640,7 @@ def mint(
     roster = _resolve_roster(env_path) if roster is None else roster
     installs, registry_present = _load_agent_installs_registry(env_path)
     if not registry_present:
-        # First-bootstrap seed, once. Every seeded guess is a CLI skill install
-        # by construction — LOCAL_SKILL_ENV_PATHS holds nothing else, and an MCP
-        # connector's walled directory is never a path a naming convention could
-        # produce.
+        # Seeded once, and only as a CLI skill path. A naming convention cannot produce an MCP directory.
         installs = {n: (DEFAULT_INSTALL_KIND, p)
                     for n, p in LOCAL_SKILL_ENV_PATHS.items()}
     existing_entries = _parse_agent_tokens_line(_read_env_raw_value(env_path, "AGENT_TOKENS") or "")
@@ -780,24 +672,12 @@ def mint(
             token = _mint_one()
             tokens[a] = token
             digests[a] = _digest(token)
-            # ⛔ THIS LINE USED TO SAY "reveal with: generate_tokens.py --reveal <a>".
-            # That command, run afterwards, is a FULL FLEET ROTATION — this
-            # file's own docstring says so: --reveal only ever shows a token
-            # from the SAME invocation. So the guidance printed next to a
-            # freshly minted credential told the operator to do the one thing
-            # that destroys every other agent's token, and it read like a
-            # retrieval step.
+            # Do not print --reveal as a later retrieval step. Run afterwards it rotates the whole fleet; it only shows a token from this same invocation.
             lines.append(f"  {a:15}  REMOTE — token minted and REGISTERED, but NOT DELIVERED")
             if a in (revealing or []):
                 lines.append("                   (revealed on this run — capture it now)")
             else:
-                # Fires for ANY remote-classified agent processed without
-                # --reveal (lm_studio, antigravity, whatever is registered
-                # later) — never for one name specially. The digest lands in
-                # AGENT_TOKENS and the plaintext is discarded at birth, so the
-                # .env reads "provisioned" for an identity that can never
-                # authenticate. Say the word, and name the ONE command that
-                # fixes it without rotating the fleet.
+                # Any remote agent without --reveal, not one special name. The digest is registered and the plaintext is already gone.
                 lines.append("                   ⛔ UNDELIVERABLE — this token was written NOWHERE and")
                 lines.append("                      can never be retrieved: its digest is registered,")
                 lines.append("                      its plaintext is already gone. Recovery (re-mints")
@@ -814,19 +694,12 @@ def mint(
                      "treated as adversarial)")
             continue
         except OSError as exc:
-            # A genuine write failure (EPERM, ENOSPC, EROFS, ...) --
-            # security-review finding F4: this must NOT crash the whole
-            # mint with a stack trace and leave every OTHER agent
-            # unprocessed. _write_agent_token_file's atomicity means the
-            # agent's existing file (if any) is untouched by this failure.
+            # A write failure must not abort the rest of the mint. The atomic writer left this agent's file untouched.
             _fail(a, f"write failed ({exc.__class__.__name__}: {exc})")
             continue
 
         if not written:
-            # D19: a REGISTERED path whose directory (or an ancestor)
-            # doesn't exist yet -- minting a token nobody can receive, then
-            # registering its digest anyway, is exactly the fresh-host
-            # defect this fix exists for.
+            # A registered path whose directory does not exist yet would mint a token nobody can receive.
             skill_dir = os.path.dirname(path)
             _fail(a, f"expected directory {skill_dir} does not exist")
             continue
@@ -837,10 +710,7 @@ def mint(
         _kind_note = "" if entry[0] == DEFAULT_INSTALL_KIND else f"  [{entry[0]}]"
         lines.append(f"  {a:15}  written → {path}  (mode 600){_kind_note}")
 
-    # Final AGENT_TOKENS entries: every successful mint's fresh digest, plus
-    # -- for a FAILED agent that was already registered -- its existing
-    # entry carried forward VERBATIM (never recomputed; I-A1's byte-identical
-    # guarantee extends to this carry-forward path too).
+    # Fresh digests, plus a failed agent's existing entry carried forward verbatim. A failure must not drop a working credential.
     final_entries: dict[str, str] = {}
     for a in roster:
         if a in digests:
@@ -848,20 +718,11 @@ def mint(
         elif a in existing_entries:
             final_entries[a] = existing_entries[a]
 
-    # Every line printed from here on is blank, a KEY=VALUE line, or starts with
-    # "# " — so the whole block pastes into an env file as-is. bootstrap_tokens.sh
-    # selects ^AGENT_TOKENS=, ^AGENT_INSTALLS= and ^AGENT_ROLES=, none of which the
-    # prefix touches.
+    # Blank, KEY=VALUE, or "# " so the block pastes into an env file. The "# " prefix does not touch bootstrap's ^AGENT_ lines.
     print("# === Gateway .env — add this line (digest form; safe to print/paste) ===")
     print("AGENT_TOKENS=" + ",".join(final_entries.values()))
     print()
-    # ⛔ MERGE, NEVER REBUILD. This line used to be generated from the roster
-    # alone, so a bulk mint ERASED every operator-declared confinement it did
-    # not know about — most damagingly `backup:admin`, the one credential
-    # restricted to /admin/*, which absence from AGENT_ROLES widens to full
-    # read/write. The additive path was fixed first; this is the same defect on
-    # the other path, and it is the more destructive of the two because a bulk
-    # mint rewrites the whole roster in one go.
+    # Merge the roles line; do not rebuild it from the roster. A rebuild erased operator confinements such as backup:admin and widened them to full access.
     _existing_roles = _parse_agent_roles_line(
         _read_env_raw_value(env_path, "AGENT_ROLES") or "")
     _merged_roles = dict(_existing_roles)
@@ -880,14 +741,11 @@ def mint(
 
     print("# === Per-agent tokens — written through, never printed ===")
     for line in lines:
-        # ONE prefix site covers all four report shapes built above (REFUSED,
-        # REMOTE, UNDELIVERABLE, written-through).
+        # One prefix covers every report shape above.
         print("# " + line)
     print()
     print("# Each agent must use its own distinct token — never share tokens across agents.")
-    # An undelivered credential is the kind of thing that must not be findable
-    # only by reading twenty lines of per-agent report. Absence from this block
-    # is what "every agent can authenticate" looks like.
+    # An undelivered credential must show up as its own block. Absence here is what "every agent can authenticate" looks like.
     _undelivered = [a for a in roster
                     if installs.get(a) is None and a not in (revealing or [])]
     if _undelivered:
@@ -908,8 +766,7 @@ def mint(
 
     if failures:
         print()
-        # ⛔ bootstrap_tokens.sh greps for the literal "PARTIAL FAILURE" (unanchored)
-        # to produce exit 2 — the "# " prefix keeps that marker intact; never reword it.
+        # bootstrap_tokens.sh greps the literal "PARTIAL FAILURE". The "# " prefix keeps that marker; do not reword the string below.
         print("# ⚠ PARTIAL FAILURE — the following agent(s) were NOT updated this mint:")
         for name, reason in failures:
             carried = " (existing token preserved, nothing revoked)" if name in existing_entries else " (never registered -- nothing to carry forward)"
@@ -957,32 +814,21 @@ def add_agent(
     """
     if env_path is None:
         env_path = _DEFAULT_GATEWAY_ENV
-    # The install KIND decides what sync_skills.sh later DELIVERS to this path,
-    # so an unknown one must never be registered — it would parse back as part
-    # of a path and silently produce a nonsense target. Checked before anything
-    # is minted, like every other refusal here.
+    # An unknown kind would parse back as part of a path. Refuse before anything is minted.
     if install_kind not in INSTALL_KINDS:
         print(f"✗ unknown install kind {install_kind!r} — expected one of "
               f"{', '.join(INSTALL_KINDS)}", file=sys.stderr)
         return 1, None
-    # A non-default kind describes a DELIVERY TARGET. Registering one without a
-    # path records a preference about a place that does not exist: the agent is
-    # REMOTE, sync has nothing to deliver to, and the kind would be silently
-    # dropped along with the absent path.
+    # A non-default kind is a delivery target. Without a path the agent is remote and the kind would be dropped.
     if install_kind != DEFAULT_INSTALL_KIND and install_path is None:
         print(f"✗ --{install_kind} needs --install-path — an install kind says what to "
               f"deliver WHERE, and without a registered path there is nowhere. For a "
               f"remote MCP host with no local directory, register it with no kind and "
               f"deliver its token with --reveal (operator-run).", file=sys.stderr)
         return 1, None
-    # Least privilege is decided BEFORE anything is minted, written or
-    # registered, so a refusal here leaves no trace — same contract as every
-    # other refusal in this function.
+    # Decided before anything is minted, so a refusal leaves no trace.
     try:
-        # `declared` matters: an agent the operator already confined with
-        # `name:read` must not be widened by a later mint, even though it is not
-        # on the code roster — the roster cannot enumerate names this framework
-        # has never heard of.
+        # An agent already confined as name:read must not be widened, even if the code roster has never heard of the name.
         _declared_now = _parse_agent_roles_line(
             _read_env_raw_value(env_path, "AGENT_ROLES") or "").get(name)
         effective_role = role_for(name, role, declared=_declared_now)
@@ -993,33 +839,7 @@ def add_agent(
         _validate_registry_field(name, "agent name")
         if install_path is not None:
             _validate_registry_field(install_path, "install path")
-            # L1 — a directory-shaped --install-path used to reach
-            # _write_agent_token_file() and crash there: leaf =
-            # os.path.basename(path) is "" for a trailing slash, so
-            # os.rename(tmp_name, "") raises a cryptic
-            # FileNotFoundError AFTER a temp file was already created.
-            # Caught here, before anything is minted or written, with a
-            # message that names the fix (--install-path is the agent's
-            # .env FILE, e.g. ~/.codex/skills/shared-memory/.env — never
-            # its containing directory).
-            #
-            # MF1 fix-round finding (security+QA review, reproduced): this
-            # USED TO call os.path.basename(install_path.rstrip("/")) --
-            # stripping the trailing slash before taking the basename
-            # recovers a non-empty leaf name (e.g. "newdir") for a
-            # trailing-slash path to a directory that does not exist yet,
-            # which also fails os.path.isdir() (nothing there to be a
-            # directory). Both clauses of this check then passed, and the
-            # refusal never fired -- the mint proceeded and
-            # _write_agent_token_file()'s OWN defensive guard (an empty
-            # `os.path.basename(path)`, computed WITHOUT stripping) caught
-            # it instead, as an uncaught ValueError, since add_agent()'s
-            # call site only catches AgentEnvIsSymlink/OSError around that
-            # write. os.path.basename() already returns "" for ANY
-            # trailing-slash path on its own -- stripping first was never
-            # needed to detect one, and only served to defeat this exact
-            # case. No .rstrip() here now: an empty basename is the correct
-            # signal for a trailing slash, existing directory or not.
+            # --install-path is the .env file, not its directory. An empty basename is the trailing-slash signal; stripping the slash first hides it.
             if not os.path.basename(install_path) or os.path.isdir(install_path):
                 raise ValueError(
                     "--install-path must be the .env FILE, not a directory "
@@ -1031,17 +851,7 @@ def add_agent(
 
     existing_raw = _read_env_raw_value(env_path, "AGENT_TOKENS") or ""
     existing_entries = _parse_agent_tokens_line(existing_raw)
-    # ── Registration guard, inverted by `replace` ───────────────────────────
-    #
-    # --add refuses an existing name: silently rotating a live agent's token
-    # would break it with no warning. That guard is right and stays.
-    #
-    # What it USED to imply was wrong, though: "there is no single-agent
-    # rotation" left --force (rotate EVERYONE) as the only way to recover one
-    # agent's token. A bulk mint registers remote agents whose tokens are never
-    # delivered, so recovering one of them cost every other agent's credential.
-    # Refusing accidental rotation must not also make deliberate re-issue
-    # impossible — that is what --remint is, and it touches nobody else.
+    # --add refuses an existing name so a live token is not rotated by accident. --remint is the deliberate re-issue, and it touches nobody else.
     if replace and name not in existing_entries:
         print(
             f"✗ {name!r} is not registered — --remint re-issues an EXISTING "
@@ -1050,16 +860,7 @@ def add_agent(
         )
         return 1, None
     if not replace and name in existing_entries:
-        # ⛔ THIS MESSAGE USED TO NAME `--remint <name> --reveal <name>` AS THE
-        # PRIMARY RECOVERY. Measured on a live MCP conversion (finding 6):
-        # an agent following the documented `--add` hits exactly this refusal,
-        # reads the next line, and is steered straight into --reveal — which is
-        # OPERATOR-ONLY, because a revealed token lands in a transcript and a
-        # transcript is stored forever. A program message an agent will act on
-        # must lead with the path an agent may actually take: WRITE-THROUGH,
-        # where the plaintext goes to a file (mode 600) and is never printed.
-        # --reveal is still named, as what it is: the operator's own-terminal
-        # alternative for an agent with no local directory to write into.
+        # Do not steer an agent at --reveal. A revealed token lands in a transcript. The path an agent may take is write-through; --reveal is the operator's own terminal.
         _kind_flag = "" if install_kind == DEFAULT_INSTALL_KIND else f" --{install_kind}"
         _path_hint = install_path or "<install-dir>/.env"
         print(
@@ -1079,25 +880,8 @@ def add_agent(
     installs, _present = _load_agent_installs_registry(env_path)
 
     if install_path is not None:
-        # I-A2/I-A9: two agents MAY legitimately share one install path (one
-        # tool reading another's skill directory) -- but
-        # _write_agent_token_file() REPLACES any existing AGENT_TOKEN= line
-        # at that path wholesale, so writing THIS agent's token there would
-        # clobber whichever registered agent already has a live token at
-        # the SAME file. Compared by NORMALIZED identity (_same_registered_
-        # file, resolving '..' and any symlink), not literal string
-        # equality -- security-review finding F3: two spellings of the
-        # identical file (".../shared-memory/.env" vs
-        # ".../other/../shared-memory/.env") defeated a `==` comparison,
-        # letting a second mint silently overwrite the first agent's token
-        # and start authenticating AS the second agent (the gateway stamps
-        # `source` from token identity -- silent provenance corruption).
-        # ⚠ On a RE-ISSUE the agent's own registered path is not a clobber —
-        # overwriting its own token file is the entire point. Excluding only
-        # `name` keeps the guard's real job intact: writing on top of a
-        # DIFFERENT agent's live token would make this agent start
-        # authenticating as that one (the gateway stamps `source` from token
-        # identity, so it is silent provenance corruption, not just a lost key).
+        # Compared by normalized path, not string equality: two spellings of one file used to overwrite the first agent's token.
+        # On a re-issue, this agent's own path is not a clobber. Writing a different agent's file would authenticate as that agent.
         clobbered = [
             n for n, (_k, p) in installs.items()
             if n in existing_entries and _same_registered_file(p, install_path)
@@ -1126,11 +910,7 @@ def add_agent(
             )
             return 1, None
         except OSError as exc:
-            # Security-review finding F4: a genuine write failure (EPERM,
-            # ENOSPC, ...) must report cleanly, not crash with a stack
-            # trace -- _write_agent_token_file's atomicity means nothing on
-            # disk changed, so this is a clean refusal, not a
-            # partially-applied one.
+            # A write failure changed nothing on disk, so report it as a refusal rather than a traceback.
             print(
                 f"✗ REFUSED — write failed ({exc.__class__.__name__}: {exc}). "
                 "Nothing was written or registered.",
@@ -1151,9 +931,7 @@ def add_agent(
     merged_entries = dict(existing_entries)
     merged_entries[name] = f"{name}:sha256:{digest}"
 
-    # As in the bulk mint: every line below is blank, KEY=VALUE, or "# "-prefixed,
-    # so the whole block pastes into an env file. bootstrap_tokens.sh's
-    # ^AGENT_TOKENS= / ^AGENT_INSTALLS= / ^AGENT_ROLES= selectors are untouched.
+    # Blank, KEY=VALUE, or "# " so the block pastes. bootstrap's ^AGENT_ selectors are unchanged.
     print("# === Gateway .env — merged AGENT_TOKENS= line (write this in place) ===")
     print("AGENT_TOKENS=" + ",".join(merged_entries.values()))
 
@@ -1163,9 +941,7 @@ def add_agent(
         merged_roles = _parse_agent_roles_line(
             _read_env_raw_value(env_path, "AGENT_ROLES") or "")
         merged_roles[name] = effective_role
-        # Repair drift while we are rewriting the line anyway: a roster identity
-        # registered before this rule existed is still declared wrong in the
-        # file. The gateway confines it regardless, but the .env should not lie.
+        # A roster identity registered before this rule is still wrong in the file. The gateway confines it anyway; the .env should not lie.
         merged_roles = enforce_roster(merged_roles)
         print()
         print("# === Gateway .env — merged AGENT_ROLES= line (write this in place) ===")
@@ -1188,21 +964,10 @@ def add_agent(
             print("#   Registered as an MCP install: sync_skills.sh delivers the CONNECTOR")
             print("#   package here (vector-skill.py, CONSTITUTION_SNIPPET_MCP.md,")
             print("#   system-prompt.md) and never the CLI skill package.")
-        # L2 — a token is read from this file ONCE, at import (both
-        # vector-skill.py's _AGENT_TOKEN_FROM_FILE and memory_bridge.py's
-        # own load populate it at load time), so a re-mint rotates the
-        # digest immediately while an already-running process keeps
-        # presenting the PREVIOUS token until it re-reads this file — every
-        # request, reads included, 401s until then. Measured live: toggling
-        # just the affected MCP server off/on in the host was sufficient; a
-        # full host restart was not required.
+        # The token is read once, at import. A re-mint 401s the running process until it re-reads the file. Toggling the MCP server was enough.
         print()
         if install_kind == "mcp":
-            # MF2 fix-round finding (QA review, LOW/cosmetic): give this
-            # branch the same "if already running" hedge the CLI branch
-            # below always had -- a fresh --add --mcp install has nothing
-            # running yet to respawn, so an unconditional "Respawn ..."
-            # overclaimed on the common first-install path.
+            # A fresh install has nothing running yet, so an unconditional "respawn" overclaimed.
             print("# ⚠ If this agent's memory MCP server is already running, respawn it so")
             print("#   it re-reads the rotated token — a full host restart works, or a")
             print("#   per-server reload/disable-enable if your host offers one; until then")
@@ -1220,11 +985,7 @@ def add_agent(
         print("#                    Otherwise an OPERATOR must reveal it, in their OWN")
         print("#                    terminal — never through an agent, whose transcript")
         print("#                    turns \"shown once\" into \"stored forever\":")
-        # ⛔ This used to say "--add {name} --reveal {name}". By the time this
-        # line prints, {name} IS already registered (this mint just added or
-        # re-issued it) — a subsequent --add of the same name hits the
-        # already-registered refusal above (line ~851) instead of revealing
-        # anything. --remint is the one that re-issues an EXISTING name.
+        # Do not say --add --reveal. This name is already registered, so another --add refuses. --remint re-issues an existing name.
         print(f"#                    generate_tokens.py --remint {name} --reveal {name}")
 
     return 0, token
@@ -1405,9 +1166,7 @@ def main(argv=None) -> int:
     install_kind = "mcp" if args.mcp else DEFAULT_INSTALL_KIND
 
     if args.mcp and args.add is None and not args.remint:
-        # An install kind is a property of ONE registration. A bulk mint
-        # re-emits the whole registry, where each entry already carries its own
-        # kind — accepting --mcp there would read as "make them all MCP".
+        # A kind belongs to one registration. --mcp on a bulk mint would read as making every entry MCP.
         print("✗ --mcp only makes sense together with --add or --remint: it "
               "declares what ONE registered install is, and a bulk mint carries "
               "each entry's kind forward from the registry already.",
@@ -1428,12 +1187,7 @@ def main(argv=None) -> int:
     if args.convert_digests is not None:
         return convert_digests(args.convert_digests)
 
-    # --add and --remint share every step after the mint itself: the same
-    # refusal handling, the same one-name --reveal contract, the same warning.
-    # They differ only in whether the name must already be registered, so the
-    # post-processing below is deliberately NOT duplicated per branch — that is
-    # how the two paths drift apart, which is the defect this release keeps
-    # finding elsewhere in this very file.
+    # --add and --remint share everything after the mint. Duplicating it is how the two paths drift.
     if args.add is not None or args.remint:
         if args.add is not None and args.remint:
             print("✗ --add and --remint are mutually exclusive: one registers a "
@@ -1448,10 +1202,7 @@ def main(argv=None) -> int:
                                   install_kind=install_kind)
         if rc != 0:
             return rc
-        # The single-agent paths mint exactly one name, so --reveal can only
-        # ever serve that one. Written against whichever flag was used rather
-        # than --add alone, or --remint NAME --reveal NAME — the documented
-        # recovery for an undelivered token — would refuse itself.
+        # These paths mint one name, so --reveal can only name that one. Checking only --add would make --remint NAME --reveal NAME refuse itself.
         _minted_name = args.add or args.remint
         unknown = [n for n in args.reveal if n != _minted_name]
         if unknown:
@@ -1490,18 +1241,8 @@ def main(argv=None) -> int:
                 continue
             print(f"  {name}: AGENT_TOKEN={tokens[name]}")
 
-    # Security-review finding F4 / I-A10: a partial per-agent failure does
-    # NOT abort this exit code as 0 -- the printed AGENT_TOKENS line is
-    # still SAFE to write into the gateway .env as-is (a failed agent's
-    # existing entry is carried forward unchanged, never dropped; see
-    # mint()'s docstring). Returning nonzero here would make bootstrap_
-    # tokens.sh's `out="$(... )"` capture (running under `set -e`) abort
-    # BEFORE it ever echoes this output or applies the safe merged line --
-    # exactly backwards from what an operator needs to see. Instead,
-    # bootstrap_tokens.sh itself greps this stdout for the "PARTIAL
-    # FAILURE" marker AFTER applying the (safe) merged registry, and exits
-    # nonzero itself at that point -- so automation still gets a
-    # distinguishable exit code, without suppressing the report.
+    # Exit 0 even on a partial failure. A nonzero return makes bootstrap's set -e drop the safe merged line before it can be applied.
+    # bootstrap greps "PARTIAL FAILURE" after applying that line, and exits nonzero itself.
     return 0
 
 

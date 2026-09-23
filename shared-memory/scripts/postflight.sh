@@ -1,42 +1,21 @@
 #!/usr/bin/env bash
 #
-# postflight.sh — verify an installed Shared Memory stack END TO END.
+# postflight.sh — verify an installed Shared Memory stack end to end.
 #
-# Implements assertions A1–A9 of shared-memory/Documentation/postflight.md.
-# THE SPEC IS THE CONTRACT: where this script and that document disagree, the
-# document wins and this script is the defect.
+# Implements A1–A9 of shared-memory/Documentation/postflight.md. Where this script and that document disagree, the document wins.
 #
-#   A1  liveness & shape        anonymous vs authenticated /health (S-10 check)
-#   A2  contract                client/gateway api_version; /health version vs checkout
-#   A3  schema truth            delegates to the two shipped verifiers
-#   A4  write path end to end   canary save → 1024-dim vector → outbox applied → :Fact
-#   A5  read path, graded       search finds the canary; reranked OR declared degraded
-#   A6  baseline emission       timings + backend_capability + capacity + hardware → JSON (never a gate)
-#   A7  conduct constraints     by construction — see the spec; stated, not tested
-#   A8  reasoning-backend       a REAL completion through the gateway proxy path; SKIPs
-#       liveness, end to end    when no backend is reported HEALTHY (/health's
-#                                llm_backends status map), never on a missing LLM
-#   A9  encoder window contract verifies advertised >= required context tokens and
-#                               empirical full payload acceptance (decision:2540)
+# A1 liveness and shape. A2 contract. A3 schema truth. A4 write path. A5 read path, graded. A6 baseline emission, never a gate. A7 conduct, stated not tested. A8 a real completion through the gateway, skipped when no backend is healthy. A9 encoder window: advertised context and a full payload (decision:2540).
 #
-# Exit 0 iff A1–A5, A8 and A9 all pass (A8 SKIPs, never gates, when no reasoning
-# backend is reported healthy right now). Run after first install (AGENTS.md
-# Phase 9) and after every upgrade:
+# Exit 0 iff A1–A5, A8 and A9 all pass. A8 skips, and does not gate, when no reasoning backend is healthy. Run after first install and after every upgrade.
 #
-#   # auth-on installs: read AGENT_TOKEN from a minted agent's skill .env —
-#   # NEVER `. file` (EXECUTES it) and never cat/grep it (fact:1499). Example
-#   # for Claude's skill path (swap in ~/.grok/, ~/.codex/, ~/.gemini/ for
-#   # another agent install):
+# Read AGENT_TOKEN from a minted agent's skill .env. Never `. file` (that executes it) and never cat or grep it (fact:1499):
 #   AGENT_ENV=${AGENT_ENV:-$HOME/.claude/skills/shared-memory/.env}
 #   AGENT_TOKEN=$(sed -n 's/^AGENT_TOKEN=//p' "$AGENT_ENV" | head -1); export AGENT_TOKEN
 #   bash shared-memory/scripts/postflight.sh
 
 set -uo pipefail   # not -e: we run every assertion and summarise, never abort early
 
-# ⛔ RULING 4: every operator-facing script accepts -h/--help (prints its own
-# header, exits 0, does nothing else) and refuses any argument it does not
-# recognise — this script previously had no argument parsing at all, so any
-# flag (including --help) was silently ignored and the assertions ran anyway.
+# --help prints this header and exits. Any other argument is refused, because this script used to ignore flags and run the assertions anyway.
 for _arg in "$@"; do
     case "$_arg" in
         -h|--help)
@@ -52,8 +31,7 @@ done
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-# Framework env lives at shared-memory/.env; the repo-root path is the pre-0.6
-# fallback — same resolution order as the gateway (hive_mind_proxy.py).
+# shared-memory/.env first, then the pre-0.6 repo-root file, matching the gateway.
 ENV_FILE="$REPO_ROOT/shared-memory/.env"
 [[ -f "$ENV_FILE" ]] || ENV_FILE="$REPO_ROOT/.env"
 
@@ -62,9 +40,7 @@ PG_CONTAINER="${PG_CONTAINER:-postgres-vector}"
 NEO4J_CONTAINER="${NEO4J_CONTAINER:-neo4j-memory}"
 PG_DB="${PG_DB:-agent_data}"
 BRIDGE="$REPO_ROOT/shared-memory/scripts/memory_bridge.py"
-# Saves can take >60 s on small hosts (measured on a 2-core machine) — the
-# outer client timeout stays generous. Slowness is A6's business, not a
-# failure of A4/A5.
+# Saves can take more than 60s on a small host. That slowness is A6's measurement, not an A4 or A5 failure, so the client timeout stays generous.
 CLIENT_TIMEOUT="${CLIENT_TIMEOUT:-240}"
 
 red()   { printf '\033[31m%s\033[0m\n' "$*"; }
@@ -76,12 +52,10 @@ ok()   { grn "  ✓ $*"; }
 warn() { ylw "  ! $*"; }
 bad()  { local a="$1"; shift; red "  ✗ $a $*"; afail["$a"]=1; }
 
-# Read one key from .env without sourcing it via the shared Python parser
-# (secure_env.read_env_value / read_env_key.py) — no bash quote-matching.
+# Read one key without sourcing .env. The shared parser does not do bash quote-matching.
 read_env() { python3 "$SCRIPT_DIR/read_env_key.py" "$ENV_FILE" "$1"; }
 
-# JSON helpers — python3 one-liners, no new dependency (python3 is guaranteed:
-# uv is an install prerequisite).
+# JSON helpers are python3 one-liners. python3 is already an install prerequisite, so this adds no dependency.
 json_get() {  # json_get <key> [key...]  — reads JSON on stdin, prints the value
     python3 -c '
 import json, sys
@@ -157,44 +131,7 @@ else:
 # <<< SELECT_SUMMARY_PHRASE
 
 # >>> A8_BACKEND_INFO (tests/test_postflight_a8.py extracts this block
-# VERBATIM and runs it standalone via subprocess with fixture stdin — same
-# technique as SELECT_SUMMARY_PHRASE above. Pure function: given the
-# /health payload (health_full) on stdin, prints
-# "<healthy_count>|<comma-joined healthy urls, no credentials>|<comma-
-# joined url=status for EVERY reported backend>".
-#
-# Fix round (operator ruling, post-build review): the first cut of this
-# function keyed on `config.llm_backends` — the CONFIGURED list — which
-# hive_mind_proxy.py's own _load_llm_backends() NEVER returns empty (unset
-# LLM_BACKENDS/LLM_BACKENDS_JSON falls back to a single-entry list built
-# from LLM_DEFAULT_TARGET, itself defaulting to "http://localhost:5000").
-# That made the "no backend configured" SKIP branch effectively
-# unreachable on any ordinary install, so a perfectly healthy LLM-less
-# deployment (AGENTS.md Phase 7: "llm":"down" blocks dreaming only, never
-# saves/search) would fire a doomed completion at the unconfigured
-# default and FAIL postflight for having no LLM at all — exactly the
-# outcome A8 exists to never cause.
-#
-# The correct signal lives in a DIFFERENT top-level /health key —
-# `llm_backends` (not `config.llm_backends`) — the per-backend STATUS MAP
-# the gateway's own liveness probe already populates every request cycle,
-# e.g. {"http://localhost:5000": "ok", "https://api.deepseek.com":
-# "timeout"}. Confirmed values (hive_mind_proxy.py, the loop that builds
-# `backend_status` just above `checks["llm"] = ...`): "ok" (probe answered
-# <400, or a credentialed backend's unauthenticated-probe 401/403 — see
-# that code's own H-1/H-2 comment), "http_<code>" (any other status),
-# "timeout", or "down" (connect/other exception) — "ok" is the ONLY
-# healthy value; every OTHER value in the vocabulary, and no backend
-# entry at all, means "not currently healthy". A3's own philosophy still
-# applies: postflight never re-derives what the gateway already decided,
-# it reads the gateway's verdict and trusts it — the fix is which VERDICT
-# to read, not a return to re-parsing LLM_BACKENDS/LLM_BACKENDS_JSON/
-# LLM_DEFAULT_TARGET in bash. healthy_count==0 is now A8's real,
-# REACHABLE SKIP signal — genuinely no backend is answering right now,
-# the documented non-fatal state, already surfaced by A1's own "llm"
-# field. Only "url" (the map's key) is ever read for the healthy-urls
-# list — has_credential/token_env never appear in this map at all, so
-# nothing here can leak a key.
+# Read llm_backends, the status map, not config.llm_backends. The configured list is never empty, so keying on it made an LLM-less install fail A8. Only status "ok" is healthy, and the map's keys are URLs, not credentials.
 a8_backend_info() {  # reads /health JSON on stdin
     python3 -c '
 import json, sys
@@ -213,47 +150,8 @@ print(str(len(healthy)) + "|" + ",".join(healthy) + "|" + summary)
 # <<< A8_BACKEND_INFO
 
 # >>> A8_GRADE_COMPLETION (tests/test_postflight_a8.py extracts this block
-# VERBATIM and runs it standalone via subprocess with fixture argv/stdin —
-# same technique as SELECT_SUMMARY_PHRASE above. Pure function: given the
-# HTTP status code postflight's own curl call to POST $GATEWAY_URL/v1/chat/
-# completions returned (argv 1), the response's X-SM-Fault-Origin header
-# value (argv 2, W4/Ruling B(i)/E(alpha2) — empty string when absent) and
-# that response's BODY on stdin, prints exactly one verdict token:
-# OK | EMPTY | NO_RESPONSE | HTTP_<code> | SKIP_<declaration>. A 200
-# with unparseable JSON, a missing/non-string "content", or blank content
-# all grade EMPTY — a 200 is not by itself a usable completion (this is the
-# D23 lesson generalised: liveness is not capability, and a shape check is
-# not a content check) — UNLESS "reasoning_content" is itself a non-empty
-# string (Item B, W5, measured 2026-08-30): a thinking model at A8's
-# max_tokens: 16 returns 16 tokens of reasoning_content, EMPTY content,
-# finish_reason: length — that is still proof a real completion crossed the
-# gateway proxy join, which is the ONE thing A8 exists to prove, so it
-# grades OK. The reasoning check mirrors the content guard EXACTLY —
-# isinstance(str) and .strip() — a structured reasoning_content object
-# ({"blocks": []}) must NOT pass. Accepted semantic shift, stated so it is
-# never later read as a hole: a finish_reason: "content_filter" response
-# carrying reasoning but no content now ALSO grades OK — correct for A8's
-# question (did a completion cross the join?), not "did the model comply".
-# SKIP_<declaration> is a NAMED NON-FATAL skip
-# (documented post-0.9.81 state, never a FAIL) for a 422 whose body carries
-# ALL FOUR conjuncts (V3): error == "no_eligible_backend", a `declaration`
-# key present, constraint != "fit" (a genuine oversized-request fit failure
-# stays FATAL), and the response actually originated at the GATEWAY (argv 2
-# == "gateway") — a passed-through UPSTREAM 422 must never be misread as a
-# gateway refusal, the same discipline rem_loop.py/consolidation_loop.py
-# enforce on their own refusal parse. This function only GRADES; the
-# human-readable message is composed at the A8 call site below — same
-# split SELECT_SUMMARY_PHRASE has from A5.
-#
-# SEC L-3 (fix round) — accepted residue, joining §7's list: for this
-# undeclared-fleet population, check_config.py's own exit code ALSO stays
-# 0 now (the guard functions it calls no longer raise for M-5'/P-5'), so
-# exit 1 there no longer distinguishes "undeclared" from "clean" either —
-# a fourth green-but-dark leg alongside top-level /health `llm` liveness,
-# postflight A1, and this SKIP_<declaration>. `/health`
-# `dependencies.llm_pool` going `degraded` (with its remedy) and
-# check_config's own per-entry ⚠ M-5'/P-5' lines are the surfaces that
-# still tell the truth about this population.
+# A 200 with empty content is not a completion, unless reasoning_content is a non-empty string: a thinking model can spend the whole token budget there and still prove the proxy join. A structured reasoning object must not pass.
+# SKIP_ is a named non-fatal 422 only when the body says no_eligible_backend, names a declaration, is not a fit failure, and X-SM-Fault-Origin is gateway. An upstream 422 is not that refusal.
 a8_grade_completion() {  # a8_grade_completion <status_code> <fault_origin_header>  (body on stdin)
     local status="$1"
     local fault_origin="$2"
@@ -312,12 +210,7 @@ print("OK" if ok else "EMPTY")
 # <<< A8_GRADE_COMPLETION
 
 # >>> A9_GRADE_WINDOW (tests/test_postflight_a9.py extracts this block
-# VERBATIM and runs it standalone via subprocess with fixture stdin).
-# Pure function: given the authenticated /health JSON on stdin,
-# parses `encoder_window` and prints:
-# <VERDICT>|<DETAIL>|<WARNING>
-# Where VERDICT is one of:
-#   OK | STILL_NULL | FAIL_WINDOW_SHORT | FAIL_EMBED_OVERRUN | FAIL_MISSING_BLOCK | UNPARSEABLE | EMPTY
+# Prints VERDICT|DETAIL|WARNING from encoder_window. Verdicts: OK, STILL_NULL, FAIL_WINDOW_SHORT, FAIL_EMBED_OVERRUN, FAIL_MISSING_BLOCK, UNPARSEABLE, EMPTY.
 a9_grade_window() {
     python3 -c '
 import json, sys
@@ -387,19 +280,10 @@ print(f"OK|embed full_payload_ok: true, {adv_str}, required: {required}|{warn_ms
 }
 # <<< A9_GRADE_WINDOW
 
-# GNU date assumed (%3N) — like the rest of the stack (Linux/docker hosts).
-# Bash builtin, never `date`: uutils coreutils (default on Ubuntu ≥25.10)
-# ignores the %3N width in `date +%s%3N` and returns nanoseconds — every timing
-# silently inflated ×10⁶ (measured on a clean Ubuntu 26.04 install).
-# $EPOCHREALTIME is "<seconds>.<microseconds>" from bash itself, everywhere.
+# Use bash $EPOCHREALTIME, not `date`. uutils ignores the %3N width and returns nanoseconds, which inflates every timing by a million.
 now_ms() { local t=$EPOCHREALTIME; echo $(( ${t%.*} * 1000 + 10#${t#*.} / 1000 )); }
 
-# Canary save through the gateway (A4/A6). new_project is idempotent-safe BY
-# CONSTRUCTION: a registered project short-circuits ingress before the flag is
-# even read (coordinator.py), so the flag stays on every save. The only
-# new_project refusals are confusable/spelling-variant names — those need the
-# operator, not a retry, and A4's failure message surfaces the gateway's reply.
-# Exactly ONE save per call, so a timing window never contains two.
+# One canary save per call, so a timing window never contains two. new_project stays on because a registered project ignores it; a spelling clash is an operator problem, not a retry.
 CANARY_META='{"project": "install-verification", "new_project": true}'
 do_save() {  # do_save <content>  — prints the bridge's JSON reply
     timeout "$CLIENT_TIMEOUT" uv run --with httpx \
@@ -409,14 +293,7 @@ do_save() {  # do_save <content>  — prints the bridge's JSON reply
 echo "Shared Memory — postflight verification (spec: shared-memory/Documentation/postflight.md)"
 echo
 
-# ── Mode selection (W-P, WP-R1) ────────────────────────────────────────────────
-# Runtime-detected, no new flag: CANARY MODE (current behavior, unchanged) while
-# the corpus holds ZERO live non-superseded community_summaries rows (either
-# kind); RE-BASELINE MODE once at least one exists. Contract refinement of the
-# v0.9.17 postflight (fact:1402/decision:1403 lineage). When the count itself is
-# undeterminable (docker missing, or the store unreachable) this FALLS BACK to
-# CANARY MODE — the safer default, since it preserves today's verification
-# rather than silently skipping a check it could not confirm was safe to skip.
+# Canary mode while no live community summary exists; re-baseline once one does (fact:1402/decision:1403). If the count cannot be read, stay in canary mode rather than skip a check that was not shown to be safe to skip.
 POSTFLIGHT_MODE="install"
 live_summary_count=""
 if command -v docker >/dev/null 2>&1; then
@@ -481,24 +358,8 @@ print(",".join(k for k in ("nrem_daemon_process", "backend_capability", "depende
                 bad A1 "authenticated payload is missing expected keys: $missing — token not resolving, or health assembly broken"
             fi
         else
-            # ONE clear message; A4/A5/A6/A8 are marked here and print a
-            # single skip line each — never a cascade of confusing errors.
-            #
-            # Fix round R1 (decision:1435): in re-baseline mode A4 needs no
-            # token at all (it performs no gateway call — see A4 below), so
-            # it must never be pre-marked failed here, and this message must
-            # not name it among what a missing token skips in that mode —
-            # spec wins, A4 cannot contribute to the exit code in re-baseline
-            # mode, INCLUDING indirectly via this earlier mark. A8 needs a
-            # token in BOTH modes (it is a live gateway call regardless of
-            # community_summaries state), so it is marked unconditionally,
-            # the same way A5 already is.
-            # Fix round F9 (QA MED-4): the message used to instruct pasting
-            # the raw token straight onto an `export` line — followed
-            # literally with a real minted token typed in, that puts the
-            # bearer on the command line and in shell history. Points at
-            # postflight.md's own non-executing read shape (AGENT_ENV +
-            # sed) instead, the same fix AGENTS.md already carries.
+            # One message, then one skip line each. In re-baseline mode A4 makes no gateway call, so a missing token must not pre-fail it (decision:1435). A8 needs a token in both modes.
+            # Point at the sed read in postflight.md. An export line would put the bearer on the command line and in shell history.
             if [[ "$POSTFLIGHT_MODE" == "re-baseline" ]]; then
                 bad A1 "auth is configured but AGENT_TOKEN is not set — read it from a minted agent's skill .env per postflight.md's Quick Start (AGENT_ENV + sed, never a pasted export) and re-run. A5, A6 and A8 are skipped for this same missing token (A4 needs no token in re-baseline mode)."
             else
@@ -695,23 +556,7 @@ if [[ "$POSTFLIGHT_MODE" == "re-baseline" ]]; then
     elif ! command -v docker >/dev/null 2>&1; then
         bad A5 "docker not found on PATH — cannot select a live Tier-3 summary for re-baseline verification"
     else
-        # QA-01 (decision:1439): BOUNDED MULTI-CANDIDATE PROBE, not a
-        # single-summary gate. The 3 most-recently-updated live rows
-        # (either kind, in order); fewer than 3 live rows: use what
-        # exists. json_agg(... ORDER BY updated_at DESC) keeps embedded
-        # newlines/unicode JSON-escaped and the ordering explicit; COALESCE
-        # covers the zero-row case (json_agg returns NULL, not '[]', on an
-        # empty input set).
-        #
-        # Why 3, measured not chosen (fact:1438 sweep, all 21 live rows on
-        # the reference install, same selector/limit-20 search this script
-        # runs): exactly 1/21 rows fails individually -- both its Tier-3
-        # candidate slots lost the rerank cut against 20 Tier-1 facts. At
-        # that rate no set of 3 DISTINCT rows on this corpus can consist
-        # entirely of failures, while a wholesale Tier-3 retrieval break
-        # still fails all 3 loudly. This is a property of this corpus at
-        # this moment, not a constant -- the fresh-install VM test
-        # re-measures it on a young corpus.
+        # Probe the three newest live rows, not one summary (decision:1439). Three is measured: one of 21 rows failed alone, so three distinct rows still catch a real retrieval break (fact:1438). json_agg of no rows is NULL, hence the COALESCE.
         candidates_json="$(docker exec "$PG_CONTAINER" psql -U postgres -d "$PG_DB" -tAc \
                 "SELECT COALESCE(json_agg(row_json ORDER BY updated_at DESC), '[]') FROM (SELECT json_build_object('id', id, 'content', content, 'kind', COALESCE(metadata->>'kind','thematic')) AS row_json, updated_at FROM community_summaries WHERE NOT superseded ORDER BY updated_at DESC LIMIT 3) sub" 2>/dev/null)"
         candidate_count="$(printf '%s' "$candidates_json" | python3 -c '
@@ -750,13 +595,7 @@ print(json.dumps(d[$cand_idx - 1]))
                 fi
                 cand_search_out="$(timeout "$CLIENT_TIMEOUT" uv run --with httpx \
                         python "$BRIDGE" search "$cand_phrase" 20 2>/dev/null)"
-                # C2 (decision:1435): the coordinator keyword-fallback shape
-                # (served when the embedder is unreachable) omits the
-                # "ranked" key entirely -- a DIFFERENT signal from an honest
-                # ranked:false degraded result, never graded as one.
-                # QA-02 (decision:1439): report the ACTUAL returned count
-                # (n), never a hardcoded 20 -- the set is at MOST 20 and
-                # smaller on a young or filtered corpus.
+                # A missing "ranked" key is the embedder-down fallback, not an honest ranked:false (decision:1435). Report the count actually returned, not a hardcoded 20 (decision:1439).
                 cand_verdict="$(printf '%s' "$cand_search_out" | python3 -c '
 import json, sys
 ref = sys.argv[1]
@@ -791,11 +630,7 @@ else:
                         break
                         ;;
                     KEYWORD_FALLBACK)
-                        # Immediate hard failure -- do NOT keep trying
-                        # candidates. The embedder being gone is not a
-                        # per-row problem a different candidate could route
-                        # around; re-baseline A4 performs no save, so this
-                        # would otherwise pass undetected.
+                        # Stop on the first candidate. A dead embedder is not a per-row miss, and re-baseline A4 saves nothing that would have caught it.
                         probe_hardfail_message="re-baseline: candidate $cand_idx of $candidate_count, $cand_ref — results carry no \"ranked\" key at all, semantic search is not serving, keyword-fallback shape detected (the embedder is unreachable); the probe stops here rather than trying more candidates"
                         break
                         ;;
@@ -919,17 +754,7 @@ print(("Shared Memory install-verification realistic canary " + marker + " — "
         fi
     fi
 
-    # D22: the timings above are a FLOOR, not a steady-state search time — on
-    # a fresh install the reranker scored whatever tiny candidate pool
-    # actually existed (often exactly the one canary A4 just saved), never a
-    # real corpus. State the pool size the baseline was measured against so
-    # a floor can never again be silently read as a steady-state reference.
-    # Query scope MIRRORS what A5 actually searched: canary mode's search is
-    # project-filtered (--project install-verification), so that project's
-    # row count IS the candidate pool; re-baseline mode's search is
-    # unfiltered whole-corpus, so the global row count is the honest scope
-    # instead. Docker-optional, like the rest of A6 — a measurement that
-    # cannot be taken is recorded null, never treated as a gate.
+    # Record the pool A5 actually searched, because a fresh-install timing is a floor, not a steady-state search. A count that cannot be taken is null, not a gate.
     corpus_scope=""
     corpus_technical_docs=""
     if command -v docker >/dev/null 2>&1; then
@@ -944,12 +769,7 @@ print(("Shared Memory install-verification realistic canary " + marker + " — "
         fi
     fi
 
-    # The capacity record and its derived fields live on /memory/telemetry —
-    # /health carries the sizing a client needs and nothing more. Fetched once,
-    # here, because both readers below want it: the baseline record and the
-    # plain-language verdict. Token via curl config on stdin, not argv, exactly
-    # like the /health fetch in A1 — argv is world-readable in /proc while the
-    # request lives. No token means no fetch, and the verdict says UNDERIVABLE.
+    # The full capacity record is on /memory/telemetry, not /health. Fetch it once, with the token on stdin, because argv is world-readable in /proc.
     if [[ -n "${AGENT_TOKEN:-}" ]]; then
         telemetry_full="$(curl -s --compressed --max-time 15 -K - "$GATEWAY_URL/memory/telemetry" <<< "header = \"Authorization: Bearer $AGENT_TOKEN\"" || true)"
     elif [[ "$auth_on" != "1" ]]; then
@@ -960,12 +780,7 @@ print(("Shared Memory install-verification realistic canary " + marker + " — "
 
     base_file="$HOME/.shared-memory/postflight/baseline-$(date -u +%Y%m%dT%H%M%SZ).json"
     # >>> A6_BASELINE_WRITER (tests/test_postflight_a8.py extracts this block
-    # VERBATIM and runs it standalone via subprocess with fixture argv/
-    # stdin, feeding a scratch path for `path` -- same technique as
-    # SELECT_SUMMARY_PHRASE/A8_BACKEND_INFO/A8_GRADE_COMPLETION above. This
-    # lets D22's corpus_size field be verified without a live gateway or
-    # Postgres/Neo4j, unlike the rest of A6's own timings (see this file's
-    # own module docstring for what stays reference-install-only).
+    # The test runs this block alone, so corpus_size can be checked without a live gateway.
     written="$(printf '%s' "${health_full:-$anon_health}" | python3 -c '
 import datetime, json, os, shutil, subprocess, sys
 (path, short_ms, big_ms, search_ms, search_rebaseline_ms, fw, mode,
@@ -1138,57 +953,23 @@ ok "A7 canaries live under the reserved project 'install-verification' and STAY 
 # ── A8 — reasoning-backend liveness, end to end ────────────────────────────────
 echo
 echo "A8 — reasoning-backend liveness, end to end:"
-# D23 (v0.9.24): hive_mind_proxy.py joined a configured backend base and the
-# incoming request path with a naive concat — f"{target_base}{request.
-# rel_url}" — so a base ending in /v1 (every cloud provider's documented
-# shape, and our own shipped .env.example before this fix) doubled into
-# /v1/v1/chat/completions, which providers answer with 404. It failed
-# COMPLETELY SILENTLY: a 404 is never billed, so neither the token counters
-# nor the provider dashboard showed anything; /health reported the backend
-# "ok" (that check is a bare /v1/models LIVENESS probe, a different code
-# path — see _v1_models_probe_url — that happened not to share the bug);
-# both daemons said "running"; and every assertion that existed at the time
-# (there was no A8 yet) passed green while REM retried the same dead
-# completion every 30 s for 45 minutes, achieving nothing. A8 exists
-# specifically to close that hole: it is the ONE assertion that drives a
-# REAL completion through the exact proxy join D23 broke (_upstream_url) —
-# never a /health field, a /v1/models probe, or a bare TCP connect, none of
-# which would have caught D23 (all three stayed green throughout the live
-# incident).
+# A8 posts a real completion through the proxy join. A doubled /v1 path 404'd silently while /health, a models probe, and every older assertion stayed green.
 reasoning_ms=""
-# ND6: carried into the Summary block below by the SKIP_* case arm — never
-# re-derived there, and never keyed off afail[] (a named skip deliberately
-# leaves afail[A8] untouched, so afail[] alone cannot distinguish "passed
-# clean" from "passed with A8 skipped").
+# The summary reads this skip name. A named skip leaves afail[A8] unset, so that array cannot tell a clean pass from a skipped A8.
 a8_skip_declaration=""
 if [[ "$token_missing" == "1" ]]; then
     warn "A8 skipped — AGENT_TOKEN missing (see A1)"
 elif [[ "$gateway_down" == "1" ]]; then
     bad A8 "skipped — gateway unreachable (see A1)"
 else
-    # IFS='|' read, matching the idiom already used for cap_fields below —
-    # a8_backend_info's third field (the full status summary) can be empty
-    # (no backends reported at all), which a bash `#*|`/`%%|*` split alone
-    # handles awkwardly once there are two delimiters.
+    # Read on '|' because the status field can be empty, and a prefix/suffix trim mishandles two delimiters.
     backend_info="$(printf '%s' "${health_full:-}" | a8_backend_info)"
     IFS='|' read -r backend_count backend_urls backend_status_summary <<< "$backend_info"
     if [[ ! "$backend_count" =~ ^[0-9]+$ || "$backend_count" -lt 1 ]]; then
-        # NEVER a gate: no backend is reported HEALTHY right now (per
-        # /health's own llm_backends status map — see a8_backend_info's own
-        # comment for the full fix-round reasoning and status vocabulary).
-        # This is the documented non-fatal state (AGENTS.md Phase 7:
-        # "llm":"down" blocks dreaming only, never saves/search), already
-        # surfaced by A1's own "llm" field — this branch must never call
-        # bad(), only warn().
+        # No healthy backend is not a failure. A1 already reports llm down, and this branch must warn, never call bad().
         warn "A8 skipped — no reasoning backend reported healthy on this gateway right now (per /health's llm_backends status map${backend_status_summary:+: $backend_status_summary}) — this is the documented non-fatal no-working-LLM state; A8 can never fail an install for it"
     else
-        # A minimal REAL completion, not a probe: small deterministic
-        # prompt, small max_tokens, same route (POST $GATEWAY_URL/v1/chat/
-        # completions) and body shape every daemon actually sends
-        # (rem_loop.py, consolidation_loop.py) — LLM_MODEL, defaulting to
-        # "local-model" exactly like them, so the model id sent here is
-        # never a postflight-only guess that could mask a real routing
-        # difference.
+        # Same route and body the daemons send, including the default model id. A postflight-only model would hide a routing difference.
         a8_model="$(read_env LLM_MODEL)"
         [[ -z "$a8_model" ]] && a8_model="local-model"
         a8_body_file="$(mktemp)"
@@ -1225,11 +1006,7 @@ print(json.dumps({
         t1="$(now_ms)"
         rm -f "$a8_body_file"
 
-        # W4 (§6.7): the second edit site, OUTSIDE the verbatim-extracted
-        # A8_GRADE_COMPLETION block — a passed-through UPSTREAM 422 must
-        # never be misread as a gateway refusal, so the discriminator needs
-        # the header the gateway itself stamps (hive_mind_proxy.py:1696).
-        # `tail -1` takes the LAST occurrence in case of a redirect chain.
+        # Read the fault-origin header here, outside the graded function. An upstream 422 is not a gateway refusal, and tail -1 keeps the last hop of a redirect.
         a8_fault_origin="$(grep -i '^X-SM-Fault-Origin:' "$a8_header_file" 2>/dev/null \
                 | tail -1 | cut -d: -f2- | tr -d ' \t\r\n')"
         rm -f "$a8_header_file"
@@ -1249,12 +1026,7 @@ print(json.dumps({
                 bad A8 "gateway returned 404 from the reasoning-backend proxy path — the known cause (D23) is a doubled /v1 path segment when a configured base already ends in /v1. Healthy backend(s) at request time: ${backend_urls:-<none>}"
                 ;;
             SKIP_*)
-                # Ruling B(i) (§6.7): a NAMED non-fatal skip, never a FAIL —
-                # postflight exits 0 with this note. Fit and every other
-                # routing/join defect (the D23 class) stay FATAL below.
-                # ND6: this is the ONE place a8_skip_declaration is set — the
-                # Summary block reads it verbatim, never re-deriving the
-                # verdict or keying off afail[] (untouched by a skip).
+                # A named skip exits 0. Fit and other join defects stay fatal below. This is the only place the skip name is set; the summary reads it and does not look at afail.
                 a8_skip_declaration="${a8_verdict#SKIP_}"
                 warn "A8 skipped: ${a8_skip_declaration} — documented post-0.9.81 state; run check_config.py to see per-backend declaration status. Healthy backend(s) at request time: ${backend_urls:-<none>}"
                 ;;

@@ -67,14 +67,7 @@ import secure_env  # noqa: E402
 from log_hygiene import scrub_url_credentials, _chmod_created_ancestors  # noqa: E402
 
 CAPTURE_SCHEMA = 1
-# Ruling A(a) 2026-08-31 (§6.4): a LOADER-SEMANTICS marker, distinct from
-# CAPTURE_SCHEMA — CAPTURE_SCHEMA versions the pre-image FORMAT (this
-# script's own JSON shape); LOADER_SEMANTICS versions what the GATEWAY's
-# loader computes for a given raw env (private_ok's default direction,
-# here). Bump this whenever such a default changes; never fold it into
-# CAPTURE_SCHEMA. An image with no "loader_semantics" key (an old-code
-# capture, or a hand-built test fixture) reads as 1 — trust-by-default —
-# by construction wherever this is read (`.get("loader_semantics", 1)`).
+# Versions the gateway loader's default direction, not the pre-image JSON shape. A missing key reads as 1. Never fold this into CAPTURE_SCHEMA.
 LOADER_SEMANTICS = 2
 
 
@@ -92,9 +85,7 @@ def _valid_loader_semantics(value) -> bool:
 DEFAULT_GATEWAY_UNIT = "hive-mind-gateway.service"
 MANAGED_KEYS = ("EMBEDDER_URL", "RERANKER_URL", "LLM_DEFAULT_TARGET",
                 "LLM_BACKENDS", "LLM_BACKENDS_JSON")
-# The three env-default rows this tool may WRITE when absent (R-A: never
-# LLM_DEFAULT_TARGET). Values come from framework_defaults.py — "read,
-# never retyped" (decision:1032).
+# The three rows this tool may write when absent. Never LLM_DEFAULT_TARGET; the values are read from framework_defaults, not retyped (decision:1032).
 from framework_defaults import FRAMEWORK_DEFAULTS  # noqa: E402
 
 EXIT_OK = 0
@@ -109,13 +100,7 @@ def _scrub(text: str) -> str:
     return scrub_url_credentials(str(text))
 
 
-# ─────────────────────────────────────────────────────────────────────────
-# Unit ownership (R-C) — ask the gateway unit what it owns before writing
-# anything. Two distinct UNKNOWNs (NEW-B): systemctl ABSENT -> proceed
-# normally (no unit, nothing can shadow); systemctl PRESENT but the query
-# fails, or a named EnvironmentFile is unreadable -> a unit MAY exist ->
-# every write declines.
-# ─────────────────────────────────────────────────────────────────────────
+# Ask the unit what it owns before writing. No systemctl means proceed; a failed query means a unit may exist, so every write declines.
 
 class UnitQuery:
     """status is one of: 'no_systemctl' (proceed normally), 'ok' (owned_keys
@@ -239,61 +224,26 @@ def query_gateway_unit(gateway_unit: str) -> UnitQuery:
     return UnitQuery("ok", owned_keys=owned, environment=environment)
 
 
-# ─────────────────────────────────────────────────────────────────────────
-# Faithful environment — PATH/HOME plus whatever the unit itself declares.
-# Operator shell exports are EXCLUDED from everything else, so the image
-# this tool computes matches what systemd would actually hand the gateway,
-# not what happens to be exported in the migrating agent's own shell.
-#
-# KNOWN FIDELITY GAPS (documented, not fixed here — MED-7 / L-4, fix round):
-#   * $CREDENTIALS_DIRECTORY / <KEY>_FILE delivery is INVISIBLE to this
-#     reconstruction: systemd injects CREDENTIALS_DIRECTORY at runtime, and
-#     it never appears in `systemctl show -p Environment`. A LoadCredential=
-#     host's credentialed entry is therefore excluded here and classifies
-#     as case 2 (unusable) even though the running gateway resolves it
-#     fine. SAFE (case 2 declines and writes nothing) but the report is
-#     pessimistic for that population — recorded for W4 rather than
-#     discovered on a customer install.
-#   * Secret-classified keys delivered via a literal `Environment=` line in
-#     the unit (see below) are deliberately EXCLUDED from the loader
-#     subprocess's environment too, for the same reason SEC-06(ii) exists
-#     everywhere else in this codebase: a value copied wholesale into a
-#     child process's environ is visible to that child's own
-#     /proc/<pid>/environ. This means `has_token` can read False for a
-#     backend whose ONLY credential source is a unit `Environment=` line
-#     (never `EnvironmentFile=` or `LoadCredential=`, both unaffected) —
-#     an accepted fidelity/security tradeoff (SEC L-4), not a bug.
-# ─────────────────────────────────────────────────────────────────────────
+# PATH, HOME, and the unit's own declarations only. The operator shell is excluded so the image matches systemd.
+# A secret on a unit Environment= line is not copied into the child, and LoadCredential= is invisible to systemctl show, so both can look like a missing token. Writes still decline.
 
 def build_faithful_env(unit_query: UnitQuery) -> "dict[str, str]":
     faithful: "dict[str, str]" = {
         "PATH": os.environ.get("PATH", ""),
         "HOME": os.environ.get("HOME", ""),
     }
-    # SEC L-4 (fix round): config keys only — a secret-classified name in
-    # the unit's OWN Environment= line (e.g. a provider key delivered as
-    # `Environment=DEEPSEEK_API_KEY=...`) must never reach this (or any)
-    # child process's environ, exactly like secure_env's own split-env
-    # design (PR A1) prevents everywhere else in this codebase.
+    # A secret on the unit's Environment= line must not enter this child process's environ.
     if unit_query.status == "ok":
         for key, value in unit_query.environment.items():
             if not secure_env.is_secret_key(key):
                 faithful[key] = value
-    # SECURE_ENV_FILE is a mechanism variable, not operator config — honour
-    # the unit's own declaration of it first (this is what a real gateway
-    # process would see); fall back to the CURRENT process's own value so a
-    # standalone/headless/test invocation (no unit at all) still resolves
-    # the same env file the operator's shell would.
+    # Mechanism variable, not operator config: the unit's value wins, then this process's, so a run with no unit still finds the file.
     if "SECURE_ENV_FILE" not in faithful and "SECURE_ENV_FILE" in os.environ:
         faithful["SECURE_ENV_FILE"] = os.environ["SECURE_ENV_FILE"]
     return faithful
 
 
-# ─────────────────────────────────────────────────────────────────────────
-# The loader subprocess — NEVER in-process (hive_mind_proxy's own loader
-# runs once at import and writes module globals). Fresh subprocess per
-# image, under the faithful environment above.
-# ─────────────────────────────────────────────────────────────────────────
+# Fresh subprocess per image. The gateway loader runs once at import and writes module globals, so it cannot run in-process.
 
 _LOADER_SNIPPET = """
 import json, sys
@@ -369,12 +319,7 @@ def run_loader(faithful_env: "dict[str, str]") -> dict:
     return data
 
 
-# ─────────────────────────────────────────────────────────────────────────
-# Raw env-file parsing — the migration's OWN view of the file's lines,
-# independent of (and prior to) any loader subprocess. Mirrors secure_env's
-# own key=value split exactly: first-wins per key, no quote/comment
-# stripping.
-# ─────────────────────────────────────────────────────────────────────────
+# This file's own lines, before any loader run. Same split as secure_env: first key wins, no quote or comment stripping.
 
 def resolve_env_file(faithful_env: "dict[str, str]") -> "Path | None":
     """Mirrors secure_env._select_env_file() exactly, but against the
@@ -447,10 +392,7 @@ def _line_value(lines: "list[str]", idx: int) -> str:
     return val.strip()
 
 
-# ─────────────────────────────────────────────────────────────────────────
-# The decision ladder (strict order, FIRST MATCH ONLY, evaluated on the
-# PRE-IMAGE + the raw file's own managed-key occurrences).
-# ─────────────────────────────────────────────────────────────────────────
+# First match only, on the pre-image plus the raw file's own managed-key lines.
 
 CASE_JSON_PRESENT_EMPTY = 0
 CASE_JSON_USABLE = 1
@@ -463,15 +405,7 @@ def classify(image: dict, occurrences: "dict[str, list[int]]", lines: "list[str]
     json_idxs = occurrences.get("LLM_BACKENDS_JSON") or []
     if json_idxs and not _line_value(lines, json_idxs[0]):
         return CASE_JSON_PRESENT_EMPTY
-    # QA H2 (fix round): case 2 requires the KEY to actually be PRESENT in
-    # the file, not merely `image["fallback_reason"]` being truthy — a real
-    # loader run can only ever set fallback_reason from inside its own
-    # `if raw_json:` branch (hive_mind_proxy.py), so this is defence in
-    # depth for any caller (a test, a future refactor) that hands classify()
-    # an inconsistent image. It is also what makes an end-to-end 'delete the
-    # JSON line from the fixture' mutation actually change the outcome —
-    # without `json_idxs and` here, a stale/mocked fallback_reason with no
-    # JSON key present would still misreport case 2.
+    # Case 2 needs the key present in the file. A truthy fallback_reason alone can come from a caller that built an inconsistent image.
     if json_idxs and image.get("fallback_reason"):
         return CASE_JSON_UNUSABLE
     if json_idxs and image.get("urls"):
@@ -544,10 +478,7 @@ def plan_case_csv_live(image: dict, csv_value: str) -> "list[dict]":
     return out
 
 
-# ─────────────────────────────────────────────────────────────────────────
-# Interactive confirm (case 4, R-A) — probe is advisory only; a human
-# confirms every materialisation.
-# ─────────────────────────────────────────────────────────────────────────
+# Probe is advisory only. A human confirms every materialisation.
 
 def _v1_models_probe_url(base: str) -> str:
     base = base.rstrip("/")
@@ -600,10 +531,7 @@ def probe_backend(url: str, timeout: float = 3.0) -> dict:
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirectHandler())
         req = urllib.request.Request(probe_url, method="GET")
         try:
-            # Belt-and-braces: a per-socket-operation timeout too, so the
-            # ordinary "nothing answers at all" case still tends to end
-            # this thread promptly — the join() deadline above is the
-            # real, load-bearing bound either way.
+            # The join() deadline is the real bound. This socket timeout only helps the abandoned thread exit sooner.
             with opener.open(req, timeout=timeout) as resp:
                 status = resp.getcode()
                 body = resp.read(65536)
@@ -628,10 +556,7 @@ def probe_backend(url: str, timeout: float = 3.0) -> dict:
     t = threading.Thread(target=_do_probe, daemon=True)
     t.start()
     t.join(timeout)
-    # A snapshot, taken NOW: if the thread is still running past the
-    # deadline it may still mutate `result` afterward — returning a copy
-    # rather than the live dict means that later mutation can never reach
-    # a caller that already moved on.
+    # Copy now: a thread still running past the deadline can still mutate the live dict.
     return dict(result)
 
 
@@ -647,12 +572,7 @@ def _effective_url_probeable(url: str) -> bool:
 
 def build_confirm_question(url: str, probe: "dict | None") -> str:
     scrubbed = _scrub(url)
-    # QA MED-4 (fix round): `probe is None` and `probe["answered"] is False`
-    # are DIFFERENT states — the first means this call never ran a probe at
-    # all (a non-interactive dry-run preview, which does not have a live
-    # operator to ask), the second means a probe genuinely ran and got no
-    # response. Conflating them as the same "did not answer" wording stated
-    # an observation that was never made.
+    # None means the probe never ran. False means it ran and got no answer. Those are not the same observation.
     if probe is None:
         observation = "not probed — this preview is non-interactive"
     elif not probe["answered"]:
@@ -693,9 +613,7 @@ def read_confirm(deadline: float = 60.0, reader=None) -> bool:
     return line.strip().lower() == "y"
 
 
-# ─────────────────────────────────────────────────────────────────────────
-# File mechanics
-# ─────────────────────────────────────────────────────────────────────────
+# File mechanics.
 
 def _detect_crlf(path: Path) -> bool:
     """Reads RAW BYTES — Path.read_text()/open(..., 'r') perform universal-
@@ -800,19 +718,12 @@ def _restore_or_die(lines: "list[str]", env_path: Path, backup_path: Path, reaso
     return EXIT_STOP
 
 
-# ─────────────────────────────────────────────────────────────────────────
-# Two-layer comparison (the property test)
-# ─────────────────────────────────────────────────────────────────────────
+# Two-layer comparison.
 
 _LAYER1_PER_URL_FIELDS = ("weights", "has_token", "models", "roles", "n_ctx",
                            "max_inflight", "extra_body")
-# Ruling A(a) (§6.4): `private_ok` moved OUT of Layer 1 (must-be-EQUAL) and
-# into the Layer-2 planned-direction set below, alongside
-# `private_ok_explicit` — a loader-semantics generation bump (W4
-# default-deny) can legitimately move it True->False on an entry this run
-# left untouched, which plain equality would misreport as a regression.
-# Still url-keyed for normalisation purposes (SEC H-4), so both stay listed
-# here even though only the first tuple is asserted EQUAL below.
+# private_ok is not an equality field: a generation bump can move it True to False on an entry this run left untouched.
+# Both stay url-keyed so normalisation still sees them.
 _URL_KEYED_FIELDS = _LAYER1_PER_URL_FIELDS + ("private_ok", "private_ok_explicit")
 
 
@@ -853,15 +764,7 @@ def two_layer_compare(pre: dict, post: dict, reported_writes: "set[str]",
     pre = _normalize_image(pre)
     post = _normalize_image(post)
     reported_writes = {_normalize_url_key(w) for w in reported_writes}
-    # SEC M-4 (fix round): same type guard as do_apply_or_dryrun's own
-    # boundary_open computation, independently applied here — this
-    # function is reached AFTER a write in the real call site, so a
-    # TypeError here would be a write-then-crash-without-restore path.
-    # Today `boundary_open` always raises first on the same malformed
-    # image (unreachable), but that stops being true the moment anyone
-    # reorders or caches it; a pure (False, message) return instead of a
-    # raised exception is also strictly better here, since it flows
-    # straight into the caller's existing _restore_or_die().
+    # A bad loader_semantics must return False here, not raise: this runs after a write, and a TypeError would skip the restore.
     for _image, _label in ((pre, "pre-image"), (post, "post-image")):
         _sem = _image.get("loader_semantics", 1)
         if not _valid_loader_semantics(_sem):
@@ -896,19 +799,8 @@ def two_layer_compare(pre: dict, post: dict, reported_writes: "set[str]",
                             f"({pre_explicit.get(url)} -> {post_explicit.get(url)}) "
                             f"but that entry was not among the reported writes")
 
-    # Ruling A(a) (§6.4): private_ok direction, Layer 2. Two, and only two,
-    # movements are legitimate:
-    #   rule 1 — False->True on an entry THIS RUN reported writing (every
-    #            write materialises true: :504/:526/:1144 — presence changes
-    #            are caught by the url-set equality above; a written entry
-    #            never goes True->False, so that direction is unreachable).
-    #   rule 2 — True->False on an entry the run LEFT UNTOUCHED, but ONLY
-    #            when the comparison crosses the loader-semantics boundary
-    #            (an old-code pre-image recomputed under new-code semantics
-    #            — exactly what a version-jump self-capture-free --preimage
-    #            run measures). Reported per-entry by name, never silent.
-    # Anything else (None<->bool, True->False within the same generation,
-    # False->True on an unreported entry) is a REAL regression — refuse.
+    # Only two private_ok moves are legitimate: False to True on an entry this run wrote, or True to False on an untouched entry when the loader-semantics boundary was crossed.
+    # Anything else is a regression.
     pre_private = pre.get("private_ok", {})
     post_private = post.get("private_ok", {})
     for url in pre.get("urls", []):
@@ -937,9 +829,7 @@ def two_layer_compare(pre: dict, post: dict, reported_writes: "set[str]",
     return True, "ok"
 
 
-# ─────────────────────────────────────────────────────────────────────────
-# Report lines — plain text, always scrubbed.
-# ─────────────────────────────────────────────────────────────────────────
+# Report lines. Call sites scrub their own URLs; this function does not scrub again.
 
 def _report(lines: "list[str]", text: str) -> None:
     """Appends `text` as-is. Deliberately NOT a second scrub pass: every
@@ -955,9 +845,7 @@ def _report(lines: "list[str]", text: str) -> None:
     lines.append(text)
 
 
-# ─────────────────────────────────────────────────────────────────────────
-# Top-level: capture
-# ─────────────────────────────────────────────────────────────────────────
+# Capture.
 
 def _open_fresh_secure_file(path: Path, mode: int = 0o600) -> int:
     """Opens `path` for writing, returning a fd this call is GUARANTEED to
@@ -1003,10 +891,7 @@ def do_capture(out_path: str, gateway_unit: str) -> int:
     captured_by = os.environ.get("SM_PRE_UPDATE_VERSION") or "self-capture (standalone)"
     payload = {"capture_schema": CAPTURE_SCHEMA, "captured_by": captured_by, "image": image}
     out = Path(out_path)
-    # SEC M-1 (fix round): only the ancestors THIS call actually creates go
-    # to 0700 (log_hygiene's own helper, reused rather than duplicated) —
-    # the update_framework.sh path already gets a 0700 mktemp -d parent,
-    # this matters for the documented standalone/operator-chosen-path mode.
+    # Only ancestors this call creates become 0700. A mktemp parent is already that; a standalone path is not.
     _chmod_created_ancestors(out.parent)
     fd = _open_fresh_secure_file(out, 0o600)
     try:
@@ -1020,9 +905,7 @@ def do_capture(out_path: str, gateway_unit: str) -> int:
     return EXIT_OK
 
 
-# ─────────────────────────────────────────────────────────────────────────
-# Top-level: apply / dry-run
-# ─────────────────────────────────────────────────────────────────────────
+# Apply or dry-run.
 
 def do_apply_or_dryrun(preimage_path: "str | None", apply: bool, gateway_unit: str,
                         confirm_reader=None) -> int:
@@ -1132,28 +1015,11 @@ def do_apply_or_dryrun(preimage_path: "str | None", apply: bool, gateway_unit: s
                         "declines (endpoint-key changes above still apply).")
         case = None
     else:
-        # pre_image is never None here: the only path that sets it None
-        # (unit_query.status == "query_failed") already returned above.
+        # pre_image is never None here: a failed unit query already returned above.
         case = classify(pre_image, occurrences, raw_lines)
 
-    # V2 (§6.4, obligation 4): the same-generation planning gate. Cases 1, 3
-    # and 4's eligibility predicates are semantics-blind — every condition
-    # they check still holds post-W4 for a deliberately-undeclared entry, so
-    # an ungated run would PLAN a write on an install that was never
-    # upgrading from anything (self-capture, no --preimage: pre and post are
-    # both computed by the CURRENT loader). Without a semantics boundary to
-    # cross there is no prior effective behaviour to preserve, so any such
-    # write would be an OPINION ("turn this on"), not a materialisation —
-    # outside this tool's job. Only a genuine version-jump (a captured
-    # pre-image from OLD code, carrying no "loader_semantics" key or an
-    # older one) opens the gate.
-    #
-    # SEC M-4 (fix round): pre_image is OPERATOR-SUPPLIED (--preimage is a
-    # path they name) — a truncated capture, a hand edit, or a future
-    # capture format writing null/a string/a float there must never reach
-    # the `<` comparison below as a raw TypeError. Guarded the same way
-    # capture_schema already is a few lines up: name the field, EXIT_STOP,
-    # never silently open or close the boundary on a guess.
+    # Same-generation installs must not be rewritten: the predicates still match an undeclared fleet, and that write would be an opinion, not a preserved behaviour.
+    # A bad loader_semantics on an operator-supplied pre-image stops here, rather than raising inside the comparison or guessing the boundary.
     if pre_image and not _valid_loader_semantics(pre_image.get("loader_semantics", 1)):
         _report(lines, f"--preimage loader_semantics={pre_image.get('loader_semantics')!r} is "
                         f"not a plain integer — cannot determine whether a loader-semantics "
@@ -1184,10 +1050,7 @@ def do_apply_or_dryrun(preimage_path: "str | None", apply: bool, gateway_unit: s
             raw_json_text = _line_value(raw_lines, json_idx)
             new_entries, touched = plan_case_json_usable(pre_image, raw_json_text)
             if new_entries is None:
-                # QA MED-3 (fix round): an unparseable shape means "cannot
-                # safely mutate — touch NOTHING", full stop. The report and the
-                # action must agree — falling through to the CSV cleanup below
-                # would write while claiming not to.
+                # An unparseable shape means touch nothing. Falling through would comment out the CSV while the report says it did not.
                 _report(lines, "LLM_BACKENDS_JSON does not parse as a JSON array of objects — "
                                 "cannot safely add private_ok — touching nothing "
                                 "(the live CSV line, if any, is also left untouched).")
@@ -1230,10 +1093,7 @@ def do_apply_or_dryrun(preimage_path: "str | None", apply: bool, gateway_unit: s
             raw_lines[csv_idx] = (
                 f"# migrated to LLM_BACKENDS_JSON by migrate_env.py {_utc_stamp()} "
                 f"— original: {orig}")
-            # QA MED-4 (fix round, §6.4): the brief's own provenance
-            # obligation for a materialising write — distinct from the
-            # comment above, which explains where the OLD CSV line went,
-            # not why this NEW JSON line exists.
+            # The CSV comment says where the old line went. This one says why the new JSON line exists.
             appended.append(f"# migrate_env.py {_utc_stamp()} materialised the pre-W4 "
                              f"effective pool from live LLM_BACKENDS (CSV)")
             appended.append(f"LLM_BACKENDS_JSON={new_json}")
@@ -1275,10 +1135,7 @@ def do_apply_or_dryrun(preimage_path: "str | None", apply: bool, gateway_unit: s
             lines = []
             if answered_yes:
                 new_entries = [{"url": default_target.rstrip("/"), "weight": 1, "private_ok": True}]
-                # QA MED-4 (fix round, §6.4): same provenance obligation as
-                # the CASE_CSV_LIVE materialisation above. R-A: never write
-                # the literal key name of the fallback env var itself, even
-                # in a comment — describe it, don't spell it.
+                # Same provenance as the CSV materialisation. Do not spell the fallback env var's name, even in this comment.
                 appended.append(f"# migrate_env.py {_utc_stamp()} materialised the pre-W4 "
                                  f"effective pool from the confirmed fallback target")
                 appended.append(f"LLM_BACKENDS_JSON={json.dumps(new_entries)}")
@@ -1295,12 +1152,7 @@ def do_apply_or_dryrun(preimage_path: "str | None", apply: bool, gateway_unit: s
                                 "LLM_BACKENDS_JSON yourself) — the repetition is designed, not "
                                 "forgetfulness.")
         else:
-            # Ruling D(a) V1 (§6.4): boundary crossing + apply + no human
-            # present + a real materialisation is NEEDED to preserve this
-            # pre-W4 install's effective behaviour (its fallback WAS serving
-            # role-less traffic) — STOP rather than exit 0 into a gateway
-            # that now silently serves nothing. R-A is preserved exactly:
-            # still no write without a human.
+            # The boundary was crossed, apply is set, and nobody is here to confirm. Stop rather than leave the gateway serving nothing. Still no write without a person.
             _report(lines, f"no backend declared — falling back to {_scrub(default_target)}, "
                             f"and this is an upgrade from a pre-default-deny install where "
                             f"that fallback WAS serving role-less traffic implicitly. A "
@@ -1325,12 +1177,7 @@ def do_apply_or_dryrun(preimage_path: "str | None", apply: bool, gateway_unit: s
         print("\n".join(lines))
         return EXIT_OK
 
-    # SEC M-3 (fix round): the operation is mkstemp(dir=parent) + os.replace()
-    # — a RENAME — which needs write+execute permission on the PARENT
-    # DIRECTORY, not on the target file's own inode (a group-writable .env
-    # in a root-owned directory would pass a file-level check and then fail
-    # inside atomic_write, reported as a raw WRITE FAILED instead of this
-    # named refusal).
+    # The write is a rename, so it needs write permission on the parent directory, not on the .env inode.
     if not os.access(env_path.parent, os.W_OK):
         _report(lines, f"REFUSING — {env_path.parent} (the .env's directory) is not "
                         f"writable and this run has planned write(s) — the write is a "
@@ -1374,11 +1221,7 @@ def do_apply_or_dryrun(preimage_path: "str | None", apply: bool, gateway_unit: s
             f"Re-run standalone once investigated: migrate_env.py --apply --preimage "
             f"<captured JSON>.")
 
-    # SEC M-4 / QA MED-9 (fix round): a SECOND, independent verification —
-    # re-read the WRITTEN file and assert EXACTLY the planned managed keys
-    # changed. two_layer_compare() above only covers the LLM pool; a wrong
-    # EMBEDDER_URL/RERANKER_URL write (or any managed-key side effect) would
-    # pass that check green with nothing to catch it.
+    # Second check, on the written file: exactly the planned managed keys changed. The pool compare above cannot see an encoder URL.
     try:
         post_raw_lines = read_raw_lines(env_path)
     except UnicodeDecodeError as exc:

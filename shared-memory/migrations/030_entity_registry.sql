@@ -1,15 +1,7 @@
--- 030 — entity_registry table for human-vetted Fact entity validation
---
--- WHAT WAS WRONG. Free-text metadata['entities'] on facts was projected verbatim
--- into Neo4j :Entity nodes without a write-time registry gate, creating graph bloat
--- (2,167 entity nodes, 3,695 decision/retro entity edges).
---
--- WHAT THIS DOES.
---   1. Create `entity_registry` table:
---      (name VARCHAR PRIMARY KEY, created_at TIMESTAMPTZ, registered_by VARCHAR).
---   2. Seed `entity_registry` from existing Fact entity strings in technical_docs.
---
--- Idempotent: safe to re-run.
+-- Migration 030: a registry so fact entity strings are not projected verbatim
+-- into Neo4j :Entity nodes. Seeded from existing fact entities. Names longer
+-- than 255 characters are skipped because the column is still VARCHAR(255);
+-- migration 034 widens it.
 
 BEGIN;
 
@@ -21,7 +13,6 @@ CREATE TABLE IF NOT EXISTS entity_registry (
 
 CREATE INDEX IF NOT EXISTS entity_registry_created_at_idx ON entity_registry (created_at);
 
--- Seed entity_registry from existing Fact records in technical_docs
 INSERT INTO entity_registry (name, registered_by)
 SELECT DISTINCT ename AS name, 'bootstrap' AS registered_by
 FROM (
