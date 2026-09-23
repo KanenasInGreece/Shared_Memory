@@ -1,73 +1,33 @@
 #!/usr/bin/env bash
 #
-# bootstrap_tokens.sh — mint agent tokens and wire them into the gateway .env.
+# bootstrap_tokens.sh — mint agent tokens and write AGENT_TOKENS, AGENT_ROLES, and AGENT_INSTALLS into the gateway .env in place.
 #
-# Runs generate_tokens.py and writes the AGENT_TOKENS (digest form) +
-# AGENT_ROLES + AGENT_INSTALLS lines into the gateway .env, IN PLACE — see
-# replace_registry_line() below. generate_tokens.py's mint flow
-# (Credential_Custody_Plan PR A2) writes each agent's token straight into
-# its own skill .env (mode 600) for every REGISTERED install path whose
-# directory already exists — nothing is printed to this terminal except
-# names, digests, and destination paths (never a raw token, unless
-# --reveal is used). A REMOTE agent (no registered install path) needs an
-# explicit, human-run reveal — pass --reveal <name> to THIS script
-# (repeatable) so it forwards to the SAME generate_tokens.py invocation
-# that does the minting.
+# generate_tokens.py writes each local agent's token into that agent's skill .env (mode 600) and prints only names, digests, and paths. Pass --reveal <name>, repeatable, to show a remote agent's token from this same mint.
 #
 #   bash shared-memory/scripts/bootstrap_tokens.sh
 #   bash shared-memory/scripts/bootstrap_tokens.sh --reveal codex --reveal grok
 #
-# Fresh-host finding D19: a REGISTERED install path whose skill directory
-# does not exist YET (the skill package hasn't been installed on this
-# machine) is REFUSED per-agent, loudly, rather than silently minting a
-# token nobody can ever receive — see the "REFUSED" lines in this script's
-# own output. Install the skill package, then re-run (a bulk rotation
-# above, or --add for just that one agent, below).
+# A registered install path whose directory does not exist yet is refused for that agent, so a token is not minted for nobody to receive. Install the skill package, then re-run.
 #
 #   bash shared-memory/scripts/bootstrap_tokens.sh --add codex \
 #       --install-path ~/.codex/skills/shared-memory/.env
 #
-# Additive mint: registers exactly ONE new agent (growing the roster)
-# without rotating anyone else's existing token — every other agent's
-# digest in AGENT_TOKENS is left byte-identical. Refuses loudly if the name
-# is already registered; there is no single-agent rotation, only --force
-# below (all-or-nothing). --install-path is optional — omit it for a
-# remote agent and pass --reveal instead.
+# --add registers one new agent and leaves every other digest unchanged. It refuses a name already registered. --remint re-issues one existing token; --force rotates everyone. Omit --install-path for a remote agent and pass --reveal instead.
 #
 #   bash shared-memory/scripts/bootstrap_tokens.sh --add opencode --mcp \
 #       --install-path ~/.config/opencode/shared-memory-mcp/.env
 #
-# --mcp registers the install as an MCP CONNECTOR install rather than a CLI
-# skill install (AGENT_INSTALLS entry `name:mcp:path`). The path is still an
-# .env FILE — the walled connector directory's own — and it is what
-# sync_skills.sh then uses to deliver the CONNECTOR package there
-# (vector-skill.py, CONSTITUTION_SNIPPET_MCP.md, system-prompt.md) instead of
-# the CLI skill package. An entry with no kind (`name:path`) is a CLI skill
-# install, permanently; nothing rewrites an existing line. --mcp requires
-# --install-path and only combines with --add / --remint.
+# --mcp records an MCP connector install (`name:mcp:path`) so sync_skills.sh delivers the connector package, not the CLI skill. It requires --install-path and only combines with --add / --remint. An entry with no kind stays a CLI skill install.
 #
-# IMPORTANT: --reveal only shows a token from THIS invocation's mint. Running
-# generate_tokens.py --reveal <name> separately, LATER, as a bulk mint, mints
-# a FRESH set of tokens for every agent in the roster — a full rotation, not
-# a free peek at the one you already registered. (--add never rotates
-# anyone regardless of --reveal.)
+# --reveal shows a token only from this invocation. A later separate reveal is a bulk mint and rotates every agent. --add never rotates anyone, even with --reveal.
 #
-# SAFETY: if AGENT_TOKENS is already set in .env, a BULK mint refuses to run
-# — minting new tokens would invalidate every agent's existing token. Use
-# --force only if you intend to rotate all tokens (agents with a registered,
-# existing install directory are redistributed automatically by the
-# write-through mint flow; remote agents still need a manual --reveal, which
-# --force accepts alongside --reveal on the SAME invocation). --add is
-# exempt from this guard entirely — growing the roster by one is the whole
-# point of it, and it never touches an existing agent's digest.
+# If AGENT_TOKENS is already set, a bulk mint refuses unless you pass --force, which rotates every token. --force accepts --reveal on the same invocation. --add is exempt and never changes an existing digest.
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-# Framework env lives at shared-memory/.env; the repo-root path is the pre-0.6
-# fallback — same resolution order as the gateway (hive_mind_proxy.py). Tokens
-# MUST land in the file the gateway actually reads, or auth stays silently off.
+# Tokens must land in the file the gateway reads: shared-memory/.env, then the pre-0.6 repo-root fallback. Otherwise auth stays silently off.
 ENV_FILE="$REPO_ROOT/shared-memory/.env"
 [[ -f "$ENV_FILE" ]] || ENV_FILE="$REPO_ROOT/.env"
 
@@ -75,80 +35,25 @@ red() { printf '\033[31m%s\033[0m\n' "$*"; }
 grn() { printf '\033[32m%s\033[0m\n' "$*"; }
 ylw() { printf '\033[33m%s\033[0m\n' "$*"; }
 
-# I.2 (SEC round, ADV1-8): script-scope temp-file cleanup registry.
-#
-# A naive `trap 'rm -f "$tmp"' EXIT` set INSIDE replace_registry_lines()
-# below would be a NO-OP: bash traps are process-global, but `local tmp`
-# goes out of scope the moment the function RETURNS, so by the time the
-# trap actually FIRES (at script exit) the variable has long since expanded
-# to an empty string — an interrupt between mktemp and the final mv would
-# leak that temp file forever. Tracking every mktemp PATH in this
-# script-scope array instead, with ONE trap registered ONCE here at top
-# level, is what survives an interrupt (Ctrl+C, a killed session) mid-
-# function. `rm -f` on a path already `mv`'d away by a successful run is a
-# harmless no-op — `rm -f` never errors on a missing target — so cleaning
-# up every path this array has ever seen, unconditionally, is safe.
+# Track every mktemp path here. A trap inside the function would expand a local that is already gone, so an interrupt would leak the temp file.
 _CLEANUP_PATHS=()
 _cleanup_temp_files() {
     local p
     for p in "${_CLEANUP_PATHS[@]:-}"; do
         [[ -n "$p" ]] && rm -f -- "$p"
     done
-    # ⛔ MEASURED FOOTGUN: under `set -e` (this script's own top-of-file
-    # setting), an EXIT-trap FUNCTION's own last command's exit status
-    # becomes the SCRIPT's final exit status if not explicitly overridden --
-    # `[[ -n "$p" ]] && rm -f ...` evaluates to 1 (false) on the empty-array
-    # case (the common one: nothing to clean up), which silently turned
-    # every `exit 0` in this script into an observed exit 1 (measured: the
-    # "AGENT_TOKENS already set, refusing" quiet-refusal path). This `return
-    # 0` is load-bearing, not decorative -- it is what makes the trap
-    # invisible to callers that check this script's own exit code.
+    # Under set -e, this trap's last status becomes the script's exit status. return 0 keeps a clean exit from looking like a failure when there is nothing to remove.
     return 0
 }
-# EXIT alone would leave INT/TERM's default disposition intact for anything
-# ELSE the signal does — bash overrides a signal's default action for a
-# trap that ONLY names EXIT not at all, but naming INT/TERM alongside EXIT
-# without an explicit `exit` in their own handler leaves the script
-# RESUMING at the interrupted line once the handler returns (bash's
-# documented trap semantics), which is the opposite of what an operator
-# hitting Ctrl+C mid-mint expects. INT/TERM get their own handler that
-# cleans up AND exits with the conventional 128+signum code; the plain
-# EXIT trap alone covers every OTHER exit path (normal return, `set -e`,
-# an explicit `exit` elsewhere in the script) without double-registering
-# the same work three times over.
+# INT and TERM clean up and exit 130 or 143. Naming them on the EXIT trap without an exit would resume after Ctrl+C.
 trap _cleanup_temp_files EXIT
 trap '_cleanup_temp_files; exit 130' INT
 trap '_cleanup_temp_files; exit 143' TERM
 
-# Rewrites ENV_FILE in place, replacing the first LIVE *or* commented-out
-# "$1=" assignment with "$2" (verbatim), appending it if no such line exists
-# at all. D20 (fresh-host finding): the old code only ever APPENDED, which
-# left TWO live AGENT_TOKENS= lines on a .env copied from .env.example (that
-# file used to ship a live, empty AGENT_TOKENS= placeholder) — it worked only
-# because the parser happens to take the last one, a parser-dependent
-# arrangement, not a stable one, and the SAME file is passed to
-# `docker compose --env-file`. Stripping any prior line (commented or live)
-# before writing the fresh one means re-running this script against an
-# OLDER .env that still carries that stale placeholder converges to exactly
-# one live assignment, same as a fresh install would.
-# ⛔ WRITE EVERY REGISTRY LINE IN ONE PASS. These used to be three sequential
-# read-modify-write calls (AGENT_TOKENS, then AGENT_INSTALLS, then AGENT_ROLES),
-# which had two failure modes, both found by review:
-#
-#   * Interruption between them leaves the file half-updated. The worst ordering
-#     is the one that existed: a new agent gets its TOKEN written and its ROLE
-#     not — and absence from AGENT_ROLES means FULL read/write, so a crash mid-run
-#     hands out an unconfined credential.
-#   * Two concurrent runs each read the same baseline and each rename their own
-#     temp file over the result, so the later one silently discards the earlier
-#     agent entirely.
-#
-# One temp file, all keys applied, one rename — plus the lock below, which is
-# what makes "read the baseline" and "replace it" a single operation rather than
-# two an interleaving run can slip between.
+# Replace the first live or commented key= line, or append it. Appending only used to leave two AGENT_TOKENS lines when .env.example shipped a placeholder.
+# Write every registry line in one temp file and one rename. A crash between token and role would leave a credential that AGENT_ROLES does not confine, and two runs can each keep the same baseline.
 replace_registry_lines() {
-    # Args: key1 line1 [key2 line2 ...]. A key whose line is empty is skipped,
-    # so a caller need not know which optional registries were produced.
+    # A key whose line is empty is skipped, so the caller need not know which registries were produced.
     local tmp; tmp="$(mktemp "${ENV_FILE}.XXXXXX")"
     _CLEANUP_PATHS+=("$tmp")
     cp "$ENV_FILE" "$tmp"
@@ -190,24 +95,18 @@ if [[ -n "$install_path" && -z "$add_name" && -z "${remint_name:-}" ]]; then
     exit 1
 fi
 if [[ "${#install_kind_flag[@]}" -gt 0 && -z "$add_name" && -z "${remint_name:-}" ]]; then
-    # An install kind describes ONE registration. A bulk mint re-emits the whole
-    # registry, each entry already carrying its own kind — accepting --mcp there
-    # would read as "convert them all".
+    # --mcp names one registration. A bulk mint already carries each entry's kind, so --mcp there would read as converting all of them.
     red "✗ --mcp only makes sense together with --add or --remint"
     exit 1
 fi
 if [[ "${#install_kind_flag[@]}" -gt 0 && -z "$install_path" ]]; then
-    # Refused HERE as well as in generate_tokens.py, deliberately: this is the
-    # documented front door, and an operator who omits the path should be told
-    # before a mint is even attempted rather than by a Python refusal two layers
-    # down that looks like a script error.
+    # Refuse a missing path here, before any mint. This is the documented front door.
     red "✗ --mcp needs --install-path <walled-dir>/.env — an install kind says"
     red "  what to deliver WHERE, and without a registered path there is nowhere."
     exit 1
 fi
 if [[ -n "${add_role:-}" && -z "$add_name" && -z "${remint_name:-}" ]]; then
-    # A bulk mint derives every role from READ_ONLY_AGENTS. Accepting --role
-    # there would look like it applied to all of them.
+    # A bulk mint takes roles from READ_ONLY_AGENTS. --role there would look like it applied to every agent.
     red "✗ --role only makes sense together with --add or --remint"
     exit 1
 fi
@@ -219,19 +118,8 @@ fi
 
 [[ -f "$ENV_FILE" ]] || { red "✗ .env not found at $ENV_FILE — run: bash shared-memory/scripts/install_framework.sh"; exit 1; }
 
-# ── One minter at a time ─────────────────────────────────────────────────────
-#
-# Minting is read-modify-write on a shared file: generate_tokens.py reads the
-# current AGENT_TOKENS, merges one entry, and prints a full replacement line
-# this script then writes back. Two concurrent runs both read the same baseline
-# and the later write silently DISCARDS the earlier agent — it is registered
-# nowhere, while its token has already been written into that agent's skill .env
-# (mode 600). The result is a credential that exists on disk and authenticates
-# against nothing, which reads as a broken agent rather than a lost write.
-#
-# The lock spans read AND write, because locking only the write would still let
-# two runs read the same baseline. Non-blocking with a clear message: a second
-# operator should be told to wait, not left watching a silent hang.
+# One minter at a time. Two runs can read the same AGENT_TOKENS baseline, and the later write drops the earlier agent whose token is already on disk.
+# The lock covers the read and the write, and it fails immediately so a second operator is told to wait.
 _LOCKFILE="${ENV_FILE}.mintlock"
 exec 8>"$_LOCKFILE" 2>/dev/null || true
 if command -v flock >/dev/null 2>&1; then
@@ -243,12 +131,10 @@ if command -v flock >/dev/null 2>&1; then
     }
 fi
 
-# Presence check before first use (defensive-bash rule from the sister
-# project's install review) — a curated message beats bash's bare
-# "uv: command not found" halfway through the run.
+# Name a missing uv before the mint starts, instead of a bare "command not found" halfway through.
 command -v uv >/dev/null 2>&1 || { red "✗ uv not found on PATH — install uv first (preflight.sh checks this)."; exit 1; }
 
-# ── Additive mint: grow the roster by one, never rotate ─────────────────────
+# --add grows the roster. --remint re-issues one existing agent. Neither path is the bulk mint below.
 if [[ -n "$add_name" || -n "${remint_name:-}" ]]; then
     if [[ -n "$add_name" && -n "${remint_name:-}" ]]; then
         red "✗ --add and --remint are mutually exclusive: one registers a NEW"
@@ -280,12 +166,7 @@ if [[ -n "$add_name" || -n "${remint_name:-}" ]]; then
 
     tokens_line="$(grep -E '^AGENT_TOKENS=' <<<"$out" || true)"
     installs_line="$(grep -E '^AGENT_INSTALLS=' <<<"$out" || true)"
-    # AGENT_ROLES is emitted only when the new agent actually needs a role — a
-    # read-only identity (READ_ONLY_AGENTS), or an explicit --role. It carries
-    # LEAST PRIVILEGE, and absence from it means FULL read/write in the gateway,
-    # so failing to write it hands a dashboard a write-capable token. That is
-    # exactly what this path used to do: the bulk mint printed the line and the
-    # additive mint did not, so nobody noticed the roster was only half honoured.
+    # Write AGENT_ROLES when the mint emits it. Absence means full read/write, and this path used to drop that line.
     roles_line="$(grep -E '^AGENT_ROLES=' <<<"$out" || true)"
     [[ -n "$tokens_line" ]] || { red "✗ generate_tokens.py produced no AGENT_TOKENS line"; exit 1; }
 
@@ -304,9 +185,8 @@ if [[ -n "$add_name" || -n "${remint_name:-}" ]]; then
     exit 0
 fi
 
-# ── Bulk mint: the whole roster, first bootstrap or a deliberate rotation ──
-
-# Guard: never silently overwrite a live token registry.
+# Bulk mint: the whole roster, for a first bootstrap or a deliberate rotation.
+# Never silently overwrite a live token registry.
 if grep -qE '^[[:space:]]*AGENT_TOKENS=.+' "$ENV_FILE" && [[ "$force" -eq 0 ]]; then
     ylw "AGENT_TOKENS is already set in $ENV_FILE — refusing to regenerate."
     ylw "Minting new tokens would break every agent that holds a current token."
@@ -365,17 +245,8 @@ fi
 echo
 ylw "Restart the gateway to load the new AGENT_TOKENS."
 
-# Security-review finding F4 / I-A10: generate_tokens.py's bulk mint()
-# returns exit 0 even when one or more agents FAILED this round (a genuine
-# write error, a missing directory, or a symlink refusal) -- deliberately,
-# because the AGENT_TOKENS line already applied above is SAFE regardless
-# (a failed agent's existing entry is carried forward unchanged, never
-# dropped; see mint()'s own docstring). Returning nonzero from THAT script
-# would have made the `out="$(...)"` capture above abort under `set -e`
-# BEFORE this script ever echoed the report or applied the safe merge --
-# exactly backwards. Instead, check for the marker HERE, after the safe
-# write already happened, so automation still gets a distinguishable exit
-# code without the report ever being suppressed.
+# generate_tokens.py exits 0 even when some agents failed, because the merged registry keeps a failed agent's old entry. A nonzero exit there would abort under set -e before this script applied that merge.
+# After the write, a PARTIAL FAILURE marker still exits 2 so automation can tell the mint was incomplete.
 if grep -q "PARTIAL FAILURE" <<<"$out"; then
     echo
     red "⚠ PARTIAL FAILURE during this mint — see the report above for which"

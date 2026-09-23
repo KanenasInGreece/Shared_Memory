@@ -1,31 +1,13 @@
 #!/usr/bin/env bash
 #
-# install_llm_backends.sh — interactively configure one or more reasoning-LLM
-# backends (local-supervised, remote/already-running, or a paid cloud API) and
-# write them into shared-memory/.env as LLM_BACKENDS_JSON.
-#
-# NEVER asks for a literal API key — only the NAME of an env var you export it
-# under yourself. See shared-memory/ops/README.md, "Reasoning-LLM backends",
-# for why (and how to get that variable into the gateway's systemd service).
+# install_llm_backends.sh — write LLM_BACKENDS_JSON. It asks for the env-var name of a key, never the key. Re-running replaces the line; it does not merge.
+# A credentialed entry over plaintext http to a public host is excluded by the gateway. This script does not write plaintext_ok.
 #
 #   bash shared-memory/ops/install_llm_backends.sh
-#
-# Safe to re-run: each run REPLACES the LLM_BACKENDS_JSON line with what you
-# enter this run — it does not merge with an earlier run.
-#
-# NON-GOAL (W0, recorded deliberately — not an oversight): a credentialed
-# entry over plaintext http to a PUBLIC host is silently excluded by the
-# gateway's transport rule (hive_mind_proxy.py _bearer_transport_ok,
-# `plaintext_ok`) — this script does not ask about or write `plaintext_ok`.
-# See shared-memory/ops/README.md, "Reasoning-LLM backends", TRANSPORT RULE.
 
 set -euo pipefail
 
-# ⛔ RULING 4: every operator-facing script accepts -h/--help (prints its own
-# header, exits 0, does nothing else) and refuses any argument it does not
-# recognise — this script previously had no argument parsing at all, so any
-# flag (including --help) was silently ignored and the interactive prompts
-# ran anyway.
+# --help used to fall through into the prompts. Unknown arguments must refuse.
 for _arg in "$@"; do
     case "$_arg" in
         -h|--help)
@@ -60,18 +42,7 @@ ask()          { local v; read -r -p "$1 [$2]: " v; printf '%s' "${v:-$2}"; }
 ask_required() { local v; while true; do read -r -p "$1: " v; [[ -n "$v" ]] && { printf '%s' "$v"; return; }; echo "  (required)"; done; }
 yesno()        { local v; read -r -p "$1 [y/N]: " v; [[ "$v" =~ ^[Yy]$ ]]; }
 
-# W0 item ① (SEC M-2, fix round — this header itself was stale after W4):
-# of the gateway's three startup guards (S-05, M-5, P-5 in
-# shared-memory/scripts/hive_mind_proxy.py), only S-05 still refuses to
-# start — any credentialed backend at all while AGENT_TOKENS is unset,
-# unless the operator has already set the documented override. M-5 and P-5
-# are loud, non-fatal startup WARNINGS since W4/decision:1824: a
-# credentialed backend with neither `private_ok` nor `roles` (M-5) is safe
-# by construction (simply never selected); auth-off plus an EXPLICIT
-# private_ok=false (P-5) is safe by construction only for a backend that
-# also carries no `roles` — one still worth asking about up front rather
-# than leaving the operator to discover it from a startup log line. This
-# block makes the script itself ask the M-5 question and warn about S-05.
+# Only S-05 still refuses to start: a credentialed backend while AGENT_TOKENS is unset. M-5 and P-5 are warnings since W4 (decision:1824); this block asks the access question instead of leaving it to the startup log.
 #
 # ROLE_VOCABULARY: extract judge
 # (source of truth: hive_mind_proxy.py's ROUTING_ROLE_NAMES; "summarize" is
@@ -79,21 +50,10 @@ yesno()        { local v; read -r -p "$1 [y/N]: " v; [[ "$v" =~ ^[Yy]$ ]]; }
 # tests/test_install_llm_backends_role_vocabulary.py)
 #
 # >>> BACKEND_ACCESS
-# _ROLE_VOCABULARY / yesno_y() / _role_vocabulary_has() /
-# _roles_cover_full_vocabulary() live inside this marker (rather than
-# beside yesno() above) so the block stays SELF-CONTAINED for
-# tests/test_install_llm_backends.py's standalone extraction —
-# build_backend_entry() depends on all four.
+# These four stay inside the marker so the extracted test block can call build_backend_entry on its own.
 _ROLE_VOCABULARY="extract judge"
 
-# SEC fix round (H-BLOCKING): yesno_y() now guards its own read the same way
-# ask_backend_roles() and the M-5 mode prompt do. Before, an exhausted pipe
-# at THIS prompt left `v` empty, the regex `[[ ! "$v" =~ ^[Nn]$ ]]` matched
-# (empty does not match ^[Nn]$) and the function returned TRUE -- silently
-# writing private_ok:true with no operator answer at all. Now EOF is a
-# THIRD state (return 2), distinct from 0=yes/1=no, so a caller can refuse
-# to guess rather than defaulting to either branch: an unanswered access
-# question must never widen access.
+# EOF is return 2, not yes. An empty read used to match the "not N" test and write private_ok true with no answer.
 yesno_y() {
     local v
     if ! read -r -p "$1 [Y/n]: " v; then
@@ -110,13 +70,7 @@ _role_vocabulary_has() {
     return 1
 }
 
-# M5 (fix round): a REAL set comparison -- sorts both sides -- rather than
-# the earlier "does the joined string contain a space" heuristic, which
-# happened to work only because _ROLE_VOCABULARY has exactly two members.
-# A future third role added to _ROLE_VOCABULARY (kept in lockstep with the
-# gateway's ROUTING_ROLE_NAMES) cannot silently break "did the operator
-# choose the full set" detection, because both sides read from the same
-# variable.
+# Set compare, not "contains a space". That heuristic only worked while the vocabulary had exactly two names.
 _roles_cover_full_vocabulary() {
     local chosen_sorted full_sorted
     chosen_sorted="$(printf '%s\n' $1 | sort | tr '\n' ' ')"
@@ -124,16 +78,7 @@ _roles_cover_full_vocabulary() {
     [[ "$chosen_sorted" == "$full_sorted" ]]
 }
 
-# ask_backend_roles() — loops until it has >=1 role from _ROLE_VOCABULARY
-# (the gateway's ROUTING_ROLE_NAMES; "summarize" is reserved and always
-# invalid here, same as at the gateway). Blank input (Enter) means "both" —
-# that is the documented default, not a re-ask condition. Anything else
-# that yields zero valid roles (an unknown name, "summarize", or a garbage
-# token) DOES re-ask — it must never fall through to an empty roles list,
-# which is itself a separate fatal shape at the gateway. Exhausted stdin
-# fails loudly (same convention as install_framework.sh's ask_secret)
-# rather than spinning. stdout carries ONLY the final space-separated role
-# list; everything else is stderr.
+# Enter means both. Anything else with no valid role is re-asked: an empty roles list is fatal at the gateway, and summarize is reserved. Stdout is only the role list.
 ask_backend_roles() {
     local raw role lc valid=() bad
     while true; do
@@ -167,24 +112,7 @@ ask_backend_roles() {
     done
 }
 
-# build_backend_entry(url, weight, model, token_env, env_file) — elicits the
-# M-5 access choice (credentialed) or the general-traffic choice
-# (uncredentialed), prints every S-05/P-5/dream-slot caveat that applies,
-# and echoes the COMPLETE jq backend entry (url/weight/model/token_env plus
-# exactly one of private_ok/roles) on stdout. It ALWAYS writes an EXPLICIT
-# choice — "private_ok": true (general-traffic) or "roles": [...]
-# (role-scoped) — on every path, credentialed or not: under W4 default-deny
-# (decision:1824) an entry with neither key defaults to private_ok=false and
-# serves no role-less traffic (M-5 is a startup WARNING now, not a refusal,
-# but this script's own output never triggers it either way, since it always
-# writes one of the two). It never writes an explicit "private_ok": false
-# (that is a real, opt-in scoping decision an operator states by hand, not
-# one this script guesses on their behalf) and it never writes "roles": []
-# (a separate fatal shape at the gateway). Every prompt/warning/caveat goes
-# to stderr; stdout carries only the finished JSON entry — the caller's
-# `entry="$(build_backend_entry ...)"` capture depends on that separation.
-# An unanswered access question (exhausted stdin at ANY point in here)
-# always returns 1 and writes NOTHING to stdout — never a default guess.
+# Always writes private_ok true or a roles list. Neither key defaults to private_ok false (decision:1824), and this script must not guess private_ok false or an empty roles list. Stdout is only the JSON entry; EOF returns 1 and writes nothing.
 build_backend_entry() {
     local url="$1" weight="$2" model="$3" token_env="$4" env_file="$5"
     local auth_off=0 priv="" roles_str="" mode="" general_rc
@@ -226,15 +154,7 @@ build_backend_entry() {
             priv="true"
         else
             roles_str="$(ask_backend_roles)" || return 1
-            # W4 default-deny (decision:1824): this "never serves role-less
-            # traffic" claim is now TRUE on BOTH paths — credentialed and
-            # uncredentialed alike. An explicit `roles` list with no
-            # `private_ok` key leaves the EFFECTIVE private_ok at its
-            # default, FALSE, for every backend regardless of credential —
-            # `_role_eligible`'s role-less branch (which falls back to
-            # effective private_ok, ignoring `roles`) excludes it either
-            # way. The uncredentialed branch below prints the identical
-            # note now, rather than the inverted one it used to need.
+            # A roles list with no private_ok stays false for role-less traffic (decision:1824), credentialed or not.
             echo "  Note: a roles-only backend never serves role-less (ad-hoc) traffic." >&2
             if ! _roles_cover_full_vocabulary "$roles_str"; then
                 echo "  Note: with only these roles, this backend does not count toward dream" >&2
@@ -262,13 +182,7 @@ build_backend_entry() {
                 return 1
             fi
             roles_str="$(ask_backend_roles)" || return 1
-            # W4 default-deny (decision:1824): the "never serves role-less
-            # traffic" claim is now TRUE on THIS (uncredentialed) path too —
-            # _role_eligible's role-less branch falls back to the EFFECTIVE
-            # private_ok, which now defaults to FALSE regardless of
-            # credential. A roles-only entry written here correctly serves
-            # no role-less traffic; this is the identical note the
-            # credentialed path above prints.
+            # Same default-deny as the credentialed path (decision:1824): roles without private_ok serve no role-less traffic.
             echo "  Note: a roles-only backend never serves role-less (ad-hoc) traffic." >&2
             if ! _roles_cover_full_vocabulary "$roles_str"; then
                 echo "  Note: with only these roles, this backend does not count toward dream" >&2
@@ -394,27 +308,7 @@ fi
 
 json_array=$(printf '%s\n' "${entries[@]}" | jq -s -c '.')
 
-# awk (not sed) for the same reason install_framework.sh uses it: the JSON value
-# contains slashes and quotes that would need fragile escaping as a sed replacement.
-#
-# R5 (fix round 1, Opus review, probe-confirmed): the PREVIOUS comment here
-# claimed "no window where the secrets-bearing file sits at default
-# permissions" — false. `chmod --reference` runs only AFTER the awk write
-# completes, so $ENV_FILE.tmp held every secret in shared-memory/.env
-# (PG_PASSWORD, NEO4J_PASSWORD, AGENT_TOKENS, BACKUP_ADMIN_TOKEN, …) at the
-# process umask (0644 under a common 022 umask) for the ENTIRE write — probe
-# reproduced this live: "MODE OF TMP RIGHT AFTER awk: 644". `chmod
-# --reference ... || true` also FAILED OPEN: a non-GNU chmod (busybox,
-# non-coreutils) errors silently and the 0644 file gets `mv`'d into place
-# with the script still printing its success banner.
-#
-# Fixed the same way S-07 fixed install_framework.sh one file over: `umask
-# 077` wraps the write in a subshell so $ENV_FILE.tmp is 600 from the byte it
-# is created, never 644 even for an instant. `chmod --reference` still runs
-# afterward for MODE FIDELITY (matching whatever $ENV_FILE's own mode
-# actually is, in case an operator widened it deliberately) — but a failed
-# chmod is now FATAL, aborting before the mv, rather than silently shipping
-# a wrongly-permissioned file.
+# awk, not sed: the JSON contains slashes and quotes. umask 077 makes the temp file 600 from the first byte; chmod after the write used to leave every secret at 0644, and a failed chmod must abort before mv.
 if grep -q '^LLM_BACKENDS_JSON=' "$ENV_FILE"; then
     (
       umask 077
@@ -444,14 +338,7 @@ echo "  Restart the gateway to pick this up:"
 echo "    systemctl --user restart hive-mind-gateway.service"
 echo "  (or: bash shared-memory/ops/install_service.sh, if it isn't installed as a service yet)"
 
-# M1 (fix round, QA review): a per-backend S-05 warning printed during
-# elicitation can scroll off-screen by the time the operator reaches
-# "Restart the gateway to pick this up" -- exactly the one state where that
-# restart command will NOT work. Re-check (value-sensitive, same as
-# build_backend_entry's own check; prints nothing itself either way) and, if
-# it still applies, re-print the warning HERE -- the true LAST thing this
-# script prints -- rather than trusting the operator to have scrolled back
-# up to see it.
+# The S-05 warning is reprinted last. The restart line just above will fail, and the earlier warning has scrolled away.
 if echo "$json_array" | jq -e 'any(.[]; has("token_env"))' >/dev/null 2>&1; then
     if ! grep -qE '^[[:space:]]*AGENT_TOKENS=[^[:space:]]' "$ENV_FILE" 2>/dev/null; then
         echo

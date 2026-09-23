@@ -2,20 +2,15 @@
 #
 # preflight.sh — verify a host is ready to run the Shared Memory gateway stack.
 #
-# Checks the hard prerequisites (docker, docker compose v2, uv, a populated
-# .env) and warns on soft ones (RAM, disk). Read-only — changes nothing.
-# Exit 0 when every hard check passes; exit 1 otherwise.
+# Checks hard prerequisites (docker, docker compose v2, uv, a populated .env) and warns on soft ones (RAM, disk). Read-only. Exit 0 when every hard check passes; exit 1 otherwise.
 #
 #   bash shared-memory/scripts/preflight.sh
 #
-# Run before `docker compose up` on a fresh gateway host (Quick Start step 1).
+# Run before `docker compose up` on a fresh gateway host.
 
 set -uo pipefail   # not -e: we run every check and summarise, never abort early
 
-# ⛔ RULING 4: every operator-facing script accepts -h/--help (prints its own
-# header, exits 0, does nothing else) and refuses any argument it does not
-# recognise — this script previously had no argument parsing at all, so any
-# flag (including --help) was silently ignored and the checks ran anyway.
+# --help prints this header and exits. Any other argument is refused, because this script used to ignore flags and run the checks anyway.
 for _arg in "$@"; do
     case "$_arg" in
         -h|--help)
@@ -31,8 +26,7 @@ done
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-# Framework env lives at shared-memory/.env; the repo-root path is the pre-0.6
-# fallback — same resolution order as the gateway (hive_mind_proxy.py).
+# shared-memory/.env first, then the pre-0.6 repo-root file, matching the gateway.
 ENV_FILE="$REPO_ROOT/shared-memory/.env"
 [[ -f "$ENV_FILE" ]] || ENV_FILE="$REPO_ROOT/.env"
 
@@ -44,19 +38,13 @@ fail=0
 ok()   { grn "  ✓ $*"; }
 warn() { ylw "  ! $*"; }
 bad()  { red "  ✗ $*"; fail=1; }
-# OPERATOR-ACTIONABLE REMEDIATION. The agent running preflight is often not
-# permitted to install anything on the host — prerequisites are the operator's
-# to place. So every hard failure that a human must fix by installing something
-# also records the exact command or source here, reprinted as ONE block at the
-# end. A ✗ that only says what is missing leaves the operator to go and find
-# out how; this hands it to them.
+# Record the install command for each hard failure. The agent running preflight often cannot install, and a bare "missing" leaves the operator to find the fix.
 REMEDIES=()
 need() { REMEDIES+=("$*"); }
 
 echo "Shared Memory — preflight checks"
 echo
 
-# ── Hard requirements ─────────────────────────────────────────────────────────
 echo "Required:"
 
 if command -v docker >/dev/null 2>&1; then
@@ -66,13 +54,7 @@ if command -v docker >/dev/null 2>&1; then
         bad "docker is installed but the daemon is not reachable (start Docker / check permissions)"
     fi
 else
-    # THE TESTED PATH IS DOCKER'S OWN REPOSITORY, for every distro — that is
-    # what our installs run and therefore the only packaging this project can
-    # speak for. Distro packages are named only as a fallback FACT, with their
-    # provenance, never as the recommendation: Fedora's own repos carry
-    # moby-engine + docker-compose (measured on a Fedora 43 install, fact:1399)
-    # and Debian ships compose v2 under the legacy name `docker-compose`
-    # (measured on Debian 13). Neither is what we test against.
+    # Recommend Docker's own repository, the only packaging this project tests. Distro packages are a fallback only: Fedora's repos carry moby-engine + docker-compose (fact:1399), and Debian ships compose v2 as docker-compose.
     if command -v dnf >/dev/null 2>&1; then
         bad "docker not found — install Docker Engine + Compose v2 from Docker's own repository (the tested path): https://docs.docker.com/engine/install/fedora/ — then sudo systemctl enable --now docker and add your user to the docker group. Fedora's own moby-engine + docker-compose also provide 'docker compose' v2, but that is not the packaging we test."
         need "Docker Engine + Compose v2, from Docker's repo: https://docs.docker.com/engine/install/fedora/ then: sudo systemctl enable --now docker && sudo usermod -aG docker \$USER"
@@ -95,39 +77,8 @@ fi
 if command -v uv >/dev/null 2>&1; then
     ok "uv ($(uv --version | awk '{print $2}'))"
 
-    # ── Is uv reachable WITHOUT the operator's shell profile? ─────────────────
-    #
-    # The check just above answers "can the OPERATOR run uv" — it runs in
-    # whatever shell invoked preflight.sh, almost always an interactive login
-    # shell that has already sourced ~/.bashrc / ~/.profile. Every agent that
-    # spawns uv instead runs it through a NON-interactive, NON-login shell (a
-    # CLI harness execs a command; it does not open a terminal), and that kind
-    # of shell reads none of those files — it starts with whatever PATH its own
-    # parent process handed it, nothing more.
-    #
-    # The recommended install two lines above — curl -LsSf
-    # https://astral.sh/uv/install.sh | sh, the upstream installer and the ONLY
-    # path this project tests against; a distro package is not something this
-    # project can speak for — places uv under $HOME/.local/bin and relies on
-    # the shell profile to put that directory on PATH. So on a fresh host that
-    # followed this exact recommendation correctly, uv ends up on the
-    # operator's PATH and invisible to everything else. That is the EXPECTED
-    # RESULT of the documented install, not a misconfiguration — and it fails
-    # completely silently: an agent that cannot run uv does not report a
-    # broken memory system, it answers some other way (or saves nothing) and
-    # nobody sees why.
-    #
-    # What is actually knowable here, and no more: whether uv resolves with NO
-    # profile in effect at all. `env -i` clears the entire environment (not
-    # just PATH) so no inherited variable can smuggle a profile's PATH edit
-    # back in; the reference path is `getconf PATH`, the platform's own
-    # compiled-in default search path — the closest thing to "what a shell has
-    # before anything user-specific runs" that any POSIX host can answer, and
-    # asking it costs nothing (getconf ships with the C library; it is never
-    # uv or python — see the note above `need()` for why that matters here).
-    # This cannot know any particular AGENT's own PATH — a framework may set
-    # one of its own — so it is worded as what was actually measured, never as
-    # a verdict on a specific agent.
+    # The check above is the operator's login shell. Agents spawn uv with no profile, and the documented installer only puts ~/.local/bin on PATH via that profile, so a correct install is still invisible to them.
+    # env -i plus getconf PATH asks only whether uv resolves with no profile at all. It cannot see one agent's own PATH, so the warning reports that measurement and nothing more.
     sys_path="$(getconf PATH 2>/dev/null)"
     if [[ -z "$sys_path" ]]; then
         : # getconf unavailable — nothing measured, so nothing claimed either way
@@ -149,17 +100,7 @@ else
     need "git: your distro's package is fine (apt install git / dnf install git)"
 fi
 
-# Tools the shipped scripts actually execute, beyond docker/uv/git above.
-# curl, python3 and timeout all sit on postflight.sh's verification path and it
-# guards none of them, so without any one an install cannot be proven. (Their
-# roles differ — curl makes the gateway calls, python3 parses the responses,
-# timeout bounds the bridge probes — so do not collapse them into one claim.) The feature-scoped ones are
-# checked further down, under Recommended, where an optional finding belongs.
-# (jq is not here because its only consumer, ops/install_llm_backends.sh, is an
-# optional install helper — not because that script self-checks. Several do:
-# backup.sh and restore.sh self-check python3 and sha256sum too, and both are
-# checked anyway. The discriminator is whether the CONSUMER is on the path to a
-# working install, never whether the script guards itself.)
+# curl, python3, and timeout sit on postflight.sh and it guards none of them, so a missing one means the install cannot be proved. jq stays under Recommended because only the optional LLM installer uses it.
 for _tool in curl python3 timeout; do
     if command -v "$_tool" >/dev/null 2>&1; then
         ok "$_tool"
@@ -173,8 +114,7 @@ for _tool in curl python3 timeout; do
     fi
 done
 
-# Read one key from .env without sourcing it via the shared Python parser
-# (secure_env.read_env_value / read_env_key.py) — no bash quote-matching.
+# Read one key without sourcing .env. The shared parser does not do bash quote-matching.
 read_env() { python3 "$SCRIPT_DIR/read_env_key.py" "$ENV_FILE" "$1"; }
 
 if [[ -f "$ENV_FILE" ]]; then
@@ -185,15 +125,7 @@ else
     bad ".env not found — run: bash shared-memory/scripts/install_framework.sh  (or copy shared-memory/.env.example → shared-memory/.env and fill it in)"
 fi
 
-# Encoder model files — an inference container with a wrong/missing model path
-# is the most common `unhealthy` in Phase 4 (AGENTS.md), and it is checkable
-# now: the .env names the dir and the compose defaults name the subpaths.
-#
-# EFFECTIVE replicas — mirrors postgres_neo4j_limits.yaml's own nested default
-# (${EMBEDDER_GPU_REPLICAS:-${GPU_ENCODER_REPLICAS:-0}}) in bash, so this
-# script's picture of "what will actually start" matches what `docker compose
-# up` will actually do, per-service override included, not just the pair-wise
-# knobs a per-service install may have moved past.
+# A missing GGUF is the usual Phase 4 unhealthy, and the .env plus compose defaults name the path now. Replica defaults follow the compose nested chain, including a per-service override, so this matches what `docker compose up` will start.
 if [[ -f "$ENV_FILE" ]]; then
     cpu_reps="$(read_env CPU_ENCODER_REPLICAS)"; cpu_reps="${cpu_reps:-1}"
     gpu_reps="$(read_env GPU_ENCODER_REPLICAS)"; gpu_reps="${gpu_reps:-0}"
@@ -202,17 +134,7 @@ if [[ -f "$ENV_FILE" ]]; then
     rer_cpu="$(read_env RERANKER_CPU_REPLICAS)";   rer_cpu="${rer_cpu:-$cpu_reps}"
     rer_gpu="$(read_env RERANKER_GPU_REPLICAS)";   rer_gpu="${rer_gpu:-$gpu_reps}"
 
-    # Double-start guard: the CPU and GPU variant of the SAME encoder bind the
-    # SAME port (8070 for both retrievers, 8071 for both rerankers) — compose
-    # itself fails loudly on the second bind when this happens, but that
-    # failure surfaces mid-`up`, after Postgres/Neo4j are already starting.
-    # Catching it here, before anything starts, is louder and earlier.
-    #
-    # A value that is not a plain non-negative integer AFTER normalising
-    # cannot be safely compared — warn and SKIP this encoder's verdict rather
-    # than guess: compose itself already fails loudly on a bad `replicas:`
-    # value at `up` time (verified: a non-integer/duplicate-name value is
-    # rejected at `config` time), so silence here is not a missed guard.
+    # CPU and GPU variants of one encoder bind the same port, and compose only fails that after Postgres and Neo4j have started. A non-integer count is skipped rather than guessed, because compose already rejects it.
     _is_int() { [[ "$1" =~ ^[0-9]+$ ]]; }
     emb_numeric=1
     if ! _is_int "$emb_cpu"; then warn "EMBEDDER_CPU_REPLICAS resolved to '$emb_cpu', not a plain integer — skipping the embedder double-start check (compose will fail loudly on this value)"; emb_numeric=0; fi
@@ -227,17 +149,9 @@ if [[ -f "$ENV_FILE" ]]; then
         bad "reranker would double-start: RERANKER_CPU_REPLICAS=$rer_cpu AND RERANKER_GPU_REPLICAS=$rer_gpu both resolve non-zero — both bind :8071; set exactly one to 0"
     fi
 
-    # M4 ruling (PR #308 review, operator-adjudicated): there is no
-    # EMBEDDER_DEVICE/RERANKER_DEVICE var to cross-check against the
-    # replicas — it was a persisted derived value (decision:1032) whose
-    # only purpose was surviving this exact drift check, and install_
-    # framework.sh no longer writes it. The double-start guard above is the
-    # only encoder-config verdict this section reaches.
+    # There is no EMBEDDER_DEVICE or RERANKER_DEVICE to cross-check. It was a persisted derived value (decision:1032), and install_framework.sh no longer writes it.
 
-    # Per-encoder GGUF: require the embedder file only if an embedder replica
-    # will start, the reranker file only if a reranker replica will start.
-    # A host that runs one encoder remotely (glxvm: reranker-only) must not
-    # fail because the unused encoder's GGUF is absent.
+    # Require a GGUF only for an encoder that will actually start. A host that runs the other encoder remotely must not fail on the unused file.
     need_embed=0
     need_rerank=0
     if [[ "$emb_cpu" != "0" || "$emb_gpu" != "0" ]]; then need_embed=1; fi
@@ -266,14 +180,7 @@ if [[ -f "$ENV_FILE" ]]; then
         warn "all encoder replicas are 0 (remote encoders): remote must serve context window ($ctx_tokens tokens, EMBED_MAX_CONTEXT_TOKENS) via --max-model-len or -c; postflight A9 will gate"
     fi
 
-    # Neo4j data-dir writability for the container user. The neo4j image drops
-    # to uid 7474 and demands WRITE access to its mounted dirs; its entrypoint
-    # (running as root) chowns /data and /logs for you but NOT /import and
-    # /plugins, so dirs created by an ordinary `mkdir -p` (user-owned, 0755)
-    # crash-loop the container on "/import is not accessible" — measured on a
-    # fresh Fedora install. Host ancestor permissions do NOT matter: the
-    # daemon mounts as root (verified: uid 7474 reads a bind mount through a
-    # 0700 home). What matters is the mounted dirs' own ownership/mode.
+    # The neo4j image runs as uid 7474 and chowns data and logs, but not import or plugins. A user-owned 0755 mkdir crash-loops those two, and only the mounted dirs' own mode matters.
     neo4j_dir="$(read_env NEO4J_HOST_DIR)"
     if [[ -n "$neo4j_dir" && -d "$neo4j_dir" ]]; then
         unwritable=""
@@ -295,20 +202,11 @@ if [[ -f "$ENV_FILE" ]]; then
     fi
 fi
 
-# ── Soft requirements (warnings only) ─────────────────────────────────────────
+# Warnings only. A miss here does not fail preflight.
 echo
 echo "Recommended:"
 
-# Neo4j checks configured heap max + pagecache (shipped defaults: 2G + 2G)
-# against physical RAM at startup and refuses to boot when they exceed it —
-# so a very small host is a HARD failure unless the .env overrides are set,
-# not a soft "you may be slow" warning. Measured on a 3.2 GB host: shipped
-# defaults refuse; the .env.example small-host preset runs.
-# MemTotal is what the kernel was LEFT, not what is fitted: firmware and
-# integrated graphics reserve some first, so a nominally-16 GB host reports 15.
-# Thresholds below are therefore set one GB under each nominal figure — a
-# machine that meets the recommendation must be able to PASS the check for it
-# (measured: 16 GB host, MemTotal 15 GB, previously warned forever).
+# Neo4j refuses to boot when heap plus pagecache exceed RAM, so a small host is a hard failure unless the .env override is set. MemTotal is what the kernel was left, so the 16 GB recommendation passes at 15.
 mem_gb=$(awk '/MemTotal/ {printf "%d", $2/1024/1024}' /proc/meminfo 2>/dev/null || echo 0)
 neo4j_heap_override=""
 [[ -f "$ENV_FILE" ]] && neo4j_heap_override="$(read_env NEO4J_HEAP_MAX)"
@@ -324,11 +222,7 @@ elif [[ "$mem_gb" -gt 0 ]]; then
     bad "RAM ${mem_gb} GB — the shipped Neo4j memory defaults (heap 2G + pagecache 2G) exceed physical RAM and Neo4j will refuse to start. Set the small-host preset in shared-memory/.env (see .env.example) and re-run"
 fi
 
-# THE FILESYSTEM THAT FILLS IS DOCKER'S, NOT THE REPO'S. Images, volumes and
-# both databases live under the docker data-root; the checkout holds source.
-# They are frequently different mounts — Debian's default LVM layout gives /var
-# ~11 GB while /home gets the rest, so measuring the repo reported hundreds of
-# free GB while the filesystem about to fill had eleven (measured, Debian 13).
+# Images, volumes, and both databases land on Docker's data-root, which is often not the checkout's filesystem. Measuring the repo hides a small /var.
 avail_gb() { df -BG --output=avail "$1" 2>/dev/null | tail -1 | tr -dc '0-9' || echo 0; }
 docker_root=$(docker info --format '{{.DockerRootDir}}' 2>/dev/null)
 [[ -d "$docker_root" ]] || docker_root=/var/lib/docker
@@ -342,8 +236,7 @@ elif [[ "$disk_gb" -gt 0 ]]; then
     warn "Disk ${disk_gb} GB free on $docker_root — ~30 GB recommended there (images + volumes + both databases land on THIS filesystem, not the checkout's). Move docker's data-root to a larger filesystem, or grow this one."
 fi
 
-# The checkout's own filesystem matters too (GGUFs commonly sit near it), but
-# only report it when it is a DIFFERENT mount — otherwise it is the same number.
+# Report the checkout's free space only when it is a different mount from Docker's. Otherwise it is the same number.
 repo_fs=$(df --output=target "$REPO_ROOT" 2>/dev/null | tail -1)
 docker_fs=$(df --output=target "$docker_root" 2>/dev/null | tail -1)
 if [[ -n "$repo_fs" && "$repo_fs" != "$docker_fs" ]]; then
@@ -353,12 +246,7 @@ if [[ -n "$repo_fs" && "$repo_fs" != "$docker_fs" ]]; then
         || warn "Disk ${repo_gb} GB free on $repo_fs — the checkout and model GGUFs live here"
 fi
 
-# PROBE IT, DO NOT ASSERT IT. `command -v nvtop` says a binary exists; it says
-# nothing about whether that binary can see a GPU. Measured on Debian 13: the
-# packaged nvtop links no libdrm backends and dlopens them at runtime, so
-# without libdrm-amdgpu1 it answers "No GPU to monitor" — as root too, so it
-# does not even look like a permission problem — while preflight cheerfully
-# reported GPU-aware dreaming as enabled.
+# `command -v nvtop` only proves a binary exists. Packaged nvtop dlopens libdrm at runtime, so a missing backend reports no GPU even as root.
 if ! command -v "${NVTOP_BIN:-nvtop}" >/dev/null 2>&1; then
     warn "nvtop not found — REM/NREM fall back to the time-based quiesce guard (optional)"
 elif nvtop_out=$("${NVTOP_BIN:-nvtop}" -s 2>/dev/null) && [[ "$nvtop_out" == *device_name* ]]; then
@@ -372,11 +260,7 @@ else
     need "libdrm for your GPU vendor, so nvtop can see it (AMD: libdrm-amdgpu1) — then confirm '${NVTOP_BIN:-nvtop} -s' lists a device"
 fi
 
-# Backup and restore stand on four small tools, and the gateway needs none of
-# them. Each line names what stops working so "proceed anyway" is a choice
-# rather than a surprise on the day a restore is actually needed. All four are
-# hard dependencies of ops/backup.sh and ops/restore.sh: those scripts die on a
-# missing sha256sum by their own check, and simply fail mid-run on the others.
+# The gateway needs none of these four. Each warning names what backup or restore loses, because those scripts die on a missing sha256sum and fail mid-run on the others.
 for _tool in gzip gunzip sha256sum flock; do
     if command -v "$_tool" >/dev/null 2>&1; then
         ok "$_tool"
@@ -391,13 +275,7 @@ for _tool in gzip gunzip sha256sum flock; do
     fi
 done
 
-# No framework or helper script runs node — the things that do are the agents
-# and the MCP host, and mcp/mcp.json's two example servers launch through npx.
-# So a gateway-only host needs none of it, while a host that will also run an
-# agent or that MCP config needs all of it, and the operator should learn which
-# they have here rather than at Phase 8. Same failure shape as uv above: the
-# upstream installer at https://nodejs.org/en/download lands user-local, and an
-# agent spawns profile-free shells that never read the profile exposing it.
+# No framework or helper script runs node. Agents and mcp/mcp.json's npx servers do, and a user-local install is invisible to a profile-free agent shell, same as uv.
 if command -v node >/dev/null 2>&1; then
     _sys_path_n="$(getconf PATH 2>/dev/null || echo /usr/bin:/bin)"
     if env -i PATH="$_sys_path_n" sh -c 'command -v node' >/dev/null 2>&1; then

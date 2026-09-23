@@ -1,56 +1,31 @@
-# Stable compose PROJECT name: without it, compose derives the project from
-# this file's parent folder (or your cwd), so moving the file — or invoking it
-# from a different directory — silently orphans the running stack from future
-# `up`/`ps`/`stop` calls while the pinned container_names then collide on the
-# next `up -d`. A fixed name keeps every invocation addressing the same stack
-# no matter where the file lives or where you stand.
+# Fixed project name. Without it compose names the stack from the parent folder or cwd, so a moved file orphans `up`/`ps`/`stop` and the pinned container names collide.
 name: shared-memory
 
 services:
 #---------- STORAGE LAYER ---------
   neo4j:
-    # Pinned exact: 5.26 is the LTS line (supported to 2028-06).
-    # 5.26.31 (2026-09-22) escapes query-log unicode (CVE-2026-1337) and
-    # bumps Jackson to 2.22.2. Cypher and the store format do not change.
-    # Bump deliberately, never float back to `neo4j:5-community`.
+    # Pinned exact. 5.26.31 escapes query-log unicode (CVE-2026-1337); Cypher and the store format do not change. Never float back to `neo4j:5-community`.
     image: neo4j:5.26.31-community
     container_name: neo4j-memory
-    # Loopback by default, same rule and same shape as INFERENCE_BIND below:
-    # a bare "7474:7474" publishes on ALL interfaces, putting the store that
-    # holds the entire corpus on the network behind nothing but its password.
-    # The gateway is a host process and reaches these over localhost; container
-    # peers use the compose network by service name, not a published port —
-    # so loopback costs neither. Widen only for a gateway on another host, and
-    # only over a network you trust.
+    # Loopback by default. A bare "7474:7474" publishes the corpus on every interface behind only its password. Widen DB_BIND only for a gateway on another host you trust.
     ports:
       - "${DB_BIND:-127.0.0.1}:7474:7474"
       - "${DB_BIND:-127.0.0.1}:7687:7687"
     volumes:
-      # Host data dirs come from the framework env (shared-memory/.env); the
-      # first-install script (scripts/install_framework.sh) sets NEO4J_HOST_DIR.
+      # Host path comes from shared-memory/.env. install_framework.sh sets NEO4J_HOST_DIR.
       - ${NEO4J_HOST_DIR:?set NEO4J_HOST_DIR in shared-memory/.env}/data:/data:z
       - ${NEO4J_HOST_DIR}/logs:/logs:z
       - ${NEO4J_HOST_DIR}/import:/import:z
       - ${NEO4J_HOST_DIR}/plugins:/plugins:z
     environment:
       - NEO4J_AUTH=neo4j/${NEO4J_PASSWORD}
-      # graph-data-science (GDS) added for ADR-017 alias-component grouping
-      # (gds.wcc) and the deferred graph-quality pass (gds.nodeSimilarity,
-      # embeddings, stable componentIds for growth deltas). GDS Community tier
-      # is free and runs on neo4j:5-community; the official plugin auto-matches
-      # the server version. Restart the container to load it.
+      # GDS is here for alias-component grouping (gds.wcc). Restart the container after adding the plugin or it stays unloaded.
       - NEO4J_PLUGINS=["apoc","graph-data-science"]
-      # APOC + GDS Security Procedures
       - NEO4J_dbms_security_procedures_unrestricted=apoc.*,gds.*
       - NEO4J_dbms_security_procedures_allowlist=apoc.*,gds.*
-      # Allow APOC to write the backup export into the mounted /import dir
-      # (ops/backup.sh → apoc.export.cypher.all). Online, no container stop.
+      # backup.sh exports Cypher into the mounted /import dir. Without this, that export is refused.
       - NEO4J_apoc_export_file_enabled=true
-      # Corrected Neo4j 5 Memory Mapping (Note the double underscores __)
-      # Defaults suit the 16 GB reference configuration (README §3). Neo4j
-      # refuses to start when heap max + pagecache exceed physical RAM, so a
-      # small host must lower these — via shared-memory/.env, never by editing
-      # this tracked file (the small-host preset is in .env.example).
+      # Neo4j 5 needs the double underscore in these names. It refuses to start when heap max plus pagecache exceed RAM; lower them in shared-memory/.env, not in this file.
       - NEO4J_server_memory_heap_initial__size=${NEO4J_HEAP_INITIAL:-1G}
       - NEO4J_server_memory_heap_max__size=${NEO4J_HEAP_MAX:-2G}
       - NEO4J_server_memory_pagecache_size=${NEO4J_PAGECACHE:-2G}
@@ -72,13 +47,7 @@ services:
       - SYS_CHROOT
 
   postgres:
-    # Pinned exact. Floor is pgvector >= 0.8 for `hnsw.iterative_scan`
-    # (coordinator.py's own GUC floor stays >= 0.8, as briefed), and >= 0.8.4
-    # for the HNSW-vacuum index-corruption fixes (pgvector CHANGELOG
-    # 0.8.3/0.8.4). PostgreSQL 17.11 carries the 2026-08-13 security release
-    # (pg_dump CVE-2026-19385, psql \unrestrict CVE-2026-18408). Bump this tag
-    # deliberately, never float it back to `pg17` — a floating tag also
-    # silently moves the PostgreSQL minor underneath it.
+    # Pinned exact. pgvector >= 0.8.4 is the HNSW-vacuum floor, and this tag carries the 2026-08-13 PostgreSQL fixes. Never float it back to `pg17`.
     image: pgvector/pgvector:0.8.6-pg17
     container_name: postgres-vector
     ports:
@@ -110,70 +79,9 @@ services:
       - SYS_CHROOT
 
 # --- INFERENCE LAYER (CPU Optimized) ---
-  # ⛔ BIND TO LOOPBACK. Only the gateway talks to these two, and neither has
-  # ANY authentication — publishing them as "8070:8070" binds every host
-  # interface, so on a LAN they are an open embedding/reranking service and an
-  # open read path into whatever text a caller submits. The container-internal
-  # --host 0.0.0.0 below is correct and must stay (binding loopback INSIDE the
-  # network namespace makes the service unreachable from the host); it is the
-  # PUBLISH spec that decides exposure. Override INFERENCE_BIND only when the
-  # gateway genuinely runs on another host, and put a network you trust under it.
-  #
-  # THREAD BUDGET. Both encoders are CPU-bound and can run at the same time (a
-  # search reranks while a daemon or a save embeds), so they share one machine.
-  # LLAMA_CPU_THREADS is a BUDGET: half the host's threads plus one — counted in
-  # threads because that is the unit `--threads` takes,
-  # leaving the rest for Postgres, Neo4j, the gateway and the operator's
-  # desktop. install_framework.sh derives it from the host and writes it to
-  # .env; the 4 below is only the fallback for a hand-rolled deploy.
-  #
-  # ⚠ MORE THREADS BUY MUCH LESS THAN THEY LOOK LIKE THEY SHOULD. Measured on
-  # the reference deployment, an identical 73k-char rerank took 63.8 s at 4
-  # threads, 36.7 s at 10 and 32.3 s at 20 — 5x the threads for 2x the speed,
-  # because these models saturate memory bandwidth (and, on multi-die CPUs, the
-  # inter-die fabric) well before they saturate cores. If reranking is too slow,
-  # RERANK_MAX_DOC_CHARS and a GPU-backed build are the levers that actually
-  # move it; thread count is not.
-  #
-  # Retriever: BGE-M3
-  # ── THE ENCODER CHOICE: CPU pair (default), GPU pair, or PER-SERVICE ───────
-  # Exactly ONE of {CPU, GPU} should be live for a given encoder at a time —
-  # each pair binds the same port (8070 for the two retrievers, 8071 for the
-  # two rerankers), so 1/1 on either port fails loudly on the second bind
-  # rather than silently. preflight.sh also checks this ahead of `up` and
-  # reports it loudly (see the encoder section there).
-  #
-  # Two knobs, layered — compose has no conditionals, so the per-service var
-  # defaults to the pair-wise one via a NESTED ${VAR:-${OTHER:-default}}
-  # substitution (verified with `docker compose config` on Compose v2/v5.4):
-  #   CPU_ENCODER_REPLICAS / GPU_ENCODER_REPLICAS   — the PAIR-WISE switch,
-  #     unchanged from before per-service existed: moves BOTH encoders
-  #     together. CPU defaults to 1 (a fresh install always gets working
-  #     encoders with no special hardware); GPU defaults to 0.
-  #   EMBEDDER_CPU_REPLICAS / EMBEDDER_GPU_REPLICAS
-  #   RERANKER_CPU_REPLICAS / RERANKER_GPU_REPLICAS — the PER-SERVICE switch.
-  #     Each defaults to the matching pair-wise var, so an install that has
-  #     only ever set CPU_ENCODER_REPLICAS/GPU_ENCODER_REPLICAS keeps
-  #     behaving EXACTLY as before — the per-service vars are opt-in. Set one
-  #     explicitly to split the pair, e.g. the measured-good mixed
-  #     arrangement on a 4 GB card (embedder GPU, reranker CPU):
-  #       EMBEDDER_GPU_REPLICAS=1
-  #       EMBEDDER_CPU_REPLICAS=0
-  #       RERANKER_GPU_REPLICAS=0
-  #       RERANKER_CPU_REPLICAS=1
-  #     (GPU_ENCODER_REPLICAS/CPU_ENCODER_REPLICAS can be left at their
-  #     defaults — the per-service vars above override them individually,
-  #     and no longer need the `--scale` flags this used to require, which
-  #     drifted from the declared state on every future `up`.)
-  #     Measured on a 4 GB Polaris host: the embedder on GPU is right (671 MB
-  #     VRAM); the reranker on GPU at the 8192 context window overflows
-  #     device memory. install_framework.sh's interview (Q3b) asks where each
-  #     encoder is served and writes whichever vars the answer needs.
-  #
-  # Setting every CPU/GPU var for an encoder to 0 means that encoder is
-  # hosted outside the stack entirely (bare llama-server, another machine):
-  # then EMBEDDER_URL / RERANKER_URL must point at whatever serves it, or
-  # saves are refused.
+  # Bind published ports to loopback. These encoders have no authentication, and `--host 0.0.0.0` inside the container must stay or the host cannot reach them. Widen INFERENCE_BIND only for a gateway on another host you trust.
+  # Both can run at once, so LLAMA_CPU_THREADS is a shared budget (the 4 below is only the hand-rolled fallback). More threads buy little once memory bandwidth is saturated; if rerank is slow, cut RERANK_MAX_DOC_CHARS or use a GPU.
+  # Retriever: BGE-M3. Exactly one of CPU or GPU may own a port (8070 retriever, 8071 reranker) or the second bind fails. Pair knobs move both (CPU default 1, GPU default 0); EMBEDDER_* and RERANKER_* default to those and override one service. A 4 GB card measured well with the embedder on GPU and the reranker on CPU. All-zero means the encoder is outside this stack, so EMBEDDER_URL / RERANKER_URL must point at it or saves are refused.
   retriever-api:
     image: ghcr.io/ggml-org/llama.cpp:server
     container_name: llama-retriever
@@ -207,9 +115,7 @@ services:
   reranker-api:
     image: ghcr.io/ggml-org/llama.cpp:server
     container_name: llama-reranker
-    # Same knobs as retriever-api above — RERANKER_CPU_REPLICAS defaults to
-    # the pair-wise CPU_ENCODER_REPLICAS, so the pair still moves together
-    # unless a per-service var overrides it.
+    # Defaults to CPU_ENCODER_REPLICAS so the pair still moves together unless this var overrides it.
     deploy:
       replicas: ${RERANKER_CPU_REPLICAS:-${CPU_ENCODER_REPLICAS:-1}}
     ports: ["${INFERENCE_BIND:-127.0.0.1}:8071:8071"]
@@ -236,26 +142,7 @@ services:
       - SETPCAP
       - SYS_CHROOT
 
-  # ── GPU encoder pair — same models, same ports, Vulkan image ───────────────
-  # This image is llama.cpp. An Intel Arc B580 (8086:e20b) is not this service.
-  # The measured B580 file is intel-arc-b580.yaml in this directory: vLLM plus
-  # rerank_shim.py. It is not started by this file.
-  # Off by default (replicas 0). Enable with GPU_ENCODER_REPLICAS=1 and
-  # CPU_ENCODER_REPLICAS=0 in shared-memory/.env for the pair, or
-  # EMBEDDER_GPU_REPLICAS=1 (+ EMBEDDER_CPU_REPLICAS=0) to move only this one
-  # — see the per-service section on retriever-api above. Vulkan is
-  # deliberate: one image covers Intel, AMD and NVIDIA (swap the tag for a
-  # CUDA build if you prefer CUDA — nothing else changes). ENCODER_GPU_INDEX
-  # pins WHICH card: llama.cpp enumerates Vulkan devices in driver order, not
-  # PCI order — read the startup log before trusting an index. Both encoders
-  # share one card on purpose (they need not both run there — see the
-  # per-service split above). Once the embedder is on a GPU, raise
-  # RERANK_MAX_DOC_CHARS to match EMBED_MAX_CHARS if the reranker joins it
-  # too: the CPU-latency reason for narrowing the reranker's view is gone.
-  # Two containers, not one, is NOT an accident: the embedder is on the critical
-  # write path (a save is refused rather than stored without a vector), the
-  # reranker degrades to vector order — one shared lifecycle would let a
-  # reranker crash restart the embedder and stop all writes.
+  # GPU pair: Vulkan llama.cpp, off by default, same ports as the CPU pair. An Intel Arc B580 (8086:e20b) is not this service — use intel-arc-b580.yaml. ENCODER_GPU_INDEX follows driver order, not PCI order. Two containers on purpose: a shared lifecycle would let a reranker crash restart the embedder and refuse every save.
   retriever-api-gpu:
     image: ghcr.io/ggml-org/llama.cpp:server-vulkan
     container_name: llama-retriever-gpu
@@ -300,11 +187,7 @@ services:
   reranker-api-gpu:
     image: ghcr.io/ggml-org/llama.cpp:server-vulkan
     container_name: llama-reranker-gpu
-    # RERANKER_GPU_REPLICAS defaults to the pair-wise GPU_ENCODER_REPLICAS —
-    # see the per-service section on retriever-api above. This is the
-    # service to LEAVE ON CPU on a small (~4 GB) card: measured, its
-    # 8192-token context window overflows device memory there while the
-    # embedder (671 MB VRAM) is fine.
+    # Leave this one on CPU on a ~4 GB card: its 8192 window overflows device memory there, and the embedder does not.
     deploy:
       replicas: ${RERANKER_GPU_REPLICAS:-${GPU_ENCODER_REPLICAS:-0}}
     ports: ["${INFERENCE_BIND:-127.0.0.1}:8071:8071"]

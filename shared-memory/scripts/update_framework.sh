@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 #
-# update_framework.sh — bring a Shared Memory deployment forward to the code
-# in this checkout, and prove the result.
+# update_framework.sh — bring a Shared Memory deployment forward to the code in this checkout, and prove the result.
 #
 #   bash shared-memory/scripts/update_framework.sh              # upgrade in place
 #   bash shared-memory/scripts/update_framework.sh --from-restore
@@ -10,47 +9,19 @@
 #   bash shared-memory/scripts/update_framework.sh --skip-env-migration  # see below
 #   bash shared-memory/scripts/update_framework.sh --skip-backup  # see below
 #
-# ⛔ --skip-backup skips Step 2 (backup BEFORE migrating) and asserts you
-# already have a current one. NEVER pass it on a host holding the ONLY copy
-# of the data — it exists for the case where a backup was just taken by
-# another means (or --from-restore's own dump IS the safeguard set) and
-# re-running ops/backup.sh would only cost time. A failed backup with this
-# flag NOT set already refuses the migrate; this flag is for skipping the
-# attempt entirely, not for recovering from one that failed.
+# --skip-backup skips the backup-before-migrate step and asserts you already have a current one. NEVER pass it on a host holding the only copy of the data.
 #
-# ⛔ --no-domain-backfill is a ONE-RELEASE no-op, kept only so an existing
-# invocation does not break: the domain backfill is opt-in now (fact:1734 C(d))
-# — omit both flags and step 8 is skipped by default. Pass --domain-backfill to
-# run it. The no-op flag and this notice are removed next release.
+# --no-domain-backfill is a one-release no-op so an existing invocation does not break: the domain backfill is opt-in now (fact:1734). Pass --domain-backfill to run it.
 #
-# ⛔ --skip-env-migration skips BOTH the pre-pull capture and the post-backup
-# migrate_env.py --apply step (W3, Backend_Declaration_Spec_2026-08-30 §4) —
-# a capture/migration bug must not block a security update. Coverage for
-# THIS upgrade is deferred to a manual standalone run of migrate_env.py; see
-# AGENTS.md.
+# --skip-env-migration skips the pre-pull capture and the migrate_env.py --apply step, so a capture bug cannot block a security update. Run migrate_env.py by hand for this upgrade.
 #
 # Env overrides: GATEWAY_URL, GATEWAY_UNIT, GATEWAY_RESTART_CMD.
 #
-# WHY THIS SCRIPT EXISTS. Install had four scripts, the client had two, and the
-# framework upgrade had NONE — eight commands of prose in AGENTS.md, including
-# an ordering guard whose violation blanks the content of every record it
-# touches. Prose is not a procedure: it cannot refuse, and it cannot be run.
+# --from-restore is the same procedure as an upgrade, minus fetching code, because restore.sh has just supplied the data. Every guard below applies to both.
 #
-# ⭐ TWO ENTRY POINTS, ONE PROCEDURE. "Upgrade" is new CODE arriving at existing
-# DATA. "Restore" is existing DATA arriving at running CODE. The work in between
-# is identical, which is why --from-restore is a flag and not a second script:
-# it skips step 0 (fetching code) because restore.sh has just supplied the data
-# instead. Every guard below applies equally to both.
+# schema_migrations lives in the database and travels with pg_dump, so a restored database states its own level. This script does not read a version out of a backup manifest.
 #
-# ⭐ THE DATABASE STATES ITS OWN LEVEL. `schema_migrations` is a table INSIDE the
-# database (apply.py's docstring), and `pg_dump -Fc` carries it, so a restored
-# database announces exactly how far it got with no help from a manifest field,
-# a version stamp, or anything else that could disagree with the schema it
-# claims to describe. Nothing here reads a version out of a backup manifest —
-# that value would be DERIVED, and a second source of truth that can drift.
-#
-# Exit 0 only when postflight passes. Any refusal exits non-zero having changed
-# as little as possible.
+# Exit 0 only when postflight passes. Any refusal exits non-zero having changed as little as possible.
 
 set -uo pipefail
 
@@ -61,11 +32,7 @@ ENV_FILE="$REPO_ROOT/shared-memory/.env"
 
 GATEWAY_URL="${GATEWAY_URL:-http://localhost:8888}"
 GATEWAY_UNIT="${GATEWAY_UNIT:-hive-mind-gateway.service}"
-# How this host restarts the gateway. systemd --user is what install_service.sh
-# sets up and what AGENTS.md documents, so it is the DEFAULT — not an assumption
-# baked into a code path. A deployment that supervises the gateway some other way
-# (a different init, a container, a bare process under a terminal multiplexer)
-# overrides this rather than editing the script.
+# systemd --user is the default because that is what install_service.sh sets up. Override this instead of editing the script when the gateway is supervised some other way.
 GATEWAY_RESTART_CMD="${GATEWAY_RESTART_CMD:-systemctl --user restart $GATEWAY_UNIT}"
 
 red() { printf '\033[31m%s\033[0m\n' "$*"; }
@@ -73,7 +40,7 @@ grn() { printf '\033[32m%s\033[0m\n' "$*"; }
 ylw() { printf '\033[33m%s\033[0m\n' "$*"; }
 die() { red "✗ $*"; exit 1; }
 
-# EXIT trap registry: function names only (never eval of a command string).
+# Exit hooks are function names, never a command string passed to eval.
 _EXIT_CLEANUP_FUNCS=()
 _run_exit_cleanup() {
     local fn
@@ -85,15 +52,7 @@ _run_exit_cleanup() {
 }
 add_exit_cleanup() { _EXIT_CLEANUP_FUNCS+=("$1"); trap _run_exit_cleanup EXIT; }
 
-# ── RULING 1: dry-run-aware refusal for the pre-`git pull` branch guard ─────
-# --dry-run is documented as "print, run nothing" -- the way an operator
-# finds out what WOULD happen. A refusal inside the guard below must never
-# become the thing that makes a dry run itself fail. Under --dry-run, print
-# the same message as an unmistakably PREDICTED outcome and return non-zero
-# to the caller (which skips only the blocked step) instead of exiting; a
-# real run still calls die() and stops exactly as it always has. Used ONLY
-# by the branch guard in step 0 -- every other refusal in this script keeps
-# calling die() directly.
+# Under --dry-run a branch-guard refusal is printed as predicted and returned, not exited. A real run still dies. Only step 0 uses this; every other refusal calls die().
 refuse() {
     if [[ "$DRY_RUN" == "1" ]]; then
         red "✗ [DRY RUN — PREDICTED: a real run would refuse here] $*"
@@ -102,21 +61,7 @@ refuse() {
     die "$*"
 }
 
-# ── RULING B: which branch this run pulled, made VISIBLE rather than silent ──
-#
-# Step 0's own "fetch new code (branch: $branch)" line names the branch, but
-# it is one line early in a long run, easy to scroll past — and nothing
-# repeats it at the end, where an operator actually checks whether the update
-# succeeded. "Upgrade to main" never verified you were ON main: a host
-# running a feature branch that still exists on the remote would pull it
-# forward and exit 0, having upgraded nothing to the release, with no message
-# anywhere saying so. This is measured, not refused outright — running a
-# branch deliberately is legitimate — but the operator must not be able to
-# mistake "pulled a stale branch" for "upgraded to the latest release".
-# $UPDATE_BRANCH is set once, in step 0, and this notice is called again at
-# every terminal path near the closing banner (same pattern as the linger
-# verdict below), so it survives to the end regardless of which path the run
-# takes.
+# A feature branch that still exists on the remote pulls forward and can exit 0 without reaching the release. Repeat the branch at every terminal banner; running a branch on purpose is allowed, hiding it is not.
 UPDATE_BRANCH=""
 _branch_notice() {
     [[ -n "$UPDATE_BRANCH" && "$UPDATE_BRANCH" != "main" ]] || return 0
@@ -125,13 +70,7 @@ _branch_notice() {
     ylw "     If you intend to upgrade to the released code, check out main and re-run."
 }
 
-# ── RULING 5: the linger verdict's "yes" and "not-applicable" branches used to
-# print NOTHING — only "no" was reported. The v0.9.39 CHANGELOG says this
-# check "reports yes, no, or not applicable", which was untrue: a passing
-# check and a check that never ran looked identical to the operator. "no"
-# stays loud with its remedy (unchanged below); this covers the other two
-# with one brief line each — enough to show the check ran, not enough to be
-# noisy about a state that needs no action.
+# "yes" and "not-applicable" used to print nothing, so a passing linger check looked like one that never ran. "no" stays loud below.
 _linger_brief() {
     case "$LINGER_VERDICT" in
         yes)             echo "   ✓ linger check: enabled for $_linger_who." ;;
@@ -160,17 +99,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 step=0
-# ⛔ run() DIES ON FAILURE. It used to return the exit code and leave checking to
-# the caller, and three steps never checked — `git pull`, the gateway restart,
-# and the domain backfill. Each failure then carried on:
-#   * a failed pull migrated the OLD code while reporting success;
-#   * a failed restart left the previous gateway answering, so the health wait
-#     passed and the backfill enqueued rows against an OLD worker — the exact
-#     content-blanking hazard this script's own comments warn about;
-#   * a failed backfill was simply skipped past.
-# Gating by default means a step added later is safe unless it opts out, which is
-# the opposite of the trap above. Use run_soft() where the caller genuinely
-# inspects the code (apply.py's exit 2/3) or tolerates failure (skill sync).
+# run() dies on failure. It used to return the code, and an unchecked pull, restart, or backfill then continued against old code, including a worker that blanks record content. Use run_soft() only when the caller inspects the code or tolerates failure.
 run() {
     local label="$1"; shift
     step=$((step + 1))
@@ -201,58 +130,9 @@ run_soft() {
     "$@"
 }
 
-# ── Linger check (update path): READ the persistent flag, never enable it ────
-#
-# A host can report `systemctl --user is-active` = active while nothing
-# listens on :8888, because without linger systemd tears down the user
-# manager the moment the last session ends and takes the gateway with it —
-# the next login starts it again, so a check run INSIDE a session can never
-# observe the failure by itself. install_service.sh enables linger on first
-# install and verifies it there; nothing re-checks an ALREADY-INSTALLED host
-# — a host installed before this existed, or one whose linger flag was later
-# flipped off by an admin or tool that doesn't know what depends on it, gets
-# no warning. This function only READS the flag. Enabling it stays owned by
-# install_service.sh — duplicating that logic here would give the two copies
-# a chance to drift.
-#
-# Verdict is printed to stdout as exactly one of: yes | no | not-applicable.
-#
-# PRIMARY instrument: /var/lib/systemd/linger/<user>. systemd-logind creates
-# this file the instant linger is enabled and removes it the instant it is
-# disabled, so its existence IS the flag (verified on this host: world-
-# readable, zero-byte, named for the user) — a plain existence test needs no
-# privilege and, whenever the parent directory itself exists, cannot be
-# misread. This replaces an earlier design that keyed the verdict on
-# "did loginctl exit 0", which is wrong: `loginctl show-user <user>
-# --property=Linger` exits 1 with "User ID N is not logged in or lingering"
-# for a user with no session AND no linger — logind DID answer, definitively
-# NO, and treating every nonzero exit as "logind didn't answer" turned that
-# into a silent `not-applicable` on exactly the population this check exists
-# for (a cron job, `systemd-run`, `sudo -u svc ...` — no session, no linger).
-#
-# SECONDARY / corroborating instrument: loginctl, consulted only when the
-# linger directory itself does not exist (this host may simply never have
-# had linger enabled for anyone, or may not run logind at all — the file
-# test alone can't distinguish those). Its rc!=0 output is read literally:
-# "is not logged in or lingering" is a definitive negative, not a failure to
-# answer; anything else unrecognised (unknown user, no D-Bus, logind not
-# running) is genuinely unanswered and reported as not-applicable. Bounded
-# with `timeout` — a check documented as read-only and non-fatal must not be
-# able to stall an upgrade on a wedged or absent D-Bus.
-#
-# ── RULING 3: the linger directory is a FUNCTION PARAMETER, never an
-# environment read. An earlier version read "${LINGER_DIR:-...}" straight
-# from the live environment, so `export LINGER_DIR=/tmp` silently bypassed
-# the whole check on a REAL production run — a test seam reachable from
-# outside the test suite is a backdoor, not a seam. The call site below
-# (LINGER_VERDICT="$(check_linger)") passes no argument at all, so a
-# production run always resolves the literal default; the environment now
-# has zero influence over the verdict. Tests that need the file-presence
-# branch without root pass the path explicitly as $1 instead.
-#
-# Self-contained: this function depends on NO script-level state (no colors,
-# no run_soft, no DRY_RUN, no $step) so it can be extracted between the
-# markers and run standalone — which is exactly what the test suite does.
+# Read linger, never enable it. Without the flag, systemd stops the user gateway when the session ends, and a check inside a session cannot see that. install_service.sh owns enabling it.
+# The flag is the file /var/lib/systemd/linger/<user>. loginctl is only a fallback when that directory is absent, and "not logged in or lingering" is a real no, not a failure to answer. timeout keeps a wedged D-Bus from stalling the upgrade.
+# The directory is a parameter, not an environment variable. An exported LINGER_DIR used to bypass the check on a real run. The function takes no script state so the test can extract it.
 # >>> LINGER_CHECK
 check_linger() {
     local who="${USER:-$(id -un)}"
@@ -284,10 +164,7 @@ check_linger() {
         return 0
     fi
 
-    # rc != 0. logind can still have answered a DEFINITIVE negative: "User ID
-    # N is not logged in or lingering" means linger is OFF, not that logind
-    # failed to respond. Anything else (unknown user, no D-Bus, logind not
-    # running) is genuinely unanswered.
+    # "is not logged in or lingering" is linger off. Any other nonzero answer is unanswered.
     if echo "$out" | grep -q "is not logged in or lingering"; then
         echo "no"
     else
@@ -296,15 +173,7 @@ check_linger() {
 }
 # <<< LINGER_CHECK
 
-# ── Linger verdict — measured HERE, in the preamble, before anything that
-# can die (the missing-.env check right below, the missing-tool check, the
-# migrations, the restart). Read-only and free, so measuring it costs
-# nothing regardless of what happens next; the point is that whichever
-# terminal path this run actually takes — the success banner, the dry-run
-# banner, the AGENT_TOKEN early exit, or a postflight-failure `die` — it
-# already has a verdict to report. This is NOT a numbered step: it changes
-# no state, so it does not belong in the step count, and no later message
-# may point at "Step N" for it.
+# Measure linger before anything can die, so every terminal path already has a verdict. It changes no state, so it is not a numbered step.
 _linger_who="${USER:-$(id -un)}"
 LINGER_VERDICT="$(check_linger)"
 
@@ -318,21 +187,8 @@ echo
 
 [[ -f "$ENV_FILE" ]] || die "no .env found — this is not a configured deployment"
 
-# ── Preconditions, checked BEFORE anything is fetched or dumped ──────────────
-#
-# These are the cheapest and most certain checks in the whole script, and they
-# used to run LAST — by failing at the first `uv run` (originally step 2,
-# Postgres; the W3 capture step now runs a `uv run` even earlier, at step 0,
-# but the reasoning is unchanged). In upgrade mode a late failure meant a
-# `git pull` and a FULL BACKUP had already happened before the run died on a
-# missing binary. Cost paid, nothing achieved.
-#
-# ⚠ `uv` is the one that actually bites, and not because hosts lack it: the
-# upstream installer puts it in ~/.local/bin, which a LOGIN shell resolves and a
-# PROFILE-FREE shell does not. An agent driving this over ssh, or from a
-# systemd unit, gets "uv: command not found" on a host where the operator can
-# run uv perfectly well by hand. That is the DEFAULT outcome of a correct
-# install, so it is named here rather than treated as a broken machine.
+# Check tools before any fetch or backup. They used to fail at the first uv run, after a pull and a full backup had already happened.
+# uv in ~/.local/bin is invisible to a profile-free shell. That is the normal installer outcome, so it is named here.
 missing=""
 for tool in git uv curl; do
     command -v "$tool" >/dev/null 2>&1 || missing="$missing $tool"
@@ -349,25 +205,8 @@ if [[ -n "$missing" ]]; then
   and if it is there, export PATH=\"\$HOME/.local/bin:\$PATH\" before re-running."
 fi
 
-# ── Steps 0–1: capture pre-upgrade effective config (upgrade path only, W3) +
-# fetch the new code ─────────────────────────────────────────────────────────
-#
-# Skipped after a restore: the checkout is already the code we intend to run,
-# and the data is what moved. A `git pull` here would be a second, unrelated
-# change landing in the middle of a migration — exactly what makes a failure
-# impossible to attribute.
-#
-# ⚠ A tarball install has no repository. AGENTS.md records the route per host at
-# the top of .env; this refuses rather than guessing, because `git pull` in a
-# directory that was never a checkout fails in a way that reads as broken tooling
-# rather than as the wrong procedure. (Measured: it failed on a detached HEAD.)
-# pull_blocked tracks a refuse() that fired under --dry-run (which returns
-# rather than exiting) so the block below knows to skip 'git pull' — and, past
-# the end of this whole step-0 block, so a --dry-run run can stop enumerating
-# right there instead of previewing steps 1+ as if a real run would reach
-# them. On a real run refuse() calls die() and this variable is never read:
-# the process has already exited. Declared here, before the .git check, so
-# BOTH branches below (real checkout and tarball tree) share one flag.
+# Skip the pull after a restore. The checkout is already the code to run, and another pull would land a second change in the middle of a migration.
+# A tarball tree has no repository, so this refuses instead of letting git pull look like broken tooling. pull_blocked lets a dry-run refusal stop the preview; a real run has already died.
 pull_blocked=0
 if [[ "$FROM_RESTORE" == "0" ]]; then
     if [[ -d "$REPO_ROOT/.git" ]]; then
@@ -382,28 +221,8 @@ if [[ "$FROM_RESTORE" == "0" ]]; then
             UPDATE_BRANCH="$branch"
             _branch_notice
 
-            # ⛔ RULING A: refuse BEFORE 'git pull', the same voice and structure as
-            # the detached-HEAD and tarball refusals above — rather than letting
-            # 'git pull --ff-only' die with git's own raw
-            #   "...but no such ref was fetched"
-            # which reads as broken tooling, not as the (nameable, recoverable)
-            # state it actually is. (Measured: a host whose checkout sat on a
-            # MERGED feature branch hit exactly this — this repo squash-merges
-            # and DELETES the branch when its PR merges, so the local upstream
-            # config still names a ref that no longer exists on the remote, and
-            # fetch returns nothing for it.)
-            #
-            # Two distinct bad states, two cheap read-only instruments:
-            #   * never tracked at all  -> `rev-parse --abbrev-ref @{upstream}` fails
-            #   * tracked, but deleted on the remote (the measured case) -> the local
-            #     remote-tracking ref survives a plain fetch (nothing prunes it), so
-            #     @{upstream} still resolves; `ls-remote --heads origin <branch>` is
-            #     what actually detects the deletion, because it asks the remote
-            #     directly instead of trusting a local ref that could be stale.
-            #
-            # ⛔ NEVER auto-switch branches here. Which branch to run is the
-            # operator's decision, not the script's — refuse and explain, then let
-            # them choose.
+            # Refuse before git pull. A squash-merged branch is deleted on the remote while the local upstream still names it, and git's own error reads as broken tooling. Do not switch branches; that choice is the operator's.
+            # No upstream is one failure. A deleted remote branch is another, and only ls-remote sees it, because the local tracking ref survives an unpruned fetch.
             upstream="$(git -C "$REPO_ROOT" rev-parse --abbrev-ref '@{upstream}' 2>/dev/null || true)"
             if [[ -z "$upstream" ]]; then
                 refuse "branch '$branch' has no upstream configured — 'git pull' has nothing
@@ -411,21 +230,7 @@ if [[ "$FROM_RESTORE" == "0" ]]; then
   or check out the branch you intend to run, then re-run.
   (Or use the tarball route and re-run with --from-restore semantics.)" || pull_blocked=1
             else
-                # ── RULING 2: distinguish "the remote answered and the branch
-                # is absent" from "the remote never answered" — the SAME
-                # defect class the linger check above already exists to fix:
-                # treating "no answer" as a definitive negative. `git
-                # ls-remote --exit-code --heads` returns exactly 2 when the
-                # remote was reached and found no matching ref (a DEFINITIVE
-                # negative — refuse); any other non-zero code is a
-                # transport/network failure (offline, a proxy, a slow or
-                # unreachable remote) and must NOT be read as "branch
-                # deleted" — that would false-refuse every offline upgrade.
-                # Verified locally: exit 0 branch present, exit 2 remote
-                # reached/branch absent, exit 128 unreachable remote (bad
-                # path or bad host) — never 2. Bounded by `timeout`, the same
-                # pattern as the linger check's `timeout 5 loginctl`, so a
-                # hanging remote cannot stall an upgrade OR a dry run.
+                # ls-remote exit 2 means the remote answered and the branch is gone. Any other nonzero status is transport failure, not a deleted branch, or every offline upgrade would be refused. timeout stops a hanging remote from stalling the run.
                 timeout 10 git -C "$REPO_ROOT" ls-remote --exit-code --heads origin "$branch" \
                     >/dev/null 2>&1
                 ls_rc=$?
@@ -448,16 +253,7 @@ if [[ "$FROM_RESTORE" == "0" ]]; then
         fi
 
         if [[ "$pull_blocked" == "0" ]]; then
-            # ── W3 env migration (Backend_Declaration_Spec_2026-08-30 §4,
-            # decision:1846): capture the pre-upgrade effective config from
-            # the OLD checkout, IMMEDIATELY BEFORE the pull moves it forward
-            # — the cross-version equality this tool holds
-            # (old_code(pre_env) == new_code(post_env)) is a construction,
-            # not an assumption, only when this runs against the OLD code's
-            # own copy. SM_PRE_UPDATE_VERSION uses the SAME sed idiom the
-            # post-restart guard below uses for FRAMEWORK_VERSION (no
-            # interpreter deps) and is exported BEFORE the capture call,
-            # which stamps captured_by from it.
+            # Capture the pre-upgrade config from the old checkout, immediately before the pull (decision:1846). The equality only holds if this runs against that old copy. SM_PRE_UPDATE_VERSION is exported first because the capture stamps captured_by from it.
             SM_PRE_UPDATE_VERSION="$(sed -n 's/^FRAMEWORK_VERSION[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' \
                 "$REPO_ROOT/shared-memory/scripts/coordinator.py" | head -1)"
             export SM_PRE_UPDATE_VERSION
@@ -468,22 +264,14 @@ if [[ "$FROM_RESTORE" == "0" ]]; then
                 echo "   upgrade is deferred to a manual standalone run of migrate_env.py."
             else
                 if [[ "$DRY_RUN" == "0" ]]; then
-                    # SEC L-1 (fix round): guarded — under `set -uo pipefail`
-                    # (no -e) a `mktemp` failure would otherwise leave
-                    # PREIMAGE_DIR empty and PREIMAGE_JSON silently pointed at
-                    # "/preimage.json".
+                    # Without -e, a failed mktemp would leave PREIMAGE_JSON pointed at /preimage.json. Refuse before the pull.
                     PREIMAGE_DIR="$(mktemp -d)" \
                         || die "could not create a temp directory for the pre-upgrade capture (mktemp failed) — refusing before the pull."
                     [[ -n "$PREIMAGE_DIR" && -d "$PREIMAGE_DIR" ]] \
                         || die "mktemp -d returned an unusable path — refusing before the pull."
                     chmod 700 "$PREIMAGE_DIR"
                     PREIMAGE_JSON="$PREIMAGE_DIR/preimage.json"
-                    # CHAIN, never replace, any EXIT trap set before this point
-                    # (none exists today — verified fe98761 — but a future
-                    # addition must not clobber this cleanup). A FUNCTION
-                    # NAME, not a command string — no eval, no quoting hazard
-                    # (SEC L-1): $PREIMAGE_DIR is read at CALL time by the
-                    # function body, never string-interpolated.
+                    # Chain the cleanup onto the exit list instead of replacing it. The function reads PREIMAGE_DIR at call time, so the path is not interpolated into a trap string.
                     _cleanup_preimage_dir() { rm -rf -- "$PREIMAGE_DIR"; }
                     add_exit_cleanup _cleanup_preimage_dir
                 else
@@ -512,12 +300,7 @@ if [[ "$FROM_RESTORE" == "0" ]]; then
     fi
 fi
 
-# ── RULING C: a --dry-run that predicted a refusal above must not go on to
-# enumerate steps 1+ as "(dry run — not executed)" — a REAL run would have
-# died() at the refusal itself and never reached them. Stop the dry run's own
-# enumeration at the same point, so what it prints matches what a real run
-# would actually attempt. Reachable ONLY under --dry-run: on a real run,
-# refuse() calls die() and exits before pull_blocked is ever read here.
+# A dry run that predicted a refusal stops here. A real run would have died and never reached the later steps, so previewing them would be a lie.
 if [[ "$pull_blocked" == "1" ]]; then
     echo
     red "✗ [DRY RUN] the real run stops here — step 0 would refuse (see above)."
@@ -525,17 +308,7 @@ if [[ "$pull_blocked" == "1" ]]; then
     exit 1
 fi
 
-# ── Step 2: safeguard the data BEFORE any migration touches it ───────────────
-#
-# A migration is the one step here that cannot be undone by re-running anything.
-# The backup is taken through the shipped ops script so it is the SAME artifact
-# restore.sh knows how to read — a bespoke dump taken here would be a second
-# backup format nobody has ever restored.
-#
-# ⚠ Retention prunes by AGE (backup.sh: find -mtime +BACKUP_RETENTION_DAYS), so
-# this safeguard set is NOT protected from a later prune. Pinning is a separate,
-# unbuilt unit; until it exists, copy the set aside if you need it past the
-# retention window.
+# Back up through ops/backup.sh before any migration. A dump invented here would be a format restore.sh has never read, and retention can still prune this set by age.
 if [[ "$SKIP_BACKUP" == "0" && "$FROM_RESTORE" == "0" ]]; then
     if [[ -f "$REPO_ROOT/shared-memory/ops/backup.sh" ]]; then
         run "backup BEFORE migrating (quiesced, via ops/backup.sh)" \
@@ -556,22 +329,7 @@ else
     fi
 fi
 
-# ── Step 3: migrate .env to explicit configuration (W3 env migration) ───────
-#
-# AFTER the backup (nothing here has touched Postgres/Neo4j yet — a refusal
-# costs only the pull, H5.4) and BEFORE the Postgres migration. Runs on BOTH
-# the upgrade and restore paths: restored data can carry the same implicit
-# shapes the upgrade path migrates, and it is always the NEW checkout's own
-# copy of migrate_env.py that must run here, post-pull or post-restore
-# either way. When step 0's capture ran (the upgrade path, not
-# --skip-env-migration), this applies against that pre-image; otherwise
-# (--from-restore, or --skip-env-migration was given for THIS run only —
-# checked again here so a capture failure never partially applies) it
-# self-captures with the CURRENT loader (N-9 — QA LOW-2, fix round: post-W4
-# this self-capture is ALWAYS same-generation by construction, so
-# migrate_env.py's V2 gate makes it a deliberate true no-op rather than a
-# real materialisation; only an aged --preimage from an OLDER loader
-# actually opens the boundary and plans a write).
+# Migrate .env after the backup and before Postgres, on both the upgrade and restore paths, using this checkout's migrate_env.py. A captured pre-image is applied when step 0 made one; otherwise the current loader self-captures, which is a same-generation no-op unless the pre-image came from an older loader.
 if [[ "$SKIP_ENV_MIGRATION" == "1" ]]; then
     step=$((step + 1))
     echo; ylw "── Step $step: migrate .env to explicit configuration"
@@ -603,12 +361,7 @@ else
     fi
 fi
 
-# ── Step 4: Postgres — forward-only, ledger-driven ───────────────────────────
-#
-# apply.py resumes from what the database itself records. It now REFUSES (exit 3)
-# a database whose ledger names migrations this checkout does not contain — the
-# restore-onto-older-code case, which used to report "Up to date" at a filename
-# this code has never seen.
+# apply.py resumes from the database's own ledger. Exit 3 means the database names migrations this checkout does not contain, which used to be reported as up to date.
 run_soft "Postgres migrations (apply.py — forward-only)" \
     uv run --with psycopg2-binary python "$REPO_ROOT/shared-memory/migrations/apply.py"
 rc=$?
@@ -618,17 +371,7 @@ if [[ "$DRY_RUN" == "0" && "$rc" == "3" ]]; then
   migrations and re-run — the schema cannot be moved backwards."
 fi
 if [[ "$DRY_RUN" == "0" && "$rc" == "2" ]]; then
-    # A populated database with an EMPTY ledger. Restoring an OLD dump is the
-    # most likely way to arrive here, not the rarest: the ledger itself only
-    # arrived in v0.8.35, so every backup taken before that carries the full
-    # framework schema and no record of how it got there.
-    #
-    # ⛔ THIS SCRIPT MUST NOT DECIDE. apply.py refuses precisely because the two
-    # available guesses are both destructive: adopting silently would skip a
-    # genuinely new migration forever, and running them all would re-execute
-    # migrations against a schema they were never written for — one of which
-    # deletes rows on a key a later migration changed. The operator chooses,
-    # once, having looked.
+    # Exit 2 is a populated database with an empty ledger, the usual shape of a pre-v0.8.35 dump. This script must not adopt or re-run those migrations; both guesses destroy data, so the operator chooses.
     die "this database has the framework schema but NO migration ledger (apply.py
   exit 2, message above). Nothing was migrated.
 
@@ -645,14 +388,7 @@ if [[ "$DRY_RUN" == "0" && "$rc" == "2" ]]; then
 fi
 [[ "$DRY_RUN" == "0" && "$rc" != "0" ]] && die "apply.py failed (exit $rc) — stopping before the graph half."
 
-# ── Step 5: Neo4j — the graph's ENTIRE forward-migration ─────────────────────
-#
-# ⛔ Neo4j has NO ledger. neo4j_init.cypher is a one-time manual step, so a
-# long-lived instance enforces whatever constraint set was true the day someone
-# last ran it, and a constraint added in a later release reaches new installs and
-# nobody else. A missing uniqueness constraint is SILENT — MERGE keeps working
-# and the only symptom is a duplicate graph node under a race. This is not optional and
-# not redundant with apply.py, which cannot reach Neo4j at all.
+# Neo4j has no ledger, so a constraint added later never reaches an old instance. A missing uniqueness constraint is silent: MERGE still works and only a race shows the duplicate. apply.py cannot reach Neo4j.
 run_soft "Neo4j constraints (no ledger exists — verify every time)" \
     uv run --with neo4j python "$REPO_ROOT/shared-memory/migrations/verify_neo4j_init.py" --apply
 rc=$?
@@ -661,13 +397,7 @@ rc=$?
   plain index blocking a uniqueness constraint. Stopping BEFORE the restart:
   a missing uniqueness constraint is silent, and MERGE keeps working."
 
-# ── Step 6: the graph half of migration 027 ──────────────────────────────────
-#
-# apply.py creates the registry ids and cannot reach Neo4j, so this stamps the
-# :Project nodes. Skipping it does not break writes — records still save, search
-# and enrich. What stops is CROSS-PROJECT SYNTHESIS: the fold gate fails closed
-# on any node lacking an identity, which presents as a system with nothing to fold
-# rather than as an error. Idempotent; read-only without --apply.
+# apply.py cannot stamp :Project nodes. Skipping this does not break writes; cross-project synthesis fails closed and looks like a corpus with nothing to fold.
 run_soft "stamp project identity onto :Project nodes (graph half of migration 027)" \
     uv run --with psycopg2-binary --with neo4j python \
     "$REPO_ROOT/shared-memory/scripts/reconcile_project_identity.py" --apply
@@ -677,10 +407,7 @@ rc=$?
   synthesis fails CLOSED on unidentified nodes and presents as a quiet corpus
   rather than an error. Fix it here, where it is still visible."
 
-# ── Step 7: restart, so the running gateway IS the migrated code ─────────────
-# The restart is the hinge: every step after it assumes the running process IS
-# the migrated code. Refuse early and clearly rather than emitting
-# "systemctl: command not found" from the middle of a migration.
+# Every step after the restart assumes the running process is the migrated code. Refuse a missing systemctl before that restart, not from the middle of it.
 if [[ "$DRY_RUN" == "0" && "$GATEWAY_RESTART_CMD" == systemctl* ]] \
    && ! command -v systemctl >/dev/null 2>&1; then
     die "this host has no systemctl, and GATEWAY_RESTART_CMD was left at its
@@ -699,14 +426,7 @@ if [[ "$DRY_RUN" == "0" ]]; then
     curl -sf --max-time 5 "$GATEWAY_URL/health" >/dev/null 2>&1 \
         || die "gateway did not come back after restart — check: journalctl --user -u $GATEWAY_UNIT -n 50"
 
-    # ⛔ "SOMETHING ANSWERS" IS NOT "THE NEW CODE IS RUNNING". If the restart
-    # command fails — a typo in GATEWAY_RESTART_CMD, a unit that refuses to stop,
-    # a supervisor that silently keeps the old process — the PREVIOUS gateway is
-    # still listening and answers this check happily. Every later step then runs
-    # against it, and step 8 enqueues repair rows only a current worker
-    # understands: an older one falls through to its ordinary fact branch and
-    # BLANKS THE CONTENT of every record it touches. So compare versions, which
-    # is the one thing an old process cannot fake.
+    # A health answer is not proof the new code is running. An old process still listening would accept the repair rows below and blank record content, so the version must match this checkout.
     _running="$(curl -s --max-time 5 "$GATEWAY_URL/health" \
         | sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
     _expected="$(sed -n 's/^FRAMEWORK_VERSION[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' \
@@ -727,26 +447,8 @@ if [[ "$DRY_RUN" == "0" ]]; then
     grn "   ✓ gateway restarted and running $_running (matches this checkout)"
 fi
 
-# D5 (decision:1832) — report the config the just-restarted gateway is
-# actually running under. AFTER step 5's restart, deliberately: reporting
-# BEFORE the restart would describe the OLD process's world. Phase B (not
-# --phase-a-only, unlike install_framework.sh's fresh-install check) needs
-# the daemon modules, so this is the SAME uv/locked invocation the systemd
-# unit uses (hive-mind-gateway.service's ExecStart) rather than an ad-hoc
-# --with list — `--no-project --with-requirements requirements-gateway.lock`,
-# resolved from REPO_ROOT the same way the unit's WorkingDirectory resolves
-# it. Deliberately NOT run_soft (Opus F8 — never sits between a run_soft call
-# and its rc=$? capture).
-#
-# Fix round Q4: gated on DRY_RUN like every other step — a bare unconditional
-# invocation ran for REAL under --dry-run and then the summary at the bottom
-# still claimed "nothing was executed", which was false.
-# Fix round Q5/Q6 (agy MED): report-not-gate is preserved — 0/1/2 are
-# check_config.py's OWN contract codes and all three stay a silent pass, this
-# step REPORTS and must never abort an update that has already restarted the
-# gateway successfully. But a bare `|| true` also swallowed a SIGNAL KILL or
-# crash outside that contract silently, reading exactly like success — rc is
-# captured and anything past the tool's own 0/1/2 vocabulary is surfaced.
+# Report the config the restarted gateway is running (decision:1832). Before the restart it would describe the old process. Use the unit's locked uv invocation, and do not sit this between a run_soft and its rc capture.
+# Dry-run must not execute it. Exit codes 0, 1, and 2 are the reporter's own results; anything past that is a crash and is printed.
 echo
 ylw "── Reporting effective configuration (check_config.py) ──"
 if [[ "$DRY_RUN" == "0" ]]; then
@@ -760,38 +462,8 @@ else
     echo "   (dry run — not executed)"
 fi
 
-# ── Step 8: domain backfill — AFTER the restart, and that is a GUARD ──────────
-#
-# ⛔ ORDERING IS SAFETY, NOT PREFERENCE. This enqueues a narrow repair row that
-# only a gateway from v0.8.47 understands. An OLDER worker does not recognise the
-# row type, falls through to its ordinary fact branch, and BLANKS THE CONTENT of
-# every record it touches. Running it before the restart means enqueuing work for
-# the process you are about to replace. The script refuses a gateway that is too
-# old — including one it cannot reach, because an unknown version is not
-# permission to write — so early is safe but pointless, and this ordering makes
-# "safe but pointless" into "correct".
-#
-# ⚠ Since v0.9.35 a real run applies ONCE (no separate preview step first) —
-# the applied run reports what it did, which is the record that matters.
-#
-# ⛔ --dry-run must state what a REAL run actually does, not what an unflagged
-# invocation of the underlying script would do on its own. A real run of THIS
-# step always passes --apply (see the `else` branch below) — measured live: a
-# real run enqueued several hundred outbox rows on a deployment carrying
-# pre-domain-axis records. Showing the bare (preview-only) invocation here
-# under --dry-run would understate that: an operator reading "enqueues
-# nothing" would not expect a write. The command line and label below now
-# match the `else` branch exactly except for the label text, so what prints
-# under --dry-run is the command a real run would execute, not a milder one.
-#
-# ⛔ OPT-IN, NOT DEFAULT (fact:1734 C(d)). This step used to run unless declined;
-# an orchestration script that rewrites axes on every deployment without the
-# operator asking for that run is exactly the accident O1 exists to prevent.
-# Pass --domain-backfill to run it. --no-domain-backfill is now a ONE-RELEASE
-# no-op — the skip it used to request is already the default — kept only so an
-# existing invocation does not break; every step after this one keeps its
-# number either way (the skip idiom below still increments `step`; it just
-# never calls run()).
+# Run the domain backfill only after the restart. An older worker does not recognise the repair row, falls through to the fact branch, and blanks record content.
+# The dry-run line includes --apply, because a real run writes. The step is opt-in (fact:1734); --no-domain-backfill is a no-op so an old invocation still parses, and the step number still advances.
 if [[ "$NO_DOMAIN_BACKFILL_NOTICE" == "1" ]]; then
     echo
     ylw "── Notice: --no-domain-backfill"
@@ -814,39 +486,16 @@ else
         "$REPO_ROOT/shared-memory/scripts/backfill_domain_of.py" --apply
 fi
 
-# ── Step 9: refresh the installed client skills ──────────────────────────────
-#
-# ⚠ AFTER the restart, deliberately. Run before it, update_skill.sh compares the
-# new client against the OLD gateway and prints "Updated to X but still
-# incompatible. The GATEWAY itself ..." — alarming, self-resolving one step
-# later, and observed on two hosts. Ordering removes the false alarm rather than
-# rewording it.
+# Refresh skills after the restart. Before it, update_skill.sh compares the new client to the old gateway and reports an incompatibility that the restart is about to remove.
 run_soft "refresh installed agent skills" bash "$REPO_ROOT/shared-memory/scripts/sync_skills.sh"
 rc=$?
 if [[ "$DRY_RUN" == "0" && "$rc" != "0" ]]; then
-    # Not fatal: the gateway is already migrated and correct. But never silent —
-    # skills are shipped as COPIES, and a stale copy fails silently forever.
+    # Not fatal: the gateway is already migrated. A stale skill copy fails silently, so the exit is still printed.
     ylw "   ! sync_skills.sh exited $rc — installed client skills may be STALE."
     ylw "     Re-run it by hand and check each agent's version before trusting them."
 fi
 
-# ── Stack pin drift check — READ-ONLY, informational, and NEVER gates this
-# script or runs the reconcile itself. v0.9.55 moved the compose image pins
-# (pgvector, neo4j) and this script does not — and by ruling never will —
-# recreate containers on its own: a host may have other legacy problems to
-# work through first, and recreating a database container is not something
-# to do silently inside "update the framework". reconcile_stack.sh is the
-# standalone script the operator runs on their own word.
-#
-# Measured HERE, after this run's own steps and before postflight, not as a
-# numbered step (same reasoning as the linger verdict above: read-only,
-# changes no state, so nothing after this is affected by measuring it) — but
-# the VERDICT is read by every terminal path below, exactly like
-# LINGER_VERDICT/_linger_brief, so it survives to whichever banner this run
-# actually reaches. Any failure to even RUN reconcile_stack.sh (docker
-# missing, the script itself absent) reports "unknown" — never surfaced as
-# drift, never surfaced as clean, and never fatal here: this check must not
-# be the thing that makes an update fail.
+# Read image-pin drift and never recreate containers here. reconcile_stack.sh is the operator's own step. A failure to run it is "unknown", not drift and not clean, and it must not fail the update.
 STACK_DRIFT_VERDICT="unknown"    # unknown | none | drift
 STACK_DRIFT_TABLE=""
 if [[ -x "$REPO_ROOT/shared-memory/scripts/reconcile_stack.sh" ]]; then
@@ -858,14 +507,11 @@ if [[ -x "$REPO_ROOT/shared-memory/scripts/reconcile_stack.sh" ]]; then
     esac
 fi
 
-# The words every terminal line carries when drift exists — including the
-# postflight-FAILED die paths below, so the LAST line always says it.
+# Appended to every terminal line when drift exists, including a postflight failure, so the last line still says it.
 _drift_suffix=""
 [[ "$STACK_DRIFT_VERDICT" == "drift" ]] && _drift_suffix=" — stack reconcile REQUIRED"
 
-# Prints the drift table and the two commands to close it — ONLY when drift
-# was actually found. A no-op otherwise, so every terminal path below can
-# call it unconditionally.
+# Print the drift table only when drift was found, so every terminal path can call this.
 _stack_drift_notice() {
     [[ "$STACK_DRIFT_VERDICT" == "drift" ]] || return 0
     echo
@@ -881,21 +527,8 @@ _stack_drift_notice() {
     echo
 }
 
-# ── Step 10: prove it ─────────────────────────────────────────────────────────
-#
-# ⚠ postflight NEEDS AGENT_TOKEN EXPORTED or A1/A5/A8 skip and it exits 1. That
-# is documented behaviour, not a defect — but it is also the single most common
-# way this step "fails" for a reason that has nothing to do with the update.
-#
-# The linger verdict measured in the preamble is reported inline at every
-# terminal path below rather than pointing at a step number — it is not a
-# step, so there is no "Step N" for a message to point at. The claim is
-# phrased CONDITIONALLY ("if the gateway runs as a systemd --user service")
-# because linger only matters to that deployment shape; this script also
-# supports a gateway run under a different init, a container, or a bare
-# process (see the GATEWAY_RESTART_CMD comment near the top), and on those a
-# `no` verdict is real but describes nothing this operator's own session
-# controls — asserting the kill as fact would be false on that host.
+# postflight exits 1 when AGENT_TOKEN is unset, because A1, A5, and A8 skip. That is the usual false failure of this step.
+# Linger is reported inline, and only as a problem if the gateway is a systemd --user service. Another supervisor does not die with the session.
 if [[ "$DRY_RUN" == "0" && -z "${AGENT_TOKEN:-}" ]]; then
     ylw "   ! AGENT_TOKEN is not exported — postflight's A1/A5/A8 will SKIP and it"
     ylw "     will exit 1. Export an agent token and run postflight yourself:"

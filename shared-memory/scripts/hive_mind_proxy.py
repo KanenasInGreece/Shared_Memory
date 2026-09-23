@@ -28,21 +28,12 @@ from secure_env import (  # noqa: E402
 )
 from log_hygiene import append_secure, secure_path, scrub_url_credentials, FILE_MODE  # noqa: E402
 from framework_defaults import FRAMEWORK_DEFAULTS  # noqa: E402
-# A-4: the ROLE RULE, from the module that owns it — never a bare _AGENT_ROLES
-# lookup, which cannot see read_only_agents() and would report a confined
-# identity as write-capable.
+# Use effective_role, not a bare _AGENT_ROLES lookup: that misses read_only_agents() and would call a confined identity write-capable.
 from agent_roles import effective_role  # noqa: E402
-# THE CONTRACT DECIDES WHAT /health SERVES: a key whose `removed_in` this
-# release has reached comes off the response in handle_health. A leaf module —
-# its only import is `__future__.annotations` — so it cannot cycle back here.
+# Import the health contract from a leaf module. handle_health drops a key once this release reaches its removed_in, and the import must not cycle back here.
 from telemetry_contract import HEALTH as HEALTH_CONTRACT, strip_dropped  # noqa: E402
-# M9 (fix round): _chmod_created_ancestors is a private log_hygiene member --
-# the only thing this module needs from it that has no public equivalent
-# (secure_path's own dir-hardening is entangled with its append-mode open,
-# which _write_capacity_records_sync's atomic-replace path doesn't want).
-# Imported here (module top, not per-call as it was) so a future log_hygiene
-# refactor that drops or renames it fails LOUDLY at gateway startup instead
-# of silently at the first capacity-log write.
+# Private log_hygiene helper with no public equivalent: secure_path opens for append, which the capacity-log replace path does not want.
+# Import at startup so a rename fails here, not on the first capacity-log write.
 try:
     from log_hygiene import _chmod_created_ancestors  # noqa: E402
 except ImportError:  # pragma: no cover -- defensive against a log_hygiene refactor
@@ -83,10 +74,7 @@ from coordinator import (
     _ERROR_BODY_PARSE_CAP,
     SUPPORTED_CONTENT_ENCODINGS,
     _short,
-    # The telemetry contract's limits (v0.9.74) — imported rather than
-    # re-declared so the number /health compares against and the number
-    # /memory/telemetry reports beside the measurement are the SAME number.
-    # Two spellings of one limit is how a payload starts contradicting itself.
+    # Same limits /health compares against and /memory/telemetry reports. Two spellings of one limit make the payload contradict itself.
     OUTBOX_AGE_WARN_S,
     ENCODER_LATENCY_WARN_MS,
     TOKEN_VERIFY_WARN_PER_MIN,
@@ -104,17 +92,11 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
     stream=sys.stderr,
 )
-# D6 (HYG round): hive_mind_proxy.py never imports httpx; coordinator.py does
-# and runs in THIS process under THIS root config, so an INFO root level turns
-# every coordinator httpx call into a journal line. WARNING silences the
-# per-request chatter without hiding a real client failure. The aiohttp access
-# log remains the per-request record.
+# coordinator imports httpx and runs in this process. WARNING hides per-request chatter; a real client failure still logs. The aiohttp access log stays the per-request record.
 logging.getLogger("httpx").setLevel(logging.WARNING)
 log = logging.getLogger("hive-proxy")
 
-# --------------------------------------------------------------------------- #
 # Watchdog configuration
-# --------------------------------------------------------------------------- #
 _DAEMON_MAX_RESTARTS    = 5    # circuit-breaker trip count
 _DAEMON_RESTART_WINDOW  = 600  # rolling window (seconds) for the trip counter
 _DAEMON_MIN_STABLE_SEC  = 30   # uptime needed to reset backoff — avoids boot-loop penalty
@@ -172,13 +154,9 @@ CREDENTIALED_BACKEND_ALLOWED_ROUTES = frozenset({
 })
 # Mistyped/wrong-method framework paths must 404/405, never fall through to the LLM catch-all (fact:1535). Known routes come from the router (decision:1032).
 RESERVED_ROUTE_PREFIXES = ("/memory/", "/admin/")
-# Encoder/reranker POST copy policy. handle_encoder counts bytes while reading
-# and 413s above this; it never streams the encoder payload (decision:2651).
-# LLM traffic in handle_proxy is unrelated; its belt is client_max_size.
+# handle_encoder counts bytes and returns 413 above this; it never streams the encoder body (decision:2651). LLM traffic uses client_max_size instead.
 EMBED_RERANK_BUFFER_CAP = int(os.environ.get("EMBED_RERANK_BUFFER_CAP", str(1024 * 1024)))
-# Fallback used ONLY when LLM_BACKENDS is unset. Deployments differ — LM Studio
-# defaults to :1234, llama.cpp servers commonly :8080 — so keep this overridable
-# instead of baking one port into the code. LLM_BACKENDS is the real knob.
+# Used only when LLM_BACKENDS is unset. Keep the port overridable; LLM_BACKENDS is the real knob.
 DEFAULT_TARGET = os.environ.get("LLM_DEFAULT_TARGET", FRAMEWORK_DEFAULTS["LLM_DEFAULT_TARGET"]["default"])
 
 # LLM_BACKENDS_JSON (preferred) or LLM_BACKENDS CSV; token_env is a process env NAME, never a literal in the URL.
@@ -204,9 +182,7 @@ def _backend_url_credential_error(url: str) -> "str | None":
     )
 
 
-# SEC A.3 (ADV1-4 + ADV2-6): a finite numeric token, never bare float() (which
-# accepts "nan"/"inf" as valid weights — those must fall through to "the
-# whole entry is the URL" instead).
+# Weight tail must be a finite numeric token. Bare float() accepts nan/inf, which must fall through as "the whole entry is the URL".
 _BACKEND_WEIGHT_TOKEN_RE = re.compile(r"^[+-]?\d+(\.\d+)?$")
 
 
@@ -296,19 +272,12 @@ def _bearer_transport_ok(backend_url: str, plaintext_ok: bool = False) -> bool:
     return host.endswith(_PRIVATE_NAME_SUFFIXES)
 
 
-# url -> the operator's "plaintext_ok": true assertion (a private path for a
-# plaintext credentialed backend — VPN, tunnel). Written by the loader, read by
-# the /health probe; the loader itself refuses a public plaintext backend.
+# Operator plaintext_ok for a private http path (VPN or tunnel). The loader refuses a public plaintext backend; the health probe reads this map.
 LLM_BACKEND_PLAINTEXT_OK: dict[str, bool] = {}
-# Set by the loader when LLM_BACKENDS_JSON was present but produced NO usable
-# backend and the legacy fallback took over — surfaced as a degraded llm_pool.
+# Set when LLM_BACKENDS_JSON yielded no usable backend and the legacy fallback took over.
 LLM_POOL_FALLBACK_REASON: "str | None" = None
-# D1 (decision:1832): set by the loader when the legacy DEFAULT_TARGET fallback
-# was substituted for ABSENCE — nothing was declared at all (no LLM_BACKENDS_JSON,
-# no LLM_BACKENDS). Distinct from LLM_POOL_FALLBACK_REASON, which marks
-# EXCLUSION (a fleet WAS declared, every entry excluded). Never inferred from
-# backend_status emptiness — that reads only what got PROBED, and a config fact
-# is knowable before any probe runs.
+# decision:1832: DEFAULT_TARGET stands in because nothing was declared. LLM_POOL_FALLBACK_REASON is the other case, a declared fleet with every entry excluded.
+# Do not infer this from backend_status; that only shows what was probed.
 LLM_POOL_CONFIG_EMPTY: bool = False
 
 
@@ -341,9 +310,7 @@ def _load_llm_backends() -> tuple[
     at the legacy/default fallback instead (ruled out)."""
     role_config_errors: list[str] = []
     url_credential_errors: list[str] = []
-    # Fix round Q11: ONE `global` declaration covering the whole function —
-    # LLM_POOL_CONFIG_EMPTY is SET-ONLY on every return path below, explicit
-    # on both True/False branches, never left to the module-level default.
+    # Set LLM_POOL_CONFIG_EMPTY on every return, both branches. Do not leave it to the module default.
     global LLM_POOL_CONFIG_EMPTY
 
     def _parse_roles(url: str, raw) -> "frozenset[str] | None":
@@ -354,11 +321,7 @@ def _load_llm_backends() -> tuple[
                 f"{scrub_url_credentials(url)}: roles must be a JSON array, got {type(raw).__name__}")
             return frozenset()
         if not raw:
-            # R-3 (decision:1357): an EMPTY roles list makes the backend
-            # eligible for nothing — every request 422s — and it must not
-            # sidestep the M-5 explicit-choice refusal (which tests `is
-            # None`). A backend that serves nothing is a config mistake, not
-            # a scope; refuse loudly at startup.
+            # decision:1357: an empty roles list is eligible for nothing, and it must not pass the is-None serves-all check. Refuse it at startup.
             role_config_errors.append(
                 f"{scrub_url_credentials(url)}: roles is an EMPTY list — this backend would be "
                 f"eligible for NOTHING (every request refused). Either omit "
@@ -426,23 +389,12 @@ def _load_llm_backends() -> tuple[
                         "The required field is url (not base_url). Keys present: %s",
                         keys)
                 continue
-            # SEC A (R-1, fatal): a URL that embeds its own credential in
-            # userinfo — checked BEFORE every other per-entry validation
-            # below, since a credentialed URL string is refused outright
-            # regardless of what else the entry configures. Excluded from
-            # the pool here (this function must never raise); the loud
-            # SystemExit is require_no_backend_url_credentials(), main()
-            # only. Query strings are NOT flagged (R-2).
+            # A userinfo credential is excluded before any other check, and this function must not raise. Startup exits in require_no_backend_url_credentials(); query strings are allowed.
             _cred_err = _backend_url_credential_error(url)
             if _cred_err:
                 url_credential_errors.append(_cred_err)
                 continue
-            # Refuse a literal secret in config, loudly — the schema only ever
-            # reads token_env (a NAME). Silently ignoring a stray "token"/"api_key"
-            # field would be worse than rejecting it: the real key would already
-            # be sitting in plaintext in whatever file holds LLM_BACKENDS_JSON
-            # (.env or an EnvironmentFile), AND the backend would silently get no
-            # credential at all. Exclude the backend and say exactly why.
+            # The schema reads token_env, a name. A literal token or api_key would sit in plaintext and still leave the backend with no credential.
             _raw_secret_fields = [f for f in ("token", "api_key", "apikey", "secret", "key")
                                    if entry.get(f)]
             if _raw_secret_fields:
@@ -458,11 +410,7 @@ def _load_llm_backends() -> tuple[
             token_env = entry.get("token_env")
             token = None
             if token_env:
-                # secure_env classifies every token_env name as a secret
-                # (SEC-09) — read it via the accessor, not os.environ; the
-                # accessor still falls back to os.environ for a value the
-                # deployer supplied through the process's own exec-time
-                # environment rather than the framework .env.
+                # token_env names are secrets, so read them with get_secret. It still falls back to a value supplied in the process environment.
                 token = get_secret(token_env)
                 if not token:
                     # Falsy token_env is unset or a refused `_FILE` secret; do not say only "not set".
@@ -474,10 +422,7 @@ def _load_llm_backends() -> tuple[
                         scrub_url_credentials(url), token_env)
                     continue
             if token and not _bearer_transport_ok(url, bool(entry.get("plaintext_ok"))):
-                # ⛔ The real call would put this key on the wire in the clear
-                # (handle_proxy attaches `Authorization: Bearer` to every
-                # credentialed request). Refuse at configuration, where the
-                # operator can see it, rather than at the first request.
+                # A bearer on plaintext http to a public host would publish the key. Refuse at configuration, not on the first request.
                 log.error(
                     "LLM backend %s is credentialed (token_env=%s) but its URL "
                     "is plaintext http to a PUBLIC host — this gateway never "
@@ -496,12 +441,7 @@ def _load_llm_backends() -> tuple[
                     "(%r) — excluding this backend from the pool.",
                     scrub_url_credentials(url), type(extra_body).__name__)
                 continue
-            # R-2 + Optional (decision:1357): both int fields must be a REAL
-            # int >= 1 — bool is an int subclass in Python (True passes a
-            # bare isinstance check), and 0/negative values are traps:
-            # max_inflight=0 makes the backend permanently at-cap (every
-            # request waits the full window then 503s), n_ctx=0 silently
-            # disables the fit check via `if not n_ctx`.
+            # decision:1357: n_ctx and max_inflight must be a real int >= 1. bool is an int subclass; 0 disables the fit check or wedges the cap.
             n_ctx_raw = entry.get("n_ctx")
             if n_ctx_raw is not None and (not isinstance(n_ctx_raw, int)
                                           or isinstance(n_ctx_raw, bool)
@@ -536,34 +476,23 @@ def _load_llm_backends() -> tuple[
             roles[url] = _parse_roles(url, entry.get("roles"))
             n_ctxs[url] = n_ctx_raw
             max_inflights[url] = max_inflight_raw
-            # W4 default-deny (decision:1824): an entry with no explicit
-            # private_ok defaults to False — undeclared backends serve
-            # nothing, credentialed or not. Explicit value
-            # (private_ok_raw is not None) always wins either way.
+            # decision:1824: omitted private_ok is false, so an undeclared backend serves nothing. An explicit bool always wins.
             private_ok_explicit[url] = private_ok_raw is not None
             private_oks[url] = private_ok_raw if private_ok_raw is not None else False
             price_ins[url] = entry.get("price_per_mtok_in")
             price_outs[url] = entry.get("price_per_mtok_out")
         if urls:
-            # Fix round Q11: SET-ONLY, explicit on this branch too — a
-            # declared, USABLE JSON fleet is unambiguously not the absence
-            # case, so this must not rely on the module-level declaration's
-            # default rather than say so itself.
+            # A usable JSON fleet is not the absence case. Set the flag here instead of leaving the module default.
             LLM_POOL_CONFIG_EMPTY = False
             return (urls, weights, tokens, models, extras, roles, n_ctxs, private_oks,
                     private_ok_explicit, max_inflights, price_ins, price_outs, role_config_errors,
                     url_credential_errors)
         log.error("LLM_BACKENDS_JSON produced no usable backend — falling back to LLM_BACKENDS/LLM_DEFAULT_TARGET")
-        # Group 3: a fleet that silently became localhost:5000 read as a healthy
-        # pool pointing at the wrong place (v0.9.75 review F6). Remember WHY,
-        # so the llm_pool dependency can say so on /health.
+        # Remember why every JSON entry was excluded, or /health would show a healthy pool at the fallback address.
         global LLM_POOL_FALLBACK_REASON
         LLM_POOL_FALLBACK_REASON = "LLM_BACKENDS_JSON produced no usable backend (every entry excluded) — serving the LLM_BACKENDS/LLM_DEFAULT_TARGET fallback"
 
-    # SEC A (R-1, fatal + ADV1-4): the legacy CSV form had NO per-entry
-    # validation of any kind before this — an explicit loop (not the old
-    # one-line list comprehension) so each parsed URL can be checked through
-    # the SAME shared helper as the JSON path before it ever reaches `urls`.
+    # The legacy CSV gets the same userinfo check as JSON before a URL enters the pool.
     _raw_backends: list[tuple[str, float]] = []
     for _e in os.environ.get("LLM_BACKENDS", FRAMEWORK_DEFAULTS["LLM_BACKENDS"]["default"]).split(","):
         if not _e.strip():
@@ -588,25 +517,14 @@ def _load_llm_backends() -> tuple[
             continue
         _raw_backends.append((_u, _w))
     if not _raw_backends:
-        # D1: this substitution is ABSENCE (nothing declared) only when it is
-        # not ALREADY the JSON-exclusion case above (LLM_POOL_FALLBACK_REASON
-        # set) — the two markers are mutually exclusive by construction, and
-        # only one may explain a given fallback. Fix round Q11: SET-ONLY on
-        # BOTH branches, never left to the module-level declaration's default —
-        # this function's own state must not depend on what an earlier call
-        # (in-process reload, or any future caller) happened to leave behind.
+        # This fallback is absence only when it is not already the JSON-exclusion case. Set the flag on both branches so a later call cannot inherit a stale value.
         LLM_POOL_CONFIG_EMPTY = not LLM_POOL_FALLBACK_REASON
         _raw_backends = [(DEFAULT_TARGET, 1.0)]
     else:
         LLM_POOL_CONFIG_EMPTY = False
     urls = [u for u, _ in _raw_backends]
     weights = {u: w for u, w in _raw_backends}
-    # Legacy comma form (and the DEFAULT_TARGET fallback) never declares
-    # private_ok explicitly, so W4 default-deny (decision:1824) applies:
-    # every backend it produces defaults private_ok=False, roles absent
-    # (serves-all traffic reaches none of them until declared). Retired
-    # invariant, no longer true: a descriptor-less fleet used to be
-    # eligible for everything (I-5a); it is now eligible for nothing.
+    # decision:1824: CSV and DEFAULT_TARGET never set private_ok, so those backends are eligible for nothing until declared.
     return (urls, weights, {u: None for u in urls}, {u: None for u in urls}, {u: None for u in urls},
             {u: None for u in urls}, {u: None for u in urls}, {u: False for u in urls},
             {u: False for u in urls}, {u: None for u in urls}, {u: None for u in urls},
@@ -687,21 +605,12 @@ LLM_COOLDOWN = float(os.environ.get("LLM_COOLDOWN", "300"))
 CHARS_PER_TOKEN_RATIO = float(os.environ.get("LLM_CHARS_PER_TOKEN_RATIO", "1.2"))
 # Eligible iff est_prompt_tokens + effective_max_tokens <= n_ctx * (1 - FIT_MARGIN).
 FIT_MARGIN = float(os.environ.get("FIT_MARGIN", "0.10"))
-# Reserved output budget when the caller's body has no max_tokens at all.
-# UNMEASURED (flagged in .env.example per fact:1338) — conservative round
-# number, not derived from a live measurement; the daemons' own task-owned
-# budgets (REM_MAX_TOKENS_*, decision:1330) are the actually-measured ceiling
-# for real dream traffic, this is only the estimator's fallback when a caller
-# sends none at all.
+# fact:1338: unmeasured output budget when the caller sends no max_tokens, not a live measurement.
+# decision:1330: REM_MAX_TOKENS_* is the measured ceiling for dream traffic; this is only the estimator fallback.
 FIT_DEFAULT_OUTPUT_TOKENS = int(os.environ.get("FIT_DEFAULT_OUTPUT_TOKENS", "2048"))
-# A backend AT its max_inflight cap counts as busy in selection (I-8); when
-# every ELIGIBLE backend is at its cap, the request WAITS on it rather than
-# widening eligibility or picking an over-cap backend (the cap never widens
-# eligibility) — bounded so a permanently-saturated single-backend
-# configuration still fails eventually instead of hanging a request forever.
+# At max_inflight the backend counts as busy. Wait for an eligible one instead of widening eligibility or picking over cap, and bound the wait so a saturated backend still fails.
 LLM_MAX_INFLIGHT_WAIT_S = float(os.environ.get("LLM_MAX_INFLIGHT_WAIT_S", "120"))
-# Floor of 0.05s: a configured 0 would busy-spin the event loop for the whole
-# wait window (Optional finding, decision:1357).
+# decision:1357: floor of 0.05s. A configured 0 would busy-spin the event loop for the whole wait.
 LLM_MAX_INFLIGHT_POLL_S = max(0.05, float(os.environ.get("LLM_MAX_INFLIGHT_POLL_S", "0.5")))
 # Cap concurrent capacity-waiters (floor 1); beyond that, 503 backend_at_capacity (decision:1357, fact:1338).
 LLM_MAX_CAPACITY_WAITERS = max(1, int(os.environ.get("LLM_MAX_CAPACITY_WAITERS", "8")))
@@ -710,12 +619,7 @@ LLM_MAX_CAPACITY_WAITERS = max(1, int(os.environ.get("LLM_MAX_CAPACITY_WAITERS",
 LLM_POOL: list[str] = list(LLM_BACKENDS)
 
 _llm_inflight: dict[str, int] = {b: 0 for b in LLM_BACKENDS}
-# Wedge visibility (2026-07-17 backend-hang lesson): a connection count cannot
-# distinguish BUSY from STUCK — a GPU-driver hang held generations for hours
-# while every surface said "ok" (reachability) or just "inflight>0". Track when
-# each in-flight request STARTED so the pool can report the oldest age; past
-# LLM_WEDGE_SUSPECT_AGE the status endpoints add a lazy 2s probe of the
-# backend's own /health and flag `suspect_wedged` when it cannot answer.
+# Inflight count cannot tell busy from stuck. Record start times so status can flag suspect_wedged after a lazy health probe.
 _llm_inflight_started: dict[str, list[float]] = {b: [] for b in LLM_BACKENDS}
 LLM_WEDGE_SUSPECT_AGE = float(os.environ.get("LLM_WEDGE_SUSPECT_AGE", "900"))
 
@@ -802,11 +706,7 @@ async def _probe_backend_alive(session, backend: str) -> bool:
             async with session.get(url, timeout=ClientTimeout(total=2.0),
                                    headers=_probe_headers(backend),
                                    allow_redirects=False) as r:
-                # 404 means "not served HERE", never "this backend is down" --
-                # so fall through to the next candidate rather than accepting
-                # it. Accepting 404 is what let a backend whose every real
-                # call 404s report itself ok on /health while REM looped on it
-                # for 45 minutes (measured, fresh Debian 13 install).
+                # 404 means this path is not served here, not that the backend is down. Accepting it let a backend that 404s every real call look ok while REM retried it.
                 if r.status == 404:
                     continue
                 if r.status < 500:
@@ -816,37 +716,24 @@ async def _probe_backend_alive(session, backend: str) -> bool:
     return False
 _llm_unhealthy_until: dict[str, float] = {b: 0.0 for b in LLM_BACKENDS}
 _llm_fail_times: dict[str, list] = {b: [] for b in LLM_BACKENDS}
-# Parallelisation telemetry (instrument-first): cumulative requests routed +
-# fails per backend, so the realised distribution can be checked against the
-# weights (is A770@3 / B580@1 actually happening?) and cooldowns observed.
+# Cumulative routed and fail counts, so the realised split can be checked against the weights.
 _llm_routed: dict[str, int] = {b: 0 for b in LLM_BACKENDS}
 _llm_fail_total: dict[str, int] = {b: 0 for b in LLM_BACKENDS}
-# Routing telemetry (Group 3, fact:1314 shape — flat counters, each paired
-# with its own last-event ts; additive, no existing key changes meaning).
+# fact:1314: flat routing counters, each paired with its own last-event timestamp. Added without changing an existing key's meaning.
 _llm_routed_by_role: dict[str, int] = {r: 0 for r in ROUTING_ROLE_NAMES}
 _llm_routed_by_role_last_ts: dict[str, "str | None"] = {r: None for r in ROUTING_ROLE_NAMES}
 _routing_no_eligible_backend_count = 0
 _routing_no_eligible_backend_last_ts: "str | None" = None
 _routing_fit_rejected_count = 0
 _routing_fit_rejected_last_ts: "str | None" = None
-# R-1 (decision:1357): the 503 backend_at_capacity refusal gets its OWN
-# counter + last-ts pair — without it a saturated capped backend stalls
-# every record while /health shows zero refusals (the 422 counters never
-# fire on this path).
+# decision:1357: the 503 backend_at_capacity refusal has its own counter and timestamp. The 422 counters never fire on this path.
 _routing_backend_at_capacity_count = 0
 _routing_backend_at_capacity_last_ts: "str | None" = None
-# R-4 (decision:1357): live count of requests currently holding a
-# capacity-wait slot — bounded by LLM_MAX_CAPACITY_WAITERS above.
+# decision:1357: how many requests currently hold a capacity-wait slot, bounded by LLM_MAX_CAPACITY_WAITERS.
 _capacity_waiters = 0
-# Optional (decision:1357): unknown X-SM-LLM-Role values seen from
-# steer-permitted callers, warned ONCE per distinct value — a typo'd role
-# silently degrades to role-less eligibility and is otherwise invisible.
+# decision:1357: warn once per unknown X-SM-LLM-Role from a steer-permitted caller. A typo otherwise degrades to role-less eligibility with no signal.
 _warned_unknown_role_values: set[str] = set()
-# Per-backend token accounting (post-review addition A). IN-PROCESS only —
-# reset on restart, deliberate, same semantics as every other gateway
-# counter; the paired last-ts is what makes a restart-aware delta
-# computable. Parsed from `usage` on a non-streaming proxied LLM response;
-# a parse failure skips the counter and never breaks the proxy path.
+# In-process token totals from usage on a non-streaming response. A parse failure skips the counter and must not break the proxy.
 _llm_tokens_prompt_total: dict[str, int] = {b: 0 for b in LLM_BACKENDS}
 _llm_tokens_completion_total: dict[str, int] = {b: 0 for b in LLM_BACKENDS}
 _llm_tokens_last_ts: dict[str, "str | None"] = {b: None for b in LLM_BACKENDS}
@@ -858,12 +745,7 @@ _llm_latency_max_s: dict[str, float] = {b: 0.0 for b in LLM_BACKENDS}
 _llm_latency_last_ts: dict[str, "str | None"] = {b: None for b in LLM_BACKENDS}
 # LLM_USAGE_CAPTURE_CAP_BYTES bounds compressed bytes accumulated for a trailing usage parse; over the cap, capture is abandoned.
 LLM_USAGE_CAPTURE_CAP_BYTES = int(os.environ.get("LLM_USAGE_CAPTURE_CAP_BYTES", str(2 * 1024 * 1024)))
-# Runtime reservation (gateway-controlled, NEVER env/user). A backend in this set
-# is held OUT of the general parallelise pool so a quality task can use it
-# exclusively, then released — e.g. the periodical golden-set recheck (v0.6.1)
-# reserves a card, runs its eval on it, releases it: no restart, no degradation,
-# the rest of the pool keeps serving REM/NREM. Control endpoint + consumer land
-# with the v0.6.1 quality work; the state + pool-exclusion seam is here now.
+# In-process reservation set, not env or user config. Selection holds these backends out of the ordinary pool while another eligible one exists.
 _llm_reserved: set[str] = set()
 
 # Cache-affinity: sticky routing for a repeated prompt prefix (llama.cpp KV cache).
@@ -980,11 +862,7 @@ def _all_roles_ineligible() -> "str | None":
         return None
     reason = "configured, but no backend is eligible for any traffic"
     if LLM_POOL_LEGACY_KEY_PRESENT:
-        # W4 (§6.5): the canonical version-jump shape — a live LLM_BACKENDS
-        # CSV (or bare LLM_DEFAULT_TARGET) that used to serve role-less
-        # traffic implicitly and now serves nothing. LLM_POOL_CONFIG_EMPTY is
-        # False for a live CSV (D1), so this is the ONLY reason string that
-        # carries the remedy for that shape.
+        # A live CSV or bare LLM_DEFAULT_TARGET used to serve role-less traffic and now serves nothing. Only this reason string carries the remedy for that shape.
         reason = f"{reason}; {_LLM_POOL_LEGACY_REMEDY}"
     return reason
 
@@ -1059,10 +937,7 @@ def _warn_unknown_role_once(role: str) -> None:
     warn ONCE per distinct value so a daemon-side typo is visible."""
     if role in _warned_unknown_role_values:
         return
-    # FR-1 (delta re-review): bound the dedupe set and truncate the logged
-    # value — distinct garbage values from a steer-permitted (or auth-off)
-    # caller must not grow memory or flood the journal with full-length
-    # strings.
+    # Bound the dedupe set and truncate the logged value so garbage role strings cannot grow memory or flood the journal.
     if len(_warned_unknown_role_values) >= 64:
         return
     _warned_unknown_role_values.add(role)
@@ -1145,8 +1020,7 @@ def _llm_mark_ok(backend: str) -> None:
     _llm_fail_times[backend] = []
 
 
-# NOTE: _ordered_llm_backends() was removed (M-3, Model_Attributes_Routing_
-# Plan_2026-08-18 pre-build review) — zero callers anywhere in this repo.
+# _ordered_llm_backends was removed; it had no callers.
 
 def _select_llm_backend(role: str = "", affinity_key: str | None = None,
                         est_prompt_tokens: float = 0.0,
@@ -1189,8 +1063,7 @@ def _select_llm_backend(role: str = "", affinity_key: str | None = None,
         return (b in eligible_set and b not in _llm_reserved
                 and _llm_unhealthy_until.get(b, 0.0) <= now)
 
-    # 1) affinity hit — same prefix already warm on an ELIGIBLE, usable,
-    #    non-saturated, non-capped card
+    # Affinity hit only when that card is eligible, usable, and under both the affinity cap and max_inflight.
     ent = _llm_affinity.get(affinity_key) if affinity_key else None
     if (ent and ent[0] in eligible_set and _usable(ent[0]) and not _at_cap(ent[0])
             and _llm_inflight.get(ent[0], 0) < AFFINITY_MAX_INFLIGHT):
@@ -1199,9 +1072,7 @@ def _select_llm_backend(role: str = "", affinity_key: str | None = None,
         _llm_affinity_hits += 1
         return ent[0]
 
-    # 2) miss — least-in-flight, protecting cards holding a reused (hits>=N)
-    #    hot prefix, with every fallback tier bottoming out at `eligible`
-    #    (P-1/P-2), never the full pool.
+    # Miss: least-in-flight inside the eligible set, protecting a reused hot prefix. Never fall back to the full pool.
     protected = {v[0] for v in _llm_affinity.values()
                  if now - v[1] <= AFFINITY_TTL and v[2] >= AFFINITY_PROTECT_HITS}
     usable = [b for b in eligible if _usable(b)]
@@ -1320,11 +1191,7 @@ def _safe_agent_name(request) -> "str | None":
         return None
 
 
-# QA-1 (HYG round, fix round): the marker a credential-audit line carries in
-# place of a query string. The MARKER, never the value — `?key=…` is a real
-# provider idiom, so the very thing that makes a query worth denying is the
-# thing that must not be written into a log an operator (or a future reader of
-# this repo's audit trail) will page through.
+# Audit marker substituted for a query string. The value stays out of the log; a provider key in the query is what must not be written.
 QUERY_REDACTED_MARKER = "?<query-redacted>"
 
 
@@ -1365,9 +1232,7 @@ def _safe_resolve_identity(request) -> "str | None":
         return None
 
 
-# S-14 (Credential_Custody_Plan PR A5): the two framework daemons — the only
-# identities _mint_daemon_token() ever mints for (see the two call sites
-# below) — are the sole non-admin identities allowed to steer LLM routing.
+# Only the two framework daemons this module mints for may steer LLM routing, besides admins.
 _CONSOLIDATION_AGENT_NAME = "consolidation"
 _REM_DAEMON_AGENT_NAME    = "rem_daemon"
 # Framework tools that send X-SM-LLM-Role but run outside the gateway are the explicit steering allowlist (decision:1357).
@@ -1408,13 +1273,7 @@ def _strip_llm_steering_headers(headers) -> "CIMultiDict[str]":
             result.add(k, v)
     return result
 
-# Upstream mid-stream disconnect — abrupt reset from the upstream server
-# (llama-server, BGE-M3) while we are reading via iter_any(). This is a
-# ClientError subclass raised by aiohttp's HTTP *client* — NOT a downstream
-# client disconnect signal. Caught in the inner streaming block to log at
-# WARNING level rather than surfacing as ERROR via the outer ClientError handler.
-# Note: ClientDisconnectedError was removed in aiohttp 3.9+; ServerDisconnectedError
-# covers abrupt resets. A clean upstream close simply ends iter_any() with no exception.
+# Upstream reset while reading iter_any(): an aiohttp client error, not a downstream disconnect. A clean close just ends the iterator.
 UPSTREAM_DISCONNECT = (ServerDisconnectedError,)
 
 
@@ -1456,19 +1315,11 @@ def _encoder_payload_too_large_response(nbytes: int) -> web.Response:
     return resp
 
 
-# --------------------------------------------------------------------------- #
 # Proxy
-# --------------------------------------------------------------------------- #
 class AsyncHiveMindProxy:
     def __init__(self):
         self.session: ClientSession | None = None
-        # Populated by set_known_routes() at startup, once, from the app
-        # router — see that method's docstring and the route-guard fields
-        # this backs: {key: {"pattern": re.Pattern | None, "methods": set[str]}}.
-        # A key is a PlainResource's exact path, or a DynamicResource's
-        # formatter string (e.g. "/memory/status/{pg_id}") — either way it's
-        # only ever used as a dict key, never matched by string equality for
-        # the dynamic case (that's what "pattern" is for).
+        # Filled once at startup from the router. A dynamic route matches on its pattern, not by string equality on the formatter key.
         self._known_routes: dict = {}
 
     def set_known_routes(self, router: "web.UrlDispatcher") -> None:
@@ -1497,9 +1348,7 @@ class AsyncHiveMindProxy:
             if resource is None:
                 continue
             info = resource.get_info()
-            # PlainResource → {"path": "/memory/save"}; DynamicResource →
-            # {"formatter": "/memory/status/{pg_id}", "pattern": re.Pattern}.
-            # (Measured against aiohttp 3.14 — see HANDOFF.md.)
+            # PlainResource exposes path; DynamicResource exposes formatter and pattern. Measured against aiohttp 3.14.
             key = info.get("path", info.get("formatter"))
             if key is None:
                 continue
@@ -1634,9 +1483,7 @@ class AsyncHiveMindProxy:
         return None
 
     async def handle_proxy(self, request: web.Request) -> web.StreamResponse:
-        # fact:1535 route-guard — runs before ANYTHING else in this method,
-        # including the S-14 header stripping below: a mistyped/wrong-method
-        # framework request must fail and say why, never reach dispatch.
+        # fact:1535: run the route guard before header stripping. A mistyped or wrong-method framework request must fail here, not reach dispatch.
         guard_response = self._route_guard(request)
         if guard_response is not None:
             return guard_response
@@ -1658,24 +1505,12 @@ class AsyncHiveMindProxy:
         # Catch-all is pool-routed LLM; strip X-SM-LLM-* from non-steering callers before role or routing is read (S-14).
         steer_headers = (request.headers if _may_steer_llm(request)
                           else _strip_llm_steering_headers(request.headers))
-        # The encoder paths are their OWN registered routes (handle_encoder)
-        # since the HYG round — handle_proxy is now unambiguously the
-        # reasoning-LLM path, so there is no target to pick before the pool
-        # selection below. The prefix loop that used to stand here was a
-        # startswith() over the DECODED path: it forwarded /v1/embeddingsX and
-        # /v1/embeddings/../x to the encoder, and it ran on a path aiohttp had
-        # never routed there. Deleted, not narrowed (R-A).
+        # Encoder paths are registered on handle_encoder, so this handler only selects an LLM backend. Do not prefix-match the decoded path; that forwarded near-miss spellings to the encoder.
         llm_backend: str | None = None
         llm_body: bytes | None = None
-        # Reasoning-LLM request → buffer the body so we can compute the
-        # cache-affinity key (bounded chat payload; buffering cost negligible),
-        # then dispatch cache-affinity-first. The key is computed as late as
-        # possible, just before selection, so nothing mutates the prompt after.
+        # Buffer the body so the affinity key is taken from the prompt before a backend rewrite.
         llm_body = await request.read() if request.can_read_body else b""
-        # A-3: parse the body ONCE — affinity, fit (est_prompt_tokens is a
-        # pure char count, no parse needed; effective_max_tokens reads the
-        # parsed struct), and the post-selection override rewrite all read
-        # this SAME struct; never a second json.loads of the same body.
+        # Parse the body once. Affinity, fit, and the backend rewrite all read this object; do not json.loads the same bytes again.
         body_obj = _parse_json_body(llm_body)
         role = steer_headers.get("X-SM-LLM-Role", "").strip().lower()
         affinity_key = _affinity_key_from_obj(body_obj)
@@ -1683,12 +1518,7 @@ class AsyncHiveMindProxy:
                              if CHARS_PER_TOKEN_RATIO > 0 else 0.0)
         effective_max_tokens = _extract_effective_max_tokens(body_obj)
 
-        # Eligibility is a HARD PRE-FILTER (P-1 Critical): computed BEFORE
-        # any affinity/health/cooldown/reserved/cap logic runs. Empty →
-        # 422, PRE-DISPATCH (I-8b: no inflight accounting has happened
-        # yet, this return is well before the try: block that reserves a
-        # slot) — never silently widens, never falls back to an
-        # ineligible backend, never queues.
+        # Eligibility is a hard pre-filter, before affinity, health, cooldown, reservation, or cap. Empty is a 422 with no inflight slot taken, and it must not widen.
         if role and role not in ROUTING_ROLE_NAMES:
             _warn_unknown_role_once(role)
         eligible_pre = _eligible_backends(role, est_prompt_tokens, effective_max_tokens)
@@ -1698,10 +1528,7 @@ class AsyncHiveMindProxy:
             _record_no_eligible_backend(constraint)
             refusal_body = {"error": "no_eligible_backend",
                             "constraint": constraint, "role": role or None}
-            # Ruling C(α)/E(α2) (§5): additive `declaration` key — never
-            # touches the `constraint` vocabulary or either daemon's
-            # three-keys-only parse (rem_loop.py:161-ish,
-            # consolidation_loop.py:833-ish both `.get` three keys).
+            # Additive declaration key only. Do not change the constraint vocabulary; both daemons read only error, constraint, and role.
             declaration = _declaration_gap()
             if declaration is not None:
                 refusal_body["declaration"] = declaration
@@ -1711,18 +1538,10 @@ class AsyncHiveMindProxy:
                     declaration, role or "(role-less)", constraint,
                     _DECLARATION_GAP_REMEDY.get(declaration, "declare explicitly"))
             if constraint == "fit":
-                # R-5 disposition (decision:1357): retry-without-charge
-                # STANDS as ruled (F-1: a config gap is not a record
-                # defect) — observability is the mitigation. The refusal
-                # names the estimate that failed so an operator can
-                # retune LLM_CHARS_PER_TOKEN_RATIO / FIT_MARGIN / n_ctx
-                # against real traffic.
+                # decision:1357: a fit rejection is not charged as a record defect. Name the estimate so the operator can retune the ratio, margin, or n_ctx.
                 refusal_body["est_prompt_tokens"] = int(est_prompt_tokens)
                 refusal_body["effective_max_tokens"] = int(effective_max_tokens)
-                # FR-2 (delta re-review): the daemons' refusal handling
-                # reads only {error, constraint, role}, so the estimate
-                # fields alone reach no operator — this journal line is
-                # where the retune signal actually lands.
+                # Daemons read only error, constraint, and role, so the estimate fields never reach an operator. This journal line is the retune signal.
                 log.warning(
                     "fit-rejected: est_prompt_tokens=%d + max_tokens=%d "
                     "fits no declared n_ctx (role=%s) — if this request "
@@ -1751,12 +1570,7 @@ class AsyncHiveMindProxy:
                 status=403, headers={"X-SM-Fault-Origin": "gateway"},
             )
 
-        # At least one backend IS eligible — fast path first; only if
-        # every eligible backend is AT its max_inflight cap right now do
-        # we join the (waiter-capped, R-4) bounded wait on it (I-8: the
-        # cap never widens eligibility, so selection never picks an
-        # over-cap backend to avoid waiting) rather than refusing or
-        # overriding the cap. All pre-dispatch: no inflight accounting yet.
+        # If every eligible backend is at its cap, wait on that set. The cap must not widen eligibility, and no inflight slot is taken yet.
         llm_backend = _select_llm_backend(
             role, affinity_key, est_prompt_tokens, effective_max_tokens)
         if llm_backend is None:
@@ -1770,12 +1584,7 @@ class AsyncHiveMindProxy:
             )
         target_base = llm_backend
 
-        # S-04 (Critical, PR A5): a request about to carry a provider
-        # key may only be POST to a framework-owned endpoint — never
-        # an arbitrary method/path forwarded verbatim to a
-        # credentialed backend.
-        # ADV-3: Placed before S5 model-mismatch refusal so a denied
-        # route returns 403 (with auth audit) rather than 400.
+        # A request that will carry a provider key may only POST a framework-owned path. Check that before the model-mismatch refusal so a denied route is 403, not 400.
         if LLM_BACKEND_TOKENS.get(llm_backend) is not None:
             route = (request.method, request.rel_url.raw_path)
             if (route not in CREDENTIALED_BACKEND_ALLOWED_ROUTES
@@ -1803,11 +1612,7 @@ class AsyncHiveMindProxy:
                     headers={"X-SM-Fault-Origin": "gateway"},
                 )
 
-        # Per-backend body rewrites (LLM_BACKENDS_JSON "model" +
-        # "extra_body") — a cloud endpoint needs its real model id, not the
-        # local "local-model" every caller sends by default, and its
-        # provider-specific switches (e.g. thinking disabled) that no
-        # caller knows to send. See _apply_backend_body_overrides.
+        # Rewrite model and extra_body per backend. Callers send local-model and do not know the provider's switches.
         llm_body = _apply_backend_body_overrides(
             llm_body, LLM_BACKEND_MODELS.get(llm_backend),
             LLM_BACKEND_EXTRAS.get(llm_backend), _body_obj=body_obj)
@@ -1862,11 +1667,7 @@ class AsyncHiveMindProxy:
                           f"was NOT forwarded to any backend — correct the path and retry."},
                 status=404, headers={"X-SM-Fault-Origin": "gateway"})
 
-        # Exact key: this handler is only ever reached through its own
-        # registration, and aiohttp's PlainResource matches on
-        # rel_url.path_safe (pinned in tests/test_auth_exemption_route_
-        # resolution.py against aiohttp's own source), which is the same
-        # string ROUTING_MAP is keyed by.
+        # This handler is only reached through its own registration. aiohttp matches the plain route on rel_url.path_safe, the same string ROUTING_MAP uses.
         target_base = ROUTING_MAP[request.rel_url.path_safe]
         llm_body: bytes | None = None
         if request.can_read_body:
@@ -1951,9 +1752,7 @@ class AsyncHiveMindProxy:
 
         # Strip X-SM-LLM-* before the upstream forward for every caller (provider never sees routing metadata).
         upstream_headers = self._filter_headers(_strip_llm_steering_headers(steer_headers))
-        # Authorization was just stripped above (see _filter_headers) — add it
-        # back ONLY for a backend that has its own configured credential. Every
-        # other backend (local, or one with no token_env) gets none, same as today.
+        # Authorization was stripped above. Put it back only for a backend that has its own configured credential.
         backend_token = None
         if llm_backend is not None:
             backend_token = LLM_BACKEND_TOKENS.get(llm_backend)
@@ -1973,12 +1772,7 @@ class AsyncHiveMindProxy:
                         status=403, headers={"X-SM-Fault-Origin": "gateway"},
                     )
                 upstream_headers["Authorization"] = f"Bearer {backend_token}"
-            # Surface for the gateway's own per-request audit line (PR A3,
-            # coordinator._audit's additive backend/key_attached fields) —
-            # auth_middleware reads these back off the request after this
-            # handler returns. Best-effort: request may be a lightweight
-            # stand-in (tests, direct handle_proxy callers) without a
-            # mapping interface.
+            # Stash backend and key_attached for the audit line auth_middleware reads after return. The request may be a test double with no mapping interface.
             try:
                 request["backend"] = llm_backend
                 if backend_token:
@@ -2002,11 +1796,7 @@ class AsyncHiveMindProxy:
         # Initialized to None so exception handlers can check object state directly
         # (.prepared attribute) rather than relying on a parallel boolean flag.
         proxy_resp: web.StreamResponse | None = None
-        # A retry is only safe when the body was buffered (llm_body, always; or
-        # embed_body, when small enough — see above) rather than streamed via
-        # request.content, which is consumed on first use and can never be
-        # resent. Anything still streaming keeps the pre-fix single-attempt
-        # behaviour.
+        # Retry only a buffered body. request.content is consumed on first use and cannot be resent.
         have_buffered_body = llm_body is not None or embed_body is not None
         max_attempts = 2 if have_buffered_body else 1
 
@@ -2016,10 +1806,7 @@ class AsyncHiveMindProxy:
                 _llm_inflight[llm_backend] = _llm_inflight.get(llm_backend, 0) + 1
                 _llm_inflight_started.setdefault(llm_backend, []).append(time.monotonic())
                 _llm_routed[llm_backend] = _llm_routed.get(llm_backend, 0) + 1
-                # Optional (decision:1357): the per-role ROUTED counter
-                # increments HERE, at dispatch, beside the inflight/_llm_routed
-                # accounting it mirrors — not back at selection, where a
-                # request could still be refused (S-04) before any dispatch.
+                # decision:1357: count the routed role here, at dispatch, beside inflight. Selection can still refuse the request before any dispatch.
                 if role:
                     _record_role_routed(role)
 
@@ -2046,16 +1833,9 @@ class AsyncHiveMindProxy:
                         # Stamp serving backend via scrub_url_credentials (query-less keys round-trip; query-bearing attribution degrades).
                         if llm_backend is not None:
                             proxy_resp.headers["X-SM-LLM-Backend"] = scrub_url_credentials(llm_backend)
-                        # Client-facing standard messaging (PR A3 / S8): a fault status
-                        # from ANY upstream (LLM, embedder, reranker) is an upstream-
-                        # origin error. S8 replaces the verbatim provider body with a
-                        # TYPED refusal (below); the fault-origin header is additive
-                        # and never set on success.
+                        # Any upstream status >= 400 is an upstream-origin fault. Replace the provider body with a typed refusal; the fault-origin header is not set on success.
                         if upstream.status >= 400:
-                            # S8: Typed refusal instead of verbatim provider >=400 bodies.
-                            # ADV-5: the read is BOUNDED to _ERROR_BODY_PARSE_CAP — the
-                            # classification only ever needs a prefix, so the read is
-                            # size-bounded and an oversized ≥400 body is not buffered.
+                            # Read only a prefix of a >=400 body. Classification does not need the rest, and an oversized body must not be buffered.
                             content_encoding = upstream.headers.get("Content-Encoding")
                             try:
                                 body_bytes = await upstream.content.read(_ERROR_BODY_PARSE_CAP)
@@ -2088,9 +1868,7 @@ class AsyncHiveMindProxy:
                                 "status": upstream.status,
                                 "type": error_type,
                             }
-                            # Encoder embed 400/413: structured overflow for
-                            # get_embedding (decision:2583). Never the verbatim
-                            # provider body. Not on LLM pool, rerank, or 5xx.
+                            # decision:2583: embed 400/413 becomes a structured overflow for get_embedding, never the provider body. Not used for the LLM pool, rerank, or 5xx.
                             path_safe = getattr(request.rel_url, "path_safe", "") or ""
                             if (
                                 llm_backend is None
@@ -2122,9 +1900,7 @@ class AsyncHiveMindProxy:
                             _client_aborted = True
                             return proxy_resp
 
-                        # R-3: auto_decompress=False means a compressed response
-                        # arrives as framing bytes, not JSON — read Content-Encoding
-                        # once so the usage capture below can decompress it.
+                        # auto_decompress is false, so a compressed body arrives as framing bytes. Read Content-Encoding once so usage capture can decompress it.
                         content_encoding = upstream.headers.get("Content-Encoding")
 
                         # Best-effort usage parse after the loop (gzip/deflate/br, cap-bounded; skip SSE) (decision:1357).
@@ -2152,17 +1928,12 @@ class AsyncHiveMindProxy:
                             await proxy_resp.write_eof()
 
                         except asyncio.CancelledError:
-                            # CancelledError is the event loop signalling task cancellation
-                            # (shutdown, timeout, framework teardown). It is NOT a disconnect
-                            # signal. Must always be re-raised so the event loop can complete
-                            # its cancellation sequence; swallowing it stalls graceful shutdown.
+                            # CancelledError is task cancellation, not a disconnect. Re-raise it or graceful shutdown stalls.
                             log.warning("Handler task cancelled during stream: %s", scrubbed_target_url)
                             raise
 
                         except UPSTREAM_DISCONNECT as e:
-                            # Upstream server dropped the connection mid-stream (clean close or
-                            # abrupt reset). Response headers are already on the wire; log and
-                            # return the partial response rather than attempting a new reply.
+                            # Upstream dropped the connection after headers were sent. Log and return the partial response; a new reply is no longer possible.
                             log.warning("Upstream dropped connection mid-stream: %s — %s", scrubbed_target_url, e)
 
                         except (ConnectionResetError, IOError) as e:
@@ -2185,9 +1956,7 @@ class AsyncHiveMindProxy:
                             except Exception:
                                 pass   # not a single-object JSON body (e.g. SSE) — skip, never breaks the proxy path
 
-                        # D9: a client abort mid-stream (`_client_aborted`,
-                        # set above) is the CALLER's event, not a verdict on
-                        # this backend — neither ok nor fail fires for it.
+                        # A client abort mid-stream is the caller's event, not a verdict on this backend. Do not mark it ok or failed.
                         if llm_backend is not None and not _client_aborted:
                             _llm_mark_ok(llm_backend)   # connected + served — clear fail streak
                         # This return is the <400 stream path; >=400 already returned a typed S-08 JSON above.
@@ -2205,27 +1974,16 @@ class AsyncHiveMindProxy:
                     raise
 
         except asyncio.CancelledError:
-            # CancelledError is BaseException (Python 3.8+) and won't be caught by
-            # `except Exception` below, but this explicit clause documents that we
-            # never absorb cancellation at any level.
+            # CancelledError is a BaseException, so except Exception will not see it. Do not absorb cancellation here either.
             raise
 
         except ClientError as ce:
-            # Upstream is down, unreachable, or refused the connection.
-            # 503: the proxy is fine; the backend is not.
-            # O-6: log the SCRUBBED, BOUNDED message text — a ClientError's own
-            # __str__ can render the full request URL (aiohttp's InvalidURL
-            # does), and a real provider pattern puts a credential in a URL
-            # (userinfo, or a `?key=...` query parameter). The client-visible
-            # body below uses the exception's CLASS NAME only, never its text.
+            # Upstream is down or refused the connection: 503, the proxy itself is fine. Log scrubbed text only; a ClientError string can contain the URL and a credential. The client sees the exception class, not that text.
             log.error("Upstream unreachable %s: %s", scrubbed_target_url,
                       _short(_scrub_url_credentials(str(ce))))
             if llm_backend is not None:
                 _llm_mark_fail(llm_backend)
-                # Gateway-origin fault (PR A3) — the gateway itself observed this
-                # (a connect/refuse failure), never what the upstream said, so it
-                # counts in the `gateway` group only, and is logged only when the
-                # call was credentialed (see record_llm_gateway_fault docstring).
+                # This connect failure is a gateway-origin fault, not something the upstream said. Count it in the gateway group, and only when the call was credentialed.
                 record_llm_gateway_fault(llm_backend, type(ce).__name__,
                                           credentialed=bool(backend_token),
                                           request_id=_safe_request_id(request))
@@ -2266,12 +2024,8 @@ class AsyncHiveMindProxy:
                                       headers={"X-SM-Fault-Origin": "gateway"})
 
         finally:
-            # Release the in-flight slot so least-busy selection stays accurate,
-            # whatever the outcome (success, disconnect, error, cancellation).
-            # NOTE the honesty gap this creates: on a client timeout the SERVER
-            # may keep generating (zombie) — inflight drops to 0 while the
-            # backend is still busy. The oldest-inflight age + suspect_wedged
-            # probe on the status surfaces exist to catch the sustained form.
+            # Release the inflight slot on every outcome so least-busy selection stays honest.
+            # A client timeout can leave the backend generating; oldest-inflight age and suspect_wedged exist for that gap.
             if llm_backend is not None:
                 _llm_inflight[llm_backend] = max(0, _llm_inflight.get(llm_backend, 0) - 1)
                 starts = _llm_inflight_started.get(llm_backend)
@@ -2283,9 +2037,7 @@ class AsyncHiveMindProxy:
                         llm_backend, time.monotonic() - _llm_req_start_mono, _llm_req_failed)
 
 
-# --------------------------------------------------------------------------- #
 # Daemon token helpers
-# --------------------------------------------------------------------------- #
 
 def _daemon_env(agent_name: str) -> dict:
     """Build a subprocess environment for the named daemon: non-secret config
@@ -2310,11 +2062,7 @@ def _daemon_env(agent_name: str) -> dict:
     return {k: v for k, v in os.environ.items() if not is_secret_key(k)}
 
 
-# Agent name -> the digest currently registered in coordinator._AGENT_TOKENS
-# for that agent's EPHEMERAL daemon token (as opposed to a persisted
-# AGENT_TOKENS registry entry). Lets a re-mint on daemon restart revoke the
-# PREVIOUS ephemeral token rather than leaving it valid forever alongside
-# the new one — a crash-restart rotates and invalidates in the same step.
+# Digest of the ephemeral daemon token in _AGENT_TOKENS, not a persisted registry entry. A restart revokes the previous token instead of leaving both valid.
 _ephemeral_daemon_token_digests: dict[str, str] = {}
 
 
@@ -2388,9 +2136,7 @@ def _daemon_env_and_token_fd(agent_name: str) -> "tuple[dict, int | None]":
         finally:
             os.close(write_fd)
     except Exception:
-        # Nit fix (finding 10): if the write itself raised, read_fd would
-        # otherwise leak -- nothing else in this function's error path
-        # closes it, and the caller never receives it to close either.
+        # If the write itself raised, close read_fd here. Nothing else on this error path does, and the caller never receives it.
         os.close(read_fd)
         _revoke_daemon_token(agent_name)
         raise
@@ -2398,9 +2144,7 @@ def _daemon_env_and_token_fd(agent_name: str) -> "tuple[dict, int | None]":
     return env, read_fd
 
 
-# --------------------------------------------------------------------------- #
 # Consolidation daemon lifecycle
-# --------------------------------------------------------------------------- #
 def _find_uv() -> "str | None":
     """Resolve the uv binary for daemon spawns.
 
@@ -2464,10 +2208,7 @@ async def _start_daemon() -> "asyncio.subprocess.Process | None":
         )
         _daemon_proc = proc
     except Exception:
-        # Nit fix (finding 10): the token was already minted and registered
-        # before spawn was attempted -- if spawn itself failed, nothing
-        # holds that token, so revoke it rather than leaving it valid with
-        # no daemon behind it.
+        # The token is minted before spawn. If spawn fails, revoke it; nothing else holds it.
         if read_fd is not None:
             _revoke_daemon_token(_CONSOLIDATION_AGENT_NAME)
         raise
@@ -2645,8 +2386,7 @@ async def _watchdog_daemon(stop_event: asyncio.Event) -> None:
                 exitcode, uptime,
             )
 
-            # Reset backoff if the daemon was stable long enough — avoids penalising
-            # recoverable transient failures (brief Postgres blip, LLM timeout).
+            # Reset backoff after a stable stretch, so a brief Postgres or LLM blip does not become a boot-loop penalty.
             if uptime >= _DAEMON_MIN_STABLE_SEC:
                 backoff = 1.0
 
@@ -2679,9 +2419,7 @@ async def _watchdog_daemon(stop_event: asyncio.Event) -> None:
         _revoke_daemon_token(_CONSOLIDATION_AGENT_NAME)
 
 
-# --------------------------------------------------------------------------- #
-# Pool status — cheap, in-memory LLM capacity signal for the dreaming daemons
-# --------------------------------------------------------------------------- #
+# Pool status: in-memory LLM capacity for the dreaming daemons
 async def handle_pool_status(request: web.Request) -> web.Response:
     """GET /pool/status — in-memory LLM pool availability, no upstream probes.
     A backend is available iff zero in-flight, not in cooldown, not reserved.
@@ -2705,8 +2443,7 @@ async def handle_pool_status(request: web.Request) -> web.Response:
         return web.json_response({})
 
     now = time.monotonic()
-    # Lazy/defensive: the session is needed only for the rare suspect-wedged
-    # probe; unit tests call this handler without a real request/app.
+    # The session is only for the rare suspect-wedged probe. Tests call this handler with no real app.
     _app = getattr(request, "app", None)
     _session = _app["proxy"].session if _app is not None and "proxy" in _app else None
     backends, free = {}, 0
@@ -2715,20 +2452,9 @@ async def handle_pool_status(request: web.Request) -> web.Response:
                  and _llm_unhealthy_until.get(b, 0.0) <= now
                  and b not in _llm_reserved)
         age = _oldest_inflight_age(b, now)
-        # F-3 (Model_Attributes_Routing_Plan_2026-08-18): free_slots counts
-        # ONLY serves-all-eligible backends (roles absent AND private_ok) —
-        # dream gating stays conservative rather than assuming a role-scoped
-        # or private_ok=false backend is fair game for whatever the caller
-        # happens to be. Full per-role slot accounting is deferred (F-3,
-        # named follow-up, not built this cycle) — `serves_all` is additive
-        # visibility, not a promise of finer-grained accounting.
+        # serves_all is visibility only: roles absent and private_ok. The free_slots count is the next flag, not this one.
         serves_all = _serves_all(b)
-        # C-1 (decision:1357): the free count uses _counts_free_slot — a
-        # backend with an explicit FULL dream-roles list is as capable as a
-        # serves-all one for the daemons' gating, and counting only
-        # serves-all silently zeroed free_slots (halting every dream daemon)
-        # for all-declared fleets. `counts_free_slot` is surfaced additively
-        # so a monitor can see WHY the count is what it is.
+        # decision:1357: a backend with the full dream-role list counts as free, same as serves-all. Counting only serves-all zeroed free_slots and halted every dream daemon.
         counts_free = _counts_free_slot(b)
         entry = {
             "inflight": _llm_inflight.get(b, 0),
@@ -2739,45 +2465,30 @@ async def handle_pool_status(request: web.Request) -> web.Response:
             "serves_all": serves_all,
             "counts_free_slot": counts_free,
         }
-        # Lazy wedge check (the one exception to "no upstream probes"): only
-        # when a request has been in flight suspiciously long — busy-generating
-        # backends answer their own /health instantly; a driver-hung one can't.
+        # Probe a backend only when a request has been in flight past the suspect age. A busy generator still answers /health; a hung driver cannot.
         if age is not None and age > LLM_WEDGE_SUSPECT_AGE and _session is not None:
             entry["suspect_wedged"] = not await _probe_backend_alive(_session, b)
         backends[b] = entry
         free += 1 if (avail and counts_free) else 0
-    # SEC B (defense in depth, second wall behind A): scrub every backend URL
-    # KEY before this client-facing response — byte-identical for a clean,
-    # query-less URL (item C); collapse-guarded (ADV1-14).
+    # Scrub backend URL keys before this response leaves. A clean query-less URL is unchanged; collapsing two distinct keys must not merge them.
     backends = _scrub_backend_keyed_dict(backends, context="/pool/status")
     return web.json_response({"free_slots": free, "backends": backends})
 
 
-# --------------------------------------------------------------------------- #
-# Backend CAPABILITY probing — "can it serve", not "is it up"
-# --------------------------------------------------------------------------- #
-# How often the capability probe re-measures. It costs real inference time on
-# the same backends that serve traffic, so it is deliberately infrequent.
+# Capability probing: whether a backend can serve, not merely whether it answers.
+# The probe costs inference on the backends that serve traffic, so the interval is long.
 CAPABILITY_PROBE_INTERVAL_S = float(
     os.environ.get("CAPABILITY_PROBE_INTERVAL_S", "600"))
-# How soon the probe re-tries after a FAILING probe (backend unreachable,
-# non-2xx, or an exception): a backend that is not serving costs nothing to
-# ping, and waiting the full interval turned a 60 s encoder cold-start into a
-# ten-minute window of `degraded` and empty searches (fact:1609). A `too_slow`
-# backend IS serving, so it keeps the full interval — a fast re-probe there
-# would add load to exactly the encoder that is struggling. Unmeasured
-# default; bounds the post-recovery blind window to one retry interval.
+# fact:1609: retry a failing probe soon. Waiting the full interval turned a short encoder cold-start into a long degraded window.
+# A too_slow backend is still serving, so it keeps the full interval.
 CAPABILITY_PROBE_RETRY_S = float(
     os.environ.get("CAPABILITY_PROBE_RETRY_S", "15"))
-# The probe payload. Small enough to be cheap, large enough to be representative
-# — a one-token ping would measure nothing about the cost that actually matters.
+# Large enough to represent a real payload. A one-token ping would not measure the cost that matters.
 CAPABILITY_PROBE_DOCS = int(os.environ.get("CAPABILITY_PROBE_DOCS", "4"))
 CAPABILITY_PROBE_DOC_CHARS = int(
     os.environ.get("CAPABILITY_PROBE_DOC_CHARS", "1000"))
 
-# Populated by the background probe; read by /health. "unknown" until the first
-# probe lands — NEVER asserted as healthy on no data (decision 928's rule: "not
-# yet probed" must not read as "verified clean").
+# Probe result for /health. Stays unknown until the first probe; decision 928 says not-yet-probed must not read as verified clean.
 _capability: dict = {"status": "unknown", "probed_at": None}
 
 
@@ -2868,8 +2579,7 @@ async def _probe_capability(session) -> dict:
         entry["latency_s"] = round(dt, 2)
         entry["throughput_chars_s"] = round(probe_chars / dt)
         if ok and entry["throughput_chars_s"] > 0:
-            # The worst case this framework can actually send: a full candidate
-            # set of fully-clamped documents.
+            # Worst case this framework can send: a full candidate set of fully clamped documents.
             full_chars = 20 * RERANK_MAX_DOC_CHARS
             projected = full_chars / entry["throughput_chars_s"]
             allowed = rerank_ceiling(["x" * RERANK_MAX_DOC_CHARS] * 20)
@@ -2969,10 +2679,7 @@ def _merge_capability_projection(previous: dict | None, fresh: dict) -> dict:
         prev_block = (previous or {}).get(backend)
         if (not isinstance(prev_block, dict)
                 or prev_block.get("projected_full_payload_s") is None):
-            # Never measured — nothing to carry, and nothing to invent.
-            # R2-N6: the verdict is nulled here too, so "we make no claim"
-            # has ONE shape across both never-measured and ageing blocks
-            # rather than being absent in one and null in the other.
+            # Nothing was measured, so carry nothing and invent nothing. Null the verdict too, the same shape as an ageing block.
             block["serves_full_payload"] = None
             block["projection_stale"] = None
             continue
@@ -2981,15 +2688,10 @@ def _merge_capability_projection(previous: dict | None, fresh: dict) -> dict:
                 block[key] = prev_block[key]
             else:
                 block.pop(key, None)
-        # A-1 (ADV-1): the VERDICT does not travel with the reading. It is
-        # explicitly null — not absent — so a renderer sees "we no longer
-        # claim this" rather than reading a missing key as false, and never
-        # sees a green verdict on a backend that just failed to answer.
+        # The verdict does not travel with a carried-forward reading. Null, not absent, so a missing key is not read as false and a failed probe cannot stay green.
         block["serves_full_payload"] = None
         block["projection_stale"] = True
-        # `previous` may itself already be a carried-forward block, so the
-        # stamp is chained: the age reported is the age of the NUMBERS, not
-        # of the cycle that last carried them.
+        # The previous block may itself have been carried forward. The age is the age of the numbers, not of the cycle that last copied them.
         block["last_ok_at"] = (prev_block.get("last_ok_at")
                                or (previous or {}).get("probed_at"))
     return fresh
@@ -3048,10 +2750,7 @@ def _probe_sleep_s(capability: dict | None,
 
 # Capacity derivation is report-only (decision:1424): no request is limited, queued, or rejected here.
 _MEM_SIZE_RE = re.compile(r"^([0-9]*\.?[0-9]+)\s*([KMGT]?I?B?)$", re.IGNORECASE)
-# M5 (fix round): KI/MI/GI/TI added alongside the existing KIB/MIB/GIB/TIB
-# so k8s-style binary notation ("8Gi", "512Mi", "4Ki" -- no trailing "B")
-# parses too, not just the docker-compose "8G"/"512M" and hand-typed
-# "2GiB" forms already handled.
+# Accept k8s binary suffixes (Ki, Mi, Gi, Ti) as well as KiB and the compose 8G form.
 _MEM_SIZE_MULTIPLIERS = {
     "": 1, "B": 1,
     "K": 1024, "KB": 1024, "KI": 1024, "KIB": 1024,
@@ -3086,34 +2785,20 @@ def _parse_mem_size(raw: str | None) -> int | None:
 # Capacity RAM subtrahends are declared allowances (env-overridable); Neo4j prefers configured heap+pagecache over the compose 8G cap.
 CAPACITY_NEO4J_FALLBACK_BYTES = _parse_mem_size(
     os.environ.get("CAPACITY_NEO4J_FALLBACK_BYTES", "8G"))
-# Postgres: the compose `deploy.resources.limits.memory: 4G` cap — Postgres
-# has no single configured-heap equivalent to read (shared_buffers=1GB in the
-# compose command is a floor, not what the backend processes actually use
-# under load), so the allowance is the container's own docker ceiling.
+# Postgres has no single heap figure (shared_buffers is a floor). The allowance is the container memory cap.
 CAPACITY_PG_MEM_ALLOWANCE_BYTES = _parse_mem_size(
     os.environ.get("CAPACITY_PG_MEM_ALLOWANCE_BYTES", "4G"))
-# Embedder: NOT measured here — a steady-state allowance for the llama.cpp
-# embedding container (fits in ~2 GB per ops/postgres_neo4j_limits.yaml's own
-# comment on the encoder pair). Only relevant when the embedder runs on THIS
-# host (CPU_ENCODER_REPLICAS=1); an operator running it elsewhere can zero
-# this.
+# Not measured: a steady-state allowance for the embedder on this host. Zero it when the embedder runs elsewhere.
 CAPACITY_EMBEDDER_MEM_ALLOWANCE_BYTES = _parse_mem_size(
     os.environ.get("CAPACITY_EMBEDDER_MEM_ALLOWANCE_BYTES", "2G"))
-# Gateway: NOT measured — this process's own steady-state footprint
-# (aiohttp + asyncpg pool + in-process telemetry dicts).
+# Not measured: this process's own steady-state footprint.
 CAPACITY_GATEWAY_MEM_ALLOWANCE_BYTES = _parse_mem_size(
     os.environ.get("CAPACITY_GATEWAY_MEM_ALLOWANCE_BYTES", "512M"))
-# OS margin: NOT measured — kernel, page cache pressure, the operator's own
-# desktop session on a shared box.
+# Not measured: kernel, page cache, and the desktop session on a shared box.
 CAPACITY_OS_MEM_MARGIN_BYTES = _parse_mem_size(
     os.environ.get("CAPACITY_OS_MEM_MARGIN_BYTES", "1G"))
 
-# Fail-open parse for a CAPACITY_* numeric env setting (H2, fix round): a
-# malformed value used to crash the gateway on import via a bare float()/
-# int() call -- these are observability/tuning knobs, not something a typo
-# in .env should be able to take the whole process down over. Logs ONE
-# warning naming the variable and the fallback it's using instead, then
-# returns the default -- never raises.
+# A bad CAPACITY_* number must not crash import. Log the name and the fallback, then use the default.
 def _capacity_env_number(name: str, default, cast):
     raw = os.environ.get(name)
     if raw is None or raw == "":
@@ -3144,19 +2829,12 @@ CAPACITY_PAYLOAD_MIN_SAMPLES = _capacity_env_number("CAPACITY_PAYLOAD_MIN_SAMPLE
 # probe_drift fires outside a ×N band of last derived chars/s; factor <= 1.0 disables the trigger.
 CAPACITY_DRIFT_BAND_FACTOR = _capacity_env_number("CAPACITY_DRIFT_BAND_FACTOR", 2.0, float)
 
-# Where derivation records persist (MEMORY_LOG_PATH's convention: env-
-# overridable, ~/.shared-memory/... default, secured 0600/0700 via
-# log_hygiene). JSON-lines, oldest-first; capped at the last N (values <= 0
-# behave as 1 -- see _append_capacity_record's M4 clamp).
+# JSON-lines capacity log, env-overridable, mode 0600. Keep the last N records; a non-positive cap keeps one.
 CAPACITY_LOG_PATH = os.environ.get(
     "CAPACITY_LOG_PATH", "~/.shared-memory/capacity/derivations.jsonl")
 CAPACITY_LOG_MAX_RECORDS = _capacity_env_number("CAPACITY_LOG_MAX_RECORDS", 20, int)
 
-# In-memory mirror of the latest record, surfaced on /health without a disk
-# read on every hit. None until the first derivation of this process's
-# lifetime lands OR a prior record is lazily loaded from disk (see
-# _capacity_latest_snapshot). Never asserted as present on no data — the same
-# discipline decision 928 established for _capability.
+# Latest record for /health, so a hit does not read disk. None until one exists; do not treat absence as a measurement (decision 928).
 _capacity_latest: dict | None = None
 _capacity_latest_loaded_from_disk = False   # memoizes the one lazy disk read
 # True after this process's first capability probe (startup fingerprint vs later config_change/probe_drift).
@@ -3218,12 +2896,7 @@ def _hardware_fingerprint() -> dict:
     except (OSError, ValueError, IndexError):
         pass   # non-Linux, unreadable, or unexpected format — stays None
     try:
-        # Installation only (SLOT_AWARE on AND nvtop on PATH) -- NEVER
-        # gpu_probe_available(), which also reflects a runtime self-disable
-        # after repeated nvtop hangs. This fingerprint is PERSISTED; a
-        # process-lifetime self-disable is not a hardware fact and must not
-        # flip it (that would fire gateway_start_fingerprint_mismatch on the
-        # next restart even though nothing about the hardware changed).
+        # Fingerprint only whether nvtop is installed. A runtime self-disable is not a hardware change and must not move a persisted fingerprint.
         from gpu_load import gpu_probe_installed
         out["gpu_present"] = bool(gpu_probe_installed())
     except Exception:
@@ -3244,9 +2917,7 @@ def _encoder_config_fingerprint() -> dict:
     return {
         "rerank_max_doc_chars": RERANK_MAX_DOC_CHARS,
         "search_candidate_floor": SEARCH_CANDIDATE_FLOOR,
-        # L17 (fix round): strip userinfo (user:pass@) before this persists
-        # to the on-disk JSONL log -- same scrub already applied to
-        # client-visible error text elsewhere in this module.
+        # Strip userinfo before this URL is written to the on-disk JSONL log.
         "embedder_url": _scrub_url_credentials(EMBEDDER_URL or ""),
         "reranker_url": _scrub_url_credentials(RERANKER_URL or ""),
         "cpu_encoder_replicas": os.environ.get("CPU_ENCODER_REPLICAS", "1"),
@@ -3298,20 +2969,13 @@ def _capacity_client_ceiling_s(capability: dict | None) -> float:
     for backend in ("reranker", "embedder"):
         block = (capability or {}).get(backend)
         if not isinstance(block, dict) or not block:
-            # R2-N3: ignorance expressed as ABSENCE is still ignorance. A
-            # block that is missing, empty, or not a dict says nothing about
-            # what that backend costs — and treating "nothing" as "zero" is
-            # the same mistake this whole mechanism exists to remove. Not
-            # reachable from our own probe (it always writes both blocks);
-            # very reachable for a client reading a partial or older
-            # gateway's /health over the wire.
+            # A missing or empty block is an unknown cost, not zero. Treating absence as zero is the under-count this ceiling exists to avoid.
             unknown = True
             continue
         try:
             value = float(block.get("projected_full_payload_s") or 0)
         except (TypeError, ValueError):
-            # A malformed projection is an UNKNOWN cost, not a zero one —
-            # fall through to the flag check rather than skipping the block.
+            # A malformed projection is an unknown cost, not zero. Fall through to the flag instead of skipping the block.
             value = 0.0
         if value > 0:
             projected += value
@@ -3490,8 +3154,7 @@ def _build_capacity_record(capability: dict | None, fingerprint: dict,
     code was already right, only the comment was wrong)."""
     reranker = (capability or {}).get("reranker") or {}
     embedder = (capability or {}).get("embedder") or {}
-    # UNCHANGED meaning: the fixed theoretical full-payload projection,
-    # verbatim from the probe, exactly as before this change.
+    # Fixed theoretical full-payload projection, copied from the probe. The basis switch below does not change this value.
     s_mean_theoretical = reranker.get("projected_full_payload_s")
     reranker_chars_per_s = reranker.get("throughput_chars_s")
 
@@ -3499,9 +3162,7 @@ def _build_capacity_record(capability: dict | None, fingerprint: dict,
     have_enough_samples = payload_stats["samples"] >= CAPACITY_PAYLOAD_MIN_SAMPLES
     have_throughput = bool(reranker_chars_per_s and reranker_chars_per_s > 0)
 
-    # Informational only (ruling 1) -- computed whenever there is enough
-    # data to trust it, but NEVER feeds queue_bound/single_search_exceeds_
-    # wait. Reported purely as useful context alongside the max.
+    # Mean projection is context only. It must not feed queue_bound; an average under-states a search at the observed max.
     s_mean_measured = None
     try:
         if (have_enough_samples and have_throughput
@@ -3511,9 +3172,7 @@ def _build_capacity_record(capability: dict | None, fingerprint: dict,
     except (TypeError, ZeroDivisionError):
         s_mean_measured = None
 
-    # RULING 1: the basis. A capacity signal must stay worst-case, so this
-    # -- not the mean above -- is what feeds queue_bound/single_search_
-    # exceeds_wait once trusted.
+    # Worst-case basis. Once enough samples exist, this observed max feeds queue_bound, not the mean above.
     s_max_measured = None
     try:
         if (have_enough_samples and have_throughput
@@ -3533,9 +3192,7 @@ def _build_capacity_record(capability: dict | None, fingerprint: dict,
     # queue_bound / single_search_exceeds_wait use effective_s_mean (observed max when sampled, else theoretical); s_mean_s itself stays the theoretical figure.
     client_ceiling = _capacity_client_ceiling_s(capability)
     queue_bound = _capacity_queue_bound(effective_s_mean, CAPACITY_TOLERABLE_WAIT_S)
-    # M10: makes explicit what queue_bound == 0 means, since "not yet
-    # measured" (None) and "one search already exceeds the tolerable wait"
-    # (0) would otherwise both read as "no usable number".
+    # queue_bound 0 means one search already exceeds the wait. None means not measured; do not collapse those.
     single_search_exceeds_wait = (
         None if not effective_s_mean or effective_s_mean <= 0
         else effective_s_mean > CAPACITY_TOLERABLE_WAIT_S
@@ -3552,10 +3209,7 @@ def _build_capacity_record(capability: dict | None, fingerprint: dict,
         "fingerprint": fingerprint,
         "probe": {
             "reranker_chars_per_s": reranker.get("throughput_chars_s"),
-            # H3: the probe's own status rides along with the reading it
-            # describes, so a future comparison can refuse to trust a
-            # reading that was never actually "ok" (see _maybe_derive_
-            # capacity's probe_drift guard).
+            # Keep the probe status with the reading. Drift must not trust a throughput that was never ok.
             "reranker_status": reranker.get("status"),
             "embedder_chars_per_s": embedder.get("throughput_chars_s"),
             "probed_at": (capability or {}).get("probed_at"),
@@ -3566,50 +3220,23 @@ def _build_capacity_record(capability: dict | None, fingerprint: dict,
                                 or embedder.get("projection_stale")),
         },
         "derived": {
-            # UNCHANGED meaning -- see this function's docstring. Always the
-            # theoretical full-payload projection, regardless of basis.
+            # Always the theoretical full-payload projection, whatever basis fed queue_bound.
             "s_mean_s": s_mean_theoretical,
             # s_max_measured_s is the observed-max projection that feeds queue_bound once CAPACITY_PAYLOAD_MIN_SAMPLES is met.
             "s_max_measured_s": s_max_measured,
-            # NEW (additive): the same projection over the OBSERVED MEAN
-            # instead -- cheap, useful CONTEXT only. Never feeds
-            # queue_bound/single_search_exceeds_wait (ruling 1: an
-            # average-case basis would under-project a search at the
-            # observed max). Same None-until-enough-samples gating as
-            # s_max_measured_s above.
+            # Mean projection, context only. It must not feed queue_bound; an average under-states a search at the observed max.
             "s_mean_measured_s": s_mean_measured,
-            # NEW (additive): which basis actually fed queue_bound /
-            # single_search_exceeds_wait THIS record. A reader must never
-            # have to guess -- this field is why reusing the existing
-            # names for those two fields is still honest (see docstring).
+            # Which basis fed queue_bound on this record. The name stays honest only because this field says so.
             "payload_basis": payload_basis,
-            # NEW (additive): real searches (rerank_successes_total +
-            # rerank_fallbacks_total at the coordinator) THIS PROCESS has
-            # served, reported UNCONDITIONALLY -- true regardless of
-            # whether payload_basis is "measured" or "theoretical" (a
-            # "theoretical" reading can still carry a nonzero count below
-            # CAPACITY_PAYLOAD_MIN_SAMPLES; it is never forced to 0).
+            # Real searches this process has served, even when the basis is still theoretical. Do not force the count to 0 below the sample threshold.
             "payload_basis_sample_count": payload_stats["samples"],
-            # NEW (additive): the observed mean rerank_payload_chars per
-            # real search this process has served. None on zero samples --
-            # never a false 0, which would read as "measured a zero-byte
-            # payload" rather than "nothing observed yet".
+            # Observed mean payload chars. None when nothing has been seen; 0 would mean a measured empty payload.
             "payload_mean_chars_measured": mean_chars_measured,
-            # NEW (additive, ruling 1): the observed MAXIMUM
-            # rerank_payload_chars per real search -- the raw number behind
-            # s_max_measured_s. None on zero samples, same discipline as
-            # the mean above. MONOTONIC non-decreasing for this process's
-            # lifetime (see CAPACITY_PAYLOAD_MIN_SAMPLES's module-level
-            # comment).
+            # Observed maximum payload chars, the number behind the measured projection. None on zero samples, and it does not decrease for this process.
             "payload_max_chars_measured": max_chars_measured,
             "client_ceiling_s": client_ceiling,
             "queue_bound": queue_bound,
-            # N2 (fix round 2): the tolerance queue_bound was actually
-            # measured against travels WITH the record it produced -- a
-            # reader (postflight, /health, a future dashboard) must not have
-            # to know today's CAPACITY_TOLERABLE_WAIT_S default separately
-            # to make sense of a stored queue_bound; the record is
-            # self-describing even if the operator's setting changes later.
+            # Store the wait the queue_bound was measured against. A later change to the default must not make an old record unreadable.
             "tolerable_wait_s": CAPACITY_TOLERABLE_WAIT_S,
             "single_search_exceeds_wait": single_search_exceeds_wait,
             # No staleness flag on the derived capacity record; projection liveness lives on backend_capability.*.projection_stale.
@@ -3678,10 +3305,7 @@ async def _append_capacity_record(record: dict) -> None:
     def _do() -> None:
         records = _read_capacity_records_sync(CAPACITY_LOG_PATH)
         records.append(record)
-        # M4 (fix round): records[-0:] is the WHOLE list, not zero records --
-        # a CAPACITY_LOG_MAX_RECORDS of 0 (or a negative value) used to keep
-        # every record ever written instead of pruning. Clamp to 1: always
-        # keep at least the latest.
+        # records[-0:] is the whole list. A non-positive cap used to keep every record; clamp to 1 so at least the latest remains.
         max_records = CAPACITY_LOG_MAX_RECORDS if CAPACITY_LOG_MAX_RECORDS > 0 else 1
         records = records[-max_records:]
         _write_capacity_records_sync(CAPACITY_LOG_PATH, records)
@@ -3689,8 +3313,7 @@ async def _append_capacity_record(record: dict) -> None:
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, _do)
     except RuntimeError:
-        _do()   # no running loop (sync caller/test) — inline, matches
-                # AsyncLineWriter.write's own fallback
+        _do()   # no running loop (sync caller or test); inline, same fallback as AsyncLineWriter.write
 
 
 def _last_capacity_record() -> dict | None:
@@ -3759,9 +3382,7 @@ def _log_capacity_change(trigger: str, last: dict | None, record: dict) -> None:
     new_probe = record["probe"]
 
     if trigger == "probe_drift":
-        # M7: the number that actually MOVED for this trigger is reranker
-        # chars/s -- MemTotal is unchanged in a drift event, so leading with
-        # it read as "nothing happened" to an operator scanning the log.
+        # The number that moved is reranker chars/s. Leading with MemTotal, which did not change, reads as if nothing happened.
         headline = (f"capacity basis changed ({trigger}): reranker "
                     f"{old_probe.get('reranker_chars_per_s')}->"
                     f"{new_probe.get('reranker_chars_per_s')} chars/s")
@@ -3816,13 +3437,7 @@ async def _maybe_derive_capacity(capability: dict, coordinator=None) -> None:
         else:
             # config_change still runs every cycle: the log is shared, so a differently-configured process can have written the last record.
             if last is None:
-                # Log file cleared/rotated out from under a running process,
-                # OR this process's own first cycle never found one either.
-                # M7: nothing prior exists to have mismatched against, so
-                # this is a fresh baseline too, not an alarm. N1(a): the
-                # same not-ok guard as the is_first branch above applies
-                # here too -- a not-ok probe must not become the first
-                # stored basis via this path either.
+                # No prior record on a later cycle is a fresh baseline, not a mismatch. A not-ok probe must not become that first stored basis.
                 if current_status != "ok":
                     log.info(
                         "capacity baseline deferred -- reranker probe not "
@@ -3837,13 +3452,7 @@ async def _maybe_derive_capacity(capability: dict, coordinator=None) -> None:
                 basis = probe_block.get("reranker_chars_per_s")
                 basis_status = probe_block.get("reranker_status")
                 current = current_reranker.get("throughput_chars_s")
-                # H3: a probe that did not answer "ok" produces fantasy
-                # throughput (a fast HTTP error can read as near-zero
-                # latency), so it must never fire drift and must never
-                # become the new basis. Both sides are guarded: the stored
-                # basis must have been recorded under an "ok" reading too,
-                # or a genuinely-recovered probe would compare against a
-                # poisoned number forever.
+                # A probe that was not ok can report a fantasy throughput. Do not fire drift, and do not replace the stored basis, unless both sides were ok.
                 if (basis_status == "ok" and current_status == "ok"
                         and _capacity_drift_outside_band(current, basis)):
                     trigger = "probe_drift"
@@ -3881,11 +3490,7 @@ async def _maybe_derive_capacity(capability: dict, coordinator=None) -> None:
 # /health TTL cache (S-11): in-process, a few seconds, so a poll burst does not re-fan-out every upstream.
 HEALTH_CACHE_TTL_S = float(os.environ.get("HEALTH_CACHE_TTL_S", "3"))
 _health_cache: dict = {"checks": None, "ts": 0.0}
-# SEC-A5-05b (PR A5 fix round): single-flight coalescing for a cache miss —
-# see _health_probe_cached's docstring. Constructed at module import time
-# with no running loop; safe under Python's current asyncio (a Lock no
-# longer binds to a specific loop at construction, only on first use inside
-# one), which is what lets this be a plain module global like _health_cache.
+# One in-flight health probe per cache miss. A Lock may be created before a loop is running; it binds on first use.
 _health_probe_lock = asyncio.Lock()
 
 
@@ -3894,10 +3499,8 @@ _health_probe_lock = asyncio.Lock()
 _STATE_OK, _STATE_DEGRADED, _STATE_DOWN = "ok", "degraded", "down"
 _STATE_UNKNOWN = "unknown"
 
-#: Last observed state per dependency, and the set of currently-raised warning
-#: keys — so a TRANSITION can be logged and a steady state cannot. Module state,
-#: not per-caller: the probe behind it is shared by every caller (see
-#: _health_probe_cached), so the transitions are the process's, not a client's.
+# Last state per dependency, and which warnings are up, so a transition logs and a steady state does not.
+# Process-wide: every caller shares the probe, so these are not per client.
 _dependency_state: dict[str, str] = {}
 _warning_state: set = set()
 
@@ -3980,10 +3583,7 @@ def _llm_pool_dependency(backend_status: dict) -> dict:
     """
     if not backend_status:
         return _dep(_STATE_UNKNOWN, "no backend configured")
-    # S7 (ADV-4): "unknown" is a per-backend state meaning the background probe
-    # daemon has not landed yet. A never-probed backend is not a down backend,
-    # and a pool nobody has probed reads unknown, never down — the "unknown
-    # never elevates" contract (decision:374 / fact:375).
+    # decision:374 and fact:375: unknown means not probed yet, not down. A pool nobody has probed stays unknown and must not be raised to down.
     probed = {b: s for b, s in backend_status.items() if s != "unknown"}
     if not probed:
         return _dep(_STATE_UNKNOWN, "not yet probed")
@@ -3991,10 +3591,7 @@ def _llm_pool_dependency(backend_status: dict) -> dict:
     if len(bad) == len(probed):
         down_reasons: list = []
         if LLM_POOL_FALLBACK_REASON:
-            # H2 (handback, decision:1832): the fleet was DECLARED and
-            # entirely excluded, and the fallback it fell back to is ALSO
-            # unreachable — compose, never drop, the same discipline item 9
-            # applies to the degraded branch below.
+            # decision:1832: the declared fleet was entirely excluded and the fallback is also unreachable. Keep that reason; do not drop it.
             down_reasons.append(LLM_POOL_FALLBACK_REASON)
         if LLM_POOL_CONFIG_EMPTY:
             down_reasons.append(
@@ -4004,21 +3601,15 @@ def _llm_pool_dependency(backend_status: dict) -> dict:
         return _dep(_STATE_DOWN, "; ".join(down_reasons))
     reasons: list = []
     if LLM_POOL_FALLBACK_REASON:
-        # F6 (v0.9.75): the configured fleet was entirely excluded and the
-        # legacy fallback is serving — a "healthy" pool at the wrong place.
+        # The configured fleet was entirely excluded and the legacy fallback is what is serving.
         reasons.append(LLM_POOL_FALLBACK_REASON)
     if LLM_POOL_CONFIG_EMPTY:
-        # NEW (decision:1832): nothing was declared and the built-in fallback
-        # is up — visible now, rather than reading `ok` like every prior
-        # release. See the docstring's item 3+.
+        # decision:1832: nothing was declared and the built-in fallback is up. Show that, instead of reading ok.
         config_empty_reason = (
             f"no backend declared — serving the built-in "
             f"{scrub_url_credentials(DEFAULT_TARGET)} fallback")
         if LLM_POOL_LEGACY_KEY_PRESENT:
-            # W4 (§6.5): a bare LLM_DEFAULT_TARGET override is a legacy shape
-            # too (Operator ruling: it alone is NOT a declaration) — the
-            # remedy rides this reason exactly like it rides
-            # _all_roles_ineligible's below.
+            # A bare LLM_DEFAULT_TARGET override is not a declaration. Attach the same remedy this reason carries for a live CSV.
             config_empty_reason = f"{config_empty_reason}; {_LLM_POOL_LEGACY_REMEDY}"
         reasons.append(config_empty_reason)
     if bad:
@@ -4186,8 +3777,7 @@ def _delta_per_min(key: str, total: int) -> float | None:
     elapsed = now - prev_at
     if elapsed <= 0:
         return None
-    # A counter that went DOWN means the process restarted; there is no rate
-    # across a restart, only a new baseline.
+    # A counter that went down means the process restarted. There is no rate across a restart, only a new baseline.
     if total < prev_total:
         return None
     return round((total - prev_total) * 60.0 / elapsed, 2)
@@ -4390,11 +3980,9 @@ def _llm_runtime_snapshot(backend_status: dict | None = None) -> dict:
         "backends": _scrub_backend_keyed_dict(dict(backend_status or {}),
                                               context="_llm_runtime_snapshot.backends"),
         "reserved": sorted(scrub_url_credentials(b) for b in _llm_reserved),
-        # Parallelisation: per-backend weight, current in-flight, cumulative
-        # routed (check the realised split against weights), fails, cooldown.
+        # Per-backend weight, inflight, routed, fails, and cooldown, so the realised split can be checked against the weights.
         "pool": _scrub_backend_keyed_dict(pool, context="_llm_runtime_snapshot.pool"),
-        # Cache affinity: hit rate + which backend holds each hot prefix, so the
-        # KV-cache win is observable.
+        # Affinity hit rate and which backend holds each hot prefix, so a KV-cache win is visible.
         "affinity": {
             "hits": _llm_affinity_hits,
             "misses": _llm_affinity_misses,
@@ -4403,9 +3991,7 @@ def _llm_runtime_snapshot(backend_status: dict | None = None) -> dict:
                              for k, v in _llm_affinity.items()
                              if now - v[1] <= AFFINITY_TTL},
         },
-        # Routing (fact:1314 shape — flat, each counter paired with its own
-        # last-event ts). Present regardless of pool size: meaningful even for a
-        # single role-scoped backend.
+        # fact:1314: flat routing counters, each with its own last-event timestamp. Kept even for a single role-scoped backend.
         "routing": {
             "routed_role_extract": _llm_routed_by_role.get("extract", 0),
             "routed_role_extract_last_ts": _llm_routed_by_role_last_ts.get("extract"),
@@ -4418,15 +4004,9 @@ def _llm_runtime_snapshot(backend_status: dict | None = None) -> dict:
             "routing_backend_at_capacity": _routing_backend_at_capacity_count,
             "routing_backend_at_capacity_last_ts": _routing_backend_at_capacity_last_ts,
         },
-        # Per-backend cumulative token counters, IN-PROCESS ONLY (reset on
-        # restart — deliberate; the ts pairing is what makes a restart-aware
-        # delta computable).
+        # In-process token totals; they reset on restart. The paired timestamp is what makes a restart-aware delta possible.
         "token_usage": _scrub_backend_keyed_dict(token_usage, context="_llm_runtime_snapshot.token_usage"),
-        # Per-backend request latency (local-vs-online comparison). latency_sum_s
-        # + requests_total makes the average derivable on the read side without
-        # the gateway ever deciding what "average" means; requests_failed_total
-        # is separate so a string of fast failures cannot dilute the success
-        # average.
+        # Latency sum and request count, so the reader computes the average. Failures are separate so fast errors do not dilute successes.
         "latency": _scrub_backend_keyed_dict(latency, context="_llm_runtime_snapshot.latency"),
     }
 
@@ -4444,16 +4024,12 @@ def _config_snapshot() -> dict:
     """
     import dream_telemetry
     cfg = {
-        # SEC B: "url" is scrub_url_credentials(b) — a list of per-backend
-        # dicts, so no key-collapse is possible (unlike the dict-keyed
-        # builders); byte-identical for a clean, query-less URL (item C).
+        # url is scrubbed text inside a list of dicts, so two backends cannot collapse into one key. A clean query-less URL is unchanged.
         "llm_backends": [
             {"url": scrub_url_credentials(b), "weight": LLM_WEIGHTS.get(b, 1.0),
              "has_credential": LLM_BACKEND_TOKENS.get(b) is not None,
              "model": LLM_BACKEND_MODELS.get(b),
-             # Model-attributes routing descriptor fields (additive) — never
-             # used by the monitor for routing math, only display; the gateway
-             # itself stays price-agnostic (M-4).
+             # Descriptor fields for display. Price is not an input to routing.
              "roles": sorted(LLM_BACKEND_ROLES[b]) if LLM_BACKEND_ROLES.get(b) else None,
              "n_ctx": LLM_BACKEND_NCTX.get(b),
              "private_ok": LLM_BACKEND_PRIVATE_OK.get(b, False),
@@ -4474,9 +4050,7 @@ def _config_snapshot() -> dict:
         },
         "embed_max_chars": dream_telemetry.EMBED_MAX_CHARS,
     }
-    # SEC-A5-02: present ONLY while the S-05 override is actually exposing a
-    # live provider key unauthenticated — additive, so a monitor that does not
-    # know the key renders exactly as before on every other install.
+    # Present only while auth is off and a live provider key is exposed. Omitted otherwise, so an older monitor still renders.
     if _unauthenticated_provider_keys_override_active():
         cfg["allow_unauthenticated_provider_keys"] = True
     return cfg
@@ -4507,10 +4081,7 @@ def telemetry_extras() -> dict:
         "routing": rt["routing"],
         "token_usage": rt["token_usage"],
         "latency": rt["latency"],
-        # SEC B: _llm_faults_snapshot() lives in coordinator.py (out of this
-        # section's touched-files list) and returns its dict keyed by raw
-        # backend URL — scrubbed here, at the render call site, with the
-        # same key-collapse guard as every other backend-keyed dict.
+        # The fault snapshot is keyed by the raw backend URL. Scrub it here, and do not let two distinct URLs collapse to one key.
         "faults": _scrub_backend_keyed_dict(_llm_faults_snapshot(), context="telemetry_extras.faults"),
     }
     return {
@@ -4538,36 +4109,15 @@ def _coordinator_health_keys(coordinator) -> dict:
         consolidation = coordinator.consolidation_health()
         return {
             "consolidation": consolidation,
-            # Top-level inference/GPU-busy signal for the monitor's LLM tile.
-            # Tri-state ("busy"|"idle"|"unknown") from the cached snapshot the
-            # coordinator probes in the background — /health never shells out to
-            # nvtop. "unknown" (nvtop absent / SLOT_AWARE off) is reported verbatim
-            # so the monitor shows "unknown", never a false "idle". Distinct from
-            # checks["llm"], which is a reachability probe of the configured pool.
+            # GPU busy/idle/unknown from the cached snapshot. /health must not shell out to nvtop, and unknown must not be reported as idle.
             "inference_busy": consolidation.get("inference_busy", "unknown"),
-            # Graph integrity is NOT a dream-cycle metric — it counts nodes a
-            # write path stored under the wrong label. It rides the same cached
-            # snapshot for cheapness, but it is surfaced TOP-LEVEL so a monitor
-            # never renders it inside the consolidation tile. None = not yet
-            # probed, which must never be read as "verified clean" (decision 928).
+            # Mis-labelled graph nodes, not a dream-cycle metric, so this stays top-level. None means not probed yet, not verified clean (decision 928).
             "graph_invalid_nodes": consolidation.get("graph_invalid_nodes"),
-            # Project identity (migration 027) — top-level for the same reason:
-            # it is an UPGRADE-completeness signal, not a dream-cycle metric. It
-            # answers "may this deployment be trusted to fold across projects
-            # yet", because the insight gate declines to count a project node
-            # that has no registry identity. None = not yet probed, never
-            # "complete". An ADDITIVE field: a monitor that does not know it
-            # renders exactly as before.
+            # Upgrade completeness for project identity, not a dream-cycle metric. None means not probed yet, not complete.
             "project_identity": consolidation.get("project_identity"),
-            # Domain identity (migration 028) — the same kind of signal for the
-            # sibling axis: registry vs graph, plus whether every section is
-            # attached to its project, which is what the cross-domain walk will
-            # depend on. Additive; None = not yet probed, never "complete".
+            # Same upgrade signal for the domain axis: registry versus graph, and whether every section is attached to its project. None means not probed yet.
             "domain_identity": consolidation.get("domain_identity"),
-            # nvtop probe self-health (fact:1645) — top-level for the same
-            # reason as its siblings above: a monitor watching for the probe
-            # disabling itself after repeated hangs should not have to reach
-            # inside the consolidation tile. None = not yet probed, never "ok".
+            # fact:1645: nvtop self-health stays top-level so a monitor need not open the consolidation tile. None means not probed yet, not ok.
             "gpu_probe": consolidation.get("gpu_probe"),
         }
     except Exception:
@@ -4611,11 +4161,7 @@ async def _build_health_checks(proxy: "AsyncHiveMindProxy", coordinator) -> dict
     """Full /health probe shape (S-10 disclosure is handle_health's job, applied after cache)."""
     checks: dict[str, str] = {}
 
-    # The embedder and reranker are llama.cpp containers that expose /health.
-    # A reasoning backend is "LM Studio or any OpenAI-compatible endpoint";
-    # those do NOT standardise /health — LM Studio logs an error for the unknown
-    # route on every probe. Use /v1/models, which every OpenAI-compatible server
-    # (LM Studio included) serves, as the LLM liveness check instead.
+    # Embedder and reranker are llama.cpp and expose /health. Do not probe a reasoning backend here; those servers do not standardize /health.
     for name, url in [
         ("embedder", f"{EMBEDDER_URL}/health"),
         ("reranker",  f"{RERANKER_URL}/health"),
@@ -4631,45 +4177,26 @@ async def _build_health_checks(proxy: "AsyncHiveMindProxy", coordinator) -> dict
 
     # Encoder /health liveness is not capability; window/throughput come from the capability probe, not these GETs.
     checks["backend_capability"] = capability_snapshot()
-    # R0-I (decision:1424): the latest CAPACITY derivation record, if any —
-    # a top-level ADDITIVE key, never nested under backend_capability (that
-    # dict is the raw probe reading; this is what was DERIVED from it plus
-    # the hardware/config fingerprint). None until the first derivation of
-    # this deployment's lifetime lands. REPORT ONLY — see the section this
-    # snapshot function lives in for the "never limits a request" invariant.
+    # decision:1424: latest capacity record, top-level and additive, not nested under the raw probe. None until the first derivation. Report only; it limits no request.
     checks["capacity"] = capacity_snapshot()
     from encoder_window import get_encoder_window_snapshot
     checks["encoder_window"] = get_encoder_window_snapshot()
 
-    # Reasoning-LLM backend pool — probe each; "llm" is ok if ANY is up (the pool
-    # tolerates a down backend). Per-backend statuses are reported for observability;
-    # a reserved judge backend is flagged. A single-backend deployment just shows one.
-    # Reasoning-LLM backend pool — now read from background probe cache (S7)
+    # Read the reasoning pool from the background probe cache. llm is ok if any backend is up; per-backend status is still reported.
     backend_status: dict[str, str] = dict(_llm_status_cache)
     if not backend_status:
         backend_status = {b: "unknown" for b in LLM_BACKENDS}
 
-    # SEC B (defense in depth, second wall behind A): scrub every backend URL
-    # KEY before this dict reaches ANY client-facing surface — it feeds BOTH
-    # checks["llm_backends"] below AND _llm_runtime_snapshot()'s "backends"
-    # field (/memory/telemetry). For a clean, query-less URL this is
-    # byte-identical (item C). Collapse guard (ADV1-14): cannot fire in
-    # production with A fatal on userinfo, but guards a test-seeded/future
-    # bypass from silently merging two distinct backends into one key.
+    # Scrub backend URL keys before they reach /health or /memory/telemetry. A clean query-less URL is unchanged; two distinct URLs must not collapse to one key.
     backend_status = _scrub_backend_keyed_dict(backend_status, context="/health backend_status")
-    # S7 (ADV-4): "unknown" is a per-backend state meaning the background probe
-    # has not landed yet — never-probed is not down. "unknown" only ever
-    # appears while the probe daemon's first cycle is still pending.
+    # unknown means the background probe has not landed, not that the backend is down.
     if any(s == "ok" for s in backend_status.values()):
         checks["llm"] = "ok"
     elif backend_status and all(s == "unknown" for s in backend_status.values()):
         checks["llm"] = "unknown"
     else:
         checks["llm"] = "down"
-    # Wedge visibility: reachability alone reported "ok" through a GPU-driver
-    # hang (the accept thread answers while the generation engine is dead).
-    # Surface the oldest in-flight age; past the suspect threshold, verify the
-    # backend can still answer its own health and flag it when it cannot.
+    # Reachability stays ok through a driver hang. Surface the oldest inflight age and flag the backend when its own health no longer answers.
     _now_mono = time.monotonic()
     _ages = {b: _oldest_inflight_age(b, _now_mono) for b in LLM_BACKENDS}
     _max_age = max((a for a in _ages.values() if a is not None), default=None)
@@ -4680,9 +4207,7 @@ async def _build_health_checks(proxy: "AsyncHiveMindProxy", coordinator) -> dict
             for b, a in _ages.items():
                 if a is not None and a > LLM_WEDGE_SUSPECT_AGE:
                     if not await _probe_backend_alive(proxy.session, b):
-                        # SEC B: scrubbed for the same reason as backend_status
-                        # above — this list renders straight onto
-                        # checks["llm_suspect_wedged"].
+                        # Scrub these URLs too. The list is rendered on checks["llm_suspect_wedged"].
                         _wedged.append(scrub_url_credentials(b))
             if _wedged:
                 checks["llm_suspect_wedged"] = _wedged
@@ -4705,52 +4230,33 @@ async def _build_health_checks(proxy: "AsyncHiveMindProxy", coordinator) -> dict
     checks["daemon"]     = checks["nrem_daemon_process"]
     checks["rem_daemon"] = checks["rem_daemon_process"]
 
-    # Version contract — clients compare api_version against their own to detect
-    # skew. Cheap string fields; no backend probe. version is informational only.
+    # Clients compare api_version to detect skew. version is informational and needs no probe.
     checks["version"]     = FRAMEWORK_VERSION
     checks["api_version"] = API_VERSION
 
     # Non-secret resolved config on authenticated /health (no .env read); credentialed backends show has_credential, never the value.
     checks["config"] = _config_snapshot()
 
-    # `status` is now the DERIVED enum over `dependencies` + `warnings`, both
-    # built at the end of this function once the coordinator's cached snapshot
-    # has been folded in. Nothing is set here.
-    # The STARTUP truth (finding 1), not live _AGENT_TOKENS emptiness -- a
-    # daemon token minted after boot must not flip this to True for an
-    # install that never configured auth. See coordinator.
-    # AUTH_CONFIGURED_AT_STARTUP's docstring.
+    # Startup flag, not live token emptiness. A daemon token minted after boot must not mark an install that never configured auth as authenticated.
     checks["auth_required"] = AUTH_CONFIGURED_AT_STARTUP
-    # Advertise the active auth scheme so clients can detect when the gateway
-    # moves from bearer tokens to PoP (asymmetric-key proof-of-possession).
+    # Advertise the auth scheme so a client can tell bearer tokens from a later proof-of-possession scheme.
     checks["auth_scheme"] = AUTH_SCHEME
-    # True while a backup quiesce is active — the monitor surfaces this as
-    # "backup ongoing", and a client seeing it knows write 503s are expected.
+    # True during backup quiesce, so a client can expect write 503s and the monitor can show a backup in progress.
     checks["backup_in_progress"] = backup_quiesce_active()
 
-    # Dream-cycle liveness (ADR-018) + the coordinator's other cached top-level
-    # signals — extracted into _coordinator_health_keys() (F4, fix round) so
-    # the lift itself is a pure, directly-unit-testable function; see its
-    # docstring for what each key means and why it's surfaced top-level.
+    # Dream-cycle and other cached coordinator signals. The lift is _coordinator_health_keys so it can be tested without this handler.
     if coordinator is not None:
         checks.update(_coordinator_health_keys(coordinator))
 
-        # pgvector version + hnsw.iterative_scan (decision:1584/fact:1583) —
-        # flat additive key, read straight off the coordinator's own startup
-        # probe (coordinator.py start()); never re-probed here, so /health
-        # stays DB-free like the rest of this block. "version": null means the
-        # probe failed or the extension was unreadable — that is itself the
-        # signal (iterative_scan is then always False, the safe default).
+        # decision:1584 and fact:1583: pgvector version and hnsw.iterative_scan come from the coordinator startup probe, not a query here.
+        # A null version means that probe failed; iterative_scan then stays false.
         checks["pgvector"] = {
             "version": getattr(coordinator, "pgvector_version", None),
             "iterative_scan": bool(getattr(coordinator, "hnsw_iterative_scan", False)),
         }
 
-    # ── dependencies + warnings + the derived status enum (v0.9.74) ──────────
-    # Everything below reads from values ALREADY IN HAND — the probes above and
-    # the coordinator's 60 s cached snapshot. ⛔ NO DATABASE CALL IS MADE HERE,
-    # which is the whole reason the snapshot exists (ADR-018, decision:362):
-    # /health is hit on every client call and every 30 s by an open dashboard.
+    # Dependencies, warnings, and the derived status. Everything below is already in hand.
+    # decision:362: no database call here. /health runs on every client call and on a polling dashboard.
     dep_snap = {}
     if coordinator is not None:
         try:
@@ -4789,9 +4295,7 @@ async def _build_health_checks(proxy: "AsyncHiveMindProxy", coordinator) -> dict
     }
 
     warnings: list = []
-    # Encoder p95 over its limit. The limit is DERIVED from the capability
-    # probe's own measured ceiling unless an operator pinned one — a flat
-    # default would be a number nobody measured (fact:1338).
+    # fact:1338: the encoder p95 limit comes from the capability probe unless an operator pinned one. A flat default would be a number nobody measured.
     for name in ("embedder", "reranker"):
         block = capability.get(name)
         if not isinstance(block, dict):
@@ -4815,13 +4319,7 @@ async def _build_health_checks(proxy: "AsyncHiveMindProxy", coordinator) -> dict
     if isinstance(rem_block, dict) and (rem_block.get("dead_lettered") or 0) > 0:
         warnings.append(_warning("rem_dead_lettered", 0,
                                  rem_block["dead_lettered"], "records"))
-    # ⛔ CALLED ONCE. `_gateway_shed_rate` MOVES ITS OWN WATERMARK, so the second
-    # call in the old `if rate > 0: ... rate ...` pair measured the interval
-    # between the two calls — microseconds — and always reported `observed: 0`.
-    # A warning whose observed value is the value that could not have raised it
-    # is worse than no warning: it fires and then denies itself. (fact:1309 —
-    # an equality between two expressions is half a guard; the VALUE is asserted
-    # in the test.)
+    # Call _gateway_shed_rate once. It moves its own watermark, so a second call measures the gap between the calls and reports observed 0 (fact:1309).
     shed = _gateway_shed_rate()
     if shed > 0:
         warnings.append(_warning("gateway_shed_503_total", 0, shed, "requests"))
@@ -4913,9 +4411,7 @@ async def handle_health(request: web.Request) -> web.Response:
                              status=status_code)
 
 
-# --------------------------------------------------------------------------- #
-# Startup / shutdown
-# --------------------------------------------------------------------------- #
+# Startup and shutdown
 def require_no_backend_url_credentials() -> None:
     """SEC A (R-1, fatal, RULED — Xenofon 2026-09-02): a backend URL whose
     userinfo carries a credential (user:pass@host, or a bare user@host) is a
@@ -5072,10 +4568,7 @@ def require_valid_llm_routing_config() -> None:
         and not LLM_BACKEND_PRIVATE_OK_EXPLICIT.get(b, False)
     )
     if needs_explicit_choice:
-        # SEC M-1 (fix round): say the credential-still-probed consequence
-        # here too, not just in check_config's per-entry rendering — the
-        # startup log is the FIRST of the two nominated instruments and an
-        # operator who never runs check_config.py should see it here.
+        # Say here that the credential is still probed. An operator who never runs check_config.py only sees the startup log.
         log.warning(
             "credentialed LLM backend(s) configured with neither `roles` nor "
             "an explicit `private_ok` — configured, but will never be "
@@ -5096,12 +4589,8 @@ def require_valid_llm_routing_config() -> None:
     )
     if not private_false_explicit:
         return
-    # SEC H-1 (fix round): "safe by construction" was claimed for BOTH
-    # subsets below; it is only true for the roles-ABSENT one. Split so
-    # each population gets the text that is actually true of it — see
-    # this function's own docstring for the mechanism (_may_steer_llm
-    # returns True unconditionally when auth is off; _role_eligible never
-    # consults private_ok on the role-carrying branch, by design, I-1).
+    # Only the roles-absent subset is safe by construction: no roles and private_ok false serves nothing.
+    # A roles list does not consult private_ok, so that subset must not use the same wording.
     roles_absent = sorted(b for b in private_false_explicit if LLM_BACKEND_ROLES.get(b) is None)
     roles_carrying = sorted(b for b in private_false_explicit if LLM_BACKEND_ROLES.get(b) is not None)
     if roles_absent:
@@ -5146,16 +4635,10 @@ def warn_if_dream_slots_impossible() -> None:
         "explicit roles list covering all of %s.", sorted(ROUTING_ROLE_NAMES))
 
 
-# A2 (post-review addition, operator 2026-08-18): lifecycle token-count sum
-# lines. Read independently here rather than importing coordinator's
-# _audit_writer — this write is DELIBERATELY never routed through
-# AsyncLineWriter (its pre-existing shutdown-only flush-hang, fact:1335 open
-# item, must never risk stalling the gateway's own drain sequence), so there
-# is nothing here to share with that writer beyond the file path.
+# fact:1335: do not route this write through AsyncLineWriter. Its shutdown flush can hang and must not stall the gateway drain.
+# Read the path here; there is nothing else to share with that writer.
 GATEWAY_AUDIT_LOG_PATH = os.environ.get("GATEWAY_AUDIT_LOG_PATH", "").strip()
-# UNMEASURED convenience knob (flagged per fact:1338) — 0 disables periodic
-# emission entirely (the shutdown emission still always fires). A deployer
-# who wants bounded loss on a hard kill (no graceful shutdown) sets this.
+# fact:1338: unmeasured interval. 0 disables the periodic emission; the shutdown emission still runs.
 TOKEN_LIFECYCLE_SUM_INTERVAL_S = float(os.environ.get("TOKEN_LIFECYCLE_SUM_INTERVAL_S", "0") or "0")
 
 
@@ -5172,8 +4655,7 @@ def _emit_token_lifecycle_sums(reason: str) -> None:
         c = _llm_tokens_completion_total.get(b, 0)
         if p == 0 and c == 0:
             continue
-        # SEC B: scrubbed for both the journal line and the audit JSONL —
-        # byte-identical for a clean, query-less URL (item C).
+        # Scrub the URL for both the journal line and the audit JSONL. A clean query-less URL is unchanged.
         _b_scrubbed = scrub_url_credentials(b)
         log.info(
             "llm-token-lifecycle-sum backend=%s reason=%s tokens_prompt_total=%d "
@@ -5282,29 +4764,15 @@ async def _drain_watchdogs_and_daemons(
 
 
 async def main() -> None:
-    # RULED (Xenofon, 2026-08-14): a plaintext AGENT_TOKENS entry refuses
-    # gateway startup outright, from v0.9.3 — before anything else stands
-    # up. See coordinator.require_no_plaintext_agent_tokens()'s docstring
-    # for why this call lives here (the real entrypoint) and nowhere else.
+    # A plaintext AGENT_TOKENS entry refuses startup, before anything else stands up. This is the real entrypoint, so the check lives here.
     require_no_plaintext_agent_tokens()
-    # D.1 (SEC round, ADV1-2): a malformed LLM_BACKENDS_JSON also refuses to
-    # start — see secure_env.require_llm_backends_json_parses()'s docstring
-    # for why this call lives here too (never at bare import time), and why
-    # check_config.py deliberately does NOT gain this same call.
+    # A malformed LLM_BACKENDS_JSON refuses startup here, not at import. check_config.py deliberately does not make this call.
     require_llm_backends_json_parses("hive_mind_proxy")
-    # SEC A (R-1, RULED — Xenofon 2026-09-02): a backend URL embedding its
-    # own credential in userinfo also refuses to start — see
-    # require_no_backend_url_credentials()'s docstring for why this call
-    # lives here too.
+    # A backend URL with a credential in userinfo refuses startup. The check lives here, with the other startup refusals.
     require_no_backend_url_credentials()
-    # S-05 (RULED — decision:1303): auth-off + a live provider key also
-    # refuses to start — see require_auth_when_provider_keys_configured()'s
-    # docstring for why this call lives here too.
+    # decision:1303: auth off plus a live provider key refuses startup. The check lives here, with the other startup refusals.
     require_auth_when_provider_keys_configured()
-    # Model-attributes routing (unknown-role refusal; M-5'/P-5' are
-    # DEGRADED WARNINGS since W4/decision:1824, no longer refusals) — see
-    # require_valid_llm_routing_config()'s docstring for why this call
-    # lives here too.
+    # decision:1824: an unknown role still refuses startup. A credentialed backend with neither roles nor an explicit private_ok, and auth-off with private_ok explicitly false, are warnings, not refusals.
     require_valid_llm_routing_config()
     warn_if_dream_slots_impossible()
 
@@ -5316,21 +4784,13 @@ async def main() -> None:
     coordinator = MemoryCoordinator()
     await coordinator.start()
 
-    # 50 MB ceiling applies to requests buffered via request.read().
-    # The streaming path (request.content) bypasses this — see handle_proxy.
+    # The 50 MB ceiling applies to bodies read via request.read(). The streaming path uses request.content and bypasses it.
     app = web.Application(client_max_size=50 * 1024 * 1024, middlewares=[auth_middleware])
     app["proxy"] = proxy  # shared with health handler
     app["coordinator"] = coordinator  # health reads the cached consolidation snapshot
-    # v0.9.74: the llm_* family, the capability/capacity snapshots and the
-    # resolved config move to /memory/telemetry, but they live in THIS module's
-    # state. A callback, not an import: coordinator.py cannot import this module
-    # (this module imports it), and the coordinator has no other way to reach
-    # them. Set before any request can be served.
+    # Telemetry for this module's state is a callback, not an import. coordinator cannot import this module. Set it before any request is served.
     coordinator.telemetry_extras_provider = telemetry_extras
-    # S16e (HYG round): one `Server` identity on every response — gateway-
-    # generated and proxied alike. Registered on the APP so it cannot be
-    # forgotten on a new handler; see _set_server_header for why this is the
-    # only mechanism aiohttp 3.14.3 offers.
+    # One Server identity on every response, including proxied ones. Registered on the app so a new handler cannot forget it.
     app.on_response_prepare.append(_set_server_header)
 
     # Coordinator routes and health endpoint before the catch-all proxy route.
@@ -5340,35 +4800,20 @@ async def main() -> None:
     # Register encoder routes before set_known_routes; never bind them to handle_proxy/_route_guard (A1 405s every known key).
     app.router.add_post("/v1/embeddings", proxy.handle_encoder)
     app.router.add_post("/v1/reranking", proxy.handle_encoder)
-    # fact:1535 route-guard: snapshot the known framework routes from the
-    # router itself, AFTER every real route above is registered and BEFORE
-    # the catch-all below — see set_known_routes()'s docstring for why the
-    # ordering is what excludes the catch-all from the snapshot.
+    # fact:1535: snapshot known routes after the real routes and before the catch-all. The catch-all must not become a known route.
     proxy.set_known_routes(app.router)
-    # Security fix A1 / adversarial review A-08: the auth exemption is now a
-    # property of the RESOLVED ROUTE, which creates a new invariant — every
-    # coordinator._UNPROTECTED_PATHS entry must be the canonical of a static
-    # (Plain) resource, because a dynamic canonical is many-to-one and would
-    # silently exempt an entire pattern family. Asserted here, in the same
-    # window as the route snapshot: after every real route, before the
-    # catch-all. Raises RuntimeError naming the offending entry.
+    # Every unprotected path must be the canonical of a static route. A dynamic canonical would exempt a whole pattern family. Assert that in this same window, before the catch-all.
     require_unprotected_paths_are_plain_routes(app.router)
     app.router.add_route("*", "/{tail:.*}", proxy.handle_proxy)
 
     runner = web.AppRunner(app)
     await runner.setup()
-    # Bind to localhost by default. Set PROXY_BIND=0.0.0.0 to opt into
-    # all-interfaces binding — only safe over an encrypted overlay network
-    # (Tailscale, WireGuard) or behind TLS. Bearer tokens are plaintext over HTTP.
+    # Localhost unless PROXY_BIND says otherwise. All-interfaces is only safe on an encrypted overlay or behind TLS; bearer tokens are plaintext on HTTP.
     bind_host = _resolve_proxy_bind_host()
     site = web.TCPSite(runner, bind_host, PORT)
     await site.start()
 
-    # AF_UNIX listener for kernel-attested person identity (SO_PEERCRED). Local
-    # agents and SSH-forwarded Unix sockets connect here so the gateway reads the
-    # operator's OS account straight from the kernel — see coordinator._peer_identity.
-    # The TCP listener stays up for back-compat (no principal on that path). Disable
-    # by setting GATEWAY_UDS_PATH="".
+    # Unix socket so local and SSH-forwarded clients present the operator's OS account via SO_PEERCRED. TCP stays up and carries no principal. GATEWAY_UDS_PATH empty disables this.
     uds_site = None
     uds_path = os.environ.get("GATEWAY_UDS_PATH")
     if uds_path is None:
@@ -5391,14 +4836,11 @@ async def main() -> None:
     stop_event = asyncio.Event()
     watchdog_task     = asyncio.create_task(_watchdog_daemon(stop_event))
     rem_watchdog_task = asyncio.create_task(_watchdog_rem_daemon(stop_event))
-    # Backend capability probe — measures whether the critical backends can
-    # actually SERVE, not merely whether they answer /health.
+    # Capability probe: whether the backends can serve, not merely whether they answer /health.
     llm_probe_task    = asyncio.create_task(_llm_probe_daemon(proxy, stop_event))
     capability_task   = asyncio.create_task(
         _capability_probe_daemon(proxy, stop_event, coordinator))
-    # A2: periodic lifecycle token-count sum lines (no-op unless
-    # TOKEN_LIFECYCLE_SUM_INTERVAL_S is set) — the unconditional shutdown
-    # emission happens later in the drain sequence below regardless.
+    # Periodic token-count sums. A no-op unless the interval is set; shutdown still emits once in the drain below.
     token_lifecycle_task = asyncio.create_task(
         _token_lifecycle_sum_daemon(stop_event))
     loop = asyncio.get_running_loop()
@@ -5406,9 +4848,7 @@ async def main() -> None:
     def _on_shutdown_signal():
         log.info("Termination signal received — initiating drain sequence...")
         stop_event.set()
-        # Remove handlers immediately so a second Ctrl+C falls back to the default
-        # Python KeyboardInterrupt handler, giving the operator an emergency hard-abort
-        # if the drain stalls on a hung backend connection.
+        # Drop the handlers immediately so a second Ctrl+C is a hard abort if the drain is stuck on a hung backend.
         for s in (signal.SIGINT, signal.SIGTERM):
             loop.remove_signal_handler(s)
 
@@ -5428,9 +4868,7 @@ async def main() -> None:
     await _drain_watchdogs_and_daemons(
         watchdog_task, rem_watchdog_task,
         (capability_task, token_lifecycle_task, llm_probe_task))
-    # A2: unconditional lifecycle sum on graceful shutdown — DIRECT
-    # SYNCHRONOUS write (see _emit_token_lifecycle_sums' docstring), so it
-    # runs here rather than through proxy.cleanup()/coordinator.stop().
+    # Shutdown sum is a direct synchronous write, so it runs here rather than inside proxy.cleanup or coordinator.stop.
     _emit_token_lifecycle_sums("shutdown")
     await coordinator.stop()
     await proxy.cleanup()

@@ -1,23 +1,12 @@
 #!/usr/bin/env bash
 #
-# install_service.sh — install/enable the Hive-Mind gateway as a systemd --user
-# service, so it starts at boot and shuts down cleanly at power-off with no
-# manual step after every restart. Idempotent — safe to re-run.
+# install_service.sh — install the gateway as a systemd --user service so it survives logout. Idempotent. A session-launched process dies on logout, and nohup does not help.
 #
 #   bash shared-memory/ops/install_service.sh
-#
-# Automates the "Install" steps documented by hand in shared-memory/ops/README.md,
-# "hive-mind-gateway.service" — that section explains WHY a service (a
-# session-launched gateway is killed on logout, nohup does not help).
 
 set -euo pipefail
 
-# ⛔ RULING 2 (measured on a real host): this script used to have NO argument
-# parsing at all — unknown flags were silently swallowed and the script always
-# ran, so probing it with --help (the most ordinary thing an operator does to
-# an unfamiliar script) created the systemd unit, enabled + started the
-# gateway, and enabled linger. -h/--help must exit 0 having done nothing, and
-# any other unrecognised argument must refuse rather than proceed.
+# --help used to create the unit, start the gateway, and enable linger. Unknown arguments must refuse.
 for _arg in "$@"; do
     case "$_arg" in
         -h|--help)
@@ -42,40 +31,18 @@ red() { printf '\033[31m%s\033[0m\n' "$*"; }
 grn() { printf '\033[32m%s\033[0m\n' "$*"; }
 ylw() { printf '\033[33m%s\033[0m\n' "$*"; }
 
-# ── Linger: keeps user services running with no active login session ───────
-# (survives logout/reboot) -- see D18 below.
-#
-# `loginctl show-user "$USER" --property=Linger` reads systemd-logind's OWN
-# record of the flag -- the only source of truth this function trusts. It
-# is consulted at the END, never inferred from either enable-linger
-# invocation's exit status: a fresh-host finding (D18) was that unprivileged
-# `loginctl enable-linger` fails with "Could not enable linger: Access
-# denied" on a NON-INTERACTIVE session (no polkit agent — e.g. a script run
-# over a plain SSH session with no active seat), the OLD code ran it,
-# ignored the failure entirely, and then unconditionally printed
-# "✓ Linger enabled for $USER" — a lie. Without linger, `systemd --user` is
-# torn down the moment the install session ends and the gateway dies on
-# logout, which is the ONE failure mode this whole script exists to
-# prevent, so a script that reports success without checking is worse than
-# one that says nothing.
+# Linger keeps the user manager alive after logout. Trust show-user, not enable-linger's exit status: a non-interactive session is denied and the old script still printed success, so the gateway died on logout.
 # >>> ENABLE_LINGER
 enable_linger() {
-    # 1. Unprivileged attempt — works whenever polkit grants it directly
-    #    (the common case: an interactive desktop or SSH login).
+    # Unprivileged first. Works when polkit grants it.
     loginctl enable-linger "$USER" >/dev/null 2>&1 || true
 
-    # 2. Non-interactive sudo retry (-n: fail immediately, never prompt for
-    #    a password — a script blocking on a hidden prompt is worse than
-    #    failing loudly). Covers a host where the operator has passwordless
-    #    sudo but no polkit agent (a bare-metal/CI install, the case D18
-    #    was actually measured on).
+    # -n so a missing passwordless sudo fails instead of hanging on a hidden prompt.
     if ! loginctl show-user "$USER" --property=Linger 2>/dev/null | grep -qx "Linger=yes"; then
         sudo -n loginctl enable-linger "$USER" >/dev/null 2>&1 || true
     fi
 
-    # 3. VERIFY the real end state, never trust either exit status — immune
-    #    both to the silent no-op above and to a loginctl/sudo combination
-    #    that exits 0 without actually flipping the flag.
+    # Exit status can lie. The property is the only success.
     loginctl show-user "$USER" --property=Linger 2>/dev/null | grep -qx "Linger=yes"
 }
 # <<< ENABLE_LINGER
@@ -98,19 +65,12 @@ systemctl --user status >/dev/null 2>&1 || {
 echo "── Shared Memory — install the gateway as a systemd --user service ──"
 mkdir -p "$UNIT_DST_DIR"
 
-# Best-effort — the Documentation= line is informational only, a placeholder is fine.
-# git remote get-url may return an SSH form (git@github.com:user/repo.git), which
-# isn't a browsable URL; convert the common case, else fall back to the placeholder.
+# Documentation= is informational. An SSH remote is rewritten to https when the shape is the common one.
 _raw_remote="$(git -C "$REPO_DIR" remote get-url origin 2>/dev/null || true)"
 REPO_URL="$(printf '%s' "$_raw_remote" | sed -E 's#^git@github\.com:#https://github.com/#; s#\.git$##')"
 [[ "$REPO_URL" == https://* ]] || REPO_URL="https://github.com/YOUR_GITHUB_USER/shared-memory"
 
-# Resolve the uv this host actually has. The unit template's /usr/bin/uv is a
-# placeholder: the documented uv install (https://astral.sh/uv) lands in
-# ~/.local/bin, which is neither the template path nor on a systemd unit's
-# default PATH — an unsubstituted unit crash-loops with 203/EXEC, and even with
-# ExecStart fixed the gateway's daemon spawns (shutil.which("uv")) come up
-# empty, leaving consolidation/REM silently stopped. Substitute both.
+# The unit's /usr/bin/uv is a placeholder. An unsubstituted path crash-loops 203/EXEC, and a missing PATH entry leaves the daemons stopped while the gateway looks healthy.
 UV_BIN="$(command -v uv || true)"
 [[ -x "$UV_BIN" ]] || UV_BIN="$HOME/.local/bin/uv"
 [[ -x "$UV_BIN" ]] || UV_BIN="$HOME/.cargo/bin/uv"

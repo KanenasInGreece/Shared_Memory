@@ -23,7 +23,7 @@ from insight_gate import (
     order_components, classify_identity,
 )
 from project_axis import PROJECT_SQL, fold_eligible
-from nrem_gate import eligible_domain_level_clusters, count_domain_level_cycles  # noqa: F401 — re-exported, see below
+from nrem_gate import eligible_domain_level_clusters, count_domain_level_cycles  # noqa: F401 — re-exported from nrem_gate; importing this file pulls psycopg2, which telemetry does not ship
 from domain_axis import resolve_domains
 from pool_status import pool_has_free_slot
 from dream_telemetry import (record_llm_call, adaptive_ceiling, embed_ceiling,
@@ -34,162 +34,62 @@ from secure_env import (
     require_llm_backends_json_parses,
 )
 
-# Configuration — set via environment variables or .env file
-#
-# SEC-05/S-03 (Credential_Custody_Plan_2026-08-14, PR A1): this daemon had NO
-# loader of its own — it read PG_PASSWORD/NEO4J_PASSWORD straight off the
-# ambient environment, relying entirely on the gateway (which spawns it) to
-# have already populated os.environ. A1's proxy no longer copies its own
-# os.environ into a daemon's child env (hive_mind_proxy._daemon_env stopped
-# doing `os.environ.copy()`), so that assumption broke — this call is what
-# keeps NREM able to connect at all, self-loading its own credentials from
-# the framework .env rather than depending on inherited env.
+# The gateway no longer copies os.environ into this daemon, so credentials load from the framework .env here.
 load_split_env()
 
 NEO4J_URI = "bolt://localhost:7687"
 NEO4J_USER = "neo4j"
 NEO4J_PASS = get_secret("NEO4J_PASSWORD", "")
-# Bound the driver pool — this daemon shares Neo4j with live gateway traffic;
-# an unbounded default pool can queue indefinitely under contention.
+# Bound the pool: this daemon shares Neo4j with live gateway traffic, and an unbounded pool queues forever.
 NEO4J_MAX_POOL = int(os.environ.get("NEO4J_MAX_POOL", "50"))
 NEO4J_ACQUIRE_TIMEOUT = float(os.environ.get("NEO4J_ACQUIRE_TIMEOUT", "30"))
 _pg_pass = get_secret("PG_PASSWORD", "")
-# Review fix #3: PG_CONN is a secret (a DSN embeds the password verbatim) —
-# read via get_secret(), never os.environ. _pg_conn_explicit is the RAW
-# value (empty string if unset) so _require_db_credentials() below can tell
-# "operator supplied a full DSN" apart from "nothing was supplied and this
-# fell back to the constructed default".
+# PG_CONN embeds the password, so read it via get_secret. The raw value tells a supplied DSN apart from the constructed default.
 _pg_conn_explicit = get_secret("PG_CONN", "")
 PG_CONN = _pg_conn_explicit or f"postgresql://postgres:{_pg_pass}@localhost:5432/agent_data"
 RETRIEVER_URL = "http://localhost:8888/v1/embeddings"
-# The daemons' ONE way in is the hive-mind gateway — never a raw LLM. Deliberately
-# NOT an env knob: the shipped compose fixes the topology, and pointing this at a
-# backend would bypass pooling, cache-affinity, wedge detection and telemetry.
-# LLM choice belongs to the gateway (LLM_BACKENDS), never to a client.
+# Daemons reach the LLM only through the gateway. An env knob here would bypass pooling, affinity, wedge detection, and telemetry.
 REASONER_URL = "http://localhost:8888/v1/chat/completions"
-# Model id sent on every reasoning call — see the LLM_MODEL note in rem_loop.py.
-# Backends that validate model ids need the real one; "local-model" only suits
-# llama.cpp / LM Studio, which ignore the field.
+# Backends that validate model ids need the real one. "local-model" only suits llama.cpp and LM Studio, which ignore the field.
 LLM_MODEL = os.environ.get("LLM_MODEL", "local-model")
-# Idle window before a pending event-driven consolidation fires. Ships at the
-# documented intent (15 min); the old hardcoded 60 was the testing value.
+# Idle window before an event-driven consolidation. 900s is the documented 15 minutes; 60 was only the old test value.
 IDLE_THRESHOLD_SEC = int(os.environ.get("NREM_IDLE_THRESHOLD_SEC", "900"))
 MAX_DEFERRAL_SEC = IDLE_THRESHOLD_SEC * 3
 DENSITY_THRESHOLD = ONT.density_threshold
-# ⛔ REMOVED (C1b): NREM_DOMAIN_THRESHOLD, a SECOND env-tunable density knob
-# that duplicated ONT.density_threshold, used to exist here. The v2 FACT GATE
-# (plan §2.1) has ONE density knob — ONT.density_threshold (DENSITY_THRESHOLD
-# above), used directly by both ``_consolidate_clusters`` (the fold) and
-# ``coordinator._nrem_cycle_counts`` (its telemetry) as of this release.
-# Keeping two numbers that were SUPPOSED to track together, tunable
-# independently via two different env vars, is exactly a future-drift risk —
-# an operator setting NREM_DOMAIN_THRESHOLD expecting it to change the gate
-# would silently do nothing, since the fold had already stopped reading it in
-# C1. Deleted rather than left as a second, unread knob.
-# Fold summary levels — also the P12 supersession scope and metadata.level
-# values. LEVEL_ENTITY is no longer PRODUCED by any fold (v2, C1) but stays
-# defined: legacy 'entity'-level community_summaries rows (Xenofon's ruling —
-# left as archive, untouched, see HANDOFF.md) still need it for ledger
-# reconciliation (`fetch_unreconciled`'s COALESCE default) and generic
-# graph-marking defaults (`_mark_consolidated_in_graph`).
+# NREM_DOMAIN_THRESHOLD is gone. The only density knob is ONT.density_threshold; a second env var would silently do nothing.
+# LEVEL_ENTITY is no longer produced. Legacy entity-level rows still need it for the ledger COALESCE default and graph-marking.
 LEVEL_ENTITY = "entity"
 LEVEL_DOMAIN = "domain"
-# Empty section key — used as a display/graph-property fallback wherever a
-# section name could be blank (legacy rows; SECTION_NONE display fallback).
+# Empty section key for legacy rows whose section name is blank.
 SECTION_NONE = ""
-# How often the daemon re-reads the DURABLE eligibility predicate (the
-# rem_reviewed outbox backlog). Due-ness is a property of that ledger, not of
-# the save notifications that happen to have arrived — a save means a record
-# exists, never that an eligible cluster does. One cheap indexed read per
-# interval; the interval also bounds how stale the observed backlog may be.
+# Re-read the rem_reviewed backlog on this interval. A save means a record exists, not that a cluster is eligible.
 NREM_ELIGIBILITY_RECHECK_SEC = int(os.environ.get("NREM_ELIGIBILITY_RECHECK_SEC", "60"))
-# How often the idle clock probes the LLM pool. The clock that decides "the
-# system is quiet" must be able to SEE the largest consumer of the resource it
-# is guarding; before this it was written in exactly one place (the notify
-# handler), so REM could hold the slot for twenty minutes while the clock ran
-# on. No threshold value can fix a blind clock.
+# Probe the LLM pool this often. The idle clock must see REM holding the slot, or quiet-time is measured while the pool is busy.
 NREM_POOL_PROBE_SEC = int(os.environ.get("NREM_POOL_PROBE_SEC", "15"))
 
-# ── Output bounds + truncation detection ─────────────────────────────────────
-# OPERATOR CONSTRAINT: a bound that processes but gives incomplete saves /
-# truncated summaries is worse than no bound at all — a truncated draft is
-# never persisted, never repair-salvaged, never parsed into slots (insight)
-# or handed to the thematic fold (which, per §3.1/C4, no longer calls an LLM
-# at all — NREM_MAX_TOKENS_SUMMARY is legacy/reserved).
-#
-# THE BOUND HAS A FLOOR IT MUST CLEAR, AND THAT FLOOR GROWS: the insight-slot
-# call (`generate_insight_slots`) is handed the previous insight as context
-# (`previous_insight`), so its own length is a floor under the output bound
-# that rises every time the fold succeeds — even though (decision:1205) the
-# LLM no longer re-emits that narrative verbatim, only bounded per-judgement
-# distillates plus one PRINCIPLE paragraph.
-#
-# Set below that floor, the fold cannot succeed by ANY path — obey the bound
-# and a required SLOT/PRINCIPLE never arrives, so parsing FAILS THE UNIT
-# (counted as slot_failures/slot_failed — a protocol failure); widen it and
-# generation itself risks TRUNCATION (counted as truncation_failures/
-# truncation_failed — a capacity failure; the two are kept apart precisely
-# so this floor problem is diagnosable, see `_CycleRec`). Either way, after
-# NREM_FOLD_FAIL_CAP occurrences (of either kind, summed — see
-# `fetch_fold_dead_letter_counts`) the dead-letter cap removes the cluster
-# from Tier 3 entirely. The most-consolidated domains cross the floor first,
-# so the failure lands on exactly the clusters carrying the most history.
-#
-# That is not hypothetical: the shipped 2048 was 0.62x the floor for this
-# framework's own busiest cluster (a 3315-token summary), which stalled fact
-# consolidation outright. 8192 clears every active summary observed here with
-# >2x headroom while staying far inside both the context window and the
-# LLM_CEILING_FLOOR wall-clock budget — the practical limit is generation TIME,
-# not context. Raise it if a legitimately larger narrative truncates; the
-# `truncation_failures` / `truncation_failed` telemetry is what says so.
+# A truncated draft is never stored. 8192 stays above the growing previous-insight floor after 2048 stalled the busiest cluster (decision:1205); NREM_MAX_TOKENS_SUMMARY is unread because the thematic fold makes no LLM call.
 NREM_MAX_TOKENS_SUMMARY = int(os.environ.get("NREM_MAX_TOKENS_SUMMARY", "8192"))
 NREM_MAX_TOKENS_INSIGHT = int(os.environ.get("NREM_MAX_TOKENS_INSIGHT", "8192"))
 
-# On a truncated draft the bound is widened ONCE and the call retried before
-# the fold is failed. A FIXED bound plus the fold dead-letter cap would
-# otherwise permanently and silently exclude any cluster that legitimately
-# needs a longer narrative than the default — the exact silent-loss failure
-# the truncation rule exists to prevent. Truncation still fails the fold; it
-# just gets one wider try first.
+# Widen a truncated bound once before failing the fold, so a longer narrative is not dead-lettered by the default.
 NREM_TRUNCATION_RETRY_FACTOR = float(
     os.environ.get("NREM_TRUNCATION_RETRY_FACTOR", "2.0"))
 
-# Insight-fold missing-slot retry (decision:1205 — payload by construction):
-# after the ONE LLM call that fills every per-judgement SLOT plus PRINCIPLE,
-# any slot still empty after parsing gets exactly ONE bounded retry (hardcoded
-# in `generate_insight_slots`, not env-tunable) asking only for the missing
-# slot(s) — a single fixed retry against a strictly-parseable protocol, unlike
-# the old preservation gate's multi-attempt probabilistic content-match loop.
+# After one SLOT/PRINCIPLE call, a still-empty slot gets one hardcoded retry for only the missing slots (decision:1205).
 
-# Fold dead-letter cap (see module docstring): key occurrences in
-# truncation_failed OR slot_failed extras within the window → skip.
+# Skip a cluster after this many truncation_failed or slot_failed hits in the window.
 NREM_FOLD_FAIL_WINDOW = int(os.environ.get("NREM_FOLD_FAIL_WINDOW", "7"))   # days
 NREM_FOLD_FAIL_CAP    = int(os.environ.get("NREM_FOLD_FAIL_CAP", "3"))
-# Per-judgement input cap for the insight-fold LLM call (decision:1205): each
-# judgement's body text (decision: content minus its title line;
-# retrospective: full notes) is capped to this many characters (head of the
-# text) before it enters the prompt — bounds prompt size regardless of how
-# long any single judgement's content is.
+# Cap each judgement body (decision text after the title line, or the full retrospective) before the insight prompt (decision:1205).
 NREM_INSIGHT_SLOT_INPUT_CHARS = int(
     os.environ.get("NREM_INSIGHT_SLOT_INPUT_CHARS", "2000"))
 
-# Slot-queue fairness (F10 + F2): how long a due consolidation may WAIT for a
-# free LLM slot before deferring (it never fires into a busy serial slot), and
-# the poll cadence while waiting.
-#
-# The budget MUST exceed the longest expected REM unit or the arbiter never
-# actually wins: a solo REM enrichment on this class of hardware runs ~1000s
-# (the ~30K-token grounding prefill dominates), so a 300s queue expired every
-# time while REM was mid-generation and NREM went back to deferring — the
-# starvation this is meant to end. 1800s clears a solo unit with margin.
-# NREM holds the priority lock only while actually queuing, so a long budget
-# costs REM nothing except the turn it is being asked to yield.
+# Wait this long for a free LLM slot. 1800s outlasts a ~1000s REM unit; a 300s queue expired mid-generation and NREM deferred forever.
 NREM_FORCED_SLOT_WAIT = float(os.environ.get("NREM_FORCED_SLOT_WAIT", "1800"))
 NREM_FORCED_SLOT_POLL = 10.0
 
 
-# MUST-mirror: rem_loop.py carries its own copy of
-# _finish_reason/_truncated (single-file-per-venv convention) — keep in agreement.
+# rem_loop.py copies _finish_reason and _truncated. Keep the copies in agreement.
 def _finish_reason(resp_json):
     """choices[0].finish_reason of an OpenAI-compatible completion response
     ('stop' | 'length' | ...); None when the shape is unexpected."""
@@ -204,10 +104,7 @@ def _truncated(resp_json):
     Semantics are FAIL-THE-UNIT — the draft is discarded, never gated/persisted."""
     return _finish_reason(resp_json) == "length"
 
-# Backup fence: a single well-known Postgres advisory lock shared with the gateway
-# (coordinator.BACKUP_ADVISORY_LOCK_KEY) and the REM daemon. The gateway holds it
-# EXCLUSIVE during a backup dump; each NREM write-cycle takes it SHARED and skips if
-# it can't — so consolidation never writes mid-dump. MUST match the coordinator's key.
+# The gateway holds this advisory lock exclusive while dumping; NREM takes it shared and skips the cycle if it cannot. Must match the coordinator key.
 BACKUP_ADVISORY_LOCK_KEY = int(os.environ.get("BACKUP_ADVISORY_LOCK_KEY", "8765309"))
 
 
@@ -226,19 +123,7 @@ def _try_backup_shared_lock():
             return None
     return conn
 
-# ── NREM slot priority (F2): the arbiter between the two dream daemons ────────
-# REM and NREM contend for ONE serial LLM slot with no fairness mechanism —
-# both simply poll pool_has_free_slot() and take what they find. REM re-arms
-# far faster and (since it may run long solo units) holds the slot for many
-# minutes, so NREM could defer indefinitely: 2403 deferred vs 32 completed
-# cycles in 3 days, zero successful folds in 4.6 days.
-#
-# The fix is a well-known advisory lock meaning "NREM is queuing for the slot;
-# do not take it". NREM holds it EXCLUSIVE only while actively waiting, and
-# for a bounded window — so REM yields its turn but can never be starved in
-# the mirror image of the bug we are fixing. Session-scoped: Postgres drops it
-# on disconnect, so a daemon crash can never wedge REM permanently.
-# MUST match rem_loop.NREM_PRIORITY_ADVISORY_LOCK_KEY.
+# REM can hold the only LLM slot for minutes, so NREM takes this exclusive lock only while queued, and it is session-scoped so a crash cannot wedge REM. Must match rem_loop.NREM_PRIORITY_ADVISORY_LOCK_KEY.
 NREM_PRIORITY_ADVISORY_LOCK_KEY = int(
     os.environ.get("NREM_PRIORITY_ADVISORY_LOCK_KEY", "8765310"))
 
@@ -264,35 +149,16 @@ def _take_nrem_priority_lock():
                        "waiting unprioritised", e)
         return None
 
-# Interval between global density sweeps. The event-driven path only evaluates
-# clusters touched by a fresh save, but eligibility can change without a save:
-# REM enrichment flips rem_processed=true after the save's notification was
-# already consumed, and notifications fired while the daemon was down are lost.
-# The sweep re-evaluates every entity hub so such clusters drain (retrospective
-# on decision pg_id 214). First sweep runs on the first idle tick after startup.
+# Sweep this often. REM can flip rem_processed after the save notify was consumed, and notifies fired while this daemon was down are lost (retrospective on decision pg_id 214).
 SWEEP_INTERVAL_SEC = int(os.environ.get("NREM_SWEEP_INTERVAL_SEC", "3600"))
 
-# Sampling temperature for the NREM summarisation LLM. Default 0.6 suits Gemma-class
-# models (see rem_loop REM_TEMPERATURE); set NREM_TEMPERATURE=0.1 (or DREAM_TEMPERATURE
-# for both daemons) in .env for Qwen-class models. Overrides the LM Studio preset.
+# 0.6 suits Gemma; set NREM_TEMPERATURE=0.1 or DREAM_TEMPERATURE for Qwen. This overrides the LM Studio preset.
 NREM_TEMPERATURE = float(os.environ.get("NREM_TEMPERATURE", os.environ.get("DREAM_TEMPERATURE", "0.6")))
-# NREM_LLM_TIMEOUT removed (ADR-021): per-call timeout is now adaptive —
-# adaptive_ceiling(len(prompt), units=cluster_size, max_tokens=widest_bound).
-# Floor: LLM_CEILING_FLOOR (600s). The max_tokens term matters most here: decode
-# time tracks the OUTPUT bound, so the ceiling must be sized on the WIDEST bound
-# a call may retry at (bounds[-1]) or the widened truncation retry is killed by
-# its own timeout instead of completing.
+# No fixed NREM_LLM_TIMEOUT. adaptive_ceiling must size on the widest retry bound, or the widened truncation retry is killed by its own timeout.
 
-# ── Consolidation run ledger (ADR-018) ──────────────────────────────────────
-# One consolidation_runs row per cycle so a silent fold crash becomes queryable
-# state (it previously surfaced only as a log line). Every recorded outcome ALSO
-# leaves a journal line: the table write is failsafe (can no-op if Postgres is
-# unreachable), so the log is the independent second record — DB + logs
-# corroborate, the same trace-on-every-lifecycle-event rule close_ledger_rows
-# follows. Rows past the retention window are pruned at daemon startup.
+# One consolidation_runs row per cycle so a silent crash is queryable. The table write can no-op, so every outcome is also logged, and rows past retention are pruned at startup.
 CONSOLIDATION_RUNS_RETENTION_DAYS = int(os.environ.get("CONSOLIDATION_RUNS_RETENTION_DAYS", "30"))
-# Throttle 'deferred' rows: at most one per cycle_type within this window, so a
-# GPU-busy episode spanning many poll ticks records one deferral, not dozens.
+# At most one deferred row per cycle_type in this window, so a busy episode does not write a row per poll.
 _DEFER_THROTTLE_SEC = 60
 
 
@@ -552,50 +418,22 @@ class _CycleRec:
     __slots__ = ("attempted", "succeeded", "failed",
                  "eligible_clusters", "eligible_oldest_age",
                  "dead_lettered_clusters", "run_id",
-                 # ⛔ decision:1205 (v0.8.71) — preservation_retries/
-                 # preservation_failures/preservation_failed RETIRED with the
-                 # anchor-gate they counted; the insight path no longer has a
-                 # content-preservation failure mode. truncation_failures/
-                 # truncation_failed count ONLY real truncation
-                 # (finish_reason=length capacity failures) again.
-                 # slot_failures/slot_failed (operator ruling, same PR) are a
-                 # SEPARATE class: a SLOT/PRINCIPLE still missing after its
-                 # one bounded retry — a PROTOCOL failure (fix prompt/model),
-                 # not a capacity one (raise max_tokens); keeping them apart
-                 # is what lets the instrument tell the two causes apart.
-                 # fold_dead_letter = keys skipped by the fold-failure cap
-                 # this cycle.
+                 # decision:1205 retired preservation_* with the anchor gate. truncation_* is finish_reason=length; slot_* is a SLOT/PRINCIPLE still missing after one retry; fold_dead_letter is keys the cap skipped.
                  "truncation_failures", "truncation_failed",
                  "slot_failures", "slot_failed", "fold_dead_letter",
-                 # Output-identity skip (operator ruling 2026-08-11) —
-                 # clusters whose re-fold would have rewritten the ACTIVE
-                 # summary byte-identically, so nothing was embedded or
-                 # written. A NEW key, mirroring dead_lettered_clusters'
-                 # shape: excluded from eligible_clusters (the census counts
-                 # what this pass actually folds — I7), reported separately.
+                 # Re-fold would rewrite the active summary byte-identically, so nothing is embedded. Excluded from eligible_clusters and counted on its own.
                  "unchanged_clusters",
-                 # Singleton-component deferral (operator ruling 2026-08-16,
-                 # third application of the I7/decision:1121 class after
-                 # dead_lettered_clusters and unchanged_clusters) — a
-                 # component whose judgement reach is exactly 1 cannot fold
-                 # an insight and is never attempted; excluded from
-                 # eligible_clusters, counted here instead.
+                 # decision:1121: judgement reach of exactly 1 cannot fold an insight, so it is excluded from eligible_clusters and counted on its own.
                  "singleton_clusters")
 
     def __init__(self):
         self.attempted = self.succeeded = self.failed = 0
-        # Coverage census (PR-2) — captured after the gate, before folding, so a
-        # crash mid-fold still records what was eligible. None until set.
+        # Captured after the gate and before folding, so a mid-fold crash still records what was eligible. None until set.
         self.eligible_clusters = None
         self.eligible_oldest_age = None
-        # D1 (fact:1189, decision:1121/I7): clusters excluded from the
-        # census above because NREM_FOLD_FAIL_CAP dead-lettered them this
-        # pass — a NEW, separate count, never folded into eligible_clusters'
-        # existing meaning. 0 (not None) once a census has run this cycle,
-        # so a cycle that dead-lettered nothing reports 0, not absence.
+        # fact:1189, decision:1121: clusters the fail cap excluded this pass. Separate from eligible_clusters; 0 once a census has run.
         self.dead_lettered_clusters = 0
-        # consolidation_runs.id of THIS cycle — stamped onto each summary it writes
-        # (community_summaries.run_id) for fact→summary→cycle lineage (Stage 2b).
+        # This cycle's consolidation_runs id, stamped on each summary it writes.
         self.run_id = None
         self.truncation_failures = 0
         self.truncation_failed = []
@@ -603,10 +441,7 @@ class _CycleRec:
         self.slot_failed = []
         self.fold_dead_letter = []
         self.unchanged_clusters = 0
-        # Operator ruling 2026-08-16: singleton components (judgement reach
-        # of exactly 1) partitioned out before the census below. 0 (not
-        # None) once a census has run this cycle, mirroring
-        # dead_lettered_clusters' presence contract.
+        # Singleton components (judgement reach of exactly 1) are partitioned out before the census. 0 once a census has run.
         self.singleton_clusters = 0
 
     def fold(self, ok):
@@ -648,31 +483,13 @@ class _CycleRec:
             return None
         out = {
             "truncation_failures": self.truncation_failures,
-            # Operator ruling (same PR as decision:1205) — SEPARATE from
-            # truncation_failures: a SLOT/PRINCIPLE missing after its one
-            # bounded retry is a PROTOCOL failure, not a capacity one.
+            # decision:1205: a missing SLOT/PRINCIPLE after one retry is a protocol failure, not a capacity failure.
             "slot_failures": self.slot_failures,
-            # D1 (fact:1189, decision:1121/I7) — NEW key, never an alias for
-            # eligible_clusters: a cluster excluded here is one the census
-            # above deliberately does NOT count as eligible backlog.
+            # fact:1189, decision:1121: clusters the census excluded. Not an alias for eligible_clusters.
             "dead_lettered_clusters": self.dead_lettered_clusters,
-            # Output-identity skips (operator ruling 2026-08-11) — clusters
-            # whose re-fold was a byte-identical no-op this cycle. NEVER an
-            # alias for eligible_clusters: a cluster counted here is one the
-            # census deliberately does NOT count as eligible backlog, so the
-            # stall verdict cannot read a fully-current corpus as stalled.
+            # Byte-identical re-folds this cycle. Not eligible backlog, or a current corpus reads as stalled.
             "unchanged_clusters": self.unchanged_clusters,
-            # Operator ruling 2026-08-16 (third application of the
-            # I7/decision:1121 class) — NEW key, never an alias for
-            # eligible_clusters: a singleton component (judgement reach of
-            # exactly 1) cannot fold an insight. Before this partition it WAS
-            # attempted every cycle and aborted at `_fold_insight`'s
-            # `len(rows) < 2` guard (live: 48 fold attempts/0 successes in
-            # 24h against 2 permanent singleton clusters) — this ruling stops
-            # that doomed attempt before it reaches the fold, so the census
-            # above must not count the component as eligible backlog,
-            # otherwise the stall verdict reads a deliberate skip as a
-            # stall.
+            # decision:1121: judgement reach of exactly 1 cannot fold. Counting it as eligible backlog made every skip look like a stall.
             "singleton_clusters": self.singleton_clusters,
         }
         if self.truncation_failed:
@@ -683,21 +500,8 @@ class _CycleRec:
             out["fold_dead_letter"] = self.fold_dead_letter
         return out
 
-# AGENT_TOKEN authenticates daemon outbound calls through the proxy.
-# It identifies the daemon as a trusted internal caller — it does NOT affect
-# the source field on any saved artifact.  Fact.source always reflects the
-# original saving agent.
-#
-# SEC-10 (Credential_Custody_Plan_2026-08-14, PR A2): the mainline path is
-# now the pipe fd hive_mind_proxy._daemon_env_and_token_fd() hands this
-# process at spawn — read_daemon_token_from_fd() drains it once, here, at
-# import time. AGENT_TOKEN never crosses via this process's own environment
-# as of A2; the fd is the ONLY way the proxy-spawned mainline path sets this.
-#
-# get_secret("AGENT_TOKEN") is the fallback for a standalone debug run of
-# this daemon (`python consolidation_loop.py`, no proxy in between, so no fd
-# exists) — a value set only in shared-memory/.env, or via an operator's own
-# export, still works instead of silently 401ing (review fix #7 from PR A1).
+# Daemon outbound auth through the proxy. It does not set Fact.source.
+# The proxy passes the token on a pipe fd, not this process's environment. get_secret is only the no-proxy debug fallback.
 _AGENT_TOKEN = read_daemon_token_from_fd() or get_secret("AGENT_TOKEN", "").strip() or None
 
 
@@ -743,11 +547,7 @@ def _routing_refusal(resp) -> dict | None:
 
 
 logging.basicConfig(level=logging.INFO)
-# D6 (HYG round): consolidation_loop.py imports httpx and runs under THIS
-# process's own root config, so an INFO root level turns every httpx call
-# into a journal line. WARNING silences the per-request chatter without
-# hiding a real client failure. The aiohttp access log remains the
-# per-request record.
+# This process's root logger is INFO, which would journal every httpx call. WARNING keeps real client failures.
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger("ConsolidationDaemon")
 
@@ -916,14 +716,7 @@ def insight_cypher_query(judgement_ids) -> str:
     )
 
 
-# ── Insight payload BY CONSTRUCTION (decision:1205, v0.8.71) ──────────────────
-# Retired here: preservation_anchor / summary_preserves / corrective_block —
-# the post-hoc free-prose + anchor-gate machinery they implemented is GONE
-# (it caused a retry lottery and forced fabricated quoted titles into insight
-# prose — see fact:1204). An insight's `content` is now ASSEMBLED BY CODE
-# from each judgement's own pg_id/title; the LLM fills only bounded
-# per-judgement SLOT distillates plus a closing PRINCIPLE paragraph, via the
-# strictly-parsed protocol below. See the module docstring.
+# decision:1205: insight content is assembled in code; the LLM fills only slots and PRINCIPLE (fact:1204). The pattern below catches a body line that looks like a protocol marker.
 
 _INSIGHT_SLOT_MARKER_RE = re.compile(
     r"(?m)^[ \t]*(SLOT[ \t]+\d+|PRINCIPLE)[ \t]*:", re.IGNORECASE)
@@ -1144,9 +937,7 @@ def _assemble_insight_content(rows, reversal_lines, slots):
     return "\n\n".join(s for s in sections if s)
 
 
-# Evidential weight rank for decision 1080: when a judgement has several
-# grounding facts, synthesis sees the strongest kind among them — never the
-# judgement's own source_ref (that names the instrument / origin, not weight).
+# decision 1080: several grounding facts contribute the strongest kind, never the judgement's own source_ref.
 _KIND_RANK = {
     "tested": 4, "measured": 3, "researched": 2,
     "observation": 1, "discussion": 0,
@@ -1167,41 +958,6 @@ def evidential_kind_for_record(rtype, source_ref, grounding_kinds=None):
             return "discussion"
         return max(kinds, key=lambda k: _KIND_RANK.get(k, 0))
     return fact_kind_from_source_ref(source_ref)
-
-
-# ── ✅ THE v2 FACT GATE PARTITIONER (Dreaming Cycle Plan to v2, §2.1; C1/C1b) ──
-# The pre-v2 two-level design (an entity-hub/MENTIONS level, and a
-# project-only level — the historical `domain_map` == PROJECT squat this
-# module's docstrings used to warn about) is GONE. `eligible_entity_level_clusters`,
-# `eligible_domain_clusters` (its project-only wrapper), `count_entity_level_cycles`
-# and their sole remaining caller, `coordinator._count_domain_cycles`, are
-# DELETED — the escalation raised when C1 shipped is now closed: `main` moved
-# past the parallel builder that held `coordinator.py`, so both the fold AND
-# its telemetry (`coordinator._nrem_cycle_counts`) now describe ONLY the v2
-# gate. `tests/test_domain_clusters.py` (which tested those two removed
-# functions and nothing else) is deleted with them.
-#
-# `eligible_domain_level_clusters` / `count_domain_level_cycles` are KEPT and
-# their name is KEPT too — deliberately, not by omission. "domain-level" was
-# never a leftover half of a two-level distinction; it describes the
-# mechanism itself (folds are keyed at (project, domain) granularity, never
-# per-project, never per-entity — neither of those exists any more to
-# contrast it with). Renaming a name that already says the true thing would
-# only cost every caller a diff for no clarity gained.
-#
-# ⛔ MOVED to ``nrem_gate.py`` (fix wave, 2026-08) — this module imports
-# psycopg2 at module level (line ~56), so any caller reaching these two PURE
-# functions through `from consolidation_loop import ...` pulls in that whole
-# import chain. `coordinator._nrem_cycle_counts` did exactly that behind a
-# lazy import, and the shipped gateway service never carries psycopg2 — so
-# `GET /memory/telemetry`'s `nrem` gauge failed on every call in production
-# while every unit test (DB access fully stubbed) stayed green. See
-# `nrem_gate.py`'s module docstring for the full account. Both names are
-# imported back in above and re-exported here — this module's own fold code
-# (`_consolidate_clusters` etc.) and every existing caller/test that does
-# `from consolidation_loop import eligible_domain_level_clusters` /
-# `count_domain_level_cycles` keep working unchanged. `coordinator.py` now
-# imports straight from `nrem_gate`, never from here.
 
 
 def sweep_due(now, last_sweep_time, last_activity, has_pending,
@@ -1259,32 +1015,7 @@ def consolidation_due(seconds_since_activity, seconds_eligible, backlog_size,
     return (False, False)
 
 
-# ── Outbox dream-cycle ledger — fact path only (decision pg_id 267) ───────────
-# A fact's neo4j_outbox row now lives through the full dream cycle:
-#
-#   pending → applied → rem_reviewed → consolidated → row DELETED
-#
-# 'consolidated' is set in the SAME Postgres transaction as the community-
-# summary INSERT (Postgres synced); the row is deleted only after the Neo4j
-# marking succeeds (both stores conclusively synced). A row's presence
-# therefore always means "this artifact has not finished dreaming" — a durable
-# NREM backlog that survives daemon restarts and lost NOTIFYs, and a
-# reconciliation point if a crash lands between the two stores.
-#
-# Decision and retrospective rows live the same lifecycle through the INSIGHT
-# path below (decision pg_id 276): a fold flips the cluster's decision rows
-# plus the consumed retrospective rows to 'consolidated' and closes them after
-# the graph marking. Retrospective rows must be identified by cypher_params
-# type, never by status: REM's outbox mark targets the latest applied row for
-# a pg_id, and a LEGACY retrospective shares its target decision's pg_id, so
-# legacy retro rows can sit at 'rem_reviewed'.
-#
-# Retro-as-record transition (2026-07-14): a v2 retrospective row carries the
-# RETRO'S OWN pg_id (it is a full record) and names its decision in
-# cypher_params->>'target_pg_id'. Legacy rows also carry target_pg_id (equal to
-# their pg_id). Insight-path queries therefore key retro rows on
-# COALESCE(target_pg_id, pg_id) so both shapes trigger, are consumed, and are
-# reconciled identically.
+# Fact rows are not retrospective, decision, or supersede (decision pg_id 267). Insight rows are those two types (decision pg_id 276), matched by type because a legacy retro shares the decision's pg_id.
 
 _FACT_ROW = "COALESCE(cypher_params->>'type', 'fact') NOT IN ('retrospective', 'decision', 'supersede')"
 _DREAM_ROW = "COALESCE(cypher_params->>'type', 'fact') IN ('decision', 'retrospective')"
@@ -1395,13 +1126,7 @@ def close_ledger_rows(conn, pg_ids, context="consolidation"):
         )
         deleted = cur.fetchall()
 
-        # Supersession GC (decision 381/384): a fact superseded before it could
-        # be REM/NREM-processed never advances its own row — it RIDES ALONG with
-        # its successor. When the superseding fact's row is closed here, purge the
-        # whole superseded ancestry (transitive via technical_docs.superseded_by)
-        # in the SAME pass, logged identically — the corrected knowledge is now
-        # consolidated, so the retired ancestors leave the working set together.
-        # Recursive walk handles chains A→B→C: closing head C purges {B, A}.
+        # decision 381/384: closing a successor also purges its superseded fact ancestry in this pass, including a chain.
         purged_preds = []
         if deleted:
             consolidated_ids = [pid for _oid, pid in deleted]
@@ -1414,9 +1139,7 @@ def close_ledger_rows(conn, pg_ids, context="consolidation"):
                 ")"
                 " DELETE FROM neo4j_outbox"
                 " WHERE pg_id IN (SELECT id FROM preds)"
-                # Only the predecessor's dream-cycle FACT row is GC'd here; a
-                # type='supersede' mirror row self-deletes on apply and must not
-                # be yanked before it marks the old node + writes the edge.
+                # Only the predecessor's fact row is removed. A type='supersede' mirror row deletes itself on apply and must mark the old node first.
                 f"   AND {_FACT_ROW}"
                 " RETURNING id, pg_id",
                 (consolidated_ids,),
@@ -1439,19 +1162,9 @@ def close_ledger_rows(conn, pg_ids, context="consolidation"):
     return len(deleted)
 
 
-# ── Insight consolidation — decision clusters → kind='insight' summaries ─────
-# Decision pg_id 276 (ratified 2026-06-10; design doc §8 + §8.8). The gate is
-# pure graph state — existence of a HAD_OUTCOME edge, never its rating — and
-# the trigger is the durable ledger: decisions have no :Fact node, so the
-# event-driven NOTIFY path is structurally deaf to them.
+# Decision pg_id 276: the gate is a HAD_OUTCOME edge, not its rating, and NOTIFY is deaf because decisions are not Fact nodes.
 
-# The predicate itself, its two thresholds and the hub cap now live in
-# insight_gate.py — the coordinator's eligibility telemetry runs the SAME query
-# projected to a count, and two copies of a gate is how telemetry came to report
-# a backlog the daemon could not fold.
-# ⛔ REMOVED (C4): `INSIGHT_DOMAIN = "insight"` — an insight's single fixed
-# "domain" placeholder is gone; §3.2 replaces it with the real, MULTI-VALUED
-# `domains` the walk actually touched (`_fold_insight`'s `domains_all`).
+# The predicate lives in insight_gate.py so telemetry and this daemon cannot disagree. An insight has no fixed domain placeholder; domains come from the walk.
 
 
 def fetch_open_retro_decision_ids(conn):
@@ -1700,21 +1413,14 @@ def supersede_covered_summaries(conn, summary_id, src_ids, level=None, kind="the
             (LEVEL_ENTITY, summary_id),
         )
         for old_id, old_src, old_level, old_kind in cur.fetchall():
-            # U5: kind isolation applies UNCONDITIONALLY — never gated on
-            # whether `level` was passed.
+            # Kind isolation is unconditional, not gated on whether level was passed.
             if old_kind != kind:
                 continue
             if level is not None and old_level != level:
                 continue
             if old_src and set(old_src) <= new_src_set:
                 cur.execute(
-                    # Both columns, always. Migration 031 defines the pair as
-                    # ONE stamp — `superseded_at` says a reason was recorded at
-                    # all, `superseded_reason` says which. Writing the reason
-                    # without the timestamp makes every coverage retirement
-                    # indistinguishable from a pre-031 row to the obvious query
-                    # ("what has been retired since the stamp existed?"), which
-                    # is the only question the pair exists to answer.
+                    # Stamp superseded_at and superseded_reason together. A reason without the timestamp is indistinguishable from a pre-031 row.
                     "UPDATE community_summaries SET superseded = true,"
                     "  superseded_at = now(), superseded_reason = 'coverage'"
                     " WHERE id = %s",
@@ -1750,22 +1456,8 @@ def close_ledger_rows_by_id(conn, row_ids, context="insight"):
     return len(deleted)
 
 
-# ── C3 — cascading (lineage) supersession, migration 031 ─────────────────────
-# Dreaming Cycle Plan to v2, §5 (AMENDED 2026-08-10 block) + `retrospective:1178`
-# refining `decision:384`. THE RULE:
-#
-#   Invalidation is identified from the stored lists. Re-gating is re-derived
-#   from the graph. The ledger is only the clock.
-#
-# Mechanism A (supersede_covered_summaries, subset coverage) and Mechanism B
-# (this section, lineage) are SEPARATE and both needed — a reversal makes the
-# covered set SMALLER, so Mechanism A can never retire the old row (§5.2).
-# Mechanism B never fabricates neo4j_outbox rows: `_find_grounded_fact_groups`
-# is a full graph scan that never reads the outbox, and a thematic fold
-# UPSERTs on (entity, project, domain, level), so re-gating needs no work
-# list — the outbox's only surviving role in the fact path is the CLOCK
-# (`consolidation_due`, `run_ledger_sweep`'s density gate), which is what
-# `refold_ledger` extends.
+# retrospective:1178 refines decision:384: invalidation is read from stored lists, re-gating from the graph, and the ledger is only the clock.
+# Mechanism B writes no outbox rows. A reversal shrinks the covered set, so subset coverage cannot retire the old row.
 
 def fetch_invalidated_summaries(conn):
     """U2 — identify ACTIVE summaries holding an invalid member, by REVERSE
@@ -1810,7 +1502,7 @@ def fetch_invalidated_summaries(conn):
     """
     out = []
     with conn.cursor() as cur:
-        # Leg 1 — thematic summary holding a superseded fact. EAGER, unchanged.
+        # Leg 1 stays eager: a thematic summary that still holds a superseded fact.
         cur.execute(
             "SELECT DISTINCT cs.id, cs.source_pg_ids, t.id"
             "  FROM community_summaries cs"
@@ -1824,10 +1516,7 @@ def fetch_invalidated_summaries(conn):
                        "kind": "thematic", "trigger_kind": "technical_docs",
                        "trigger_id": trig})
 
-        # Leg 2 — insight summary holding a reversed decision directly.
-        # EAGER, unchanged (§2.2a / I10) — a different trigger from the
-        # disabled lineage leg: the invalidated record is a MEMBER of the
-        # insight's own `source_pg_ids`, not a thematic summary beneath it.
+        # Leg 2 stays eager: the reversed decision is a member of the insight, not a thematic summary under it.
         cur.execute(
             "SELECT DISTINCT cs.id, cs.source_pg_ids, t.id"
             "  FROM community_summaries cs"
@@ -1841,9 +1530,7 @@ def fetch_invalidated_summaries(conn):
                        "kind": "insight", "trigger_kind": "technical_docs",
                        "trigger_id": trig})
 
-        # Leg 3 (thematic→insight lineage cascade) is DISABLED — decision:1207.
-        # Do NOT reinstate a query here; the read-side annotation lives in
-        # coordinator.py's search path (`stale_summaries`).
+        # decision:1207: do not reinstate the thematic-to-insight lineage query. Search annotates stale summaries in coordinator.py.
     return out
 
 
@@ -1940,9 +1627,7 @@ def retire_invalidated_summaries(conn):
                 (summary_id,),
             )
             if cur.rowcount == 0:
-                # Already retired (concurrent pass, or already superseded by
-                # Mechanism A between the SELECT above and here) — no ledger
-                # write either; whatever retired it owns that ledger entry.
+                # Already retired by a concurrent pass or Mechanism A. That retirement owns the ledger entry.
                 continue
             retired.append((summary_id, info["kind"], info["source_pg_ids"]))
 
@@ -2184,7 +1869,7 @@ def merge_logs(log_dir: str) -> None:
         log_path = os.path.join(log_dir, f"{tool}.log")
         if not os.path.exists(log_path) or os.path.getsize(log_path) == 0:
             if os.path.exists(log_path):
-                os.remove(log_path)  # clean up empty file
+                os.remove(log_path)  
             continue
         rotating_path = log_path + ".rotating"
         try:
@@ -2211,7 +1896,7 @@ def merge_logs(log_dir: str) -> None:
                 pass
         return
 
-    # Group by calendar date (entries may span multiple days if daemon was down)
+    # A down daemon can leave entries that span more than one day.
     by_date: dict = {}
     for entry in all_entries:
         try:
@@ -2224,7 +1909,6 @@ def merge_logs(log_dir: str) -> None:
         out_path = os.path.join(log_dir, f"shared_memory_{date}.log.gz")
         tmp_path = out_path + ".tmp"
 
-        # Merge with existing archive for this date if present
         existing: list = []
         if os.path.exists(out_path):
             try:
@@ -2268,36 +1952,14 @@ class ConsolidationDaemon:
         self.pending_pg_ids = set()
         self.last_activity = datetime.now()
         self.first_notification_time = None
-        # Pool-busy sweep backoff: a due sweep that found no free LLM slot does
-        # not re-probe on every ~1s listen tick (that spams the log and a
-        # /pool/status GET per second during long dream generations) — it waits
-        # this many seconds before the next attempt. The DB deferral record is
-        # separately throttled by _DEFER_THROTTLE_SEC.
+        # A due sweep with no free slot waits this long instead of probing every listen tick.
         self._sweep_backoff_until: datetime | None = None
-        # Durable eligibility state (see consolidation_due). `_backlog` is the
-        # last observed rem_reviewed fact backlog — the cycle's entry points AND
-        # its due-ness predicate, both read from the same durable ledger so they
-        # cannot disagree. `_backlog_eligible_since` is when it last became
-        # eligible (None while below the density threshold), which anchors the
-        # backstop on eligibility age rather than on notification age.
+        # _backlog is the rem_reviewed fact backlog, so entry points and due-ness come from the same ledger. _backlog_eligible_since anchors the backstop on eligibility age, not notify age.
         self._backlog: list = []
         self._backlog_checked_at: datetime | None = None
         self._backlog_eligible_since: datetime | None = None
-        # TWO clocks, deliberately. `last_activity` keeps its original meaning —
-        # the last save notification — and still gates the periodic hygiene
-        # sweep. `last_busy` additionally tracks the shared LLM pool, and gates
-        # the event-driven consolidation cycle.
-        #
-        # They are split because the two consumers want different things from
-        # "quiet". Consolidation competes with REM for the exclusive slot, so it
-        # must not be declared due while REM holds it — that is the whole point
-        # of making the clock pool-aware. The sweep does backfill,
-        # reconciliation and the insight pass; it has NO backstop, so gating it
-        # on a clock a busy pool can hold open indefinitely would let a
-        # continuously-loaded system suppress it forever. (The insight cycle has
-        # already gone 5.2 days without a fold once; do not rebuild that.)
+        # last_activity is the last save and gates the sweep. last_busy tracks the LLM pool and gates consolidation, so a busy pool cannot suppress the sweep forever.
         self.last_busy = datetime.now()
-        # Last time the idle clock probed the LLM pool.
         self._pool_probed_at: datetime | None = None
         self.driver = AsyncGraphDatabase.driver(
             NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASS),
@@ -2306,24 +1968,13 @@ class ConsolidationDaemon:
         )
         self.is_running = True
         self.last_log_merge_date = None
-        # Truncation signal from the last generate_insight_slots call — the
-        # CALLER resets it before each call and reads it after a falsy
-        # return to tell a capacity failure (finish_reason=length) from an
-        # ordinary LLM failure. Kept on the daemon (not the return value) so
-        # mocked generators in tests keep their dict|None contract.
+        # Set around generate_insight_slots so the caller can tell finish_reason=length from an ordinary failure without changing the return tests mock.
         self._last_llm_truncated = False
-        # decision:1205 (v0.8.71) — the SECOND failure signal the slot
-        # protocol needs alongside truncation: a SLOT or PRINCIPLE still
-        # missing after its one bounded retry. Same reset-before/read-after
-        # convention as _last_llm_truncated; the two are mutually exclusive
-        # per call (see generate_insight_slots).
+        # decision:1205: a SLOT or PRINCIPLE still missing after its one retry. Reset and read like _last_llm_truncated; the two flags are mutually exclusive per call.
         self._last_llm_missing_slots = False
-        # datetime.min ⇒ the first idle tick after startup sweeps immediately,
-        # draining clusters that became eligible while the daemon was down.
+        # datetime.min so the first idle tick sweeps immediately and drains clusters that became eligible while down.
         self.last_sweep_time = datetime.min
-        # The unanchored graph sweep runs once per process start — it covers
-        # pre-coordinator facts that have no outbox rows. Every later sweep
-        # is driven by the durable outbox ledger instead.
+        # One unanchored graph sweep per process, for facts with no outbox row. Later sweeps use the ledger.
         self._startup_sweep_done = False
 
     def _requeue(self, pg_ids):
@@ -2353,9 +2004,7 @@ class ConsolidationDaemon:
         def _read():
             conn = psycopg2.connect(PG_CONN, connect_timeout=5)
             try:
-                # C3: the widened input set (§5 amendment) — outbox backlog
-                # UNION lineage-invalidation backlog, deduped. The density
-                # predicate below is unchanged; only what feeds it grows.
+                # Outbox backlog union lineage-invalidation backlog. Density is unchanged; only the input set grows.
                 return fetch_combined_fact_backlog(conn)
             finally:
                 conn.close()
@@ -2366,10 +2015,7 @@ class ConsolidationDaemon:
                 "NREM: could not read the rem_reviewed backlog (%s) — keeping the "
                 "previous observation of %d; the cycle stays gated on it.",
                 e, len(self._backlog))
-            # Say it on the record, not only in the log. A daemon acting on a
-            # stale eligibility view looks exactly like a daemon with nothing to
-            # do — both report "not due" — so without this the operator cannot
-            # tell a quiet system from a blind one.
+            # Record a failed eligibility read. An unrecorded miss looks the same as not due.
             await loop.run_in_executor(
                 None, lambda: _crun_record_deferred(
                     "fact_consolidation", "eligibility_read_failed"))
@@ -2538,8 +2184,7 @@ class ConsolidationDaemon:
                         advertised = classification.advertised
                         requested = classification.requested
                         if prev > reserved_snap:
-                            # Leftover EMBED_MAX_CHARS > reserved: one reserved
-                            # snap even when that drop is < 10%.
+                            # If the text is still longer than the reserved window, snap once even when that drop is under 10%.
                             new_len = min(reserved_snap, prev - 1)
                         else:
                             if (
@@ -2549,8 +2194,7 @@ class ConsolidationDaemon:
                                 new_len = min(prev - 1, prev * advertised // requested)
                             else:
                                 new_len = prev // 2
-                            # Reserved was a no-op (production 24570==24570) or
-                            # the ratio barely moved (8192/8193). Halve.
+                            # The reserved snap did nothing, or the ratio barely moved. Halve so the retry actually shrinks.
                             if new_len * 10 >= prev * 9:
                                 new_len = prev // 2
                         if (
@@ -2578,27 +2222,13 @@ class ConsolidationDaemon:
                     resp.raise_for_status()
                     return resp.json()["data"][0]["embedding"]
         except Exception as e:
-            # Name the exception CLASS: the bare str() of an httpx timeout is
-            # empty, which printed "Embedding error:" and told the operator
-            # nothing about whether it timed out, was refused, or 500'd.
+            # An httpx timeout's str() is empty, so log the exception class or the line says nothing.
             logger.error("Embedding error after %.0fs ceiling on %d chars: %s: %s",
                          ceiling, len(text), type(e).__name__, e)
             return None
         return None
 
-    # ⛔ REMOVED (C4): `generate_summary` — the LLM-narrative synthesis method
-    # the thematic fold used to call. §3.1/§4.2 Path A step 2 replace that
-    # entirely with a zero/low-inference Zettelkasten concatenation
-    # (`fold_record_line` over each constituent's own tight text, built
-    # inline in `_consolidate_clusters`) — no LLM call, no preservation
-    # gate, no truncation handling, no cumulative "previous + new" merge.
-    # `NREM_MAX_TOKENS_SUMMARY` / its truncation-retry math stay defined
-    # (an existing deployment's env override must not start erroring) but
-    # are no longer read by anything. The insight fold (Path B) ALSO
-    # changed kind as of v0.8.71 (decision:1205): §3.2's "synthesised
-    # natural language" is now assembled BY CODE from bounded LLM
-    # distillates, not written whole by the LLM — see
-    # `generate_insight_slots` / `_assemble_insight_content` below.
+    # The thematic fold no longer calls an LLM, so NREM_MAX_TOKENS_SUMMARY is defined but unread. decision:1205: insight text is assembled from bounded distillates, not written whole by the LLM.
 
     async def _call_insight_llm(self, prompt, entity, units, items=None,
                                 only_ids=None, need_principle=True):
@@ -2648,16 +2278,7 @@ class ConsolidationDaemon:
                     }, ceiling_s=_ceiling, prompt_chars=len(prompt))
                     refusal = _routing_refusal(resp)
                     if refusal:
-                        # F-1/F-2: the gateway declined to place this job — a
-                        # config gap, never evidence about this fold. Log
-                        # loudly ONCE, fail this call WITHOUT poisoning the
-                        # fold (neither _last_llm_truncated nor
-                        # _last_llm_missing_slots is set, so _fold_insight's
-                        # three-way branch takes its plain "ledger rows stay
-                        # open, next sweep retries" path — no
-                        # truncation_failures/slot_failures charge), and
-                        # never widen to bound[1] (no retry of a refused call
-                        # within this cycle).
+                        # A gateway routing refusal is a config gap. Do not set the truncation or slot flags, and do not retry the wider bound; the ledger stays open.
                         logger.warning(
                             "NREM: insight fold for '%s' REFUSED by gateway "
                             "routing (constraint=%s role=%s) — fold skipped, "
@@ -2676,8 +2297,7 @@ class ConsolidationDaemon:
                             "NREM: insight slots for '%s' TRUNCATED at max_tokens=%d — "
                             "retrying ONCE at %d before failing the fold",
                             entity, max_tokens, bounds[1])
-                # FAIL-THE-UNIT: a truncated draft never reaches the parser —
-                # no partial slot set is ever assembled from it.
+                # A truncated draft never reaches the parser.
                 self._last_llm_truncated = True
                 logger.error(
                     "NREM: insight slots for '%s' TRUNCATED again at max_tokens=%d "
@@ -2714,11 +2334,7 @@ class ConsolidationDaemon:
         items = _insight_slot_items(rows)
         expected_ids = {it["pg_id"] for it in items}
 
-        # F2 (multi-role review): MOCK_LLM is checked ONLY inside
-        # `_call_insight_llm` now — this method's own code path (build
-        # prompt, call, parse, retry-if-missing, fail-if-still-missing) is
-        # IDENTICAL whether mocked or live, so a mocked cycle exercises the
-        # real parser and the real retry logic, never a shortcut around them.
+        # MOCK_LLM is handled only inside _call_insight_llm, so a mocked cycle still runs this parser and the one retry.
         prompt = _build_insight_prompt(entity, items, previous_insight=previous_insight,
                                        reversal_lines=reversal_lines)
         text = await self._call_insight_llm(prompt, entity, units=max(1, len(items)),
@@ -2782,9 +2398,7 @@ class ConsolidationDaemon:
         (it feeds the idle clock and `sweep_due`), and is cleared here because
         this cycle has now considered everything those notifications could have
         contributed."""
-        # Requeued ids are unioned in as belt-and-braces: a fold that failed
-        # left its outbox rows at 'rem_reviewed', so the ledger already carries
-        # them — but a re-queue must never depend on that being true.
+        # Union requeued ids in. A failed fold should still be on the ledger, but a re-queue must not depend on that.
         ids_to_process = sorted(
             set(ids if ids is not None else self._backlog) | set(self.pending_pg_ids))
         if not ids_to_process:
@@ -2806,8 +2420,7 @@ class ConsolidationDaemon:
                     "enrichment progress.",
                     DENSITY_THRESHOLD, len(ids_to_process),
                 )
-                # Say so on the record: an unrecorded idle run is read as a
-                # stall by the health surface (see _crun_record_idle).
+                # Record the idle run. An unrecorded idle is read as a stall.
                 loop = asyncio.get_running_loop()
                 await loop.run_in_executor(
                     None, lambda: _crun_record_idle("fact_consolidation"))
@@ -2816,8 +2429,7 @@ class ConsolidationDaemon:
             await self._consolidate_clusters(rows)
 
         except Exception as e:
-            # Nothing to re-queue — the entry points came from the durable
-            # ledger and are still there for the next pass.
+            # Nothing to re-queue: the entry points are still on the durable ledger.
             logger.error(f"Consolidation cycle failed: {str(e)}")
 
     async def _find_grounded_fact_groups(self):
@@ -2871,8 +2483,7 @@ class ConsolidationDaemon:
                 f" MATCH (f)-[:{ONT.domain_of}]->(dom:{ONT.domain})"
                 f"           -[:{ONT.project_of}]->(proj:{ONT.project})"
                 f" WITH DISTINCT f, proj.name AS project, dom.name AS domain"
-                # rem_summary wins when present (long facts REM condensed); short
-                # facts carry their curated text verbatim (non-destructive REM).
+                # rem_summary when REM condensed a long fact; otherwise the curated text.
                 f" RETURN f.pg_id AS pg_id,"
                 f"        coalesce(f.rem_summary, f.content) AS content,"
                 f"        project, domain"
@@ -2984,7 +2595,7 @@ class ConsolidationDaemon:
                     )
                     logger.info("Ledger sweep: reconciled summary %d, closed %d rows.", summary_id, closed)
 
-                # C3: widened input set — see fetch_combined_fact_backlog.
+                # Same widened set as fetch_combined_fact_backlog: outbox union lineage invalidation.
                 backlog = await loop.run_in_executor(None, lambda: fetch_combined_fact_backlog(conn))
             finally:
                 await loop.run_in_executor(None, conn.close)
@@ -3015,7 +2626,7 @@ class ConsolidationDaemon:
             await self._consolidate_clusters(rows)
 
         except Exception as e:
-            # Nothing to re-queue — the ledger is durable; the next sweep retries.
+            # Nothing to re-queue: the ledger is durable and the next sweep retries.
             logger.error(f"Ledger sweep failed: {str(e)}")
 
     async def run_global_sweep(self):
@@ -3049,7 +2660,7 @@ class ConsolidationDaemon:
             await self._consolidate_clusters(rows)
 
         except Exception as e:
-            # Nothing to re-queue — the next sweep re-evaluates the whole graph.
+            # Nothing to re-queue: the next sweep re-evaluates the whole graph.
             logger.error(f"Global sweep failed: {str(e)}")
 
     async def _consolidate_clusters(self, rows):
@@ -3077,11 +2688,7 @@ class ConsolidationDaemon:
             None, lambda: psycopg2.connect(PG_CONN, connect_timeout=5)
         )
         try:
-            # Record map for every fact across all clusters (single batch).
-            # PROJECT via project_axis.PROJECT_SQL (the one resolution). SECTION
-            # via domain_axis.resolve_domains over the same metadata blob —
-            # never the historical squat where metadata.domain held the project.
-            # Kind: facts from source_ref; judgements via decision 1080.
+            # One batch for every fact: project from PROJECT_SQL, section from resolve_domains, never the old metadata.domain squat. Fact kind comes from source_ref; judgement kind uses decision 1080.
             all_ids = sorted({r["pg_id"] for r in rows})
             def _fetch_records(ids=all_ids):
                 if not ids:
@@ -3096,7 +2703,7 @@ class ConsolidationDaemon:
                         (ids,),
                     )
                     rows = cur.fetchall()
-                # Grounding kinds for any judgement rows (1080).
+                # Grounding kinds for judgement rows (decision 1080).
                 judgement_ids = [
                     r[0] for r in rows
                     if (r[2] or "fact") in ("decision", "retrospective")
@@ -3138,8 +2745,7 @@ class ConsolidationDaemon:
                     rtype = rtype or "fact"
                     meta = meta if isinstance(meta, dict) else {}
                     sections = resolve_domains(meta)
-                    # §3.1 `entities` — the HUMAN-ASSERTED entities of the
-                    # constituent facts (payload, never a gate key — §2.1).
+                    # Human-asserted entities travel in the payload. They are not a gate key.
                     raw_entities = meta.get("entities")
                     entities = sorted({
                         e.strip() for e in (raw_entities or [])
@@ -3151,8 +2757,7 @@ class ConsolidationDaemon:
                         "rtype": rtype,
                         "kind": evidential_kind_for_record(
                             rtype, sref, grounded_kinds.get(pid)),
-                        # ORIGIN / instrument locus (decision 916 + 1080): may
-                        # still cite a judgement's source_ref; kind does not.
+                        # Origin may still cite a judgement source_ref (decision 916). Kind does not (decision 1080).
                         "origin": origin_location(sref),
                         "recorded": str(recorded) if recorded else "unknown",
                         "entities": entities,
@@ -3160,16 +2765,7 @@ class ConsolidationDaemon:
                 return out
             record_map = await loop.run_in_executor(None, _fetch_records)
 
-            # ✅ v2 FACT GATE (plan §2.1) — the ONLY level. project/domain/
-            # registered-ness all come from `rows` — the graph-native
-            # GROUNDED_IN/DOMAIN_OF/PROJECT_OF walk `_find_grounded_fact_groups`
-            # already ran — not from Postgres metadata, so there is no second
-            # source of truth for "which axis pair a fact belongs to" to drift
-            # against the first. A DOMAIN_OF/PROJECT_OF edge only exists for a
-            # REGISTERED section (coordinator.py's `_domain_identities`), so
-            # `registered_sections` built from these SAME rows is a correctness
-            # confirmation for `eligible_domain_level_clusters`, not a second
-            # Postgres registry lookup.
+            # Axis membership comes from the graph walk already in these rows, not a second Postgres lookup. A DOMAIN_OF edge exists only for a registered section.
             content_by_pid: dict = {}
             project_map: dict = {}
             domains_map: dict = {}
@@ -3185,10 +2781,7 @@ class ConsolidationDaemon:
             pg_ids_all = list(content_by_pid)
             contents_all = [content_by_pid[pid] for pid in pg_ids_all]
 
-            # work_items: (project, section, contents, pg_ids) — no entity, no
-            # project-only level (§2.1: "There is NO project level and NO
-            # entity level"). `eligible_domain_level_clusters` is the SAME
-            # partitioner already proven for the (project, section) gate.
+            # Only (project, section) folds. There is no entity level and no project-only level.
             work_items = [
                 (project, section, c, p)
                 for (project, section), c, p in eligible_domain_level_clusters(
@@ -3197,19 +2790,10 @@ class ConsolidationDaemon:
                 )
             ]
 
-            # Skip clusters whose member-ref key already hit truncation/slot fail cap; fetch before census so they are not counted as backlog (fact:1189).
+            # Fetch the fail cap before the census so a capped cluster is not counted as backlog (fact:1189).
             dead_letter = await loop.run_in_executor(None, fetch_fold_dead_letter_counts)
 
-            # D1 — partition BEFORE the census, not inside the fold loop, so
-            # the census below only ever sees clusters actually eligible to
-            # fold this pass. label is the human-readable display name
-            # (telemetry/logs); fold_key is the content-derived dead-letter
-            # identity — see _fold_identity (decision 882). Kept as a
-            # defensive check even though nothing on THIS path can populate
-            # it any more (§3.1 — see the note below): a dead-letter row
-            # written by code that predates this release can still
-            # legitimately skip a cluster until it ages out of
-            # NREM_FOLD_FAIL_WINDOW.
+            # Partition before the census: label is display-only and fold_key is the member-ref identity (decision 882). An old dead-letter row can still skip a cluster until the window ages out.
             eligible_work_items = []
             dead_lettered_count = 0
             for project, section, contents, pg_ids in work_items:
@@ -3227,21 +2811,7 @@ class ConsolidationDaemon:
                     continue
                 eligible_work_items.append((project, section, contents, pg_ids))
 
-            # ── OUTPUT-IDENTITY PARTITION (operator ruling 2026-08-11) ──
-            # The plan's deterministic ordering exists so "the summary is
-            # upserted and its content compared across re-folds" — this is
-            # that comparison, previously never implemented: without it every
-            # sweep re-embedded and rewrote every eligible group forever
-            # (measured live: the same two summaries rewritten every ~15 min
-            # for a full afternoon after the last save, their 20-entry
-            # summary_history rings churned to identical snapshots). The
-            # fold output is zero-inference and therefore free to compute;
-            # compute it FIRST, compare against the ACTIVE row, and only
-            # embed + write when something actually changed. A superseded
-            # constituent, P12 subset supersession, or Mechanism B
-            # retirement all still refold: they change the computed output,
-            # the member set, or remove the active row entirely — the check
-            # fails open to folding on every divergence.
+            # The fold is deterministic, so compare it to the active row before embedding. A byte-identical rewrite is skipped; any membership or text change still folds.
             active_rows = await loop.run_in_executor(
                 None, lambda: fetch_active_thematic_rows(
                     conn, [(p or "", s or SECTION_NONE)
@@ -3257,9 +2827,7 @@ class ConsolidationDaemon:
                 summary = "\n".join(
                     fold_record_line(r, content) for content, r in zip(contents, recs)
                 )
-                # §3.1 `entities` — union of the constituents' own
-                # human-asserted entities. Payload only, never a gate key
-                # (§2.1: "entities do NOT gate").
+                # Union of the members' human-asserted entities. Payload only, not a gate key.
                 entities = sorted({
                     e for pid in pg_ids
                     for e in (record_map.get(pid) or {}).get("entities") or []
@@ -3277,16 +2845,7 @@ class ConsolidationDaemon:
                     "be byte-identical, skipped without embedding or write "
                     "(unchanged_clusters).", rec.unchanged_clusters)
 
-            # Coverage census — AFTER the gate (the gate this cycle folds),
-            # after dead-letter exclusion (D1: a permanently-failing cluster
-            # is not eligible backlog), AND after the output-identity
-            # partition above (an already-current cluster is not backlog
-            # either — counting it would leave the ADR-018 stall verdict
-            # reading "eligible backlog present, no fold succeeded" forever
-            # on a fully-current corpus). dead_lettered_count and
-            # unchanged_clusters are each reported separately — never folded
-            # into eligible_clusters' existing meaning (CLAUDE.md Group 3: a
-            # metric whose meaning changes must change name).
+            # Census after the gate, after dead-letter exclusion, and after the unchanged skip. Those two counts stay separate from eligible_clusters.
             member_id_lists = [list(w[3]) for w in fold_work_items]
             all_member_ids = [pid for ids in member_id_lists for pid in ids]
             ts_map = await loop.run_in_executor(
@@ -3296,34 +2855,19 @@ class ConsolidationDaemon:
                 member_id_lists, ts_map, DENSITY_THRESHOLD)
             rec.dead_lettered_clusters = dead_lettered_count
 
-            # I7 (refold_ledger clock): every fact this pass evaluated
-            # (pg_ids_all, the full _find_grounded_fact_groups scan) but
-            # which did NOT land in ANY density-gated cluster — regardless of
-            # dead-letter status; a dead-lettered cluster's members DID gate
-            # (they met density), they are simply not folding again right
-            # now, which is a different fact from never having gated at all
-            # — is a candidate that does not gate — close any OPEN
-            # refold_ledger row citing it as dropped/below_density rather
-            # than let it sit open forever inflating the backlog count for a
-            # group that cannot fold on its own right now.
+            # A scanned fact that never met density is not backlog. Close its open refold_ledger row instead of leaving it forever.
             all_gated_member_ids = [pid for w in work_items for pid in w[3]]
             below_density_ids = sorted(set(pg_ids_all) - set(all_gated_member_ids))
             await loop.run_in_executor(
                 None, lambda: drop_below_density_refold_rows(
                     conn, below_density_ids, context="fact_consolidation"))
 
-            # C3.1 F1: a ledger row whose pg_id never entered pg_ids_all at
-            # all (ungrounded or domainless — outside this scan entirely)
-            # cannot be reached by the below_density close above, which only
-            # sees pg_ids_all's own members. Close those separately, with a
-            # distinct reason, so the two zombie classes stay distinguishable.
+            # A pg_id that never entered the scan cannot be closed as below-density. Close it with a distinct reason.
             await loop.run_in_executor(
                 None, lambda: drop_out_of_scan_refold_rows(
                     conn, pg_ids_all, context="fact_consolidation"))
 
-            # No entity, no project-only level (§2.1) — every work item folds
-            # at LEVEL_DOMAIN with an empty entity/aliases. Constants, not
-            # per-item fields, so the loop body below still reads naturally.
+            # Every item folds at domain level with an empty entity. These are constants, not per-item fields.
             entity = ""
             level = LEVEL_DOMAIN
             aliases: list = []
@@ -3331,34 +2875,13 @@ class ConsolidationDaemon:
             for project, section, summary, pg_ids, entities in fold_work_items:
                 label = f"domain:{project}/{section or SECTION_NONE}"
 
-                # §3.1/§4.2 Path A step 2 — THE ZETTELKASTEN INDEX: a
-                # structured concatenation mapping each constituent pg_id to
-                # its own tight text (already `coalesce(rem_summary,
-                # content)` per `_find_grounded_fact_groups`). ZERO/LOW
-                # INFERENCE — no LLM call, no preservation gate, no
-                # dead-letter-producing failure mode, and no "previous +
-                # new" cumulative merge: every re-fold recomputes the
-                # group's FULL current membership fresh (`_find_grounded_
-                # fact_groups`' own docstring: "an already-folded fact must
-                # keep counting toward the next re-fold"), which is why
-                # there is no "previous summary" fetch here — a delta-merge
-                # concept that only ever made sense for a narrative. The
-                # `summary` text and `entities` union were computed in the
-                # output-identity partition above (the same zero-inference
-                # build, done once); a work item reaching this loop is one
-                # whose output DIFFERS from the active row (or has no
-                # active row), so the embedding below is never spent on a
-                # byte-identical rewrite. This REPLACES the LLM-narrative
-                # path the removed `generate_summary` method used to run
-                # for facts (Path B / insight fold still synthesises —
-                # §3.2 says "synthesised natural language", §3.1 does not).
+                # Zero-inference index: each member's own text, recomputed from the full current membership. This loop runs only when that text differs from the active row.
                 topic = f"{project}/{section}"
                 logger.info(
                     "Building Zettelkasten index for '%s' [project=%s section=%s "
                     "level=%s] (%d facts)...",
                     topic, project, section or SECTION_NONE, level, len(pg_ids))
 
-                # 3. Vectorize
                 embedding = await self.get_embedding(summary)
                 if not embedding:
                     logger.error("Failed to vectorize summary for %s. Re-queueing IDs.",
@@ -3367,10 +2890,7 @@ class ConsolidationDaemon:
                     self._requeue(pg_ids)
                     continue
 
-                # 4. Postgres write: summary + ledger flag, one transaction,
-                #    committed BEFORE the graph marking.
-                # Key shape (migration 029): project + section domain + level;
-                # entity empty string at domain level (COALESCE in unique index).
+                # Summary and ledger flag commit before graph marking. The unique key is project, section, and level, with entity '' at domain level.
                 metadata = {
                     "type": "community_summary",
                     "kind": "thematic",
@@ -3381,10 +2901,7 @@ class ConsolidationDaemon:
                     "aliases": aliases,
                     "source_pg_ids": pg_ids,
                     "entities": entities,
-                    # §3.1 `cypher_query` — the traversal that rebuilds this
-                    # group's provenance neighbourhood at READ time, rather
-                    # than duplicating graph depth into the payload
-                    # (decision:912/1032/1059).
+                    # Read-time provenance walk, not a copy of the neighbourhood in the payload (decision:912/1032/1059).
                     "cypher_query": thematic_cypher_query(pg_ids),
                     "timestamp": datetime.now().isoformat()
                 }
@@ -3395,15 +2912,7 @@ class ConsolidationDaemon:
                     _level = level
                     def _write_summary():
                         with conn.cursor() as cur:
-                            # ON CONFLICT matches migration 032's partial unique
-                            # index (rebuilds 029 with "AND NOT superseded" —
-                            # C3.1 F0). Without the added predicate here this
-                            # arbiter would still match a lineage-RETIRED row on
-                            # the same axis key and UPDATE it in place, and the
-                            # UPDATE branch below never clears `superseded` — the
-                            # row would stay retired forever. With it, a retired
-                            # row no longer conflicts and the INSERT below lands
-                            # a fresh ACTIVE row instead.
+                            # ON CONFLICT must include AND NOT superseded (migration 032). Otherwise a lineage-retired row matches, and the UPDATE never clears superseded.
                             cur.execute("""
                                 INSERT INTO community_summaries (content, metadata, embedding, source_pg_ids, run_id)
                                 VALUES (%s, %s, %s, %s, %s)
@@ -3470,7 +2979,6 @@ class ConsolidationDaemon:
                     self._requeue(pg_ids)
                     continue
 
-                # 5. Graph sync + ledger close.
                 try:
                     await self._mark_consolidated_in_graph(
                         pg_ids, summary_pg_id, entity or "", project,
@@ -3491,13 +2999,11 @@ class ConsolidationDaemon:
                         label, summary_pg_id, e,
                     )
 
-            # U4 close, beside the outbox close above: any refold_ledger row
-            # a fold in THIS pass just covered transitions to 'refolded'.
+            # Beside the outbox close: refold_ledger rows this pass covered become refolded.
             await loop.run_in_executor(
                 None, lambda: close_refold_ledger_rows(conn, context="fact_consolidation"))
         except Exception as e:
-            # Cycle-level crash (e.g. domain fetch / cluster iteration) — record
-            # 'crashed' + log, then re-raise to the caller's existing handler.
+            # Record crashed, then re-raise so the caller's handler still runs.
             logger.error(
                 "Consolidation run [fact_consolidation] CRASHED after %d/%d folds: %s: %s (run_id=%s)",
                 rec.succeeded, rec.attempted, type(e).__name__, str(e)[:200], run_id)
@@ -3550,7 +3056,6 @@ class ConsolidationDaemon:
                 fact_ids=pg_ids, summary_pg_id=summary_pg_id,
                 entity=entity or "", project=project or "",
                 section=section or SECTION_NONE, level=level or LEVEL_ENTITY)
-            # SUPERSEDES edges for any Postgres-superseded summaries
             if superseded_ids:
                 await session.run(
                     f"MATCH (new:{ONT.community_summary} {{pg_id: $new_id}})"
@@ -3560,7 +3065,7 @@ class ConsolidationDaemon:
                     new_id=summary_pg_id, old_ids=superseded_ids
                 )
 
-    # ── Insight consolidation (decision pg_id 276) ────────────────────────────
+    # Insight consolidation (decision pg_id 276).
 
     async def _find_fresh_insight_clusters(self):
         """✅ THE v2 INSIGHT GATE (plan §2.2-§2.4) — replaces the pre-v2 1-hop
@@ -3654,7 +3159,7 @@ class ConsolidationDaemon:
             registered_sections.add((r["project"], r["domain"]))
         pg_ids_all = list(project_map)
 
-        # G1 — reused, not re-derived (same call `_consolidate_clusters` makes).
+        # Same partitioner as the fact cycle, not a second derivation.
         groups = eligible_domain_level_clusters(
             [""] * len(pg_ids_all), pg_ids_all, project_map, domains_map,
             DENSITY_THRESHOLD, registered_sections,
@@ -3678,15 +3183,7 @@ class ConsolidationDaemon:
                     )
                     continue
                 clusters.append({
-                    # D3 (fact:1189) — an honest project/domain-derived
-                    # DISPLAY label, matching the fact cycle's own `label`
-                    # convention (`f"domain:{project}/{section or
-                    # SECTION_NONE}"`, above). This is NOT the fold identity
-                    # (decision 882) — that stays `_judgement_fold_identity`
-                    # (comp's own member ids), untouched. Multiple components
-                    # from the same (project, domain) group legitimately
-                    # share this label; it is a log/metadata display value,
-                    # never a key.
+                    # fact:1189: display label only, same shape as the fact cycle. Not the fold identity (decision 882); several components may share it.
                     "entity": f"{project}/{section or SECTION_NONE}",
                     "decision_ids": decision_ids,
                     "projects": [project],
@@ -3697,16 +3194,7 @@ class ConsolidationDaemon:
                 })
         return clusters
 
-    # ⛔ REMOVED (C4): `_fetch_outcome_edges` / `_fetch_grounding_edges` — the
-    # Neo4j reads that fed the pre-C4 insight prompt's [RETROSPECTIVE ...] /
-    # [GROUNDING ...] lines. §3.2 restricts the insight TEXT to strictly each
-    # judgement's own Title+Rationale; retrospectives are now folded in
-    # directly as their own ordered judgement blocks (each is a first-class
-    # `technical_docs` row under retro-as-record), and grounding-edge detail
-    # (GROUNDED_IN/INFORMED_BY/CONSIDERED/REJECTED/UNDER_CONDITIONS) is
-    # deferred to the graph walk (`insight_cypher_query`) rather than
-    # rendered into the prompt. `_fold_insight` below no longer needs a
-    # Neo4j session at all.
+    # The pre-C4 edge fetches are gone. Insight text is each judgement's title and rationale; edge detail stays in insight_cypher_query, and _fold_insight does not open a Neo4j session.
 
     async def run_insight_cycle(self):
         """Insight consolidation pass — ledger-driven like run_ledger_sweep
@@ -3727,12 +3215,11 @@ class ConsolidationDaemon:
             return
         try:
             async with self._record_cycle("insight") as rec:
-                # 0. Reconcile — re-apply unconfirmed graph markings, close rows.
+                # Re-apply unconfirmed graph markings and close those rows.
                 try:
                     stuck = await loop.run_in_executor(None, lambda: fetch_unreconciled_insights(conn))
                 except Exception as e:
-                    # Pre-migration schema (no kind metadata is fine; missing
-                    # superseded column is not) — nothing to reconcile either way.
+                    # A failed reconciliation query leaves nothing to reconcile this pass.
                     logger.warning(f"Insight cycle: reconciliation query failed: {str(e)}")
                     stuck = []
                 for summary_id, entity, src_ids in stuck:
@@ -3746,24 +3233,16 @@ class ConsolidationDaemon:
                     )
                     logger.info("Insight cycle: reconciled insight %d, closed %d rows.", summary_id, closed)
 
-                # 1. Re-folds — active insights with un-dreamed retrospectives.
-                #    fetch_refold_insights self-guards on empty retro_ids.
+                # Re-fold active insights that still have un-dreamed retrospectives. Empty retro ids yield nothing.
                 retro_ids = await loop.run_in_executor(None, lambda: fetch_open_retro_decision_ids(conn))
                 refolds = await loop.run_in_executor(
                     None, lambda: fetch_refold_insights(conn, retro_ids)
                 )
-                # Fold dead-letter cap (see module docstring) — checked at the
-                # call sites so _fold_insight's query order stays untouched.
+                # The dead-letter cap is checked here so _fold_insight's query order stays unchanged.
                 dead_letter = await loop.run_in_executor(None, fetch_fold_dead_letter_counts)
 
                 def _dead_lettered(entity, judgement_ids, types):
-                    # label is the human-readable display name (telemetry/
-                    # logs); key is the content-derived dead-letter identity
-                    # — see _judgement_fold_identity's docstring. Must match
-                    # what _fold_insight computes internally from the SAME
-                    # ids (and the SAME source of truth for types — Postgres
-                    # `metadata->>'type'`) for a failure recorded here to be
-                    # found on a later lookup.
+                    # label is for logs. The dead-letter key must match what _fold_insight computes from the same ids and metadata type.
                     label = f"insight/{entity}"
                     key = _judgement_fold_identity(judgement_ids, types)
                     if dead_letter.get(key, 0) >= NREM_FOLD_FAIL_CAP:
@@ -3777,9 +3256,7 @@ class ConsolidationDaemon:
                         return True
                     return False
 
-                # Track only ids actually FOLDED (not merely attempted): an
-                # aborted fold (LLM down, <2 rows) must not suppress a fresh cluster
-                # that shares its ids — that work should still be tried this pass.
+                # Only ids that actually folded. An aborted fold must not hide a fresh cluster that shares them.
                 folded: set = set()
                 for old_id, entity, src_ids, prev_content, prev_metadata in refolds:
                     prev_metadata = prev_metadata or {}
@@ -3791,10 +3268,7 @@ class ConsolidationDaemon:
                         "Insight cycle: re-folding insight %d ('%s') — new retrospective(s) on %s.",
                         old_id, entity, sorted(set(src_ids) & set(retro_ids)),
                     )
-                    # C4: `summary_ids`/`project` are OWNED by this insight and
-                    # a re-fold does not change which thematic summaries it
-                    # rests on (only a new retrospective triggered it) — carry
-                    # them forward rather than losing them.
+                    # A re-fold does not change which thematic summaries this insight rests on, so carry summary_ids and project forward.
                     ok = await self._fold_insight(
                         conn, entity, src_ids, previous_insight=prev_content,
                         summary_ids=prev_metadata.get("summary_ids"),
@@ -3804,25 +3278,9 @@ class ConsolidationDaemon:
                     if ok:
                         folded.update(src_ids)
 
-                # 2. Fresh clusters from the graph gate.
                 clusters = await self._find_fresh_insight_clusters()
 
-                # §2.5 identity resolution — LOCKED: an insight's identity is
-                # the SET of judgement pg_ids it covers. C4 makes
-                # `source_pg_ids` judgement-inclusive (criterion C fixed the
-                # `_mark_insight_in_graph` seam), so this comparison is now
-                # exact, not an approximation:
-                #   'same'    -- no new insight; APPEND the triggering
-                #                thematic summary id + domain onto the
-                #                EXISTING insight (criterion G).
-                #   'covered' -- the existing insight already covers this
-                #                reach in full (not in §2.5's LOCKED table —
-                #                insight_gate.classify_identity's own
-                #                defensive extra case); nothing to add,
-                #                nothing to fold. Logged, not silent.
-                #   'supersedes' / 'overlap' / 'disjoint' -- fold as normal;
-                #                subset-coverage supersession (Mechanism A)
-                #                resolves 'supersedes' at write time.
+                # Identity is the set of judgement pg_ids. 'same' appends onto the existing insight; 'covered' adds nothing; the other classes fold, and subset supersession resolves 'supersedes' at write time.
                 existing_insights = await loop.run_in_executor(
                     None, lambda: fetch_active_insight_rows(conn))
                 surviving = []
@@ -3863,20 +3321,7 @@ class ConsolidationDaemon:
                     )
                 clusters = surviving
 
-                # D1 (fact:1189, decision:1121/I7): partition dead-lettered
-                # clusters out BEFORE the census, not inside the fold loop —
-                # a cluster NREM_FOLD_FAIL_CAP has permanently skipped must
-                # not count as eligible backlog, or the backlog this cycle
-                # reports (and _consolidation_stall_verdict, coordinator.py,
-                # reads) can never clear once one exists. dead_lettered_now
-                # is reported separately (rec.dead_lettered_clusters, a NEW
-                # telemetry key) — never folded into eligible_clusters'
-                # existing meaning (CLAUDE.md Group 3: a metric whose meaning
-                # changes must change name). This is the ONE place
-                # `_dead_lettered` is called for a fresh cluster — its
-                # logging/rec.fold_dead_letter side effect must fire exactly
-                # once per dead-lettered cluster, so the fold loop below no
-                # longer re-checks it.
+                # fact:1189, decision:1121: drop dead-lettered clusters before the census and count them separately, so a capped cluster cannot look like backlog forever.
                 eligible_clusters = []
                 dead_lettered_now = 0
                 for c in clusters:
@@ -3887,29 +3332,7 @@ class ConsolidationDaemon:
                     eligible_clusters.append(c)
                 clusters = eligible_clusters
 
-                # Operator ruling 2026-08-16 — third application of the
-                # I7/decision:1121 class ("a deliberate skip must not read
-                # as a stall"), following the exact precedent of D1's
-                # dead_lettered_clusters (fact:1189) and unchanged_clusters
-                # (fact:1240): a component whose judgement reach is exactly
-                # 1 record cannot fold an insight — there is nothing to
-                # relate yet — and the fold code has never SUCCEEDED on such
-                # a component: it WAS attempted every cycle and aborted at
-                # `_fold_insight`'s `len(rows) < 2` guard (the measured 48
-                # attempts/0 successes in 24h cited in `extra()` above). Left
-                # inside eligible_clusters, a permanent singleton reads every
-                # cycle as backlog the fold "failed" to clear, when it is in
-                # fact a doomed attempt this partition now stops before the
-                # fold ever runs. Partitioned out HERE, before the census,
-                # exactly like the dead-letter partition above — never inside
-                # the fold loop, so it is captured even on a mid-fold crash.
-                # Reported under rec.singleton_clusters, a NEW additive
-                # telemetry key — never folded into eligible_clusters'
-                # existing meaning (CLAUDE.md Group 3: a metric whose
-                # meaning changes must change name; here eligible_clusters
-                # narrows consistently with its two prior exclusions, and
-                # the excluded population gets its own name, same as
-                # dead-lettered and unchanged clusters before it).
+                # decision:1121: judgement reach of exactly 1 cannot fold (fact:1189, fact:1240). Partition it out before the census and count it as singleton_clusters, not eligible backlog.
                 non_singleton_clusters = []
                 singleton_now = 0
                 for c in clusters:
@@ -3927,14 +3350,7 @@ class ConsolidationDaemon:
                         singleton_now,
                     )
 
-                # Coverage census (PR-2) — captured BEFORE folding so a crash
-                # mid-fold still records what was eligible. eligible_clusters =
-                # uncovered insight opportunities NOT already dead-lettered;
-                # oldest age = the K-th-oldest member's outbox write-time
-                # (eligibility onset) of the most neglected cluster. Uses the
-                # FULL judgement reach (C4) — a component whose only new
-                # member is a retrospective must still be visible to the
-                # staleness census.
+                # Census before folding so a crash still records eligibility. Age uses the full judgement reach, including a component whose only new member is a retrospective.
                 cluster_id_lists = [
                     [int(i) for i in c["judgement_ids"] if i is not None] for c in clusters
                 ]
@@ -3966,11 +3382,7 @@ class ConsolidationDaemon:
                     if ok:
                         folded.update(ids)
 
-                # U4 close, beside the outbox closes above: any refold_ledger
-                # row a fold in THIS pass just covered transitions to
-                # 'refolded' (both kinds — cheap, and correct regardless of
-                # whether this particular pass folded thematic or insight
-                # rows, since close_refold_ledger_rows checks both).
+                # Beside the outbox closes: refold_ledger rows this pass covered become refolded, for either kind.
                 await loop.run_in_executor(
                     None, lambda: close_refold_ledger_rows(conn, context="insight"))
         except Exception as e:
@@ -4025,12 +3437,7 @@ class ConsolidationDaemon:
                 )
                 return cur.fetchall()
         rows = await loop.run_in_executor(None, _fetch_judgements)
-        # Singleton components (judgement reach of exactly 1) are partitioned
-        # out upstream in `run_insight_cycle` (operator ruling 2026-08-16) and
-        # never reach this call, so this guard no longer needs to cover that
-        # case — it now means purely what its log message says: a
-        # graph/Postgres divergence, some requested judgement id(s) missing
-        # from `technical_docs`.
+        # Reach of 1 never gets here. Fewer than 2 rows means some requested judgement ids are missing from Postgres.
         if len(rows) < 2:
             logger.warning(
                 "Insight fold for '%s' skipped: only %d of %d source judgements found in Postgres.",
@@ -4038,20 +3445,11 @@ class ConsolidationDaemon:
             )
             return False
 
-        # Content-derived dead-letter identity — computed from the SAME rows
-        # just fetched (so it agrees with the caller's pre-check, which used
-        # `fetch_judgement_types`/`_find_fresh_insight_clusters`'s own
-        # `judgement_types` — same underlying `technical_docs.metadata->>
-        # 'type'` source of truth either way).
+        # Dead-letter key from these rows, so it matches the caller's pre-check on the same metadata type.
         types = {int(r[0]): (r[3] or "decision") for r in rows}
         fold_key = _judgement_fold_identity(src_ids, types)
 
-        # Project/domain/entity union across the component — independent of
-        # the LLM call, still needed for the write's metadata. Ascending
-        # pg_id (SQL ORDER BY id) is §2.4's within-component order; this
-        # call always folds exactly ONE component, so there is no
-        # cross-component order to additionally apply here (`rows` is also
-        # re-sorted explicitly inside `_assemble_insight_content`).
+        # Project, domain, and entity are a union over this one component, independent of the LLM call. Within-component order is ascending pg_id.
         seen_projects: dict = {}   # project -> count, for the mode fallback
         domains_all: set = set()
         entities_all: set = set()
@@ -4071,14 +3469,7 @@ class ConsolidationDaemon:
         entities = sorted(entities_all)
         summary_ids = sorted({int(s) for s in (summary_ids or []) if s is not None})
 
-        # Criterion D — the reversal payload obligation (carried outside §3;
-        # see HANDOFF.md). Independent of the walk/gate: driven by
-        # refold_ledger trigger provenance, so it needs neither of §2.2a's
-        # two open edge cases resolved. decision:1205: these lines are
-        # already machine-built strings — included VERBATIM in the
-        # assembled scaffold (`_assemble_insight_content`), so the WHAT/WHY
-        # obligation is satisfied BY CONSTRUCTION; no anchor/LLM-compliance
-        # step is needed to keep them intact any more.
+        # decision:1205: reversal lines are already machine-built and copied verbatim into the scaffold, so no preservation gate has to protect them.
         reversals = await loop.run_in_executor(
             None, lambda: fetch_reversal_context(conn, src_ids))
         reversal_lines = [
@@ -4089,14 +3480,7 @@ class ConsolidationDaemon:
             for r in reversals
         ]
 
-        # Snapshot the consumable ledger rows BEFORE the LLM call: a
-        # retrospective arriving mid-fold stays open and re-triggers. Then
-        # COMMIT to end the read transaction — psycopg2 opens one on the first
-        # execute and would otherwise sit idle-in-transaction across the
-        # multi-minute LLM call, pinning xmin and blocking autovacuum on the
-        # high-churn outbox/technical_docs tables. The snapshot lives in Python;
-        # the later ledger flip re-checks status IN ('applied','rem_reviewed'),
-        # so closing the read transaction here is semantically free.
+        # Snapshot consumable outbox rows, then commit, so the read transaction does not sit idle across the LLM call. A retrospective that arrives mid-fold stays open; the later flip re-checks status.
         row_ids = await loop.run_in_executor(
             None, lambda: fetch_insight_outbox_rows(conn, src_ids)
         )
@@ -4111,10 +3495,7 @@ class ConsolidationDaemon:
             reversal_lines=reversal_lines)
         if not slots:
             if self._last_llm_truncated:
-                # Capacity failure — the truncated draft never reached the
-                # parser; no partial slot set was ever assembled from it.
-                # Open ledger rows are the durable requeue; the fold-failure
-                # cap dead-letters repeat offenders.
+                # Truncation never reaches the parser. Open ledger rows requeue; the fail cap dead-letters repeats.
                 cyc.truncation_failures += 1
                 cyc.truncation_failed.append(fold_key)
                 logger.error(
@@ -4122,13 +3503,7 @@ class ConsolidationDaemon:
                     "assembly, nothing persisted); ledger rows stay open. "
                     "(truncation_failures=%d)", entity, cyc.truncation_failures)
             elif self._last_llm_missing_slots:
-                # decision:1205 + operator ruling (same PR): a SLOT/PRINCIPLE
-                # still missing after its one bounded retry FAILS THE UNIT
-                # with the same no-partial-write semantics truncation
-                # already uses — but it is a PROTOCOL failure (fix
-                # prompt/model), not a capacity one (raise max_tokens), so
-                # it is counted SEPARATELY: slot_failures/slot_failed, never
-                # truncation_failures/truncation_failed.
+                # decision:1205: a SLOT/PRINCIPLE still missing after one retry fails the fold, counted as slot_failures, not truncation_failures.
                 cyc.slot_failures += 1
                 cyc.slot_failed.append(fold_key)
                 logger.error(
@@ -4140,10 +3515,7 @@ class ConsolidationDaemon:
                 logger.error(f"Failed to synthesise insight for '{entity}' — ledger rows stay open; next sweep retries.")
             return False
 
-        # decision:1205 — content is ASSEMBLED BY CODE from the slots just
-        # filled: every judgement's own pg_id and (for decisions) title are
-        # rendered VERBATIM by construction, never by LLM compliance. There
-        # is nothing left for a post-hoc preservation gate to check.
+        # decision:1205: content is assembled from the slots. Titles and pg_ids are copied verbatim, so no preservation gate remains.
         insight = _assemble_insight_content(rows, reversal_lines, slots)
 
         embedding = await self.get_embedding(insight)
@@ -4156,16 +3528,12 @@ class ConsolidationDaemon:
             "kind": "insight",
             "entity": entity,
             "project": resolved_project,
-            # §3.2 `domains` — MULTI-VALUED (the walk legitimately crosses
-            # domains; designed, not a tidiness problem).
+            # The walk can cross domains. That is the stored shape, not a bug.
             "domains": domains,
             "entities": entities,
-            # ⛔ I9 — judgement pg_ids ONLY (coordinator.py:5223/5250 join
-            # this straight to technical_docs).
+            # Judgement pg_ids only. The coordinator joins this straight to technical_docs.
             "source_pg_ids": src_ids,
-            # ⛔ §3.2 — NEW, SEPARATE field: the thematic community_summaries
-            # ids this insight rests on. Never mixed into source_pg_ids —
-            # the two sequences overlap.
+            # Thematic summary ids this insight rests on. A separate field, because the two id sequences overlap.
             "summary_ids": summary_ids,
             "cypher_query": insight_cypher_query(src_ids),
             "timestamp": datetime.now().isoformat(),
@@ -4190,9 +3558,7 @@ class ConsolidationDaemon:
             logger.error(f"Insight write error for '{entity}': {str(e)}")
             return False
 
-        # Graph sync + ledger close — same crash contract as the fact path:
-        # Postgres is committed; a failure here leaves the consumed rows at
-        # 'consolidated' and reconciliation re-applies this exact marking.
+        # Postgres is already committed. A graph failure leaves rows at consolidated for reconciliation to re-apply.
         try:
             await self._mark_insight_in_graph(src_ids, summary_id, entity, superseded_ids)
             closed = await loop.run_in_executor(
@@ -4301,26 +3667,22 @@ class ConsolidationDaemon:
     async def listen_for_events(self):
         """Asynchronous LISTEN on Postgres with non-blocking poll and hard backstop."""
         loop = asyncio.get_running_loop()
-        # ADR-018: a prior process may have died mid-fold, leaving an in-flight
-        # consolidation_runs row. Mark such orphans 'crashed' (so they cannot
-        # masquerade as in-flight) and prune old rows before we start recording.
+        # Mark in-flight rows from a dead process as crashed, and prune old rows, before recording new ones.
         await loop.run_in_executor(None, _crun_recover_and_prune)
         conn, cur = await self._make_listen_conn()
         logger.info("Listening for 'new_artifact' notifications...")
         try:
             while self.is_running:
-                # Run blocking select() in a thread so the asyncio event loop stays
-                # responsive. 1-second timeout gives the idle/backstop logic its
-                # 1-second resolution without stalling other coroutines.
+                # select() runs in a thread so the event loop stays responsive. The 1s timeout is the idle-check resolution.
                 readable = await loop.run_in_executor(
                     None, lambda: select.select([conn], [], [], 1.0)
                 )
 
                 if readable == ([], [], []):
-                    # Timeout path — check idle / backstop thresholds
+                    # Select timed out: this tick checks idle and the backstop.
                     now = datetime.now()
 
-                    # Daily log merge — runs once per calendar day on first poll of the new day
+                    # Merge logs once, on the first poll of the new day.
                     today = now.date()
                     if self.last_log_merge_date != today:
                         log_dir = os.path.expanduser(os.environ.get("MEMORY_LOG_PATH", "~/.shared-memory/logs"))
@@ -4328,14 +3690,11 @@ class ConsolidationDaemon:
                             merge_logs(log_dir)
                         self.last_log_merge_date = today
 
-                    # The consolidation clock must see the whole system, not just
-                    # saves — otherwise it declares "quiet" while REM holds the
-                    # slot. The sweep below keeps the notification-only clock.
+                    # The consolidation clock must see the pool, not only saves, or it calls the system quiet while REM holds the slot.
                     await self._note_pool_activity(now)
                     seconds_since_activity = self._quiet_since(now)
 
-                    # Due-ness reads the DURABLE ledger predicate, never the
-                    # ephemeral save-notification set (see consolidation_due).
+                    # Due-ness comes from the ledger, not from which save notifications arrived.
                     backlog = await self._refresh_backlog(now)
                     seconds_eligible = (
                         (now - self._backlog_eligible_since).total_seconds()
@@ -4344,17 +3703,10 @@ class ConsolidationDaemon:
                         seconds_since_activity, seconds_eligible, len(backlog))
 
                     if should_consolidate:
-                        # Yield to active user inference on the GPU. The hard
-                        # backstop is not starved — it may WAIT for a slot
-                        # (F10) — but consolidation NEVER fires into a busy
-                        # serial slot, forced or not.
+                        # Never fire into a busy serial slot. The backstop may wait for one; it does not skip the wait.
                         slot_free = await pool_has_free_slot(headers=_auth_headers())
                         if not slot_free:
-                            # F2: BOTH paths queue with priority, not just the
-                            # forced one. Deferring immediately on the normal
-                            # path is what let REM — which re-arms faster and
-                            # holds the slot for minutes — take every slot and
-                            # starve consolidation entirely.
+                            # Both the normal and forced paths queue. Deferring the normal path immediately let faster REM starve consolidation.
                             logger.warning(
                                 "NREM: consolidation due (forced=%s) but LLM pool busy — "
                                 "queuing up to %.0fs for a free slot (never firing into "
@@ -4371,9 +3723,7 @@ class ConsolidationDaemon:
                                 logger.warning("NREM: LLM pool has no free slot — deferring consolidation; will re-check next cycle.")
                                 await loop.run_in_executor(None, lambda: _crun_record_deferred("fact_consolidation", "pool_busy"))
                         else:
-                            # Backup fence: SHARED advisory lock held across the cycle.
-                            # If the gateway holds it EXCLUSIVE (backup dumping), defer —
-                            # the ledger is durable, so nothing is lost by waiting.
+                            # Shared backup lock across the cycle. If the gateway holds it exclusive, defer; the ledger keeps the work due.
                             gate = await loop.run_in_executor(None, _try_backup_shared_lock)
                             if gate is None:
                                 logger.info("NREM: backup in progress — deferring consolidation; the durable backlog keeps it due.")
@@ -4389,16 +3739,8 @@ class ConsolidationDaemon:
                                     await self.run_consolidation_cycle(backlog)
                                 finally:
                                     await loop.run_in_executor(None, gate.close)
-                                    # Re-arm both clocks. The durable predicate
-                                    # does not clear itself the way the old
-                                    # pending set did — a cycle that folds
-                                    # nothing leaves the backlog exactly as it
-                                    # found it — so without this the daemon
-                                    # would re-fire on the very next 1s tick and
-                                    # spin. A cycle is itself system activity
-                                    # (it just held the LLM slot), and the
-                                    # backstop measures "eligible and NOT YET
-                                    # ATTENDED", so attending resets it.
+                                    # The backlog does not clear itself when a cycle folds nothing, so re-arm both clocks or the next tick fires again.
+                                    # Attending resets the backstop, which measures eligible and not yet attended.
                                     after = datetime.now()
                                     self.last_busy = after
                                     await self._refresh_backlog(after, force=True)
@@ -4408,11 +3750,7 @@ class ConsolidationDaemon:
                           or now >= self._sweep_backoff_until) and \
                          sweep_due(now, self.last_sweep_time, self.last_activity,
                                    should_consolidate):
-                        # Background hygiene — always yields to active inference;
-                        # a deferred sweep retries after the pool-busy backoff.
-                        # F2: queue with priority like the consolidation path,
-                        # otherwise the sweep never wins the slot either (the
-                        # insight backlog had gone 5.2 days without a fold).
+                        # The sweep queues for a slot too. Deferring immediately let the insight backlog sit unfolded for days.
                         if not await pool_has_free_slot(headers=_auth_headers()) and not await self._wait_for_slot():
                             from datetime import timedelta as _td
                             self._sweep_backoff_until = now + _td(seconds=60)
@@ -4420,28 +3758,17 @@ class ConsolidationDaemon:
                                         "(next attempt in 60s).")
                             await loop.run_in_executor(None, lambda: _crun_record_deferred("insight", "pool_busy"))
                         else:
-                            # Backup fence: SHARED advisory lock held across the sweep.
-                            # Deferred if the gateway holds it EXCLUSIVE — last_sweep_time
-                            # is not advanced, so the sweep stays due and retries.
+                            # Same backup lock for the sweep. Do not advance last_sweep_time, so a deferred sweep stays due.
                             gate = await loop.run_in_executor(None, _try_backup_shared_lock)
                             if gate is None:
                                 logger.info("NREM: backup in progress — deferring sweep.")
                                 await loop.run_in_executor(None, lambda: _crun_record_deferred("insight", "backup_in_progress"))
                             else:
                                 try:
-                                    # C3 — Mechanism B, BEFORE either fold pass
-                                    # re-derives groups from the graph this
-                                    # tick, so a summary retired here is
-                                    # already gone (and its constituents
-                                    # already back in the widened backlog) by
-                                    # the time run_ledger_sweep/run_insight_
-                                    # cycle look.
+                                    # Run lineage invalidation before either fold, so a summary retired this tick is already gone when groups are re-derived.
                                     await self.run_lineage_invalidation_pass()
                                     if not self._startup_sweep_done:
-                                        # Once per process start: the unanchored graph
-                                        # sweep covers pre-coordinator facts that have
-                                        # no outbox rows; the ledger sweep then does
-                                        # the backfill/reconciliation pass.
+                                        # Once per process: the unanchored sweep covers facts with no outbox row, then the ledger sweep backfills.
                                         logger.info("Startup sweep: global graph pass + ledger pass.")
                                         await self.run_global_sweep()
                                         await self.run_ledger_sweep()
@@ -4449,20 +3776,16 @@ class ConsolidationDaemon:
                                     else:
                                         logger.info("Sweep interval reached. Starting ledger sweep.")
                                         await self.run_ledger_sweep()
-                                    # Insight pass rides every sweep — it is ledger-
-                                    # driven (decision/retro rows + graph gate), so it
-                                    # needs no fact backlog to be due.
+                                    # The insight pass is ledger-driven, so it runs on every sweep without waiting for a fact backlog.
                                     await self.run_insight_cycle()
                                     self.last_sweep_time = datetime.now()
                                 finally:
                                     await loop.run_in_executor(None, gate.close)
                 else:
-                    # Socket readable — drain notification queue
                     try:
                         conn.poll()
                     except (psycopg2.DatabaseError, psycopg2.OperationalError) as exc:
-                        # Connection dropped (network glitch, backend restart, etc.).
-                        # Reconnect so notifications are not silently lost.
+                        # Reconnect so a dropped LISTEN does not lose notifications silently.
                         logger.warning("LISTEN connection lost (%s) — reconnecting", exc)
                         try:
                             conn.close()
@@ -4482,10 +3805,7 @@ class ConsolidationDaemon:
                                 if not self.pending_pg_ids:
                                     self.first_notification_time = datetime.now()
                                 self.pending_pg_ids.add(pg_id)
-                                # A save is ACTIVITY, never ELIGIBILITY. It
-                                # refreshes the idle clock (someone is working)
-                                # and nothing more — the eligibility question is
-                                # asked of the durable ledger in _refresh_backlog.
+                                # A save refreshes the idle clock only. Eligibility is read from the ledger, not from this notification.
                                 self.last_activity = datetime.now()
                         except json.JSONDecodeError:
                             logger.error(f"Failed to decode notification payload: {notify.payload}")
@@ -4510,9 +3830,6 @@ async def main():
 
 if __name__ == "__main__":
     _require_db_credentials()
-    # D.1 (SEC round, ADV1-2): same placement reasoning as
-    # _require_db_credentials() above — never at bare import time (this
-    # module is imported freely by tests with a malformed LLM_BACKENDS_JSON
-    # on purpose), only at the actual daemon entrypoint.
+    # Parse LLM backends only at the entrypoint. Tests import this module with a malformed LLM_BACKENDS_JSON on purpose.
     require_llm_backends_json_parses("consolidation_loop")
     asyncio.run(main())

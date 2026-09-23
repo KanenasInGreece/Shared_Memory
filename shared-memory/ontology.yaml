@@ -1,48 +1,10 @@
-# Shared Memory Ontology Configuration
+# DOMAIN vocabulary only: entity sub-types for what records are ABOUT. No writer stamps these labels; :Entity is merged plain and REM writes none (decision:1664), so a rename here only changes what telemetry accepts. Restart daemons after editing. Other path: SMEM_ONTOLOGY_PATH.
 #
-# This file configures ONLY the DOMAIN vocabulary — the entity sub-types that
-# describe what your facts and decisions are ABOUT. Edit and GROW these as your
-# domain evolves. ⚠ No writer currently applies a sub-label to a node — every
-# :Entity is merged plain, and REM writes no labels (decision:1664). Renaming
-# or adding one here only widens the schema-compliance allowlist these names
-# are checked against; it changes what telemetry accepts, not what gets
-# written. Restart the daemons after editing (read at startup).
-# To use a non-default location: set SMEM_ONTOLOGY_PATH=/path/to/ontology.yaml
-#
-# ─────────────────────────────────────────────────────────────────────────────
-# THE FRAMEWORK SPINE IS NOT CONFIGURABLE (decision 550).
-# The spine is the framework's identity — high-signal ADR capture, alias-not-merge
-# entity resolution, fact-grounding, and the summarising dream cycle. It is pinned in
-# code and will ALWAYS appear in your graph regardless of this file. Every spine
-# field maps 1-to-1 from the record's JSONB metadata to a determined first-write node
-# or edge in Neo4j. Listed here so you know what to expect; these keys are IGNORED if
-# placed in this file.
-#
-#   Spine node labels (always present):
-#     Fact, Entity, CommunitySummary, Insight (a kind of CommunitySummary),
-#     Decision, Human, AIAgent, Project, Domain, Activity, Milestone,
-#     ReasoningTrace, ReasoningStep
-#
-#   ⚠ `Domain` above is the BELONGING AXIS — a registered SECTION of one project
-#   (`operations`, `infrastructure`) — and it is spine, pinned in code. It is not
-#   the "domain vocabulary" this file configures; that is the entity sub-types
-#   below, which describe what a record is ABOUT. One word, two jobs: belonging
-#   is spine, aboutness is yours.
-#
-#   Spine relationships (always present) — each 1-to-1 from a JSONB field:
-#     MENTIONS, REPORTS_ON (legacy), ALIASES, SUMMARIZED_BY, NEXT_STEP,
-#     WAS_ATTRIBUTED_TO, WAS_ASSISTED_BY, WAS_GENERATED_BY, PROJECT_OF, DOMAIN_OF,
-#     ACTED_ON_BEHALF_OF, SUPERSEDES, INFORMED_BY, HAD_OUTCOME, REFERENCES,
-#     GROUNDED_IN, CONSIDERED, REJECTED, UNDER_CONDITIONS, PRODUCES_INSIGHT
-#
-#   The consolidation dream cycle (NREM) reads ONLY these spine identifiers; your
-#   domain vocabulary below enriches what the summaries READ, but never triggers or
-#   decides the consolidation mechanism — so changing this file never requires any
-#   framework rewrite.
-# ─────────────────────────────────────────────────────────────────────────────
+# The spine is not configurable (decision 550). Those keys are pinned in code and ignored if copied here. `Domain` in the spine list is a project's section, not these sub-types. NREM reads only the spine, so this file never decides when consolidation runs.
+# Spine labels: Fact, Entity, CommunitySummary, Insight, Decision, Human, AIAgent, Project, Domain, Activity, Milestone, ReasoningTrace, ReasoningStep.
+# Spine relationships: MENTIONS, REPORTS_ON, ALIASES, SUMMARIZED_BY, NEXT_STEP, WAS_ATTRIBUTED_TO, WAS_ASSISTED_BY, WAS_GENERATED_BY, PROJECT_OF, DOMAIN_OF, ACTED_ON_BEHALF_OF, SUPERSEDES, INFORMED_BY, HAD_OUTCOME, REFERENCES, GROUNDED_IN, CONSIDERED, REJECTED, UNDER_CONDITIONS, PRODUCES_INSIGHT.
 
-# DOMAIN entity sub-types (Path A multi-label under :Entity). Rename or extend to
-# fit your domain.
+# Entity sub-types under :Entity. Rename or extend to fit the domain.
 labels:
   component: Component                  # software unit we build (module/class/script/daemon)
   system: System                        # service / datastore / framework / infra we run
@@ -50,13 +12,8 @@ labels:
   concept: Concept                      # pattern / technique / principle / signal
   document: Document                    # spec / ADR / doc / research artifact
 
-# Framework consolidation tuning (mechanism parameters, NOT domain vocabulary).
-# Operator-tunable, but they parametrise the immutable dream cycle — not the schema.
+# Dream-cycle parameters, not schema. They tune consolidation; they do not add labels.
 consolidation:
-  # v2 FACT GATE (Dreaming Cycle Plan to v2, §2.1): min grounded (GROUNDED_IN
-  # from a Decision/Retrospective), non-superseded Facts in one registered
-  # (project, domain) group to trigger a thematic synthesis. Recalibrated
-  # 5 -> 3 when the gate moved off entity hubs onto this axis (a smaller,
-  # sparser population by construction).
+  # Minimum grounded, non-superseded facts in one (project, domain) group before a thematic synthesis. Lowered from 5 to 3 because that axis is sparser than the old entity hubs.
   density_threshold: 3
   insight_threshold: 2           # min unconsolidated judgements the G3 walk must reach (not an entity-hub count)

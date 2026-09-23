@@ -24,29 +24,10 @@ the gateway's asyncpg/aiohttp stack exists, so this module must import cleanly
 with nothing but the standard library.
 """
 
-# Identities that may only ever READ. "monitor" is the shared-memory-monitor
-# dashboard — an ops client that must never borrow a write-capable token.
-#
-# ⭐ THIS IS A ROSTER, NOT A SPECIAL CASE FOR ONE NAME (operator, 2026-08-23:
-# "we may have other agents read only ... keep the code enforcing anything that
-# is supposed to be read only"). There are three ways an identity becomes
-# read-only, and enforcement covers all three:
-#
-#   1. listed here in code — the durable way, travels with the framework;
-#   2. named in SHARED_MEMORY_READ_ONLY_AGENTS (comma-separated) — a deployment
-#      confining an identity this framework has never heard of, without editing
-#      a shipped file (the same env-overridable-default rule the rest of the
-#      project follows);
-#   3. declared `name:read` in AGENT_ROLES by the operator — already read-only,
-#      and must never be silently widened by a later mint.
-#
-# (3) is why widening is refused against the roster AND against what is already
-# declared: the roster cannot enumerate identities it does not know about, but
-# the .env already states them.
+# Built-in read-only roster. A deployment can add names via SHARED_MEMORY_READ_ONLY_AGENTS, and an existing AGENT_ROLES `name:read` must not be widened by a later mint: the roster cannot know names it has never heard of.
 _READ_ONLY_AGENTS_BUILTIN = ["monitor"]
 
-# Kept as a module-level name because callers (and tests) import it directly.
-# read_only_agents() is the accessor that also honours the environment.
+# Imported by callers. read_only_agents() is the accessor that also honours the environment.
 READ_ONLY_AGENTS = list(_READ_ONLY_AGENTS_BUILTIN)
 
 _ENV_ROSTER_VAR = "SHARED_MEMORY_READ_ONLY_AGENTS"

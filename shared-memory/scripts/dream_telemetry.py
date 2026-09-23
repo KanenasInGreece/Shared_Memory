@@ -39,58 +39,14 @@ DREAM_METRICS_PATH = os.environ.get("DREAM_METRICS_PATH", "").strip() or None
 # work unit count (NREM cluster facts), so a big job is never killed for being big.
 CEILING_FLOOR_S = float(os.environ.get("LLM_CEILING_FLOOR", "600"))
 
-# Slowest generation rate the ceiling is willing to sit through, tokens/second.
-# The prompt/unit terms above size the ceiling on the INPUT, but decode time is
-# driven by the OUTPUT bound — so a raised max_tokens silently outgrew the
-# ceiling and turned "this cluster needs a longer narrative" into an opaque
-# timeout, which (unlike a truncation) is not even counted as a capacity
-# failure. This term makes the ceiling scale with what actually costs the time.
-#
-# DELIBERATELY BELOW OBSERVED THROUGHPUT, NOT AT IT: a ceiling sized on the
-# average kills every slower-than-average run. Measured here across 16 NREM
-# calls: min 11.29, mean 13.93, max 15.10 tok/s (Qwen3-14B Q4_K_M on one Arc
-# card, single slot). 10 leaves margin under the observed floor. It is an env
-# knob because this is the one constant that is purely a property of somebody
-# else's hardware — a faster rig should raise it, a CPU-only one must lower it.
-#
-# Keep the product (max_tokens / this) under the slot-arbiter budget
-# (NREM_FORCED_SLOT_WAIT, default 1800s) or a long fold outlasts REM's
-# willingness to yield the shared slot and the two daemons start fighting.
+# Decode follows the output bound, so a ceiling sized only on the input turns a longer narrative into an uncounted timeout. 10 sits under a measured floor of 11.29 tok/s; a long fold must also stay inside the slot-arbiter budget or the daemons fight.
 LLM_MIN_TOK_S = float(os.environ.get("LLM_MIN_TOK_S", "10"))
 
-# ── Embedding call sizing ────────────────────────────────────────────────────
-# Same lesson as LLM_MIN_TOK_S above, on the other backend. Embedding cost is
-# NOT constant and not even linear: measured on BGE-M3 (335M Q8_0, llama.cpp,
-# CPU) throughput fell threefold from 438 tok/s at 236 tokens to 148 tok/s at
-# 7414, fitting a linear term plus a quadratic attention term to within 0.52 s
-# across the range. A CONSTANT timeout therefore under-provisions exactly the
-# large inputs that need it most: the shipped 20 s covered only ~52% of the
-# embedder's own 8192-token context, so a fold could synthesise a summary it
-# could never vectorise, and lose the whole generation to a timeout.
-#
-# ANCHOR THE FLOOR AT MAX CONTEXT, NOT AT THE AVERAGE. Because the true cost is
-# superlinear, a linear rule is safe only when its throughput floor is taken
-# from the SLOWEST (largest-input) observation. Checked against the measurement:
-# anchored on the worst observed 147.5 tok/s a linear rule predicts 56 s at 8192
-# tokens against a true 59 s — under by 4 s, absorbed by the margin below;
-# anchored on the mean 273 tok/s it predicts 30 s against the same 59 s, under
-# by 29 s, and would fail every large call while looking correct on small ones.
-# The default sits below the worst observation for that margin. A GPU-backed or
-# faster embedder should raise it; a slower box must lower it.
+# Throughput falls as the input grows, so a constant timeout kills the large calls and looks fine on small ones. Anchor this floor on the slowest observation, not the mean.
 EMBED_MIN_TOK_S = float(os.environ.get("EMBED_MIN_TOK_S", "100"))
-# THE INVARIANT IS THE EMBEDDER'S CONTEXT. BGE-M3 has a hard 8192-token window
-# and REFUSES anything larger outright (HTTP 500 "input is too large to
-# process") rather than truncating it. So every caller clamps its input, and
-# BECAUSE the input is clamped the longest embedding call this framework can
-# ever make is a known, fixed quantity — the ceiling is computed from it here
-# rather than guessed at each call site. Env-tunable only because a different
-# deployment may run a different embedder; the derivation stays in code.
+# BGE-M3 refuses past its window instead of truncating, so the longest call is a known size. Tunable only because another embedder may differ.
 EMBED_MAX_CONTEXT_TOKENS = int(os.environ.get("EMBED_MAX_CONTEXT_TOKENS", "8192"))
-# Conservative chars-per-token, used for BOTH the clamp and the token estimate.
-# Held BELOW the ~4.3 measured for English prose because code, identifiers and
-# non-English tokenize denser: a low value truncates earlier (never overruns the
-# context) and over-estimates tokens (never under-sizes the timeout). Both
-# errors are on the safe side, which is why one constant serves both uses.
+# Below measured English prose so denser text truncates early and the timeout is over-estimated. Both mistakes stay on the safe side.
 EMBED_CHARS_PER_TOKEN = float(os.environ.get("EMBED_CHARS_PER_TOKEN", "3.0"))
 # Special-token reserve (BOS/EOS/CLS/SEP) so raw text sent to the tokenizer
 # never pushes the final sequence over the model window. Valid range: [0, EMBED_MAX_CONTEXT_TOKENS).
@@ -136,40 +92,9 @@ def embed_ceiling(input_chars: int) -> float:
                est_tokens / EMBED_MIN_TOK_S * EMBED_SAFETY_FACTOR)
 
 
-# ── Reranking call sizing ────────────────────────────────────────────────────
-# The SAME lesson as the embedder above, on the third backend — and the one it
-# was never applied to. The reranker scores each (query, document) pair, so its
-# cost tracks the TOTAL text handed to it, not the number of documents. It ran
-# for an unknown period behind a CONSTANT 5 s timeout while a real 20-candidate
-# set measured 64 s, so every search silently fell back to unranked cosine order
-# and the failure was invisible: the fallback emitted a plausible score and
-# /health only ever pinged for liveness.
-#
-# ANCHOR THE FLOOR AT THE LARGEST PAYLOAD, exactly as for the embedder. Measured
-# on BGE-Reranker-v2-m3 (568M Q8_0, llama.cpp, CPU, 4 threads): 1447 char/s on a
-# 20k-char set falling to 887 char/s on a 129k-char one — throughput DROPS as the
-# payload grows, so a floor taken from the average would under-provision the
-# large calls that need it most. The default sits below the worst observation.
-# A GPU-backed reranker should raise it; a slower box must lower it.
+# Cost tracks total text, not document count. A fixed 5s timeout hid a 64s rerank behind a plausible unranked score. Throughput drops as the payload grows, so this floor is the slowest observation, not the mean.
 RERANK_MIN_CHARS_S = float(os.environ.get("RERANK_MIN_CHARS_S", "800"))
-# Longest text ever SENT PER DOCUMENT. This is a relevance window, not a
-# truncation of the record: the full text is always kept in Tier 1 and still
-# returned by search — only the text the reranker SCORES is bounded.
-#
-# ⛔ IT DEFAULTS TO THE EMBEDDING WINDOW, AND THAT DEFAULT IS THE CORRECTNESS
-# ONE. Retrieval SELECTS a candidate using the embedding of up to
-# EMBED_MAX_CHARS; if ranking then sees a narrower slice, a record can be
-# demoted for lacking the very text it was selected for — ranking undoing
-# retrieval. Measured on the reference corpus, narrowing to 2000 chars kept only
-# about half of reranking's improvement over plain vector order. So the two
-# windows are DERIVED FROM ONE VALUE rather than set independently, and any
-# divergence between them is a deliberate act with a cost, not a default.
-#
-# Lowering it is the dominant latency lever, far more than thread count: at a
-# fixed 4 threads, narrowing a real 20-candidate set to 2000 chars took it from
-# 64 s to 30 s, and char/s IMPROVES as documents shorten because the attention
-# term is quadratic. Lower it when latency forces the trade — knowing what the
-# trade is.
+# Defaults to the embedding window. Ranking a narrower slice demotes a record for lacking the text it was selected for. Lowering it is the latency lever; that is a deliberate loss of ranking, not a free speedup.
 RERANK_MAX_DOC_CHARS = int(os.environ.get(
     "RERANK_MAX_DOC_CHARS", str(EMBED_MAX_CHARS)))
 # Same role as EMBED_SAFETY_FACTOR — headroom over the derived time, because

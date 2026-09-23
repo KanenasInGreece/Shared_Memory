@@ -73,12 +73,7 @@ class OntologyConfig:
     configures: str = "CONFIGURES"   # controls / parametrises / governs
     describes: str = "DESCRIBES"     # documents / specifies (Document→X)
     validates: str = "VALIDATES"     # quality-gate / test / telemetry validates X
-    # Consolidation tuning. density_threshold recalibrated 5 -> 3 for the v2
-    # FACT GATE (Dreaming Cycle Plan to v2, §2.1) — the population it measures
-    # changed from "facts on an entity hub" to "facts GROUNDED_IN by a
-    # judgement, grouped by (project, domain)", a structurally smaller and
-    # sparser count on this corpus (measured live: two groups gate at 13 and 5
-    # grounded facts). See consolidation_loop.py's DENSITY_THRESHOLD.
+    # Lowered from 5 to 3 because the gate now counts grounded facts per (project, domain), which is sparser than the old entity hubs.
     density_threshold: int = 3
     insight_threshold: int = 2
 
@@ -94,9 +89,7 @@ def _load() -> OntologyConfig:
     relationship type. Spine keys present in the file are ignored: the file cannot
     rename or redefine the framework, only extend the domain vocabulary."""
     cfg = OntologyConfig()  # all spine + domain defaults; spine is fixed from here on
-    # Candidate list (same form as the env loaders): the file lives with the
-    # framework at shared-memory/ontology.yaml; the repo root is a FALLBACK
-    # for checkouts predating the move. SMEM_ONTOLOGY_PATH overrides both.
+    # shared-memory/ontology.yaml, then a repo-root fallback for old checkouts. SMEM_ONTOLOGY_PATH overrides both.
     _here = os.path.dirname(__file__)
     _override = os.environ.get("SMEM_ONTOLOGY_PATH")
     candidates = [_override] if _override else [
@@ -143,12 +136,7 @@ def _validate(cfg: OntologyConfig) -> OntologyConfig:
 ONT = _validate(_load())
 
 
-# ── Entity-name hygiene (inbound quality gate) ────────────────────────────────
-# A deterministic "garbage-in" gate applied where names enter the graph
-# (outbox→Neo4j projection and REM enrichment). It keeps graph hubs meaningful:
-# leaked pg-ids ("254"), booleans, placeholders and schema vocabulary must never
-# become Entity nodes. It is NOT a casing pass — proper-noun forms ("Neo4j",
-# "LanceDB") are canonical and case-variant unification is the alias layer's job.
+# Inbound name gate. Leaked ids, booleans, and schema words must not become Entity nodes. This is not a casing pass; aliases unify case variants.
 
 # Minimum entity-name length after stripping. Env-tunable. Default 2 keeps useful
 # short abbreviations ("uv", "VM", "ER") while dropping single-character noise.
@@ -167,9 +155,7 @@ _ENTITY_NOISE_NAMES: frozenset[str] = frozenset({
     "fact", "entity", "decision", "human", "aiagent", "project",
     "activity", "milestone", "communitysummary", "reasoningtrace", "reasoningstep",
     "retrospective",
-    # Added with the domain axis (028). `Domain:` was already refused as an axis
-    # DECLARATION by _AXIS_DECLARATION_RE; this catches the bare schema word, the
-    # same way "project" has been caught since the label existed.
+    # Bare schema word. The `Domain:` form is refused separately by the axis-declaration pattern.
     "domain", "domain_of",
     # entity type sub-labels + typed relationships (decision 472) — schema vocabulary
     "component", "system", "model", "concept", "document",
@@ -180,29 +166,7 @@ _ENTITY_NOISE_NAMES: frozenset[str] = frozenset({
 _NUMERIC_NAME_RE = re.compile(r"^[0-9]+$")
 _WHITESPACE_RE = re.compile(r"\s+")
 
-# An AXIS DECLARATION is not a topic name (P14/P18). A name of the form
-# `Project: <something>` states which project a record BELONGS TO — that is
-# established at first write from the client's working directory, or later by the
-# promotion writer, and it is carried by the PROJECT_OF edge. Writing it into the
-# topic vocabulary as well makes the axis a hub that records cluster on, which is
-# how a project name ends up anchoring a Tier-3 narrative that is about a project
-# rather than about a theme.
-#
-# ⚠ DELIBERATELY A FORM TEST, NEVER A REGISTRY LOOKUP. Resolving a BARE name
-# against the project registry would be the obvious implementation and it is
-# wrong: registered project names are frequently real topics too — a project is
-# often named after the very thing its records discuss, and short registry names
-# are ordinary English words. Measured on a live corpus, one registry row was
-# simultaneously a `:System` entity carrying 91 inbound edges; a gate that
-# resolved bare names would have deleted a hub of true statements the same size
-# as the axis hub it was meant to remove.
-# A name that spells out `Project:` has declared
-# which axis it is on; a bare name has declared nothing. Keeping it a form test
-# also keeps this function PURE — no database, no I/O, same contract as every
-# other rule here.
-#
-# `Domain:` is included before the domain axis exists, on purpose: the axis is
-# specified and the same mistake is otherwise made twice.
+# `Project:` / `Domain:` is belonging, not a topic, and it already has its own edge. A registry lookup of the bare name would delete real topic hubs, because projects are often named after what they discuss.
 _AXIS_DECLARATION_RE = re.compile(r"^\s*(?:project|domain)\s*:", re.IGNORECASE)
 
 
@@ -300,31 +264,11 @@ GENUINELY_REFERENCED_ENTITY_RULE = (
 )
 
 
-# ── Fact epistemic kind (soft, DERIVED from source_ref) ───────────────────────
-# fact_kind is a soft tag — NOT a spine sub-label — giving a stored fact its
-# evidential weight for the high-signal grounding story (decision 552 + the
-# fact-overload discussion). It is DERIVED from source_ref, never elicited
-# separately.
-#
-# THE FLOOR IS `discussion`, NOT `observation`. Every fact is produced in a
-# conversation; that is the base case, not a degenerate one. What a source_ref
-# records is which EXTERNAL context entered that conversation and upgraded it:
-#   code            -> measured
-#   external source -> researched
-#   empirical check -> tested   (a test run, OR a reading off the LIVE system)
-#   nothing external, a conclusion reasoned out in the discussion -> observation
-# So `observation` is a deliberate QUALIFIER ("we reasoned this out"), never a
-# default — an unmarked fact is `discussion`, which the advisory gate then
-# grounds softly as INFORMED_BY rather than as hard evidence. That is the point:
-# an unqualified claim should not enter synthesis weighted as evidence.
+# Soft evidential weight derived from source_ref, not a spine label (decision 552). The floor is discussion; observation is a deliberate qualifier, so an unmarked fact is not weighted as evidence.
 DISCUSSION_CONTEXT: str = "discussion_context"    # explicit form of the default
 OBSERVATION_CONTEXT: str = "observation_context"  # a conclusion reasoned out in the discussion
 
-# Empirical readings off the RUNNING system (graph census, /health, journal) are
-# `tested` — they are verified against reality, not derived from code. They have
-# no file to cite, so they carry a `live:` locus (e.g. "live:neo4j/entity-census")
-# or a datastore URI. Without this they would fall to the floor and a measurement
-# of 4,318 live nodes would weigh the same as a passing remark.
+# A live reading has no file to cite. Without this prefix it would fall through to discussion and weigh the same as a remark.
 LIVE_PREFIX: str = "live:"
 _LIVE_SCHEMES: tuple[str, ...] = ("neo4j://", "bolt://", "postgres://", "postgresql://")
 
@@ -333,12 +277,7 @@ _CODE_SUFFIXES: tuple[str, ...] = (
     ".h", ".sh", ".sql", ".yaml", ".yml", ".toml",
 )
 
-# A path is a TEST path when a path COMPONENT is test-like — not when the string
-# merely contains "test". A substring check promoted `scripts/latest_run.py` and
-# `notes/greatest_hits.md` to `tested`, the highest evidential weight, because
-# "latest" and "greatest" contain "test". Evidence weight must never inflate by
-# accident: the insight prompt tells the model tested/measured outranks
-# discussion, so a false `tested` silently strengthens a claim.
+# Match a path component, not the substring "test". "latest" and "greatest" contain it, and a false tested kind outranks discussion in the insight prompt.
 _TEST_TOKEN_RE = re.compile(r"(?:^|[/\\._-])tests?(?:[/\\._-]|$)")
 
 
@@ -409,13 +348,7 @@ def origin_location(source_ref: object) -> str:
     return s.split("#", 1)[0].split("@", 1)[0].strip()
 
 
-# ── Record type → graph label (the grounding-target resolver) ─────────────────
-# A grounding target is any SPINE record, not only a Fact. Resolving its label
-# from technical_docs `metadata->>'type'` MUST be exhaustive over the record
-# types: a type that falls through to a default mints a stub node under the
-# WRONG label, leaving the real node unlinked (the shadow-node class of defect,
-# bug 578 — originally found for Decision targets, and repeated for
-# Retrospective targets until this map replaced a binary conditional).
+# A missing type must not mint a stub under the wrong label. That left the real Decision or Retrospective node unlinked.
 RECORD_TYPE_LABELS: dict[str, str] = {
     "decision":      ONT.decision,
     "retrospective": ONT.retrospective,
@@ -432,10 +365,7 @@ def record_label_for_type(record_type: object) -> str:
     return RECORD_TYPE_LABELS.get(record_type.strip().lower(), ONT.fact)
 
 
-# ── Decision→fact grounding roles + advisory fact_kind gate (decision 582) ─────
-# A decision links to each grounding fact by a ROLE relation, not a flat GROUNDED_IN.
-# GROUNDING_ROLES maps the operator-facing role word (elicited via --grounded-in
-# "pgid:role") to the spine relation. Every one is already a SPINE relationship.
+# Role word to spine relation (decision 582). A flat GROUNDED_IN would erase considered, rejected, and the soft informed_by case.
 GROUNDING_ROLES: dict[str, str] = {
     "based_on":         ONT.grounded_in,   # positive evidence / basis
     "grounded_in":      ONT.grounded_in,
@@ -445,13 +375,7 @@ GROUNDING_ROLES: dict[str, str] = {
     "informed_by":      ONT.informed_by,   # soft input (not hard basis)
 }
 
-# Advisory gate (decision 582, OPTION A): fact_kind sets the DEFAULT grounding
-# relation when the operator names none — a discussion is soft (INFORMED_BY),
-# everything else defaults to hard basis (GROUNDED_IN). This is the minimal soft/
-# hard cut; it is NOT enforced — an explicit operator role always wins and is
-# recorded asserted_by=operator; nothing is silently rewritten. Hard enforcement
-# (option B) is deferred until mis-typing evidence justifies it. Deliberately small
-# (only discussion is soft) so it can be refined on the evidence option A gathers.
+# Default only when the operator names no role (decision 582). An explicit role always wins; discussion is the only soft kind.
 _FACT_KIND_DEFAULT_ROLE: dict[str, str] = {
     "discussion": ONT.informed_by,
     # observation / tested / measured / researched → GROUNDED_IN (below)
@@ -464,43 +388,19 @@ def default_grounding_role(fact_kind: object) -> str:
     return _FACT_KIND_DEFAULT_ROLE.get(fact_kind, ONT.grounded_in)
 
 
-# Every relationship a grounding edge can carry — DERIVED from both role sources
-# (the operator's word and the fact_kind default) so a role can never be added
-# without every traversal that reads grounding seeing it.
-#
-# Anything walking "what grounds this record" must match ALL of these, never
-# GROUNDED_IN alone: four of the six role words produce a different relation, and
-# INFORMED_BY is what a discussion-kind fact defaults to when the operator names
-# no role at all — the bare-pg_id path. Matching one relation makes a decision
-# that cites its evidence read as though it rests on nothing.
+# Derived from both role maps so a new role cannot be invisible to a traversal. Matching GROUNDED_IN alone hides a discussion that defaulted to INFORMED_BY.
 GROUNDING_RELATIONS: tuple[str, ...] = tuple(sorted(
     set(GROUNDING_ROLES.values()) | set(_FACT_KIND_DEFAULT_ROLE.values()) | {ONT.grounded_in}
 ))
 
 
-# ── Retrospective outcome-state ratings (spine) ───────────────────────────────
-# The one machine-readable outcome field on a retrospective record (retro-as-node
-# session). Outcome STATES, not valence: 'reversed' keeps its structural semantics
-# (supersession cascade), 'pending' = not yet judged, 'refined' = the decision
-# evolved. Free-text nuance lives in the notes; legacy free-text ratings are
-# preserved in metadata.original_rating by the one-time migration. Code-pinned —
-# never read from ontology.yaml.
+# Outcome states, not valence. `reversed` still drives the supersession cascade. Code-pinned; ontology.yaml cannot rename them.
 RETRO_RATINGS: frozenset[str] = frozenset({
     "validated", "mixed", "refined", "pending", "reversed",
 })
 
 
-# ── Spine vs Domain split (decision 550) ──────────────────────────────────────
-# SPINE = the framework identity / unique selling point — code-pinned, never read
-# from ontology.yaml: the high-signal ADR capture (Fact/Decision/CommunitySummary/
-# Insight + provenance), alias-not-merge, fact-grounding, and every relation the
-# summarising dream cycle (NREM) depends on. DOMAIN = the entity sub-labels loaded
-# from the file; it describes what records are ABOUT. ⚠ Nothing currently applies
-# a sub-label to a node — DOMAIN_LABELS below is a compliance ALLOWLIST, not a set
-# of labels any writer stamps (REM writes none, `decision:1664`). The typed
-# Entity→Entity relation NAMES are code-pinned too (no `relationships:` section
-# in the file); only their compliance membership lives here.
-# The boundary contract test asserts consolidation touches only SPINE identifiers.
+# Spine is code-pinned and is what NREM walks (decision 550). DOMAIN_LABELS is only the compliance allowlist: no writer stamps those sub-labels (decision:1664).
 SPINE_LABELS: frozenset[str] = frozenset({
     ONT.fact, ONT.entity, ONT.community_summary, ONT.reasoning_trace,
     ONT.reasoning_step, ONT.decision, ONT.human, ONT.ai_agent,

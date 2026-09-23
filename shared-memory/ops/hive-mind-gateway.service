@@ -1,121 +1,44 @@
 [Unit]
 Description=Shared Memory Hive-Mind Gateway (coordinator + consolidation + REM daemons)
 Documentation=https://github.com/KanenasInGreece/Shared_Memory
-# Best-effort ordering: the coordinator itself waits up to PG_STARTUP_WAIT_S
-# (default 60s, .env-overridable) for Postgres to start accepting connections
-# before giving up and exiting, so a boot-order race becomes a bounded retry
-# instead of an immediate crash — Restart= below is still the real backstop
-# once that window is exhausted.
+# Ordering only. The coordinator already waits PG_STARTUP_WAIT_S for Postgres; Restart= is the backstop after that window.
 After=network-online.target docker.service
 Wants=network-online.target
 
 [Service]
 Type=simple
-# Repo root — the .env beside it is loaded automatically by hive_mind_proxy.py.
+# Repo root. hive_mind_proxy.py loads the .env beside this checkout.
 WorkingDirectory=/path/to/your/shared-memory-GitHub
-# Dependencies are pinned to the tested versions (requirements-gateway.lock, the
-# gateway process's RESTRICTED set — deliberately narrower than requirements.txt;
-# see requirements-gateway.txt). Resolves relative to WorkingDirectory above.
-# The uv path below is a PLACEHOLDER — install_service.sh substitutes the uv it
-# resolves on this host (the documented installer puts uv in ~/.local/bin, which
-# a systemd unit's default PATH does not include; measured: 203/EXEC crash-loop).
+# requirements-gateway.lock is the gateway's narrower pin, resolved from WorkingDirectory. The uv path is a placeholder: install_service.sh substitutes the host uv, because a unit PATH misses ~/.local/bin and the service crash-loops 203/EXEC.
 ExecStart=/usr/bin/uv run --no-project --with-requirements requirements-gateway.lock python shared-memory/scripts/hive_mind_proxy.py 8888
-# The gateway spawns the consolidation/REM daemons through `uv` resolved from
-# PATH — install_service.sh prepends the resolved uv's directory here, or the
-# daemons silently stay stopped while the gateway itself looks healthy.
+# Daemons are spawned via `uv` on PATH. install_service.sh prepends that directory, or they stay stopped while the gateway looks healthy.
 Environment=PATH=/usr/local/bin:/usr/bin:/bin
-# The proxy traps SIGTERM and drains the daemons cleanly — let it.
+# The proxy drains daemons on SIGTERM; do not let systemd send SIGKILL first.
 KillSignal=SIGTERM
 TimeoutStopSec=30
 Restart=on-failure
 RestartSec=5
 
-# S-17 (Credential_Custody_Plan PR A4) — cheap, verified-compatible hardening.
-# UMask=0077: any file this process (or a spawned daemon) creates defaults to
-# 0600/0700 — belt-and-suspenders alongside the umask calls already in
-# install_framework.sh/backup.sh, covers anything that doesn't set its own.
+# Files this process creates default to 0600/0700, including ones that never set their own mode.
 UMask=0077
-# NoNewPrivileges=yes: this process never needs setuid/setgid/capabilities —
-# refuses to gain any it does not already have.
+# Never needs setuid, setgid, or extra capabilities.
 NoNewPrivileges=yes
 
-# S16 (HYG round) — LimitCORE=0: a crash (SIGABRT, a segfault, or the SIGABRT
-# Fedora's 10-timeout-abort.conf drop-in raises when a stop runs past its
-# timeout) must never write a core dump — a core file holds every secret this
-# process loaded from shared-memory/.env (PG_PASSWORD, NEO4J_PASSWORD, any
-# LLM_BACKENDS_JSON API key) in plaintext. This unit had inherited
-# LimitCORE=infinity; 231 such dumps had accumulated on this workstation
-# before the retention policy vacuumed them. See ops/README.md's "Hardening"
-# section for the temporary, deliberate lift used to diagnose a native crash.
+# A core would hold every secret loaded from shared-memory/.env. A stop that hits Fedora's timeout-abort also dumps a core.
 LimitCORE=0
 
-# ProtectHome (read-only or tmpfs) was evaluated and left OUT: WorkingDirectory
-# is a checkout under $HOME (deployer-chosen path, so it cannot be named as a
-# ReadWritePaths= exception here), and the audit/REM/telemetry logs default to
-# ~/.shared-memory/logs (MEMORY_LOG_PATH, .env.example) — also under $HOME.
-# ProtectHome=read-only would make the log directory unwritable; ProtectHome=yes
-# hides $HOME entirely and would break WorkingDirectory itself. Revisit if a
-# future release moves state to a fixed, non-$HOME path this unit can pin.
-#
-# ProtectSystem=full (HYG round, ruling applied): the default AF_UNIX
-# listener path (_default_uds_path() in hive_mind_proxy.py) is
-# $XDG_RUNTIME_DIR/shared-memory-gw.sock, falling back to /tmp when
-# XDG_RUNTIME_DIR is unset — neither is under %h, but `full` only makes
-# /usr, /boot, /efi and /etc read-only; it never touches /tmp, /run or
-# $XDG_RUNTIME_DIR, so this write is unaffected either way. `strict` stays
-# FORBIDDEN — it would make %h itself read-only. See ops/README.md (Hardening)
-# for the write-path-outside-%h observation this directive does not resolve.
+# ProtectHome stays off: WorkingDirectory and the default logs are under $HOME, and this unit cannot name that deployer-chosen path as an exception.
+# ProtectSystem=full leaves /tmp, /run, and $XDG_RUNTIME_DIR writable, which is where the socket lives. `strict` is forbidden because it makes the home directory read-only.
 ProtectSystem=full
 
-# RestrictAddressFamilies: every socket family this unit's processes use is
-# traced, and the set is closed to those four. AF_UNIX — the UDS listener,
-# asyncio socketpairs, journald. AF_INET/AF_INET6 — the aiohttp server and
-# client, asyncpg, the neo4j driver, httpx to the encoders. AF_NETLINK —
-# glibc's getaddrinfo interface enumeration, and nvtop's device enumeration
-# behind gpu_load.py. Nothing under shared-memory/scripts/ opens AF_PACKET,
-# AF_ALG or AF_VSOCK. Run as a drop-in on the test host from 2026-09-04
-# before shipping here: health ok, search served, zero restarts, and the
-# nvtop probe reporting gpu_probe.state = ok with inference_busy reading a
-# real value rather than `unknown`.
+# Closed to the families this process actually opens. AF_NETLINK is required for getaddrinfo and for nvtop behind gpu_load.py; dropping it makes the GPU probe read unknown.
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
 
-# LoadCredential= example (SEC-06, PR A4; corrected fix round 1, R3, Opus
-# review, verified against `man systemd.exec` and `systemd-path` on the
-# reference host) — uncomment to deliver a secret without ever touching
-# shared-memory/.env or this process's own EnvironmentFile=. secure_env.py
-# reads it from $CREDENTIALS_DIRECTORY/<name>, where <name> is the
-# credential ID below (systemd convention: lowercase). The corresponding
-# framework key is the uppercase form (pg_password -> PG_PASSWORD).
-#
-# THIS IS THE BARE-ID FORM — no ":PATH" — DELIBERATELY. This unit is a
-# `systemd --user` unit (see the top-level docs for why: a session-launched
-# gateway dies with the session). The originally-shipped example here used
-# an ABSOLUTE path into /etc/credstore — the SYSTEM manager's store, mode
-# 0700 root:root on a stock install, unreadable by any --user unit and
-# unconditionally FATAL to the unit start once the path can't be opened
-# (`man systemd.exec`: "a missing credential is not considered fatal" holds
-# ONLY when the path is omitted or a bare identifier — an absolute path that
-# can't be read is fatal). The bare-ID form below instead has the PER-USER
-# service manager search $XDG_CONFIG_HOME/credstore/, $XDG_RUNTIME_DIR/credstore/,
-# $HOME/.local/lib/credstore/, in that order (verified live via `systemd-path
-# user-search-credential-store`) — put the file at
-# $XDG_CONFIG_HOME/credstore/pg_password (typically ~/.config/credstore/pg_password),
-# mode 600 from the FIRST BYTE, owned by the account this unit runs as — NOT
-# create-then-chmod (NEW-2, fix round 2: this recipe used to write the file
-# with `printf … > path` at the process umask, THEN chmod 600 it after —
-# the exact window this PR closes in install_framework.sh/install_llm_
-# backends.sh's own scripts. Fixed the same way: a `umask 077` subshell
-# around the write, so the file is 600 from the moment it exists, never
-# briefly at the default umask (often 0644):
+# Uncomment to deliver a secret outside shared-memory/.env. Bare id only: an absolute path this --user unit cannot read is fatal at start, while a missing bare id is not.
+# The user manager looks in ~/.config/credstore/. Write the file 600 from the first byte; create-then-chmod briefly exposes it at the default umask.
+# This does not hide the credential from the account that runs the unit.
 #   mkdir -p ~/.config/credstore && chmod 700 ~/.config/credstore
 #   ( umask 077; printf '%s' 'your-postgres-password' > ~/.config/credstore/pg_password )
-#   chmod 600 ~/.config/credstore/pg_password   # belt-and-suspenders — umask above already made it 600
-# ⚠ See server-setup.md, "Credential delivery" — for a `--user` unit this
-# tier does NOT isolate the credential from your OWN account (the account
-# IS the "user associated with the unit" per man systemd.exec); it removes
-# the value from shared-memory/.env and from every OTHER user unit's
-# environment, which is real hardening against a different account, not
-# against this one.
 #LoadCredential=pg_password
 #LoadCredential=neo4j_password
 

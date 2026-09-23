@@ -1,20 +1,7 @@
--- Migration 009: Phase 3a insight consolidation (decision pg_id 276)
---
--- 1. technical_docs.superseded — decision-level reversal filter for Tier-1
---    search. Set when a decision is reversed (retrospective rating
---    'reversed'); search excludes superseded rows from candidates. Insights
---    are never invalidated this way — a re-fold writes a superseding insight
---    instead.
---
--- 2. Re-create the community_summaries (entity, domain) unique index as a
---    PARTIAL index excluding kind='insight' rows. Thematic summaries keep
---    their conflict-UPDATE upsert (migration 007); insight rows are
---    always-INSERT with supersession as the dedup mechanism. If insights
---    shared the upsert key, a re-fold would conflict-UPDATE the superseded
---    row in place and superseded=true would silently survive, making the
---    fresh insight invisible (the "resurrection trap").
---
--- Idempotent: safe to re-run.
+-- Migration 009 (decision pg_id 276): technical_docs.superseded hides a reversed
+-- decision from Tier-1 search. The (entity, domain) unique index is partial so
+-- kind='insight' rows are always inserted — sharing the upsert key would update
+-- a superseded row in place and leave the new insight invisible.
 
 BEGIN;
 

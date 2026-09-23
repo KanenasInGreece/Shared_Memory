@@ -82,17 +82,7 @@ __all__ = [
     "type_matches",
 ]
 
-#: The release this contract document was LAST MEANINGFULLY EDITED in — not a
-#: free-running "today". D4 (decision:1832) makes this the FIFTH entry in
-#: test_change_group_contracts.py's `_VERSION_PINS`, proven against the known-
-#: broken state first (this constant sat at "0.9.74" through three releases —
-#: 0.9.75/76/77 — of the OTHER four pins moving without it, unnoticed because
-#: nothing compared them). ⚠ This value now leads the other four rather than
-#: following them: W2 ships as the next +0.0.1 after the v0.9.78 anchor, so it
-#: is bumped here to "0.9.79", and the fifth pin will not agree with
-#: coordinator.py's FRAMEWORK_VERSION et al. until the merger's own version-
-#: bump step (which those four files stay reserved for) catches up to it at
-#: release time — that gap is the check doing its job, not a build defect.
+#: Not a free-running today: this is the fifth version pin, so a missed bump is visible (decision:1832).
 VERSION = "0.9.112"
 
 
@@ -132,9 +122,7 @@ CATEGORIES = (
     "graph",
 )
 
-#: The ONLY keys an anonymous caller sees on an auth-configured install
-#: (decision:1333 — unchanged by this release, and pinned by
-#: test_health_anonymous_slimming.py).
+#: The only keys an anonymous caller sees when auth is configured (decision:1333).
 ANONYMOUS_HEALTH_KEYS = ("status", "version", "api_version")
 
 
@@ -159,78 +147,26 @@ def _k(types: str, category: str, *, unit: str | None = None,
     }
 
 
-#: ⛔ NOT "now" — the INTRODUCTION stamp `since=INTRODUCED_0_9_74` puts on 228
-#: keys and `in_version` puts on the four original MEANING_CHANGES entries.
-#: FROZEN at 0.9.74 and named for what it is (D4, decision:1832): bumping it
-#: with VERSION would re-date all 228 keys as arriving in whatever release
-#: touches this file next, in the regenerated public doc — and nothing in the
-#: suite would have caught it, because `since` was never asserted against
-#: anything but itself. A key genuinely NEW in a later release gets that
-#: release's literal version string, same as `dependencies.postgres.state`
-#: below does with `INTRODUCED_0_9_74` itself.
+#: Frozen introduction stamp. Bumping it with VERSION would re-date every key that cites it in the public doc (decision:1832).
 INTRODUCED_0_9_74 = "0.9.74"
-#: Same pattern, one release later — FROZEN at 0.9.79 (handback H1): the three
-#: W2 MEANING_CHANGES entries below were pinned to the bare `VERSION` constant,
-#: but `VERSION` is now the fifth version pin and moves EVERY release
-#: (test_change_group_contracts.py's `_VERSION_PINS`). Pinning a historical
-#: entry to `VERSION` directly means the very next bump falsifies it — the
-#: cheapest "fix" in that moment is to re-date the entry to the new VERSION,
-#: which is exactly the meaning-change falsification the whole point of this
-#: file exists to prevent (fact:1626). Entries authored under THIS stamp keep
-#: it forever, the same way the four originals keep `INTRODUCED_0_9_74`; the
-#: general `in_version <= VERSION` bound (item 8) stays the durable rule that
-#: catches anything genuinely wrong regardless of which release is current.
+#: Frozen. A historical meaning-change pinned to VERSION would be re-dated on the next bump (fact:1626).
 INTRODUCED_0_9_79 = "0.9.79"
 
-#: W4's four MEANING_CHANGES entries froze here at release time (QA MED-8 of
-#: the v0.9.81 cycle): they were authored against bare ``VERSION`` while the
-#: wave was in flight and pinned to this constant at the version bump, the
-#: same carve-out INTRODUCED_0_9_79 got — so no later release can silently
-#: re-date them.
+#: Frozen at release so a later bump cannot re-date W4's meaning changes.
 INTRODUCED_0_9_81 = "0.9.81"
 
-#: Same pattern, this OBS round (R-A, W6): keys genuinely NEW this cycle
-#: (D9's `gateway.client_disconnects_total`) are stamped with THIS frozen
-#: constant rather than bare `VERSION`, so a later release's version bump
-#: cannot silently re-date them. At the pin-bump the merger freezes this
-#: into the real ship version if it differs (renaming the constant to match,
-#: same move `INTRODUCED_0_9_79`/`INTRODUCED_0_9_81` got at their releases) —
-#: not this build step's job.
+#: Frozen stamp for keys new in this release, so a later VERSION bump cannot re-date them.
 INTRODUCED_0_9_88 = "0.9.88"
-#: The 0.9.97 stamp: S7 moved the reasoning-LLM probe off the request path into
-#: a background daemon, so `unknown` became a per-backend enum value — never-
-#: probed, before the daemon's first cycle lands — on top of the existing
-#: ok/timeout/down/http_* set.
+#: The probe left the request path, so `unknown` means not yet probed, before the daemon's first cycle.
 INTRODUCED_0_9_97 = "0.9.97"
 #: The 0.9.104 stamp: decision:2540 encoder window contract.
 INTRODUCED_0_9_104 = "0.9.104"
-#: The FROZEN stamp of the first drop: the release from which the dual-emitted
-#: copies moved off `/health` at v0.9.74 stop being SERVED. Every row carrying
-#: it keeps its `moved_to`, so the document still renders the old→new map after
-#: the copies are gone. Frozen exactly like INTRODUCED_0_9_74 and its
-#: successors — a later release that drops a further batch of copies gets its
-#: own literal version string, never a re-dating of this one
-#: (test_the_first_drop_stamp_is_frozen pins the literal).
+#: Frozen release at which the v0.9.74 /health copies stop being served. A later drop gets its own stamp.
 DUAL_EMIT_DROP_TARGET = "0.9.90"
-#: The telemetry-side copies (the 16 rows under `GET /memory/telemetry` that
-#: moved at v0.9.74) are served one release longer: the consumer of record,
-#: shared-memory-monitor 0.9.30, still reads them at their old homes (its own
-#: record, fact:1989, lists each read and its new home). Frozen like the stamp
-#: above; a stamp is honoured exactly when its release arrives.
+#: Telemetry copies stay one release longer because the monitor still reads the old homes (fact:1989).
 TELEMETRY_DUAL_EMIT_DROP_TARGET = "0.9.91"
 
-#: CG (OBS round) — the enumerated `warnings[].key` vocabulary. Before this,
-#: `warnings[].key` was a free `str` (see the entry below): a renamed or
-#: added warning key was invisible to every guard, and three existing
-#: `log="health.warning.*"` annotations elsewhere in this file (fixed in the
-#: same change) named keys NO producer ever emitted. Re-derived from the six
-#: `_warning(...)` call sites in `hive_mind_proxy.py`'s health-build function
-#: — never hand-maintained independently of them — and pinned by an AST/
-#: source walk in `tests/test_obs_cg_warning_keys.py` in both directions:
-#: every literal `_warning(` first-arg (the encoder pair's f-string expands
-#: via its `("embedder", "reranker")` loop) is a member of this set, and
-#: every member of this set has a producer. Rendered into the generated doc
-#: by `render_markdown()` below.
+#: Enumerated so a renamed warning key cannot slip past the guards. Must match the `_warning(` producers, both ways.
 WARNING_KEYS: frozenset[str] = frozenset({
     "encoder_embedder_projected_ms",
     "encoder_reranker_projected_ms",
@@ -241,11 +177,7 @@ WARNING_KEYS: frozenset[str] = frozenset({
 })
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# GET /health — the authenticated payload (an auth-off install serves the same
-# shape to everyone; an anonymous caller on an auth-configured install sees
-# ANONYMOUS_HEALTH_KEYS and nothing else).
-# ═══════════════════════════════════════════════════════════════════════════════
+# Authenticated /health. With auth off everyone sees this shape; an anonymous caller sees only ANONYMOUS_HEALTH_KEYS.
 HEALTH: dict[str, dict] = {
     # ── liveness ────────────────────────────────────────────────────────────
     "status": _k("str", "liveness", note=(
@@ -714,14 +646,8 @@ HEALTH: dict[str, dict] = {
 }
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# GET /memory/telemetry — paths are relative to the ``telemetry`` wrapper key.
-# The envelope is ``{"status": "success", "telemetry": {...}}``; ``status`` there
-# is the REPLY envelope, not a health verdict, and is not part of this table.
-# Every section is computed independently and degrades to ``{"error": "..."}`` on
-# its own failure, so one dead backend never blanks the payload — hence the
-# ``<section>.error`` entries below.
-# ═══════════════════════════════════════════════════════════════════════════════
+# Paths sit under the telemetry wrapper. Envelope status is the reply, not a health verdict.
+# Each section fails on its own, so one dead backend cannot blank the payload.
 TELEMETRY: dict[str, dict] = {
     # ── liveness / cache ────────────────────────────────────────────────────
     "timestamp": _k("str", "liveness",
@@ -1350,11 +1276,7 @@ TELEMETRY: dict[str, dict] = {
 }
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# MEANING CHANGES — fact:1626: a key whose VALUE changes meaning while its NAME
-# stays is ENUMERATED, never left to be discovered. A consumer reading only the
-# key list would see nothing wrong here; that is exactly why this list exists.
-# ═══════════════════════════════════════════════════════════════════════════════
+# A key whose value changes meaning while its name stays is listed here, or a consumer of the key list sees nothing wrong (fact:1626).
 MEANING_CHANGES: tuple[dict, ...] = (
     {
         "endpoint": "telemetry",
@@ -1401,9 +1323,7 @@ MEANING_CHANGES: tuple[dict, ...] = (
         "shape_changed": False,
     },
     # ── W2 (decision:1832) — visibility before behaviour. FROZEN at
-    # INTRODUCED_0_9_79 (handback H1) — VERSION is the fifth version pin and
-    # moves every release; pinning these three historical entries to the
-    # bare VERSION constant would falsify them at the very next bump.
+    # INTRODUCED_0_9_79, not VERSION: the next bump would re-date these three entries.
     {
         "endpoint": "health",
         "path": "dependencies.llm_pool.state",
@@ -1463,14 +1383,7 @@ MEANING_CHANGES: tuple[dict, ...] = (
                    "already present even during that window"),
         "shape_changed": False,
     },
-    # ── W4 default-deny (decision:1824) — pinned to the bare `VERSION`
-    # constant for now, same as the W2 entries above were AT THE TIME they
-    # were authored (see INTRODUCED_0_9_79's own comment): this build has
-    # not been released yet, so there is no frozen stamp to name — the
-    # merger's version-bump lands VERSION at the assigned release number in
-    # the SAME commit this file ships in, which is exactly when these four
-    # should be frozen into a new INTRODUCED_0_9_8x constant (mirroring how
-    # INTRODUCED_0_9_79 was carved out) so a LATER bump cannot re-date them.
+    # ── W4 default-deny (decision:1824) — frozen at INTRODUCED_0_9_81, not live VERSION, so a later bump cannot re-date these entries.
     {
         "endpoint": "health",
         "path": "config.llm_backends[].private_ok",
@@ -1495,12 +1408,7 @@ MEANING_CHANGES: tuple[dict, ...] = (
     },
     {
         "endpoint": "health",
-        # W4 default-deny (decision:1824): a SECOND, distinct meaning change
-        # on the SAME field this wave — the "(legacy-CSV population)" suffix
-        # keeps this entry's key distinct from the immutable, frozen W2
-        # entry above (test_the_meaning_change_list_covers_every_re_pointed_
-        # key pins THAT one to INTRODUCED_0_9_79 forever) rather than
-        # colliding with it in the by_path lookup and silently clobbering it.
+        # W4 default-deny (decision:1824): the suffix keeps this key distinct from the frozen W2 entry, so the lookup cannot clobber it.
         "path": "dependencies.llm_pool.state (legacy-CSV population)",
         "in_version": INTRODUCED_0_9_81,
         "was": ("`ok` for a live legacy `LLM_BACKENDS` CSV (or the bare "
@@ -1557,12 +1465,7 @@ MEANING_CHANGES: tuple[dict, ...] = (
                    "replacement of the original fact"),
         "shape_changed": False,
     },
-    # ── OBS round D1 (2026-09, ruling R-A) — pinned to the bare `VERSION`
-    # constant: this build has not shipped yet, so there is no frozen stamp
-    # to name (same practice the W2/W4 entries above followed at THEIR
-    # authorship time, before the merger's version-bump froze them into
-    # INTRODUCED_0_9_79 / INTRODUCED_0_9_81). At release the merger freezes
-    # these into a new INTRODUCED_0_9_8x constant the same way.
+    # Frozen at INTRODUCED_0_9_88, not live VERSION, so a later bump cannot re-date this entry.
     {
         "endpoint": "health",
         "path": "warnings[] (key=token_verify_failed_per_min)",
@@ -1584,8 +1487,7 @@ MEANING_CHANGES: tuple[dict, ...] = (
                    "threshold-0 semantics, are unchanged"),
         "shape_changed": False,
     },
-    # ── OBS round D2 (2026-09, ruling R-A) — same not-yet-shipped pinning
-    # practice as D1's entry above.
+    # Same freeze as the entry above: INTRODUCED_0_9_88, not live VERSION.
     {
         "endpoint": "telemetry",
         "path": "gateway.requests_total",
@@ -1645,9 +1547,7 @@ MEANING_CHANGES: tuple[dict, ...] = (
     },
 )
 
-#: Keys REMOVED outright in 0.9.74 (not moved) — each had no writer and had
-#: therefore read 0 since it shipped. Listed so a consumer knows the difference
-#: between "gone" and "moved", and so the removal is auditable.
+#: Removed, not moved: each had no writer and had read 0 since it shipped.
 REMOVED_IN_0_9_74: tuple[dict, ...] = (
     {"endpoint": "telemetry", "path": "entity_graph.alias_edges",
      "reason": "no writer — the ALIASES relationship was never emitted by any "
@@ -1661,12 +1561,7 @@ REMOVED_IN_0_9_74: tuple[dict, ...] = (
      "reason": "same retired gds.wcc stamp"},
 )
 
-#: Keys REMOVED outright in 0.9.88 (S12, OBS round; R-B) — same shape and same
-#: reason class as REMOVED_IN_0_9_74: no writer. `LLM_MAX_TRIES` was read by
-#: nothing but this render itself — no retry loop ever consulted it — and the
-#: comments beside it promised cross-backend failover this pool never had (the
-#: real retry is same-target, buffered-body-gated; a genuine failure 503s the
-#: caller rather than hopping to a different backend).
+#: Removed, not moved: LLM_MAX_TRIES had no retry loop, and the old comment promised failover this pool never did.
 REMOVED_IN_0_9_88: tuple[dict, ...] = (
     {"endpoint": "health", "path": "config.llm_pool_tuning.max_tries",
      "reason": "no writer — LLM_MAX_TRIES was read by nothing but this "
@@ -1677,23 +1572,8 @@ REMOVED_IN_0_9_88: tuple[dict, ...] = (
 )
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# CONDITIONAL KEYS — the exemption list for the "every documented key is
-# emitted" direction, in ONE visible place rather than a flag scattered through
-# 550 entries, so the list can be read as a whole and argued with.
-#
-# ⚠ THIS LIST IS THE ONLY WAY A KEY ESCAPES THE COMPLETENESS CHECK, so adding to
-# it is the cheap way to make a failing contract test pass — and that is exactly
-# what it must not become. Every entry below is one of three kinds:
-#
-#   (a) IDENTITY — present only for an authenticated caller.
-#   (b) OVERRIDE / CONDITION — present only while a specific condition holds
-#       (an S-05 override in effect, a wedged backend, an error branch).
-#   (c) SHAPE ALTERNATIVE — a container that may be EMPTY. An empty dict emits
-#       the container path; a populated one emits its `*` children instead. One
-#       payload can only ever show one of the two, so both are exempt; the
-#       OTHER direction (nothing undocumented is emitted) still pins both.
-# ═══════════════════════════════════════════════════════════════════════════════
+# Keys that may be absent from a full payload. Adding one is the cheap way to silence the completeness check.
+# Each entry is identity, a live condition, or an empty-versus-populated shape.
 CONDITIONAL: frozenset = frozenset({
     # (a) identity — authenticated callers only
     "health:agent",
@@ -1851,9 +1731,7 @@ def required_paths(contract: dict, endpoint: str) -> set:
             if f"{endpoint}:{p}" not in CONDITIONAL and not is_dropped(s)}
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# Walking a payload against the contract
-# ═══════════════════════════════════════════════════════════════════════════════
+# Payload walk.
 _SCALAR_TYPE_NAMES = {
     str: "str", bool: "bool", int: "int", float: "float", type(None): "null",
 }
@@ -1864,8 +1742,7 @@ def _json_type(value) -> str:
         return "dict"
     if isinstance(value, list):
         return "list"
-    # bool BEFORE int — bool is a subclass of int and would otherwise be
-    # reported as int, which would let a bool/int swap pass the type check.
+    # bool before int, or a bool/int swap passes the type check.
     if isinstance(value, bool):
         return "bool"
     return _SCALAR_TYPE_NAMES.get(type(value), type(value).__name__)
@@ -1947,17 +1824,7 @@ def canonical_paths(payload: dict, contract: dict) -> set[str]:
     return {p for p, _ in walk_payload(payload, contract)}
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# Dropping the copies a release stops serving
-#
-# THE CONTRACT DECIDES WHAT IS SERVED. `is_dropped` is the predicate, and the
-# two response boundaries (`hive_mind_proxy.handle_health`,
-# `coordinator.handle_telemetry`) call `strip_dropped` on a COPY of what they
-# are about to serve. Nothing internal changes: every emitter still runs, every
-# cache still holds the full shape, and the values derived from it —
-# `dependencies.*`, `warnings[]`, `status`, and the new homes that
-# `telemetry_extras()` builds by reading the /health cache — are untouched.
-# ═══════════════════════════════════════════════════════════════════════════════
+# The contract decides what is served. Emitters and caches keep the full shape; only the response copy is stripped.
 def is_dropped(spec: dict) -> bool:
     """True iff this release has reached the row's ``removed_in``.
 
@@ -2042,9 +1909,7 @@ def strip_dropped(payload: dict, contract: dict) -> dict:
     return _prune(payload, dropped, kept)
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# Rendering the document
-# ═══════════════════════════════════════════════════════════════════════════════
+# Document render.
 _RULE_OF_THUMB = (
     "up/down → health · a number → telemetry · number > limit → telemetry keeps "
     "the number, health raises the warning, the log records the crossing."
@@ -2054,10 +1919,7 @@ _RULE_OF_THUMB = (
 def _rows(contract: dict, endpoint: str) -> list[str]:
     lines = []
     for cat in CATEGORIES:
-        # A dropped row is off the wire, so it is off the LIVE table — its
-        # old→new mapping is rendered once, in "Dual-emitted copies dropped".
-        # Filtered before the emptiness check, so a category whose every row
-        # has gone loses its heading too rather than printing an empty table.
+        # A dropped row is off the live table; its old-to-new map is rendered once elsewhere. Filter first so an empty category loses its heading.
         entries = [(p, s) for p, s in sorted(contract.items())
                    if s["category"] == cat and not is_dropped(s)]
         if not entries:

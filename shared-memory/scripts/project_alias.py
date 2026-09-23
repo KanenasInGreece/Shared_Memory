@@ -25,15 +25,7 @@ SERVER-SIDE ONLY — never shipped in a skill. Clients send what their folder is
 called; deciding what that means is the gateway's job.
 """
 
-# Resolve one name. `{p}` is the caller's placeholder style — asyncpg uses $1,
-# psycopg2 uses %s — matching PROJECT_MATCH_SQL's convention rather than picking
-# a driver for every future caller.
-#
-# ⚠ THE MAPPING IS TO AN IDENTITY, NOT TO A NAME (migration 027). The junction
-# stores ``project_id``; the CURRENT name is read back through the registry on
-# every resolution. That is what makes an alias row stay true across a rename
-# with no maintenance: the row records which project a retired spelling meant,
-# and what that project is called today is a question only the registry answers.
+# `{p}` is the caller's placeholder, same as PROJECT_MATCH_SQL. The junction stores project_id (migration 027); the current name is read back, so a rename does not rewrite the alias row.
 ALIAS_RESOLVE_SQL = (
     "SELECT p.name"
     " FROM project_aliases pa"
@@ -42,15 +34,7 @@ ALIAS_RESOLVE_SQL = (
     " WHERE a.name = {p} AND pa.active"
 )
 
-# Every active alias, for the tools that must not re-ask a settled question —
-# and, since the by-key resolution step, for ingress and the search filter too.
-#
-# ⚠ THE TWO COLUMNS ARE LABELLED, and that is a correctness fix rather than a
-# tidy-up. Both are called `name` in their own tables, so a driver that returns
-# rows keyed BY COLUMN NAME (asyncpg does; psycopg2's default cursor does not)
-# sees one key twice and silently answers with whichever it kept — an alias map
-# that maps a name to itself. Positional access is unaffected, which is how
-# `sync_project_registry.py` has always read it.
+# Both columns are labelled. They are both `name` in their tables, and asyncpg keeps one of two identical keys, so the map would alias a name to itself.
 ACTIVE_ALIASES_SQL = (
     "SELECT a.name AS alias, p.name AS canonical"
     " FROM project_aliases pa"

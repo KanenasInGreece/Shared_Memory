@@ -77,14 +77,7 @@ CANDIDATE_SQL = """
 
 
 def _load_env() -> None:
-    # Delegates to secure_env's split loader (Credential_Custody_Plan PR A4,
-    # SEC-05-class sweep) instead of parsing shared-memory/.env by hand: config
-    # keys still reach os.environ via setdefault, exactly as before, but
-    # PG_PASSWORD/PG_CONN/NEO4J_PASSWORD (and anything else secret-classified)
-    # are held only in secure_env's in-process store — never os.environ — and
-    # must be read back through secure_env.get_secret(). Same candidate order
-    # (shared-memory/.env, then the pre-0.6 repo-root fallback), no library
-    # dependency (secure_env parses the file itself).
+    # Secrets stay in the in-process store. Read them with get_secret(); a hand parser would put the passwords in os.environ.
     secure_env.load_split_env()
 
 

@@ -6,57 +6,23 @@
 #   bash shared-memory/scripts/uninstall_framework.sh --level data
 #   bash shared-memory/scripts/uninstall_framework.sh --level all --yes
 #
-# LEVELS (operator-ruled: tiered, and --level is REQUIRED — there is no default,
-# because the safe default for an irreversible operation is "say what you mean"):
+# --level is required. There is no default, because an irreversible operation must be named.
 #
-#   service  the gateway stops being a service, and no agent can reach it.
-#            systemd user unit, linger, and EVERY agent's skill directory
-#            (which is where its raw AGENT_TOKEN lives). Containers, data and
-#            .env are untouched — this level is reversible; the exact working
-#            procedure (install_service.sh, sync_skills.sh --install, then a
-#            per-agent bootstrap_tokens.sh --remint ... --install-path, then a
-#            gateway restart) is printed at the end of a real run of this
-#            level, not duplicated here where it could drift out of sync.
+# service stops the gateway service and removes every agent's skill directory, where its raw token lives. Containers, data, and .env stay. The reverse procedure is printed at the end of a real run, not copied here.
 #
-#   data     everything above, plus the stores and the credentials: containers
-#            and volumes, the Neo4j/Postgres data directories, and
-#            shared-memory/.env.
-#            ⛔ NOT reversible. The corpus is gone unless a backup set exists.
+# data also removes containers, volumes, the Neo4j and Postgres data directories, and shared-memory/.env. Not reversible unless a backup set exists.
 #
-#   all      everything above, plus LLM_MODELS_DIR (GGUF weights). A level named
-#            "all" that quietly preserved 1.2 GB of models would not be "all".
+# all also removes LLM_MODELS_DIR. A level named all that kept the weights would not be all.
 #
-# ⛔ WHAT IS NEVER REMOVED, AT ANY LEVEL:
+# Never removed, at any level: ~/.shared-memory, which holds backups, the audit trail, and capacity history, and this repository checkout. The final rm -rf is printed for you to run.
 #
-#   * ~/.shared-memory — THE HOST'S RECORD, not the installation's. It holds the
-#     backup sets, the credential audit trail, the capacity measurement history
-#     and every postflight baseline. An audit trail an uninstall can erase is not
-#     an audit trail; the measurements describe the machine, not the install.
-#     Deleting a corpus and its backups in one command is unrecoverable, and the
-#     backup is the ONLY preservation mechanism
-#     this framework has: the stores bake credentials into their data directories
-#     at init, so a preserved data dir without its .env is permanently unreadable.
-#     That is also why there is no "keep my data" option — keeping data is what
-#     the backup is for.
-#
-#   * THE REPOSITORY CHECKOUT. This script lives inside it and cannot delete the
-#     ground it stands on cleanly. The final `rm -rf` is printed for the operator
-#     to run deliberately.
-#
-# Exit 0 when the requested level is fully removed; non-zero on any refusal.
+# Exit 0 when the requested level is fully removed. Any refusal exits non-zero.
 
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-# Same two candidates, same order, as every other loader in this project
-# (apply.py's _load_env(), bootstrap_tokens.sh, ...): shared-memory/.env,
-# falling back to the pre-0.6 repo-root path. Kept as an ARRAY too (not just
-# the resolved $ENV_FILE below) because the mintlock cleanup further down
-# must check both candidates regardless of which one currently exists — once
-# $ENV_FILE itself is gone (a re-run after a partial uninstall), resolution
-# below silently shifts to the OTHER candidate, and a mintlock stranded at
-# the first one would never be found again if only $ENV_FILE were checked.
+# shared-memory/.env first, then the pre-0.6 repo-root file. Both candidates are kept, because a re-run after .env is gone would otherwise look for the mint lock in the wrong place.
 _ENV_CANDIDATES=("$REPO_ROOT/shared-memory/.env" "$REPO_ROOT/.env")
 ENV_FILE="${_ENV_CANDIDATES[0]}"
 [[ -f "$ENV_FILE" ]] || ENV_FILE="${_ENV_CANDIDATES[1]}"
@@ -89,10 +55,7 @@ case "$LEVEL" in
     *)   die "unknown level '$LEVEL' (expected service, data or all)" ;;
 esac
 
-# ── Read the installation's own description of itself ────────────────────────
-# Same hand-rolled parse as every other loader in this project — never import a
-# parser, which is how two verifiers came to report a credentials error for a
-# missing dependency.
+# Parse .env by hand. Importing a parser is how two verifiers reported a credentials error for a missing dependency.
 env_get() {
     local key="$1" line
     [[ -f "$ENV_FILE" ]] || return 0
@@ -107,16 +70,8 @@ BACKUP_DIR="$(env_get BACKUP_DIR)"; BACKUP_DIR="${BACKUP_DIR:-$HOME/.shared-memo
 STATE_DIR="$HOME/.shared-memory"
 UNIT_PATH="$HOME/.config/systemd/user/$GATEWAY_UNIT"
 
-# Agent install directories: the REGISTRY first, because an install path is owned
-# information about this host and not something a naming convention reproduces.
-# The historical four are added only when they actually exist on disk.
-#
-# ⚠ AGENT_INSTALLS entries have TWO arities — `name:path` (kind `skill`, the
-# permanent meaning of the two-field form) and `name:kind:path`. Stripping only
-# the name and calling dirname on the rest turned `opencode:mcp:/w/.env` into
-# the literal directory `mcp:`, so an MCP install's walled directory — which
-# holds that agent's raw token, the very thing this inventory warns about —
-# was neither listed nor removed, and a nonsense path was listed instead.
+# Prefer AGENT_INSTALLS, because a path is this host's own fact. The historical four are added only when they exist.
+# Entries are name:path or name:kind:path. Stripping only the name turned an mcp path into a directory literally named mcp:.
 mapfile -t _registry_entries < <(
     grep -E '^AGENT_INSTALLS=' "$ENV_FILE" 2>/dev/null | tail -1 | cut -d= -f2- \
     | tr ',' '\n' | sed -n 's/^[[:space:]]*[^:]*:[[:space:]]*\(.*[^[:space:]]\)[[:space:]]*$/\1/p')
@@ -145,7 +100,7 @@ done
 
 _size() { [[ -e "$1" ]] && du -sh "$1" 2>/dev/null | awk '{print $1}' || echo "-"; }
 
-# ── Inventory FIRST. Nothing is removed before the operator has seen this. ────
+# Nothing is removed before the operator has seen this inventory.
 echo "Shared Memory — UNINSTALL (level: $LEVEL)"
 echo "  repo   : $REPO_ROOT"
 echo "  env    : ${ENV_FILE}$([[ -f "$ENV_FILE" ]] || echo ' (absent)')"
@@ -199,13 +154,7 @@ echo "                    ⛔ never removed at any level — it is the only way 
 echo "  repo checkout     $REPO_ROOT"
 echo "                    this script runs from inside it; the final rm -rf is yours."
 if [[ "$LEVEL" == "service" ]]; then
-    # M7 (decision:1824 item 3): --level service leaves shared-memory/.env in
-    # place untouched (only data/all remove it, already listed above under
-    # WILL BE REMOVED) — one plain line stating that plainly, so an operator
-    # is never left to discover it: every declared LLM backend, its
-    # private_ok/roles/extra_body state and any token_env NAME reference
-    # survives, and a later restart resumes exactly the pool this file
-    # declares.
+    # --level service leaves shared-memory/.env in place (decision:1824). data and all are the levels that remove it, and that must be visible here.
     echo "  framework env     $ENV_FILE   (left in place — every declared LLM backend,"
     echo "                    its private_ok/roles/extra_body state and any token_env"
     echo "                    NAME reference survives untouched; a later restart resumes"
@@ -213,7 +162,7 @@ if [[ "$LEVEL" == "service" ]]; then
 fi
 echo
 
-# ── The backup gate. Irreversible levels refuse to start unencumbered. ───────
+# data and all refuse to start when no backup set exists, unless --no-backup was passed.
 if [[ "$LEVEL" != "service" && "$NO_BACKUP" != "1" ]]; then
     _sets="$(find "$BACKUP_DIR" -maxdepth 1 -name '*.manifest.json' 2>/dev/null | wc -l | tr -d ' ')"
     if [[ "${_sets:-0}" -eq 0 ]]; then
@@ -230,8 +179,7 @@ if [[ "$LEVEL" != "service" && "$NO_BACKUP" != "1" ]]; then
     ylw "  ! not verified here — run 'bash shared-memory/ops/backup.sh --verify' if unsure."
 fi
 
-# A dry run reports the gate's verdict too. "What would happen" includes "it
-# would refuse" — a preview that hides the refusal is not a preview.
+# A dry run must also show a refusal. A preview that hides it is not a preview.
 if [[ "$DRY_RUN" == "1" ]]; then
     grn "Dry run — nothing was removed."
     exit 0
@@ -244,18 +192,8 @@ if [[ "$ASSUME_YES" != "1" ]]; then
 fi
 
 echo
-# ── service ──────────────────────────────────────────────────────────────────
 echo "Removing the service ..."
-# ⛔ `systemctl --user` TALKS TO THE SESSION BUS, NOT TO $HOME. Pointing HOME at
-# a sandbox does NOT sandbox it: the calls below reach the real user's systemd
-# instance whatever HOME says. Measured the hard way — a test running this
-# script under a temporary HOME stopped and disabled the live gateway on the
-# development machine, and disabled linger with it.
-#
-# So the service is touched only when THIS install's unit file is actually
-# present. That is also the correct rule on its own terms: an installation that
-# never installed a service has no service to remove, and stopping a unit this
-# tree did not install is reaching outside the thing being uninstalled.
+# systemctl --user talks to the session bus, not to $HOME, so a sandboxed HOME still hits the live user systemd. Touch the service only when this install's unit file is present.
 if [[ ! -f "$UNIT_PATH" ]]; then
     ylw "  ! no unit at $UNIT_PATH — this install has no service; leaving systemd alone"
 elif command -v systemctl >/dev/null 2>&1; then
@@ -264,10 +202,7 @@ elif command -v systemctl >/dev/null 2>&1; then
     rm -f "$UNIT_PATH"
     systemctl --user daemon-reload 2>/dev/null || true
     grn "  ✓ unit stopped, disabled and removed"
-    # Mirrors install_service.sh, which enables linger the same way and needs the
-    # same sudo fallback: plain loginctl returns "Access denied" for a non-root
-    # user on some distributions, and a silent failure here leaves the machine
-    # in a state the install would not have produced.
+    # install_service.sh enables linger the same way and needs the same sudo fallback. A silent failure would leave a state the install would not have produced.
     if loginctl disable-linger "$USER" >/dev/null 2>&1; then
         grn "  ✓ linger disabled"
     elif sudo -n loginctl disable-linger "$USER" >/dev/null 2>&1; then
@@ -315,32 +250,8 @@ fi
 
 # ── data ─────────────────────────────────────────────────────────────────────
 # >>> COMPOSE_DOWN_AND_VERIFY
-# The compose file requires NEO4J_HOST_DIR / PG_DATA_DIR to interpolate at all
-# (postgres_neo4j_limits.yaml's `${VAR:?set ... in shared-memory/.env}` guards)
-# — EVERY `docker compose` invocation against it, `down` included, needs those
-# values or config parsing fails before docker touches a single container.
-# Measured (fact:1515): invoking `down -v` without `--env-file` failed exactly
-# that way, and the caller's `2>&1 | tail -3` discarded the exit code and
-# printed success regardless — four `restart: always` containers kept running
-# while the next block below deleted their data directories out from under
-# them.
-#
-# So: (1) always pass --env-file when $ENV_FILE exists, the same shape the
-# install side already uses (install_framework.sh / preflight.sh / AGENTS.md
-# all print `-f ... --env-file ...`). (2) When it does not — a re-run after a
-# partial uninstall already removed it — fall back to explicit dummy values
-# for ONLY the two required-but-unused-by-`down` keys, just enough to satisfy
-# compose's interpolation gate. This is an honest fallback, not a workaround:
-# `down -v` never mounts or reads those paths, and this compose file declares
-# no top-level `volumes:` at all — every volume in it is a bind mount, so `-v`
-# has nothing of its own to remove either way (the real data dirs are handled
-# by remove_data_dir() below, from the .env's actual values, while they still
-# exist). The dummy values exist only so compose's config parser lets `down`
-# run at all when the file that would have supplied real ones is gone.
-# (3) CHECK the exit code — never swallow it behind a pipe again. (4) then
-# MEASURE that the containers are actually gone (`docker ps -a`, matched
-# against the compose file's own `container_name:` list) before saying so —
-# compose exiting 0 is not proof by itself.
+# Compose will not parse this file without NEO4J_HOST_DIR and PG_DATA_DIR, including on `down`. `down -v` without `--env-file` failed that way, and a pipe hid the exit code while data dirs were deleted under live containers (fact:1515).
+# Pass --env-file when it exists. If a partial uninstall already removed it, dummy values only satisfy interpolation, because this stack has no named volumes for `-v` to remove. Then check the exit code and that docker ps no longer lists the compose file's container names.
 compose_down_and_verify() {
     local down_out down_rc containers name leftover=()
 
@@ -369,15 +280,7 @@ compose_down_and_verify() {
     mapfile -t containers < <(grep -E '^[[:space:]]*container_name:' "$COMPOSE_FILE" \
         | sed -E 's/^[[:space:]]*container_name:[[:space:]]*//')
 
-    # Ops & Release Integrity review, Critical (Ops-14), merger-verified.
-    # FAILS OPEN otherwise: an empty $containers array (compose file syntax
-    # changed, renamed, or missing entirely by the time this runs) makes the
-    # loop below iterate zero times, find zero leftovers, and claim VERIFIED
-    # success -- the exact unearned checkmark this whole function exists to
-    # remove, reintroduced one layer up in its own verification step. An
-    # empty parse is refused as a verification FAILURE, not treated as "zero
-    # containers to check". No fallback heuristic (guessing container names)
-    # -- an honest "cannot verify" beats a clever guess.
+    # An empty container_name parse must fail, not report success. Zero names means this function cannot check docker ps, not that nothing is running.
     if [[ ${#containers[@]} -eq 0 ]]; then
         red "  ✗ could not parse any container_name: entries from $COMPOSE_FILE --"
         red "    the teardown CANNOT be verified. This does not mean nothing is"
@@ -418,18 +321,7 @@ else
     ylw "  ! docker or compose file absent — skipping ($COMPOSE_FILE)"
 fi
 
-# ⛔ THE STORES' DATA DIRECTORIES ARE NOT OWNED BY THIS USER.
-# Measured on a live install: PG_DATA_DIR is mode 700 owned by the uid the
-# Postgres image runs as, so the operator cannot even `ls` it, let alone remove
-# it — `rm -rf` fails with EACCES. And because these are BIND MOUNTS rather than
-# named volumes, `docker compose down -v` does not touch them either: without
-# this step the corpus survives an uninstall that reported success.
-#
-# The fix is the idiom this project already uses to reach Postgres tooling —
-# do the work where the permissions live, in a container — rather than asking
-# the operator for sudo. Failure is reported, never swallowed: an earlier draft
-# wrote `rm -rf "$d" && echo ✓`, which printed nothing at all when the remove
-# failed and left the data behind under a success message.
+# These data directories are bind mounts owned by the container uid, so `down -v` does not remove them and this user often cannot either. A failed remove must be reported, or the corpus survives under a success message.
 remove_data_dir() {
     local d="$1"
     [[ -n "$d" && -e "$d" ]] || return 0
@@ -457,32 +349,15 @@ for d in "$NEO4J_HOST_DIR" "$PG_DATA_DIR"; do
     remove_data_dir "$d" || _data_failures=$((_data_failures + 1))
 done
 
-# ⛔ $STATE_DIR IS NOT TOUCHED (operator-ruled). It is not installation state —
-# it is the HOST's record: the backup sets, the credential audit trail, the
-# capacity measurement history, and every postflight baseline. An audit trail
-# that an uninstall can erase is not an audit trail, and the measurements
-# describe this machine rather than this installation, so reinstalling does not
-# make them untrue. An earlier draft cleared it entry-by-entry keeping only
-# backups; that would have destroyed the audit log and the capacity history for
-# no benefit — and capacity history has already been lost once on this project.
+# Do not touch ~/.shared-memory. It is the host's record of backups, the audit trail, and capacity history, and an uninstall that can erase an audit trail is not one.
 
 [[ -f "$ENV_FILE" ]] && rm -f "$ENV_FILE" && echo "  ✓ removed $ENV_FILE (every credential this install had)"
 
-# bootstrap_tokens.sh's read-modify-write lock on $ENV_FILE (see its own
-# comment at _LOCKFILE=). It has no purpose once the .env it guards is gone,
-# and — unlike $ENV_FILE above — nothing else in this script incidentally
-# removed it, so a prior --level data run left it stranded on disk forever.
-#
-# Checked against BOTH candidates, not just the resolved $ENV_FILE: once
-# .env is gone, resolution above silently shifts to the OTHER candidate, so
-# a re-run after a partial uninstall (.env already gone, mintlock still
-# sitting where that .env used to be) would otherwise look in the wrong
-# place and never find it.
+# The mint lock has no purpose once its .env is gone, and nothing else removes it. Check both env candidates, because a re-run after .env is gone resolves to the other one.
 for _cand in "${_ENV_CANDIDATES[@]}"; do
     [[ -f "${_cand}.mintlock" ]] && rm -f "${_cand}.mintlock" && echo "  ✓ removed ${_cand}.mintlock (bootstrap_tokens.sh's mint lock)"
 done
 
-# ── all ──────────────────────────────────────────────────────────────────────
 if [[ "$LEVEL" == "all" ]]; then
     if [[ -n "$LLM_MODELS_DIR" && -d "$LLM_MODELS_DIR" ]]; then
         rm -rf "$LLM_MODELS_DIR" && echo "  ✓ removed LLM models $LLM_MODELS_DIR"
@@ -491,10 +366,7 @@ if [[ "$LEVEL" == "all" ]]; then
     fi
 fi
 
-# Credentials the operator placed by hand live under $STATE_DIR/creds — nothing
-# in this repository writes them, so an uninstall has no business deleting them.
-# It DOES have a duty to say they are still there: "everything goes" that quietly
-# leaves an API key on disk is the sort of half-truth an operator acts on.
+# Credentials under ~/.shared-memory/creds were placed by hand, so this script does not delete them. It must still say they are there.
 if [[ -d "$STATE_DIR/creds" ]] && [[ -n "$(ls -A "$STATE_DIR/creds" 2>/dev/null)" ]]; then
     echo
     ylw "⚠ CREDENTIALS LEFT ON THIS HOST — not created by this framework, so not"

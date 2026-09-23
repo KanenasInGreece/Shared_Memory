@@ -4,35 +4,15 @@ Documentation=https://github.com/KanenasInGreece/Shared_Memory
 
 [Service]
 Type=oneshot
-# Set WorkingDirectory to your repo root; backup.sh resolves shared-memory/.env
-# from there (creds + BACKUP_* knobs), falling back to a pre-0.6 repo-root .env.
-# Override with --env <path> if your env lives elsewhere.
-# The script self-locks (flock) against overlap.
+# Repo root. backup.sh reads shared-memory/.env from here (pre-0.6 fallback: a repo-root .env) unless you pass --env. It flock's itself so two runs cannot overlap.
 WorkingDirectory=/path/to/your/shared-memory-GitHub
 ExecStart=/usr/bin/env bash shared-memory/ops/backup.sh
-# S-17 (Credential_Custody_Plan PR A4) — cheap, verified-compatible hardening,
-# same reasoning as hive-mind-gateway.service: this script creates dump files
-# (pgdump/cypher.gz — secrets-adjacent, not secrets themselves, but tightly
-# scoped by default is still the right posture) and never needs elevated
-# privileges. ProtectHome intentionally left out for the same reason as the
-# gateway unit — BACKUP_DIR defaults to ~/.shared-memory/backups, under $HOME.
+# Dumps are secrets-adjacent, so new files are 0600, and this script never needs extra privileges. ProtectHome stays off because BACKUP_DIR defaults to ~/.shared-memory/backups.
 UMask=0077
 NoNewPrivileges=yes
 
-# S16 (HYG round) — LimitCORE=0: same reasoning as hive-mind-gateway.service,
-# and more pointed here — backup.sh's init_secrets_dir() writes the curl auth
-# bearer token and BOTH database passwords to plaintext files (mode 600) for
-# the run's duration; a core dump of this process would capture them from its
-# own environment/heap even faster than from a .env read. See
-# ops/README.md's "Hardening" section for the temporary lift procedure.
+# init_secrets_dir() holds the bearer token and both database passwords in this process. A core dump would capture them.
 LimitCORE=0
 
-# ProtectSystem=full (HYG round, ruling applied): backup.sh's
-# init_secrets_dir() calls `mktemp -d` to hold the curl auth header and the
-# Postgres/Neo4j --env-files for docker exec — that directory is under /tmp
-# (or $TMPDIR) by default, not under %h, but `full` only makes /usr, /boot,
-# /efi and /etc read-only; it never touches /tmp, /run or $XDG_RUNTIME_DIR,
-# so this write is unaffected either way. `strict` stays FORBIDDEN — it
-# would make %h itself read-only. See ops/README.md (Hardening) for the
-# write-path-outside-%h observation this directive does not resolve.
+# `full` does not touch /tmp, where init_secrets_dir() puts the docker-exec env files. `strict` is forbidden because it makes the home directory read-only.
 ProtectSystem=full

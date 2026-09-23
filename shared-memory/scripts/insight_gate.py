@@ -4,10 +4,7 @@ Imports only ontology and stdlib; the walk takes an already-built Neo4j driver a
 """
 from ontology import ONT
 
-# THE CLOSED RELATION SET (plan §0): grounding edges + HAD_OUTCOME. Nothing
-# else — in particular NEVER SUPERSEDES (§2.3 is explicit and settled: the
-# walk must never follow it). Order here is cosmetic only; the Cypher below
-# matches all six as one undirected relationship-type disjunction.
+# Grounding edges plus HAD_OUTCOME only. The walk must not follow SUPERSEDES, or a reversed decision pulls the next record in.
 CLOSED_RELATION_TYPES: tuple[str, ...] = (
     ONT.grounded_in, ONT.informed_by, ONT.considered,
     ONT.rejected, ONT.under_conditions, ONT.had_outcome,
@@ -15,15 +12,7 @@ CLOSED_RELATION_TYPES: tuple[str, ...] = (
 
 _JUDGEMENT_LABELS = (ONT.decision, ONT.retrospective)
 
-# Retained ONLY as the telemetry age-percentile K for
-# ``_kth_oldest_age_seconds`` (consolidation_loop.run_insight_cycle) — how
-# many of a component's oldest members set its "how long has this been
-# eligible" reading. It is NOT a gate parameter any more: v2 has no
-# per-decision-count threshold (G1's density lives in ONT.density_threshold;
-# G2/G3 are each "at least one", not a tunable count). Kept under its old
-# name deliberately narrowed rather than silently repurposed — see the
-# CLAUDE.md rule that a metric's meaning must never invert under an unchanged
-# name; the docstring here is that rename-in-place.
+# Age-census K only, not a gate. The old name stayed so the metric would not silently change meaning.
 INSIGHT_AGE_CENSUS_K: int = ONT.insight_threshold
 
 

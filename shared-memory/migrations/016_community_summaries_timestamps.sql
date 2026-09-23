@@ -1,22 +1,8 @@
--- Migration 016: created_at + updated_at on community_summaries — universal temporal
--- provenance / latency instrumentation (decision: universal timestamps as latency
--- instrumentation, not just recency)
---
--- community_summaries was the ONLY authoritative record store without a time column.
---   created_at — first fold (immutable provenance).
---   updated_at — last fold (the recency + staleness signal). Thematic summaries mutate
---                in place (ON CONFLICT DO UPDATE), so the daemon stamps updated_at =
---                now() on each fold while created_at is preserved (not in the SET).
---
--- This ALSO unlocks the coarse dream-cycle latency purely in Postgres, no Neo4j:
---   summary.created_at − min(source technical_docs.created_at over source_pg_ids)
---   = the fact→summary end-to-end time.
---
--- Backfill: recover both from the ISO 'timestamp' the daemon already writes into
--- metadata per fold (regex-guarded so a malformed value can't abort the migration);
--- rows without a parseable timestamp stay NULL (unknown). Future rows get DEFAULT now().
--- IDEMPOTENT: ADD COLUMN IF NOT EXISTS; backfill only fills NULLs; SET DEFAULT / CREATE
--- INDEX IF NOT EXISTS are no-ops once present.
+-- Migration 016: created_at and updated_at on community_summaries, the only
+-- store that had no time column (decision: universal timestamps as latency
+-- instrumentation, not just recency). created_at is the first fold; updated_at
+-- moves on each in-place re-fold. The regex accepts only an ISO-shaped
+-- metadata timestamp so a bad value cannot abort the migration.
 
 ALTER TABLE community_summaries ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ;
 ALTER TABLE community_summaries ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ;

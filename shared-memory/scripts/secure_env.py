@@ -74,28 +74,7 @@ import stat
 import sys
 from pathlib import Path
 
-# The explicit half of SEC-09's classification.
-#
-# Review fix #3: PG_CONN joins this list. A full DSN
-# (postgresql://postgres:<pw>@host/db) embeds the Postgres password verbatim
-# — treating PG_CONN as "config" would have exported that password to
-# os.environ and every daemon's child env exactly as if PG_PASSWORD itself
-# had leaked.
-#
-# R4 (fix round 1, Opus review): AGENT_TOKEN (singular) joins this list too.
-# It was already classified secret everywhere via the suffix pattern
-# (is_secret_key("AGENT_TOKEN") was always True) — this is NOT about
-# classification, which was already correct. It is about MEMBERSHIP in
-# candidate_secret_keys (load_split_env(), below): SEC-06 (ii)'s advisory
-# and the file-based delivery tiers both iterate that set, and a key only
-# reaches it via KNOWN_SECRET_NAMES, an .env-file line, a discovered
-# token_env name, or (as of this fix round) a _FILE/$CREDENTIALS_DIRECTORY
-# pointer actually present. AGENT_TOKEN is never written to shared-memory/.env
-# by design (see hive_mind_proxy._daemon_env_and_token_fd() / the pipe-fd
-# delivery PR A2 introduced), so before this line it could sit directly in a
-# process's exec environment and get NO SEC-06 (ii) advisory at all — the one
-# key this workstream has spent two PRs getting OUT of the environment was
-# the one the new advisory could not see (Opus probe-confirmed).
+# PG_CONN embeds the Postgres password, so treating it as config would export it. AGENT_TOKEN is already secret by suffix; it is listed so the advisory can see a key that is never written to shared-memory/.env.
 KNOWN_SECRET_NAMES = {
     "PG_PASSWORD",
     "NEO4J_PASSWORD",
@@ -106,65 +85,23 @@ KNOWN_SECRET_NAMES = {
     "PG_CONN",
 }
 
-# Review fix #5: names that WOULD match the suffix pattern below but are
-# genuine operator config, not secrets — checked BEFORE the pattern so they
-# are never misclassified. Found by grepping .env.example and every script
-# in this process family for a name ending in any of the (widened, fix #6)
-# suffixes:
-#   EMBED_CHARS_PER_TOKEN            — dream_telemetry.py's chars-per-token
-#                                       ratio (a float knob, not a credential)
-#   BACKUP_ADVISORY_LOCK_KEY         — a Postgres advisory-lock integer id
-#   NREM_PRIORITY_ADVISORY_LOCK_KEY  — same, NREM's priority-wait lock id
-# (AGENT_TOKEN, singular, also matches "_TOKEN" but is deliberately NOT on
-# this list — it IS a secret. PR A1 delivered it to a daemon's child env as
-# one named interim exception in hive_mind_proxy._daemon_env(); PR A2
-# (SEC-10) closes that: a freshly-minted, per-boot daemon token now crosses
-# only through an inherited pipe fd (see read_daemon_token_from_fd() below),
-# never through the child environment at all. Putting AGENT_TOKEN on this
-# list would still be the misclassification in the other direction — it
-# stays classified secret so it can never be exported to os.environ either.)
+# Suffix matches that are config, checked before the pattern. EMBED_CHARS_PER_TOKEN is a ratio; the advisory-lock keys are integers. AGENT_TOKEN matches _TOKEN and stays a secret so it is never exported.
 KNOWN_CONFIG_NAMES = {
     "EMBED_CHARS_PER_TOKEN",
     "BACKUP_ADVISORY_LOCK_KEY",
     "NREM_PRIORITY_ADVISORY_LOCK_KEY",
 }
 
-# The pattern half — catches provider keys (DEEPSEEK_API_KEY, XAI_API_KEY, ...)
-# and any future secret-shaped var nobody added to KNOWN_SECRET_NAMES above.
-# Review fix #6: widened past the original three (_PASSWORD/_TOKEN/_API_KEY)
-# to also catch _SECRET/_KEY/_CREDENTIAL(S), matched case-insensitively —
-# is_secret_key() upper-cases the candidate before comparing. _KEY alone is
-# broad enough to catch real config (the *_ADVISORY_LOCK_KEY pair above),
-# which is exactly why KNOWN_CONFIG_NAMES exists and is checked first.
+# Catches provider keys the explicit list does not name. _KEY is wide enough to hit the advisory-lock ids, which is why those are excluded first.
 _SECRET_SUFFIXES = (
     "_PASSWORD", "_TOKEN", "_API_KEY", "_SECRET", "_KEY",
     "_CREDENTIAL", "_CREDENTIALS",
 )
 
-# Review fix #2: token_env names discovered at runtime from LLM_BACKENDS_JSON.
-# A backend can name an arbitrary env var (e.g. "OPENROUTER_CREDENTIAL") that
-# matches none of the suffixes above, so the suffix pattern alone cannot
-# catch it — SEC-09's "every token_env name from backend config" clause is
-# what does. Populated by load_split_env(), consulted by is_secret_key() (so
-# _daemon_env()'s filter excludes it too). Module-level and additive: once a
-# name is seen it stays classified secret for the life of the process — this
-# is deliberately NOT reset by load_split_env() re-runs, only by a test
-# harness that owns the module's lifetime (see the test file's fixture).
+# Names from token_env that match no suffix. Once seen they stay secret for the process; a reload must not forget a credential name.
 _dynamic_secret_names: set[str] = set()
 
-# D.1 (SEC round, ADV1-2): set by _token_env_names() on a genuine parse
-# failure of a non-empty LLM_BACKENDS_JSON (invalid JSON, or valid JSON that
-# is not an array) -- consulted by require_llm_backends_json_parses() below.
-# _token_env_names() itself must NEVER raise (load_split_env() runs at
-# module IMPORT time in hive_mind_proxy.py/rem_loop.py/consolidation_loop.py,
-# and every test in this repo imports those modules freely, many with a
-# deliberately malformed env) -- this flag is how a parse failure that must
-# stay silent at import time still becomes a LOUD, named refusal at the
-# actual entrypoint (main()/a daemon's __main__ guard), same placement
-# pattern as require_db_credentials(). Reset on every call so a LATER,
-# corrected LLM_BACKENDS_JSON (an operator's fix, or a test re-invoking
-# load_split_env() with a clean value) clears a stale failure rather than
-# wedging every subsequent check permanently fatal.
+# A bad LLM_BACKENDS_JSON must not raise at import. This flag makes the same failure loud at the entrypoint, and a later good value clears it.
 _llm_backends_json_parse_failed: bool = False
 
 # In-process only. Populated by load_split_env(); read by get_secret(). Never
@@ -653,15 +590,7 @@ def _read_secret_file(path: Path, *, source: str) -> "str | None":
     bad = _first_control_character(raw)
     if bad is not None:
         offset, ch = bad
-        # NEVER the secret's content, and NEVER its length either: this file
-        # is under the cap, so its size is the key's own length give or take
-        # the artefact — a reconstruction aid an operator does not need to
-        # fix the file. (The over-cap warnings above DO print a size, but
-        # that is a different case: there the size IS the complaint, and the
-        # secret was refused before any of it was used.) `offset` is a
-        # CHARACTER index into the decoded string, not a byte offset — they
-        # differ the moment the file holds any multi-byte UTF-8 — so it is
-        # labelled as one rather than left to read as a file position.
+        # No length: under the cap it is the secret's length. offset is a character index, not a byte position.
         print(f"[secure_env] WARNING: {source} ({path}) contains a control "
               f"character \\x{ord(ch):02x} at character offset {offset} "
               f"— refusing to use it, treating as "
@@ -673,16 +602,7 @@ def _read_secret_file(path: Path, *, source: str) -> "str | None":
     return raw
 
 
-# O7 (fix round 1, Opus review): every candidate key name that becomes part
-# of a filesystem path or an env-var name below must look like an ordinary
-# identifier — no `/`, no `..`, no whitespace, no leading digit/underscore.
-# A candidate key can originate from `LLM_BACKENDS_JSON`'s `token_env`
-# (arbitrary JSON string content, never validated at parse time) or from a
-# malformed `<K>_FILE`/`$CREDENTIALS_DIRECTORY` entry name (fix round 1's own
-# new derivation below) — without this gate, a `token_env` of
-# `../../../home/user/.ssh/id_rsa` would have `_credentials_directory_secret()`
-# read OUTSIDE `$CREDENTIALS_DIRECTORY`, and the value read would then be SENT
-# to that backend's URL as its bearer token (Opus O7).
+# token_env is an arbitrary string. Without this, `../../../home/user/.ssh/id_rsa` would be read and sent as a bearer token.
 _VALID_KEY_NAME = re.compile(r"^[A-Za-z][A-Za-z0-9_]*$")
 
 
@@ -939,47 +859,21 @@ def load_split_env() -> None:
                 )
             raw_pairs.append((key, unquoted_val))
 
-    # F6: collapse to canonical keys ONCE, before anything else reads
-    # `file_values` — deterministically LAST-DEFINITION-WINS (file order),
-    # regardless of which case variant each line used. Every downstream
-    # consumer of `file_values` (the LLM_BACKENDS_JSON read just below, and
-    # the secret-resolution loop further down) now sees one unambiguous
-    # value per canonical key instead of racing a set's iteration order.
+    # One spelling per key, last line wins. Otherwise two casings race a set's iteration order.
     file_values: dict[str, str] = {}
     for key, val in raw_pairs:
         file_values[_normalize_key(key)] = val
 
-    # Review fix #2 (F4 fixed, see docstring above): the EFFECTIVE
-    # LLM_BACKENDS_JSON — os.environ first (an operator/systemd-exported
-    # value, the documented provider-key delivery path — AGENTS.md /
-    # ops/README.md), the file second (now canonical — any spelling is
-    # SEEN). Same precedence as get_secret() (fix #1): an exported value
-    # always wins. Computed even when no .env file exists at all, since the
-    # mainline case is an exec-env-only deployment.
+    # An exported value wins over the file, same as get_secret(). Still computed when there is no .env.
     llm_json = os.environ.get("LLM_BACKENDS_JSON") or file_values.get("LLM_BACKENDS_JSON", "")
     _dynamic_secret_names.update(_token_env_names(llm_json))
 
-    # Config keys: unchanged from every prior release — setdefault into
-    # os.environ, under the RAW (export-stripped, but not case-folded)
-    # spelling raw_pairs carries, so an operator's own literal config-var
-    # casing survives. Secret-classified keys are skipped here entirely;
-    # they are resolved below, through the three-tier secret path instead
-    # (SEC-06 i: they must never touch os.environ by any route, including
-    # this one).
+    # Config keeps the operator's spelling in os.environ. Secrets skip this path entirely.
     for key, val in raw_pairs:
         if not is_secret_key(key):
             os.environ.setdefault(key, val)
 
-    # Secret keys: every name we can actually see as secret-shaped —
-    # present in the .env file, on the fixed KNOWN_SECRET_NAMES list (so
-    # LoadCredential=/_FILE alone can resolve a credential with no .env file
-    # present at all), a dynamically-discovered token_env name, OR (fix
-    # round 1, R4/QF-3) a key derived from a <K>_FILE pointer or a
-    # $CREDENTIALS_DIRECTORY entry that is actually present. Without the last
-    # two, file-based delivery silently did nothing for any secret-shaped key
-    # outside the first three sources — probe-confirmed on AGENT_TOKEN_FILE
-    # and DEEPSEEK_API_KEY_FILE, both of which resolved to None even with the
-    # file present, readable, and correctly formatted.
+    # Includes names that exist only as a _FILE pointer or a credentials-directory entry. Without those, a present file resolved to None.
     candidate_secret_keys = (
         {k for k in file_values if is_secret_key(k)}
         | KNOWN_SECRET_NAMES
@@ -987,25 +881,7 @@ def load_split_env() -> None:
         | _derive_file_pointer_candidates(file_values)
         | _derive_credentials_directory_candidates()
     )
-    # D.2 (ADV1-3), storage key canonicalisation: `key` here can be ANY case
-    # a candidate arrived in (KNOWN_SECRET_NAMES / the dynamic token_env set
-    # / the two derived-candidate helpers are already canonical; `file_values`
-    # is now ALSO already canonical, per F6 above). $CREDENTIALS_DIRECTORY/
-    # <key> and <KEY>_FILE are resolved against the CANONICAL form — the
-    # systemd/Docker convention both already assume an upper-case env-var
-    # name, and this is what lets a lowercase `agent_tokens=` line's implied
-    # `AGENT_TOKENS_FILE` pointer resolve too. The plaintext .env value
-    # itself is looked up under that SAME canonical form — `file_values` no
-    # longer holds any other spelling to look up. The STORE is always the
-    # canonical form: get_secret("AGENT_TOKENS") (used throughout this
-    # codebase as a fixed upper-case literal) must reach a value that was
-    # declared as `agent_tokens=` in the .env file, not silently miss it
-    # because load_split_env() filed it under the raw spelling instead —
-    # exactly the bug ADV1-3 describes ("auth silently turns off on that
-    # install"). setdefault() is still what keeps this additive: the first
-    # TIER to resolve for a given canonical key wins (unchanged); F6 is what
-    # makes the plaintext-.env TIER itself deterministic when two spellings
-    # of the same key are both present.
+    # Store and look up the canonical spelling. A lowercase agent_tokens= line otherwise misses get_secret("AGENT_TOKENS") and auth turns off. The first tier that resolves still wins.
     for key in candidate_secret_keys:
         canonical = _normalize_key(key)
         value = _credentials_directory_secret(canonical)

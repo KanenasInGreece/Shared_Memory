@@ -1,30 +1,10 @@
-# Intel Arc B580 encoder pair. Not the default image.
-#
-# The default stack is llama.cpp in postgres_neo4j_limits.yaml. Use this file
-# when the GPU is an Intel Arc B580 (PCI 8086:e20b, 12 GB). It is the Main
-# workstation configuration 2: both encoders on that card, vLLM, online LLM.
-# Do not use it for another Arc card. An A770 was not this measurement.
-#
-#   lspci -nn | grep -i '8086:e20b'
-#
-# Two vLLM processes, one model each, plus the path shim. vLLM serves
-# /v1/rerank; the gateway posts /v1/reranking. rerank_shim.py rewrites that
-# path and nothing else. The embedder needs no shim.
-#
-# Weights are Hugging Face directories, not GGUF:
-#   BAAI/bge-m3 and BAAI/bge-reranker-v2-m3.
-# Set the host directories and the render-node group before up:
+# Intel Arc B580 encoder pair. Not the default image — that is llama.cpp in postgres_neo4j_limits.yaml. Use this only when the GPU is PCI 8086:e20b; an A770 was not this measurement.
+# vLLM serves /v1/rerank and the gateway posts /v1/reranking, so the shim rewrites that one path. Weights are Hugging Face directories (BAAI/bge-m3, BAAI/bge-reranker-v2-m3), not GGUF.
+# Leave the llama.cpp replicas at 0 or they take :8070/:8071. Point the gateway at the bases: EMBEDDER_URL=http://127.0.0.1:8091 and RERANKER_URL=http://127.0.0.1:8092.
 #   GPU_RENDER_GID=$(stat -c %g /dev/dri/renderD128)
 #   GPU_VIDEO_GID=$(stat -c %g /dev/dri/card0)
 #   B580_EMBED_MODEL_DIR=/path/to/bge-m3
 #   B580_RERANK_MODEL_DIR=/path/to/bge-reranker-v2-m3
-#
-# Leave the llama.cpp encoder replicas at 0 so they do not take :8070/:8071.
-# Point the gateway at this file's published ports (bases, not full paths):
-#   EMBEDDER_URL=http://127.0.0.1:8091
-#   RERANKER_URL=http://127.0.0.1:8092
-#
-#   docker compose -f shared-memory/ops/intel-arc-b580.yaml up -d
 
 name: shared-memory-b580
 

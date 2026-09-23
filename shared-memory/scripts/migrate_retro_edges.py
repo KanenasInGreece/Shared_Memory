@@ -68,16 +68,7 @@ _pg_pass   = secure_env.get_secret("PG_PASSWORD", "")
 PG_CONN    = secure_env.get_secret(
     "PG_CONN", f"postgresql://postgres:{_pg_pass}@localhost:5432/agent_data"
 )
-# W7 round 2/3: EMBED_URL was this script's own private, undocumented knob
-# — the framework's real GATEWAY_URL was never read here at all, so an
-# operator pointing GATEWAY_URL at a non-default gateway got no effect on
-# this tool. GATEWAY_URL (already documented, shared-memory/.env.example)
-# is now the source of truth; EMBED_URL is a ONE-RELEASE deprecated
-# override, honoured with a warning, for anyone who already set it by hand
-# (secure_env.load_split_env() above means a hand-written EMBED_URL line in
-# shared-memory/.env WAS already honoured before this change — silently
-# dropping it could send this migrator at a different endpoint and write
-# wrong-model vectors).
+# GATEWAY_URL is the documented knob. EMBED_URL remains a one-release override: dropping a hand-set line would write vectors against a different model.
 GATEWAY_URL = os.environ.get("GATEWAY_URL", "http://localhost:8888")
 _embed_url_override = os.environ.get("EMBED_URL")
 if _embed_url_override:

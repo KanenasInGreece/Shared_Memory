@@ -34,14 +34,7 @@ from secure_env import (
 
 # ── Environment ───────────────────────────────────────────────────────────────
 
-# SEC-05/S-03 (Credential_Custody_Plan_2026-08-14, PR A1): this daemon used to
-# have its own private _load_env() that dumped the whole .env — secrets
-# included — into os.environ. Its own comment called that "harmless while the
-# daemon is spawned by the gateway", an assumption A1 inverts: the proxy no
-# longer hands this process' child env any secrets (hive_mind_proxy._daemon_env
-# stopped copying os.environ), so a loader that re-imported them here would be
-# the leak path. Now the shared split loader — secrets go to secure_env's
-# in-process store, read back via get_secret(), never os.environ.
+# Secrets stay in secure_env, not os.environ: re-importing the .env here would put them back on the leak path the proxy stopped copying.
 load_split_env()
 
 NEO4J_URI    = "bolt://localhost:7687"
@@ -52,42 +45,17 @@ NEO4J_PASS   = get_secret("NEO4J_PASSWORD", "")
 NEO4J_MAX_POOL        = int(os.environ.get("NEO4J_MAX_POOL", "50"))
 NEO4J_ACQUIRE_TIMEOUT = float(os.environ.get("NEO4J_ACQUIRE_TIMEOUT", "30"))
 _pg_pass     = get_secret("PG_PASSWORD", "")
-# Review fix #3: PG_CONN is a secret (a DSN embeds the password verbatim) —
-# read via get_secret(), never os.environ. _pg_conn_explicit is the RAW
-# value (empty string if unset) so _require_db_credentials() below can tell
-# "operator supplied a full DSN" apart from "nothing was supplied and this
-# fell back to the constructed default" — the constructed default always
-# looks non-empty even when it embeds an empty password.
+# PG_CONN embeds the password, so it is read via get_secret(); the raw value stays empty when unset so a constructed default is not mistaken for an operator DSN.
 _pg_conn_explicit = get_secret("PG_CONN", "")
 PG_CONN      = _pg_conn_explicit or f"postgresql://postgres:{urllib.parse.quote_plus(_pg_pass)}@localhost:5432/agent_data"
-# The daemons' ONE way in is the hive-mind gateway — never a raw LLM. Pointing this
-# at a backend directly would bypass pooling, cache-affinity, wedge detection and
-# telemetry, so it is deliberately NOT an env knob: the shipped compose fixes the
-# topology. LLM choice belongs to the gateway (LLM_BACKENDS), never to a client.
+# Fixed at the gateway, not an env knob: a direct backend would skip pooling, affinity, wedge detection, and telemetry.
 REASONER_URL   = "http://localhost:8888/v1/chat/completions"
-# Model id sent on every reasoning call. "local-model" suits llama.cpp / LM Studio,
-# which ignore the field — but a backend that VALIDATES model ids (vLLM or TGI with
-# named models, an OpenRouter/LiteLLM router, an OpenAI-compatible cloud endpoint, or
-# LM Studio with several models loaded) needs the real id. Configurable, never assumed.
+# "local-model" is only safe where the server ignores the field; a backend that validates model ids needs the real one.
 LLM_MODEL      = os.environ.get("LLM_MODEL", "local-model")
 AUDIT_LOG_PATH = os.environ.get("AUDIT_LOG_PATH", "").strip() or None
 
-# AGENT_TOKEN authenticates the daemon's outbound calls through the proxy.
-# It identifies the daemon as a trusted internal caller — it does NOT affect
-# the source field on the Fact nodes being enriched.  Fact.source always
-# reflects the original saving agent (e.g. "claude", "gemini").
-#
-# SEC-10 (Credential_Custody_Plan_2026-08-14, PR A2): the mainline path is
-# now the pipe fd hive_mind_proxy._daemon_env_and_token_fd() hands this
-# process at spawn — read_daemon_token_from_fd() drains it once, here, at
-# import time. AGENT_TOKEN never crosses via this process's own child (it
-# has none) or its own environment as of A2; the fd is the ONLY way the
-# proxy-spawned mainline path sets this.
-#
-# get_secret("AGENT_TOKEN") is the fallback for a standalone debug run of
-# this daemon (`python rem_loop.py`, no proxy in between, so no fd exists) —
-# a value set only in shared-memory/.env, or via an operator's own export,
-# still works instead of silently 401ing (review fix #7 from PR A1).
+# Authenticates this daemon only; it does not change Fact.source.
+# The proxy passes it on a pipe fd; get_secret is the fallback when this file is run by hand and no fd exists.
 _AGENT_TOKEN = read_daemon_token_from_fd() or get_secret("AGENT_TOKEN", "").strip() or None
 
 
@@ -129,10 +97,7 @@ def _require_db_credentials() -> None:
         neo4j_password=NEO4J_PASS, daemon_name="rem_loop",
     )
 
-# Adaptive scan cadence (ADR-021) — replaces the fixed 120s POLL_INTERVAL magic
-# number. Fast when there is work to drain, exponential backoff to a cap when idle,
-# so REM is responsive under load and near-silent when caught up. Internal tuning
-# constants, not user knobs (no env clutter); only the bounds remain.
+# Internal cadence bounds, not env knobs: fast while work remains, backoff when idle.
 MIN_POLL_SEC  = 15    # never faster (don't hammer Neo4j/Postgres)
 BASE_POLL_SEC = 30    # cadence while there is work
 MAX_POLL_SEC  = 300   # never slower than 5 min (liveness)
@@ -146,28 +111,17 @@ def adaptive_poll_sleep(idle_streak: int) -> float:
     return max(MIN_POLL_SEC,
                min(MAX_POLL_SEC, BASE_POLL_SEC * (2 ** min(idle_streak - 1, 8))))
 BATCH_SIZE         = 5     # facts per cycle (LLM calls are the latency bottleneck)
-# REM_LLM_TIMEOUT removed (ADR-021): the per-call timeout is now adaptive —
-# adaptive_ceiling(len(prompt)) — so a long prompt is never killed for being
-# long. Only the floor (LLM_CEILING_FLOOR, default 600s) remains tunable.
+# Per-call timeout is adaptive_ceiling(len(prompt)); only the floor stays tunable, so a long prompt is not killed for length.
 WRITE_QUIESCE_SEC  = int(os.environ.get("WRITE_QUIESCE_SEC", "30"))  # yield to active writes
-# Non-destructive summary gate (retro-as-node session; PROMPT-gated since the
-# REM rebuild): a summary is REQUESTED from the LLM and stored (as rem_summary)
-# only when the original content exceeds this many chars — short, deliberately-
-# curated records stay verbatim and NREM reads them as written. 2000 matches
-# the graph-tier content cap: below it the verbatim text fits the node anyway,
-# so a summary adds nothing but style drift.
+# A summary is requested only past this length; shorter text already fits the node, and a summary would only drift it.
 REM_SUMMARY_THRESHOLD = int(os.environ.get("REM_SUMMARY_THRESHOLD", "2000"))
 
-# Anchor kinds — the three record types REM enriches. Kind is derived from the
-# Postgres metadata->>'type' of the row (fact = anything untyped).
+# Kind comes from Postgres metadata->>'type'; an untyped row is a fact.
 KIND_FACT     = "fact"
 KIND_DECISION = "decision"
 KIND_RETRO    = "retrospective"
 
-# Backup fence: a single well-known Postgres advisory lock shared with the gateway
-# (coordinator.BACKUP_ADVISORY_LOCK_KEY) and the NREM daemon. The gateway holds it
-# EXCLUSIVE during a backup dump; each REM cycle takes it SHARED and skips if it
-# can't — so enrichment never writes mid-dump. MUST match the coordinator's key.
+# Shared with the gateway and NREM. REM takes it SHARED and skips if a backup holds it EXCLUSIVE, so enrichment never writes mid-dump. Must match the coordinator's key.
 BACKUP_ADVISORY_LOCK_KEY = int(os.environ.get("BACKUP_ADVISORY_LOCK_KEY", "8765309"))
 
 
@@ -180,13 +134,7 @@ def _take_shared_backup_lock(conn) -> bool:
         cur.execute("SELECT pg_try_advisory_lock_shared(%s)", (BACKUP_ADVISORY_LOCK_KEY,))
         return bool(cur.fetchone()[0])
 
-# ── NREM slot priority (F2): yield the LLM slot when NREM is queuing ──────────
-# REM and NREM contend for ONE serial LLM slot. REM re-arms far faster and its
-# solo units run ~1000s, so without an arbiter NREM defers indefinitely (it
-# went 4.6 days without a successful fold). NREM takes this advisory lock
-# EXCLUSIVE while it is queuing for the slot; REM checks it at cycle start and
-# yields its turn. Session-scoped, so a dead NREM can never wedge REM.
-# MUST match consolidation_loop.NREM_PRIORITY_ADVISORY_LOCK_KEY.
+# REM re-arms faster than NREM and would hold the one LLM slot indefinitely; yield while NREM holds this lock. A dead holder cannot wedge it. Must match consolidation_loop's key.
 NREM_PRIORITY_ADVISORY_LOCK_KEY = int(
     os.environ.get("NREM_PRIORITY_ADVISORY_LOCK_KEY", "8765310"))
 
@@ -209,17 +157,10 @@ def _nrem_is_queuing(conn) -> bool:
         logger.warning("REM: NREM-priority probe failed (%s) — proceeding", exc)
         return False
 
-# Sampling temperature for the REM enrichment LLM. Default 0.6 suits Gemma-class
-# models, which degrade at very low temperatures; set REM_TEMPERATURE=0.1 in .env
-# for Qwen-class models that prefer near-greedy decoding. DREAM_TEMPERATURE sets
-# both daemons at once. The request value overrides the LM Studio preset.
+# 0.6 because Gemma degrades when colder; set REM_TEMPERATURE=0.1 for Qwen. DREAM_TEMPERATURE sets both daemons, and the request overrides the LM Studio preset.
 REM_TEMPERATURE = float(os.environ.get("REM_TEMPERATURE", os.environ.get("DREAM_TEMPERATURE", "0.6")))
 
-# ── Output bounds + truncation detection ─────────────────────────────────────
-# Every LLM call sets max_tokens, and finish_reason='length' FAILS the unit.
-# OPERATOR CONSTRAINT: a bound that processes but gives incomplete saves /
-# truncated summaries is worse than no bound at all — truncated output is never
-# json_repair-salvaged, never persisted, never fed to downstream gates.
+# finish_reason='length' fails the unit: a truncated summary is never repaired, stored, or passed downstream.
 REM_MAX_TOKENS_SOLO        = int(os.environ.get("REM_MAX_TOKENS_SOLO", "1500"))
 REM_MAX_TOKENS_PER_FACT    = int(os.environ.get("REM_MAX_TOKENS_PER_FACT", "400"))
 REM_MAX_TOKENS_PER_SUMMARY = int(os.environ.get("REM_MAX_TOKENS_PER_SUMMARY", "250"))
@@ -233,40 +174,27 @@ REM_TRUNCATION_SPECIMEN_CHARS = int(os.environ.get("REM_TRUNCATION_SPECIMEN_CHAR
 # After this many chargeable failures the record is skipped until rem_attempts is reset; transport is not charged.
 REM_MAX_ATTEMPTS = int(os.environ.get("REM_MAX_ATTEMPTS", "5"))
 
-# STEP 3 (decision 890) — batch-vs-solo starvation. A solo record passed over
-# this many times by the NREM-queuing yield is promoted into the starved
-# sub-queue, drained unconditionally (no yield check) at the START of the next
-# solo pass. Few records, ever, should reach this — it is a rescue valve, not
-# the normal path.
+# A solo record skipped this often by the NREM yield is drained first, with no yield check (decision 890). It is a rescue valve, not the normal path.
 REM_STARVED_THRESHOLD = int(os.environ.get("REM_STARVED_THRESHOLD", "3"))
 
 # LLM failure classes recorded on REMDaemon._last_llm_failure.
 LLM_FAIL_TRANSPORT = "transport"   # HTTP non-200 / connection / gateway-shape — NOT chargeable
 LLM_FAIL_CLIENT    = "client"      # deterministic HTTP 4xx (400, 404, 422) — CHARGEABLE
-LLM_FAIL_TRUNCATED = "truncated"   # finish_reason=length even after the retry (widened for
-                                    # an honest truncation, same-bound for a degenerate one)
+LLM_FAIL_TRUNCATED = "truncated"   # length after the retry: widened once if honest, same bound if a loop
 LLM_FAIL_PARSE     = "parse"       # response arrived but its content is unusable
-LLM_FAIL_ROUTING_REFUSED = "routing_refused"   # gateway declined to place the job (422
-                                    # no_eligible_backend / 503 backend_at_capacity,
-                                    # Model_Attributes_Routing_Plan_2026-08-18 F-1/F-2) —
-                                    # a config gap, not a record defect — NOT chargeable
+LLM_FAIL_ROUTING_REFUSED = "routing_refused"   # gateway refused to place the job; a config gap, not chargeable
 
 # Failure classes that may count toward a record's dead-letter cap.
 LLM_FAIL_CHARGEABLE = frozenset({LLM_FAIL_TRUNCATED, LLM_FAIL_PARSE, LLM_FAIL_CLIENT})
 
 
 logging.basicConfig(level=logging.INFO)
-# D6 (HYG round): rem_loop.py imports httpx and runs under THIS process's own
-# root config, so an INFO root level turns every httpx call into a journal
-# line. WARNING silences the per-request chatter without hiding a real client
-# failure. The aiohttp access log remains the per-request record.
+# httpx on this process's root logger would journal every request at INFO; WARNING keeps real client failures.
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger("REMDaemon")
 
 
-# MUST-mirror: consolidation_loop.py carries its own copy of
-# _finish_reason/_truncated (single-file-per-venv convention, like
-# _load_env/_auth_headers) — keep both in agreement.
+# consolidation_loop.py has its own copy of these two helpers; keep them in agreement.
 def _finish_reason(resp_json) -> str | None:
     """choices[0].finish_reason of an OpenAI-compatible completion response
     ('stop' | 'length' | ...). llama.cpp always sets it and the gateway passes
@@ -294,21 +222,13 @@ def _completion_text(resp_json) -> str:
         content = (resp_json.get("choices") or [{}])[0].get("message", {}).get("content")
     except (AttributeError, IndexError, TypeError):
         return ""
-    # A non-string content (list/dict envelope variants) must not escape: the
-    # solo call site classifies OUTSIDE any try, so a passed-through non-str
-    # would abort the whole REM cycle (fact:1347 S-2, executed).
+    # A non-string body would abort the solo classifier, which runs outside any try (fact:1347).
     return content if isinstance(content, str) else ""
 
 
-# Parse-free flat-object extractor: matches the innermost `{...}` spans (no
-# nested braces), which is exactly the shape a JSON array of relationship
-# objects degenerates into under repetition — this never attempts to parse
-# the body as JSON (N3: a truncated body is classified, never parsed).
+# Innermost `{...}` only, and never parsed: a repetition loop's flat objects in a truncated body.
 _FLAT_OBJECT_RE = re.compile(r"\{[^{}]*\}")
-# Quoted strings >=30 chars — Decision extras (considered/rejected/...) are
-# STRING arrays, not objects, and a summary is prose, so an object-only
-# detector calls a sentence loop honest (pre-build review F-6). The length
-# floor keeps short schema tokens (rel_types, keys) from ever counting.
+# Decision extras and summaries are strings, so objects alone would miss a sentence loop; 30 chars skips schema tokens.
 _LONG_STRING_RE = re.compile(r'"([^"]{30,})"')
 
 
@@ -400,11 +320,7 @@ def _parse_llm_json(candidate: str):
                          exc, exc2, candidate)
             return None
         if isinstance(obj, dict):
-            # An EMPTY dict counts as salvaged. It used to be rejected on the
-            # reasoning that a repair yielding nothing had failed — true when
-            # every result had to carry a field, false now: `{}` is a shape the
-            # caller can legitimately receive, and rejecting it charged the
-            # record a parse failure for an answer that parsed.
+            # {} is a parsed answer, not a failed repair; rejecting it charged a parse failure.
             logger.warning("REM JSON salvaged via json_repair (orig: %s)", exc)
             return obj
         logger.error("REM JSON unrepairable (not an object after repair): %s | payload=%.400s",
@@ -447,12 +363,7 @@ class REMDaemon:
             connection_acquisition_timeout=NEO4J_ACQUIRE_TIMEOUT,
         )
         self.is_running = True
-        # Failure class of the most recent LLM call (LLM_FAIL_* or None on
-        # success). Set by _llm_process / _llm_process_batch, read by the
-        # callers to decide whether the failure is chargeable to the RECORD.
-        # Instance state rather than a return value: REM processes records
-        # serially within a cycle (same convention as NREM's
-        # _last_llm_truncated), so signatures stay stable.
+        # Chargeable class of the last call. Serial within a cycle, so it lives here instead of on every return.
         self._last_llm_failure: str | None = None
 
     # ── Postgres connection factory ───────────────────────────────────────────
@@ -565,10 +476,7 @@ class REMDaemon:
             pg_ids.append(r["pg_id"])
             attempts[r["pg_id"]] = int(r.get("rem_attempts") or 0)
             passed_over[r["pg_id"]] = int(r.get("rem_passed_over") or 0)
-            # The RECORD label the queue matched on. A node may carry others
-            # (or, on a corrupt write, more than one record label) — record
-            # the first that made it selectable, deterministically ordered so
-            # the identity check is stable across cycles.
+            # First matching record label, sorted, so a node with extra labels still checks the same one each cycle.
             matched = sorted(set(r.get("labels") or []) & record_labels)
             sel_labels[r["pg_id"]] = matched[0] if matched else ""
         return pg_ids, attempts, sel_labels, passed_over
@@ -612,11 +520,7 @@ class REMDaemon:
                     f"MATCH (n)"
                     f" WHERE (n:{ONT.fact} OR n:{ONT.decision} OR n:{ONT.retrospective})"
                     f"   AND n.pg_id IN $pg_ids"
-                    # Reset rem_passed_over in the SAME statement: a record
-                    # earns its starved-queue promotion by being repeatedly
-                    # SKIPPED, never by time, and the moment it's actually
-                    # picked up is the one unambiguous "no longer starved"
-                    # event (decision 890's REM half, STEP 3).
+                    # Clear rem_passed_over in the same statement: starvation is counted in skips, and a pickup is the only reset (decision 890).
                     f" SET n.rem_pickups = coalesce(n.rem_pickups, 0) + 1,"
                     f"     n.rem_passed_over = 0",
                     pg_ids=list(pg_ids),
@@ -985,12 +889,8 @@ class REMDaemon:
                   KIND_RETRO:    ONT.retrospective}.get(kind, ONT.fact)
 
         async with self.driver.session() as session:
-            # Non-destructive per kind: Decision keeps rationale, Retrospective
-            # keeps notes; Fact content becomes the ORIGINAL text verbatim.
-            # rem_summary is written only when a summary was produced (which
-            # only happens above REM_SUMMARY_THRESHOLD).
-            # Success also clears rem_attempts (poison-record escape hatch):
-            # historical failures never linger once a record enriches cleanly.
+            # Decision and Retrospective keep their own text; a Fact is rewritten from the original, and rem_summary is stored only when one was produced.
+            # Success clears rem_attempts so old failures do not linger.
             if kind in (KIND_DECISION, KIND_RETRO):
                 if summary:
                     await session.run(
@@ -1037,17 +937,14 @@ class REMDaemon:
         Result shape: {} — plus "summary" when one was requested.
         """
         if len(content) <= REM_SUMMARY_THRESHOLD:
-            # Nothing is wanted from the model for this record — REM asks for a
-            # summary and nothing else (`decision:1664`), and this one is under
-            # the threshold. No round-trip: {} is the complete answer, and the
-            # write path still marks it rem_processed.
+            # Under the threshold REM asks for nothing, so {} is the whole answer and still gets marked processed (decision:1664).
             return {}, "no-call"
         if os.getenv("MOCK_LLM") == "1":
             return {"summary": f"REM summary (mock): {content[:100]}"}, "mock"
 
         prompt = build_single_prompt(content, kind)
 
-        _ceiling = adaptive_ceiling(len(prompt))   # scales with the prompt
+        _ceiling = adaptive_ceiling(len(prompt))
         model = "local-model"
 
         async def _attempt(max_tokens: int):
@@ -1075,20 +972,14 @@ class REMDaemon:
                         },
                     )
             except Exception as exc:
-                # Name the type: httpx timeout/transport errors stringify to ""
-                # ("LLM error:" with nothing after it tells the next reader
-                # nothing about whether it timed out, reset, or refused).
+                # httpx errors stringify to empty; the type name is the only way to tell timeout from reset.
                 logger.error("LLM error: %s: %s", type(exc).__name__, exc)
                 return None, model, LLM_FAIL_TRANSPORT, False
             _backend = resp.headers.get("X-SM-LLM-Backend")
             model = _backend or "local-model"
             refusal = _routing_refusal(resp)
             if refusal:
-                # F-1/F-2: the gateway declined to place this job — a config
-                # gap (no eligible backend / everyone at capacity), never
-                # evidence about THIS record. Log loudly ONCE, skip WITHOUT
-                # charging rem_attempts (LLM_FAIL_ROUTING_REFUSED is not in
-                # LLM_FAIL_CHARGEABLE), no retry within this cycle.
+                # A routing refusal is a config gap, not evidence about this record, so the attempt is not charged.
                 logger.warning(
                     "REM: pg_id=%s solo enrichment call REFUSED by gateway "
                     "routing (constraint=%s role=%s) — skipping WITHOUT "
@@ -1138,14 +1029,8 @@ class REMDaemon:
 
         resp_json, model, failure, degenerate = await _attempt(REM_MAX_TOKENS_SOLO)
 
-        # The retry differs by CLASS (L0-b): an HONEST truncation gets the
-        # bound widened ONCE before the unit fails (F4) — a fixed bound plus
-        # the attempt cap would otherwise dead-letter, silently and
-        # permanently, any record that simply needs more output than the
-        # default. A DEGENERATE truncation (repetition loop, fact:1329/1330)
-        # gets exactly one retry at the SAME bound instead — the retry is a
-        # fresh sampling draw, not a bigger budget for the loop to repeat
-        # into. Either class still fails the unit if the retry also truncates.
+        # An honest truncation widens the bound once; a repetition loop retries at the same bound, because a larger budget only feeds the loop (fact:1329/1330).
+        # Either way a second truncation fails the unit.
         if failure == LLM_FAIL_TRUNCATED:
             if degenerate:
                 retry_bound = REM_MAX_TOKENS_SOLO
@@ -1191,9 +1076,7 @@ class REMDaemon:
                     )
 
         if failure is not None:
-            # Fail-the-unit: the body is never handed to _parse_llm_json /
-            # json_repair (an incomplete enrichment must never be salvaged
-            # into a persistable dict).
+            # An incomplete body is never repaired into a dict that could be stored.
             self._last_llm_failure = failure
             return None, model
 
@@ -1219,10 +1102,7 @@ class REMDaemon:
             return None, model
         # Strict parse first; salvage Gemma-4 JSON slips via json_repair (decision 491).
         parsed = _parse_llm_json(raw[start:end])
-        # `is not None`, never falsiness: an empty object is a PARSED object.
-        # Only _parse_llm_json returning None is a parse failure; a `{}` body is
-        # a complete answer that simply carries no summary, and the summary gate
-        # in _apply_fact_result is what charges the record for that.
+        # None is the parse failure; {} parsed and simply has no summary, which the summary gate charges later.
         self._last_llm_failure = None if parsed is not None else LLM_FAIL_PARSE
         return parsed, model
 
@@ -1290,10 +1170,7 @@ class REMDaemon:
                 model = _backend or "local-model"
                 refusal = _routing_refusal(resp)
                 if refusal:
-                    # F-1/F-2: skip WITHOUT charging — a config gap says
-                    # nothing about any of the batched records; they all
-                    # retry, still batched, next cycle (same non-attributable
-                    # shape as any other whole-call failure, F1).
+                    # A routing refusal says nothing about these records, so none of them is charged.
                     logger.warning(
                         "REM batch: call (%d facts) REFUSED by gateway "
                         "routing (constraint=%s role=%s) — skipping WITHOUT "
@@ -1326,11 +1203,7 @@ class REMDaemon:
                 raw = resp_json["choices"][0]["message"]["content"]
                 if not isinstance(raw, str):
                     raise TypeError(f"content is {type(raw).__name__}, expected str")
-                # L0-a: specimen logging extends to batch GENERATION calls
-                # (not verify — F-9, a confirm/deny tail is near-worthless).
-                # No RETRY POLICY change for batch (L0-b is solo-only); the
-                # classifier here is informational, feeding the re-measurement
-                # corpus the specimen accumulates, same as the solo call site.
+                # Batch truncation is logged, not retried: the solo retry policy does not apply, and the specimen is only for re-measurement.
                 if truncated:
                     degenerate = truncation_is_degenerate(raw)
                     specimen = _truncation_specimen(raw)
@@ -1452,9 +1325,7 @@ class REMDaemon:
         """
         self._last_llm_failure = None
         result, _model = await self._llm_process(content, kind, pg_id=pg_id)
-        # `is None` is the failure test, never falsiness: a record below
-        # REM_SUMMARY_THRESHOLD is asked for nothing, so {} is its COMPLETE
-        # answer (`decision:1664`).
+        # None is the failure; {} means the record was under the threshold and asked for nothing (decision:1664).
         if result is None:
             failure = self._last_llm_failure or LLM_FAIL_TRANSPORT
             chargeable = failure in LLM_FAIL_CHARGEABLE
@@ -1492,11 +1363,7 @@ class REMDaemon:
             return False
         if not want_summary:
             summary = ""   # never store a summary that was not requested
-        # Guard: for a Fact the original content is load-bearing (it becomes
-        # f.content verbatim). A call site that forgets it would blank the node
-        # and loop the fact through REM forever (consistency check fails every
-        # cycle) — refuse loudly instead (and count the attempt: after
-        # REM_MAX_ATTEMPTS the record dead-letters rather than looping forever).
+        # A Fact with no original would be written blank and fail the consistency check forever; charge the attempt so it dead-letters.
         if kind == KIND_FACT and not original_content:
             logger.error("REM: pg_id=%d called without original_content — skipping", pg_id)
             await self._bump_rem_attempts([pg_id])
@@ -1512,11 +1379,7 @@ class REMDaemon:
             await self._bump_rem_attempts([pg_id])
             return False
 
-        # Verify consistency — full string comparison (not prefix) against the
-        # value actually written (the ORIGINAL content verbatim, capped at 2000).
-        # Only facts have their content touched by REM; decisions and
-        # retrospectives are enrichment-only (rationale/notes left intact), so
-        # the Fact-content check does not apply to them.
+        # Full-string check against the original that was written. Only Facts have their content replaced.
         if kind == KIND_FACT:
             try:
                 consistent = await self._fact_is_consistent(pg_id, original_content)
@@ -1525,10 +1388,7 @@ class REMDaemon:
                 consistent = False
 
             if not consistent:
-                # F5: without the revert this record would strand at
-                # rem_processed=true with its outbox row at 'applied' —
-                # invisible to both worklists. Revert + count the attempt so
-                # it re-enters the queue under the attempt cap.
+                # A mismatch left marked processed would vanish from both worklists; revert it and count the attempt.
                 logger.error(
                     "REM: discrepancy — pg_id=%d Fact content mismatch after write; "
                     "reverting rem_processed (+1 attempt) so the record re-enters "
@@ -1547,10 +1407,7 @@ class REMDaemon:
             await self._mark_outbox_rem_reviewed(pg_id, conn, loop, kind=kind)
             outbox_marked = True
         except Exception as exc:
-            # F5: same stranding hazard as the consistency branch — revert the
-            # Neo4j mark (+1 attempt) and fail the unit, so the record retries
-            # (the write is an idempotent SET) instead of sitting at
-            # 'applied' forever.
+            # Same stranding as a consistency miss: revert the mark and count the attempt so the idempotent write can retry.
             logger.error(
                 "REM: pg_id=%d outbox mark failed (%s) — reverting rem_processed "
                 "(+1 attempt); record re-enters the queue under the attempt cap",
@@ -1559,11 +1416,7 @@ class REMDaemon:
             await self._revert_rem_mark(pg_id, kind)
             return False
 
-        # Notify NREM (outbox mark succeeded if we got here):
-        # rem_processed=true is set on the Neo4j node, so this fact will not
-        # be re-processed by REM. NREM re-evaluates the cluster; the
-        # consolidated=false filter in NREM ensures no spurious work. A notify
-        # failure alone is tolerable — the ledger sweep re-evaluates durably.
+        # The node is already marked, so a missed notify is tolerable: the ledger sweep re-evaluates the cluster.
         try:
             await self._notify_nrem(pg_id, conn, loop)
         except Exception as exc:
@@ -1592,8 +1445,7 @@ class REMDaemon:
         # Single AUTOCOMMIT connection shared across all Postgres helpers in this cycle.
         conn = await loop.run_in_executor(None, self._open_pg_conn)
         try:
-            # Backup fence: skip this cycle if a backup holds the EXCLUSIVE advisory
-            # lock. The SHARED lock auto-releases when conn closes in the finally.
+            # Skip if a backup holds the lock EXCLUSIVE. The shared lock drops when conn closes.
             if not await loop.run_in_executor(None, lambda: _take_shared_backup_lock(conn)):
                 logger.info("REM: backup in progress — deferring enrichment cycle.")
                 return 0, 0
@@ -1606,16 +1458,12 @@ class REMDaemon:
                 )
                 return 0, 0
 
-            # Yield the turn when NREM is queuing for the slot (F2). Without
-            # this REM — which re-arms faster and runs multi-minute units —
-            # takes every slot and consolidation never folds at all.
+            # REM re-arms faster than NREM; without this yield consolidation never gets the slot.
             if await loop.run_in_executor(None, lambda: _nrem_is_queuing(conn)):
                 logger.info("REM: NREM is queuing for the LLM slot — yielding this cycle.")
                 return 0, 0
 
-            # Yield only if the whole LLM pool is busy — the gateway routes to a
-            # free card (incl. one the user isn't LLM-loading). NOT a global GPU
-            # gate, which self-defers to our own dream work + ignores a free card.
+            # Defer only when every LLM slot is busy. A global GPU gate would wait on our own dream work and ignore a free card.
             if not await pool_has_free_slot(headers=_auth_headers()):
                 logger.warning("REM: LLM pool has no free slot — deferring enrichment cycle")
                 return 0, 0
@@ -1633,19 +1481,13 @@ class REMDaemon:
             logger.info("REM cycle: %d fact(s) to process (pg_ids=%s)", len(pg_ids), pg_ids)
 
             content_map = await self._batch_fetch_content(pg_ids, conn, loop)
-            # Wall clock at pickup — the reference for poll_ms (created_at → REM picks
-            # it up). Taken once the batch is in hand, just before enrichment work.
+            # Pickup clock for poll_ms, taken once the batch is in hand and before the slow work.
             pickup_wall = time.time()
 
             processed = 0
             attempted = 0
-            # Split: regular facts are BATCHED into one call; decisions and
-            # retrospectives stay single-record (distinct anchors raise batched
-            # failure — advisor-reviewed).
-            # One fact → single path (no batch overhead). Batch→solo DEMOTION:
-            # a fact that already FAILED once (rem_attempts > 0) is routed solo —
-            # a clean single-record prompt isolates it from batch alignment, the
-            # dominant failure mode for a record that poisons a shared call.
+            # Facts batch; decisions and retrospectives stay solo because their anchors do not share a prompt.
+            # A fact that already failed once goes solo too, so it cannot poison the shared call.
             fact_items: list[dict] = []
             solo_ids: list[tuple[int, str]] = []   # (pg_id, kind) — decisions/retros + demoted facts
             kind_to_label = {KIND_FACT:     ONT.fact,
@@ -1654,21 +1496,11 @@ class REMDaemon:
             for pg_id in pg_ids:
                 row = content_map.get(pg_id)
                 if not row or not row.get("content"):
-                    # No Postgres record behind the node. Retiring it (rather
-                    # than the bare `continue` this used to be) is what stops
-                    # it holding a queue slot forever — the outbox filter above
-                    # already guarantees the save committed, so an absent row
-                    # means the node, not the timing, is wrong.
+                    # The outbox already says the save committed, so a missing row is a bad node, not a race. Retire it or it holds a slot forever.
                     await self._mark_node_invalid(
                         pg_id, label_map.get(pg_id, ""), "no_postgres_record")
                     continue
-                # IDENTITY CHECK (820): the node REM selected must be the node
-                # REM will mark processed. Everything below resolves from the
-                # pg_id, and the anchor written by _apply_fact_result is
-                # derived from the Postgres kind — so a selected label that
-                # disagrees with that kind means the cycle would enrich and
-                # mark a DIFFERENT node, leaving the selected one unprocessed
-                # and permanently re-selected. Retire it instead.
+                # The write anchor comes from the Postgres kind, not the selected label. A mismatch would mark a different node and re-select this one forever.
                 expected = kind_to_label.get(row["kind"], ONT.fact)
                 selected = label_map.get(pg_id, "")
                 if selected and selected != expected:
@@ -1686,10 +1518,7 @@ class REMDaemon:
 
             if len(fact_items) > 1:
                 attempted += len(fact_items)
-                # Every member really is handed to this call, so the whole
-                # batch is picked up together. Safe to bulk-bump: pickups feed
-                # rotation only, never the dead-letter cap, so this cannot
-                # repeat F1 (charging a batch-wide 503 to innocent records).
+                # Every member is in this call, and pickups only rotate the queue, so a bulk bump cannot dead-letter the batch.
                 await self._bump_rem_pickups([it["pg_id"] for it in fact_items])
                 self._last_llm_failure = None
                 results, call_timing, _model = await self._llm_process_batch(
@@ -1702,11 +1531,7 @@ class REMDaemon:
                         )
                         await self._bump_rem_attempts([it["pg_id"] for it in fact_items])
                     else:
-                        # F1: the CALL failed (transport/HTTP/envelope). That is
-                        # evidence about the backend, not about these facts — no
-                        # attempt is charged, so a pool 503 can never demote the
-                        # batch to solo or march innocent records toward
-                        # dead-letter. They retry, still batched, next cycle.
+                        # The call failed, not the facts, so no attempt is charged and they stay batched next cycle.
                         logger.warning(
                             "REM batch: call failed (%s) — %d fact(s) retry next cycle; "
                             "no attempt charged (not attributable to any record)",
@@ -1714,12 +1539,7 @@ class REMDaemon:
                         )
                     results = {}
                 else:
-                    # The call succeeded: a missing/invalid line IS evidence
-                    # about ITS record. Count the attempt so a repeat offender
-                    # is demoted solo next cycle and eventually dead-letters.
-                    # `is None` and not falsiness: a fact below
-                    # REM_SUMMARY_THRESHOLD is asked for nothing, so {} is a
-                    # COMPLETE line for it (`decision:1664`).
+                    # A missing line is that record's fault, so count it. {} is complete for a fact under the threshold, not a miss (decision:1664).
                     missing = [it["pg_id"] for it in fact_items
                                if results.get(it["pg_id"]) is None]
                     if missing:
@@ -1730,9 +1550,7 @@ class REMDaemon:
                             it["pg_id"], KIND_FACT, res, conn, loop,
                             original_content=it["content"]):
                         processed += 1
-                        # Durable REM timing (decision 570) — per-CALL metrics shared by
-                        # the batch, plus this fact's own poll_ms. Written after the
-                        # enrichment commits so a timing failure never loses a review.
+                        # Timing is written after the review commits, so a timing failure cannot lose it (decision 570).
                         if call_timing:
                             row = content_map.get(it["pg_id"]) or {}
                             await self._write_rem_timing(
@@ -1748,13 +1566,7 @@ class REMDaemon:
                         it["pg_id"], it["content"], KIND_FACT, conn, loop):
                     processed += 1
 
-            # STEP 3 (decision 890) — starved sub-queue: a record repeatedly
-            # skipped by the yield below (rem_passed_over >= threshold) is
-            # drained FIRST and UNCONDITIONALLY, with no yield check inside
-            # this loop. A persistently-queuing NREM would otherwise re-starve
-            # exactly the records this mechanism exists to rescue — the
-            # promotion has to buy at least one guaranteed attempt per cycle,
-            # bounded by how few records ever reach the threshold.
+            # Records skipped often enough are drained first, with no yield inside this loop, or a queuing NREM re-starves them (decision 890).
             starved_ids = {pg_id for pg_id, _ in solo_ids
                            if passed_over_map.get(pg_id, 0) >= REM_STARVED_THRESHOLD}
             starved  = [(pg_id, kind) for pg_id, kind in solo_ids if pg_id in starved_ids]
@@ -1768,11 +1580,7 @@ class REMDaemon:
                     processed += 1
 
             for solo_done, (pg_id, kind) in enumerate(remaining):
-                # F2: yield at RECORD boundaries, not just cycle boundaries.
-                # A cycle can hold up to BATCH_SIZE solo records at ~20 minutes
-                # each, so a cycle-start-only check let REM own the slot for
-                # well over an hour while NREM's queue expired — the starvation
-                # the arbiter exists to prevent, just on a longer clock.
+                # Yield between solo records. A cycle-start check let REM hold the slot for the whole batch while NREM's queue expired.
                 if await loop.run_in_executor(None, lambda: _nrem_is_queuing(conn)):
                     passed_ids = [pid for pid, _ in remaining[solo_done:]]
                     await self._bump_rem_passed_over(passed_ids)
@@ -1783,9 +1591,7 @@ class REMDaemon:
                         solo_done, len(remaining), len(starved), len(passed_ids))
                     break
                 attempted += 1
-                # Per-RECORD, and only past the yield: a record the yield never
-                # reached was not picked up and must not rotate, or the tail
-                # this counter exists to expose stays hidden.
+                # Bump only after the yield. A record never reached was not picked up, and rotating it would hide the tail.
                 await self._bump_rem_pickups([pg_id])
                 if await self._process_fact(
                         pg_id, content_map[pg_id]["content"], kind, conn, loop):
@@ -1816,11 +1622,7 @@ class REMDaemon:
                         "dead-letters persistent offenders)", attempted)
             except Exception as exc:
                 logger.error("REM cycle error: %s", exc, exc_info=True)
-            # Adaptive cadence: work drained → stay responsive at BASE; idle →
-            # exponential backoff to MAX so an idle system polls near-silently.
-            # FAILURE ≠ IDLE: a cycle that attempted candidates but processed
-            # none keeps the streak at 0 (BASE cadence) — backing off would
-            # mask a poison loop as a quiet system.
+            # Idle backs off; a cycle that tried and failed stays at BASE, or a poison loop looks like a quiet system.
             idle_streak = 0 if (count > 0 or attempted > 0) else idle_streak + 1
             await asyncio.sleep(adaptive_poll_sleep(idle_streak))
 
@@ -1840,11 +1642,6 @@ async def main() -> None:
 
 if __name__ == "__main__":
     _require_db_credentials()
-    # D.1 (SEC round, ADV1-2): same placement reasoning as
-    # _require_db_credentials() above — never at bare import time (this
-    # module is imported freely by tests with a malformed LLM_BACKENDS_JSON
-    # on purpose), only at the actual daemon entrypoint. A daemon must not
-    # crash-loop on a bare import traceback that reads as "daemon crashed",
-    # never as "LLM_BACKENDS_JSON typo".
+    # At the entrypoint, not import: tests import this module with a bad LLM_BACKENDS_JSON on purpose, and a crash there looks like the daemon died.
     require_llm_backends_json_parses("rem_loop")
     asyncio.run(main())
