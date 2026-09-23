@@ -13,7 +13,7 @@ metadata at that date, not recalled.
 |---|---|---|---|
 | PostgreSQL | 17.11 | PostgreSQL Licence | separate process (TCP) |
 | pgvector | 0.8.6 | PostgreSQL Licence | extension inside PostgreSQL |
-| Neo4j Community Edition | 5.26.30 (LTS) | **GPLv3** | separate process, reached over Bolt through the Apache-2.0 driver; image pulled by Compose |
+| Neo4j Community Edition | 5.26.31 (LTS) | **GPLv3** | separate process, reached over Bolt through the Apache-2.0 driver; image pulled by Compose |
 | APOC | loaded by the Neo4j container at start | Apache-2.0 | plugin inside Neo4j |
 | Neo4j Graph Data Science (community) | loaded by the Neo4j container at start | **GPLv3** | plugin inside Neo4j, called over Bolt; fetched by the container from Neo4j's servers |
 | llama.cpp server (`server`, `server-vulkan` images) | floating tags | MIT | separate processes (HTTP) |
