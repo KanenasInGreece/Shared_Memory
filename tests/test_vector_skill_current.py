@@ -53,15 +53,6 @@ def test_save_decision_docstring_matches_the_writer():
     assert "Naming none means" not in doc
 
 
-def test_archive_reasoning_trace_docstring_names_the_refusal():
-    text = _read(_CONNECTOR)
-    doc = ast.get_docstring(
-        _tools(text)[[n.name for n in _tools(text)].index("archive_reasoning_trace")]
-    )
-    assert "unknown_type" in doc
-    assert "eligible for consolidation" not in doc
-
-
 def test_system_prompt_shows_a_call_for_every_connector_tool():
     names = [n.name for n in _tools(_read(_CONNECTOR))]
     prompt = _read(_PROMPT)

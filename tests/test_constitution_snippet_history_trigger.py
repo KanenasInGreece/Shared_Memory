@@ -35,6 +35,26 @@ def _read(path):
         return fh.read()
 
 
+def _shipped_text(path: str) -> str:
+    """What an agent actually reads.
+
+    A snippet file is mostly an HTML comment addressed to whoever installs it;
+    only the marker-delimited block is pasted into a constitution. Reading the
+    whole file let a rule live in the version-history comment and still satisfy
+    these checks -- measured on the MCP snippet at v7, where "is a pointer, not
+    the record" was in the header and absent from the block. system-prompt.md
+    has no markers: the whole file is the surface.
+    """
+    text = _read(path)
+    for marker in ("<!-- shared-memory:mcp-constitution-snippet",
+                   "<!-- shared-memory:constitution-snippet"):
+        if marker in text:
+            after = text.split(marker, 1)[1]
+            body = after.split("-->", 1)[1]
+            return body.split("<!-- /shared-memory:", 1)[0]
+    return text
+
+
 def test_the_cli_snippet_carries_v6():
     text = _read(_CLI_SNIPPET)
     assert "<!-- shared-memory:constitution-snippet v6 -->" in text, (
@@ -42,9 +62,9 @@ def test_the_cli_snippet_carries_v6():
         "will not read as drifted and Phase 8c will not re-propose it")
 
 
-def test_the_mcp_snippet_carries_v7():
+def test_the_mcp_snippet_carries_v8():
     text = _read(_MCP_SNIPPET)
-    assert "<!-- shared-memory:mcp-constitution-snippet v7 -->" in text, (
+    assert "<!-- shared-memory:mcp-constitution-snippet v8 -->" in text, (
         "the MCP snippet's marker did not advance to v7 — an installed block "
         "will not read as drifted and Phase 8c will not re-propose it")
 
@@ -57,7 +77,7 @@ def test_all_three_surfaces_name_the_history_trigger():
     newline in one and not another — a check that a reflow could break would
     be measuring line length, not content."""
     def _flat(path):
-        return re.sub(r"\s+", " ", _read(path))
+        return re.sub(r"\s+", " ", _shipped_text(path))
 
     missing = [path for path in (_CLI_SNIPPET, _MCP_SNIPPET, _SYSTEM_PROMPT)
                if _PHRASE not in _flat(path)]
@@ -86,7 +106,7 @@ def test_all_three_surfaces_name_the_index_pointer_rule():
     and filters superseded ones from search. The rule must read the same on
     every surface; whitespace-normalised for the same reason as above."""
     def _flat(path):
-        return re.sub(r"\s+", " ", _read(path))
+        return re.sub(r"\s+", " ", _shipped_text(path))
 
     missing = [path for path in (_CLI_SNIPPET, _MCP_SNIPPET, _SYSTEM_PROMPT)
                if _POINTER_PHRASE not in _flat(path)]
@@ -100,7 +120,7 @@ def test_all_three_surfaces_prescribe_the_index_repair():
     must prescribe following superseded_by to the current record and rewriting
     the index line, or the next invocation repeats the same wrong answer."""
     def _flat(path):
-        return re.sub(r"\s+", " ", _read(path))
+        return re.sub(r"\s+", " ", _shipped_text(path))
 
     missing = [path for path in (_CLI_SNIPPET, _MCP_SNIPPET, _SYSTEM_PROMPT)
                if _REPAIR_PHRASE not in _flat(path)]

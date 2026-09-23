@@ -23,8 +23,8 @@ predicate, would drift from the one retrieval chain, and would need server-only
 modules it is not shipped. So search, graph queries, lineage and saves all go
 through the gateway, and this file holds rendering plus the MCP tool surface.
 
-MCP tools: hybrid_search_and_rerank, save_artifact, archive_reasoning_trace,
-save_decision, save_retrospective, supersede, review_hold, check_memory_health,
+MCP tools: hybrid_search_and_rerank, save_artifact, save_decision,
+save_retrospective, supersede, review_hold, check_memory_health,
 memory_telemetry, record_lineage, graph_query.
 """
 import asyncio
@@ -198,7 +198,7 @@ AGENT_ID = os.environ.get("AGENT_ID", "vector_skill")
 # v4 a fact save without a registered metadata.project is rejected 400 carrying
 # project_required or project_unknown plus near-match proposals.
 API_VERSION = 4
-VERSION = "1.0.0"
+VERSION = "1.0.1"
 CLIENT_VERSION_HEADER = "X-SM-Api-Version"
 # Framework build, separate from api_version, so two clients on the same wire contract can still be counted apart in clients.versions_seen.
 CLIENT_BUILD_HEADER = "X-Shared-Memory-Client"
@@ -807,48 +807,6 @@ async def save_artifact(content: str, metadata_json: str = "{}") -> str:
     # The coordinator's message carries the no-entities Tier-3 warning.
     neo4j_status = result.get("neo4j", "pending")
     return f"Success (pg_id={pg_id}, neo4j={neo4j_status}): {result.get('message', '')}".rstrip()
-
-@mcp.tool()
-async def archive_reasoning_trace(session_id: str, task: str, steps: list,
-                                  project: str = "") -> str:
-    """Archive the agent's reasoning path as a memory record.
-
-    Requires a write-capable agent token: a read-only token receives an
-    honest HTTP 403 role refusal from the gateway — expected, do not retry.
-
-    `steps` is a list of dicts: [{'thought': ..., 'tool': ..., 'result': ...}].
-
-    `project` is REQUIRED, exactly as for any other record — a trace belongs to
-    the work that produced it. It is deliberately NOT exempt and NOT defaulted to
-    the sentinel: exempting it would quietly rebuild the untagged population the
-    project axis exists to remove, and defaulting it would park records without
-    anyone deciding to. Ask the operator, or pass 'general_discussion' knowingly.
-
-    Do not call this to keep a conclusion. The metadata type is
-    ``reasoning_trace``. Ingress returns ``unknown_type``. Save the conclusion
-    with ``save_artifact`` instead.
-    """
-    if not steps:
-        return "Error: no steps to archive."
-    lines = [f"Reasoning trace for task: {task}", ""]
-    for i, step in enumerate(steps):
-        lines.append(f"{i + 1}. Thought: {step.get('thought', '')}")
-        if step.get("tool"):
-            lines.append(f"   Tool: {step['tool']}")
-        if step.get("result") is not None:
-            lines.append(f"   Result: {step['result']}")
-    content = "\n".join(lines)
-    metadata = {
-        "source": AGENT_ID,
-        "type": "reasoning_trace",
-        "session_id": session_id,
-        "task": task,
-        "step_count": len(steps),
-    }
-    if project:
-        metadata["project"] = project
-    return await save_artifact(content, json.dumps(metadata))
-
 
 def _alternatives_list(alternatives) -> list[str]:
     """One value in, one alternative out, verbatim and never split, because a well-written alternative contains commas and splitting on one stored fragments that do not stand alone.

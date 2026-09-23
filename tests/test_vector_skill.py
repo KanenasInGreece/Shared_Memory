@@ -174,34 +174,6 @@ async def test_mcp_hybrid_search_reports_a_down_gateway_plainly():
 
 
 @pytest.mark.asyncio
-async def test_mcp_archive_reasoning_trace_saves_a_record():
-    """It used to CREATE ReasoningTrace/ReasoningStep nodes straight in Neo4j,
-    which bypasses the outbox (the thing that makes a save atomic across both
-    stores) and bypasses read authorization — durable in one store, visible to
-    everyone. Now it is an ordinary record on the ordinary save path."""
-    mock_response = MagicMock(status_code=200, json=lambda: {
-        "status": "success", "pg_id": MOCK_PG_ID, "neo4j": "pending", "message": "ok"})
-    steps = [{"thought": "research", "tool": "grep", "result": "found"}]
-    with patch("httpx.AsyncClient.post", return_value=mock_response) as mock_post:
-        result = await vector_skill.archive_reasoning_trace("sess_1", "test task", steps, project="shared-memory-GitHub")
-
-    assert "Success" in result
-    call = mock_post.call_args
-    assert call.args[0].endswith("/memory/save")
-    meta = call.kwargs["json"]["metadata"]
-    assert meta["type"] == "reasoning_trace"
-    assert meta["session_id"] == "sess_1"
-    assert meta["step_count"] == 1
-    assert "research" in call.kwargs["json"]["content"]
-
-
-@pytest.mark.asyncio
-async def test_mcp_archive_reasoning_trace_rejects_empty():
-    result = await vector_skill.archive_reasoning_trace("sess_1", "t", [])
-    assert "Error" in result
-
-
-@pytest.mark.asyncio
 async def test_mcp_save_decision_success():
     """save_decision routes through coordinator and returns pg_id on success."""
     mock_response = MagicMock()
@@ -683,7 +655,7 @@ def _registered_tools() -> list:
 # it. The CLI half of that parity is pinned in
 # test_change_group_contracts._CLI_ACTIONS.
 _MCP_TOOLS = {
-    "hybrid_search_and_rerank", "save_artifact", "archive_reasoning_trace",
+    "hybrid_search_and_rerank", "save_artifact",
     "save_decision", "save_retrospective", "supersede", "review_hold",
     "check_memory_health", "memory_telemetry", "record_lineage", "graph_query",
 }
@@ -704,7 +676,7 @@ def test_system_prompt_names_every_registered_mcp_tool():
     Adding a tool without documenting it makes the tool unreachable in
     practice."""
     tools = _registered_tools()
-    assert len(tools) >= 11, f"expected the full tool surface, found {tools}"
+    assert len(tools) >= 10, f"expected the full tool surface, found {tools}"
     prompt = open(_repo("mcp", "system-prompt.md"), encoding="utf-8").read()
     missing = [t for t in tools if t not in prompt]
     assert not missing, f"system-prompt.md does not mention MCP tool(s): {missing}"
