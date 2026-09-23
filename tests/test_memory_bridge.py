@@ -4,6 +4,7 @@ import asyncio
 import importlib.util
 import os
 import sys
+import httpx
 from unittest.mock import MagicMock, patch, AsyncMock
 
 # Dynamic load of memory_bridge.py
@@ -778,3 +779,39 @@ def test_no_response_is_decoded_before_its_status_class_is_known():
     assert not offenders, (
         f"a gateway response is decoded outside the status-class helper: {offenders}"
     )
+
+
+@pytest.mark.asyncio
+async def test_retrospective_timeout_says_slow_not_down():
+    """A timed-out retrospective save is the slow-gateway message, not a traceback and not 'unreachable'."""
+    with patch("httpx.AsyncClient.post", side_effect=httpx.ReadTimeout("slow")):
+        result = await memory_bridge.save_retrospective_artifact(
+            pg_id=1, rating="validated", notes="measured", grounded_in="1")
+    assert result["status"] == "error"
+    assert "SLOW" in result["message"]
+    assert "unreachable" not in result["message"].lower()
+
+
+@pytest.mark.asyncio
+async def test_retrospective_connect_error_says_unreachable():
+    with patch("httpx.AsyncClient.post", side_effect=httpx.ConnectError("refused")):
+        result = await memory_bridge.save_retrospective_artifact(
+            pg_id=1, rating="validated", notes="measured", grounded_in="1")
+    assert result["status"] == "error"
+    assert "unreachable" in result["message"].lower()
+
+
+@pytest.mark.asyncio
+async def test_lineage_timeout_says_slow_not_down(capsys):
+    """lineage used to let a timeout escape; it now uses the same slow-gateway message as save."""
+    argv = sys.argv
+    try:
+        sys.argv = ["memory_bridge.py", "lineage", "fact:1"]
+        with patch("httpx.AsyncClient.get", side_effect=httpx.ReadTimeout("slow")):
+            await memory_bridge.main()
+    finally:
+        sys.argv = argv
+    out = json.loads(capsys.readouterr().out)
+    assert out["status"] == "error"
+    assert "SLOW" in out["message"]
+    assert "unreachable" not in out["message"].lower()

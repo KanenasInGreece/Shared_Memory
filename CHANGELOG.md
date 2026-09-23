@@ -7,6 +7,16 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.0.0] — 2026-09-23
+
+The operator declared 1.0.0. `API_VERSION` stays 4.
+
+### Fixed
+- `save_retrospective` and `lineage` report a timeout as a slow gateway. A refused connection is still unreachable. Those two commands used to let the timeout escape.
+
+### Changed
+- Comments in both `memory_bridge.py` copies are one sentence. A citation names what that record says. The REM fairness line cites `decision 894`. The project field is written in both places and does not cite `fact:1757`.
+
 ## [0.9.114] — 2026-09-23
 
 ### Fixed

@@ -136,7 +136,7 @@ def test_no_stale_version_string_remains_in_the_worked_examples():
     shipped, not what the client is now) and must not be flagged."""
     import memory_bridge
     skill = _read(SKILL)
-    found = re.findall(r'"version"\s*:\s*"(0\.9\.\d+)"', skill)
+    found = re.findall(r'"version"\s*:\s*"(\d+\.\d+\.\d+)"', skill)
     assert found, 'no worked example carries a "version": "X.Y.Z" value at all'
     stale = sorted(set(v for v in found if v != memory_bridge.VERSION))
     assert not stale, (
