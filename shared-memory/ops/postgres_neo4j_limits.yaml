@@ -237,6 +237,9 @@ services:
       - SYS_CHROOT
 
   # ── GPU encoder pair — same models, same ports, Vulkan image ───────────────
+  # This image is llama.cpp. An Intel Arc B580 (8086:e20b) is not this service.
+  # The measured B580 file is intel-arc-b580.yaml in this directory: vLLM plus
+  # rerank_shim.py. It is not started by this file.
   # Off by default (replicas 0). Enable with GPU_ENCODER_REPLICAS=1 and
   # CPU_ENCODER_REPLICAS=0 in shared-memory/.env for the pair, or
   # EMBEDDER_GPU_REPLICAS=1 (+ EMBEDDER_CPU_REPLICAS=0) to move only this one

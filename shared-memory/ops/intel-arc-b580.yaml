@@ -1,0 +1,126 @@
+# Intel Arc B580 encoder pair. Not the default image.
+#
+# The default stack is llama.cpp in postgres_neo4j_limits.yaml. Use this file
+# when the GPU is an Intel Arc B580 (PCI 8086:e20b, 12 GB). It is the Main
+# workstation configuration 2: both encoders on that card, vLLM, online LLM.
+# Do not use it for another Arc card. An A770 was not this measurement.
+#
+#   lspci -nn | grep -i '8086:e20b'
+#
+# Two vLLM processes, one model each, plus the path shim. vLLM serves
+# /v1/rerank; the gateway posts /v1/reranking. rerank_shim.py rewrites that
+# path and nothing else. The embedder needs no shim.
+#
+# Weights are Hugging Face directories, not GGUF:
+#   BAAI/bge-m3 and BAAI/bge-reranker-v2-m3.
+# Set the host directories and the render-node group before up:
+#   GPU_RENDER_GID=$(stat -c %g /dev/dri/renderD128)
+#   GPU_VIDEO_GID=$(stat -c %g /dev/dri/card0)
+#   B580_EMBED_MODEL_DIR=/path/to/bge-m3
+#   B580_RERANK_MODEL_DIR=/path/to/bge-reranker-v2-m3
+#
+# Leave the llama.cpp encoder replicas at 0 so they do not take :8070/:8071.
+# Point the gateway at this file's published ports (bases, not full paths):
+#   EMBEDDER_URL=http://127.0.0.1:8091
+#   RERANKER_URL=http://127.0.0.1:8092
+#
+#   docker compose -f shared-memory/ops/intel-arc-b580.yaml up -d
+
+name: shared-memory-b580
+
+services:
+  b580-embed:
+    image: intel/vllm:0.21.0-xpu
+    container_name: b580-embed
+    user: "${B580_UID:-1000}:${B580_GID:-1000}"
+    group_add:
+      - ${GPU_RENDER_GID:?set GPU_RENDER_GID to the render node group}
+      - ${GPU_VIDEO_GID:?set GPU_VIDEO_GID to the card group}
+    ipc: host
+    shm_size: 8gb
+    # Fedora SELinux: a labeled /dev/dri does not open inside the container.
+    security_opt:
+      - label=disable
+    devices:
+      - /dev/dri:/dev/dri
+    environment:
+      CCL_ZE_IPC_EXCHANGE: sockets
+    volumes:
+      # --device does not pass this directory. Without it oneCCL cannot see the GPU.
+      - /dev/dri/by-path:/dev/dri/by-path:ro
+      - ${B580_EMBED_MODEL_DIR:?set B580_EMBED_MODEL_DIR}:/models/bge-m3:ro
+    command:
+      - vllm
+      - serve
+      - /models/bge-m3
+      - --served-model-name
+      - bge-m3
+      - --runner
+      - pooling
+      - --gpu-memory-utilization
+      - "0.3"
+      - --max-model-len
+      - "8192"
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+    ports:
+      - "127.0.0.1:${B580_EMBED_PORT:-8091}:8000"
+    restart: unless-stopped
+
+  b580-rerank:
+    image: intel/vllm:0.21.0-xpu
+    container_name: b580-rerank
+    user: "${B580_UID:-1000}:${B580_GID:-1000}"
+    group_add:
+      - ${GPU_RENDER_GID:?set GPU_RENDER_GID to the render node group}
+      - ${GPU_VIDEO_GID:?set GPU_VIDEO_GID to the card group}
+    ipc: host
+    shm_size: 8gb
+    security_opt:
+      - label=disable
+    devices:
+      - /dev/dri:/dev/dri
+    environment:
+      CCL_ZE_IPC_EXCHANGE: sockets
+    volumes:
+      - /dev/dri/by-path:/dev/dri/by-path:ro
+      - ${B580_RERANK_MODEL_DIR:?set B580_RERANK_MODEL_DIR}:/models/bge-reranker-v2-m3:ro
+    command:
+      - vllm
+      - serve
+      - /models/bge-reranker-v2-m3
+      - --served-model-name
+      - bge-reranker-v2-m3
+      - --runner
+      - pooling
+      # Ceiling, not a reservation. A pooling model has no KV cache to fill.
+      - --gpu-memory-utilization
+      - "0.6"
+      - --max-model-len
+      - "8192"
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+    ports:
+      - "127.0.0.1:${B580_RERANK_PORT:-8090}:8000"
+    restart: unless-stopped
+
+  b580-rerank-shim:
+    image: python:3.12-slim
+    container_name: b580-rerank-shim
+    depends_on:
+      - b580-rerank
+    environment:
+      SHIM_VLLM_URL: http://b580-rerank:8000
+      # Bind inside the container. The published port below stays on loopback.
+      SHIM_HOST: 0.0.0.0
+      SHIM_PORT: "8092"
+    volumes:
+      - ../scripts/rerank_shim.py:/rerank_shim.py:ro
+    command: ["python", "/rerank_shim.py"]
+    ports:
+      - "127.0.0.1:${B580_SHIM_PORT:-8092}:8092"
+    restart: unless-stopped
