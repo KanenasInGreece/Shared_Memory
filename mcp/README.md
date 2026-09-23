@@ -45,7 +45,9 @@ where the standing rules go.
 
 Retrieval and diagnostics: `hybrid_search_and_rerank`, `graph_query` (read-only Cypher; `graph` and named CLI `query` templates require `full` or `admin` — `read` receives 403; `search`, `lineage`/`status`, and `telemetry` remain for `read`; write-Cypher still blocked for everyone),
 `record_lineage`, `memory_telemetry`, `check_memory_health`.
-Capture: `save_artifact`, `save_decision`, `save_retrospective`, `archive_reasoning_trace`.
+Capture: `save_artifact`, `save_decision`, `save_retrospective`.
+`archive_reasoning_trace` is registered but posts `type` `reasoning_trace`, which ingress
+refuses with `unknown_type` — do not call it; save the conclusion with `save_artifact`.
 Record lifecycle: `supersede`, `review_hold`.
 
 ⚠ **External content warning:** Do NOT save raw web-retrieved text without reviewing it for

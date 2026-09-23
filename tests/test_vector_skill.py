@@ -94,13 +94,14 @@ async def test_mcp_save_artifact_success():
 
 @pytest.mark.asyncio
 async def test_mcp_save_artifact_gateway_down():
-    """save_artifact returns a readable error when the gateway is unreachable."""
+    """save_artifact returns a readable error, naming the unit to start, when the gateway is unreachable."""
     with patch("httpx.AsyncClient.post", side_effect=Exception("connection refused")):
         result = await vector_skill.save_artifact(
             MOCK_CONTENT, '{"source":"qwen3-27b","project":"shared-memory-GitHub"}'
         )
     assert "Error" in result
-    assert "hive_mind_proxy.py" in result
+    assert "unreachable" in result.lower()
+    assert "hive-mind-gateway.service" in result
 
 
 @pytest.mark.asyncio
@@ -329,14 +330,15 @@ async def test_mcp_save_decision_treats_a_lone_string_as_one_alternative():
 
 @pytest.mark.asyncio
 async def test_mcp_save_decision_coordinator_down():
-    """save_decision returns a readable error when the coordinator is unreachable."""
+    """save_decision returns a readable error, naming the unit to start, when the coordinator is unreachable."""
     with patch("httpx.AsyncClient.post", side_effect=Exception("connection refused")):
         result = await vector_skill.save_decision(
             title="T", decided_by="X", project="P",
             rationale="R", source="test-model",
         )
     assert "Error" in result
-    assert "hive_mind_proxy.py" in result
+    assert "unreachable" in result.lower()
+    assert "hive-mind-gateway.service" in result
 
 
 @pytest.mark.asyncio
@@ -1096,3 +1098,70 @@ print("T5_OK")
     assert result.returncode == 0, f"stdout={result.stdout!r} stderr={result.stderr!r}"
     assert "T5_OK" in result.stdout
     assert "refusing to load" in result.stderr, result.stderr
+
+
+# ── A slow gateway is not a down gateway, on the write tools too ─────────────
+
+@pytest.mark.asyncio
+async def test_write_tool_timeout_says_slow_not_unreachable():
+    """The write tools inlined their own 'unreachable' string, so a timed-out
+    save told the operator to start a gateway that was already running — the
+    fact:1112 class, closed on the CLI door and left open here."""
+    import httpx
+    with patch("httpx.AsyncClient.post", side_effect=httpx.ReadTimeout("slow")):
+        saved = await vector_skill.save_artifact(
+            "content", json.dumps({"source": "test", "project": "shared-memory-GitHub"}))
+        decided = await vector_skill.save_decision(
+            title="t", decided_by="x", project="shared-memory-GitHub",
+            rationale="r", source="test")
+        retro = await vector_skill.save_retrospective(
+            pg_id=1, rating="validated", notes="n", source="test")
+        superseded = await vector_skill.supersede(pg_id=1)
+        held = await vector_skill.review_hold(summary_id=1, pg_id=1)
+    for result in (saved, decided, retro, superseded, held):
+        assert "UP and SLOW" in result, result
+        assert "unreachable" not in result.lower(), result
+
+
+@pytest.mark.asyncio
+async def test_write_tool_connect_error_still_says_unreachable():
+    """The other half of the split: a refused connection is still a down gateway."""
+    import httpx
+    with patch("httpx.AsyncClient.post", side_effect=httpx.ConnectError("refused")):
+        saved = await vector_skill.save_artifact(
+            "content", json.dumps({"source": "test", "project": "shared-memory-GitHub"}))
+        superseded = await vector_skill.supersede(pg_id=1)
+    for result in (saved, superseded):
+        assert "unreachable" in result.lower(), result
+        assert "UP and SLOW" not in result, result
+
+
+@pytest.mark.asyncio
+async def test_telemetry_timeout_says_slow_not_unreachable():
+    import httpx
+    with patch("httpx.AsyncClient.get", side_effect=httpx.ReadTimeout("slow")):
+        result = await vector_skill.memory_telemetry()
+    assert "UP and SLOW" in result, result
+    assert "unreachable" not in result.lower(), result
+
+
+def test_every_tool_docstring_leads_with_what_the_tool_does():
+    """An MCP host shows the docstring's first line as the tool description, so a
+    docstring that opens on the token caveat describes the refusal rather than
+    the tool."""
+    import ast
+    src = open(os.path.join(os.path.dirname(__file__), "..", "mcp", "vector-skill.py"),
+               encoding="utf-8").read()
+    offenders = []
+    for node in ast.parse(src).body:
+        if not isinstance(node, ast.AsyncFunctionDef):
+            continue
+        if not any((d.func if isinstance(d, ast.Call) else d).attr == "tool"
+                   for d in node.decorator_list
+                   if isinstance((d.func if isinstance(d, ast.Call) else d), ast.Attribute)):
+            continue
+        doc = ast.get_docstring(node) or ""
+        first = doc.strip().split("\n", 1)[0].strip()
+        if not first or first.startswith("Requires") or first.startswith("This is a READ"):
+            offenders.append(f"{node.name}: {first!r}")
+    assert not offenders, f"tool docstrings do not open on what the tool does: {offenders}"
