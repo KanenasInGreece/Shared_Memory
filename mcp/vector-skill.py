@@ -3,19 +3,14 @@
 # dependencies = ["fastmcp==4.0.3", "httpx==0.28.1"]
 # ///
 #
-# PEP 723 inline metadata — the connector declares its OWN dependencies, so the
-# documented spawn line is `uv run --no-project <this file>` and nothing else.
-# The versions above are the ones `requirements-mcp.lock` pins (checked by
-# tests/test_mcp_spawn_lines_pinned.py); that lock stays in-tree as the hashed
-# audit artefact and the source these two pins are verified against.
+# PEP 723 inline metadata: the connector declares its own dependencies, so the
+# spawn line is `uv run --no-project <this file>`. The versions above are the
+# ones `requirements-mcp.lock` pins, checked by tests/test_mcp_spawn_lines_pinned.py.
 #
-# WHY NOT `--with-requirements requirements-mcp.lock`: that flag resolves the
-# lock RELATIVE TO THE SPAWNING PROCESS'S WORKING DIRECTORY, and an MCP host
-# spawns its stdio servers from a directory nobody documents — measured
-# `error: File not found`, exit 2. It is also a local dependency-hijack
-# surface: whoever can drop a `requirements-mcp.lock` into that directory
-# chooses what `uv` installs and executes. Inline metadata travels with the
-# script, so it cannot be aimed somewhere else.
+# `--with-requirements requirements-mcp.lock` resolves the lock relative to the
+# spawning process's working directory, and an MCP host spawns stdio servers
+# from a directory nobody documents. Inline metadata travels with the script, so
+# it cannot be aimed at another file.
 """
 Vector Skill — MCP server exposing the shared memory to an MCP host (LM Studio).
 
@@ -23,29 +18,13 @@ THIN CLIENT (ADR-014). This process owns no database connections. Every
 operation is an HTTP call to the Hive-Mind Gateway on :8888, which is the single
 component that talks to Postgres and Neo4j.
 
-That was not always true, and the reason it matters is not tidiness. This server
-used to run its own copy of the retrieval chain — its own vector query, its own
-Tier-3 lookup, its own graph expansion — straight against the databases. Three
-consequences, all of them real:
+A client that queried the stores directly would apply no read-visibility
+predicate, would drift from the one retrieval chain, and would need server-only
+modules it is not shipped. So search, graph queries, lineage and saves all go
+through the gateway, and this file holds rendering plus the MCP tool surface.
 
-  * READ AUTHORIZATION WAS BYPASSED. The gateway applies a visibility predicate
-    to every read (`global`, own `private`, matching `scope`). A direct
-    `SELECT ... FROM technical_docs WHERE NOT superseded` applies none, so this
-    host could retrieve other agents' private records and scope-restricted rows.
-    A second implementation of a read path is a second implementation of its
-    access control, and this one simply did not have any.
-  * IT DRIFTED. Every retrieval improvement had to be made twice, and in
-    practice was made once — so this host silently served months-old ranking
-    behaviour while every other agent got the current chain.
-  * IT IMPORTED SERVER MODULES. The Cypher it built needed `ontology`, pulled in
-    off `shared-memory/scripts`, which is the operations surface and is not
-    shipped to clients.
-
-So: search, graph queries, lineage and saves all go through the gateway, and
-this file holds rendering plus the MCP tool surface. Nothing else.
-
-MCP tools: hybrid_search_and_rerank, save_artifact, archive_reasoning_trace,
-save_decision, save_retrospective, supersede, review_hold, check_memory_health,
+MCP tools: hybrid_search_and_rerank, save_artifact, save_decision,
+save_retrospective, supersede, review_hold, check_memory_health,
 memory_telemetry, record_lineage, graph_query.
 """
 import asyncio
@@ -61,51 +40,16 @@ import httpx
 from fastmcp import FastMCP
 
 # ── Client-scoped credentials ────────────────────────────────────────────────
-#
-# This process is a CLIENT. The only secrets it may hold are its OWN AGENT_TOKEN
-# and the gateway URL — never the framework/server env, which carries
-# PG_PASSWORD, NEO4J_PASSWORD and the entire AGENT_TOKENS registry. A client that
-# loaded that file would inherit every other agent's credentials, and the point
-# of per-agent tokens is that each origin is separately identifiable and
-# separately revocable.
-#
-# The two used to collide by default: this script lived at the repo root, where
-# a pre-0.6 install keeps the server env. It now lives in mcp/, so "the .env
-# beside me" is mcp/.env — a client-only location — and loading the file beside
-# this script is what makes a per-install copy work, the same shape as each CLI
-# agent owning its own skill .env. The guard stays: a server env copied here is
-# still recognisably the server's, gets REFUSED, and the refusal says why. Any
-# MCP host can install its own copy in its own directory with its own token;
-# nothing here assumes LM Studio.
-#
-# VECTOR_SKILL_ENV overrides the path outright, for an install that keeps its
-# client env somewhere else. An MCP host that injects AGENT_TOKEN through its own
-# config block (mcp.json's `env`) needs no file at all — that path is unaffected
-# BY CONSTRUCTION: the host writes it into this process's os.environ before this
-# module is ever imported, which is outside this loader's reach either way.
+# This client may hold only its own AGENT_TOKEN and the gateway URL, so a .env
+# carrying any of these server keys is refused rather than loaded, because it
+# would hand this process every other agent's credentials.
+# VECTOR_SKILL_ENV names another file, and a host that injects AGENT_TOKEN
+# through its own config block needs no file at all.
 _SERVER_ONLY_KEYS = frozenset({"AGENT_TOKENS", "PG_PASSWORD", "NEO4J_PASSWORD"})
 
-# D.4 (SEC round, ADV1-15): key = the text before the first "=", with an
-# optional leading "export " stripped — so `export AGENT_TOKENS=...` (a
-# legitimate shell-sourceable form some deployers use) is recognised by its
-# KEY, not lost the way a naive re-parse could. The previous implementation
-# matched "AGENT_TOKENS=" etc. as a bare SUBSTRING of the whole line, which
-# happened to also catch the `export` form (the substring is still present
-# after the word "export ") but for the wrong reason — it would just as
-# readily match the same text appearing inside an unrelated VALUE (a comment
-# quoting the line, a value containing "AGENT_TOKENS=" as literal text).
-# Matching the parsed KEY instead is the correct check either way; handling
-# `export` explicitly is what keeps that one legitimate form recognised
-# under the corrected approach.
-#
-# Fix round F5 (SEC1 HIGH-3 + MED-5): re.IGNORECASE added. The "export "
-# in the pattern above was case-SENSITIVE, so "EXPORT AGENT_TOKENS=..."
-# matched NEITHER the export branch NOR the bare-key branch (the whole
-# "EXPORT" token, followed by a space then more non-"=" text, satisfies
-# neither `(?:export\s+)?` case-sensitively nor `[^=\s]+\s*=` at position
-# 0) — probed: this regex returned no match at all for an "EXPORT "-
-# prefixed server-only key, so _looks_like_server_env() never detected the
-# framework .env and this client loaded it.
+# The key is the text before the first "=", with an optional `export` of any
+# casing stripped, so a shell-sourceable line is classified by its key rather
+# than by a substring that could also appear inside an unrelated value.
 _ENV_KEY_RE = re.compile(r"^(?:export\s+)?([^=\s]+)\s*=", re.IGNORECASE)
 
 
@@ -113,9 +57,7 @@ _EXPORT_PREFIX_RE = re.compile(r"^export\s+", re.IGNORECASE)
 
 
 def _strip_export_prefix(key: str) -> str:
-    """Fix round F5: strip an optional leading shell `export ` keyword
-    (case-insensitive) from a raw .env line's key text, at parse time.
-    Mirrors secure_env._strip_export_prefix() exactly."""
+    """Drop a leading shell ``export`` from a .env key so ``export AGENT_TOKENS`` is still classified as a secret."""
     s = key
     while s and (s[0].isspace() or s[0] == "﻿"):
         s = s[1:]
@@ -126,22 +68,14 @@ def _strip_export_prefix(key: str) -> str:
 
 
 def _strip_balanced_quotes(value: str) -> str:
-    """S16g (HYG round, R-G'): a `.env` VALUE wrapped in ONE balanced pair of
-    surrounding quotes — `"v"` or `'v'` — has that pair stripped; everything
-    else (an unbalanced leading quote with no matching trailing one, a bare
-    quote embedded in the value, mismatched quote characters, or no quotes
-    at all) is kept VERBATIM. Same rule, independently duplicated in
-    secure_env.py and memory_bridge.py — none of the three may import from
-    another (Group 1: the client/server surface split)."""
+    """Strip one matching pair of surrounding quotes from a .env value, and leave every other quote untouched."""
     if len(value) >= 2 and value[0] == value[-1] and value[0] in ('"', "'"):
         return value[1:-1]
     return value
 
 
 def _looks_like_server_env(path: str) -> bool:
-    """True when this .env is the FRAMEWORK's, not a client's. Best-effort: an
-    unreadable file is not treated as a server env, since the only cost of
-    trying to load it is the parser's own failure to read it."""
+    """True when this .env is the framework's rather than a client's; an unreadable file is not treated as one, since the loader will fail to read it anyway."""
     try:
         with open(path, "r", encoding="utf-8", errors="replace") as fh:
             for line in fh:
@@ -159,28 +93,12 @@ def _looks_like_server_env(path: str) -> bool:
     return False
 
 
-# AGENT_TOKEN is read into a private variable and NEVER exported into this
-# process's own os.environ (ported from memory_bridge.py:86-97, S-18 /
-# MCPW-R2-C5 — origin fact:1816): this door used to load its whole .env —
-# AGENT_TOKEN included, and after the MCP-W mint a write-capable one — into
-# os.environ, the same "secret sitting in a long-lived process's own
-# environment" class the CLI door already closed (visible via this process's
-# own /proc/<pid>/environ, same UID, and to anything that later snapshots the
-# environment). An operator's own real `export AGENT_TOKEN=...` still wins —
-# checked FIRST on every call, before any file value is considered (see
-# _auth_headers below). _AGENT_TOKEN_FROM_FILE is populated once below, from
-# the file only, and is the seam tests use to neutralise a real on-disk .env
-# during isolated runs
-# (monkeypatch.setattr(vs, "_AGENT_TOKEN_FROM_FILE", "")).
+# AGENT_TOKEN from the file stays in this variable, never in os.environ where
+# /proc and child processes would see it, and an operator export still wins
+# (fact:1816: this door used to export its whole .env, token included).
 _AGENT_TOKEN_FROM_FILE = ""
 
-# Duplicated (not imported) from memory_bridge.py:129-148 — both clients ship
-# alone, so neither may depend on the other or on a server-only module (the
-# same reason memory_bridge doesn't import secure_env). A contract test
-# (test_client_secret_mirror_parity.py) pins both copies against secure_env.
-# py's own KNOWN_SECRET_NAMES / _SECRET_SUFFIXES so a future drift fails
-# loudly instead of needing a fresh probe to find (the R6 lesson, reopened
-# here if this mirror is ever edited alone).
+# Same secret names as the server, pinned by test_client_secret_mirror_parity.py, because this client ships alone and a missed name would land in os.environ.
 _CLIENT_KNOWN_SECRET_NAMES = {
     "PG_PASSWORD", "NEO4J_PASSWORD", "TAVILY_API_KEY", "AGENT_TOKENS",
     "BACKUP_ADMIN_TOKEN", "PG_CONN",
@@ -192,15 +110,7 @@ _CLIENT_SECRET_SUFFIXES = (
 
 
 def _client_key_norm(name: str) -> str:
-    """Fix round F11 (SEC1 MED-7 + LOW-8): shared client-side key
-    normaliser — mirrors secure_env._normalize_key() exactly (duplicated,
-    not imported: this client ships alone and may not depend on a
-    server-only module). BOM (U+FEFF) + whitespace stripped from both
-    ends, in EITHER order and any interleaving, then upper-cased. A single
-    fixed-order strip (e.g. .strip().lstrip(BOM)) only handles ONE of the
-    two orderings a raw line can carry — probed by SEC1: "﻿ AGENT_TOKENS"
-    (BOM then space) and " ﻿AGENT_TOKENS" (space then BOM) each defeat
-    exactly one fixed order."""
+    """Strip a leading or trailing BOM and whitespace in either order, then upper-case, matching the server key normaliser."""
     s = name
     while s and (s[0].isspace() or s[0] == "﻿"):
         s = s[1:]
@@ -210,18 +120,7 @@ def _client_key_norm(name: str) -> str:
 
 
 def _is_client_secret_key(name: str) -> bool:
-    """True if `name` must never be exported into this client's own
-    os.environ (mirrors secure_env.is_secret_key(), narrowed to what this
-    client can ever encounter). AGENT_TOKEN is excluded -- it has its own
-    private-variable path and is never routed through this predicate.
-
-    Fix round F11 (SEC1 MED-7): normalises internally via
-    _client_key_norm(), so ANY caller — pre-normalised or raw — classifies
-    correctly. Before this fix, `_is_client_secret_key("agent_tokens")` was
-    False (exact-match-only against the upper-cased name list, no internal
-    normalisation) — defused today only because every call site happens to
-    pass an already-`.upper()`d key; a future caller passing a raw key
-    would silently re-open a live `agent_tokens=` export."""
+    """True when this name must stay out of os.environ; AGENT_TOKEN is excluded because it has its own private variable, and the check normalises the name first."""
     key_norm = _client_key_norm(name)
     if key_norm == "AGENT_TOKEN":
         return False
@@ -235,78 +134,31 @@ _ENV_PATH = os.environ.get("VECTOR_SKILL_ENV", "").strip() or os.path.join(
 
 
 def _load_env_manually(path: str) -> None:
-    """The ONE parser this client has for its `.env`.
+    """Parse this client's `.env` with the gateway's rules: a value runs to the end of its line, an inline hash stays in the value, and an unbalanced quote does not swallow the next line.
 
-    An env loader must NEVER silently no-op because a parser dependency is
-    missing — that class once made two verifiers report a CREDENTIALS error
-    for a missing DEPENDENCY — so this door parses the file itself. Same
-    structure and same rules as memory_bridge.py's `_read_env_file`: strip,
-    skip comments/no-`=` lines, divert AGENT_TOKEN to _AGENT_TOKEN_FROM_FILE
-    (never exported), skip any secret-shaped key (never exported either), and
-    first-definition-wins for everything else — real env vars still win
-    because they were already set before this ever runs. A VALUE is read
-    verbatim to the end of its line: an inline `# comment` after a value is
-    part of the value, and a line with an unbalanced quote is kept as written
-    and never swallows the next line. Multi-line values, `${VAR}`
-    interpolation and `\\n` escapes are not a form any shipped or minted
-    `.env` uses and are not supported."""
+    The parser is written out here rather than imported so a missing
+    dependency can never make the loader silently no-op.
+    """
     global _AGENT_TOKEN_FROM_FILE
     try:
-        # utf-8-sig: a file saved as UTF-8-with-BOM has its first three bytes
-        # decoded to a leading U+FEFF on the FIRST key otherwise — SEC round
-        # HIGH-2 (2026-09-01, gemini). Belt and braces with the per-key
-        # lstrip below, which also catches a BOM character that ended up
-        # embedded mid-file some other way (e.g. a bad concatenation).
+        # utf-8-sig, matching memory_bridge.py: a BOM would otherwise stick to
+        # the first key, and the per-key strip below catches one left mid-file.
         with open(path, encoding="utf-8-sig") as f:
             for line in f:
                 line = line.strip()
                 if not line or line.startswith("#") or "=" not in line:
                     continue
                 key, _, val = line.partition("=")
-                # F5 (SEC1 HIGH-3/MED-5): strip an optional leading
-                # "export "/"EXPORT " prefix before classification —
-                # without this, the stored key for an "export
-                # AGENT_TOKENS=..." line was the literal "export
-                # AGENT_TOKENS", matching neither the AGENT_TOKEN diversion
-                # nor _is_client_secret_key's exact-name list, exporting
-                # the registry straight into os.environ.
+                # Strip `export` before classifying, or the key of an
+                # `export AGENT_TOKENS=` line matches neither the token
+                # diversion nor the secret list.
                 key = _strip_export_prefix(key).strip()
                 val = _strip_balanced_quotes(val.strip())
                 if not key:
                     continue
-                # SEC round HIGH-1 + HIGH-2 (2026-09-01, gemini), H-1
-                # follow-up fix (2026-09-01 — regression in the first
-                # pass): normalize for FILTERING/DIVERSION ONLY, at this
-                # call site — never inside _is_client_secret_key, which
-                # stays a BYTE-IDENTICAL mirror of memory_bridge.py's (the
-                # parity test pins it). str.strip() does NOT remove U+FEFF
-                # (it is not whitespace), so a stray BOM or a lowercase
-                # spelling used to sail past both the AGENT_TOKEN divert
-                # and the secret-suffix/name check below and land straight
-                # in os.environ. `key` itself — never `key_norm` — is
-                # still what gets exported when the key isn't filtered:
-                # this only changes what counts as secret/AGENT_TOKEN,
-                # never the exported name's casing.
-                #
-                # H-1: key_norm is upper-cased HERE, once, and BOTH the
-                # AGENT_TOKEN comparison and the predicate call use this
-                # single already-uppercased value. The first pass instead
-                # compared the token key case-SENSITIVELY
-                # (`key_norm == "AGENT_TOKEN"` with key_norm only
-                # lstripped+stripped) while calling the predicate with
-                # `key_norm.upper()` — so a lowercase `agent_token=` line
-                # folded onto "AGENT_TOKEN" for the predicate's OWN
-                # deliberate early-return exemption (`_is_client_secret_
-                # key`: `if name == "AGENT_TOKEN": return False`, which
-                # exists BECAUSE the token has its own diversion path)
-                # while never matching the still-case-sensitive diversion
-                # check above it — caught by NEITHER, exported by the
-                # setdefault below. This deliberately now catches every
-                # case-variant spelling of the token — a SAFER-direction
-                # divergence from memory_bridge.py's exact-case diversion,
-                # recorded there as a SEC-round twins item, not fixed here
-                # (memory_bridge.py, the CLI door, is not this file's to
-                # touch).
+                # One normalised form classifies the key, and the stored name
+                # keeps the caller's casing. This catches every case variant of
+                # the token, which memory_bridge.py diverts case-sensitively.
                 key_norm = _client_key_norm(key)
                 if key_norm == "AGENT_TOKEN":
                     if not _AGENT_TOKEN_FROM_FILE:
@@ -342,36 +194,23 @@ mcp = FastMCP("Local_RAG_Orchestrator")
 COORDINATOR_BASE = os.environ.get("COORDINATOR_URL", "http://localhost:8888")
 AGENT_ID = os.environ.get("AGENT_ID", "vector_skill")
 
-# Wire contract this MCP server speaks on its /memory/* gateway calls. Keep in
-# step with API_VERSION in coordinator.py / memory_bridge.py — the gateway logs
-# a warning (coordinator._check_client_version) if they disagree.
-# v4 (project registry): a fact save without a REGISTERED metadata.project is
-# rejected 400 carrying error=project_required|project_unknown plus near-match
-# proposals. BREAKING for any client that saved untagged facts. The second
-# submission is accepted in three forms: a proposal, new_project=true, or the
-# reserved sentinel general_discussion.
+# The wire contract, kept in step with coordinator.py and memory_bridge.py; on
+# v4 a fact save without a registered metadata.project is rejected 400 carrying
+# project_required or project_unknown plus near-match proposals.
 API_VERSION = 4
-VERSION = "1.0.0"
+VERSION = "1.0.1"
 CLIENT_VERSION_HEADER = "X-SM-Api-Version"
-# This client's own FRAMEWORK VERSION, distinct from the wire API_VERSION: two
-# clients can speak api_version 4 while one of them is forty releases behind on
-# behaviour. The gateway counts it as `clients.versions_seen` (0.9.74). Group 1
-# parity — memory_bridge.py sends the same header under the same name.
+# Framework build, separate from api_version, so two clients on the same wire contract can still be counted apart in clients.versions_seen.
 CLIENT_BUILD_HEADER = "X-Shared-Memory-Client"
 
-# Constants that MUST mirror the gateway's (a thin client never imports server
-# modules, so they are restated here and kept in step by review).
-# ontology.RETRO_RATINGS — outcome STATES, not valence:
+# Outcome states, not valence: 'reversed' drives the supersession cascade; nuance goes in notes.
 RETRO_RATINGS = ("validated", "mixed", "refined", "pending", "reversed")
-# Record types that may qualify a reference. A record id is unique only WITHIN
-# its table — technical_docs and community_summaries run independent sequences —
-# so a bare integer lifted off a summary result resolves against the wrong table
-# and returns a confident, unrelated record (decision 822).
+# A record id is unique only within its table, so a reference is qualified (decision 822: a bare integer off a summary resolved against the facts table and returned an unrelated record).
 RECORD_TYPES = ("fact", "decision", "retrospective", "summary", "insight")
 
 CALL_TIMEOUT = httpx.Timeout(30.0, connect=5.0)
 
-# Same search_ceiling rule as memory_bridge (parity test); derived from /health, not a fixed 60s (fact:1112).
+# The search wait comes from /health projections, not a fixed 60s (fact:1112: the shipped client used a fixed wait and reported a live gateway as down).
 HEALTH_PROBE_TIMEOUT_S    = float(os.environ.get("HEALTH_PROBE_TIMEOUT_S", "3"))
 SEARCH_TIMEOUT_S          = float(os.environ.get("SEARCH_TIMEOUT_S", "0") or 0)
 SEARCH_TIMEOUT_FLOOR_S    = float(os.environ.get("SEARCH_TIMEOUT_FLOOR_S", "30"))
@@ -382,8 +221,7 @@ SEARCH_OVERHEAD_S         = float(os.environ.get("SEARCH_OVERHEAD_S", "15"))
 
 
 def search_ceiling(capability: dict | None, capacity: dict | None = None) -> float:
-    """Seconds to wait for search: must match memory_bridge.search_ceiling (parity test); mixed/unknown encoders floor at SEARCH_TIMEOUT_FALLBACK_S (fact:1560).
-    """
+    """Seconds to wait for a search, matching memory_bridge.search_ceiling; a mixed or unknown encoder pair floors at SEARCH_TIMEOUT_FALLBACK_S (fact:1560: an unknown backend cost is not a zero cost)."""
     if SEARCH_TIMEOUT_S > 0:
         return SEARCH_TIMEOUT_S
 
@@ -428,21 +266,16 @@ def search_ceiling(capability: dict | None, capacity: dict | None = None) -> flo
 
 _CAPABILITY_CACHE: dict | None = None
 _CAPACITY_CACHE: dict | None = None
-# CQ-03 (PR #310 review): guards against two searches starting in the same
-# instant both seeing an empty cache and both firing a /health request.
+# Stops two searches that start in the same instant from both firing a /health request.
 _HEALTH_FETCH_LOCK = asyncio.Lock()
 
 
 async def _fetch_health_blocks() -> None:
-    """GET /health once per process and cache both ``backend_capability`` and
-    ``capacity`` from it — ONE request feeds both caches, never two. Never
-    raises: sizing the search must never be the thing that fails it.
+    """GET /health once per process and cache both ``backend_capability`` and ``capacity`` from that one request, never raising, because sizing the search must not be what fails it.
 
-    Sends this client's own auth headers (S-10, PR A5): ``backend_capability``
-    moved behind auth along with the rest of /health's operational detail, so
-    an unauthenticated call here would always land on the anonymous-slim
-    shape and silently fall back to the constant ceiling on every
-    authenticated install."""
+    The call carries this client's auth headers: both blocks sit behind auth,
+    so an anonymous call would silently fall back to the constant ceiling.
+    """
     global _CAPABILITY_CACHE, _CAPACITY_CACHE
     if _CAPABILITY_CACHE is not None:
         return   # already attempted this process — do not retry
@@ -477,28 +310,13 @@ async def _gateway_capacity() -> dict | None:
 
 
 def _auth_headers() -> dict:
-    """Headers for every coordinator request.
-
-    Advertises this server's API_VERSION so the gateway can log version skew.
-    Adds the Bearer token when AGENT_TOKEN is set — checked fresh on every
-    call so an operator export or a test's monkeypatch.setenv/setattr always
-    wins, falling back to the value this module parsed out of its own .env at
-    import time (never itself exported to os.environ — see
-    _AGENT_TOKEN_FROM_FILE above). An MCP host that injects AGENT_TOKEN
-    through its own env block (mcp.json's `env`) is unaffected by any of
-    this: the host writes it into os.environ before this module is even
-    imported, outside this module's reach either way.
-    """
+    """Headers for every coordinator request: the API version so the gateway can log skew, and a Bearer token read fresh on each call so an operator export wins over the file value."""
     headers = {CLIENT_VERSION_HEADER: str(API_VERSION),
                CLIENT_BUILD_HEADER: VERSION}
-    # ⚠ Deliberate TRUTHINESS, not an emptiness/None check (MCPW_R2C5_Builder_
-    # Brief.md §2.4, pinned by test_exported_empty_agent_token_falls_back_to_
-    # file_token): an exported AGENT_TOKEN="" used to suppress the header even
-    # when the file held a real token. Full parity with the CLI door
-    # (memory_bridge.py:494, byte-identical expression) is chosen over
-    # preserving that edge — a blank export reads as a mistake-shaped input,
-    # not a documented kill switch, and one precedence rule across both doors
-    # beats a silent divergence. Do not "fix" this back to a presence check.
+    # Deliberate truthiness, not a presence check: an exported empty token
+    # falls back to the file value rather than suppressing the header, which is
+    # the CLI door's rule too. Pinned by
+    # test_exported_empty_agent_token_falls_back_to_file_token.
     token = os.environ.get("AGENT_TOKEN", "").strip() or _AGENT_TOKEN_FROM_FILE
     if token:
         headers["Authorization"] = f"Bearer {token}"
@@ -532,9 +350,8 @@ def _append_log(tool: str, min_level: int, event: str, data: dict, content: str 
             entry["content"] = content
             if len(content.encode()) > _CONTENT_SIZE_WARN_BYTES:
                 entry["content_size_warn"] = f"content is {len(content.encode())} bytes — reduce log level to avoid large logs"
-        # Offloaded to a single worker thread: these handlers are async and a
-        # sync append on the event loop stalls every concurrent tool call for
-        # the duration of a disk write. One thread preserves entry ordering.
+        # One worker thread, because a sync append on the event loop would
+        # stall every concurrent tool call and a second thread would reorder.
         _LOG_EXECUTOR.submit(_append_line,
                              os.path.join(log_dir, f"{tool}.log"),
                              json.dumps(entry) + "\n")
@@ -545,18 +362,13 @@ def _append_log(tool: str, min_level: int, event: str, data: dict, content: str 
 
 
 def _unavailable(exc: Exception, ceiling: float | None = None) -> str:
-    """Uniform message when the gateway cannot be reached. The gateway is the
-    only path to memory now, so this is a hard failure rather than a degraded
-    mode — saying so plainly beats silently returning nothing.
+    """The one message for a gateway this client could not reach.
 
-    A read timeout is a DIFFERENT fault and gets its own message: httpx's
-    ReadTimeout stringifies to nothing, so folding it in here told the reader to
-    start a service that was already running (fact:1112).
-
-    Structural guard, not a courtesy: a GatewayReplyError means the gateway
-    ANSWERED, so it can never be reported as unreachable — even from a call
-    site that forgot its own `except GatewayReplyError` clause. This is the
-    last place fact:1503's defect could re-enter.
+    A timeout is a different fault and gets its own wording (fact:1112: an
+    httpx ReadTimeout stringifies to nothing, so the reader was told to start a
+    service that was already running). A GatewayReplyError means the gateway
+    answered and so can never be reported as unreachable, even from a call site
+    that forgot its own except clause (fact:1503).
     """
     if isinstance(exc, GatewayReplyError):
         return exc.message
@@ -571,15 +383,10 @@ def _unavailable(exc: Exception, ceiling: float | None = None) -> str:
 
 
 def _auth_rejected(tool: str) -> str:
-    """The ONE 401 response. Six tools used to inline their own copy of this
-    message and so never logged the failure — and the write tools were the six,
-    which is the worse half to lose from the audit trail. `tool` is the calling
-    tool's own name, so the log says which call was rejected.
+    """The one 401 response, logged under the calling tool's name so the audit trail says which call was rejected.
 
-    Branches on whether a credential was actually SENT: a 401 with no
-    Authorization header is a MISSING token, not a rejected one, and telling
-    the operator it was "rejected" points them at comparing a value against
-    the gateway registry when nothing was ever configured to compare.
+    It branches on whether a credential was sent, because a 401 with no
+    Authorization header is a missing token rather than a rejected one.
     """
     presented = "Authorization" in _auth_headers()
     where = ("this client's own .env (beside this script, or wherever "
@@ -596,19 +403,12 @@ def _auth_rejected(tool: str) -> str:
 
 
 class GatewayReplyError(Exception):
-    """The gateway ANSWERED, and its answer was not a 2xx JSON payload.
+    """The gateway answered, and its answer was not a 2xx JSON payload.
 
-    Carries the ready-to-return tool string. Mirrors memory_bridge's class of
-    the same name — Group 1: two front doors, one gateway, one error contract.
-
-    ``logged_event`` names the audit event the RAISE SITE already wrote, or is
-    None when it wrote nothing. Centralising the decode routed 401 through this
-    exception instead of an early return, and a catch block that logs
-    unconditionally would then record ONE refused call TWICE — ``auth_failed``
-    from _auth_rejected and ``save_rejected`` behind it, where before the 401
-    logged ``auth_failed`` alone. Deliberately an ATTRIBUTE and not a phrase
-    read back out of the message: keying the audit trail on message text would
-    tie it to wording that exists to be improved.
+    ``logged_event`` names the audit event the raise site already wrote, or is
+    None when it wrote nothing, so a catch block does not record one refused
+    call twice. It is an attribute rather than a phrase read back out of the
+    message, which would tie the audit trail to wording meant to improve.
     """
 
     def __init__(self, message: str, *, logged_event: str | None = None):
@@ -622,35 +422,22 @@ def _body_snippet(r, limit: int = 200) -> str:
     raises: this runs on the error path, where a second failure would replace a
     diagnosis with a traceback."""
     try:
-        # Same hazard as _gateway_message: this is gateway-controlled text on
-        # its way to a terminal or log — strip control characters before the
-        # whitespace collapse and the cap (the non-JSON error page is exactly
-        # the attacker-shaped body this path exists for).
+        # Gateway-controlled text bound for a terminal, so control characters
+        # are stripped before the collapse and the cap.
         return " ".join(_clean_gateway_text(r.text or "").split())[:limit]
     except Exception:
         return ""
 
 
-# The gateway's own words are reflected into this client's audit log and into
-# the operator's terminal — and COORDINATOR_BASE is an env-overridable default,
-# so the endpoint that produced them is not axiomatically trusted. Two limits
-# apply before the string is used anywhere.
-#
-# MEASURED, not guessed: the longest message any deployed middleware refusal
-# emits is 378 characters, so a 600-character cap preserves every legitimate
-# message whole and truncates only a body no deployed path can produce.
+# COORDINATOR_BASE is env-overridable, so the gateway's own words are capped
+# and stripped before they reach a log or a terminal. The longest message any
+# deployed refusal emits measured 378 characters, so this cap truncates only a
+# body no deployed path produces.
 _GATEWAY_MESSAGE_MAX = 600
 
 
 def _clean_gateway_text(msg: str) -> str:
-    """Strip ASCII control characters (newline and tab kept) and cap the length.
-
-    A message printed to a terminal is not inert: an ANSI escape can clear the
-    screen or rewrite the line the operator is reading, and a BEL is not a
-    diagnosis. Stripping runs BEFORE the cap so the cap counts characters the
-    reader will actually see. Mirrors memory_bridge's helper of the same name —
-    Group 1: two front doors, one error contract.
-    """
+    """Strip ASCII control characters, keeping newline and tab, then cap the length, because an ANSI escape printed to a terminal can rewrite the line the operator is reading."""
     cleaned = "".join(
         ch for ch in msg
         if ch in ("\n", "\t") or (ord(ch) >= 32 and ord(ch) != 127)
@@ -659,12 +446,7 @@ def _clean_gateway_text(msg: str) -> str:
 
 
 def _gateway_message(r) -> str | None:
-    """The gateway's own ``message`` when the body is JSON and carries one.
-    Guarded end to end: a decode failure is a RESULT here, never an exception
-    that escapes into the transport handler.
-
-    The message is capped and control-stripped on the way out — see
-    ``_clean_gateway_text``."""
+    """The gateway's own ``message`` when the body is JSON and carries one, capped and control-stripped, with a decode failure returned as a result rather than raised into the transport handler."""
     try:
         body = r.json()
     except Exception:
@@ -678,14 +460,12 @@ def _gateway_message(r) -> str | None:
 
 def _reply_json(r, tool: str) -> dict:
     """Decode JSON only after the status class is known (fact:1503)."""
-    # _auth_rejected writes `auth_failed` in BOTH of its sub-branches, so the
-    # 401 is already in the audit log by the time this is raised — which is what
+    # _auth_rejected has already logged `auth_failed`, which is what
     # `logged_event` tells the catch block.
     if r.status_code == 401:
         raise GatewayReplyError(_auth_rejected(tool), logged_event="auth_failed")
 
-    # The gateway's OWN words come FIRST, before this client's framing — see the
-    # matching comment in memory_bridge._reply_json.
+    # The gateway's own words come before this client's framing.
     if r.status_code == 403:
         detail = _gateway_message(r) or _body_snippet(r)
         head = (f"Error: the gateway refused this request (HTTP 403): {detail}"
@@ -723,25 +503,13 @@ def _valid_ref(ref: str) -> bool:
 # ── Rendering ────────────────────────────────────────────────────────────────
 
 def _render_results(results: list, elapsed: float) -> str:
-    """Render the gateway's search response for an MCP host.
-
-    Every result carries the gateway's own `ref` (`fact:816`, `summary:87`) and
-    `record_type`. Those are surfaced verbatim rather than reduced to a bare
-    integer, because the bare integer is exactly what makes a follow-up lookup
-    resolve against the wrong table.
-    """
+    """Render the gateway's search response for an MCP host, surfacing each row's own ``ref`` and ``record_type`` verbatim, because a bare integer is what makes a follow-up lookup resolve against the wrong table."""
     if not results:
         return "Result: No relevant documentation found."
 
-    # ⛔ RENDER IN THE ORDER THE GATEWAY RETURNED. This used to partition the
-    # results and print every Tier-3 narrative above every fact — which was
-    # harmless only while the gateway pinned them there too. The gateway now
-    # RANKS summaries against facts on one scale and returns them interleaved,
-    # so re-grouping here would reinstate a guarantee the server deliberately
-    # removed, and would do it invisibly: the summary would sit on top carrying
-    # a score that says it belongs sixth.
-    #
-    # A client must not re-impose an ordering the server took a position on.
+    # Render in the order the gateway returned. It ranks summaries against
+    # facts on one scale, so re-grouping here would put a summary on top
+    # carrying a score that says it belongs sixth.
     body = []
     for r in results:
         rtype = r.get("record_type")
@@ -750,8 +518,7 @@ def _render_results(results: list, elapsed: float) -> str:
             kind = ("Insight (cross-project principle)" if rtype == "insight"
                     else "Global Context Summary")
             bits = [f"Ref: {r.get('ref', r.get('pg_id'))}"]
-            # Tier-3 rows carry a real score now; showing it is what makes the
-            # position it was given inspectable rather than a matter of trust.
+            # Showing the score makes a Tier-3 row's position inspectable.
             if score is not None:
                 bits.insert(0, f"Score: {score:.2f}")
             src = r.get("source_pg_ids") or []
@@ -773,8 +540,7 @@ def _render_results(results: list, elapsed: float) -> str:
             line += f"\n[Matched entities]: {', '.join(map(str, ents))}"
         body.append(f"{line}\n{r.get('content', '')}")
 
-    # Counts every row, Tier-3 included — the old header counted only the facts,
-    # so a result set was reported as smaller than what was printed.
+    # Counts every row, Tier-3 included, so the header matches what is printed.
     header = f"### Unified Memory Results ({len(results)} item(s) found in {elapsed:.2f}s)\n\n"
     parts = [header + "\n\n---\n\n".join(body)] if body else []
     return "\n\n---\n\n".join(parts)
@@ -783,10 +549,7 @@ def _render_results(results: list, elapsed: float) -> str:
 # ── Retrieval ────────────────────────────────────────────────────────────────
 
 def _unranked_warning(results) -> str | None:
-    """T-07 (PR #310 review): the SHARED core sentence — must return the
-    identical string as ``memory_bridge._unranked_warning`` for the identical
-    input; a parity test holds the two in step. Each door decorates it in its
-    own idiom (a bare stderr line there, a ``NOTE: …`` prefix here)."""
+    """The sentence both doors share for an unranked result set, held byte-identical to ``memory_bridge._unranked_warning`` by a parity test and decorated per door."""
     if not isinstance(results, list):
         return None
     unranked = sum(1 for row in results if isinstance(row, dict) and row.get("ranked") is False)
@@ -797,13 +560,7 @@ def _unranked_warning(results) -> str | None:
 
 
 def _fallback_warning(payload: object) -> str | None:
-    """Mirrors ``memory_bridge._fallback_warning`` exactly (v0.9.62,
-    fact:1609) — a parity test holds the two in step. See there for the
-    rationale: the gateway serves a KEYWORD (substring) fallback rather than
-    failing the search when the embedder is unavailable, and this MUST fire
-    on an empty ``results: []`` too — the common shape a natural-language
-    query takes against a substring match. Input is the raw gateway payload
-    dict, not the unwrapped results list."""
+    """Warn that the gateway served a keyword fallback instead of failing the search, firing on an empty result list too, since that is the shape a natural-language query takes against a substring match (fact:1609)."""
     if not isinstance(payload, dict) or payload.get("fallback") != "keyword":
         return None
     results = payload.get("results")
@@ -814,8 +571,7 @@ def _fallback_warning(payload: object) -> str | None:
 
 
 def _stale_projection_note(capability: dict | None) -> str | None:
-    """Mirrors ``memory_bridge._stale_projection_note`` exactly (B1/T-02,
-    PR #310 review) — see there for the rationale."""
+    """Name each backend whose cost projection has gone stale, so the ceiling above reads as a lower bound rather than a measurement."""
     if not isinstance(capability, dict):
         return None
     notes = []
@@ -834,20 +590,13 @@ def _stale_projection_note(capability: dict | None) -> str | None:
 async def _search_payload(query: str, limit: int = 5, project: str = "",
                            domains: list[str] | str = "",
                            since: str = "") -> dict | str:
-    """The HTTP call + error handling ``hybrid_search_and_rerank()`` used to
-    inline, pulled out so it can derive BOTH the unranked warning and
-    (v0.9.62, fact:1609) the keyword-fallback warning from the SAME call
-    instead of a second HTTP round trip.
+    """Make the search call and return either the decoded payload or an already-phrased error string, so one round trip feeds both the unranked and the keyword-fallback warnings.
 
-    Returns the decoded gateway payload (a dict) on a 2xx reply — success OR
-    a gateway-reported ``status: error`` body, both are legitimate JSON
-    answers. Returns an already-phrased error STRING — exactly what
-    ``hybrid_search_and_rerank`` returned directly before this split — when
-    the gateway could not be reached or refused the request outright
-    (``GatewayReplyError``/transport failure): those are a different fault
-    than a gateway-SERVED fallback and never carry a ``fallback`` marker, so
-    a caller need only branch on ``isinstance(payload, str)``."""
-    # Sized from the gateway's own published cost, never from a constant.
+    A dict is any 2xx answer, including a gateway-reported ``status: error``
+    body; a string is a refusal or a transport failure, so a caller branches on
+    ``isinstance(payload, str)``.
+    """
+    # Sized from the gateway's published cost, never a constant.
     ceiling = search_ceiling(await _gateway_capability(), await _gateway_capacity())
     body = {"query": query, "limit": limit, "agent_id": AGENT_ID}
     if project:
@@ -917,12 +666,9 @@ async def hybrid_search_and_rerank(query: str, limit: int = 5, project: str = ""
         return f"Error: {results.get('message', 'search failed')}"
     results_list = results if isinstance(results, list) else []
     rendered = _render_results(results_list, (datetime.now() - start).total_seconds())
-    # This tool returns rendered text, not a dict/list — so the unranked and
-    # fallback warnings are lines prepended to that text rather than `note`
-    # fields. Prepended in the OPPOSITE order the CLI door prints them (the
-    # fallback one first, THEN unranked) so the final top-to-bottom order —
-    # unranked, then fallback — matches the CLI's stderr order on the two
-    # front doors (nit d, delta review).
+    # This tool returns text, so the warnings are prepended lines rather than
+    # `note` fields. They go on in reverse, leaving the reader the same
+    # top-to-bottom order the CLI door prints: unranked, then fallback.
     fallback_warning = _fallback_warning(payload)
     if fallback_warning:
         rendered = f"NOTE: {fallback_warning}\n\n" + rendered
@@ -939,11 +685,10 @@ async def hybrid_search_and_rerank(query: str, limit: int = 5, project: str = ""
 
 @mcp.tool()
 async def save_artifact(content: str, metadata_json: str = "{}") -> str:
-    """
+    """Store an artifact in shared memory through the Hive-Mind Gateway.
 
     Requires a write-capable agent token: a read-only token receives an
     honest HTTP 403 role refusal from the gateway — expected, do not retry.
-    Stores an artifact in shared memory via the Hive-Mind Gateway.
 
     Routes through the Memory Coordinator (POST /memory/save) — no direct DB
     writes here — so the save gets the full server-side path: BGE-M3 embedding
@@ -984,8 +729,8 @@ async def save_artifact(content: str, metadata_json: str = "{}") -> str:
     kept but flagged + hidden from search). To retract a fact WITHOUT a
     replacement, use the `supersede` tool instead.
     """
-    # Validate metadata client-side first so the model gets a clear MCP error
-    # before any network call. The coordinator is the authority and re-checks.
+    # Validated here so the model gets a clear error before any network call;
+    # the coordinator is the authority and re-checks.
     if isinstance(metadata_json, str):
         try:
             m_data = json.loads(metadata_json)
@@ -1007,11 +752,8 @@ async def save_artifact(content: str, metadata_json: str = "{}") -> str:
             "Facts without provenance are rejected to protect memory integrity."
         )
 
-    # Project is required on a fact, exactly as on the CLI front door — the two
-    # are doors to one gateway, and a rule enforced on only one of them is a rule
-    # with a way around it. There is no cwd to derive from here (the MCP server
-    # runs wherever the host launched it), so the model must supply it: ask the
-    # operator which project this belongs to rather than inferring one.
+    # Project is required on a fact here as on the CLI door, and there is no
+    # cwd to derive it from, because the host launches this server anywhere.
     if m_data.get("type") not in ("decision", "retrospective") and not m_data.get("project"):
         _append_log("vector_skill", 2, "missing_project", {"content_preview": content[:100]}, content)
         return (
@@ -1024,9 +766,8 @@ async def save_artifact(content: str, metadata_json: str = "{}") -> str:
         )
 
     m_data["timestamp"] = datetime.now().isoformat()
-    # Auth-enabled gateways overwrite metadata.source with the verified agent
-    # identity (e.g. "lm_studio"). Preserve the loaded model name so the
-    # specific model behind the save is not lost when several share one token.
+    # An auth-enabled gateway overwrites metadata.source with the verified
+    # agent identity, so the loaded model name is kept here too.
     m_data.setdefault("model", m_data["source"])
     entities = m_data.get("entities", [])
 
@@ -1042,26 +783,19 @@ async def save_artifact(content: str, metadata_json: str = "{}") -> str:
             )
             result = _reply_json(r, "save_artifact")
     except GatewayReplyError as exc:
-        # ONE refused save is ONE audit line. Before the decode was centralised
-        # a 401 returned here early, logging `auth_failed` alone and no
-        # `save_rejected`; _auth_rejected still writes that line, so this path
-        # must not add a second. Every OTHER class — 403, other 4xx, 5xx, a
-        # malformed 2xx — logs `save_rejected` here, and that IS new signal:
-        # those replies used to be logged as `gateway_down`, which was a lie
-        # about a gateway that had answered.
+        # One refused save is one audit line: a 401 was already logged by
+        # _auth_rejected, and every other class logs `save_rejected` here
+        # rather than the `gateway_down` these replies used to claim.
         if exc.logged_event is None:
             _append_log("vector_skill", 2, "save_rejected", {"message": exc.message}, content)
         return exc.message
     except Exception as exc:
         _append_log("vector_skill", 2, "gateway_down", {"content_preview": content[:100]}, content)
-        return (
-            f"Error: Hive-Mind Gateway unreachable at {coordinator_url} — is "
-            f"hive_mind_proxy.py running? Save aborted to protect memory integrity. ({exc})"
-        )
+        return (f"{_unavailable(exc)} Save aborted to protect memory "
+                f"integrity — an unembedded record is invisible to search.")
 
     if result.get("status") != "success":
-        # Coordinator rejected the save — e.g. missing source (400) or the
-        # embedder unreachable after retries (503). Surface its message verbatim.
+        # The coordinator refused the save, so its message is surfaced verbatim.
         _append_log("vector_skill", 2, "save_rejected", {"message": result.get("message", result)}, content)
         return f"Error: {result.get('message', result)}"
 
@@ -1070,67 +804,15 @@ async def save_artifact(content: str, metadata_json: str = "{}") -> str:
         _append_log("vector_skill", 1, "no_entities", {"pg_id": pg_id, "source": m_data.get("source")}, content)
     _append_log("vector_skill", 3, "save_success", {"pg_id": pg_id, "source": m_data.get("source"), "entity_count": len(entities)}, content)
 
-    # The coordinator's message already carries the no-entities Tier-3 warning.
+    # The coordinator's message carries the no-entities Tier-3 warning.
     neo4j_status = result.get("neo4j", "pending")
     return f"Success (pg_id={pg_id}, neo4j={neo4j_status}): {result.get('message', '')}".rstrip()
 
-@mcp.tool()
-async def archive_reasoning_trace(session_id: str, task: str, steps: list,
-                                  project: str = "") -> str:
-    """
-
-    Requires a write-capable agent token: a read-only token receives an
-    honest HTTP 403 role refusal from the gateway — expected, do not retry.
-    Archive the agent's reasoning path as a memory record.
-
-    `steps` is a list of dicts: [{'thought': ..., 'tool': ..., 'result': ...}].
-
-    `project` is REQUIRED, exactly as for any other record — a trace belongs to
-    the work that produced it. It is deliberately NOT exempt and NOT defaulted to
-    the sentinel: exempting it would quietly rebuild the untagged population the
-    project axis exists to remove, and defaulting it would park records without
-    anyone deciding to. Ask the operator, or pass 'general_discussion' knowingly.
-
-    Do not call this to keep a conclusion. The metadata type is
-    ``reasoning_trace``. Ingress returns ``unknown_type``. Save the conclusion
-    with ``save_artifact`` instead.
-    """
-    if not steps:
-        return "Error: no steps to archive."
-    lines = [f"Reasoning trace for task: {task}", ""]
-    for i, step in enumerate(steps):
-        lines.append(f"{i + 1}. Thought: {step.get('thought', '')}")
-        if step.get("tool"):
-            lines.append(f"   Tool: {step['tool']}")
-        if step.get("result") is not None:
-            lines.append(f"   Result: {step['result']}")
-    content = "\n".join(lines)
-    metadata = {
-        "source": AGENT_ID,
-        "type": "reasoning_trace",
-        "session_id": session_id,
-        "task": task,
-        "step_count": len(steps),
-    }
-    if project:
-        metadata["project"] = project
-    return await save_artifact(content, json.dumps(metadata))
-
-
 def _alternatives_list(alternatives) -> list[str]:
-    """One value in, ONE alternative out — verbatim, and never split.
+    """One value in, one alternative out, verbatim and never split, because a well-written alternative contains commas and splitting on one stored fragments that do not stand alone.
 
-    Deliberately duplicated from memory_bridge.alternatives_list rather than
-    imported: a thin client never imports server modules, and these two files
-    are the framework's two independent front doors. They carried the SAME
-    `alternatives.split(",")` and shredded identically, which is why the fix
-    belongs in both — a capability corrected on one client and not the other is
-    the Group 1 parity defect this framework keeps paying for.
-
-    A well-written alternative contains commas, so splitting on one stored
-    fragments that do not stand alone, in Postgres AND in the graph, with no
-    warning. Accepts a list (one entry per option) or a lone string (exactly one
-    option — under-splitting never invents an option nobody wrote).
+    A list is one entry per option and a lone string is exactly one option,
+    since under-splitting never invents an option nobody wrote.
     """
     if alternatives is None:
         return []
@@ -1156,11 +838,10 @@ async def save_decision(
     domain: list[str] | str = "",
     new_domain: bool = False,
 ) -> str:
-    """
+    """Save an architectural or design decision with full PROV-O provenance.
 
     Requires a write-capable agent token: a read-only token receives an
     honest HTTP 403 role refusal from the gateway — expected, do not retry.
-    Save an architectural or design decision with full PROV-O provenance.
 
     Routes through the Memory Coordinator so the Decision→Human→Project→AIAgent
     subgraph is written by the outbox worker — no direct Neo4j writes here.
@@ -1236,25 +917,16 @@ async def save_decision(
     metadata = {
         "type": "decision",
         "source": source,
-        # ⛔ THE SAME VALUE, IN BOTH PLACES, AND ONLY EVER THIS ONE. A decision
-        # has ONE project — the one the operator asserted — and it belongs at
-        # the top level as well as in the blob, because that is the key every
-        # reader inspecting Postgres directly trusts. Parity with
-        # memory_bridge.py's `build_decision_metadata` (`fact:1757`).
+        # A decision has one project, written both here and in the blob,
+        # because the top-level key is what a reader inspecting Postgres reads.
         "project": project,
-        # A decision mints no entity of its own (decision:1664) — the gateway
-        # accepts an empty list permanently; a non-empty one is refused.
+        # A decision mints no entity of its own, so the gateway accepts this
+        # empty list and refuses a non-empty one (decision:1664).
         "entities": [],
         "decision": decision_data,
     }
-    # The operator has confirmed this project is new, so the save registers it
-    # instead of being refused. Never inferred and never a default: from v0.8.44
-    # a decision's project is checked against the registry, and that check only
-    # means something if declaring a new project is a deliberate act.
-    # The SECTIONS of the project this decision belongs to — a list, or one
-    # name. A decision ASSERTS these exactly as it asserts its project.
-    # Naming none stores no section. It does not take the grounding facts'
-    # sections. `belonging` is read-side only.
+    # A decision asserts its own sections as it asserts its own project, so
+    # naming none stores none and does not take the grounding facts'.
     _domains = ([d.strip() for d in domain if isinstance(d, str) and d.strip()]
                 if isinstance(domain, list)
                 else [d.strip() for d in (domain or "").split(",") if d.strip()])
@@ -1262,16 +934,18 @@ async def save_decision(
         decision_data["domains"] = _domains
     if new_domain:
         metadata["new_domain"] = True
+    # The operator has confirmed the name is new, so the save registers it
+    # instead of being refused; the registry check only means something while
+    # declaring a new project stays a deliberate act.
     if new_project:
         metadata["new_project"] = True
-    # The registered projects this new one is deliberately NOT. Needed only when
-    # the gateway refuses the name as confusable — and it names which.
+    # The registered projects this new one is deliberately not, needed only
+    # after the gateway refuses the name as confusable and names which.
     _distinct = [d.strip() for d in (confirm_distinct_from or "").split(",") if d.strip()]
     if _distinct:
         metadata["confirm_distinct_from"] = _distinct
-    # grounded_in: same "pgid[:role],pgid" grammar as memory_bridge.py's
-    # build_decision_metadata — materialised as typed (:Decision)-[:ROLE]->
-    # (:Fact|:Decision) edges by the outbox worker.
+    # The "pgid[:role],pgid" grammar the CLI door uses, materialised by the
+    # outbox worker as typed edges out of the decision.
     gi: list = []
     grounded_roles: dict = {}
     for tok in grounded_in.split(","):
@@ -1308,10 +982,7 @@ async def save_decision(
     except GatewayReplyError as exc:
         return exc.message
     except Exception as exc:
-        return (
-            f"Error: Memory coordinator unreachable at {coordinator_url} — "
-            f"is hive_mind_proxy.py running? ({exc})"
-        )
+        return _unavailable(exc)
 
     if result.get("status") == "success":
         pg_id = result.get("pg_id")
@@ -1330,13 +1001,12 @@ async def save_retrospective(
     grounded_in: str = "",
     elicited: bool = False,
 ) -> str:
-    """
+    """Record an outcome for an existing Decision as a full retrospective
+    record: its own searchable record plus a Retrospective node behind the
+    decision's HAD_OUTCOME trigger edge.
 
     Requires a write-capable agent token: a read-only token receives an
     honest HTTP 403 role refusal from the gateway — expected, do not retry.
-    Record an outcome for an existing Decision as a full retrospective record
-    (own searchable record + Retrospective node behind the decision's
-    HAD_OUTCOME trigger edge).
 
     Use this after a decision has been acted on to close the Why-To loop.
     Multiple retrospectives per decision are allowed — the newest is the
@@ -1394,10 +1064,7 @@ async def save_retrospective(
     except GatewayReplyError as exc:
         return exc.message
     except Exception as exc:
-        return (
-            f"Error: Memory coordinator unreachable at {coordinator_url} — "
-            f"is hive_mind_proxy.py running? ({exc})"
-        )
+        return _unavailable(exc)
 
     if result.get("status") == "success":
         own = result.get("pg_id")
@@ -1409,21 +1076,21 @@ async def save_retrospective(
 
 @mcp.tool()
 async def supersede(pg_id: int, by: int = 0) -> str:
-    """
+    """Retract or supersede an existing FACT (decision 381/384).
 
     Requires a write-capable agent token: a read-only token receives an
     honest HTTP 403 role refusal from the gateway — expected, do not retry.
-    Retract / supersede an existing FACT (decision 381/384). Decisions and
-    retrospectives are refused with HTTP 400: supersession is the fact
-    lifecycle. To overturn a decision call save_retrospective against it with
-    rating='reversed' — that marks it superseded as the consequence of a verdict
-    that stays in the graph for a successor to ground on. To revise a
+
+    Soft: the old fact is KEPT for provenance but flagged, hidden from search,
+    and excluded from consolidation. Supersession is EXPLICIT; never infer it
+    from similarity.
+
+    Decisions and retrospectives are refused with HTTP 400: supersession is the
+    fact lifecycle. To overturn a decision call save_retrospective against it
+    with rating='reversed' — that marks it superseded as the consequence of a
+    verdict that stays in the graph for a successor to ground on. To revise a
     retrospective, save a NEW one against the same decision; the latest live
     verdict is the one that counts.
-
-    Soft — the old fact
-    is KEPT (provenance) but flagged, hidden from search, and excluded from
-    consolidation. Supersession is EXPLICIT; never infer it from similarity.
 
     Use when a stored fact is wrong or outdated and you are NOT saving a
     replacement in the same call. To save a correction that supersedes an old
@@ -1448,10 +1115,7 @@ async def supersede(pg_id: int, by: int = 0) -> str:
     except GatewayReplyError as exc:
         return exc.message
     except Exception as exc:
-        return (
-            f"Error: Memory coordinator unreachable at {coordinator_url} — "
-            f"is hive_mind_proxy.py running? ({exc})"
-        )
+        return _unavailable(exc)
     if result.get("status") == "success":
         return result.get("message", f"Fact {pg_id} superseded.")
     return f"Error: {result.get('message', result)}"
@@ -1459,11 +1123,10 @@ async def supersede(pg_id: int, by: int = 0) -> str:
 
 @mcp.tool()
 async def review_hold(summary_id: int, pg_id: int) -> str:
-    """
+    """Mark a summary's flagged stale source as reviewed-and-held (decision 384).
 
     Requires a write-capable agent token: a read-only token receives an
     honest HTTP 403 role refusal from the gateway — expected, do not retry.
-    Mark a summary's flagged stale source as reviewed-and-held (decision 384).
 
     When a search result carries a stale_sources warning (a summary/insight was
     synthesised from a since-superseded fact) and you judge the change immaterial,
@@ -1485,23 +1148,18 @@ async def review_hold(summary_id: int, pg_id: int) -> str:
     except GatewayReplyError as exc:
         return exc.message
     except Exception as exc:
-        return (
-            f"Error: Memory coordinator unreachable at {coordinator_url} — "
-            f"is hive_mind_proxy.py running? ({exc})"
-        )
+        return _unavailable(exc)
     if result.get("status") == "success":
         return result.get("message", f"Summary {summary_id}: supersession of {pg_id} held.")
     return f"Error: {result.get('message', result)}"
 
 
-ROLE_REPORTING_MIN_VERSION = "0.9.54"  # R2-01: the server half (agent/role
-# on authenticated /health) does not exist on 0.9.52 -- it ships in PR #311.
+# The gateway only reports agent and role on authenticated /health from here on.
+ROLE_REPORTING_MIN_VERSION = "0.9.54"
 
 
 def _gateway_predates(version: str | None, minimum: str = ROLE_REPORTING_MIN_VERSION) -> bool | None:
-    """Whether ``version`` names a gateway release strictly before ``minimum``.
-    None when unparseable — treated the same as "predates" by the caller.
-    Mirrors ``memory_bridge._gateway_predates`` exactly (T-04, PR #310 review)."""
+    """Whether ``version`` names a gateway release strictly before ``minimum``, returning None when it cannot be parsed, which the caller treats as predating."""
     try:
         parsed = tuple(int(p) for p in str(version).split("."))
         floor = tuple(int(p) for p in minimum.split("."))
@@ -1511,11 +1169,7 @@ def _gateway_predates(version: str | None, minimum: str = ROLE_REPORTING_MIN_VER
 
 
 def _role_diagnosis(payload: dict) -> str:
-    """T-04 (PR #310 review): three distinguishable reasons `role` can be
-    missing — see ``memory_bridge._role_diagnosis`` for the full rationale.
-    1) present → verbatim. 2) absent + gateway predates ROLE_REPORTING_MIN_VERSION
-    (or unparseable version) → the gateway never sends it. 3) absent + gateway
-    current → this caller's own token was not accepted (anonymous-slim reply)."""
+    """Tell the three reasons `role` can be missing apart: present, absent because the gateway is too old to send it, or absent because this caller's token was not accepted."""
     if "role" in payload:
         return payload.get("role")
     predates = _gateway_predates(payload.get("version"))
@@ -1567,10 +1221,8 @@ async def check_memory_health() -> str:
                            "error": str(exc),
                            "hint": "systemctl --user start hive-mind-gateway.service"},
                           indent=2)
-    # `agent`/`role` ride on the AUTHENTICATED /health payload (a server change
-    # this PR does not build). `agent` is surfaced only when present — it
-    # passes through verbatim below; `role` always gets a line via the
-    # three-way diagnosis in `_role_diagnosis` (T-04, PR #310 review).
+    # Both ride on the authenticated payload: `agent` passes through when
+    # present, and `role` always gets a line from the three-way diagnosis.
     payload["role"] = _role_diagnosis(payload)
     payload["client"] = {"tool": "vector-skill", "version": VERSION,
                          "api_version": API_VERSION}
@@ -1608,22 +1260,21 @@ async def memory_telemetry() -> str:
         return json.dumps(_reply_json(resp, "memory_telemetry"), indent=2)
     except GatewayReplyError as exc:
         return exc.message
-    except Exception as e:
-        return f"Error: gateway unreachable — {e}"
+    except Exception as exc:
+        return _unavailable(exc)
 
 
-# ── Reads that the CLI skill already had and this surface did not ────────────
+# ── Reads ────────────────────────────────────────────────────────────────────
 
 @mcp.tool()
 async def record_lineage(ref: str) -> str:
-    """
+    """Answer "what happened to this record?" — its state, its dream-cycle
+    stamps (applied → rem_reviewed → consolidated), and which summary it was
+    folded into, with the fact→summary latency.
 
     This is a READ — GET /memory/status/{ref} makes no mutation, so it is on
     the gateway's read-role allowlist and a read-only agent token reaches it
     fine, no 403.
-    "What happened to this record?" — its state, its dream-cycle stamps
-    (applied → rem_reviewed → consolidated), and which summary it was folded
-    into, with the fact→summary latency.
 
     `ref` takes a bare id or a QUALIFIED reference: "fact:816", "decision:840",
     "summary:87". Prefer the qualified form and take it verbatim from a search

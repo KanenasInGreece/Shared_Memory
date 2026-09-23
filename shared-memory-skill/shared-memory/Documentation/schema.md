@@ -574,8 +574,8 @@ generator does faithfully introspect.
 | `Fact` | Outbox worker (on every save) | Primary node — one per `technical_docs` row, keyed by `pg_id` |
 | `Entity` | Outbox worker | Named entity extracted from `metadata["entities"]`; anchors consolidation clusters |
 | `CommunitySummary` | Consolidation daemon | Synthesised narrative, keyed by `pg_id`. Thematic: one per `(entity, domain)` hub. Insight (`kind: "insight"` property, decision pg_id 276): cross-project decision synthesis, accumulates + supersedes. |
-| `ReasoningTrace` | Agent (via `archive_reasoning_trace`) | Root of a reasoning session |
-| `ReasoningStep` | Agent (via `archive_reasoning_trace`) | Individual step within a trace |
+| `ReasoningTrace` | Nothing — no writer in shipped code | Root of a reasoning session. The connector tool was removed in 1.0.1 and ingress refuses `type: reasoning_trace`, so the label is defined in `ontology.py` and never written. |
+| `ReasoningStep` | Nothing — no writer in shipped code | Individual step within a trace. Same as above. |
 
 ### Entity type sub-labels (Path A multi-label)
 

@@ -482,21 +482,20 @@ def test_every_manifest_file_is_byte_identical_across_both_tracked_copies():
     )
 
 
-def test_a_reasoning_trace_carries_a_project_like_any_other_record():
-    """It is deliberately NOT exempt: a trace belongs to the work that produced
-    it, and exempting it would quietly rebuild the untagged population. It is
-    also not DEFAULTED to the sentinel — that would park records without anyone
-    deciding to."""
+def test_no_connector_tool_defaults_a_project_to_the_sentinel():
+    """No record type is exempt from carrying a project, and none may DEFAULT to
+    the sentinel — that parks records without anyone deciding to. Naming the
+    sentinel in a docstring as a deliberate choice is the opposite, and correct.
+
+    This used to be pinned on archive_reasoning_trace, which was removed in
+    1.0.1 because ingress refuses `type: reasoning_trace`. The rule outlived the
+    tool, so it is pinned across the whole connector surface instead."""
     src = open(os.path.join(os.path.dirname(__file__), "..", "mcp", "vector-skill.py"),
                encoding="utf-8").read()
-    body = src.split("async def archive_reasoning_trace")[1].split("\n@mcp.tool()")[0]
-    signature = body.split(")")[0]
-    assert "project: str" in signature, "the tool must take a project"
-    assert f'project: str = "{SENTINEL}"' not in signature, (
-        "the sentinel must not be the DEFAULT — that parks records without "
-        "anyone deciding to. Naming it in the docstring as a deliberate choice "
-        "is the opposite, and is correct.")
-    assert 'metadata["project"] = project' in body
+    assert f'project: str = "{SENTINEL}"' not in src, (
+        "a connector tool defaults project to the sentinel")
+    assert f'project="{SENTINEL}"' not in src, (
+        "a connector tool hard-codes the sentinel as a project value")
 
 
 # ── The spelling gate must not depend on the trigram gate (v0.8.48) ──────────

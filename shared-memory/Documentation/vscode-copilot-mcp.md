@@ -192,7 +192,7 @@ not numbers the model produced.
   will tell you.
 - **The server log does not say "shared-memory".** The connector's own banner names its internal
   app (`Local_RAG_Orchestrator`); that is the line to look for in VS Code's Output panel, followed
-  by *Discovered 11 tools*.
+  by *Discovered 10 tools*.
 - **Restart both ends after a token change.** The gateway freezes its registry at startup; the
   MCP host freezes its environment at spawn.
 - **A 403 on a write is correct.** These are `read` identities. If Copilot reports it could not

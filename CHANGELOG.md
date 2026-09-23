@@ -7,6 +7,24 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.0.1] — 2026-09-23
+
+The MCP connector loses a tool that could never succeed, and reports a slow gateway as slow. `API_VERSION` stays 4.
+
+### Removed
+- `archive_reasoning_trace`. It posted `type` `reasoning_trace`, which ingress refuses with `unknown_type`, so every call failed. The connector now registers ten tools. `ReasoningTrace` and `ReasoningStep` stay defined in `ontology.py` and are documented in `schema.md` as having no writer in shipped code.
+
+### Fixed
+- `save_artifact`, `save_decision`, `save_retrospective`, `supersede`, `review_hold` and `memory_telemetry` report a timeout as a slow gateway. Each inlined its own unreachable string, so a read timeout told the operator to start a gateway that was already running. They now use the same split as search.
+- Seven tool docstrings opened on the write-token caveat rather than on what the tool does, and an MCP host renders that first line as the tool description. `supersede` also had a sentence split mid-clause.
+
+### Changed
+- `CONSTITUTION_SNIPPET_MCP.md` is v8. A host that mounts the connector directly carries this block and never reads `system-prompt.md`, so four rules that lived only there are now in the block: filters are arguments rather than query text, files confirm an answer but do not supply one, a save needs a registered project because this host has no working directory to derive one from, and a `ranked: false` row is keyword fallback. `save_retrospective` is named as an action instead of only in the 403 list. The role sentence names MCP tools rather than the CLI's action names; the two doors keep their own spellings on purpose.
+- `system-prompt.md` no longer tells an MCP agent that the CLI's named `query` templates are role-gated. There is no tool for them on this surface.
+- The three-surface snippet checks read the marker-delimited block instead of the whole file. The index-pointer rule was in the MCP snippet's HTML version-history comment, which is not pasted into a constitution, and the check passed on it anyway.
+- Comments in `mcp/vector-skill.py` are one sentence. A citation names what that record says.
+- `mcp/README.md`, `mcp/system-prompt.md` and `Documentation/vscode-copilot-mcp.md` name ten tools.
+
 ## [1.0.0] — 2026-09-23
 
 The operator declared 1.0.0. `API_VERSION` stays 4.

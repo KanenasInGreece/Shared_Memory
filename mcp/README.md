@@ -41,11 +41,11 @@ spawn a stdio server and inject environment variables can mount the memory this 
 **agent** host (opencode) and an **LLM server** (LM Studio, README §21), which differ only in
 where the standing rules go.
 
-## Tools (11; the CLI's named query shortcuts have no MCP twin — use graph_query)
+## Tools (10; the CLI's named query shortcuts have no MCP twin — use graph_query)
 
 Retrieval and diagnostics: `hybrid_search_and_rerank`, `graph_query` (read-only Cypher; `graph` and named CLI `query` templates require `full` or `admin` — `read` receives 403; `search`, `lineage`/`status`, and `telemetry` remain for `read`; write-Cypher still blocked for everyone),
 `record_lineage`, `memory_telemetry`, `check_memory_health`.
-Capture: `save_artifact`, `save_decision`, `save_retrospective`, `archive_reasoning_trace`.
+Capture: `save_artifact`, `save_decision`, `save_retrospective`.
 Record lifecycle: `supersede`, `review_hold`.
 
 ⚠ **External content warning:** Do NOT save raw web-retrieved text without reviewing it for
