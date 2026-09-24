@@ -67,6 +67,9 @@ def _auth_headers() -> dict:
 def _routing_refusal(resp) -> dict | None:
     """Recognize a gateway routing refusal (422 ``no_eligible_backend`` or 503
     ``backend_at_capacity``) via body and ``X-SM-Fault-Origin: gateway`` header.
+    Keys on the structured body AND that header, never on the status alone: a
+    real provider 422 or 503 passed through the proxy must not be misread as
+    the gateway declining to place the job.
     Returns ``{"error", "constraint", "role"}`` or None.
     """
     if resp.status_code not in (422, 503):
@@ -431,7 +434,11 @@ class REMDaemon:
     async def _bump_rem_pickups(self, pg_ids: list[int]) -> None:
         """Increment monotonic ``rem_pickups`` (and reset ``rem_passed_over``) prior
         to processing to ensure fair queue rotation without affecting dead-letter caps.
-        Bumps batches in bulk and solo records individually after yield checks.
+        Bumps batches in bulk and solo records individually AFTER the yield checks,
+    never at selection time: a solo record the arbiter's yield never reaches was
+    not picked up, and rotating it anyway would hide the tail this counter
+    exists to expose. Best-effort, so a failed bump never masks the work it
+    precedes.
         """
         if not pg_ids:
             return
@@ -451,7 +458,9 @@ class REMDaemon:
 
     async def _bump_rem_passed_over(self, pg_ids: list[int]) -> None:
         """Increment ``rem_passed_over`` for remaining solo records when yielding to
-        NREM, tracking starvation until reset by a pickup.
+        NREM, tracking starvation until reset by a pickup — never by time, so a
+    persistently-queuing NREM cannot be waited out by the clock, only by the
+    record actually being processed.
         """
         if not pg_ids:
             return

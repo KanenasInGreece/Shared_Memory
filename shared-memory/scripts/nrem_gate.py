@@ -12,6 +12,10 @@ def eligible_domain_level_clusters(contents, pg_ids, project_map, domains_map,
     """Partition facts into ``(project, section)`` buckets for registered sections,
     fanning out multi-section facts. Shared by ``_consolidate_clusters`` and
     ``_nrem_cycle_counts`` so fold processing and telemetry census match.
+    ``registered_sections`` is a second, cheap confirmation rather than a second
+    source of truth: a DOMAIN_OF/PROJECT_OF edge exists only for a registered
+    section, so the caller derives it from the same graph rows that already
+    proved registration.
 
     Returns list of ``((project, section), contents, pg_ids)``.
     """
