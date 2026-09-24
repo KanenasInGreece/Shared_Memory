@@ -4064,6 +4064,8 @@ def _config_snapshot() -> dict:
         ],
         "llm_pool_tuning": {
             "fail_threshold": LLM_FAIL_THRESHOLD,
+            # The transport threshold above and this one are separate on purpose, and an operator reading only one of them would misjudge how tolerant the pool is of a hosted provider (see .env.example).
+            "http_fail_threshold": LLM_HTTP_FAIL_THRESHOLD,
             "fail_window_s": LLM_FAIL_WINDOW,
             "cooldown_s": LLM_COOLDOWN,
         },

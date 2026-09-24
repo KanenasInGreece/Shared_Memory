@@ -77,7 +77,8 @@ def test_config_snapshot_no_longer_renders_max_tries(monkeypatch):
     importlib.reload(g)
     cfg = g._config_snapshot()
     assert "max_tries" not in cfg["llm_pool_tuning"]
-    assert set(cfg["llm_pool_tuning"]) == {"fail_threshold", "fail_window_s", "cooldown_s"}
+    assert set(cfg["llm_pool_tuning"]) == {
+        "fail_threshold", "http_fail_threshold", "fail_window_s", "cooldown_s"}
 
 
 # ═══════════════════════════════════════════════════════════════════════════
