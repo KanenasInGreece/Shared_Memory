@@ -118,28 +118,11 @@ ROUTING_MAP = {
 
 
 def _encoder_near_miss(path: str) -> "str | None":
-    """R-A' (HYG round): the registered encoder path `path` is a near-miss OF —
-    it starts with that path but is not equal to it — or None.
-
-    Pure and total so a mutation check can bite it. `path` is the DECODED
-    request path, which is what makes this cover the traversal spellings:
-    `/v1/embeddings/../x` and `/v1/embeddings/..%2fx` both decode to something
-    still under the encoder path, while `/v1/embeddingsX` and
-    `/v1/embeddings/anything` are the plain suffix forms.
-
-    Why it has to exist. Until the encoder paths were registered, handle_proxy
-    prefix-matched them with startswith() and forwarded every one of those
-    spellings to the embedder. Registration moves the exact path to
-    handle_encoder and leaves the near-misses falling through the catch-all to
-    the reasoning-LLM POOL — a mistyped framework call silently answered by a
-    chat model, which is exactly the defect fact:1535 exists for. So the
-    near-misses become 404s in _route_guard's own voice instead.
-
-    The exact spelling never reaches this: it is a registered route. A
-    trailing-slash or %2f spelling never reaches it either — those are known
-    keys and _route_guard, which runs first, answers them (404 and 405
-    respectively). This function is only for the shapes no branch of the guard
-    can see, because they resemble a route without being one."""
+    """Return the matched encoder path if decoded `path` is a near-miss prefix or
+    traversal, preventing fallthrough to the LLM pool (fact:1535 — an MCP tool's GET
+    with query params reached the LLM pool instead of the framework route it named,
+    so a mistyped or wrong-method framework path must 404 or 405 and never fall
+    through to the catch-all)."""
     for encoder_path in ROUTING_MAP:
         if path != encoder_path and path.startswith(encoder_path):
             return encoder_path
@@ -227,23 +210,11 @@ _PRIVATE_NAME_SUFFIXES = (".local", ".lan", ".internal", ".home", ".home.arpa", 
 
 
 def _bearer_transport_ok(backend_url: str, plaintext_ok: bool = False) -> bool:
-    """May this gateway put a bearer on the wire to `backend_url`?
+    """Check whether bearer auth may be sent to `backend_url`.
 
-    ⛔ A KEY OVER PLAINTEXT TO A PUBLIC HOST IS A KEY PUBLISHED TO THE PATH
-    (operator security ruling, 2026-08-28). https is always fine. Plaintext
-    http carries a bearer only where the path is private by construction —
-    and the operator's own local fleet (a llama-server on the LAN, a node on
-    the tailnet) MUST keep working, so "private" is: any IP that is NOT
-    GLOBAL per `ipaddress` (loopback, RFC1918, Tailscale CGNAT 100.64/10,
-    link-local, ULA, and the documentation ranges — the predicate is
-    `not is_global`, never `is_private`, which misses CGNAT) · an unqualified
-    host name (`llama-box`) · a name under .local/.lan/.internal/.home/
-    .home.arpa/.ts.net. Anything else — a public IP or a public FQDN — is
-    refused unless the backend entry says `"plaintext_ok": true`, the operator
-    asserting the path is private (a VPN, a reverse tunnel). Parsed strictly: lowercase scheme, `hostname`
-    (never the netloc — userinfo and ports do not count); an unparsable URL
-    is refused. One rule, two callers: the pool loader (a credentialed backend
-    that fails it is EXCLUDED, never called) and the /health probe (bare)."""
+    ⛔ A KEY OVER PLAINTEXT TO A PUBLIC HOST IS A KEY PUBLISHED TO THE PATH.
+    Allows https, non-global IP/local host destinations (.local, .lan, .internal,
+    .home, .home.arpa, .ts.net), or plaintext http with "plaintext_ok": true."""
     try:
         parts = urllib.parse.urlsplit(backend_url)
     except Exception:
@@ -286,28 +257,12 @@ def _load_llm_backends() -> tuple[
         dict[str, "dict | None"], dict[str, "frozenset[str] | None"], dict[str, "int | None"],
         dict[str, bool], dict[str, bool], dict[str, "int | None"],
         dict[str, "float | None"], dict[str, "float | None"], list[str], list[str]]:
-    """Returns (urls, weights, tokens, models, extras, roles, n_ctx, private_ok,
-    private_ok_explicit, max_inflight, price_in, price_out, role_config_errors,
-    url_credential_errors).
+    """Parse configured LLM backends from LLM_BACKENDS_JSON or legacy LLM_BACKENDS.
 
-    `role_config_errors` collects a human-readable message per backend whose
-    `roles` list names something outside ROUTING_ROLE_NAMES — collected here
-    (module import time, so every test that imports this module freely still
-    collects cleanly) rather than raised here. The actual SystemExit lives in
-    require_valid_llm_routing_config(), called from main() ONLY — same
-    placement reasoning as require_auth_when_provider_keys_configured().
-
-    `url_credential_errors` (SEC A, R-1) collects one message per backend URL
-    (from EITHER ingest path — LLM_BACKENDS_JSON or the legacy CSV form)
-    whose userinfo carries a credential — see _backend_url_credential_error().
-    Collected here for the SAME reason (module import must stay clean); its
-    own SystemExit lives in require_no_backend_url_credentials(), called from
-    main() ONLY, same placement/shape as role_config_errors above. R-1
-    (fatal): the offending entry is still EXCLUDED from the returned pool
-    here (so this function itself never raises), but ANY non-empty
-    url_credential_errors makes main() refuse to start — never a silent
-    exclude-and-continue that would let the gateway come up healthy pointed
-    at the legacy/default fallback instead (ruled out)."""
+    Returns parsed backend attributes and config errors; errors are collected
+    rather than raised so module imports stay clean, with startup enforcement
+    deferred to require_valid_llm_routing_config() and
+    require_no_backend_url_credentials()."""
     role_config_errors: list[str] = []
     url_credential_errors: list[str] = []
     # Set LLM_POOL_CONFIG_EMPTY on every return, both branches. Do not leave it to the module default.
@@ -560,24 +515,11 @@ _LLM_POOL_LEGACY_REMEDY = (
 def _apply_backend_body_overrides(body: bytes, model: "str | None",
                                   extra: "dict | None",
                                   _body_obj: "dict | None" = None) -> bytes:
-    """The request body as this backend must receive it.
+    """Apply backend `extra` and `model` overrides to request JSON bytes.
 
-    Pure so it can be tested (and mutation-checked) without the proxy plumbing.
-    `extra` (the backend's extra_body config) is merged first and overrides the
-    caller — it is the operator's per-backend truth, and the callers are our own
-    daemons sending one homogeneous request shape. The `model` override is
-    applied last and only when the caller sent a model field, preserving the
-    long-standing rewrite contract — so an explicit per-backend model always
-    beats an extra_body["model"] left there by mistake. Best-effort by design:
-    an unparseable or non-object body is forwarded unchanged rather than
-    dropped.
-
-    `_body_obj` (A-3, "parse the body once"): handle_proxy already parses the
-    body once for affinity/fit — pass that SAME dict through here to skip a
-    second json.loads of identical bytes. A shallow copy is taken before any
-    mutation so the caller's own parsed struct (read earlier, for affinity/
-    fit) is never touched by this step. None (the default, and every direct
-    unit-test call in this repo) parses `body` itself, unchanged from before."""
+    Merges `extra` and sets `model` if originally present; `_body_obj` may
+    provide the pre-parsed payload to avoid re-parsing, returning unparseable
+    bodies unchanged."""
     if not model and not extra:
         return body
     if _body_obj is not None:
@@ -640,20 +582,8 @@ def _oldest_inflight_age(backend: str, now: float) -> float | None:
 
 
 def _v1_models_probe_url(backend_base: str) -> str:
-    """H-3 (Model_Attributes_Routing_Plan_2026-08-18): the /v1/models
-    liveness-probe URL for a backend base, without doubling /v1 when the
-    configured base ALREADY includes it. LLM_BACKENDS_JSON's own documented
-    cloud-base shape is "https://api.deepseek.com/v1" — naively concatenating
-    "/v1/models" onto that probes ".../v1/v1/models", a malformed URL.
-
-    Verified live (builder, v0.9.13): DeepSeek's edge auth governor returns
-    401 uniformly for ANY path under its domain (confirmed against a bogus
-    path too — same 401), so the doubled and correct forms were
-    indistinguishable through DeepSeek specifically; this fix is not
-    validated as observably behavior-changing for that one provider, but the
-    doubled URL is a real construction defect regardless of what any single
-    provider's auth gate happens to do with it — a path-sensitive gate on a
-    different provider would answer these two URLs differently."""
+    """Return the /v1/models probe URL for `backend_base` without doubling /v1 if
+    the configured base already includes it."""
     base = backend_base.rstrip("/")
     if base.endswith("/v1"):
         return f"{base}/models"
@@ -661,24 +591,10 @@ def _v1_models_probe_url(backend_base: str) -> str:
 
 
 def _upstream_url(target_base: str, rel_url) -> str:
-    """Join a backend base to the incoming request path WITHOUT doubling /v1.
+    """Join target base to request path without doubling /v1.
 
-    Every OpenAI-compatible cloud provider publishes a base that already ends
-    in /v1 (our own .env.example ships exactly that for DeepSeek), while the
-    daemons address this gateway at /v1/chat/completions. A naive concat
-    therefore produced /v1/v1/chat/completions, which providers answer with
-    404 -- measured live: 404 on the doubled path, 200 on the correct one with
-    the same key. It failed SILENTLY: a 404 is never billed, so neither the
-    token counters nor the provider dashboard showed anything, while /health
-    reported the backend ok and REM retried every 30 s forever.
-
-    _v1_models_probe_url already de-duplicated this for the PROBE path; the
-    judgement that it was "not observably behavior-changing" was formed there
-    and does not carry to the work path, where the path is decisive. This is
-    the join every proxied route goes through, so embedder/reranker bases
-    ending in /v1 are covered too, not just chat.
-
-    Pure and total so a mutation check can bite it."""
+    Prevents silent /v1/v1/chat/completions 404s (which are unbilled and leave
+    /health reporting ok while REM retries indefinitely)."""
     base = str(target_base).rstrip("/")
     rel = str(rel_url)
     if base.endswith("/v1") and rel.startswith("/v1/"):
@@ -687,17 +603,12 @@ def _upstream_url(target_base: str, rel_url) -> str:
 
 
 def _probe_headers(backend: str) -> dict:
-    """Headers for a liveness/health probe of `backend` — the SAME credential a
-    real call carries (handle_proxy's `backend_token` branch), or nothing.
+    """Return authentication headers for a liveness/health probe of `backend`.
 
-    A probe that does not authenticate cannot tell "the key is rejected" from
-    "no key was sent": DeepSeek's edge answers 401 to ANY unauthenticated
-    request on any path, so a bare probe of a credentialed backend always
-    401s. v0.9.74 started counting a credentialed 401 as down (correct about
-    the DEPENDENCY) while the probe was still bare — a false `degraded` the
-    operator caught on the first live reading (fact:1794). With the bearer
-    attached, `http_401` means exactly what /health says it means: this
-    gateway's key for that backend is not accepted."""
+    Carries the backend's bearer token so probes distinguish rejected keys from
+    unauthenticated requests, preventing false degraded states (fact:1794 — a false
+    llm_pool degraded because the health probe carried no backend credential, and
+    DeepSeek answers 401 to any unauthenticated request on any path)."""
     token = LLM_BACKEND_TOKENS.get(backend)
     if not token:
         return {}
@@ -769,11 +680,7 @@ _llm_affinity_misses = 0
 
 
 def _parse_json_body(body: bytes) -> "dict | None":
-    """The request body parsed ONCE (Model_Attributes_Routing_Plan_2026-08-18
-    A-3: "affinity, overrides, and fit all read that struct; never a second
-    json.loads of the same body"). Returns a dict, or None for anything that
-    doesn't parse to a JSON object — every caller below treats None exactly
-    like "nothing usable here", never raises."""
+    """Parse request JSON bytes once into a dict, returning None on failure."""
     try:
         obj = json.loads(body)
     except Exception:
@@ -804,10 +711,8 @@ def _affinity_key(body: bytes) -> str | None:
 
 
 def _extract_effective_max_tokens(body_obj: "dict | None") -> float:
-    """The OUTPUT budget the fit check must reserve headroom for: the
-    caller's own `max_tokens` when present and a positive number, else
-    FIT_DEFAULT_OUTPUT_TOKENS (I-3: this is read-only sizing information for
-    the fit check — it is never written back into the request body)."""
+    """Return positive max_tokens from `body_obj`, or FIT_DEFAULT_OUTPUT_TOKENS.
+    Used as read-only headroom for fit checks and never written back."""
     if isinstance(body_obj, dict):
         mt = body_obj.get("max_tokens")
         if isinstance(mt, (int, float)) and mt > 0:
@@ -816,10 +721,7 @@ def _extract_effective_max_tokens(body_obj: "dict | None") -> float:
 
 
 def _serves_all(url: str) -> bool:
-    """True iff `url` is in the "roles absent" serves-all degenerate class —
-    gated by private_ok (the ONLY place private_ok gates a serves-all
-    candidate; an explicit roles list is its own opt-in and is never gated
-    by private_ok, see _role_eligible)."""
+    """Return True if backend has no explicit roles and has private_ok enabled."""
     return LLM_BACKEND_ROLES.get(url) is None and LLM_BACKEND_PRIVATE_OK.get(url, False)
 
 
@@ -834,9 +736,8 @@ def _role_eligible(url: str, role: str) -> bool:
 
 
 def _fits(url: str, est_prompt_tokens: float, effective_max_tokens: float) -> bool:
-    """Fit check (A-1): backends without a declared n_ctx always fit
-    (backward compat — no fit information available). May only EXCLUDE a
-    backend (I-3); never modifies the request in any way."""
+    """Return True if total tokens fit within backend n_ctx with FIT_MARGIN headroom.
+    Undeclared n_ctx always fits."""
     n_ctx = LLM_BACKEND_NCTX.get(url)
     if not n_ctx:
         return True
@@ -845,29 +746,18 @@ def _fits(url: str, est_prompt_tokens: float, effective_max_tokens: float) -> bo
 
 def _eligible_backends(role: str, est_prompt_tokens: float = 0.0,
                        effective_max_tokens: float = 0.0) -> list[str]:
-    """The HARD PRE-FILTER (P-1 Critical): role+privacy+fit eligibility,
-    computed BEFORE any affinity/health/cooldown/reserved/cap logic runs.
-    Everything else in _select_llm_backend operates strictly inside this
-    set — an empty return here is the 422 no_eligible_backend signal."""
+    """Return backends eligible by role, privacy, and fit before dynamic routing.
+    An empty return triggers a 422 no_eligible_backend refusal."""
     role = (role or "").strip().lower()
     return [b for b in LLM_POOL if _role_eligible(b, role)
             and _fits(b, est_prompt_tokens, effective_max_tokens)]
 
 
 def _all_roles_ineligible() -> "str | None":
-    """D2.4 (decision:1832): the NEW fleet-wide-only eligibility verdict for
-    /health's llm_pool dependency. None normally; a reason string iff
-    `_eligible_backends` comes up EMPTY for role-less traffic AND every
-    ROUTING_ROLE_NAMES role — i.e. the fleet cannot serve ANY traffic class,
-    not merely one. A hole for SOME roles only (a card scoped to `judge` in a
-    fleet with no `extract` backend) must NOT touch llm_pool — a backend
-    serving other traffic fine is not down, and per-role holes stay unsurfaced
-    here (M2, carried to W4).
-
-    Pure, no I/O, no cache: reads LLM_POOL through the same
-    `_eligible_backends` request routing itself calls (`:1109`/`:1621`), so a
-    test that monkeypatches `_eligible_backends` sees the change on the very
-    next call — there is no startup-cached census to go stale (Opus F3)."""
+    """Return a reason string if no backend can serve role-less traffic or any
+    ROUTING_ROLE_NAMES role (decision:1832 — the nothing-eligible verdict lives in the
+    rem and nrem dependency reasons rather than in a new /health surface).
+    Returns None if at least one role can be served."""
     if any(_eligible_backends(r) for r in ("",) + tuple(sorted(ROUTING_ROLE_NAMES))):
         return None
     reason = "configured, but no backend is eligible for any traffic"
@@ -895,15 +785,8 @@ _DECLARATION_GAP_REMEDY = {
 
 def _classify_no_eligible_constraint(role: str, est_prompt_tokens: float,
                                      effective_max_tokens: float) -> str:
-    """Which axis emptied the eligible set, for the 422 body's `constraint`
-    field ("role"|"privacy"|"fit") — computed by re-checking role+privacy
-    ALONE (ignoring fit): if that alone is already empty, the size of the
-    request was never the issue. Within that: "privacy" if a serves-all
-    (roles-absent) candidate EXISTS but is blocked by private_ok=false —
-    the fleet does have a home for this traffic class, if only it were
-    private; "role" if no backend is configured to handle this function at
-    all (privacy is moot — nothing to opt in). Role-less traffic that fails
-    role+privacy is always "privacy" (roles never enter into it)."""
+    """Classify why routing eligibility was empty ("role", "privacy", or "fit").
+    Evaluates role and privacy before fit to determine the bounding constraint."""
     role = (role or "").strip().lower()
     role_privacy_eligible = [b for b in LLM_POOL if _role_eligible(b, role)]
     if role_privacy_eligible:
@@ -959,18 +842,12 @@ def _warn_unknown_role_once(role: str) -> None:
 
 
 def _counts_free_slot(url: str) -> bool:
-    """C-1 Critical fix (decision:1357, amending the plan's F-3 clause
-    minimally): a backend counts toward /pool/status free_slots iff it can
-    take ANY dream job — either serves-all (roles absent AND private_ok) or
-    an EXPLICIT roles list covering every dream role. Dream traffic always
-    carries a role, so a full explicit list is exactly as capable as
-    serves-all for the daemons' gating purposes; counting only the former
-    (the original F-3 reading) silently zeroed free_slots for a fleet whose
-    every backend declares roles — the very configuration M-5 steers
-    credentialed operators toward — and halted REM/NREM with
-    no warning anywhere. Partial-role fleets still count 0 (per-role slot
-    accounting stays deferred) — require_valid_llm_routing_config() warns
-    LOUDLY at startup for that case instead of leaving it silent."""
+    """Check if backend counts toward /pool/status free_slots.
+
+    Counts backends that can take any dream job (serves-all with private_ok or
+    explicitly covering all dream roles), preventing silently zeroed dream cycles
+    (decision:1357 — the routing ruling: counting only serves-all backends toward
+    free_slots silently zeroed the dream cycle, plus six required fixes)."""
     roles = LLM_BACKEND_ROLES.get(url)
     if roles is None:
         return LLM_BACKEND_PRIVATE_OK.get(url, False)
@@ -978,9 +855,7 @@ def _counts_free_slot(url: str) -> bool:
 
 
 def _record_backend_token_usage(backend: str, usage: dict) -> None:
-    """Post-review addition A: per-backend cumulative prompt/completion token
-    counters from a proxied response's `usage` object. Best-effort — never
-    raises, never breaks the proxy path it is called from."""
+    """Record cumulative prompt and completion tokens from response `usage` object."""
     try:
         p = usage.get("prompt_tokens")
         c = usage.get("completion_tokens")
@@ -998,10 +873,8 @@ def _record_backend_token_usage(backend: str, usage: dict) -> None:
 
 
 def _record_llm_latency(backend: str, elapsed_s: float, failed: bool) -> None:
-    """New instrument: per-backend LLM request latency. Called exactly once
-    per pool-routed request from handle_proxy's finally block (O-2 precedent
-    at the credential-fault recorder above) — wrapped so an exception here
-    can never break the proxy path it is called from."""
+    """Record per-backend LLM request latency and failure counts.
+    Called from handle_proxy's finally block without raising."""
     try:
         _llm_requests_total[backend] = _llm_requests_total.get(backend, 0) + 1
         if failed:
@@ -1027,8 +900,8 @@ def _llm_mark_fail(backend: str, threshold: "int | None" = None) -> None:
         log.warning("LLM backend %s in cooldown for %.0fs (%d fails)", scrub_url_credentials(backend), LLM_COOLDOWN, limit)
 
 
-# An upstream status that is a verdict on the BACKEND, not on the request: 429 says it is refusing load and every 5xx says it failed to serve.
-# Every other 4xx is about this request (400 model_mismatch, 401/403 a rejected key, 404 a path it does not serve) and must not cool a backend down: those do not heal on a timer, so a cooldown would hide the cause and cost availability for nothing.
+# 429 and 5xx fault the backend; client 4xx errors reflect request defects and
+# must not trip backend cooldown.
 def _http_status_faults_backend(status: int) -> bool:
     """True iff this upstream status should count toward the backend's fail streak."""
     return status == 429 or status >= 500
@@ -1043,26 +916,10 @@ def _llm_mark_ok(backend: str) -> None:
 def _select_llm_backend(role: str = "", affinity_key: str | None = None,
                         est_prompt_tokens: float = 0.0,
                         effective_max_tokens: float = 0.0) -> "str | None":
-    """Pick a backend, or None. Eligibility (role+privacy+fit) is now a HARD
-    PRE-FILTER (P-1 Critical): every fallback tier below — affinity hit, cold
-    selection, the protected-prefix logic, the cooldown-ignoring last resort
-    — operates STRICTLY inside the eligible set; none of them may widen past
-    it (P-1/P-2). Precedence: eligibility > _llm_reserved > cooldown (P-4).
+    """Select an eligible LLM backend via cache affinity or least-in-flight.
 
-    Two None cases, deliberately not distinguished by this function's return
-    value alone (the caller, handle_proxy, tells them apart by calling
-    _eligible_backends() itself FIRST):
-      * the eligible set is empty (role/privacy/fit) — the 422 case.
-      * the eligible set is non-empty but every member is AT its
-        max_inflight cap right now — the WAIT case (I-8: the cap never
-        widens eligibility, so this function will never pick an over-cap
-        backend to avoid returning None).
-
-    Cache-affinity first (keep a warm KV prefix on its card, P-2: an
-    affinity-cached backend outside the eligible set is a MISS), else
-    least-in-flight while PROTECTING cards holding a frequently-reused
-    prefix from eviction. Allocation-free. Clients never choose. Records/
-    refreshes the affinity map as a side effect."""
+    Operates strictly within role, privacy, and fit eligibility, returning None
+    if no candidate is eligible or if all candidates are at capacity."""
     global _llm_affinity_hits, _llm_affinity_misses
     now = time.monotonic()
     for k in [k for k, v in _llm_affinity.items() if now - v[1] > AFFINITY_TTL]:
@@ -1109,13 +966,8 @@ def _select_llm_backend(role: str = "", affinity_key: str | None = None,
 async def _select_backend_waiting_on_capacity(
         role: str, affinity_key: "str | None",
         est_prompt_tokens: float, effective_max_tokens: float) -> "str | None":
-    """Bounded poll loop around _select_llm_backend for the max_inflight WAIT
-    case (operator ruling 2026-08-18: "daemons already wait synchronously" —
-    this mirrors that, gateway-side, via the existing S-11-style poll shape
-    rather than a new queue). Called ONLY after the caller has already
-    confirmed the eligible set (role+privacy+fit) is non-empty — a None
-    return here means every eligible backend stayed at its cap for the whole
-    wait window, not that nothing was eligible."""
+    """Poll _select_llm_backend up to LLM_MAX_INFLIGHT_WAIT_S for capacity slots.
+    Returns None if all eligible backends remain saturated through the deadline."""
     deadline = time.monotonic() + LLM_MAX_INFLIGHT_WAIT_S
     while True:
         backend = _select_llm_backend(role, affinity_key, est_prompt_tokens, effective_max_tokens)
@@ -1129,14 +981,10 @@ async def _select_backend_waiting_on_capacity(
 async def _wait_for_capacity_slot(role: str, affinity_key: "str | None",
                                   est_prompt_tokens: float,
                                   effective_max_tokens: float) -> "str | None":
-    """R-4 (decision:1357): the bounded-WAITER wrapper around the bounded
-    wait. Every waiter holds an admitted request for up to the full wait
-    window (and counts toward any S-11 gateway-wide admission budget), so
-    the number of simultaneous waiters is itself capped — beyond
-    LLM_MAX_CAPACITY_WAITERS the caller gets an immediate None (→ 503)
-    instead of joining the queue. The counter has the same
-    increment-at-entry / release-on-every-exit lifetime discipline as the
-    I-8b inflight score."""
+    """Wait for capacity while bounding concurrency by LLM_MAX_CAPACITY_WAITERS
+    (decision:1357 — the routing ruling: counting only serves-all backends toward
+    free_slots silently zeroed the dream cycle, plus six required fixes).
+    Returns None immediately when the waiter limit is reached."""
     global _capacity_waiters
     if _capacity_waiters >= LLM_MAX_CAPACITY_WAITERS:
         return None
@@ -1166,32 +1014,18 @@ GATEWAY_SERVER_HEADER = "shared-memory-gateway"
 
 
 async def _set_server_header(request, response) -> None:
-    """S16e — stamp the gateway's own `Server` on EVERY response.
-
-    aiohttp 3.14.3 has no `server_header` parameter (measured), and the header
-    is `setdefault`-ed at response-prepare time, so an `on_response_prepare`
-    handler is the single mechanism that covers both kinds of reply: a
-    gateway-generated one (`/health` is unauthenticated on the shipped default
-    and used to disclose `Python/3.14 aiohttp/3.14.3` to anyone) and a proxied
-    one (which otherwise relays whatever the backend calls itself). One
-    identity on the wire, so the header never tells a caller which path
-    answered."""
+    """Stamp the gateway's Server header on every gateway and proxied response,
+    overriding aiohttp 3.14.3 defaults to prevent server software disclosure."""
     response.headers["Server"] = GATEWAY_SERVER_HEADER
 
 
 def _scrub_url_credentials(text: str) -> str:
-    """Security review O-6 — see log_hygiene.scrub_url_credentials (shared with
-    the coordinator since v0.9.50, when its encoder URLs became operator-supplied)."""
+    """Scrub credentials from URLs in text for log hygiene."""
     return scrub_url_credentials(text)
 
 
 def _safe_request_id(request) -> "str | None":
-    """Best-effort read of the request_id auth_middleware stashes on the
-    request (PR A3), used to correlate a credential-audit line with the same
-    request's gateway audit line. None for a request never routed through
-    the middleware (auth disabled, or a lightweight stand-in without a
-    mapping interface — every direct handle_proxy() caller in this repo's
-    own tests)."""
+    """Return request_id stashed by auth_middleware for audit correlation, or None."""
     try:
         return request.get("request_id")
     except AttributeError:
@@ -1199,10 +1033,7 @@ def _safe_request_id(request) -> "str | None":
 
 
 def _safe_agent_name(request) -> "str | None":
-    """Best-effort read of the authenticated_agent auth_middleware stashes on
-    the request — same fallback shape as _safe_request_id, for a lightweight
-    test stand-in without a mapping interface, or a request that never went
-    through the middleware (auth disabled)."""
+    """Return authenticated_agent stashed by auth_middleware, or None."""
     try:
         return request.get("authenticated_agent")
     except AttributeError:
@@ -1214,20 +1045,10 @@ QUERY_REDACTED_MARKER = "?<query-redacted>"
 
 
 def _audited_route_spelling(rel_url) -> str:
-    """The request target as the credential-audit line must record it: the RAW
-    path, plus a marker when a query string was present.
+    """Return raw path with redacted query marker for credential auditing.
 
-    QA-1. Both credentialed gates (R-4 pre-dispatch, S-04 post-selection) deny
-    on `rel_url.raw_path` and on the mere PRESENCE of a query, so the audit
-    line has to carry those same two facts or it cannot explain the refusal it
-    is recording. `request.path` — what both sites passed before — is
-    percent-DECODED, which made a `/v1/chat/completio%6es` denial read as
-    `path=/v1/chat/completions`, i.e. the ALLOWED route, and made a query
-    denial indistinguishable from a plain-path one. An operator reading the log
-    could not tell why the framework's own endpoint had been refused.
-
-    ⛔ The query VALUE is never returned. The marker says a query was there and
-    nothing else about it."""
+    ⛔ The query VALUE is never returned. Preserves raw path encoding to record
+    exact refusal reasons without leaking query contents."""
     spelling = rel_url.raw_path
     if rel_url.query_string:
         spelling += QUERY_REDACTED_MARKER
@@ -1235,15 +1056,7 @@ def _audited_route_spelling(rel_url) -> str:
 
 
 def _safe_resolve_identity(request) -> "str | None":
-    """resolve_identity(), tolerant of a lightweight/missing request double
-    — handle_health/handle_pool_status are unit-tested by calling the
-    handler directly (some callers pass None: "the session is needed only
-    for the rare suspect-wedged probe; unit tests call this handler without
-    a real request/app", per handle_pool_status's own docstring). Same
-    fallback shape as _safe_request_id/_safe_agent_name above; a genuinely
-    absent identity (no headers at all, or no request at all) is
-    indistinguishable from an anonymous caller here, which is the correct
-    reading either way."""
+    """Safely resolve request identity, returning None if request is absent or malformed."""
     try:
         return resolve_identity(request)
     except AttributeError:
@@ -1262,14 +1075,8 @@ DAEMON_AGENT_NAMES = frozenset(
 
 
 def _may_steer_llm(request) -> bool:
-    """True if the resolved identity for this request may set X-SM-LLM-*
-    backend-steering headers (S-14): a framework daemon, or an admin-role
-    token (today unreachable in practice — auth_middleware confines admin
-    tokens to /admin/*, so one can never reach handle_proxy at all; checked
-    anyway so this stays correct if that routing ever changes). Auth-off
-    installs have no identity to check — steering stays available to
-    everyone, same backward-compat shape as every other identity-gated
-    check in this file when AUTH_CONFIGURED_AT_STARTUP is False."""
+    """Return True if identity may send X-SM-LLM-* headers (daemons, admins,
+    or when authentication is disabled at startup)."""
     if not AUTH_CONFIGURED_AT_STARTUP:
         return True
     agent_name = _safe_agent_name(request)
@@ -1279,12 +1086,7 @@ def _may_steer_llm(request) -> bool:
 
 
 def _strip_llm_steering_headers(headers) -> "CIMultiDict[str]":
-    """Drop every X-SM-LLM-* header (backend/affinity steering signals) from
-    a client-originated request whose identity may not set them (S-14).
-    Returns a CIMultiDict — case-insensitive .get()/.items(), matching
-    aiohttp's own request.headers semantics — so every downstream reader
-    (the role lookup in handle_proxy, then _filter_headers) sees the same
-    interface whether or not stripping happened."""
+    """Return a CIMultiDict copy of headers with X-SM-LLM-* steering headers removed."""
     result: CIMultiDict = CIMultiDict()
     for k, v in headers.items():
         if not k.lower().startswith("x-sm-llm-"):
@@ -1341,22 +1143,10 @@ class AsyncHiveMindProxy:
         self._known_routes: dict = {}
 
     def set_known_routes(self, router: "web.UrlDispatcher") -> None:
-        """Snapshot the framework's registered routes (method + path pattern)
-        for the wrong-method/unknown-path guard in handle_proxy.
-
-        Derived from the router itself, never a hand-written table
-        (decision:1032 class — never write what can be derived): every
-        /memory/* and /admin/* route attach() registers, plus /health and
-        /pool/status, is picked up automatically, so a future route added
-        anywhere in the app is covered without touching this method.
-
-        Called after attach_coordinator() and the /health, /pool/status
-        registrations. The catch-all route ("*", "/{tail:.*}") is excluded
-        by its wildcard METHOD below, not by registration order — so the
-        snapshot is correct whether it is taken before or after the
-        catch-all is added. main() still calls this before adding the
-        catch-all purely as a readable convention.
-        """
+        """Snapshot registered routes (method and path pattern) from UrlDispatcher,
+        excluding wildcard catch-all routes (decision:1032 — duplicate what the graph walk
+        consumes, dereference what the reader renders; never write what a reader can derive).
+        Enables handle_proxy route guarding against mistyped framework calls."""
         known: dict = {}
         for route in router.routes():
             if route.method == "*":
@@ -1398,35 +1188,12 @@ class AsyncHiveMindProxy:
             log.info("Upstream client session closed.")
 
     def _filter_headers(self, headers, *, strip_gateway_namespace: bool = False) -> dict:
-        """Strip hop-by-hop, Host, and Authorization headers.
-        Applied identically to both request (→ upstream) and response (→ client).
-        Authorization is never forwarded: what a client sends here is its OWN
-        gateway auth token (see coordinator.auth_middleware) — a credential
-        scoped to talking to the gateway, not to whatever sits behind it. A
-        backend that needs its own credential (a paid cloud API) gets one
-        added back explicitly in handle_proxy, from LLM_BACKENDS_JSON's
-        token_env — never from what the client happened to send.
+        """Filter headers across request and response directions.
 
-        `strip_gateway_namespace` additionally strips `x-sm-*` and
-        `www-authenticate` — used ONLY on the RESPONSE direction (upstream →
-        client, security review O-1). Without it, a hostile/misconfigured
-        upstream can set `X-SM-Fault-Origin: gateway` (or `X-SM-LLM-Backend`)
-        on an otherwise-successful response and have it pass straight
-        through — the gateway's own header assignment only happens on a
-        FAULT status, so on success nothing overwrites an upstream-supplied
-        value. Treating the X-SM- namespace (and the RFC 6750 challenge
-        header, so a client can't be confused about which side of the
-        credential boundary wants a token) as gateway-owned means any such
-        header on the wire is always one the gateway put there.
-
-        ⚠ `strip_gateway_namespace` is also the DIRECTION discriminator (it is
-        True at exactly one call site, the response direction, and False at
-        exactly one, the request direction — enforced by there being only
-        those two). S13/S16f hang the two direction-specific denylists off it:
-        CLIENT_ORIGIN_HEADERS on the request direction,
-        UPSTREAM_ONLY_RESPONSE_HEADERS on the response direction. Kept a
-        DENYLIST and a plain dict (R-C, R-D): an allowlist here would silently
-        break the next provider-specific header a caller legitimately sends."""
+        Strips hop-by-hop, Host, and client Authorization headers.
+        ⚠ When strip_gateway_namespace is True (response direction), removes x-sm-*,
+        www-authenticate, and UPSTREAM_ONLY_RESPONSE_HEADERS to prevent upstream
+        spoofing; otherwise (request direction), removes CLIENT_ORIGIN_HEADERS."""
         result = {
             k: v for k, v in headers.items()
             if k.lower() not in HOP_BY_HOP and k.lower() not in ("host", "authorization")
@@ -1646,37 +1413,18 @@ class AsyncHiveMindProxy:
         )
 
     async def handle_encoder(self, request: web.Request) -> web.StreamResponse:
-        """The embedder/reranker forward — a REAL route, not a prefix guess.
+        """Handle exact POST /v1/embeddings and /v1/reranking routes.
 
-        Registered in main() as POST /v1/embeddings and POST /v1/reranking
-        immediately before set_known_routes(), so aiohttp's own router decides
-        what reaches here: an exact match on rel_url.path_safe and nothing
-        else. Every near spelling (trailing slash, %2f, a suffix, a traversal)
-        falls to the catch-all and is refused there — by _route_guard for a
-        known key, by _encoder_near_miss for a prefix hit.
+        Enforces exact raw wire path equality, applies payload caps, and forwards
+        upstream without credentials.
 
-        NEVER bind this path to handle_proxy and never wrap this handler in
-        _route_guard: the guard returns 405 for ANY known key including an
-        allowed method (load-bearing for security fix A1), so a registered
-        encoder route routed through it would 405 every legitimate POST.
-
-        No credential is ever attached on this path — `llm_backend` stays None,
-        which is what gates the backend_token block in _forward_upstream. The
-        encoders are framework-local; a provider key has no business here.
-
-        Steering headers are passed through unfiltered on purpose: the S-14
-        gate exists to decide who may STEER the LLM POOL, and there is no pool
-        decision on this path. _forward_upstream strips every X-SM-LLM-* header
-        before the upstream forward regardless of who sent it (P-6), so what
-        reaches the encoder is identical either way.
-
-        The raw wire path must EQUAL the router's match: aiohttp matches on the
-        percent-decoded `path_safe`, so `/v1/embedding%73` would otherwise land
-        here and be forwarded with its encoded spelling — the same rule the
-        credentialed gates apply, so every gateway edge compares what it
-        forwards. This handler is reachable only through its own two
-        registrations, so the `path_safe` echoed in that refusal is always one
-        of the two framework literals, never caller text."""
+        ⛔ NEVER bind these paths to handle_proxy and never wrap this handler in
+        _route_guard: the guard answers 405 for ANY known key, including an
+        allowed method, so a registered encoder route routed through it would
+        refuse every legitimate POST. Near spellings are meant to fall to the
+        catch-all, where _route_guard and _encoder_near_miss refuse them
+        instead (fact:1535 — a mistyped framework path must 404 or 405, never
+        fall through to the LLM pool)."""
         if request.rel_url.raw_path != request.rel_url.path_safe:
             return web.json_response(
                 {"error": f"No such framework route: {request.rel_url.raw_path}. The framework "
@@ -1752,16 +1500,9 @@ class AsyncHiveMindProxy:
         role: str = "",
         steer_headers=None,
     ) -> web.StreamResponse:
-        """The shared upstream forward: build the URL and headers, stream or
-        buffer the body, relay the response, and account for it.
-
-        Extracted verbatim from handle_proxy when the encoder paths became
-        real routes (HYG round, R-A) — one forward path, two entry points, so
-        the header filtering, the retry, the disconnect handling and the
-        telemetry can never drift apart between them. `llm_backend` None is
-        the encoder shape: no credential, no pool accounting, no latency
-        record — exactly what the embedder/reranker path did before, when it
-        was the `target_base is not None` branch of handle_proxy."""
+        """Forward request upstream, relaying streamed or buffered responses.
+        Handles header filtering, optional backend credentials, retries, and
+        telemetry accounting."""
         if steer_headers is None:
             steer_headers = request.headers
         target_url = _upstream_url(target_base, request.rel_url)
@@ -2063,25 +1804,8 @@ class AsyncHiveMindProxy:
 # Daemon token helpers
 
 def _daemon_env(agent_name: str) -> dict:
-    """Build a subprocess environment for the named daemon: non-secret config
-    the proxy must pin, and NOTHING ELSE.
-
-    SEC-05 (Credential_Custody_Plan_2026-08-14, PR A1): this used to be
-    `os.environ.copy()`, which handed every secret the gateway process held
-    (PG_PASSWORD, NEO4J_PASSWORD, AGENT_TOKENS, provider keys) to the child's
-    exec-time environment — visible for the child's whole lifetime via
-    `/proc/<pid>/environ`. Daemons self-load their own DB credentials through
-    secure_env.load_split_env() (each has its own copy of the framework .env
-    to read); they never receive one via this env dict.
-
-    PR A1 still had one deliberate exception here: the daemon's own
-    AGENT_TOKEN crossed via this dict. PR A2 (SEC-10) closes it — see
-    `_daemon_env_and_token_fd()` below, which delivers a freshly-minted,
-    per-boot token through an inherited pipe fd instead. `agent_name` is
-    kept as a parameter for call-site symmetry with that function and
-    because every caller already has it at hand, even though this function
-    itself no longer branches on it.
-    """
+    """Return non-secret environment variables for daemon subprocesses,
+    preventing credential leakage via /proc/<pid>/environ."""
     return {k: v for k, v in os.environ.items() if not is_secret_key(k)}
 
 
@@ -2090,19 +1814,8 @@ _ephemeral_daemon_token_digests: dict[str, str] = {}
 
 
 def _mint_daemon_token(agent_name: str) -> str:
-    """Mint a fresh, random, per-boot bearer token for one of the two
-    framework daemons (SEC-10, Credential_Custody_Plan_2026-08-14 PR A2) and
-    register it in-memory in coordinator._AGENT_TOKENS, keyed by its digest
-    exactly like every other registry entry — `_lookup_agent_by_token()`
-    does not need to know an entry is ephemeral.
-
-    Never written to any file, never logged, and never persisted anywhere:
-    a gateway restart mints a fresh token for both daemons, which is the
-    whole migration (the plan's 'Daemons: transparent on restart'
-    seamlessness criterion). Any PREVIOUS ephemeral token this function
-    registered for `agent_name` is revoked first, so a daemon respawn does
-    not accumulate stale-but-still-valid tokens in the registry.
-    """
+    """Mint an in-memory ephemeral bearer token for agent_name, registering its
+    digest in coordinator._AGENT_TOKENS and revoking any previous token."""
     old_digest = _ephemeral_daemon_token_digests.pop(agent_name, None)
     if old_digest is not None:
         _AGENT_TOKENS.pop(old_digest, None)
@@ -2115,39 +1828,15 @@ def _mint_daemon_token(agent_name: str) -> str:
 
 
 def _revoke_daemon_token(agent_name: str) -> None:
-    """Deregister `agent_name`'s ephemeral daemon token (nit fix, A2 security
-    review, finding 10). Used when the daemon process failed to spawn AFTER
-    its token was already minted and registered — no process holds it, so it
-    must not linger in coordinator._AGENT_TOKENS as a still-valid credential
-    with nothing behind it."""
+    """Deregister ephemeral daemon token from _AGENT_TOKENS if spawn fails."""
     digest = _ephemeral_daemon_token_digests.pop(agent_name, None)
     if digest is not None:
         _AGENT_TOKENS.pop(digest, None)
 
 
 def _daemon_env_and_token_fd(agent_name: str) -> "tuple[dict, int | None]":
-    """Build a daemon's child environment plus a pipe fd carrying its
-    freshly-minted AGENT_TOKEN (SEC-10) — never via the child environment,
-    argv, or any file.
-
-    The read end's fd NUMBER is named by the AGENT_TOKEN_FD env var (a
-    number is meaningless off this process tree, so it is not itself
-    secret); the token VALUE crosses only through the pipe's kernel buffer.
-    The token is written and the write end closed HERE, before the caller
-    spawns the child: token_urlsafe(32) is far under PIPE_BUF, so the write
-    never blocks, and the bytes are already sitting in the pipe's kernel
-    buffer by the time exec() runs.
-
-    Returns (env, read_fd) — read_fd is None when auth is disabled for this
-    install (coordinator.AUTH_CONFIGURED_AT_STARTUP is False, fix for
-    finding 1): no token is minted, AGENT_TOKEN_FD is not set, and the
-    caller must not pass_fds. Minting a token for a disabled-auth install
-    would flip coordinator._AGENT_TOKENS from empty to non-empty — exactly
-    the state AUTH_CONFIGURED_AT_STARTUP exists to stop the auth middleware
-    from misreading as "auth is now configured". Skipping the mint keeps
-    pre-A2 behaviour byte for byte: daemons' unauthenticated calls pass
-    exactly as before.
-    """
+    """Return child daemon environment and an inherited pipe read fd containing
+    an ephemeral AGENT_TOKEN, or (env, None) if auth is disabled."""
     env = _daemon_env(agent_name)
     if not AUTH_CONFIGURED_AT_STARTUP:
         return env, None
@@ -2169,12 +1858,7 @@ def _daemon_env_and_token_fd(agent_name: str) -> "tuple[dict, int | None]":
 
 # Consolidation daemon lifecycle
 def _find_uv() -> "str | None":
-    """Resolve the uv binary for daemon spawns.
-
-    PATH first; then the documented user-level install locations, because a
-    systemd unit's default PATH omits ~/.local/bin — without the fallback the
-    gateway serves normally while both daemons silently stay stopped.
-    """
+    """Resolve uv binary from PATH or ~/.local/bin and ~/.cargo/bin fallbacks."""
     uv = shutil.which("uv")
     if uv:
         return uv
@@ -2196,19 +1880,8 @@ def _find_gateway_lock() -> str:
 
 
 async def _start_daemon() -> "asyncio.subprocess.Process | None":
-    """Fix round finding 9 (QA LOW): `_daemon_proc` is published HERE,
-    synchronously, the instant `create_subprocess_exec` returns — not left
-    to the caller's own assignment a few lines later in
-    `_watchdog_daemon()`. `asyncio.create_subprocess_exec` is this
-    function's only `await` before returning; a cancellation can only be
-    delivered AT an await point, so once it returns there is no further
-    suspension between the spawn succeeding and the global being set. Before
-    this fix, a cancel delivered while the CALLER's `proc = await
-    _start_daemon()` was still unwinding back up the call stack (after the
-    subprocess was already live) left `_daemon_proc` unset — the drain's
-    terminate step then skipped a daemon that was already running, orphaning
-    it holding a live token that G's own watchdog-`finally` had just
-    revoked."""
+    """Spawn the consolidation daemon, publishing _daemon_proc immediately to
+    prevent orphaning processes if cancelled before caller assignment."""
     global _daemon_proc
     daemon_path = Path(__file__).parent / "consolidation_loop.py"
     if not daemon_path.exists():
@@ -2243,8 +1916,8 @@ async def _start_daemon() -> "asyncio.subprocess.Process | None":
 
 
 async def _start_rem_daemon() -> "asyncio.subprocess.Process | None":
-    """Fix round finding 9 (QA LOW): see _start_daemon()'s docstring —
-    identical reasoning, mirrored here for `_rem_proc`."""
+    """Spawn the REM daemon, publishing _rem_proc immediately to prevent
+    orphaning processes if cancelled before caller assignment."""
     global _rem_proc
     rem_path = Path(__file__).parent / "rem_loop.py"
     if not rem_path.exists():
@@ -2278,25 +1951,8 @@ async def _start_rem_daemon() -> "asyncio.subprocess.Process | None":
 
 
 async def _watchdog_rem_daemon(stop_event: asyncio.Event) -> None:
-    """Start the REM daemon and restart it on unexpected crashes.
-
-    Uses identical watchdog logic to the consolidation daemon:
-    exponential backoff, stable-uptime reset, and circuit-breaker trip.
-
-    G (S6): the whole body is wrapped in try/finally so this agent's
-    ephemeral daemon token is revoked on EVERY exit path of this watchdog —
-    clean exit, circuit-breaker trip, AND cancellation — not only the three
-    spawn-failure paths _revoke_daemon_token() already covered before this
-    fix. `finally` also fires on asyncio.CancelledError (this coroutine
-    being cancelled) — SAFE here ONLY because of the shutdown ORDER main()
-    enforces in its drain sequence: both daemon processes are terminated
-    (unblocking each watchdog's own `proc.wait()`) BEFORE
-    watchdog_task/rem_watchdog_task.cancel() ever runs, so a cancel can
-    never revoke a token still held by a LIVE daemon process — see the
-    comment at that drain sequence, where this order is now load-bearing.
-    Revoking twice is harmless: _revoke_daemon_token() pops with a default
-    and is a no-op the second time.
-    """
+    """Run and supervise the REM daemon with exponential backoff and circuit-breaking.
+    Revokes the ephemeral daemon token on every exit path in finally."""
     global _rem_proc, _rem_healthy
 
     try:
@@ -2361,19 +2017,8 @@ async def _watchdog_rem_daemon(stop_event: asyncio.Event) -> None:
 
 
 async def _watchdog_daemon(stop_event: asyncio.Event) -> None:
-    """Start the consolidation daemon and restart it on unexpected crashes.
-
-    False-positive protection:
-    - Only restarts on unexpected exits (not returncode 0 or -SIGTERM).
-    - Exponential backoff (1 s → … → 60 s) so a boot-loop fails slowly.
-    - Backoff resets when the daemon ran stably for ≥ _DAEMON_MIN_STABLE_SEC.
-    - Circuit breaker: ≥ _DAEMON_MAX_RESTARTS crashes inside _DAEMON_RESTART_WINDOW
-      seconds → log CRITICAL and stop restarting (requires gateway restart to reset).
-
-    G (S6): see _watchdog_rem_daemon's docstring — identical try/finally
-    revoke-on-every-exit-path reasoning, mirrored here for the
-    consolidation daemon's own ephemeral token.
-    """
+    """Run and supervise the consolidation daemon with backoff and circuit-breaking.
+    Revokes the ephemeral daemon token on every exit path in finally."""
     global _daemon_proc, _daemon_healthy
 
     try:
@@ -2444,24 +2089,9 @@ async def _watchdog_daemon(stop_event: asyncio.Event) -> None:
 
 # Pool status: in-memory LLM capacity for the dreaming daemons
 async def handle_pool_status(request: web.Request) -> web.Response:
-    """GET /pool/status — in-memory LLM pool availability, no upstream probes.
-    A backend is available iff zero in-flight, not in cooldown, not reserved.
-    Because ALL LLM traffic (dream cycles AND user chats) flows through the
-    gateway, in-flight IS the LLM-usage signal — so REM/NREM gate on this instead
-    of a global nvtop check (which self-defers to our own dream work and ignores a
-    free card). Desktop/display GPU use is intentionally not considered.
-
-    SEC-A5-01 (PR A5 fix round): the roster/pool-state detail below (backend
-    URLs keyed to inflight/cooldown/reserved/available — an idle/busy oracle
-    for whatever provider is configured) is gated exactly like /health
-    (SEC-A5-03: ONLY when AUTH_CONFIGURED_AT_STARTUP is true — an auth-off
-    install keeps today's full payload). Every REAL internal caller sends
-    its own token: pool_status.pool_has_free_slot() (rem_loop.py,
-    consolidation_loop.py) attaches its daemon Authorization header — see
-    those modules' _auth_headers(). An anonymous caller on an auth-configured install gets
-    an empty object; pool_status.py's `.get("free_slots", 1)` default then
-    fail-opens exactly as it already does on any other unreachable/erroring
-    gateway, rather than silently and permanently losing slot-awareness."""
+    """GET /pool/status — report in-memory LLM pool availability for daemons.
+    Returns backend availability and free slots, redacting details for anonymous callers
+    when auth is configured."""
     if AUTH_CONFIGURED_AT_STARTUP and not bool(_safe_resolve_identity(request)):
         return web.json_response({})
 
@@ -2517,14 +2147,7 @@ _capability: dict = {"status": "unknown", "probed_at": None}
 
 
 def _projection_age_s(last_ok_at, now=None) -> float | None:
-    """Seconds since the surviving numbers were actually measured.
-
-    None — never 0.0 — for every case where the age is UNKNOWN: never
-    measured, no stamp, an unparseable stamp, and (R2-N7) a stamp in the
-    future. 0.0 means "just measured", and a clock stepped backwards is the
-    one case where publishing that would be actively misleading: the oldest
-    possible reading would read as the freshest. One shape for "we do not
-    know how old this is"."""
+    """Return seconds since numbers were measured, or None if unknown or in the future."""
     if not last_ok_at:
         return None
     try:
@@ -2539,21 +2162,8 @@ def _projection_age_s(last_ok_at, now=None) -> float | None:
 
 
 def capability_snapshot() -> dict:
-    """The published view of the capability probe — what /health serialises
-    as `backend_capability`.
-
-    A-2 (ADV-2): each backend block also carries `projection_age_s`, computed
-    HERE rather than at merge time, so the age is the age at the moment of
-    READING. There is deliberately NO age cap: an old projection is still the
-    only measurement anyone has, and capping it back to absence would restore
-    the very defect this feature removes. Computing it at read time also means
-    a probe daemon that has stopped running shows a monotonically growing age
-    instead of a frozen one — a stalled instrument becomes visible rather than
-    looking like a quiet system.
-
-    The per-backend blocks are COPIED before the computed key is added: the
-    carried projection is now the only copy of a number meant to outlive its
-    cycle, so a caller must not be able to reach in and edit it."""
+    """Return published capability probe view with read-time projection ages,
+    copying per-backend blocks to prevent caller mutation."""
     snap = dict(_capability)
     now = datetime.now(timezone.utc)
     for backend in ("reranker", "embedder"):
@@ -2567,13 +2177,8 @@ def capability_snapshot() -> dict:
 
 
 async def _probe_capability(session) -> dict:
-    """Time both critical backends on a fixed, representative payload.
-
-    Reports the OBSERVED throughput and — the part that matters — projects it
-    onto the largest payload the framework can actually send, then compares that
-    against the timeout the caller would apply. `serves_full_payload: false` is
-    the machine-readable form of the defect that hid here: a backend that is up,
-    answers /health, and still cannot finish a real request in time."""
+    """Measure backend throughput on a representative payload and project latency
+    against worst-case timeouts to verify full payload service."""
     from dream_telemetry import (EMBED_MAX_CHARS, RERANK_MAX_DOC_CHARS,
                                  embed_ceiling, rerank_ceiling)
 
@@ -2660,36 +2265,13 @@ _PROJECTION_CARRY_KEYS = ("projected_full_payload_s", "ceiling_s",
 
 
 def _merge_capability_projection(previous: dict | None, fresh: dict) -> dict:
-    """A projection, once measured, never DISAPPEARS from /health WITHIN A
-    PROCESS LIFETIME; it only ages and says so. (The carry is in-memory: a
-    gateway restart legitimately starts again from "unknown" rather than
-    trusting a number measured before whatever caused the restart.)
-
-    The defect this exists for (fact:1560): the probe daemon replaced the
-    module-level snapshot WHOLESALE every cycle, and a failing probe writes
-    only `status`/`error` — so `projected_full_payload_s` vanished from a
-    backend's block at exactly the moment the backend was busy. Clients size
-    their search timeout from that block (memory_bridge.search_ceiling), so
-    they fell back to a fixed default (CAPACITY_SEARCH_TIMEOUT_FALLBACK_S,
-    120 s — NOT the 30 s floor, which only clamps a derived value) while the
-    gateway kept working the same request for minutes. An absent number read
-    as "nothing to worry about" when the truth was "the last thing we
-    measured was alarming".
-
-    So: a cycle that MEASURED a projection publishes it fresh and stamps
-    `projection_stale: False`; a cycle that failed keeps the last measured
-    NUMBERS of that block, nulls the `serves_full_payload` verdict, stamps
-    `projection_stale: True` and `last_ok_at` (when the surviving numbers
-    were actually taken), and leaves this cycle's own `status`/`error` in
-    place. A backend that has NEVER measured keeps today's shape and gets
-    `projection_stale: None` — "never measured" is a third state, and no
-    number is invented to fill it.
-
-    "Measured" means the block carries `projected_full_payload_s`, which
-    includes a `too_slow` verdict: that reading succeeded, it was just slow,
-    and a slow-but-real projection is precisely the value a client must not
-    lose. Mutates and returns `fresh` (the dict _probe_capability just
-    built); `previous` is only read."""
+    """Retain last measured projection metrics across probe failures (fact:1560 —
+    the client's search timeout collapsed to its 30 s floor exactly when the
+    reranker was busy, because a failing probe wrote only status and the
+    measured projection vanished).
+    Marks projections stale when carried over and sets serves_full_payload to None.
+    A backend that has NEVER measured keeps today's shape with projection_stale
+    None: "never measured" is a third state, and no number is invented to fill it."""
     if not isinstance(fresh, dict):
         return fresh
     for backend in ("reranker", "embedder"):
@@ -2717,25 +2299,15 @@ def _merge_capability_projection(previous: dict | None, fresh: dict) -> dict:
         block["projection_stale"] = True
         # The previous block may itself have been carried forward. The age is the age of the numbers, not of the cycle that last copied them.
         block["last_ok_at"] = (prev_block.get("last_ok_at")
-                               or (previous or {}).get("probed_at"))
+                                or (previous or {}).get("probed_at"))
     return fresh
 
 
 async def _capability_probe_daemon(proxy, stop_event, coordinator=None) -> None:
-    """Refresh the capability snapshot on a slow cadence, forever.
+    """Periodically probe backend capability without raising uncaught exceptions.
 
-    Wrapped so a probe failure can never propagate: this is an OBSERVABILITY
-    path, and an unguarded exception here would take down the thing it exists
-    to report on (the trap named in CLAUDE.md's Group 3).
-
-    `coordinator` (optional — the running MemoryCoordinator instance, when
-    the caller has one) is threaded through to _maybe_derive_capacity so the
-    measured-payload basis can read its cumulative rerank counters.
-
-    ⛔ The fresh reading is MERGED onto the previous snapshot, never assigned
-    over it — see _merge_capability_projection for why a wholesale
-    replacement made a measured projection disappear on the cycle it
-    mattered most."""
+    ⛔ Fresh readings are merged onto previous snapshots rather than replacing
+    them wholesale so measured projections do not vanish when a backend is busy."""
     global _capability
     while not stop_event.is_set():
         try:
@@ -2756,11 +2328,7 @@ async def _capability_probe_daemon(proxy, stop_event, coordinator=None) -> None:
 def _probe_sleep_s(capability: dict | None,
                    interval_s: float | None = None,
                    retry_s: float | None = None) -> float:
-    """INVARIANT: the probe interval is a function of the last probe's
-    outcome. A backend block whose status is `failing` (or a snapshot that
-    has never landed: `unknown` / absent) → the short retry interval;
-    otherwise (`ok`, `too_slow`) → the full interval. Pure, so the branch is
-    testable and mutation-checkable without a gateway."""
+    """Return retry_s if any backend is failing or unprobed, else interval_s."""
     interval_s = CAPABILITY_PROBE_INTERVAL_S if interval_s is None else interval_s
     retry_s = CAPABILITY_PROBE_RETRY_S if retry_s is None else retry_s
     cap = capability or {}
@@ -2785,10 +2353,7 @@ _MEM_SIZE_MULTIPLIERS = {
 
 
 def _parse_mem_size(raw: str | None) -> int | None:
-    """Parse a docker-compose-style memory size ('8G', '512M', a bare byte
-    count, or an operator's hand-edited 'GiB'/'MiB'/'KiB' notation) into
-    bytes. None on anything unparsable — fail-open, never raises, so a
-    malformed env value degrades the derivation rather than the gateway."""
+    """Parse memory size strings into bytes, returning None without raising on error."""
     if raw is None:
         return None
     s = str(raw).strip()
@@ -2868,21 +2433,8 @@ _capacity_first_probe_done = False
 
 
 def _capacity_neo4j_allowance_bytes() -> int | None:
-    """Operator-configured heap+pagecache when BOTH parse; otherwise the
-    compose cap default. Partial config (one of the two set) still falls
-    back to the default rather than guessing the missing half. None
-    (never silently 0) when the fallback itself fails to parse -- M5, fix
-    round: the caller decides what an unparsable allowance means for the
-    overall recommendation.
-
-    N3 (fix round 2): a variable that was left UNSET falls back silently --
-    that is the normal, expected "not configured" case, nothing failed.
-    A variable that WAS set but rejected by _parse_mem_size is different:
-    the operator tried to configure this and got silently overridden by the
-    default, which used to leave no trace anywhere. One warning names the
-    rejected variable (never its value -- these are memory sizes, not
-    secrets, but there is no reason to echo a malformed operator string back
-    into the log either); the fallback behavior itself is unchanged."""
+    """Return configured Neo4j heap+pagecache bytes if both parse, otherwise fallback default.
+    Warns if either env var is set but fails parsing."""
     heap_raw = os.environ.get("NEO4J_HEAP_MAX")
     pagecache_raw = os.environ.get("NEO4J_PAGECACHE")
     heap = _parse_mem_size(heap_raw)
@@ -2903,9 +2455,7 @@ def _capacity_neo4j_allowance_bytes() -> int | None:
 
 
 def _hardware_fingerprint() -> dict:
-    """nproc + MemTotal + GPU presence. Every field fails open to None/False
-    on a platform that cannot answer — this must never raise, called from a
-    background daemon loop with no request to fail."""
+    """Return hardware fingerprint (nproc, MemTotal, GPU presence), failing open without raising."""
     out: dict = {"nproc": None, "mem_total_bytes": None, "gpu_present": False}
     try:
         out["nproc"] = os.cpu_count()
@@ -2929,13 +2479,7 @@ def _hardware_fingerprint() -> dict:
 
 
 def _encoder_config_fingerprint() -> dict:
-    """The config subset that changes what the probe measures or what the
-    derivation assumes. RERANK_MAX_DOC_CHARS/SEARCH_CANDIDATE_FLOOR come
-    from the encoder-sizing modules (imported lazily, matching
-    _probe_capability's own pattern, to avoid a load-order dependency).
-    Replica counts are the compose knobs that move the encoders onto a GPU
-    (ops/postgres_neo4j_limits.yaml CPU_ENCODER_REPLICAS / GPU_ENCODER_
-    REPLICAS) — not read anywhere else in this module, so read directly."""
+    """Return configuration subset affecting encoder probe measurements and capacity derivation."""
     from dream_telemetry import RERANK_MAX_DOC_CHARS
     from coordinator import SEARCH_CANDIDATE_FLOOR
     return {
@@ -2955,37 +2499,12 @@ def _capacity_fingerprint() -> dict:
 
 
 def _capacity_client_ceiling_s(capability: dict | None) -> float:
-    """Server-side mirror of memory_bridge.search_ceiling() — see that
-    function's docstring for the reasoning; this must stay semantically
-    identical (a parity test asserts it) so queue_bound is computed against
-    the timeout the client will genuinely apply, not a server guess.
+    """Server-side mirror of memory_bridge.search_ceiling() for capacity derivation.
 
-    A-5 (T-01): that includes the PARTIAL-ignorance rule the clients apply.
-    When one backend reports a positive projection and the other reports
-    `status: "failing"` (or a `projection_stale` block with no projection of
-    its own), the known backend's number is only a LOWER bound on the true
-    cost — the failing backend's cost is unknown, not zero. So the floor
-    under the derivation becomes CAPACITY_SEARCH_TIMEOUT_FALLBACK_S rather
-    than CAPACITY_SEARCH_TIMEOUT_FLOOR_S: ignorance of PART of the cost must
-    not resolve to a number already known to be too small, exactly as
-    ignorance of ALL of it does not. Before this, the fact:1560 shape (an
-    embedder that probed in 1.8 s beside a reranker that answered nothing)
-    produced 30 s here while the client produced 120 s — the mirror's own
-    parity test never saw the case the mechanism exists for.
-
-    R2-N3 extends that to ignorance expressed as ABSENCE: a backend block
-    that is missing, empty or not a dict is unknown, not free. ⚠ This makes
-    the mirror STRICTER than the clients on those three shapes (the clients
-    key on `status`/`projection_stale` only, so they read absence as zero
-    cost and can floor at 30 s where this returns 120 s). The divergence is
-    in the SAFE direction — the server's queue_bound is computed against a
-    more generous ceiling than the client will apply — but it is a real
-    difference, and closing it belongs in the clients.
-
-    The clients additionally fold in the gateway's published `capacity`
-    block; this mirror does not, and must not — it IS the function that
-    produces `capacity.derived.client_ceiling_s`, so reading it back here
-    would be circular. Parity is over the capability input."""
+    ⚠ Falls back to CAPACITY_SEARCH_TIMEOUT_FALLBACK_S when any backend projection is
+    unknown or failing (fact:1560 — the client's search timeout collapsed to its 30 s
+    floor exactly when the reranker was busy, because a failing probe wrote only
+    status and the measured projection vanished)."""
     if CAPACITY_SEARCH_TIMEOUT_S > 0:
         return CAPACITY_SEARCH_TIMEOUT_S
 
@@ -3018,35 +2537,14 @@ def _capacity_client_ceiling_s(capability: dict | None) -> float:
 
 
 def _capacity_queue_bound(s_mean: float | None, tolerable_wait_s: float) -> int | None:
-    """floor(tolerable_wait_s / s_mean), floored at 0 (division of two
-    positives already never goes negative; the floor is defensive
-    documentation, not a correction). None when s_mean is unknown/non-
-    positive (no probe reading yet) — a queue bound of 0 would otherwise
-    read as "no room", which is a different claim from "not yet measured".
-
-    H1 (fix round): measured against CAPACITY_TOLERABLE_WAIT_S, an
-    operator-stated tolerance, NOT client_ceiling_s — see that constant's
-    module-level comment for why the old client_ceiling-based formula was
-    circular. 0 here genuinely means "a single search already exceeds the
-    tolerable wait" (see single_search_exceeds_wait in the derived record,
-    M10) rather than a second, ambiguous meaning of "no room"."""
+    """Return max search requests fitting within tolerable_wait_s, or None if unmeasured."""
     if not s_mean or s_mean <= 0:
         return None
     return max(0, int(tolerable_wait_s // s_mean))
 
 
 def _capacity_recommended_mem_limit_bytes(mem_total_bytes: int | None) -> int | None:
-    """MemTotal minus every declared allowance above. None when MemTotal
-    itself is unknown, OR (M5, fix round) when ANY declared allowance failed
-    to parse -- an operator-set CAPACITY_*_BYTES value _parse_mem_size
-    rejected used to silently coerce to 0 via `x or 0`, which SUBTRACTS
-    LESS than intended and so INFLATES the recommendation in the dangerous
-    direction (recommending more memory for the reranker than the host
-    actually has spare). Unknown beats wrong-in-the-dangerous-direction: one
-    warning names the offending variable and the whole recommendation comes
-    back None rather than a falsely generous number. Floored at 0 rather
-    than negative when every value DOES parse — a negative number is not a
-    smaller recommendation, it is "no room", which 0 says plainly."""
+    """Return MemTotal minus declared allowances, returning None if any allowance is invalid."""
     if mem_total_bytes is None:
         return None
     named = [
@@ -3071,11 +2569,7 @@ def _capacity_recommended_mem_limit_bytes(mem_total_bytes: int | None) -> int | 
 
 def _capacity_drift_outside_band(current: float | None, basis: float | None,
                                   band_factor: float | None = None) -> bool:
-    """True iff `current` sits outside a [1/band, band] ratio of `basis`.
-    Exactly AT the factor (ratio == band or == 1/band) is still INSIDE the
-    band — "outside a x2 band" means strictly outside, not at-or-beyond, so
-    a probe that happens to land on exactly double doesn't flap the trigger
-    on rounding. None/non-positive inputs never fire (nothing to compare)."""
+    """Return True if current/basis ratio strictly exceeds band_factor or 1/band_factor."""
     if band_factor is None:
         band_factor = CAPACITY_DRIFT_BAND_FACTOR
     if not current or not basis or current <= 0 or basis <= 0 or band_factor <= 1:
@@ -3085,20 +2579,9 @@ def _capacity_drift_outside_band(current: float | None, basis: float | None,
 
 
 def _capacity_payload_stats(coordinator) -> dict:
-    """Read-only snapshot of the coordinator's own cumulative rerank
-    payload counters (fact:1441 — coordinator._rerank_payload_chars_total /
-    _rerank_payload_docs_total / _rerank_payload_chars_max, plus
-    _rerank_successes / _rerank_failures for the sample count, all already
-    accumulated for GET /memory/telemetry — reused verbatim here, not a
-    second collection mechanism).
-
-    `coordinator` may be None (a caller that never wired it through, or
-    every existing test in this suite, none of which pass one) — that is
-    the same as "zero samples", never an error. Every attribute read is
-    guarded: a mocked/partial coordinator missing one, or a non-numeric
-    value on any of them, degrades to zero rather than raising -- this is
-    an observability derivation and must fail open like the rest of this
-    module (Group 3)."""
+    """Read cumulative rerank payload counters from coordinator (fact:1441 —
+    the measured payload-wall cost curve, which exposed two derivation defects;
+    the mean is reported and never the bound), failing open to zeros if absent."""
     samples = chars_total = docs_total = chars_max = 0
     if coordinator is not None:
         try:
@@ -3122,60 +2605,16 @@ def _capacity_payload_stats(coordinator) -> dict:
 
 
 def _probe_measured_at(capability: dict | None, block: dict) -> str | None:
-    """When the throughput reported for one backend was actually measured.
-
-    `last_ok_at` is the authority whenever the block has one (the merge
-    stamps it on every probed block, fresh or carried). Falling back to the
-    snapshot's own `probed_at` keeps this honest for a capability dict that
-    never went through the merge — a caller predating it, or a record
-    rebuilt from an older log."""
+    """Return backend measurement timestamp from last_ok_at or capability probed_at."""
     stamp = block.get("last_ok_at") if isinstance(block, dict) else None
     return stamp or (capability or {}).get("probed_at")
 
 
 def _build_capacity_record(capability: dict | None, fingerprint: dict,
                             trigger: str, coordinator=None) -> dict:
-    """Assemble one capacity derivation record. `capability` is the SAME
-    dict _probe_capability() produced this cycle (capability_snapshot()'s
-    shape) — s_mean_s reuses its reranker.projected_full_payload_s verbatim
-    rather than recomputing a second model; this field's meaning is
-    UNCHANGED and always equals that theoretical projection, exactly as
-    before this change, regardless of `coordinator` — every caller that
-    predates this parameter (including every existing test) gets identical
-    output.
-
-    NOTE on the probe's own model vs the real candidate pool: the probe
-    projects onto 20 x RERANK_MAX_DOC_CHARS (see _probe_capability), a fixed
-    worst-case count that measurement on the reference workstation showed
-    is ~4.9x the largest real payload observed and ~6.9x the mean (operator
-    rulings, 2026-08-23 — see CAPACITY_PAYLOAD_MIN_SAMPLES's module-level
-    comment for the numbers and the corrected ratios). The REAL per-search
-    candidate pool is max(SEARCH_CANDIDATE_FLOOR, limit) + 2
-    (coordinator.py's Tier-1 fetch: the vector-search LIMIT plus the Tier-3
-    summary and the deep-dive lookup that ride along).
-
-    `coordinator` (optional — None on a fresh install, a process that
-    hasn't wired it through, or any caller that predates this parameter)
-    supplies the OBSERVED payload stats via _capacity_payload_stats. When
-    at least CAPACITY_PAYLOAD_MIN_SAMPLES real searches have been served,
-    the derived record's queue_bound and single_search_exceeds_wait are
-    computed from the observed MAXIMUM payload (s_max_measured_s) instead
-    of the fixed theoretical one — a capacity signal must stay
-    worst-case, so the average (s_mean_measured_s, still reported as cheap
-    informational context) never feeds these two fields. s_mean_s ITSELF
-    is never touched, so a reader who only ever looked at s_mean_s keeps
-    seeing exactly what it always meant.
-
-    Why it is still safe to leave queue_bound/single_search_exceeds_wait
-    under their existing names even though the basis feeding them can now
-    change: `payload_basis` ships in the SAME record and is mandatory
-    (never omitted), so a reader can always tell which basis actually
-    drove a given value — a name is only a problem to reuse when its
-    meaning changes SILENTLY; here it cannot, because the record is
-    self-describing. `payload_basis_sample_count` always reports the true
-    sample count regardless of which basis was used (NOT 0 on
-    "theoretical" — an earlier draft of this comment said otherwise; the
-    code was already right, only the comment was wrong)."""
+    """Assemble a capacity derivation record from capability probe data and coordinator stats.
+    Uses observed maximum payload for queue_bound once sample thresholds are met,
+    reporting payload_basis and sample counts explicitly."""
     reranker = (capability or {}).get("reranker") or {}
     embedder = (capability or {}).get("embedder") or {}
     # Fixed theoretical full-payload projection, copied from the probe. The basis switch below does not change this value.
@@ -3270,9 +2709,7 @@ def _build_capacity_record(capability: dict | None, fingerprint: dict,
 
 
 def _read_capacity_records_sync(path: str) -> list[dict]:
-    """Tolerant JSON-lines reader: a malformed line is skipped, never fatal
-    — the log is an observability trail, not a transaction log. Missing
-    file returns []."""
+    """Read capacity records from JSONL file, skipping malformed lines and returning [] if missing."""
     expanded = os.path.expanduser(path)
     if not os.path.exists(expanded):
         return []
@@ -3293,16 +2730,7 @@ def _read_capacity_records_sync(path: str) -> list[dict]:
 
 
 def _write_capacity_records_sync(path: str, records: list[dict]) -> None:
-    """Atomic replace via a same-directory temp file opened 0600 directly
-    (log_hygiene's FILE_MODE) — os.replace preserves the source inode's
-    permission bits, so the final file is never briefly world-readable
-    under the process umask the way `open(tmp, 'w')` then chmod would be.
-
-    M9 (fix round): the temp-file open now carries O_NOFOLLOW too, mirroring
-    log_hygiene.secure_path's own reasoning -- a symlink pre-planted at the
-    `.tmp` path by a different-uid actor in a relocated (CAPACITY_LOG_PATH
-    under /tmp or another shared dir) log directory must not get this
-    process to write through it."""
+    """Atomically write capacity records to temporary file with O_NOFOLLOW and replace path."""
     expanded = os.path.expanduser(path)
     _chmod_created_ancestors(Path(expanded).parent)
     tmp = f"{expanded}.tmp"
@@ -3322,10 +2750,7 @@ def _write_capacity_records_sync(path: str, records: list[dict]) -> None:
 
 
 async def _append_capacity_record(record: dict) -> None:
-    """Append + prune to the last CAPACITY_LOG_MAX_RECORDS, off the event
-    loop (log_hygiene.AsyncLineWriter's reasoning — disk I/O never runs
-    inline — but this needs read-modify-write for pruning, which
-    AsyncLineWriter's append-only writer does not do)."""
+    """Append record and prune CAPACITY_LOG_PATH off the event loop."""
     def _do() -> None:
         records = _read_capacity_records_sync(CAPACITY_LOG_PATH)
         records.append(record)
@@ -3346,9 +2771,7 @@ def _last_capacity_record() -> dict | None:
 
 
 def capacity_snapshot() -> dict | None:
-    """The latest derivation record, or None before any exists (this
-    process's own derivation OR a prior process's, lazily loaded from disk
-    once). Read by /health — never asserted as present on no data."""
+    """Return latest derivation record or None, lazily loaded from disk if uninitialized."""
     global _capacity_latest, _capacity_latest_loaded_from_disk
     if _capacity_latest is None and not _capacity_latest_loaded_from_disk:
         _capacity_latest_loaded_from_disk = True
@@ -3360,21 +2783,9 @@ def capacity_snapshot() -> dict | None:
 
 
 def _log_capacity_change(trigger: str, last: dict | None, record: dict) -> None:
-    """One line per re-derivation.
-
-    M7 (fix round): the very first record this log has EVER held is not an
-    alarm -- there is nothing prior to compare against, so it logs at INFO
-    as "capacity baseline established" and carries no re-run-postflight
-    tail. Every other trigger means something ACTUALLY changed (a hardware/
-    config mismatch, or measured drift) and keeps the louder WARNING path
-    with that tail (fact:1425 A2: every hardware-era change should produce
-    a fresh postflight verification, and this line is where the operator
-    learns that -- log only, the gateway never runs postflight itself).
-
-    N1(b) (fix round 2): basis_recovery is likewise informational, not an
-    alarm -- it means the instrument just HEALED itself from an unusable
-    basis, which is good news the operator did nothing to cause and need do
-    nothing about. No re-run-postflight tail either."""
+    """Log capacity re-derivations, emitting INFO for baselines/recoveries and WARNING
+    with a verification tail for hardware changes (fact:1425 — operator mid-build
+    rulings; A2 is that every hardware-era change should produce a fingerprint tail)."""
     def _mib(b):
         return f"{b / (1024 ** 2):.0f}MiB" if isinstance(b, (int, float)) else "?"
 
@@ -3428,14 +2839,12 @@ def _log_capacity_change(trigger: str, last: dict | None, record: dict) -> None:
 
 
 async def _maybe_derive_capacity(capability: dict, coordinator=None) -> None:
-    """Called every capability-probe cycle. Decides which of the passive
-    triggers (if any) fires, derives + stores + logs on a hit, and NEVER
-    raises — this rides the same observability path _probe_capability does,
-    so a bug here must not take down the probe daemon (Group 3).
+    """Evaluate capacity triggers each probe cycle, deriving and persisting records on change.
 
-    `coordinator` (optional) is passed straight through to
-    _build_capacity_record so the measured-payload basis can read its
-    cumulative rerank counters — see that function's docstring."""
+    ⛔ NEVER raises: this rides the same observability path as
+    _probe_capability, so a bug here must not take down the probe daemon it
+    reports through (the Group 3 trap — a metric added to a work path changes
+    that path's failure modes)."""
     global _capacity_first_probe_done
     try:
         fingerprint = _capacity_fingerprint()
@@ -3535,22 +2944,14 @@ def _dep(state: str, reason: str | None = None) -> dict:
 
 def _encoder_dependency(probe: str, capability: object, window: dict | None = None,
                         kind: str = "embedder") -> dict:
-    """One encoder's dependency enum.
+    """Return encoder dependency state.
 
-    ⛔ LIVENESS IS NOT CAPABILITY, and this is where that finally reaches
-    `status`. The reranker once answered /health throughout a period in which a
-    full candidate set cost ~64 s against a 5 s ceiling — every search silently
-    fell back to unranked vector order while the probe read green. The capability
-    verdict (`too_slow` / `failing`) now makes the encoder DEGRADED. It does NOT
-    make it down, and that distinction is load-bearing: down is the 503, and a
-    slow encoder still returns vectors.
-
-    decision:2540: window contract checks. Advertised context < required tokens
-    degrades with `window_short:N<required`; embed full_payload_ok: False degrades
-    with `window_overrun`. Unreachable encoder stays DOWN.
-    decision:2557: kind="reranker" with full_payload_ok False does not degrade with
-    window_overrun (reranker ranks prefix of pair); it falls through to capability.
-    """
+    ⛔ Liveness is not capability: slow capability degrades rather than marks down.
+    Enforces window contracts (decision:2540 — the encoder window contract: a conservative
+    token-reserve clamp, a runtime probe and a postflight check, because encoders advertising
+    8192 tokens were sent payloads tokenising to 8193), treating reranker overflow as prefix
+    scoring (decision:2557 — the reranker's 8192 is a ranking prefix it scores, not a rejection
+    boundary; only the embedder's 8192 rejects)."""
     if probe != "ok":
         return _dep(_STATE_DOWN, f"probe:{probe}")
     if isinstance(window, dict):
@@ -3569,42 +2970,11 @@ def _encoder_dependency(probe: str, capability: object, window: dict | None = No
 
 
 def _llm_pool_dependency(backend_status: dict) -> dict:
-    """down when EVERY backend is down, degraded when any is.
+    """Return LLM pool dependency state, prioritizing liveness before configuration.
 
-    Before this, `llm` read `ok` while N-1 of N backends were down — the pool
-    tolerates a dead backend, so "any is up" was the right answer for the
-    routing question and the wrong answer for the operator's.
-
-    D2 (decision:1832) — LIVENESS FIRST, THEN CONFIGURATION. The order below is
-    load-bearing: a `down` verdict is never softened by what the config MEANS,
-    only explained by it. Checked in this order:
-      1. no backend probed at all -> unknown (nothing to derive a verdict from)
-      2. every probed backend down -> DOWN, unconditionally. Every applicable
-         DOWN-tier reason COMPOSES too (handback H2 — the down branch used to
-         drop LLM_POOL_FALLBACK_REASON entirely: a declared fleet that was
-         entirely EXCLUDED, whose fallback is ALSO down, read a bare "all 1
-         backend(s) down" with the explanatory fact gone. LLM_POOL_FALLBACK_
-         REASON and LLM_POOL_CONFIG_EMPTY never coexist by construction — D1 —
-         so at most one of the two configuration facts joins the liveness
-         fact): LLM_POOL_FALLBACK_REASON (a declared fleet, every entry
-         EXCLUDED — F6, v0.9.75), or LLM_POOL_CONFIG_EMPTY (M1: nothing was
-         declared at all, naming the EFFECTIVE DEFAULT_TARGET value, scrubbed,
-         never a hardcoded "localhost:5000" — our ports are one valid
-         configuration, not the only one, fix round Q2), each followed by the
-         bare liveness fact itself.
-      3+. every DEGRADED reason that applies COMPOSES (fix round Q9 — the same
-         lead/append discipline `_rem_dependency`/`_nrem_dependency` use, so two
-         coexisting facts are never collapsed into one at the cost of the
-         other): LLM_POOL_FALLBACK_REASON (a declared fleet, every entry
-         EXCLUDED — F6, v0.9.75, unchanged), LLM_POOL_CONFIG_EMPTY and the
-         fallback IS serving (⚠ a deliberate, ruled change: a legacy
-         zero-config-but-working install used to read `ok` here — visibility
-         before behaviour, ahead of W4 retiring the fallback), some (not all)
-         probed backends down (unchanged), and the NEW fleet-wide eligibility
-         verdict (D2.4) — NO role (role-less or any ROUTING_ROLE_NAMES role)
-         has an eligible backend. A hole for SOME roles only does NOT reach
-         here (agy 3 / Opus F6).
-    """
+    Evaluates down/degraded states composing reasons (decision:1832 — the nothing-eligible
+    verdict lives in the rem and nrem dependency reasons rather than in a new /health surface),
+    warning if fleet configuration is empty or legacy fallbacks serve (⚠)."""
     if not backend_status:
         return _dep(_STATE_UNKNOWN, "no backend configured")
     # decision:374 and fact:375: unknown means not probed yet, not down. A pool nobody has probed stays unknown and must not be raised to down.
@@ -3647,12 +3017,8 @@ def _llm_pool_dependency(backend_status: dict) -> dict:
 
 
 def _outbox_dependency(census: object, age_limit_s: int) -> dict:
-    """failed rows, or a pending row older than the limit, is DEGRADED.
-
-    The outbox had NO representation on /health at all: a permanently-failed row
-    means a record that is in Postgres and will never reach Neo4j, and the only
-    place that was visible was a telemetry key that VANISHED when it read zero.
-    """
+    """Return outbox dependency state, reporting degraded if failed rows exist
+    or pending rows exceed age limits."""
     if not isinstance(census, dict):
         return _dep(_STATE_UNKNOWN, "not yet probed")
     failed = census.get("failed") or 0
@@ -3665,13 +3031,9 @@ def _outbox_dependency(census: object, age_limit_s: int) -> dict:
 
 
 def _dream_slots_impossible_reason() -> "str | None":
-    """D3 (decision:1832): a PURE config fact, knowable before any probe —
-    None normally; the same reason `warn_if_dream_slots_impossible` logs at
-    startup when NO backend counts toward /pool/status free_slots (that
-    function's own predicate, `_counts_free_slot` over `LLM_BACKENDS`). The
-    startup warning stays; this puts the same fact on /health for the
-    gateway's whole lifetime, in the dependency it actually explains
-    (`rem_daemon`/`nrem_daemon`, not a bare log line nobody is tailing)."""
+    """Return explanation if no backend provides dream slots (decision:1832 —
+    the nothing-eligible verdict lives in the rem and nrem dependency reasons rather
+    than in a new /health surface), else None."""
     if any(_counts_free_slot(b) for b in LLM_BACKENDS):
         return None
     return ("no backend counts toward dream slots — REM and NREM will never "
@@ -3679,16 +3041,9 @@ def _dream_slots_impossible_reason() -> "str | None":
 
 
 def _rem_dependency(process_running: bool, dead_lettered: object) -> dict:
-    """A PID is not health. `rem_daemon` was a PID check and nothing else, so a
-    REM that was dead-lettering every record it touched read `running`.
-
-    D3/B3 (decision:1832) — ordering: down -> config verdict (dream slots
-    impossible) -> the rest, same logic as `_llm_pool_dependency`'s D2. When
-    BOTH a dead-letter reason and the slots-impossible reason apply, the
-    liveness/dead-letter reason leads and the slots reason APPENDS — a fleet
-    actively dead-lettering has the more urgent story, but an operator needs
-    both facts in one place.
-    """
+    """Return REM daemon dependency state checking process liveness, dead letters, and
+    dream slot configuration (decision:1832 — the nothing-eligible verdict lives in the
+    rem and nrem dependency reasons rather than in a new /health surface)."""
     if not process_running:
         return _dep(_STATE_DOWN, "process not running")
     dead_letter_reason = (f"dead_letters:{dead_lettered}"
@@ -3706,18 +3061,9 @@ def _rem_dependency(process_running: bool, dead_lettered: object) -> dict:
 
 def _nrem_dependency(process_running: bool, consolidation: object,
                      attempt_floor: int) -> dict:
-    """Same argument as REM, plus the middle state `stalled` alone cannot say:
-    a daemon that ATTEMPTS folds and succeeds at none is not stalled — it is
-    running, busy, and producing nothing, which reads as perfectly healthy.
-
-    D3/B3 (decision:1832) — ordering: down -> config verdict (dream slots
-    impossible) -> probe-timing states -> the rest. The `unknown` "not yet
-    probed" state must NOT gate the config verdict: a config fact is knowable
-    before any probe runs, so not-yet-probed AND slots-impossible together
-    read `degraded`, never `unknown`. Once a real snapshot exists, the slots
-    reason still applies and APPENDS to whatever the snapshot says (same
-    lead/append precedence as REM's dead-letters).
-    """
+    """Return NREM daemon dependency state evaluating liveness, fold successes, and
+    dream slot configuration (decision:1832 — the nothing-eligible verdict lives in the
+    rem and nrem dependency reasons rather than in a new /health surface)."""
     if not process_running:
         return _dep(_STATE_DOWN, "process not running")
     slots_reason = _dream_slots_impossible_reason()
@@ -3749,22 +3095,10 @@ def _nrem_dependency(process_running: bool, consolidation: object,
 
 def _registry_dependency(read_failures: object,
                          census_failures: object = 0) -> dict:
-    """A registry that could not be READ answers 200 with a silently different
-    answer: by-key resolution becomes a no-op and a filtered search matches only
-    the literal string it was given, which is indistinguishable from a name
-    nobody registered.
+    """Return registry dependency state from read search failures and internal probe census failures.
 
-    ⛔ TWO INPUTS, BOTH OF WHICH MUST REACH THE VERDICT (F1). `read_failures` is
-    the SEARCH path: a filter that could not be resolved. `census_failures` is
-    this health layer's OWN probe: the row-count query behind `registry.*`. The
-    first version of that query named a table that does not exist, so it failed
-    on every install — and because nothing counted it, the dependency read `ok`
-    while the numbers it is supposed to describe were null. A health check that
-    cannot see its own instrument failing is not a health check.
-
-    The reason NAMES which one, because the two have different fixes: a stale
-    gauge and a silently-degraded search are not the same incident.
-    """
+    ⛔ Both search-path read failures and health-probe census failures must reach
+    the verdict so failures in the health instrument itself do not read as clean."""
     if not isinstance(read_failures, int):
         return _dep(_STATE_UNKNOWN, "not yet probed")
     reasons = []
@@ -3786,12 +3120,7 @@ _rate_marks: dict[str, tuple[int, float]] = {}
 
 
 def _delta_per_min(key: str, total: int) -> float | None:
-    """Events per minute since the last call for ``key``.
-
-    None on the FIRST call: there is no previous mark, so there is no rate — and
-    dividing a lifetime total by the seconds since boot would report a
-    long-dead burst as a live one.
-    """
+    """Return events per minute since last call for key, or None on first call or counter resets."""
     now = time.monotonic()
     prev = _rate_marks.get(key)
     _rate_marks[key] = (total, now)
@@ -3822,36 +3151,8 @@ def _gateway_shed_rate() -> int:
 
 
 def _token_verify_failure_rate(now: float | None = None) -> float | None:
-    """D1: the COUNT of token_verify_failed events in a true 60 s monotonic
-    window — replaces the old `_delta_per_min` extrapolation, which divided
-    the lifetime counter's delta by the gap between health-cache BUILDS
-    (HEALTH_CACHE_TTL_S), not by a fixed window. That made the "reading"
-    entirely poll-cadence-dependent: one event read ~24/min at the 3 s TTL
-    default and ~0.1/min under 600 s polling of the same single event —
-    the poll cadence WAS the number, never the actual rate.
-
-    Walks a synchronous snapshot of the coordinator's fixed-256 ring
-    (`telemetry_token_verify_ring()`, appended with `time.monotonic()` at
-    both bump sites) and counts entries within 60.0 seconds of `now`. No
-    await anywhere in the walk.
-
-    `now` is injectable — tests pass an explicit monotonic float to control
-    which ring entries fall inside the window, rather than patching
-    `datetime` (the ring never reads wall-clock time, so patching
-    `datetime` would not move it at all). Production callers always pass
-    None and get the live `time.monotonic()`.
-
-    Saturates at the ring's fixed 256-entry cap: a 60 s flood of more than
-    256 events reads exactly 256, not the true rate — documented, not a
-    bug (see coordinator._token_verify_failure_ring's declaration and
-    HANDOFF.md). The warning still fires at a saturated reading; only the
-    unbounded lifetime total remains at credentials.token_verify_failed.
-
-    Returns 0.0 (never None) when the ring is empty — unlike the old
-    "None on the very first call" semantics, an honest window has nothing
-    to distinguish "never happened" from "not yet warmed up"; a genuinely
-    empty 60 s window IS zero events.
-    """
+    """Return count of token_verify_failed events within a 60 s sliding window,
+    reading from coordinator telemetry ring and saturating at its 256-entry capacity."""
     try:
         if now is None:
             now = time.monotonic()
@@ -3862,13 +3163,9 @@ def _token_verify_failure_rate(now: float | None = None) -> float | None:
 
 
 def overall_status(dependencies: dict, warnings: list) -> str:
-    """down if any dependency is down; degraded if any is degraded or any
-    warning is raised; else ok.
+    """Compute overall status (down, degraded, ok).
 
-    ⚠ `unknown` NEVER ELEVATES. A dependency nobody has probed yet is not a
-    dependency that is failing, and a gateway that reported `degraded` for its
-    first 60 seconds every restart would train an operator to ignore the field.
-    """
+    ⚠ unknown never elevates: unprobed dependencies do not report degraded."""
     states = [d.get("state") for d in dependencies.values()]
     if _STATE_DOWN in states:
         return _STATE_DOWN
@@ -3878,14 +3175,8 @@ def overall_status(dependencies: dict, warnings: list) -> str:
 
 
 def _log_health_transitions(dependencies: dict, warnings: list) -> None:
-    """ONE LINE PER CHANGE, never one per poll.
-
-    /health is polled every 30 s by an open dashboard and on every client call;
-    logging the state would produce a log that is 100% steady-state noise and
-    would bury the one line that matters. A transition into a bad state is a
-    WARNING, a recovery is INFO — so `journalctl -p warning` is a list of things
-    that went wrong, not a list of times someone looked.
-    """
+    """Log dependency state changes and warning transitions on state shifts,
+    avoiding steady-state poll noise."""
     try:
         for name, dep in dependencies.items():
             new = dep.get("state")
@@ -3913,30 +3204,8 @@ def _log_health_transitions(dependencies: dict, warnings: list) -> None:
 
 
 def _scrub_backend_keyed_dict(d: dict, *, context: str) -> dict:
-    """SEC B (ADV1-14): scrub every KEY of a backend-URL-keyed dict through
-    scrub_url_credentials before it reaches a client-facing render. For a
-    clean, query-less URL this is byte-identical (item C guarantees it) —
-    the whole point is that a normal install's /health and /memory/telemetry
-    output does not change one byte.
-
-    Key-collapse guard: scrubbing can, in principle, merge two DISTINCT
-    backend keys into one rendered key (e.g. two credentialed URLs that
-    differ only in userinfo). With item A fatal on any userinfo URL this
-    cannot happen for a production pool — but this guard exists for a
-    test-seeded pool or a future ingest-path bypass: on a collapse this logs
-    an error and returns SCRUBBED keys, positionally de-duplicated, rather
-    than silently losing an entry.
-
-    Fix round F7 (QA MED-2): the first cut of this guard, on a collapse,
-    returned the RAW (unscrubbed) dict — i.e. its own escape hatch did
-    exactly what item B exists to prevent. `/pool/status` is a member of
-    `_UNPROTECTED_PATHS` (reachable anonymously), so a collapse there used
-    to hand an anonymous caller both original URLs verbatim, userinfo and
-    all — strictly worse than the plain unscrubbed dict this function
-    guards against everywhere else. Never acceptable, even as a rare/
-    test-only escape hatch: this now scrubs every key regardless, and
-    disambiguates a collapse with a positional suffix (`#0`, `#1`, ...) so
-    every entry survives and NO credential ever reaches the render."""
+    """Scrub credentials from dict keys, appending positional disambiguation suffixes
+    on key collisions to preserve entries without exposing credentials."""
     scrubbed = {scrub_url_credentials(k): v for k, v in d.items()}
     if len(scrubbed) != len(d):
         log.error(
@@ -3951,22 +3220,8 @@ def _scrub_backend_keyed_dict(d: dict, *, context: str) -> dict:
 
 
 def _llm_runtime_snapshot(backend_status: dict | None = None) -> dict:
-    """The whole in-memory llm_* family, built ONCE.
-
-    Every value here is process-local and reset-on-restart; nothing in this
-    function performs I/O, so it is safe to call from the telemetry path as well
-    as the health path. `backend_status` is the liveness map the health probe
-    already computed — passed in rather than re-probed, because a telemetry
-    request must never fire N network probes of its own.
-
-    SEC B: every backend-URL-keyed dict below is scrubbed at the very end
-    (via _scrub_backend_keyed_dict, with its key-collapse guard) before
-    returning — this is THE single builder feeding BOTH /health and
-    /memory/telemetry, so scrubbing here once covers both. `backend_status`
-    is scrubbed a second, harmless time (idempotent — item C) since its
-    caller (_build_health_checks) already scrubs it for checks["llm_backends"];
-    defense in depth for any other/future caller that does not.
-    """
+    """Build in-memory snapshot of LLM routing, token usage, latency, and pool state.
+    Uses cached backend_status without performing network I/O, scrubbing backend keys."""
     now = time.monotonic()
     total_routed = sum(_llm_routed.values()) or 1
     aff_total = _llm_affinity_hits + _llm_affinity_misses
@@ -4036,16 +3291,11 @@ def _llm_runtime_snapshot(backend_status: dict | None = None) -> dict:
 
 
 def _config_snapshot() -> dict:
-    """Effective NON-SECRET configuration the running gateway resolved from the
-    environment, so the live LLM/tuning setup is inspectable without reading
-    .env on the host.
+    """Return effective non-secret configuration resolved from environment.
 
-    ⛔ SECRETS ARE NEVER ECHOED HERE — AGENT_TOKENS and the PG/Neo4j passwords
-    do not appear, and `has_credential` is a BOOL, never the token. Tracked
-    regardless of whether any backend uses it today, so the capability is
-    monitor-visible from the moment it is configured rather than only once
-    someone goes looking (fact 898).
-    """
+    ⛔ Secrets are never exposed: credentials appear only as booleans (fact:898 —
+    /health's config.llm_backends block reports url and weight and never exposes
+    a backend token)."""
     import dream_telemetry
     cfg = {
         # url is scrubbed text inside a list of dicts, so two backends cannot collapse into one key. A clean query-less URL is unchanged.
@@ -4083,17 +3333,10 @@ def _config_snapshot() -> dict:
 
 
 def telemetry_extras() -> dict:
-    """The blocks /memory/telemetry serves out of THIS module's state.
+    """Return telemetry blocks served by proxy for /memory/telemetry.
 
-    Registered on the coordinator at startup (see the app factory) because
-    coordinator.py cannot import this module — this module imports it.
-
-    ⛔ NO NETWORK PROBE HAPPENS HERE. The liveness enums are read off the
-    /health probe CACHE, so a telemetry request never fires the 2+N backend
-    fan-out of its own; a stale-by-up-to-HEALTH_CACHE_TTL_S enum on the numbers
-    endpoint is exactly the right trade, and the fresh verdict is on /health
-    where it belongs. Cheap, synchronous, and safe to call from a request path.
-    """
+    ⛔ No network probes run here: reads cached health probe enums synchronously
+    to avoid per-request upstream network fan-out."""
     cached = _health_cache.get("checks") or {}
     rt = _llm_runtime_snapshot(cached.get("llm_backends") or {})
     llm: dict = {
@@ -4118,19 +3361,9 @@ def telemetry_extras() -> dict:
 
 
 def _coordinator_health_keys(coordinator) -> dict:
-    """The consolidation-health lift for /health: everything read off the
-    coordinator's cached (DB-free) snapshot (ADR-018) — stalled=true means an
-    eligible backlog exists but nothing has folded within the stall window and
-    no fold is in-flight, an actionable alert, not a probe miss. Pure: reads
-    coordinator.consolidation_health() and derives the top-level keys from it,
-    nothing else. On ANY failure it returns the same "not yet probed" /
-    "unknown" defaults the inline except branch used to return.
-
-    Extracted (F4, fix round) so this can be unit-tested directly with a stub
-    coordinator instead of only by inspecting _build_health_checks' source —
-    a source-inspection test can prove a line exists in the function body, but
-    not that it actually executes (a `if False:` around it would still pass).
-    """
+    """Derive consolidation health keys for /health from coordinator's cached snapshot
+    (decision:362 — ADR-018 locked a cached consolidation snapshot so /health makes no database call).
+    Fails open to unknown defaults without raising."""
     try:
         consolidation = coordinator.consolidation_health()
         return {
@@ -4184,25 +3417,13 @@ def _probe_interval_for(backend: str) -> float:
 
 
 def _classify_probe_status(status: int) -> str:
-    """The liveness verdict for a probe response.
+    """Classify backend probe HTTP status into liveness verdicts.
 
-    429 is the one 4xx that means healthy: the backend is up and rate-limiting
-    this probe, and it will serve real traffic, so reading it as not-ok made a
-    working hosted provider report a dead pool.
-
-    ⛔ EVERY OTHER 4xx STAYS NOT-OK, AND 404 ESPECIALLY. A 404 is the signature
-    of a mistyped backend URL, and this daemon — unlike `_probe_backend_alive`,
-    which falls through to a second path — asks for exactly one path and has no
-    other evidence the backend serves anything. Calling that alive would pair
-    with `_http_status_faults_backend` (which deliberately ignores 404, because
-    a config fault does not heal on a cooldown timer) to leave a typo'd backend
-    reading healthy AND never cooling down, absorbing traffic indefinitely.
-    The probe is the signal for a configuration fault; the cooldown is the
-    signal for a load fault. 401 and 403 stay not-ok for the same reason: they
-    say this gateway's key is rejected (fact:1794 — a bare probe of a
-    credentialed backend always 401s, which is why the probe carries the
-    bearer), which an operator must see.
-    """
+    Treats 429 as ok (live backend rate-limiting).
+    ⛔ Every other 4xx stays not-ok, especially 404 (mistyped URLs would otherwise
+    read healthy and never cool down) and 401/403 rejected keys (fact:1794 — a false
+    llm_pool degraded because the health probe carried no backend credential, and
+    DeepSeek answers 401 to any unauthenticated request on any path)."""
     if status < 400 or status == 429:
         return "ok"
     return f"http_{status}"
@@ -4413,26 +3634,8 @@ async def _build_health_checks(proxy: "AsyncHiveMindProxy", coordinator) -> dict
 
 
 async def _health_probe_cached(proxy: "AsyncHiveMindProxy", coordinator) -> dict:
-    """TTL-cached wrapper around _build_health_checks (S-11), with
-    single-flight coalescing on a miss (SEC-A5-05b, PR A5 fix round): the
-    TTL alone bounds SEQUENTIAL cost only — N concurrent misses arriving
-    together (e.g. a burst of /health hits right as the TTL expires) would
-    each observe a stale timestamp and each run the full 2+N-probe fan-out
-    before any of them writes back. The lock below makes every concurrent
-    miss AWAIT the one probe already in flight: the second-and-later caller
-    re-checks the cache immediately after acquiring the lock and finds it
-    fresh (the first caller already populated it) — that re-check IS the
-    coalescing, not a redundant guard — so only ONE _build_health_checks()
-    call ever runs per TTL window regardless of how many callers arrive
-    concurrently.
-
-    Anonymous and authenticated callers SHARE this cache — the probe itself
-    (embedder/reranker/LLM reachability, daemon liveness, dream-cycle
-    snapshot) costs the same regardless of who's asking, and a second probe
-    within the TTL window buys nothing; only the RESPONSE SHAPE handle_
-    health serves differs per caller, and that projection is applied fresh
-    on every call, never cached itself (see _build_health_checks's
-    docstring)."""
+    """Return TTL-cached health check results with single-flight lock coalescing
+    to prevent concurrent probe fan-out on cache expiry."""
     now = time.monotonic()
     cached = _health_cache["checks"]
     if cached is not None and now - _health_cache["ts"] < HEALTH_CACHE_TTL_S:
@@ -4489,26 +3692,9 @@ async def handle_health(request: web.Request) -> web.Response:
 
 # Startup and shutdown
 def require_no_backend_url_credentials() -> None:
-    """SEC A (R-1, fatal, RULED — Xenofon 2026-09-02): a backend URL whose
-    userinfo carries a credential (user:pass@host, or a bare user@host) is a
-    startup refusal, never a silent exclude-and-continue. Collected at parse
-    time by _load_llm_backends() (BOTH ingest paths — LLM_BACKENDS_JSON and
-    the legacy CSV form — via the shared _backend_url_credential_error()
-    helper) into _LLM_BACKEND_URL_CREDENTIAL_ERRORS; raised here, same
-    placement reasoning as require_auth_when_provider_keys_configured() and
-    require_valid_llm_routing_config() below: every test in this repo
-    imports this module freely, many with deliberately-invalid backend
-    config, so an unconditional check at import/parse time would kill test
-    collection itself, not just a genuinely misconfigured gateway.
-
-    Refusing here (rather than excluding the entry and continuing) is the
-    R-1 ruling: excluding would let a JSON fleet that is ENTIRELY
-    credentialed URLs fall through to the legacy/default fallback and come
-    up healthy pointed at localhost — silently serving from the wrong place
-    with no operator-visible signal beyond a log line. The message is built
-    entirely from strings _backend_url_credential_error() already ran
-    through the fixed (item C) scrub_url_credentials — never a raw
-    credential."""
+    """Refuse startup if any backend URL embeds userinfo credentials (user:pass@host).
+    Checked at startup rather than import time to allow test imports without killing
+    collection."""
     if not _LLM_BACKEND_URL_CREDENTIAL_ERRORS:
         return
     raise SystemExit(
@@ -4525,16 +3711,9 @@ def require_no_backend_url_credentials() -> None:
 
 
 def _unauthenticated_provider_keys_override_active() -> bool:
-    """True iff this process is running with the S-05 override ACTUALLY in
-    effect — auth off, a provider key attached to a configured backend, and
-    the operator set ALLOW_UNAUTHENTICATED_PROVIDER_KEYS (SEC-A5-02, PR A5
-    fix round). Read fresh every call (never cached) so it always reflects
-    the live env/config rather than a value captured once at import time.
-    Shared by require_auth_when_provider_keys_configured() below (decides
-    warn-vs-raise) and _build_health_checks() (surfaces the condition on
-    the authenticated /health payload so it stays MONITORABLE for the
-    gateway's whole lifetime, not just greppable in a boot log that
-    rotates)."""
+    """Return True if running unauthenticated with configured provider keys and
+    ALLOW_UNAUTHENTICATED_PROVIDER_KEYS is set. Evaluated dynamically on each
+    call for startup validation and /health monitoring."""
     if AUTH_CONFIGURED_AT_STARTUP:
         return False
     if not any(LLM_BACKEND_TOKENS.get(b) for b in LLM_BACKENDS):
@@ -4543,29 +3722,10 @@ def _unauthenticated_provider_keys_override_active() -> bool:
 
 
 def require_auth_when_provider_keys_configured() -> None:
-    """S-05 (Required, RULED — decision:1303, PR A5): AGENT_TOKENS unset
-    disables auth AND the in-flight cap AND the audit path (see coordinator.
-    auth_middleware's AUTH_CONFIGURED_AT_STARTUP early-return) while any
-    provider key stays attached to whatever backend it's configured for — so
-    an auth-unset install with a credentialed backend lets ANY network peer
-    that can reach the gateway sign a request with that key. Refuses to
-    start rather than run that way.
-
-    Two ways out, both named in the error: configure AGENT_TOKENS, or set
-    ALLOW_UNAUTHENTICATED_PROVIDER_KEYS=1 — an explicit, deliberate override
-    for a deployment that has decided the risk is acceptable (documented in
-    .env.example with a warning).
-
-    REFINED invariant, not a narrowed one: an auth-unset install with NO
-    provider-credentialed backend configured — the original backward-compat
-    population, e.g. a bare local llama-server — is completely unaffected;
-    this only gates the NEW combination of auth-off *and* a live provider
-    key. Call from main() ONLY (the real entrypoint), same placement
-    reasoning as require_no_plaintext_agent_tokens(): every test in this
-    repo imports this module freely, many with AUTH_CONFIGURED_AT_STARTUP
-    False on purpose, so an unconditional check here would kill test
-    collection itself, not just a genuinely misconfigured gateway.
-    """
+    """Refuse startup if provider keys are configured without AGENT_TOKENS or explicit
+    ALLOW_UNAUTHENTICATED_PROVIDER_KEYS (decision:1303 — auth off with a live provider
+    key attached to a backend refuses startup). Called from main() to avoid failing test
+    collection."""
     if AUTH_CONFIGURED_AT_STARTUP:
         return
     credentialed = sorted(b for b in LLM_BACKENDS if LLM_BACKEND_TOKENS.get(b))
@@ -4593,42 +3753,13 @@ def require_auth_when_provider_keys_configured() -> None:
 
 
 def require_valid_llm_routing_config() -> None:
-    """Model-attributes routing startup refusals (Model_Attributes_Routing_
-    Plan_2026-08-18 REVISED DESIGN). Three loud, named refusals, all
-    deferred to main() ONLY — same placement reasoning as require_auth_
-    when_provider_keys_configured() above: every test in this repo imports
-    this module freely with all manner of deliberately-invalid combinations,
-    so an unconditional check at import/parse time would kill test
-    collection itself, not just a genuinely misconfigured gateway.
-
-    1. Unknown `roles` entry — collected by _load_llm_backends() into
-       _LLM_BACKEND_ROLE_CONFIG_ERRORS at parse time; raised here. UNCHANGED
-       by W4 — still fatal.
-    2. M-5′ (W4, decision:1824 — was Critical/fatal, now a DEGRADED WARNING):
-       a credentialed (token_env resolved) backend with NEITHER `roles` NOR
-       an EXPLICIT `private_ok` used to be bricked SILENT under the old
-       default (private_ok defaulted True for it); under default-deny it is
-       simply never selected (private_ok defaults False) — safe by
-       construction, so refusing startup over it is no longer warranted.
-       Loud startup log instead, plus check_config's per-entry rendering
-       (H2/H3 posture — no new /health surface, decision:1785).
-    3. P-5′ (W4): auth OFF (no AGENT_TOKENS configured) AND a backend whose
-       `private_ok` was EXPLICITLY set to false (not merely defaulted) →
-       loud startup log, never a refusal. Narrowed from the old "ANY
-       private_ok=false" predicate because under default-deny that is now
-       the pervasive, unremarkable default for every undeclared backend —
-       only an OPERATOR-STATED false (a deliberate scoping decision) is
-       still worth a word. SEC H-1 (fix round): "safe by construction" is
-       true ONLY for the roles-ABSENT subset — no `roles` plus
-       `private_ok=false` really does serve nothing. A backend that ALSO
-       carries `roles` is NOT safe by construction: those roles still serve
-       EVERY caller, and with auth off the gateway cannot tell callers
-       apart — the scoping is unenforceable, not harmless. The two
-       populations get two separate warnings below, worded accordingly. The
-       old ALLOW_UNAUTHENTICATED_PROVIDER_KEYS override branch is gone with
-       the exit it existed to bypass — S-05's own use of that knob
-       (require_auth_when_provider_keys_configured) is untouched.
-    """
+    """Validate model routing configuration at startup. Raises on invalid roles
+    and warns when credentialed backends lack roles or explicit private_ok
+    (decision:1824 — backend configuration must be declared or it does not fire:
+    private_ok is default-deny, so an undeclared backend serves nothing;
+    decision:1785 — the telemetry contract: /health answers "can I use it and what
+    to expect", /memory/telemetry carries the numbers, logs carry the events), or
+    when unauthenticated backends set private_ok to false."""
     if _LLM_BACKEND_ROLE_CONFIG_ERRORS:
         raise SystemExit(
             "FATAL: LLM_BACKENDS_JSON has invalid `roles` entries:\n  "
@@ -4691,15 +3822,10 @@ def require_valid_llm_routing_config() -> None:
 
 
 def warn_if_dream_slots_impossible() -> None:
-    """C-1 (decision:1357): if NO backend counts toward /pool/status
-    free_slots, every dream daemon (REM, NREM) gates itself
-    off a permanent 0 and simply never runs — with no LLM call ever made, no
-    refusal counter ever fires, so without this warning the condition is
-    invisible everywhere. A partial-role fleet (e.g. every backend scoped to
-    a single function) is the remaining way to reach it; per-role slot
-    accounting stays deferred, so the honest answer today is a LOUD startup
-    line naming the fix. A warning, not a refusal — a gateway serving only
-    ad-hoc client traffic is legitimate."""
+    """Warn at startup if no backend contributes to /pool/status free_slots, which
+    would prevent REM and NREM dream daemons from ever running (decision:1357 — the
+    routing ruling: counting only serves-all backends toward free_slots silently
+    zeroed the dream cycle, plus six required fixes)."""
     if any(_counts_free_slot(b) for b in LLM_BACKENDS):
         return
     log.warning(
@@ -4719,12 +3845,10 @@ TOKEN_LIFECYCLE_SUM_INTERVAL_S = float(os.environ.get("TOKEN_LIFECYCLE_SUM_INTER
 
 
 def _emit_token_lifecycle_sums(reason: str) -> None:
-    """One structured line per backend with the LIFECYCLE token totals so
-    far, to the journal AND the gateway audit JSONL (A2). DIRECT SYNCHRONOUS
-    write — never AsyncLineWriter, whose shutdown-only flush-hang (fact:1335
-    open item) this call must not risk triggering during the gateway's own
-    drain sequence. Best-effort: a write failure here must never break
-    shutdown or the periodic caller's loop."""
+    """Write lifecycle token totals per backend directly to the journal and audit
+    JSONL, bypassing AsyncLineWriter (fact:1335 — v0.9.9 shipped the method-and-path
+    allowlist on the credentialed proxy path; its open item is that AsyncLineWriter's
+    shutdown flush can hang). Best-effort write that never breaks shutdown or loops."""
     ts = datetime.now(timezone.utc).isoformat()
     for b in LLM_BACKENDS:
         p = _llm_tokens_prompt_total.get(b, 0)
@@ -4747,9 +3871,8 @@ def _emit_token_lifecycle_sums(reason: str) -> None:
 
 
 async def _token_lifecycle_sum_daemon(stop_event: asyncio.Event) -> None:
-    """Periodic A2 emission on TOKEN_LIFECYCLE_SUM_INTERVAL_S (no-op, exits
-    immediately, when unset/0 — the shutdown emission in main()'s drain
-    sequence is unconditional and covers every install either way)."""
+    """Periodically emit token lifecycle sums on TOKEN_LIFECYCLE_SUM_INTERVAL_S;
+    exits immediately if interval is <= 0."""
     if TOKEN_LIFECYCLE_SUM_INTERVAL_S <= 0:
         return
     while not stop_event.is_set():
@@ -4761,20 +3884,15 @@ async def _token_lifecycle_sum_daemon(stop_event: asyncio.Event) -> None:
 
 
 def _default_uds_path() -> str:
-    """Per-user runtime socket by default (0700 dir → only this user reaches it,
-    which is exactly right for a single-user box). For a multi-user gateway set
-    GATEWAY_UDS_PATH to a shared location and widen GATEWAY_UDS_MODE."""
+    """Return default per-user runtime socket path under XDG_RUNTIME_DIR or /tmp
+    (overridden by GATEWAY_UDS_PATH / GATEWAY_UDS_MODE)."""
     base = os.environ.get("XDG_RUNTIME_DIR") or "/tmp"
     return os.path.join(base, "shared-memory-gw.sock")
 
 
 def _encoder_routing_log_line() -> str:
-    """Pure formatter for the startup encoder-routing announcement (Group 3
-    journal-scrub sweep). Split out from the log.info() call so a test can
-    assert on the exact string without capturing logging output. Scrubbed
-    like every other URL-bearing startup line: EMBEDDER_URL/RERANKER_URL are
-    ordinary env-configured endpoints, never validated to be credential-free,
-    and this line is unconditional at every gateway start."""
+    """Format the startup encoder routing announcement with scrubbed EMBEDDER_URL
+    and RERANKER_URL endpoints for unit test assertion."""
     return (
         f"### /v1/embeddings->{scrub_url_credentials(EMBEDDER_URL)} | "
         f"/v1/reranking->{scrub_url_credentials(RERANKER_URL)} | default->LLM pool"
@@ -4782,20 +3900,8 @@ def _encoder_routing_log_line() -> str:
 
 
 def _resolve_proxy_bind_host() -> str:
-    """The interface hive_mind_proxy binds to — pure (reads os.environ,
-    performs no I/O, opens no socket), so it can be unit-tested without a
-    real TCPSite.
-
-    SEC H (R-3, RULED — Xenofon 2026-09-02, measured on glxvm):
-    TCPSite(runner, "", port) binds ALL interfaces (0.0.0.0 + [::]);
-    "127.0.0.1" binds loopback only. A PRESENT-BUT-EMPTY PROXY_BIND
-    (`PROXY_BIND=` in the env file, or an EnvironmentFile line whose value
-    was blanked) must NOT fall through to the empty string — the `or`
-    idiom (deliberately not `.get()`'s own default, which would honour an
-    empty value AS empty) catches both "unset" and "set-but-empty" the
-    same way and resolves both to loopback. All-interfaces stays the
-    explicit PROXY_BIND=0.0.0.0 opt-in — a deliberate, recorded reversal of
-    the W1 "never normalise an idiom" position, for this one site."""
+    """Resolve the bind interface from PROXY_BIND, defaulting unset or empty values
+    to 127.0.0.1 (loopback); all-interfaces requires explicit PROXY_BIND=0.0.0.0."""
     raw = os.environ.get("PROXY_BIND", "")
     resolved = raw.strip() or "127.0.0.1"
     if "PROXY_BIND" in os.environ and not raw.strip():
