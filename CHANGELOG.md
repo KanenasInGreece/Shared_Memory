@@ -7,6 +7,20 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.0.3] - 2026-09-24
+
+Postflight's fresh-install parity assertion passes again on an existing install. `API_VERSION` stays 4.
+
+### Fixed
+- Postflight A3 (Postgres fresh-install parity) failed on every install older than v0.9.113, because that release shortened comments inside three plpgsql function bodies by editing the migrations that create them. Those migrations were already recorded in `schema_migrations`, and `apply.py` never re-runs a recorded migration, so the live bodies stayed frozen with the old comments while the migration files and `schema_init.sql` moved on. A fresh install was never affected; it builds from the current files and matches them. `042_function_comment_parity.sql` re-creates `notify_new_artifact`, `entity_vocab_aliases_before_write` and `assert_domain_alias_namespaces_disjoint` with `CREATE OR REPLACE`, so an existing install converges on what a fresh one installs. A migration is immutable once applied, which is why this is a new file rather than another edit to the originals.
+
+### Verification
+- Measured against a live database: `verify_schema_init.py` exited 1 before applying the migration and exits 0 after, reporting `functions 132/132 - tables 16/16 - triggers 9/9 - indexes 61/61`. After the migration, `pg_get_functiondef` for each of the three functions is byte-identical to the definition `schema_init.sql` installs, modulo the trailing semicolon `pg_get_functiondef` does not emit. Suite 4152 passed, 1 skipped.
+- `apply.py` resumes from `SELECT max(filename)` rather than from the set of applied filenames, so a database already past a repair migration's number would skip it permanently. Every host was checked before this landed: two were at `041_outbox_type_check.sql` and 041 was the highest file on `main`.
+
+### Known, not fixed here
+- `schema_init.sql` is auto-generated but has been hand-edited: regenerating it produces a 40-line diff from a shortened header and one reformatted `CHECK` constraint, so the file is not currently reproducible from its own generator. It does not affect A3 and is left for its own change.
+
 ## [1.0.2] — 2026-09-24
 
 The reasoning pool serves an external OpenAI-compatible provider as a fleet rather than as one busy card. `API_VERSION` stays 4.
