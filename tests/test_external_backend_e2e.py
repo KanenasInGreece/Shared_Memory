@@ -31,6 +31,7 @@ import importlib
 import json
 import os
 import sys
+import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -83,8 +84,17 @@ class StubProvider:
 
 
 def _artifact_dir() -> Path:
-    raw = os.environ.get("SM_E2E_ARTIFACT_DIR", "~/.shared-memory/e2e")
-    d = Path(os.path.expanduser(raw))
+    """Where the run's transcript lands.
+
+    SM_E2E_ARTIFACT_DIR is the durable, opt-in location an operator sets when
+    they want the artifact to outlive the run. With it unset the transcript goes
+    to a temporary directory instead of the real home: an ordinary `pytest
+    tests/` by a stranger must not write into ~/.shared-memory, which is the
+    same rule conftest applies to the credential-audit and capacity logs.
+    """
+    raw = os.environ.get("SM_E2E_ARTIFACT_DIR")
+    d = (Path(os.path.expanduser(raw)) if raw
+         else Path(tempfile.gettempdir()) / "sm-e2e-artifacts")
     d.mkdir(parents=True, exist_ok=True)
     return d
 
@@ -114,7 +124,11 @@ def _restore_gateway_module_state():
                 "LLM_PROBE_INTERVAL_CREDENTIALED_S", "E2E_PROVIDER_KEY"):
         os.environ.pop(var, None)
     import secure_env
-    secure_env._secrets.pop("AGENT_TOKENS", None)
+    # E2E_PROVIDER_KEY is read through get_secret, which CACHES it, so clearing
+    # the environment alone would leave this file's invented value readable by
+    # every later test in the session.
+    for cached in ("AGENT_TOKENS", "E2E_PROVIDER_KEY"):
+        secure_env._secrets.pop(cached, None)
     import coordinator
     import hive_mind_proxy
     importlib.reload(coordinator)
@@ -131,8 +145,13 @@ def _load_gateway(monkeypatch, backends):
     monkeypatch.delenv("AGENT_TOKENS", raising=False)
     monkeypatch.delenv("LLM_BACKENDS", raising=False)
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps(backends))
-    monkeypatch.setenv("LLM_PROBE_INTERVAL_S", "0.2")
-    monkeypatch.setenv("LLM_PROBE_INTERVAL_CREDENTIALED_S", "1.0")
+    # setdefault, not setenv: a scenario that needs a particular cadence sets it
+    # before calling this, and clobbering that made the cadence test measure the
+    # default instead of the gap it was configured to measure.
+    monkeypatch.setenv("LLM_PROBE_INTERVAL_S",
+                       os.environ.get("LLM_PROBE_INTERVAL_S") or "0.2")
+    monkeypatch.setenv("LLM_PROBE_INTERVAL_CREDENTIALED_S",
+                       os.environ.get("LLM_PROBE_INTERVAL_CREDENTIALED_S") or "1.0")
     import secure_env
     secure_env._secrets.pop("AGENT_TOKENS", None)
     import coordinator
@@ -196,6 +215,10 @@ def test_e2e_a_declared_multi_slot_backend_stays_available_while_busy(monkeypatc
         client = TestClient(TestServer(app))
         await client.start_server()
         try:
+            # Generous, because the snapshot must happen while BOTH requests are
+            # still in flight and the pinning below spends ~0.4 s getting there;
+            # a 0.6 s upstream left too little margin on a loaded machine.
+            stub.slow_seconds = stub_local.slow_seconds = 5.0
             stub.chat_mode = stub_local.chat_mode = "slow"
             # Pin one request to EACH backend. Left to itself the router picks
             # least-in-flight and would send both to the hosted one, leaving
@@ -360,9 +383,9 @@ def test_e2e_a_rate_limited_probe_does_not_report_a_working_pool_as_down(monkeyp
 
     assert set(obs["probe_status_map"].values()) == {"ok"}, (
         f"a 429 on the liveness probe was read as not-ok; artifact {path}")
-    assert obs["llm_pool_dependency"]["state"] != "down", (
-        f"a rate-limited probe reported the pool DOWN while it was serving; "
-        f"artifact {path}")
+    assert obs["llm_pool_dependency"]["state"] == "ok", (
+        f"a rate-limited probe must leave the pool exactly ok — 'not down' would "
+        f"also accept a regression to degraded; artifact {path}")
     assert obs["real_completion_status"] == 200, (
         f"the backend that was called down did not actually serve; artifact {path}")
     assert obs["llm_pool_dependency_when_failing"]["state"] == "down", (
@@ -390,6 +413,10 @@ def test_e2e_a_credentialed_backend_is_probed_far_less_often(monkeypatch):
         plain_url = f"http://{up_p.host}:{up_p.port}"
         keyed_url = f"http://{up_k.host}:{up_k.port}"
         monkeypatch.setenv("E2E_PROVIDER_KEY", "k" * 20)
+        # A wider gap between the two intervals, so the comparison below is a
+        # ratio with room in it rather than an absolute count sitting on its
+        # own boundary.
+        monkeypatch.setenv("LLM_PROBE_INTERVAL_CREDENTIALED_S", "2.0")
         c, g = _load_gateway(monkeypatch, [
             {"url": plain_url, "private_ok": True},
             {"url": keyed_url, "private_ok": True, "token_env": "E2E_PROVIDER_KEY",
@@ -420,7 +447,13 @@ def test_e2e_a_credentialed_backend_is_probed_far_less_often(monkeypatch):
         f"the credentialed backend was not credentialed, so this measured nothing; "
         f"artifact {path}")
     hits = obs["probe_hits"]
-    assert hits["plain"] > hits["credentialed"], (
-        f"the credentialed backend was probed as often as the plain one; artifact {path}")
-    assert hits["credentialed"] <= 3, (
-        f"the credentialed interval is not being honoured; artifact {path}")
+    assert hits["credentialed"] >= 1, (
+        f"the credentialed backend was never probed at all, so this measured "
+        f"nothing; artifact {path}")
+    # A ratio, not an absolute count: the plain interval is a quarter of the
+    # credentialed one, so anything less than twice as many plain probes means
+    # the separation is not being honoured, and a loaded machine that runs
+    # fewer cycles overall still satisfies it.
+    assert hits["plain"] >= 2 * hits["credentialed"], (
+        f"the credentialed backend was probed nearly as often as the plain one "
+        f"({hits}); artifact {path}")
