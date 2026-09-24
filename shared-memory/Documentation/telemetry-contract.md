@@ -3,7 +3,7 @@
 
 # The Telemetry Contract
 
-Contract version **1.0.1**. Every key the gateway emits on `GET /health` and `GET /memory/telemetry`, what it means, what it is measured in, when it arrived, and where it is going.
+Contract version **1.0.2**. Every key the gateway emits on `GET /health` and `GET /memory/telemetry`, what it means, what it is measured in, when it arrived, and where it is going.
 
 ## The roles
 
@@ -126,6 +126,7 @@ Each key below was moved to a new home and served from both places while consume
 | `GET /health` | `config.llm_pool_tuning.cooldown_s` | `telemetry:config.llm_pool_tuning.cooldown_s` |
 | `GET /health` | `config.llm_pool_tuning.fail_threshold` | `telemetry:config.llm_pool_tuning.fail_threshold` |
 | `GET /health` | `config.llm_pool_tuning.fail_window_s` | `telemetry:config.llm_pool_tuning.fail_window_s` |
+| `GET /health` | `config.llm_pool_tuning.http_fail_threshold` | `telemetry:config.llm_pool_tuning.http_fail_threshold` |
 | `GET /health` | `daemon` | `health:nrem_daemon_process` |
 | `GET /health` | `domain_identity.complete` | `telemetry:axes.domain_identity.complete` |
 | `GET /health` | `domain_identity.mismatched` | `telemetry:axes.domain_identity.mismatched` |
@@ -510,6 +511,7 @@ The envelope is `{"status": "success", "telemetry": {…}}`; paths below are rel
 | `config.llm_pool_tuning.cooldown_s` | float/int | _s | 0.9.74 | — | — | — | — |
 | `config.llm_pool_tuning.fail_threshold` | int | — | 0.9.74 | — | — | — | — |
 | `config.llm_pool_tuning.fail_window_s` | float/int | _s | 0.9.74 | — | — | — | — |
+| `config.llm_pool_tuning.http_fail_threshold` | int | — | 1.0.2 | — | — | — | Upstream 429 and 5xx count toward a backend's cooldown on this threshold rather than the transport one; a success clears the streak, so it counts consecutive failures rather than a rate. |
 | `gpu_probe` | null | — | 0.9.74 | — | — | — | null until the first probe |
 | `gpu_probe.consecutive_hangs` | int | — | 0.9.74 | — | — | — | — |
 | `gpu_probe.leaked_children` | int | — | 0.9.74 | — | — | — | — |

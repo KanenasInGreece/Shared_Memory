@@ -83,7 +83,7 @@ __all__ = [
 ]
 
 #: Not a free-running today: this is the fifth version pin, so a missed bump is visible (decision:1832).
-VERSION = "1.0.1"
+VERSION = "1.0.2"
 
 
 def _version_tuple(v: str) -> tuple:
@@ -163,6 +163,7 @@ INTRODUCED_0_9_97 = "0.9.97"
 INTRODUCED_0_9_104 = "0.9.104"
 #: insight_gate_skips on the consolidation roll-up. VERSION is not bumped in this change.
 INTRODUCED_0_9_114 = "0.9.114"
+INTRODUCED_1_0_2 = "1.0.2"
 #: Frozen release at which the v0.9.74 /health copies stop being served. A later drop gets its own stamp.
 DUAL_EMIT_DROP_TARGET = "0.9.90"
 #: Telemetry copies stay one release longer because the monitor still reads the old homes (fact:1989).
@@ -548,6 +549,16 @@ HEALTH: dict[str, dict] = {
     "config.llm_pool_tuning.cooldown_s": _k(
         "float|int", "llm", unit="_s",
         moved_to="telemetry:config.llm_pool_tuning.cooldown_s", removed_in=DUAL_EMIT_DROP_TARGET),
+    # Declared here only so /health strips it: the config block is built once and
+    # read by both endpoints, and an UNDECLARED key would pass strip_dropped and
+    # reach /health undocumented. The key itself is new at 1.0.2 and belongs on
+    # telemetry, where the whole block moved at 0.9.90 — hence a since LATER than
+    # its own removed_in, which is truthful rather than odd: it never appears on
+    # /health at any version.
+    "config.llm_pool_tuning.http_fail_threshold": _k(
+        "int", "llm", since=INTRODUCED_1_0_2,
+        moved_to="telemetry:config.llm_pool_tuning.http_fail_threshold",
+        removed_in=DUAL_EMIT_DROP_TARGET),
     "config.llm_affinity.prefix_chars": _k(
         "int", "llm", unit="_chars",
         moved_to="telemetry:config.llm_affinity.prefix_chars", removed_in=DUAL_EMIT_DROP_TARGET),
@@ -1024,6 +1035,12 @@ TELEMETRY: dict[str, dict] = {
     "config.llm_backends[].price_per_mtok_in": _k("float|null", "llm", since=INTRODUCED_0_9_74),
     "config.llm_backends[].price_per_mtok_out": _k("float|null", "llm", since=INTRODUCED_0_9_74),
     "config.llm_pool_tuning.fail_threshold": _k("int", "llm", since=INTRODUCED_0_9_74),
+    # Declared on telemetry only, never on health: every /health copy of this block carries removed_in=0.9.90 and is already stripped, so a new key there would be born retired.
+    "config.llm_pool_tuning.http_fail_threshold": _k(
+        "int", "llm", since=INTRODUCED_1_0_2,
+        note="Upstream 429 and 5xx count toward a backend's cooldown on this "
+             "threshold rather than the transport one; a success clears the "
+             "streak, so it counts consecutive failures rather than a rate."),
     "config.llm_pool_tuning.fail_window_s": _k("float|int", "llm", unit="_s", since=INTRODUCED_0_9_74),
     "config.llm_pool_tuning.cooldown_s": _k("float|int", "llm", unit="_s", since=INTRODUCED_0_9_74),
     "config.llm_affinity.prefix_chars": _k("int", "llm", unit="_chars", since=INTRODUCED_0_9_74),

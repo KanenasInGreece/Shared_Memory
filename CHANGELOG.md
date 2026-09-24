@@ -7,6 +7,23 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.0.2] — 2026-09-24
+
+The reasoning pool serves an external OpenAI-compatible provider as a fleet rather than as one busy card. `API_VERSION` stays 4.
+
+### Fixed
+- `/pool/status` reports a backend available when it has spare capacity, not only when it is idle. `available` compared the in-flight count against zero and never read the backend's declared `max_inflight`, so a provider offering 32 slots reported unavailable with 31 of them free and the dream daemons deferred for the length of every request. A backend that declares no `max_inflight` is unchanged: the default of one reproduces the old test exactly.
+- An upstream 429 or 5xx counts toward a backend's cooldown. Only transport-level errors did before, and a hosted provider reports its faults as an HTTP status, so a backend answering 429 to everything kept a clean fail streak and stayed in rotation. It was worse than staying in: a fast error returns its slot immediately, so least-in-flight selection actively preferred the failing backend over a healthy one mid-generation. Every 4xx other than 429 never counts, because a rejected key or a wrong path does not heal on a cooldown timer.
+- The liveness probe no longer reports a rate-limited provider as a dead pool. A 429 on `GET /v1/models` read as not-ok, which drove `llm_pool` and the top-level status to `down` while the provider would serve real traffic; 401 and 403 still surface, because a rejected key is a real fault. A 404 stays not-ok on purpose: the probe asks for one path only, so a mistyped URL has no other evidence behind it, and calling it alive would leave that backend healthy-looking and never cooling down.
+
+### Added
+- `LLM_HTTP_FAIL_THRESHOLD` (default 5, unmeasured), the threshold an upstream 429 or 5xx counts against. A success clears the streak, so it counts consecutive failures rather than a rate. Published on `/memory/telemetry` as `config.llm_pool_tuning.http_fail_threshold`.
+- `LLM_PROBE_INTERVAL_S` (default 3.0) and `LLM_PROBE_INTERVAL_CREDENTIALED_S` (default 30.0, both unmeasured). The probe cadence was a hardcoded 3 s for every backend, which cost a hosted provider roughly 28,800 authenticated `GET /v1/models` a day and could spend a request quota on liveness alone. A credentialed backend's `/health` status can now be up to the credentialed interval stale.
+- `tests/test_external_backend_e2e.py`, an end-to-end suite that drives a real aiohttp upstream on a real port through the real proxy over real sockets, with the upstream's behaviour switchable per route. Each run writes a JSON transcript naming the fleet, the observations and the upstream's own hit counters; `SM_E2E_ARTIFACT_DIR` makes it durable.
+
+### Changed
+- Comments in `hive_mind_proxy.py`, `rem_loop.py` and `nrem_gate.py` are one or two sentences, and every record id they cite carries a short gloss of what that record says. Comments that were already a single clear line are untouched. Code and control flow are unchanged: each file parses to an identical syntax tree once docstrings are blanked.
+
 ## [1.0.1] — 2026-09-23
 
 The MCP connector loses a tool that could never succeed, and reports a slow gateway as slow. `API_VERSION` stays 4.

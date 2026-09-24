@@ -1,6 +1,7 @@
-"""Pure (project, domain) fold partitioner; no DB driver, so the gateway telemetry gauge can import it without psycopg2.
+"""Pure (project, domain) fold partitioner without DB drivers for telemetry import.
 
-Keep imports stdlib-only besides project_axis and ontology; test_nrem_gate_import_purity.py enforces that.
+Imports must stay stdlib-only (besides project_axis and ontology), enforced by
+test_nrem_gate_import_purity.py.
 """
 
 from project_axis import fold_eligible
@@ -8,22 +9,13 @@ from project_axis import fold_eligible
 
 def eligible_domain_level_clusters(contents, pg_ids, project_map, domains_map,
                                    threshold, registered_sections):
-    """THE v2 FACT GATE PARTITIONER (Dreaming Cycle Plan to v2, §2.1) — the
-    only one ``consolidation_loop._consolidate_clusters`` calls, and the only
-    one ``coordinator._nrem_cycle_counts`` counts against for its
-    `fact_cycles` census, so the fold and its telemetry can never again
-    disagree. (project, section) with **no** entity — exactly the plan's
-    anchor: "(project, domain), and nothing else."
-
-    Pure. Only **registered** non-empty sections form buckets — an unregistered
-    or blank section never qualifies. ``registered_sections`` is a set of
-    ``(project_name, section_name)`` pairs. ``_consolidate_clusters`` derives
-    it from the SAME graph rows ``_find_grounded_fact_groups`` already proved
-    registered (a DOMAIN_OF/PROJECT_OF edge only exists for a registered
-    section — coordinator.py's ``_domain_identities`` never writes one
-    otherwise), so this is a second, cheap confirmation rather than a second
-    source of truth. Fan-out: a fact tagged with several sections counts in
-    each bucket, not just one.
+    """Partition facts into ``(project, section)`` buckets for registered sections,
+    fanning out multi-section facts. Shared by ``_consolidate_clusters`` and
+    ``_nrem_cycle_counts`` so fold processing and telemetry census match.
+    ``registered_sections`` is a second, cheap confirmation rather than a second
+    source of truth: a DOMAIN_OF/PROJECT_OF edge exists only for a registered
+    section, so the caller derives it from the same graph rows that already
+    proved registration.
 
     Returns list of ``((project, section), contents, pg_ids)``.
     """
@@ -55,10 +47,10 @@ def eligible_domain_level_clusters(contents, pg_ids, project_map, domains_map,
 
 def count_domain_level_cycles(pg_ids, project_map, domains_map, threshold,
                               registered_sections):
-    """Telemetry twin of ``eligible_domain_level_clusters`` — count only,
-    same partitioner, so the gauge and the fold can never again describe
-    different populations. Used by ``coordinator._nrem_cycle_counts`` for the
-    `fact_cycles` census in ``GET /memory/telemetry``."""
+    """Count-only wrapper around ``eligible_domain_level_clusters`` used by
+    ``coordinator._nrem_cycle_counts`` for the `fact_cycles` census in
+    ``GET /memory/telemetry``.
+    """
     contents = [""] * len(pg_ids)
     return len(eligible_domain_level_clusters(
         contents, pg_ids, project_map, domains_map, threshold,
