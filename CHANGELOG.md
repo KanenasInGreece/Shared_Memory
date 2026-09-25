@@ -7,6 +7,24 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.0.4] - 2026-09-25
+
+The install path stops being able to leak a token by accident. `API_VERSION` stays 4.
+
+### Fixed
+- `--reveal` refuses when stdout is not a terminal. A pipe, a redirect, a log or an agent's captured output is where a token must never land, and the refusal happens before anything is minted, revealed or written. This had been measured twice: following the published install path put a live bearer token into an agent transcript, and the same token then sat in a world-readable log for sixteen hours, which provoked an installing agent into scanning the filesystem for credentials. Every surface already said reveal was operator-only, in prose, in three places. The guard is conditioned on `--reveal` alone, so the write-through mint every local agent install uses is untouched: local agents are minted with `--install-path`, which writes the token into that agent's own `.env` and prints only the path.
+- The refusal does not name its own override. A refusal that prints its bypass is one an agent satisfies by setting the bypass, which is why `gitguard`'s refusal never names its marker either.
+- A value of exactly 64 hexadecimal characters offered where a plaintext token belongs is refused as digest-shaped, because a client `.env` was once given the digest from the gateway's registry and failed later as an opaque rejection. `--force-hex` registers one anyway, for a token an operator genuinely generated as hex.
+- `--role` accepts `write` as an alias for `full`. `GET /health` renders that role as `write`, so a role read off a live gateway and passed back was refused for using the framework's own word. It lands in the registry as `full`; `write` is not a registry role.
+- An undeliverable mint prints the `mkdir` and the per-agent `--remint` that fix it, instead of saying only that something went wrong.
+
+### Added
+- `SHARED_MEMORY_ALLOW_REVEAL_WITHOUT_TTY`, documented in `.env.example` as something whose output should be treated as disclosed. No install needs it.
+- `OPERATE.md` gains what to capture before an uninstall removes the `.env` — the backend entry and the separate key-file pointer, whose absence loads a backend with `has_credential=False` while looking correctly restored — and a note that a non-login ssh shell cannot see a user-local `uv`.
+
+### Verification
+- Proved on a deliberate full uninstall and clean reinstall of the d9400 test host: the bulk mint ran over ssh with no terminal and was never refused, the undeliverable report named each recovery command, `--role write` landed as `opencode:full`, and postflight returned exit 0 in CANARY mode with 21 assertions passed. Suite 4199 passed, 1 skipped.
+
 ## [1.0.3] - 2026-09-24
 
 Postflight's fresh-install parity assertion passes again on an existing install. `API_VERSION` stays 4.
