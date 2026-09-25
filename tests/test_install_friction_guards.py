@@ -212,7 +212,7 @@ def test_an_invented_role_is_still_refused(tmp_path):
 
 def test_the_missing_directory_failure_names_the_commands_to_fix_it():
     src = (SCRIPTS / "generate_tokens.py").read_text()
-    assert "mkdir -p {skill_dir} && bootstrap_tokens.sh --remint {a}" in src, (
+    assert "mkdir -p {skill_dir} && bash shared-memory/scripts/bootstrap_tokens.sh --remint {a}" in src, (
         "the missing-directory failure must name both the mkdir and the per-agent "
         "remint, or the reader is left to infer the recovery")
 
