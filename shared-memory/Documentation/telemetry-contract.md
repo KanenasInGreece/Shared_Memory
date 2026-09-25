@@ -3,7 +3,7 @@
 
 # The Telemetry Contract
 
-Contract version **1.0.6**. Every key the gateway emits on `GET /health` and `GET /memory/telemetry`, what it means, what it is measured in, when it arrived, and where it is going.
+Contract version **1.0.7**. Every key the gateway emits on `GET /health` and `GET /memory/telemetry`, what it means, what it is measured in, when it arrived, and where it is going.
 
 ## The roles
 
@@ -783,9 +783,18 @@ The envelope is `{"status": "success", "telemetry": {…}}`; paths below are rel
 | `compliance.invalid_relationships[].count` | int | — | <=0.9.73 | — | — | — | — |
 | `compliance.invalid_relationships[].name` | str | — | <=0.9.73 | — | — | — | — |
 | `compliance.label_compliance` | str | — | <=0.9.73 | — | — | — | ok \| non-compliant |
+| `compliance.label_distribution` | dict | — | 1.0.7 | — | — | — | every label in the graph with its node count; a node with several labels counts once under each |
+| `compliance.label_distribution.*` | int | — | 1.0.7 | — | — | — | — |
 | `compliance.predicate_distribution` | dict | — | <=0.9.73 | — | — | — | — |
 | `compliance.predicate_distribution.*` | int | — | <=0.9.73 | — | — | — | a CENSUS of what is in the graph, not of what the ontology allows — a legacy predicate (ALIASES) shows here for as long as edges exist |
 | `compliance.relationship_compliance` | str | — | <=0.9.73 | — | — | — | — |
+| `compliance.top_paths[]` | list | — | 1.0.7 | — | — | — | the most frequent (label set, relationship type, label set) triples, at most 15; a label set is the node's labels sorted and joined with ':'. Computed in the background every GRAPH_TOP_PATHS_REFRESH_S, never on this request; empty until the first computation and when that setting is 0 |
+| `compliance.top_paths[].count` | int | — | 1.0.7 | — | — | — | — |
+| `compliance.top_paths[].from` | str | — | 1.0.7 | — | — | — | — |
+| `compliance.top_paths[].rel` | str | — | 1.0.7 | — | — | — | — |
+| `compliance.top_paths[].to` | str | — | 1.0.7 | — | — | — | — |
+| `compliance.top_paths_as_of` | str/null | — | 1.0.7 | — | — | — | when the served top_paths were computed; null before the first success. A failed refresh leaves this at the last success |
+| `compliance.top_paths_error` | str | — | 1.0.7 | — | — | — | present only when the last top_paths refresh failed |
 | `entity_graph.entities_total` | int | — | <=0.9.73 | — | — | — | — |
 | `entity_graph.error` | str | — | <=0.9.73 | — | — | — | present only when this section's own query failed |
 | `entity_graph.genuinely_referenced_entities` | int | — | <=0.9.73 | — | — | — | — |

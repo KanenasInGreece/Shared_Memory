@@ -126,7 +126,7 @@ def _short(value: Any, cap: int = 200) -> str:
 
 
 # FRAMEWORK_VERSION is the build string and may drift. API_VERSION is the wire contract with memory_bridge.py; bump it only when shape, auth, or routes break older clients.
-FRAMEWORK_VERSION = "1.0.6"
+FRAMEWORK_VERSION = "1.0.7"
 # API v2: retrospective is a full record. v4: unregistered project is 400 (proposal / new_project / sentinel).
 API_VERSION = 4
 CLIENT_VERSION_HEADER = "X-SM-Api-Version"
@@ -1921,6 +1921,24 @@ CONSOLIDATION_ORPHAN_TIMEOUT_SEC = int(os.environ.get("CONSOLIDATION_ORPHAN_TIME
 
 # Telemetry tunables: every default is unmeasured unless its comment says otherwise (decision:1785, fact:1338).
 TELEMETRY_CACHE_S = float(os.environ.get("TELEMETRY_CACHE_S", "15"))
+#: How often the background refresher recomputes compliance.top_paths, a full relationship scan. 0 disables it. UNMEASURED; fact:2767 timed 0.23 s on 33k relationships.
+GRAPH_TOP_PATHS_REFRESH_S = float(os.environ.get("GRAPH_TOP_PATHS_REFRESH_S", "300"))
+#: Rows served in compliance.top_paths.
+GRAPH_TOP_PATHS_LIMIT = 15
+
+
+def merge_top_paths(rows: list, limit: int) -> list[dict]:
+    """Collapse (labels, type, labels) count rows onto sorted label sets and return the most frequent.
+
+    labels() order is not guaranteed and many nodes carry several labels, so the same set can arrive
+    in two orders; each set is sorted and joined with ":" before grouping. Ties order by from, rel, to.
+    """
+    acc: dict[tuple[str, str, str], int] = {}
+    for r in rows:
+        key = (":".join(sorted(r["la"] or [])), r["rel"], ":".join(sorted(r["lb"] or [])))
+        acc[key] = acc.get(key, 0) + r["c"]
+    ranked = sorted(acc.items(), key=lambda kv: (-kv[1], kv[0]))
+    return [{"from": f, "rel": rel, "to": t, "count": c} for (f, rel, t), c in ranked[:limit]]
 #: Observation window for the encoder latency rings. UNMEASURED.
 ENCODER_LATENCY_WINDOW = int(os.environ.get("ENCODER_LATENCY_WINDOW", "200"))
 #: Own window for the pool-wait and Neo4j rings. Sharing the encoder window let one rename move three instruments. Both unmeasured.
@@ -2582,6 +2600,8 @@ class MemoryCoordinator:
         # Cached consolidation snapshot so /health stays database-free; stalled is not asserted on no data. The telemetry lock is single-flight; see _telemetry_cached.
         self._telemetry_cache: dict = {"snap": None, "ts": 0.0}
         self._telemetry_lock = asyncio.Lock()
+        # compliance.top_paths, refreshed in the background (decision:2768). Kept out of _dependency_health so /health never carries it.
+        self._top_paths: dict = {"rows": [], "as_of": None, "error": None, "attempted": None}
         # Proxy-owned telemetry blocks. Importing hive_mind_proxy back would cycle; None means those sections are absent.
         self.telemetry_extras_provider = None
 
@@ -9059,10 +9079,42 @@ class MemoryCoordinator:
                 log.warning("dependency health refresh failed: %s", exc)
                 self._dependency_health = {**self._dependency_health, "fresh": False}
 
+            # Its own try, after the others: a dead Postgres probe above must not freeze a Neo4j-only census.
+            try:
+                await self._refresh_top_paths(time.monotonic())
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                log.warning("top_paths refresh failed: %s", exc)
+
             try:
                 await asyncio.sleep(CONSOLIDATION_HEALTH_REFRESH_SEC)
             except asyncio.CancelledError:
                 raise
+
+    async def _refresh_top_paths(self, now: float) -> None:
+        """Recompute compliance.top_paths when GRAPH_TOP_PATHS_REFRESH_S has passed since the last attempt.
+
+        A full relationship scan, so it runs here and never on a telemetry request. A failure keeps the
+        previous rows and as_of, so the served age says how stale they are, and records the error.
+        """
+        if GRAPH_TOP_PATHS_REFRESH_S <= 0:
+            return
+        last = self._top_paths["attempted"]
+        if last is not None and now - last < GRAPH_TOP_PATHS_REFRESH_S:
+            return
+        self._top_paths["attempted"] = now
+        try:
+            async with self._neo4j.session() as session:
+                rows = await (await session.run(
+                    "MATCH (a)-[r]->(b) "
+                    "RETURN labels(a) AS la, type(r) AS rel, labels(b) AS lb, count(*) AS c"
+                )).data()
+        except Exception as exc:
+            self._top_paths["error"] = str(exc)
+            return
+        self._top_paths.update(rows=merge_top_paths(rows, GRAPH_TOP_PATHS_LIMIT),
+                               as_of=datetime.now(timezone.utc).isoformat(), error=None)
 
     async def _nrem_cycle_counts(self) -> dict:
         """Pending NREM consolidation cycles for facts and decisions.
@@ -9483,10 +9535,19 @@ class MemoryCoordinator:
         label_dist = {r["name"]: r["c"] for r in labels}
         rel_status, invalid_rels = self._compliance_split(pred_dist, KNOWN_RELATIONSHIPS)
         lbl_status, invalid_lbls = self._compliance_split(label_dist, KNOWN_LABELS)
+        top = self._top_paths
         return {
             "predicate_distribution": dict(
                 sorted(pred_dist.items(), key=lambda kv: (-kv[1], kv[0]))
             ),
+            # The whole label census. A node with several labels counts once under each.
+            "label_distribution": dict(
+                sorted(label_dist.items(), key=lambda kv: (-kv[1], kv[0]))
+            ),
+            # Served from the background refresher; see _refresh_top_paths.
+            "top_paths": [dict(r) for r in top["rows"]],
+            "top_paths_as_of": top["as_of"],
+            **({"top_paths_error": top["error"]} if top["error"] else {}),
             "label_compliance": lbl_status,
             "invalid_labels": invalid_lbls,
             "relationship_compliance": rel_status,

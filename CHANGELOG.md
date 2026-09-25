@@ -7,6 +7,15 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.0.7] - 2026-09-25
+
+The graph-shape view comes back to `/memory/telemetry` for a read-only client. `API_VERSION` stays 4.
+
+### Added
+- `compliance.label_distribution`: every node label in the graph with its count. The compliance build already counted these on every snapshot but published only the labels outside the ontology. A node with several labels counts once under each.
+- `compliance.top_paths`: the 15 most frequent (label set, relationship type, label set) triples, with `compliance.top_paths_as_of`. A label set is the node's labels sorted and joined with `:`, because nodes commonly carry several labels and their order is not guaranteed. This is a scan of every relationship, so it never runs on a request: the background refresher recomputes it every `GRAPH_TOP_PATHS_REFRESH_S` (default 300, unmeasured; `0` turns it off). A failed refresh keeps the previous rows, leaves `top_paths_as_of` at the last success, and adds `compliance.top_paths_error`. The refresh has its own step in the refresher loop, so a dead Postgres earlier in the loop does not freeze it.
+- Relationships by type were already served as `compliance.predicate_distribution`. With these two additions, a read-role client such as the monitor can draw the graph's shape without the raw Cypher that route has refused it since 0.9.102.
+
 ## [1.0.6] - 2026-09-25
 
 Every recovery command the mint prints now leaves a working agent. `API_VERSION` stays 4.

@@ -773,6 +773,9 @@ _NEO4J_PLAN = [
         {"name": "MENTIONS", "c": 6000}, {"name": "ALIASES", "c": 3}]),
     ("UNWIND labels(n) AS l", [
         {"name": "Fact", "c": 900}, {"name": "Decision", "c": 200}]),
+    # Run by the background refresher only (_refresh_top_paths), never by the telemetry build.
+    ("MATCH (a)-[r]->(b) RETURN labels(a) AS la", [
+        {"la": ["Fact"], "rel": "MENTIONS", "lb": ["Entity", "Concept"], "c": 5000}]),
     ("coalesce(n.rem_invalid, false) = true", [
         {"label": "Fact", "reason": "label_mismatch", "c": 1}]),
 ]
@@ -831,6 +834,8 @@ def _telemetry_payload(g):
         # census query naming a table that does not exist stayed green in every
         # test while failing on every install.
         await c._refresh_registry_census()
+        # compliance.top_paths the same way: through the refresher step that serves it.
+        await c._refresh_top_paths(0.0)
         return await c._telemetry_cached()
 
     return asyncio.run(_run())
