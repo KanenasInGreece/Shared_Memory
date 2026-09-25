@@ -49,8 +49,9 @@ def _already_registered_refusal(tmp_path, capsys, **kw) -> str:
 
 
 def _command_lines(text: str) -> list:
-    """Every line that offers a runnable generate_tokens.py invocation, in order."""
-    return [l.strip() for l in text.splitlines() if "generate_tokens.py" in l]
+    """Every line that offers a runnable mint invocation, in order. The recovery commands name the wrapper since 1.0.6."""
+    return [l.strip() for l in text.splitlines()
+            if "generate_tokens.py" in l or "bootstrap_tokens.sh --" in l]
 
 
 def test_the_first_command_offered_is_write_through_not_reveal(tmp_path, capsys):
