@@ -121,7 +121,8 @@ fi
 # One minter at a time. Two runs can read the same AGENT_TOKENS baseline, and the later write drops the earlier agent whose token is already on disk.
 # The lock covers the read and the write, and it fails immediately so a second operator is told to wait.
 _LOCKFILE="${ENV_FILE}.mintlock"
-exec 8>"$_LOCKFILE" 2>/dev/null || true
+# The braces scope 2>/dev/null to this exec. Bare, exec would keep it for the rest of the script and discard every later error.
+{ exec 8>"$_LOCKFILE"; } 2>/dev/null || true
 if command -v flock >/dev/null 2>&1; then
     flock -n 8 || {
         red "✗ another bootstrap_tokens.sh is minting against $ENV_FILE right now."
@@ -133,6 +134,13 @@ fi
 
 # Name a missing uv before the mint starts, instead of a bare "command not found" halfway through.
 command -v uv >/dev/null 2>&1 || { red "✗ uv not found on PATH — install uv first (preflight.sh checks this)."; exit 1; }
+
+# The mint's stdout is captured below for the registry lines. A reveal goes to a copy of this script's own stdout instead, so the token never enters $out and the mint judges the real destination.
+reveal_fd_args=()
+if [[ "${#reveal_args[@]}" -gt 0 ]]; then
+    exec 3>&1
+    reveal_fd_args=(--reveal-fd 3)
+fi
 
 # --add grows the roster. --remint re-issues one existing agent. Neither path is the bulk mint below.
 if [[ -n "$add_name" || -n "${remint_name:-}" ]]; then
@@ -156,7 +164,8 @@ if [[ -n "$add_name" || -n "${remint_name:-}" ]]; then
 
     rc=0
     out="$(cd "$REPO_ROOT" && uv run python shared-memory/scripts/generate_tokens.py \
-        "${add_flags[@]}" "${reveal_args[@]}" 2>&1)" || rc=$?
+        "${add_flags[@]}" "${reveal_args[@]}" "${reveal_fd_args[@]}" 2>&1)" || rc=$?
+    exec 3>&-
     echo "$out"
 
     if [[ "$rc" -ne 0 ]]; then
@@ -201,7 +210,8 @@ if grep -qE '^[[:space:]]*AGENT_TOKENS=.+' "$ENV_FILE" && [[ "$force" -eq 0 ]]; 
 fi
 
 echo "Generating agent tokens ..."
-out="$(cd "$REPO_ROOT" && uv run python shared-memory/scripts/generate_tokens.py "${reveal_args[@]}")"
+out="$(cd "$REPO_ROOT" && uv run python shared-memory/scripts/generate_tokens.py "${reveal_args[@]}" "${reveal_fd_args[@]}")"
+exec 3>&-
 echo "$out"
 
 tokens_line="$(grep -E '^AGENT_TOKENS=' <<<"$out" || true)"

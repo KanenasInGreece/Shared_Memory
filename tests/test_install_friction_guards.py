@@ -252,7 +252,7 @@ def test_operate_md_warns_not_to_use_the_override_to_get_reveal_working_over_ssh
 def test_the_guard_is_conditioned_on_reveal_and_nothing_else():
     """A mint with no --reveal must not consult the terminal at all."""
     src = (SCRIPTS / "generate_tokens.py").read_text()
-    assert "if args.reveal and not _reveal_output_is_a_terminal():" in src, (
+    assert "if args.reveal and not _reveal_output_is_a_terminal(args.reveal_fd):" in src, (
         "the TTY guard must be conditioned on --reveal; unconditioned it would "
         "block the write-through mint that every local agent install uses")
 

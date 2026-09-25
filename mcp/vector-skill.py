@@ -198,7 +198,7 @@ AGENT_ID = os.environ.get("AGENT_ID", "vector_skill")
 # v4 a fact save without a registered metadata.project is rejected 400 carrying
 # project_required or project_unknown plus near-match proposals.
 API_VERSION = 4
-VERSION = "1.0.4"
+VERSION = "1.0.5"
 CLIENT_VERSION_HEADER = "X-SM-Api-Version"
 # Framework build, separate from api_version, so two clients on the same wire contract can still be counted apart in clients.versions_seen.
 CLIENT_BUILD_HEADER = "X-Shared-Memory-Client"
