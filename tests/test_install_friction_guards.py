@@ -95,8 +95,13 @@ def test_reveal_refuses_end_to_end_without_minting(tmp_path):
     assert "sha256:" not in r.stdout, "a refused reveal must not print a registry line"
 
 
-def test_the_refusal_names_the_recovery_for_an_already_leaked_token(tmp_path):
-    """Someone reading this message has usually already leaked one."""
+def test_the_refusal_never_names_its_own_bypass(tmp_path):
+    """⛔ fact:2055 A-1, ruled into this repo by decision:2058: an agent reading a
+    refusal "fixes the error" by prepending the marker, which is why gitguard's
+    refusal never names SM_GIT_MAIN_OK. The first cut of this guard printed the
+    override variable, handing an agent the exact way to leak the credential the
+    guard exists to protect. The refusal still has to tell a human where to look,
+    so it points at .env.example by name without naming the variable."""
     env = dict(os.environ)
     env["HOME"] = str(tmp_path)
     env.pop(gt._REVEAL_TTY_OVERRIDE, None)
@@ -104,8 +109,11 @@ def test_the_refusal_names_the_recovery_for_an_already_leaked_token(tmp_path):
                         "--reveal", "codex"],
                        capture_output=True, text=True, env=env, timeout=60,
                        cwd=str(SCRIPTS))
-    assert "re-mint" in r.stderr
-    assert gt._REVEAL_TTY_OVERRIDE in r.stderr
+    assert gt._REVEAL_TTY_OVERRIDE not in r.stderr, (
+        "the refusal prints the name of its own override — an agent will set it")
+    assert gt._REVEAL_TTY_OVERRIDE not in r.stdout
+    assert ".env.example" in r.stderr, "a human still needs to be told where it is"
+    assert "re-mint" in r.stderr, "someone reading this has usually already leaked one"
 
 
 # ── P1: a digest is not a token ──────────────────────────────────────────────
@@ -284,14 +292,85 @@ def test_write_is_not_itself_a_registry_role():
     assert gt._normalise_role("write") in VALID_ROLES
 
 
-def test_main_actually_normalises_the_role_it_parsed():
-    """⚠ A SOURCE PIN, and a deliberately weak one. Observing the normalised role
-    reach the registry needs a real --add mint, and running the real mint to check
-    a guard is exactly what rotated four live client tokens while this change was
-    being built (fact:1471). A weak guard beats re-running that, so this asserts
-    the call site exists rather than its effect; test_write_normalises_to_full
-    covers the mapping itself."""
-    src = (SCRIPTS / "generate_tokens.py").read_text()
-    assert "args.role = _normalise_role(args.role)" in src, (
-        "main() must pass the parsed role through _normalise_role, or --role write "
-        "parses and then reaches agent_roles, which rejects it")
+def test_main_normalises_the_role_all_the_way_into_the_registry(tmp_path, monkeypatch):
+    """The effect, not the call site: --role write must reach AGENT_ROLES as "full".
+
+    Isolated the way this suite already isolates mint() -- a freshly loaded module
+    whose _DEFAULT_GATEWAY_ENV is a tmp file and whose LOCAL_SKILL_ENV_PATHS is
+    emptied, which is the mechanism built after the 2026-08-24 incident where three
+    tests calling mint() bare rotated a real agent's token file (fact:1471). Nothing
+    here can reach the operator's own ~/.claude.
+    """
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "gt_role_norm_mod", str(SCRIPTS / "generate_tokens.py"))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    gateway_env = tmp_path / "gateway.env"
+    gateway_env.write_text("")
+    mod._DEFAULT_GATEWAY_ENV = str(gateway_env)
+    mod.LOCAL_SKILL_ENV_PATHS = {}
+    skill = tmp_path / "skill"
+    skill.mkdir()
+
+    # What is observable: agent_roles validates the role BEFORE minting and raises
+    # on anything outside read|full|admin, so an alias that parses without mapping
+    # makes this add FAIL. rc 0 therefore proves the mapping happened. There is no
+    # AGENT_ROLES entry to inspect for "full" — absence of an entry IS full — which
+    # is why the assertion is on the outcome rather than on a registry line.
+    import io
+    from contextlib import redirect_stdout
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        rc = mod.main(["--add", "roletestagent", "--role", "write",
+                       "--install-path", str(skill / ".env")])
+    out = buf.getvalue()
+    assert rc == 0, (
+        "--role write was refused all the way through: the alias parsed but did not "
+        f"map to a registry role, so agent_roles rejected it. Output: {out[:300]}")
+    assert "roletestagent:write" not in out, (
+        "the unmapped alias reached the registry — write is not a registry role")
+    assert (skill / ".env").exists(), "the token was not delivered write-through"
+
+
+def test_the_digest_path_refuses_a_digest_end_to_end(tmp_path):
+    """The CALL SITE, not just the predicate: a 64-hex value piped into --digest
+    must be refused. Without this, disabling the check at its call site leaves the
+    predicate's own tests green — which is how a dead guard survives."""
+    env = dict(os.environ)
+    env["HOME"] = str(tmp_path)
+    r = subprocess.run([sys.executable, str(SCRIPTS / "generate_tokens.py"),
+                        "--digest", "someagent"],
+                       input="a" * 64, capture_output=True, text=True, env=env,
+                       timeout=60, cwd=str(SCRIPTS))
+    assert r.returncode == 1, f"a digest was accepted as a token: {r.stdout[:200]}"
+    assert "sha256 DIGEST" in r.stderr
+    assert "sha256:" not in r.stdout, "it printed a registry line for a digest"
+
+
+def test_force_hex_registers_a_genuine_hex_token(tmp_path):
+    """The escape hatch the review asked for: a token an operator generated as 64
+    hex characters stays registrable, so the guard cannot lock anyone out."""
+    env = dict(os.environ)
+    env["HOME"] = str(tmp_path)
+    r = subprocess.run([sys.executable, str(SCRIPTS / "generate_tokens.py"),
+                        "--digest", "someagent", "--force-hex"],
+                       input="a" * 64, capture_output=True, text=True, env=env,
+                       timeout=60, cwd=str(SCRIPTS))
+    assert r.returncode == 0, r.stderr[:300]
+    assert "someagent:sha256:" in r.stdout
+
+
+def test_the_digest_refusal_names_force_hex_and_that_is_deliberate(tmp_path):
+    """⚠ Read with test_the_refusal_never_names_its_own_bypass, which forbids the
+    opposite. The distinction is the kind of escape: --force-hex recovers from a
+    MISTAKE for a human at a terminal running an undocumented advanced flag, while
+    the TTY override is a SECURITY bypass whose whole risk is an agent using it to
+    print a credential. Do not make these two "consistent"."""
+    env = dict(os.environ)
+    env["HOME"] = str(tmp_path)
+    r = subprocess.run([sys.executable, str(SCRIPTS / "generate_tokens.py"),
+                        "--digest", "someagent"],
+                       input="a" * 64, capture_output=True, text=True, env=env,
+                       timeout=60, cwd=str(SCRIPTS))
+    assert "--force-hex" in r.stderr
