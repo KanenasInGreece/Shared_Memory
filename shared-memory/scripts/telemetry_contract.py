@@ -83,7 +83,7 @@ __all__ = [
 ]
 
 #: Not a free-running today: this is the fifth version pin, so a missed bump is visible (decision:1832).
-VERSION = "1.0.6"
+VERSION = "1.0.7"
 
 
 def _version_tuple(v: str) -> tuple:
@@ -164,6 +164,8 @@ INTRODUCED_0_9_104 = "0.9.104"
 #: insight_gate_skips on the consolidation roll-up. VERSION is not bumped in this change.
 INTRODUCED_0_9_114 = "0.9.114"
 INTRODUCED_1_0_2 = "1.0.2"
+#: compliance.label_distribution and top_paths, the monitor's graph-shape view (decision:2768).
+INTRODUCED_1_0_7 = "1.0.7"
 #: Frozen release at which the v0.9.74 /health copies stop being served. A later drop gets its own stamp.
 DUAL_EMIT_DROP_TARGET = "0.9.90"
 #: Telemetry copies stay one release longer because the monitor still reads the old homes (fact:1989).
@@ -1130,6 +1132,24 @@ TELEMETRY: dict[str, dict] = {
     "compliance.predicate_distribution.*": _k("int", "graph", note=(
         "a CENSUS of what is in the graph, not of what the ontology allows — a "
         "legacy predicate (ALIASES) shows here for as long as edges exist")),
+    "compliance.label_distribution": _k("dict", "graph", since=INTRODUCED_1_0_7, note=(
+        "every label in the graph with its node count; a node with several labels "
+        "counts once under each")),
+    "compliance.label_distribution.*": _k("int", "graph", since=INTRODUCED_1_0_7),
+    "compliance.top_paths[]": _k("list", "graph", since=INTRODUCED_1_0_7, note=(
+        "the most frequent (label set, relationship type, label set) triples, at most 15; "
+        "a label set is the node's labels sorted and joined with ':'. Computed in the "
+        "background every GRAPH_TOP_PATHS_REFRESH_S, never on this request; empty until "
+        "the first computation and when that setting is 0")),
+    "compliance.top_paths[].from": _k("str", "graph", since=INTRODUCED_1_0_7),
+    "compliance.top_paths[].rel": _k("str", "graph", since=INTRODUCED_1_0_7),
+    "compliance.top_paths[].to": _k("str", "graph", since=INTRODUCED_1_0_7),
+    "compliance.top_paths[].count": _k("int", "graph", since=INTRODUCED_1_0_7),
+    "compliance.top_paths_as_of": _k("str|null", "graph", since=INTRODUCED_1_0_7, note=(
+        "when the served top_paths were computed; null before the first success. "
+        "A failed refresh leaves this at the last success")),
+    "compliance.top_paths_error": _k("str", "graph", since=INTRODUCED_1_0_7,
+                                     note="present only when the last top_paths refresh failed"),
     "compliance.label_compliance": _k("str", "graph", note="ok | non-compliant"),
     "compliance.invalid_labels[]": _k("list", "graph"),
     "compliance.invalid_labels[].name": _k("str", "graph"),
@@ -1620,6 +1640,7 @@ CONDITIONAL: frozenset = frozenset({
     "telemetry:breakdown.error",
     "telemetry:entity_graph.error",
     "telemetry:compliance.error",
+    "telemetry:compliance.top_paths_error",
     "telemetry:graph_integrity.error",
     "telemetry:consolidation.error",
     "telemetry:refold_ledger.error",
@@ -1666,6 +1687,13 @@ CONDITIONAL: frozenset = frozenset({
     "telemetry:refold_ledger.by_trigger_kind.*",
     "telemetry:compliance.predicate_distribution",
     "telemetry:compliance.predicate_distribution.*",
+    "telemetry:compliance.label_distribution",
+    "telemetry:compliance.label_distribution.*",
+    # Empty on an empty graph, before the first background refresh, and when GRAPH_TOP_PATHS_REFRESH_S is 0.
+    "telemetry:compliance.top_paths[].from",
+    "telemetry:compliance.top_paths[].rel",
+    "telemetry:compliance.top_paths[].to",
+    "telemetry:compliance.top_paths[].count",
     "health:llm_affinity.hot_prefixes",
     "telemetry:llm.backends",
     "telemetry:llm.backends.*",
