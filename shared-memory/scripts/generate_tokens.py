@@ -8,6 +8,11 @@ stdout into a durable transcript — "shown once" silently becomes "stored
 forever" — so this script writes tokens straight into the files that need
 them and prints only names, digests, and destination paths.
 
+Operators run it through bootstrap_tokens.sh, which writes the registry lines it
+prints into the gateway .env. Run directly, it only prints them, and the gateway
+rejects a new token until they are copied in. The recovery commands it prints
+therefore name bootstrap_tokens.sh.
+
   uv run python shared-memory/scripts/generate_tokens.py
     1. Prints the AGENT_TOKENS=... line for the GATEWAY .env, in DIGEST
        form (name:sha256:<hex>) — a digest is not a secret, so it is safe
@@ -723,7 +728,7 @@ def mint(
             _kind, _path = installs.get(name, (DEFAULT_INSTALL_KIND, "<path>"))
             _kind_flag = " --mcp" if _kind == "mcp" else ""
             lines.append(f"                   install the {name} skill package first, then re-run:")
-            lines.append(f"                   generate_tokens.py --add {name}{_kind_flag} --install-path {_path}")
+            lines.append(f"                   bash shared-memory/scripts/bootstrap_tokens.sh --add {name}{_kind_flag} --install-path {_path}")
 
     for a in roster:
         entry = installs.get(a)
@@ -744,7 +749,7 @@ def mint(
                 lines.append("                      its plaintext is already gone. Recovery (re-mints")
                 lines.append("                      ONLY this agent, rotates nobody — run it YOURSELF,")
                 lines.append("                      never through an agent):")
-                lines.append(f"                        bootstrap_tokens.sh --remint {a} --reveal {a}")
+                lines.append(f"                        bash shared-memory/scripts/bootstrap_tokens.sh --remint {a} --reveal {a}")
             continue
 
         token = _mint_one()
@@ -764,7 +769,7 @@ def mint(
             skill_dir = os.path.dirname(path)
             _fail(a, f"expected directory {skill_dir} does not exist "
                      f"-- create it and re-mint this one agent: "
-                     f"mkdir -p {skill_dir} && bootstrap_tokens.sh --remint {a}")
+                     f"mkdir -p {skill_dir} && bash shared-memory/scripts/bootstrap_tokens.sh --remint {a}")
             continue
 
         tokens[a] = token
@@ -822,7 +827,7 @@ def mint(
         print("#    as provisioned, which is the misleading part. Fix now with")
         print("#    (operator-run — NEVER through an agent, a transcript stores it forever):")
         for a in _undelivered:
-            print(f"#      bootstrap_tokens.sh --remint {a} --reveal {a}")
+            print(f"#      bash shared-memory/scripts/bootstrap_tokens.sh --remint {a} --reveal {a}")
         print("#    (--remint re-mints ONE agent; it never touches anyone else.)")
         print()
 
@@ -931,10 +936,10 @@ def add_agent(
             "silently rotates an existing agent's token.\n"
             f"  To re-issue THIS agent only (every other digest untouched), writing\n"
             f"  the new token straight into its own .env — never printing it:\n"
-            f"      generate_tokens.py --remint {name}{_kind_flag} --install-path {_path_hint}\n"
+            f"      bash shared-memory/scripts/bootstrap_tokens.sh --remint {name}{_kind_flag} --install-path {_path_hint}\n"
             f"  If {name} has NO local directory to write into, an OPERATOR (never an\n"
             f"  agent — a transcript stores a revealed token forever) can run instead:\n"
-            f"      bootstrap_tokens.sh --remint {name} --reveal {name}\n"
+            f"      bash shared-memory/scripts/bootstrap_tokens.sh --remint {name} --reveal {name}\n"
             "  To rotate the whole fleet deliberately: bootstrap_tokens.sh --force.",
             file=sys.stderr,
         )
@@ -982,11 +987,12 @@ def add_agent(
             return 1, None
         if not written:
             skill_dir = os.path.dirname(install_path)
+            _kind_flag = "" if install_kind == DEFAULT_INSTALL_KIND else f" --{install_kind}"
             print(
                 f"✗ REFUSED — expected directory {skill_dir} does not exist. "
                 f"Create it first: mkdir -p {skill_dir}. "
                 f"Install the {name} skill package first, then re-run:\n"
-                f"  generate_tokens.py --add {name} --install-path {install_path}",
+                f"  bash shared-memory/scripts/bootstrap_tokens.sh --add {name}{_kind_flag} --install-path {install_path}",
                 file=sys.stderr,
             )
             return 1, None
@@ -1045,12 +1051,12 @@ def add_agent(
         print(f"#   {name:15}  REMOTE / no install path given.")
         print("#                    Prefer the write-through form when this agent HAS a")
         print("#                    local directory — it never prints the token:")
-        print(f"#                      generate_tokens.py --remint {name} --install-path <dir>/.env")
+        print(f"#                      bash shared-memory/scripts/bootstrap_tokens.sh --remint {name} --install-path <dir>/.env")
         print("#                    Otherwise an OPERATOR must reveal it, in their OWN")
         print("#                    terminal — never through an agent, whose transcript")
         print("#                    turns \"shown once\" into \"stored forever\":")
         # Do not say --add --reveal. This name is already registered, so another --add refuses. --remint re-issues an existing name.
-        print(f"#                    bootstrap_tokens.sh --remint {name} --reveal {name}")
+        print(f"#                    bash shared-memory/scripts/bootstrap_tokens.sh --remint {name} --reveal {name}")
 
     return 0, token
 

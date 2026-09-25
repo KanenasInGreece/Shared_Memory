@@ -468,8 +468,9 @@ A fresh gateway host goes from clone to running with five helper scripts in
    that agent's package, or create the directory yourself and re-run with
    `--add <name> --install-path <dir>`). **`UNDELIVERABLE`** — a remote agent was minted with
    no local skill install found and `--reveal` was not passed on that same invocation; recover
-   with `generate_tokens.py --remint <name> --reveal <name>` **on one invocation, run by you in
-   your own terminal, never through an agent** (`--reveal` prints a live token).
+   with `bash shared-memory/scripts/bootstrap_tokens.sh --remint <name> --reveal <name>` **on one
+   invocation, run by you in your own terminal, never through an agent** (`--reveal` prints a live
+   token).
 
 7. **Start the reasoning LLM** on `:5000` — LM Studio or any OpenAI-compatible server — and
    declare it in `LLM_BACKENDS_JSON` (step 1's installer offers `ops/install_llm_backends.sh` for
