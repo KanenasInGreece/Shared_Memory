@@ -122,6 +122,50 @@ from agent_roles import (                                    # noqa: E402
 role_for = role_for_mint
 
 # First bootstrap only, and only for CLI skill installs this script can see. lm_studio has no skill .env, and antigravity is not guessed onto gemini's path.
+# The one escape hatch from the --reveal TTY guard, for a deliberate scripted reveal on a host with no terminal; named rather than silent so it shows up in a shell history and in review.
+_REVEAL_TTY_OVERRIDE = "SHARED_MEMORY_ALLOW_REVEAL_WITHOUT_TTY"
+
+
+def _normalise_role(role: "str | None") -> "str | None":
+    """The registry role for what the caller typed.
+
+    GET /health renders the "full" role as "write" (_health_role_for), so a role read
+    off a live /health and passed straight back used to be refused for using the
+    framework's own word. Accepted as an alias here rather than renaming the
+    rendering, which the monitor reads. "write" is NOT a registry role, so without
+    this mapping agent_roles rejects it before anything is minted.
+    """
+    return "full" if role == "write" else role
+
+
+def _looks_like_a_digest(value: str) -> bool:
+    """True for exactly the shape of a sha256 hex digest, which is never a token.
+
+    Deliberately narrow, 64 hex characters and nothing else, so a long genuine token
+    is unaffected: secrets.token_urlsafe gives 43 characters including non-hex ones,
+    so the two shapes do not overlap.
+    """
+    v = value.strip()
+    return len(v) == 64 and all(c in "0123456789abcdefABCDEF" for c in v)
+
+
+def _reveal_output_is_a_terminal() -> bool:
+    """True if a human is plausibly watching stdout, or the operator overrode it.
+
+    isatty is the only available signal separating a terminal from a pipe, a file or
+    an agent harness. It is not a security boundary, since a caller can allocate a
+    pty, and is not meant to be one: it stops the accident the published install path
+    used to cause.
+    """
+    if os.environ.get(_REVEAL_TTY_OVERRIDE, "").strip().lower() in ("1", "true", "yes", "on"):
+        return True
+    try:
+        return sys.stdout.isatty()
+    except Exception:
+        # A stdout that cannot answer is not a terminal.
+        return False
+
+
 # That one seed is recorded in AGENT_INSTALLS. Later mints read only the registry; a name with no path is remote, and --reveal is the only delivery.
 LOCAL_SKILL_ENV_PATHS = {
     "claude": os.path.expanduser("~/.claude/skills/shared-memory/.env"),
@@ -583,12 +627,19 @@ def _write_agent_token_file(path: str, token: str) -> bool:
 
 def mint(
     env_path: "str | None" = None, roster: "list[str] | None" = None,
-    revealing: "list[str] | None" = None,
+    revealing: "list[str] | None" = None,   # ⛔ see the note below: no TTY guard here
 ) -> "tuple[dict, dict, list]":
     """Mint a fresh token for every agent in `roster` (default: resolved by
     _resolve_roster() -- AGENTS union whatever's already registered),
     write-through every agent with a REGISTERED install path whose skill
     directory exists, and print only names/digests/destination paths.
+    ⛔ NO TTY GUARD HERE. main() refuses --reveal when stdout is not a terminal;
+    this function does not, so a Python caller that passes `revealing` prints raw
+    tokens wherever its stdout goes. That is deliberate — mint() cannot know
+    whether its caller is a human, and the three in-process tests that exercise
+    reveal depend on calling it — but any NEW caller passing `revealing` owns that
+    decision and should be checked.
+
     Returns (tokens, digests, failures) so main() can serve --reveal from
     the SAME minted set without re-parsing anything, and report a partial
     failure without a stack trace (security-review finding F4 / I-A10 --
@@ -701,7 +752,9 @@ def mint(
         if not written:
             # A registered path whose directory does not exist yet would mint a token nobody can receive.
             skill_dir = os.path.dirname(path)
-            _fail(a, f"expected directory {skill_dir} does not exist")
+            _fail(a, f"expected directory {skill_dir} does not exist "
+                     f"-- create it and re-mint this one agent: "
+                     f"mkdir -p {skill_dir} && bootstrap_tokens.sh --remint {a}")
             continue
 
         tokens[a] = token
@@ -921,6 +974,7 @@ def add_agent(
             skill_dir = os.path.dirname(install_path)
             print(
                 f"✗ REFUSED — expected directory {skill_dir} does not exist. "
+                f"Create it first: mkdir -p {skill_dir}. "
                 f"Install the {name} skill package first, then re-run:\n"
                 f"  generate_tokens.py --add {name} --install-path {install_path}",
                 file=sys.stderr,
@@ -1124,7 +1178,7 @@ def main(argv=None) -> int:
              "one. Use --add for an agent that is not registered yet.",
     )
     ap.add_argument(
-        "--role", metavar="ROLE", choices=list(VALID_ROLES),
+        "--role", metavar="ROLE", choices=list(VALID_ROLES) + ["write"],
         help="Role for the agent being added with --add: read | full | admin. "
              "Roles only ever NARROW access. Omit it and the role is derived: "
              "a name in READ_ONLY_AGENTS always gets 'read', anything else "
@@ -1153,6 +1207,13 @@ def main(argv=None) -> int:
              "Ignored without --add/--remint.",
     )
     ap.add_argument(
+        "--force-hex", action="store_true",
+        help="Register a 64-hex value as a token anyway. That shape is normally "
+             "refused because it is the shape of a sha256 digest, and a digest "
+             "pasted from the gateway's AGENT_TOKENS registers a credential nobody "
+             "can present. Use this only for a token you generated yourself as hex.",
+    )
+    ap.add_argument(
         "--mcp", action="store_true",
         help="Register this agent's install as an MCP CONNECTOR install "
              "(AGENT_INSTALLS kind 'mcp') rather than a CLI skill install. "
@@ -1164,6 +1225,33 @@ def main(argv=None) -> int:
     )
     args = ap.parse_args(argv)
     install_kind = "mcp" if args.mcp else DEFAULT_INSTALL_KIND
+
+    args.role = _normalise_role(args.role)
+
+    # ⛔ A REVEALED TOKEN IS ONLY EVER FOR A HUMAN'S OWN TERMINAL, so if stdout is
+    # not a TTY nobody is watching and the reveal does not happen. README, OPERATE.md
+    # Phase 6 and this script's own banner all said so in prose and it did not hold:
+    # fact:1499 (following the published Quick Start put a live bearer token into an
+    # agent transcript) and fact:1543 (the same token sat in a world-readable log for
+    # 16+ hours, which provoked an agent into a filesystem-wide credential hunt).
+    # A rotation fixes a leaked token; nothing un-writes a transcript. Checked once
+    # here so --add, --remint and a bulk --force --reveal are all covered.
+    if args.reveal and not _reveal_output_is_a_terminal():
+        print(
+            "\u2717 REFUSED: --reveal prints a live bearer token and stdout is not a "
+            "terminal, so this is a pipe, a redirect, a log, or an agent's "
+            "captured output -- exactly where a token must never land. Nothing "
+            "was minted, revealed or written.\n"
+            "  Run it yourself, in your own terminal, interactively.\n"
+            "  If a token has ALREADY been revealed into a transcript or a log, "
+            "treat it as disclosed: re-mint that identity and delete the log.\n"
+            "  There is a documented override for a deliberate scripted reveal on a "
+            "host with no terminal. It is named in shared-memory/.env.example, "
+            "deliberately NOT here: a refusal that prints its own bypass is a refusal "
+            "an agent satisfies by setting the bypass (fact:2055 A-1, the same reason "
+            "gitguard's refusal never names its marker).",
+            file=sys.stderr)
+        return 1
 
     if args.mcp and args.add is None and not args.remint:
         # A kind belongs to one registration. --mcp on a bulk mint would read as making every entry MCP.
@@ -1180,6 +1268,21 @@ def main(argv=None) -> int:
             return 1
         if len(raw_token) < 20:
             print("✗ token is too short (entropy floor: 20 characters minimum)", file=sys.stderr)
+            return 1
+        if _looks_like_a_digest(raw_token) and not args.force_hex:
+            # fact:1543: a monitor install was given the sha256 DIGEST from the gateway's
+            # AGENT_TOKENS line instead of the plaintext token, nothing validated the shape,
+            # and it failed only later as an opaque 401 — diagnosing which sent an agent
+            # hunting credentials across the filesystem. Name the mistake here instead.
+            print("✗ that value is 64 hexadecimal characters, which is the shape of a "
+                  "sha256 DIGEST, not of a token. The AGENT_TOKENS line in the gateway "
+                  "shared-memory/.env holds DIGESTS; a client needs the PLAINTEXT token, "
+                  "which is only ever written into that agent's own .env at mint time or "
+                  "shown by an operator-run --reveal. Digesting a digest would register a "
+                  "credential nobody can present.\n"
+                  "  If this really is a token you generated yourself as 64 hex "
+                  "characters (openssl rand -hex 32), re-run with --force-hex.",
+                  file=sys.stderr)
             return 1
         print(f"{args.digest}:sha256:{_digest(raw_token)}")
         return 0

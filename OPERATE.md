@@ -257,7 +257,30 @@ Backup captures Postgres and Neo4j together. It needs a `backup:admin` token alr
 bash shared-memory/ops/backup.sh
 ```
 
+## Running these over ssh
+
+A non-interactive ssh shell reads no profile, so a user-local `uv` in `~/.local/bin` is not on PATH. That is the correct outcome rather than a defect (`fact:1460`: install tooling comes from upstream instructions, and a user-local install being invisible to a profile-free shell is what that buys). Every script here that shells out to `uv` fails having done nothing and says so, so export it first:
+
+```bash
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+`uninstall_framework.sh` also asks for the level to be typed and has no terminal over ssh, so it refuses with `not confirmed — nothing was removed`. Its documented `--yes` is the non-interactive path, after the `--dry-run`.
+
+⛔ `--reveal` is the opposite case: it refuses when stdout is not a terminal, and that is deliberate. Do not reach for the override to get it working over ssh — run it in your own terminal.
+
 ## Uninstall
+
+**Capture these first when the level removes `shared-memory/.env`** — `data` and `all` both do, and it holds every credential this install has. Restoring a credentialed reasoning backend needs TWO lines and only the first is obvious (measured on a d9400 rebuild).
+
+```bash
+grep '^LLM_BACKENDS_JSON' shared-memory/.env      # the backend entry
+grep '_FILE=' shared-memory/.env                  # the pointers to key files
+```
+
+⛔ The `<KEY>_FILE` pointer is a separate line. Without it the backend loads `has_credential=False` and the pool serves nothing while `LLM_BACKENDS_JSON` looks correctly restored; after a reinstall confirm with `python3 shared-memory/scripts/check_config.py --phase-a-only`, where that env-var name must read `has_credential=True`. The key FILE survives when it lives outside the framework's own state, and the uninstall lists any such credential it deliberately did not remove.
+
+A reinstall MUST mint fresh tokens: the `.env` held digests only, every raw token lived in the skill directories the uninstall deletes, so an old `.env` configures auth nobody can satisfy.
 
 `--level` is required. There is no default. Show `--dry-run` first. Ask which level.
 
