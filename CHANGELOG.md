@@ -7,6 +7,26 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.0.5] - 2026-09-25
+
+`bootstrap_tokens.sh --reveal` works again from your own terminal. `API_VERSION` stays 4.
+
+### Fixed
+- At 1.0.4 every `--reveal` through `bootstrap_tokens.sh` was refused, even from an interactive terminal: the wrapper runs the mint inside `$(…)` to read the registry lines back, and there the mint's stdout is always a pipe. `--add NAME --reveal NAME`, `--remint NAME --reveal NAME` and `--force --reveal NAME` were all dead, and no remote agent (the monitor, an MCP host on another machine) could be issued a token by the documented path. The refusal came before any mint, so nothing was rotated or written. The wrapper now hands the mint a copy of its own stdout as a separate file descriptor, and only the reveal block goes there. The token never enters the output the wrapper captures, so `bash -x bootstrap_tokens.sh … 2>debug.log` cannot write it into a trace. The guard judges that descriptor, so a wrapper whose own output is piped, redirected or captured still refuses exactly as before. On the terminal the revealed token now appears above the rest of the report rather than below it.
+- `bootstrap_tokens.sh` had discarded its own stderr since 0.9.35. The line that opens the mint lock was a bare `exec … 2>/dev/null`, which silences stderr for the rest of the script, so a bulk mint's refusals and any Python traceback never reached the operator. The redirect is now scoped to that one command.
+- `--add/--remint NAME --reveal OTHER` is refused before the mint. It used to be refused after, when the new token was already in the agent's `.env`, leaving that agent holding a token the gateway did not know while the wrapper said nothing had been written.
+- `--reveal-fd` that names a descriptor which is not open for writing is refused before the mint, including when the override is set.
+- The recovery commands the mint prints for an undeliverable remote agent now name `bootstrap_tokens.sh --remint NAME --reveal NAME`. The direct `generate_tokens.py` form they used to name mints and reveals a token but only prints the registry line, so the gateway keeps rejecting the new token until that line is copied into `.env` by hand.
+
+### Added
+- `generate_tokens.py --reveal-fd FD` writes the reveal block to an already-open descriptor instead of stdout. It must be a terminal, as stdout would have to be.
+
+### Changed
+- `.env.example` says that `SHARED_MEMORY_ALLOW_REVEAL_WITHOUT_TTY` is read from the shell environment only; setting it in the `.env` file does nothing.
+
+### Not covered
+- A terminal logger (`script`, tmux `pipe-pane`, asciinema) records what the terminal shows, and a pty-allocating harness looks like a terminal. The guard stops accidents, not a caller that wants the token.
+
 ## [1.0.4] - 2026-09-25
 
 The install path stops being able to leak a token by accident. `API_VERSION` stays 4.

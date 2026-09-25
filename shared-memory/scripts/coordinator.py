@@ -126,7 +126,7 @@ def _short(value: Any, cap: int = 200) -> str:
 
 
 # FRAMEWORK_VERSION is the build string and may drift. API_VERSION is the wire contract with memory_bridge.py; bump it only when shape, auth, or routes break older clients.
-FRAMEWORK_VERSION = "1.0.4"
+FRAMEWORK_VERSION = "1.0.5"
 # API v2: retrospective is a full record. v4: unregistered project is 400 (proposal / new_project / sentinel).
 API_VERSION = 4
 CLIENT_VERSION_HEADER = "X-SM-Api-Version"
