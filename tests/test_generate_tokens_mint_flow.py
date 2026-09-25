@@ -1424,7 +1424,7 @@ def test_remote_add_recovery_advice_uses_remint_not_add(tmp_path, capsys):
     out = capsys.readouterr().out
 
     assert rc == 0 and token
-    assert "generate_tokens.py --remint codex --reveal codex" in out, (
+    assert "bootstrap_tokens.sh --remint codex --reveal codex" in out, (
         f"recovery advice for an undelivered REMOTE agent must name --remint "
         f"(re-issues an EXISTING name), not --add (refuses one):\n{out}"
     )
@@ -1459,15 +1459,15 @@ def test_following_the_printed_remote_add_recovery_advice_actually_works(tmp_pat
     # First mint: generate_tokens.py --add codex   (no --install-path -> REMOTE)
     rc, out = _capture(gt.main, ["--add", "codex"])
     assert rc == 0, out
-    assert "generate_tokens.py --remint codex --reveal codex" in out
+    assert "bootstrap_tokens.sh --remint codex --reveal codex" in out
 
     # bootstrap_tokens.sh's replace_registry_lines() step: persist the merged
     # AGENT_TOKENS= line this mint printed.
     tokens_line = next(l for l in out.splitlines() if l.startswith("AGENT_TOKENS="))
     env_path.write_text(tokens_line + "\n")
 
-    # Now follow the printed advice literally, against the SAME env file:
-    # generate_tokens.py --remint codex --reveal codex
+    # Now follow the printed advice through the mint it runs, against the SAME env file.
+    # The wrapper itself is exercised end to end in test_bootstrap_tokens_reveal_tty.py.
     rc2, out2 = _capture(gt.main, ["--remint", "codex", "--reveal", "codex"])
     assert rc2 == 0, (
         f"the printed recovery command FAILED when actually run:\n{out2}"
@@ -1593,10 +1593,10 @@ def test_bulk_mint_warns_undeliverable_for_a_remote_agent_without_reveal(tmp_pat
         "per-agent report — its digest is in AGENT_TOKENS and its plaintext is "
         "already gone"
     )
-    assert "generate_tokens.py --remint lm_studio --reveal lm_studio" in per_agent, (
+    assert "bootstrap_tokens.sh --remint lm_studio --reveal lm_studio" in per_agent, (
         "the per-agent warning does not name the recovery command for THIS agent"
     )
-    assert "generate_tokens.py --remint lm_studio --reveal lm_studio" in closing_block, (
+    assert "bootstrap_tokens.sh --remint lm_studio --reveal lm_studio" in closing_block, (
         "the closing block names no per-agent recovery command — it used to "
         "print a literal '<name>' placeholder"
     )

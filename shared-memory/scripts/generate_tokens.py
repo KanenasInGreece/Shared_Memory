@@ -100,6 +100,7 @@ them and prints only names, digests, and destination paths.
 """
 import argparse
 import errno
+import fcntl
 import hashlib
 import os
 import secrets
@@ -149,8 +150,12 @@ def _looks_like_a_digest(value: str) -> bool:
     return len(v) == 64 and all(c in "0123456789abcdefABCDEF" for c in v)
 
 
-def _reveal_output_is_a_terminal() -> bool:
-    """True if a human is plausibly watching stdout, or the operator overrode it.
+def _reveal_output_is_a_terminal(fd: "int | None" = None) -> bool:
+    """True if a human is plausibly watching the reveal's destination, or the operator overrode it.
+
+    The destination is stdout, or `fd` when --reveal-fd names one. bootstrap_tokens.sh
+    captures stdout to parse the registry lines, so it passes its own terminal as a
+    separate fd and the token never enters the wrapper's memory.
 
     isatty is the only available signal separating a terminal from a pipe, a file or
     an agent harness. It is not a security boundary, since a caller can allocate a
@@ -160,10 +165,15 @@ def _reveal_output_is_a_terminal() -> bool:
     if os.environ.get(_REVEAL_TTY_OVERRIDE, "").strip().lower() in ("1", "true", "yes", "on"):
         return True
     try:
-        return sys.stdout.isatty()
+        return os.isatty(fd) if fd is not None else sys.stdout.isatty()
     except Exception:
         # A stdout that cannot answer is not a terminal.
         return False
+
+
+def _reveal_stream(fd: "int | None"):
+    """Where the --reveal block goes: stdout, or the descriptor --reveal-fd names, left open for its owner."""
+    return sys.stdout if fd is None else os.fdopen(fd, "w", closefd=False)
 
 
 # That one seed is recorded in AGENT_INSTALLS. Later mints read only the registry; a name with no path is remote, and --reveal is the only delivery.
@@ -734,7 +744,7 @@ def mint(
                 lines.append("                      its plaintext is already gone. Recovery (re-mints")
                 lines.append("                      ONLY this agent, rotates nobody — run it YOURSELF,")
                 lines.append("                      never through an agent):")
-                lines.append(f"                        generate_tokens.py --remint {a} --reveal {a}")
+                lines.append(f"                        bootstrap_tokens.sh --remint {a} --reveal {a}")
             continue
 
         token = _mint_one()
@@ -812,7 +822,7 @@ def mint(
         print("#    as provisioned, which is the misleading part. Fix now with")
         print("#    (operator-run — NEVER through an agent, a transcript stores it forever):")
         for a in _undelivered:
-            print(f"#      generate_tokens.py --remint {a} --reveal {a}")
+            print(f"#      bootstrap_tokens.sh --remint {a} --reveal {a}")
         print("#    (--remint re-mints ONE agent; it never touches anyone else.)")
         print()
 
@@ -924,7 +934,7 @@ def add_agent(
             f"      generate_tokens.py --remint {name}{_kind_flag} --install-path {_path_hint}\n"
             f"  If {name} has NO local directory to write into, an OPERATOR (never an\n"
             f"  agent — a transcript stores a revealed token forever) can run instead:\n"
-            f"      generate_tokens.py --remint {name} --reveal {name}\n"
+            f"      bootstrap_tokens.sh --remint {name} --reveal {name}\n"
             "  To rotate the whole fleet deliberately: bootstrap_tokens.sh --force.",
             file=sys.stderr,
         )
@@ -1040,7 +1050,7 @@ def add_agent(
         print("#                    terminal — never through an agent, whose transcript")
         print("#                    turns \"shown once\" into \"stored forever\":")
         # Do not say --add --reveal. This name is already registered, so another --add refuses. --remint re-issues an existing name.
-        print(f"#                    generate_tokens.py --remint {name} --reveal {name}")
+        print(f"#                    bootstrap_tokens.sh --remint {name} --reveal {name}")
 
     return 0, token
 
@@ -1152,6 +1162,13 @@ def main(argv=None) -> int:
              "free peek at one already registered.",
     )
     ap.add_argument(
+        "--reveal-fd", type=int, default=None, metavar="FD",
+        help="Write the --reveal block to this already-open file descriptor instead "
+             "of stdout. It must be a terminal, as stdout would have to be. "
+             "bootstrap_tokens.sh passes its own terminal this way, so the token "
+             "never enters the output it captures.",
+    )
+    ap.add_argument(
         "--convert-digests", nargs="?", const=_DEFAULT_GATEWAY_ENV,
         metavar="ENV_PATH",
         help="Convert an existing gateway .env's AGENT_TOKENS to digest form "
@@ -1236,7 +1253,18 @@ def main(argv=None) -> int:
     # 16+ hours, which provoked an agent into a filesystem-wide credential hunt).
     # A rotation fixes a leaked token; nothing un-writes a transcript. Checked once
     # here so --add, --remint and a bulk --force --reveal are all covered.
-    if args.reveal and not _reveal_output_is_a_terminal():
+    # Checked before the mint, because the override skips the TTY check and a closed or read-only descriptor would only fail after the token exists.
+    if args.reveal and args.reveal_fd is not None:
+        try:
+            writable = (fcntl.fcntl(args.reveal_fd, fcntl.F_GETFL) & os.O_ACCMODE) in (os.O_WRONLY, os.O_RDWR)
+        except OSError:
+            writable = False
+        if not writable:
+            print(f"\u2717 --reveal-fd {args.reveal_fd} is not an open, writable file descriptor. "
+                  "Nothing was minted, revealed or written.", file=sys.stderr)
+            return 1
+
+    if args.reveal and not _reveal_output_is_a_terminal(args.reveal_fd):
         print(
             "\u2717 REFUSED: --reveal prints a live bearer token and stdout is not a "
             "terminal, so this is a pipe, a redirect, a log, or an agent's "
@@ -1296,16 +1324,8 @@ def main(argv=None) -> int:
             print("✗ --add and --remint are mutually exclusive: one registers a "
                   "NEW agent, the other re-issues an existing one.", file=sys.stderr)
             return 1
-        if args.add is not None:
-            rc, token = add_agent(args.add, install_path=args.install_path,
-                                  role=args.role, install_kind=install_kind)
-        else:
-            rc, token = add_agent(args.remint, install_path=args.install_path,
-                                  role=args.role, replace=True,
-                                  install_kind=install_kind)
-        if rc != 0:
-            return rc
         # These paths mint one name, so --reveal can only name that one. Checking only --add would make --remint NAME --reveal NAME refuse itself.
+        # Checked before the mint: afterwards the new token is already in the agent's .env, and refusing then leaves it unregistered.
         _minted_name = args.add or args.remint
         unknown = [n for n in args.reveal if n != _minted_name]
         if unknown:
@@ -1315,12 +1335,23 @@ def main(argv=None) -> int:
                 file=sys.stderr,
             )
             return 1
+        if args.add is not None:
+            rc, token = add_agent(args.add, install_path=args.install_path,
+                                  role=args.role, install_kind=install_kind)
+        else:
+            rc, token = add_agent(args.remint, install_path=args.install_path,
+                                  role=args.role, replace=True,
+                                  install_kind=install_kind)
+        if rc != 0:
+            return rc
         if args.reveal:
-            print()
-            print("⚠ REVEALING raw token value(s) below — run this yourself, NEVER through")
-            print("  an agent. Agent transcripts are durable: piping this output through an")
-            print("  agent turns \"shown once\" into \"stored forever\".")
-            print(f"  {_minted_name}: AGENT_TOKEN={token}")
+            out = _reveal_stream(args.reveal_fd)
+            print(file=out)
+            print("⚠ REVEALING raw token value(s) below — run this yourself, NEVER through", file=out)
+            print("  an agent. Agent transcripts are durable: piping this output through an", file=out)
+            print("  agent turns \"shown once\" into \"stored forever\".", file=out)
+            print(f"  {_minted_name}: AGENT_TOKEN={token}", file=out)
+            out.flush()
         return 0
 
     roster = _resolve_roster(_DEFAULT_GATEWAY_ENV)
@@ -1334,15 +1365,17 @@ def main(argv=None) -> int:
                                       revealing=args.reveal)
 
     if args.reveal:
-        print()
-        print("⚠ REVEALING raw token value(s) below — run this yourself, NEVER through")
-        print("  an agent. Agent transcripts are durable: piping this output through an")
-        print("  agent turns \"shown once\" into \"stored forever\".")
+        out = _reveal_stream(args.reveal_fd)
+        print(file=out)
+        print("⚠ REVEALING raw token value(s) below — run this yourself, NEVER through", file=out)
+        print("  an agent. Agent transcripts are durable: piping this output through an", file=out)
+        print("  agent turns \"shown once\" into \"stored forever\".", file=out)
         for name in args.reveal:
             if name not in tokens:
-                print(f"  {name}: REFUSED this mint (no directory / not registered — see above)")
+                print(f"  {name}: REFUSED this mint (no directory / not registered — see above)", file=out)
                 continue
-            print(f"  {name}: AGENT_TOKEN={tokens[name]}")
+            print(f"  {name}: AGENT_TOKEN={tokens[name]}", file=out)
+        out.flush()
 
     # Exit 0 even on a partial failure. A nonzero return makes bootstrap's set -e drop the safe merged line before it can be applied.
     # bootstrap greps "PARTIAL FAILURE" after applying that line, and exits nonzero itself.
