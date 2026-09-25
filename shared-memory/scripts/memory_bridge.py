@@ -35,7 +35,7 @@ from datetime import datetime
 
 import httpx
 
-VERSION = "1.0.5"
+VERSION = "1.0.6"
 # Must match GET /health api_version; v4 refuses unregistered project on fact save.
 API_VERSION = 4
 

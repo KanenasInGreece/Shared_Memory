@@ -7,6 +7,17 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.0.6] - 2026-09-25
+
+Every recovery command the mint prints now leaves a working agent. `API_VERSION` stays 4.
+
+### Fixed
+- The write-through recovery commands named the direct `generate_tokens.py --add/--remint NAME --install-path PATH`. That call writes the agent's new token into its `.env` but only prints the gateway's registry line, so the gateway kept the old digest and the agent, which had been working, started failing auth. The commands printed when a skill directory is missing, when `--add` meets a name already registered, and for a remote agent that has a local directory now name `bootstrap_tokens.sh`, which writes the registry line too. The 1.0.5 reveal recovery commands were already changed the same way.
+- README's recovery for an `UNDELIVERABLE` agent names `bootstrap_tokens.sh --remint NAME --reveal NAME`.
+- `generate_tokens.py`'s own help says that run directly it only prints the registry lines.
+- The command printed when an MCP connector's directory is missing kept `--mcp`, so following it no longer re-registers the connector as a CLI skill install.
+- Every printed recovery command is spelled `bash shared-memory/scripts/bootstrap_tokens.sh …`, so it runs when pasted at the repository root.
+
 ## [1.0.5] - 2026-09-25
 
 `bootstrap_tokens.sh --reveal` works again from your own terminal. `API_VERSION` stays 4.
