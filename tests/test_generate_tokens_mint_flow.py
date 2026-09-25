@@ -298,7 +298,11 @@ def test_main_without_reveal_prints_no_token_value(tmp_path):
     assert "REVEALING" not in out
 
 
-def test_main_reveal_prints_only_the_named_agent_token(tmp_path):
+def test_main_reveal_prints_only_the_named_agent_token(tmp_path, monkeypatch):
+    # --reveal now refuses when stdout is not a terminal, and pytest captures
+    # stdout, so a test that legitimately exercises reveal opts in through the
+    # same named override a deliberate scripted reveal uses.
+    monkeypatch.setenv("SHARED_MEMORY_ALLOW_REVEAL_WITHOUT_TTY", "1")
     gt = load_generate_tokens()
     gt.LOCAL_SKILL_ENV_PATHS = {}
     rc, out = _capture(gt.main, ["--reveal", "codex"])
@@ -848,6 +852,10 @@ def test_reveal_accepts_a_previously_added_agent_outside_the_default_roster(tmp_
     """--reveal must stop refusing names outside the OLD hardcoded AGENTS
     list -- it now accepts any REGISTERED name, resolved from the roster
     (AGENTS union the on-disk registry), not the fixed AGENTS constant."""
+    # --reveal now refuses when stdout is not a terminal, and pytest captures
+    # stdout, so a test that legitimately exercises reveal opts in through the
+    # same named override a deliberate scripted reveal uses.
+    monkeypatch.setenv("SHARED_MEMORY_ALLOW_REVEAL_WITHOUT_TTY", "1")
     gt = load_generate_tokens()
     env_path = tmp_path / ".env"
     env_path.write_text(f"AGENT_TOKENS=cursor:sha256:{_digest('t1')}\n")
@@ -1439,6 +1447,10 @@ def test_following_the_printed_remote_add_recovery_advice_actually_works(tmp_pat
     invocations, exactly as the real two-script pipeline does, so the second
     call sees codex as genuinely registered.
     """
+    # --reveal now refuses when stdout is not a terminal, and pytest captures
+    # stdout, so a test that legitimately exercises reveal opts in through the
+    # same named override a deliberate scripted reveal uses.
+    monkeypatch.setenv("SHARED_MEMORY_ALLOW_REVEAL_WITHOUT_TTY", "1")
     gt = load_generate_tokens()
     env_path = tmp_path / ".env"
     monkeypatch.setattr(gt, "_DEFAULT_GATEWAY_ENV", str(env_path))
