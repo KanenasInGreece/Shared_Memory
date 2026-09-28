@@ -618,6 +618,25 @@ def fold_record_line(record, content):
             f" pg_id={record.get('pg_id', '?')}] {content}")
 
 
+def render_thematic_fold(contents, pg_ids, record_map=None):
+    """Render deterministic fold text for a thematic cluster in ascending pg_id
+    order, so the byte-identical skip of decision:1242 (skip an unchanged fold) holds. Returns
+    (summary, sorted_pg_ids). Pure, no I/O."""
+    record_map = record_map or {}
+    paired = sorted(zip(pg_ids, contents), key=lambda x: int(x[0]))
+    sorted_pg_ids = [pid for pid, _ in paired]
+    recs = [
+        dict(record_map.get(pid) or
+             {"rtype": "fact", "kind": "observation", "recorded": "unknown"},
+             pg_id=pid)
+        for pid in sorted_pg_ids
+    ]
+    summary = "\n".join(
+        fold_record_line(r, content) for (_, content), r in zip(paired, recs)
+    )
+    return summary, sorted_pg_ids
+
+
 def _cypher_id_list(pg_ids) -> str:
     """Literal, sorted, de-duplicated Cypher list of integer ids — pure,
     deterministic (stable across re-folds so the stored `cypher_query`
@@ -1257,12 +1276,12 @@ def append_insight_references(conn, insight_id, summary_id, domain):
     """§2.5 identity 'same' case: **no new insight** — the triggering
     thematic summary id is appended to the EXISTING active insight's
     ``summary_ids`` and the triggering domain to its ``domains``, both
-    deduplicated, order-preserving. Returns True iff the row was found
-    still active and updated; False if it was retired between the identity
-    check and this call (the caller then leaves the cluster for the next
-    cycle to re-evaluate — no fold is performed either way, so nothing is
-    lost by deferring). ``summary_id`` may be None (no active thematic row
-    yet to cite) — a no-op limited to the domain append in that case."""
+    deduplicated, order-preserving. Writes metadata only, never updated_at
+    (migration 016: it moves only on a re-fold), so an insight ledger row closes
+    only on a real fold. Returns 'appended', 'unchanged' (both lists already
+    current — no UPDATE), or 'retired' (row inactive mid-cycle; the next cycle
+    re-evaluates the cluster).
+    ``summary_id`` may be None (no active thematic row yet to cite)."""
     with conn.cursor() as cur:
         cur.execute(
             "SELECT metadata FROM community_summaries"
@@ -1271,22 +1290,27 @@ def append_insight_references(conn, insight_id, summary_id, domain):
         )
         row = cur.fetchone()
         if not row:
-            return False
+            return "retired"
         meta = row[0] or {}
         summary_ids = list(meta.get("summary_ids") or [])
+        changed = False
         if summary_id is not None and summary_id not in summary_ids:
             summary_ids.append(summary_id)
+            changed = True
         domains = list(meta.get("domains") or [])
         if domain and domain not in domains:
             domains.append(domain)
+            changed = True
+        if not changed:
+            return "unchanged"
         meta["summary_ids"] = summary_ids
         meta["domains"] = domains
         cur.execute(
-            "UPDATE community_summaries SET metadata = %s, updated_at = now()"
+            "UPDATE community_summaries SET metadata = %s"
             " WHERE id = %s",
             (json.dumps(meta), insight_id),
         )
-        return True
+        return "appended"
 
 
 def fetch_reversal_context(conn, judgement_ids):
@@ -1717,10 +1741,9 @@ def close_refold_ledger_rows(conn, context="consolidation"):
     nothing having actually folded — the THEMATIC upsert sets
     `updated_at = now()` on every real fold, so for thematic rows the
     bound excludes a summary that could not have been the re-fold this
-    row is waiting for. For INSIGHT rows the bound is weaker:
-    `append_insight_references`'s 'same'-identity path also sets
-    `updated_at = now()` on every match, fold or not, so an insight row
-    can close 'constituent_folded' without anything having folded.
+    row is waiting for. For INSIGHT rows the same bound holds: the 'same'
+    identity path updates metadata without touching updated_at, so an insight
+    row closes only on a real fold.
 
     'dropped'/'constituent_superseded' — defensive: the row's own `pg_id`
     became superseded again after the row opened. Should not occur given
@@ -2819,34 +2842,27 @@ class ConsolidationDaemon:
                     continue
                 eligible_work_items.append((project, section, contents, pg_ids))
 
-            # Compare the fold's rendered text to the active row before embedding — row order follows the Neo4j scan, which is unordered. A byte-identical rewrite is skipped; any membership, order, or text change still folds.
+            # Compare the fold's rendered text to the active row before embedding — lines are in ascending pg_id order, so the text is deterministic and a byte-identical rewrite is skipped (decision:1242: deterministic fold skip).
             active_rows = await loop.run_in_executor(
                 None, lambda: fetch_active_thematic_rows(
                     conn, [(p or "", s or SECTION_NONE)
                            for p, s, _c, _i in eligible_work_items]))
             fold_work_items = []
             for project, section, contents, pg_ids in eligible_work_items:
-                recs = [
-                    dict(record_map.get(pid) or
-                         {"rtype": "fact", "kind": "observation", "recorded": "unknown"},
-                         pg_id=pid)
-                    for pid in pg_ids
-                ]
-                summary = "\n".join(
-                    fold_record_line(r, content) for content, r in zip(contents, recs)
-                )
+                summary, sorted_pg_ids = render_thematic_fold(
+                    contents, pg_ids, record_map)
                 # Union of the members' human-asserted entities. Payload only, not a gate key.
                 entities = sorted({
-                    e for pid in pg_ids
+                    e for pid in sorted_pg_ids
                     for e in (record_map.get(pid) or {}).get("entities") or []
                 })
                 key = (project or "", section or SECTION_NONE)
                 if thematic_fold_is_current(
-                        active_rows.get(key), summary, pg_ids, entities):
+                        active_rows.get(key), summary, sorted_pg_ids, entities):
                     rec.unchanged_clusters += 1
                     continue
                 fold_work_items.append(
-                    (project, section, summary, pg_ids, entities))
+                    (project, section, summary, sorted_pg_ids, entities))
             if rec.unchanged_clusters:
                 logger.info(
                     "NREM fold: %d cluster(s) already current — re-fold would "
@@ -3207,7 +3223,10 @@ class ConsolidationDaemon:
         retrospectives, resolve §2.5 identity for fresh clusters (folding a
         genuinely new/grown set, APPENDING a reference on an exact 'same'
         match — criterion G), then fold what remains. Failures need no
-        re-queue — the ledger is durable and the next sweep retries."""
+        re-queue — the ledger is durable and the next sweep retries.
+        A failing component is attempted once per pass: it counts one failure
+        per pass so NREM_FOLD_FAIL_CAP counts sweeps, not the groups that reach
+        it, and attempted/failed counts exclude same-pass repeats."""
         loop = asyncio.get_running_loop()
         try:
             conn = await loop.run_in_executor(
@@ -3316,15 +3335,20 @@ class ConsolidationDaemon:
                     thematic_id = await loop.run_in_executor(
                         None, lambda p=proj, d=c["domain"]:
                             fetch_active_thematic_summary_id(conn, p, d))
-                    updated = await loop.run_in_executor(
+                    append_status = await loop.run_in_executor(
                         None, lambda: append_insight_references(
                             conn, iid, thematic_id, c["domain"]))
                     await loop.run_in_executor(None, conn.commit)
+                    log_action = (
+                        "appended" if append_status == "appended"
+                        else "already current — no write" if append_status == "unchanged"
+                        else "SKIPPED (retired mid-cycle)"
+                    )
                     logger.info(
                         "Insight identity: %s/%s reach matches insight %d's "
                         "judgement set exactly — %s summary_ids+=%s domains+=%s.",
                         proj, c["domain"], iid,
-                        "appended" if updated else "SKIPPED (retired mid-cycle)",
+                        log_action,
                         thematic_id, c["domain"],
                     )
                 clusters = surviving
@@ -3368,10 +3392,19 @@ class ConsolidationDaemon:
                     cluster_id_lists, ts_map, INSIGHT_AGE_CENSUS_K)
                 rec.dead_lettered_clusters = dead_lettered_now
                 rec.singleton_clusters = singleton_now
+                attempted: set[frozenset[int]] = set()
                 for c in clusters:
                     ids = c["ids"]
                     if not ids or any(i in folded for i in ids):
                         continue  # already folded as a re-fold this pass
+                    f_ids = frozenset(ids)
+                    if f_ids in attempted:
+                        logger.debug(
+                            "Insight cycle: component %s already attempted this pass — skipping.",
+                            sorted(ids),
+                        )
+                        continue
+                    attempted.add(f_ids)
                     logger.info(
                         "Insight cycle: fresh cluster on '%s/%s' — %d judgements.",
                         c["projects"][0] if c["projects"] else "?", c["domain"], len(ids),
