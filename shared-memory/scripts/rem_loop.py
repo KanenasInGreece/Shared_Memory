@@ -122,6 +122,11 @@ KIND_FACT     = "fact"
 KIND_DECISION = "decision"
 KIND_RETRO    = "retrospective"
 
+
+def _anchor_label(kind: str) -> str:
+    """Map a Postgres record kind to its Neo4j label, defaulting to Fact."""
+    return {KIND_DECISION: ONT.decision, KIND_RETRO: ONT.retrospective}.get(kind, ONT.fact)
+
 # Shared with the gateway and NREM. REM takes it SHARED and skips if a backup holds it EXCLUSIVE, so enrichment never writes mid-dump. Must match the coordinator's key.
 BACKUP_ADVISORY_LOCK_KEY = int(os.environ.get("BACKUP_ADVISORY_LOCK_KEY", "8765309"))
 
@@ -415,8 +420,9 @@ class REMDaemon:
             sel_labels[r["pg_id"]] = matched[0] if matched else ""
         return pg_ids, attempts, sel_labels, passed_over
 
-    async def _bump_rem_attempts(self, pg_ids: list[int]) -> None:
-        """Increment rem_attempts for these pg_ids; callers pass only truncated/parse/client failures, never transport or routing refusal."""
+    async def _set_on_records(self, pg_ids: list[int], set_clause: str, what: str) -> None:
+        """Best-effort SET across all record labels for these pg_ids; a failed
+        bump never masks the work it precedes."""
         if not pg_ids:
             return
         try:
@@ -425,11 +431,16 @@ class REMDaemon:
                     f"MATCH (n)"
                     f" WHERE (n:{ONT.fact} OR n:{ONT.decision} OR n:{ONT.retrospective})"
                     f"   AND n.pg_id IN $pg_ids"
-                    f" SET n.rem_attempts = coalesce(n.rem_attempts, 0) + 1",
+                    f" SET {set_clause}",
                     pg_ids=list(pg_ids),
                 )
         except Exception as exc:
-            logger.warning("REM: rem_attempts bump failed for %s: %s", pg_ids, exc)
+            logger.warning("REM: %s bump failed for %s: %s", what, pg_ids, exc)
+
+    async def _bump_rem_attempts(self, pg_ids: list[int]) -> None:
+        """Increment rem_attempts for these pg_ids; callers pass only truncated/parse/client failures, never transport or routing refusal."""
+        await self._set_on_records(
+            pg_ids, "n.rem_attempts = coalesce(n.rem_attempts, 0) + 1", "rem_attempts")
 
     async def _bump_rem_pickups(self, pg_ids: list[int]) -> None:
         """Increment monotonic ``rem_pickups`` (and reset ``rem_passed_over``) prior
@@ -437,24 +448,13 @@ class REMDaemon:
         Bumps batches in bulk and solo records individually AFTER the yield checks,
         never at selection time: a solo record the arbiter's yield never reaches was
         not picked up, and rotating it anyway would hide the tail this counter
-        exists to expose. Best-effort, so a failed bump never masks the work it
-        precedes.
+        exists to expose.
         """
-        if not pg_ids:
-            return
-        try:
-            async with self.driver.session() as session:
-                await session.run(
-                    f"MATCH (n)"
-                    f" WHERE (n:{ONT.fact} OR n:{ONT.decision} OR n:{ONT.retrospective})"
-                    f"   AND n.pg_id IN $pg_ids"
-                    # Clear rem_passed_over in the same statement: starvation is counted in skips, and a pickup is the only reset (decision 890).
-                    f" SET n.rem_pickups = coalesce(n.rem_pickups, 0) + 1,"
-                    f"     n.rem_passed_over = 0",
-                    pg_ids=list(pg_ids),
-                )
-        except Exception as exc:
-            logger.warning("REM: rem_pickups bump failed for %s: %s", pg_ids, exc)
+        # Clear rem_passed_over in the same statement: starvation is counted in skips, and a pickup is the only reset (decision 890).
+        await self._set_on_records(
+            pg_ids,
+            "n.rem_pickups = coalesce(n.rem_pickups, 0) + 1,     n.rem_passed_over = 0",
+            "rem_pickups")
 
     async def _bump_rem_passed_over(self, pg_ids: list[int]) -> None:
         """Increment ``rem_passed_over`` for remaining solo records when yielding to
@@ -462,19 +462,8 @@ class REMDaemon:
         persistently-queuing NREM cannot be waited out by the clock, only by the
         record actually being processed.
         """
-        if not pg_ids:
-            return
-        try:
-            async with self.driver.session() as session:
-                await session.run(
-                    f"MATCH (n)"
-                    f" WHERE (n:{ONT.fact} OR n:{ONT.decision} OR n:{ONT.retrospective})"
-                    f"   AND n.pg_id IN $pg_ids"
-                    f" SET n.rem_passed_over = coalesce(n.rem_passed_over, 0) + 1",
-                    pg_ids=list(pg_ids),
-                )
-        except Exception as exc:
-            logger.warning("REM: rem_passed_over bump failed for %s: %s", pg_ids, exc)
+        await self._set_on_records(
+            pg_ids, "n.rem_passed_over = coalesce(n.rem_passed_over, 0) + 1", "rem_passed_over")
 
     async def _mark_node_invalid(self, pg_id: int, label: str, reason: str) -> None:
         """Retire a structurally invalid node (missing Postgres row or label mismatch)
@@ -514,8 +503,7 @@ class REMDaemon:
         post-write consistency or outbox failure occurs. Ensures the record re-enters
         the queue under the attempt cap rather than stranding in limbo.
         """
-        anchor = {KIND_DECISION: ONT.decision,
-                  KIND_RETRO:    ONT.retrospective}.get(kind, ONT.fact)
+        anchor = _anchor_label(kind)
         try:
             async with self.driver.session() as session:
                 await session.run(
@@ -759,8 +747,7 @@ class REMDaemon:
         (decision:1664 — REM only summarises). Marks rem_processed=true last so failed
         writes are retried.
         """
-        anchor = {KIND_DECISION: ONT.decision,
-                  KIND_RETRO:    ONT.retrospective}.get(kind, ONT.fact)
+        anchor = _anchor_label(kind)
 
         async with self.driver.session() as session:
             # Facts rewrite original content; rem_summary is stored only if produced, and success clears rem_attempts.
@@ -1324,9 +1311,6 @@ class REMDaemon:
             # Facts batch; decisions, retrospectives, and previously-failed facts run solo.
             fact_items: list[dict] = []
             solo_ids: list[tuple[int, str]] = []   # (pg_id, kind) — decisions/retros + demoted facts
-            kind_to_label = {KIND_FACT:     ONT.fact,
-                             KIND_DECISION: ONT.decision,
-                             KIND_RETRO:    ONT.retrospective}
             for pg_id in pg_ids:
                 row = content_map.get(pg_id)
                 if not row or not row.get("content"):
@@ -1335,7 +1319,7 @@ class REMDaemon:
                         pg_id, label_map.get(pg_id, ""), "no_postgres_record")
                     continue
                 # The write anchor comes from the Postgres kind, not the selected label. A mismatch would mark a different node and re-select this one forever.
-                expected = kind_to_label.get(row["kind"], ONT.fact)
+                expected = _anchor_label(row["kind"])
                 selected = label_map.get(pg_id, "")
                 if selected and selected != expected:
                     await self._mark_node_invalid(
