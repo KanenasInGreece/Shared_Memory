@@ -208,18 +208,18 @@ def classify_identity(new_ids, existing_ids) -> str:
     covers. Pure set comparison between a freshly-walked component's judgement
     ids and one existing active insight's judgement-id set.
 
-      'same'       -- identical sets. No new insight — the caller (C3) adds
-                       the triggering thematic summary/domain as a reference
-                       on the existing insight rather than folding again.
+      'same'       -- identical sets. No new insight — `run_insight_cycle`
+                       adds the triggering thematic summary/domain as a
+                       reference on the existing insight rather than
+                       folding again.
       'supersedes' -- ``new_ids`` is a STRICT superset of ``existing_ids``.
                        New insight; it supersedes the old by subset coverage.
       'covered'    -- ``existing_ids`` is a strict superset of ``new_ids``
                        (the reverse of 'supersedes') — the existing insight
                        already covers this reach in full; nothing new to add.
-                       Not named in the plan's LOCKED table because the walk
-                       only grows over time in the documented scenario, but
-                       the same set logic settles it the same way: no new
-                       insight is warranted.
+                       Not named in the plan's LOCKED table (the walk only
+                       grows in the documented scenario), but the same set
+                       logic settles it: no new insight is warranted.
       'overlap'    -- partial intersection, neither a subset of the other.
                        Both coexist (accepted early duplication, §2.5).
       'disjoint'   -- no shared members — unrelated insights.
