@@ -1996,20 +1996,6 @@ def _consolidation_stall_verdict(last_success_age, in_flight, has_backlog, thres
 # roll-up and the per-type report can never drift apart.
 CONSOLIDATION_CYCLE_TYPES = ("insight", "fact_consolidation")
 
-# consolidation_runs.extra keys _compute_consolidation_health surfaces as "the
-# latest recorded value" (one array_agg/FILTER column per key in its SQL).
-# Shared contract for all six: a NEW key, never an alias for eligible_clusters;
-# None means no cycle has recorded it yet, not zero. One tuple so the roll-up
-# dict can never drift from the SQL's own column list.
-_LATEST_EXTRA_KEYS = (
-    ("dead_lettered_clusters", "excluded from eligible_clusters: NREM_FOLD_FAIL_CAP dead-lettered them (fact:1189, decision:1121)."),
-    ("unchanged_clusters", "skipped because the re-fold matched the active summary byte for byte."),
-    ("singleton_clusters", "excluded from eligible_clusters: judgement reach was exactly 1, so no insight can fold."),
-    ("insight_gate_skips", "insight groups that failed G2 or G3. Not backlog."),
-    ("truncation_failures", "latest truncation count."),
-    ("slot_failures", "latest slot-protocol-miss count, not only a capacity one."),
-)
-
 
 def _consolidation_rollup(by_type: dict, any_stalled: bool, started_at: dict,
                           cycle_types=CONSOLIDATION_CYCLE_TYPES) -> dict:
@@ -8369,6 +8355,18 @@ class MemoryCoordinator:
         ``_nrem_cycle_counts`` is a separate, purely informational density
         gauge elsewhere (``snap["nrem"]``) — it must never stand in for "the
         gate fired"."""
+        # consolidation_runs.extra keys surfaced below as "the latest recorded
+        # value" (one array_agg/FILTER column per key in the SQL). Shared
+        # contract for all six: a NEW key, never an alias for eligible_clusters;
+        # None means no cycle has recorded it yet, not zero.
+        _LATEST_EXTRA_KEYS = (
+            ("dead_lettered_clusters", "excluded from eligible_clusters: NREM_FOLD_FAIL_CAP dead-lettered them (fact:1189, decision:1121)."),
+            ("unchanged_clusters", "skipped because the re-fold matched the active summary byte for byte."),
+            ("singleton_clusters", "excluded from eligible_clusters: judgement reach was exactly 1, so no insight can fold."),
+            ("insight_gate_skips", "insight groups that failed G2 or G3. Not backlog."),
+            ("truncation_failures", "latest truncation count."),
+            ("slot_failures", "latest slot-protocol-miss count, not only a capacity one."),
+        )
         query = """
             WITH ranked AS (
               SELECT cycle_type, started_at, finished_at, outcome, error_class, error_msg,
