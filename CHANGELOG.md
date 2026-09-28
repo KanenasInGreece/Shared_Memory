@@ -7,6 +7,16 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.0.8] - 2026-09-28
+
+The dreaming-cycle code says what it does. Behaviour is unchanged. `API_VERSION` stays 4, and the telemetry contract has no additions, moves, removals or meaning changes.
+
+### Changed
+- Comments in `consolidation_loop.py`, `insight_gate.py`, `coordinator.py`, `rem_loop.py` and `dream_telemetry.py` that had drifted from the code are corrected. The thematic fold's row order follows an unordered graph scan. A superseded constituent changes the fold's computed content. Insight components can span projects. Community summaries are written `global` and do not inherit their sources' visibility. Insights are retired by the lineage pass, not by a re-fold. REM also expands a fact's first-write snippet to its text and records its own counters. The telemetry ceiling includes the `max_tokens` term, and the rerank example uses the real default cap.
+- `mcp/system-prompt.md` describes REM the same way. No tool name changes.
+- Review-round history that no longer explains anything is removed from these files. Every rule and prohibition stays.
+- Small refactors with identical behaviour: one helper each for REM's kind-to-label map and counter bumps, for the fold discovery maps, and for the six latest-recorded telemetry roll-up keys; the insight provenance query reuses the walk's relation list; the rerank prefix helpers reuse the module's pair budget; the unused `DEFAULT_DOMAIN` constant is gone.
+
 ## [1.0.7] - 2026-09-25
 
 The graph-shape view comes back to `/memory/telemetry` for a read-only client. `API_VERSION` stays 4.
