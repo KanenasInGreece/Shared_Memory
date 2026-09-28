@@ -1973,12 +1973,9 @@ def _consolidation_backlog(eligible_clusters) -> int:
     is an ABSENCE OF EVIDENCE, not evidence of backlog: report 0, not a looser
     substitute count.
 
-    Previously this fell back to the NREM density count
-    (``_nrem_cycle_counts``) when no census had been recorded, which answers
-    "does raw candidate material exist" rather than "did it gate" — the two
-    are exactly the distinction I7 draws, and conflating them let a cycle that
-    had never run report a stall the strict gate would never have agreed to.
-    The fallback is removed; it must not be reintroduced. Pure → testable."""
+    Never fall back to the NREM density count (``_nrem_cycle_counts``) — it
+    answers "does material exist", not "did it gate"; the fallback must not
+    be reintroduced. Pure → testable."""
     return eligible_clusters if eligible_clusters is not None else 0
 
 
@@ -1988,11 +1985,8 @@ def _consolidation_stall_verdict(last_success_age, in_flight, has_backlog, thres
     nothing is currently in-flight. Extracted so the verdict is unit-testable
     without a database.
 
-    I7 (`decision:1121`): this function was already correct — ``has_backlog``
-    is trusted as given, so the guarantee that it means GATING backlog (not
-    raw density) lives entirely in what the caller passes as ``has_backlog``,
-    i.e. in ``_consolidation_backlog`` above. Not changed by this fix; cited
-    here so the two functions' contracts are read together."""
+    ``has_backlog`` must be the gating census from ``_consolidation_backlog``
+    (I7), never raw candidate density."""
     if not has_backlog or in_flight:
         return False
     return last_success_age is None or last_success_age > threshold
@@ -2150,8 +2144,9 @@ def _visibility_filter(viewer: str | None, viewer_scope: str | None,
     A caller that asserts no scope cannot match ``'scope'`` rows. Returns the SQL
     fragment and its parameters; ``start`` is the next free asyncpg positional
     index (``$N``). Every read in ``handle_search`` composes this, so a private
-    fact is filtered from Tier-1 AND its Tier-3 synthesis never leaks (the
-    community summary inherits the source cluster's scope/visibility).
+    fact is filtered from Tier-1; every community summary is written
+    ``'global'`` regardless of its sources' visibility (the folds do not
+    consult it), so this clause has nothing to exclude in Tier-3 today.
     """
     if not viewer:
         return "visibility = 'global'", []
@@ -3695,7 +3690,9 @@ class MemoryCoordinator:
         Decision surfaces as a no-op rather than a phantom node.
         """
         retro = params.get("retrospective", {})
-        # decision 276: reversal marks the decision node so the insight gate can skip it. Insights are superseded by the re-fold, not invalidated here.
+        # decision 276: reversal marks the decision node so the insight gate can skip it.
+        # Insights citing it are retired eagerly by the lineage pass's reversal leg
+        # (decision:1207 ③), not by a write here.
         reversal = bool(retro.get("superseded"))
         async with self._neo4j.session() as session:
             if params.get("v") == 2:
@@ -6387,11 +6384,12 @@ class MemoryCoordinator:
     # ── POST /memory/review_hold ──────────────────────────────────────────────
 
     async def handle_review_hold(self, request: web.Request) -> web.Response:
-        """Mark a summary's supersession as reviewed-and-held (decision 384, 8e):
-        the consumer judged a flagged stale source immaterial, so stop surfacing it.
-        Records {old, by} in community_summaries.metadata.reviewed_supersessions
-        (dedup by old). A later supersession of a DIFFERENT source still surfaces;
-        a re-fold (8c) makes a new summary with fresh metadata, so acks never leak."""
+        """Mark a summary's supersession as reviewed-and-held: per decision:384
+        (stale sources are flagged at read time), the consumer judged a flagged
+        stale source immaterial, so stop surfacing it. Records {old, by} in
+        community_summaries.metadata.reviewed_supersessions (dedup by old). A
+        later supersession of a DIFFERENT source still surfaces; a re-fold makes
+        a new summary with fresh metadata, so acks never leak."""
         try:
             body = await request.json()
         except Exception:
@@ -8354,11 +8352,9 @@ class MemoryCoordinator:
         backlog present AND no successful fold within STALL_THRESHOLD AND
         nothing in-flight.
 
-        ⚠ No longer calls ``_nrem_cycle_counts`` here: that density count used
-        to be the no-census fallback and is not any more (I7). It remains a
-        SEPARATE, purely informational gauge elsewhere (``snap["nrem"]`` in
-        the telemetry snapshot) — "raw candidate material exists" is still
-        worth reporting, it just must never stand in for "the gate fired"."""
+        ``_nrem_cycle_counts`` is a separate, purely informational density
+        gauge elsewhere (``snap["nrem"]``) — it must never stand in for "the
+        gate fired"."""
         query = """
             WITH ranked AS (
               SELECT cycle_type, started_at, finished_at, outcome, error_class, error_msg,
