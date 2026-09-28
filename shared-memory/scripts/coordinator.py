@@ -8360,12 +8360,17 @@ class MemoryCoordinator:
         # contract for all six: a NEW key, never an alias for eligible_clusters;
         # None means no cycle has recorded it yet, not zero.
         _LATEST_EXTRA_KEYS = (
-            ("dead_lettered_clusters", "excluded from eligible_clusters: NREM_FOLD_FAIL_CAP dead-lettered them (fact:1189, decision:1121)."),
-            ("unchanged_clusters", "skipped because the re-fold matched the active summary byte for byte."),
-            ("singleton_clusters", "excluded from eligible_clusters: judgement reach was exactly 1, so no insight can fold."),
-            ("insight_gate_skips", "insight groups that failed G2 or G3. Not backlog."),
-            ("truncation_failures", "latest truncation count."),
-            ("slot_failures", "latest slot-protocol-miss count, not only a capacity one."),
+            # Dead-lettered at NREM_FOLD_FAIL_CAP, so excluded from eligible_clusters (fact:1189).
+            "dead_lettered_clusters",
+            # The re-fold matched the active summary byte for byte.
+            "unchanged_clusters",
+            # Judgement reach of exactly 1: no insight can fold, so not eligible backlog.
+            "singleton_clusters",
+            # Insight groups that failed G2 or G3. Not backlog.
+            "insight_gate_skips",
+            "truncation_failures",
+            # A protocol miss, not only a capacity one.
+            "slot_failures",
         )
         query = """
             WITH ranked AS (
@@ -8538,7 +8543,7 @@ class MemoryCoordinator:
                 "eligible_oldest_age_seconds": (r["eligible_oldest_age"] if r else None),
                 # _LATEST_EXTRA_KEYS: None means no census has recorded the key yet, not zero.
                 **{k: (int(r[k]) if r and r[k] is not None else None)
-                   for k, _why in _LATEST_EXTRA_KEYS},
+                   for k in _LATEST_EXTRA_KEYS},
                 # Why the most-recent deferral happened (None if never deferred);
                 # only meaningful when last_outcome == "deferred".
                 "last_deferred_reason": (r["last_deferred_reason"] if r else None),
