@@ -19,8 +19,8 @@ from datetime import datetime
 from neo4j import AsyncGraphDatabase
 from ontology import ONT, fact_kind_from_source_ref, origin_location
 from insight_gate import (
-    INSIGHT_AGE_CENSUS_K, walk_group_reached_set, passes_insight_gate,
-    order_components, classify_identity,
+    INSIGHT_AGE_CENSUS_K, CLOSED_RELATION_TYPES, walk_group_reached_set,
+    passes_insight_gate, order_components, classify_identity,
 )
 from project_axis import PROJECT_SQL, fold_eligible
 from nrem_gate import eligible_domain_level_clusters, count_domain_level_cycles  # noqa: F401 — re-exported from nrem_gate; importing this file pulls psycopg2, which telemetry does not ship
@@ -599,10 +599,6 @@ async def _post_nrem(client: httpx.AsyncClient, payload: dict,
     return resp
 
 
-# Unused leftover; untagged facts are skipped by fold_eligible, not bucketed here.
-DEFAULT_DOMAIN = "general"
-
-
 def fold_record_line(record, content):
     """Render one fold-prompt line for a record, differentiating it by TYPE,
     evidential KIND, ORIGIN locus (decision 916) and capture date — differentiated
@@ -715,8 +711,7 @@ def insight_cypher_query(judgement_ids) -> str:
     / UNDER_CONDITIONS are deferred TO (§3.2: excluded from the embedded
     TEXT, reachable here). Self-contained, no bind parameters. Pure."""
     ids = _cypher_id_list(judgement_ids)
-    rels = "|".join((ONT.grounded_in, ONT.informed_by, ONT.considered,
-                     ONT.rejected, ONT.under_conditions, ONT.had_outcome))
+    rels = "|".join(CLOSED_RELATION_TYPES)
     return (
         f"MATCH (j) WHERE (j:{ONT.decision} OR j:{ONT.retrospective})"
         f" AND j.pg_id IN [{ids}]"
@@ -1957,6 +1952,28 @@ def merge_logs(log_dir: str) -> None:
         except OSError:
             pass
 
+
+def _project_domain_maps(rows):
+    """Shared (project, section) discovery fold over `_find_grounded_fact_groups`'s
+    flat rows: the per-pg_id project/domains maps and the registered
+    (project, section) set both fact and insight discovery partition on.
+    Iteration order is preserved (dict insertion order = row order), so
+    `list(project_map)` matches whichever key set a caller previously
+    derived `pg_ids_all` from. Pure. Returns
+    ``(project_map, domains_map, registered_sections, pg_ids_all)``."""
+    project_map: dict = {}
+    domains_map: dict = {}
+    registered_sections: set = set()
+    for r in rows:
+        pid = r["pg_id"]
+        project_map[pid] = r["project"]
+        doms = domains_map.setdefault(pid, [])
+        if r["domain"] not in doms:
+            doms.append(r["domain"])
+        registered_sections.add((r["project"], r["domain"]))
+    return project_map, domains_map, registered_sections, list(project_map)
+
+
 class ConsolidationDaemon:
     def __init__(self):
         self.pending_pg_ids = set()
@@ -2767,19 +2784,9 @@ class ConsolidationDaemon:
             record_map = await loop.run_in_executor(None, _fetch_records)
 
             # Axis membership comes from the graph walk already in these rows, not a second Postgres lookup. A DOMAIN_OF edge exists only for a registered section.
-            content_by_pid: dict = {}
-            project_map: dict = {}
-            domains_map: dict = {}
-            registered_sections: set = set()
-            for r in rows:
-                pid = r["pg_id"]
-                content_by_pid[pid] = r["content"]
-                project_map[pid] = r["project"]
-                doms = domains_map.setdefault(pid, [])
-                if r["domain"] not in doms:
-                    doms.append(r["domain"])
-                registered_sections.add((r["project"], r["domain"]))
-            pg_ids_all = list(content_by_pid)
+            content_by_pid: dict = {r["pg_id"]: r["content"] for r in rows}
+            project_map, domains_map, registered_sections, pg_ids_all = \
+                _project_domain_maps(rows)
             contents_all = [content_by_pid[pid] for pid in pg_ids_all]
 
             # Only (project, section) folds. There is no entity level and no project-only level.
@@ -3144,17 +3151,8 @@ class ConsolidationDaemon:
         if not rows:
             return []
 
-        project_map: dict = {}
-        domains_map: dict = {}
-        registered_sections: set = set()
-        for r in rows:
-            pid = r["pg_id"]
-            project_map[pid] = r["project"]
-            doms = domains_map.setdefault(pid, [])
-            if r["domain"] not in doms:
-                doms.append(r["domain"])
-            registered_sections.add((r["project"], r["domain"]))
-        pg_ids_all = list(project_map)
+        project_map, domains_map, registered_sections, pg_ids_all = \
+            _project_domain_maps(rows)
 
         # Same partitioner as the fact cycle, not a second derivation.
         groups = eligible_domain_level_clusters(
@@ -3285,6 +3283,10 @@ class ConsolidationDaemon:
 
                 clusters = await self._find_fresh_insight_clusters()
                 rec.insight_gate_skips = self._insight_gate_skips
+                # Normalise once per cluster: judgement_ids come from the walk's own label
+                # keys (ints, never None), so every later pass over `clusters` reads this.
+                for c in clusters:
+                    c["ids"] = [int(i) for i in c["judgement_ids"] if i is not None]
 
                 # Identity is the set of judgement pg_ids. 'same' appends onto the existing insight; 'covered' adds nothing; the other classes fold, and subset supersession resolves 'supersedes' at write time.
                 existing_insights = await loop.run_in_executor(
@@ -3331,7 +3333,7 @@ class ConsolidationDaemon:
                 eligible_clusters = []
                 dead_lettered_now = 0
                 for c in clusters:
-                    ids = [int(i) for i in c["judgement_ids"] if i is not None]
+                    ids = c["ids"]
                     if ids and _dead_lettered(c["entity"], ids, c.get("judgement_types") or {}):
                         dead_lettered_now += 1
                         continue
@@ -3342,7 +3344,7 @@ class ConsolidationDaemon:
                 non_singleton_clusters = []
                 singleton_now = 0
                 for c in clusters:
-                    ids = [int(i) for i in c["judgement_ids"] if i is not None]
+                    ids = c["ids"]
                     if len(ids) < 2:
                         singleton_now += 1
                         continue
@@ -3357,9 +3359,7 @@ class ConsolidationDaemon:
                     )
 
                 # Census before folding so a crash still records eligibility. Age uses the full judgement reach, including a component whose only new member is a retrospective.
-                cluster_id_lists = [
-                    [int(i) for i in c["judgement_ids"] if i is not None] for c in clusters
-                ]
+                cluster_id_lists = [c["ids"] for c in clusters]
                 all_member_ids = [i for ids in cluster_id_lists for i in ids]
                 ts_map = await loop.run_in_executor(
                     None, lambda: _fetch_outbox_created_at(all_member_ids))
@@ -3369,7 +3369,7 @@ class ConsolidationDaemon:
                 rec.dead_lettered_clusters = dead_lettered_now
                 rec.singleton_clusters = singleton_now
                 for c in clusters:
-                    ids = [int(i) for i in c["judgement_ids"] if i is not None]
+                    ids = c["ids"]
                     if not ids or any(i in folded for i in ids):
                         continue  # already folded as a re-fold this pass
                     logger.info(
