@@ -336,7 +336,9 @@ CREATE TABLE IF NOT EXISTS community_summaries (
     updated_at       TIMESTAMPTZ DEFAULT now(),
     run_id           BIGINT,
     superseded_at    TIMESTAMPTZ,
-    superseded_reason TEXT
+    superseded_reason TEXT,
+    superseded_by    INTEGER,
+    CONSTRAINT community_summaries_successor_only_when_superseded CHECK (((superseded_by IS NULL) OR superseded))
 );
 
 CREATE INDEX IF NOT EXISTS community_summaries_active_idx ON public.community_summaries USING btree (id) WHERE (NOT superseded);
@@ -589,6 +591,10 @@ CREATE INDEX IF NOT EXISTS technical_docs_visibility_idx ON public.technical_doc
 -- ─── Foreign keys ──────────────────────────────────────────────────────────
 -- Added after every table exists: a referencing table can sort before its
 -- target, so these cannot be inline column constraints.
+DO $$ BEGIN
+    ALTER TABLE community_summaries ADD CONSTRAINT community_summaries_superseded_by_fkey FOREIGN KEY (superseded_by) REFERENCES community_summaries(id) ON DELETE SET NULL;
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;
 
 DO $$ BEGIN
     ALTER TABLE decision_alternatives ADD CONSTRAINT decision_alternatives_decision_pg_id_fkey FOREIGN KEY (decision_pg_id) REFERENCES technical_docs(id) ON DELETE CASCADE;

@@ -6829,6 +6829,7 @@ class MemoryCoordinator:
             result = await session.run(
                 f"MATCH (n {{pg_id: $pg_id}}) WHERE {anchor_where}"
                 " OPTIONAL MATCH (n)-[r]-(related)"
+                "   WHERE NOT (related:CommunitySummary AND coalesce(related.superseded,false))"
                 # Pull genuinely-referenced entity alias siblings (decision:890); stray Decision ALIASES edges do not surface.
                 f" OPTIONAL MATCH (related)-[:{ONT.aliases}]-(al:{ONT.entity})"
                 f"   WHERE EXISTS {{"
@@ -6967,6 +6968,7 @@ class MemoryCoordinator:
                 " CALL (pg_id) {"
                 f"   MATCH (n {{pg_id: pg_id}}) WHERE {anchor_where}"
                 "   OPTIONAL MATCH (n)-[r]-(related)"
+                "     WHERE NOT (related:CommunitySummary AND coalesce(related.superseded,false))"
                 f"   OPTIONAL MATCH (related)-[:{ONT.aliases}]-(al:{ONT.entity})"
                 f"     WHERE EXISTS {{"
                 f"       MATCH (related)<-[:{ONT.entity_link}]-(m)"
@@ -7448,39 +7450,46 @@ class MemoryCoordinator:
                 if pid in stale_map and pid not in acked
             ]
 
-        # Annotate insight stale_summaries at read time from community_summaries via summary_ids, never technical_docs (decision:1207).
+        # Annotate insight retired_summaries at read time from community_summaries via summary_ids, never technical_docs (decision:1207, decision:2778).
         insight_summary_ids: set[int] = set()
         if insight:
             insight_meta = insight.get("metadata")
             insight_meta = (_coerce_jsonb_obj(insight_meta)
                              if not isinstance(insight_meta, dict) else insight_meta)
             insight_summary_ids.update((insight_meta or {}).get("summary_ids") or [])
-        stale_summary_map: dict[int, str | None] = {}
+        retired_summary_map: dict[int, tuple[str | None, int | None]] = {}
         if insight_summary_ids:
             try:
                 async with self._acquire() as conn:
                     ssrows = await conn.fetch(
-                        "SELECT id, superseded_reason FROM community_summaries"
+                        "SELECT id, superseded_reason, superseded_by FROM community_summaries"
                         " WHERE id = ANY($1) AND superseded",
                         list(insight_summary_ids),
                     )
-                stale_summary_map = {r["id"]: r["superseded_reason"] for r in ssrows}
+                retired_summary_map = {
+                    r["id"]: (r["superseded_reason"], r["superseded_by"])
+                    for r in ssrows
+                }
             except Exception as e:
                 # A database fault must not read as no superseded summaries. The annotation is advisory, and the miss is logged.
                 log.warning(
-                    "stale_summaries annotation degraded (%s: %s) — "
+                    "retired_summaries annotation degraded (%s: %s) — "
                     "%d summary_ids unchecked",
                     type(e).__name__, e, len(insight_summary_ids),
                 )
-                stale_summary_map = {}  # degrade to no annotation
+                retired_summary_map = {}  # degrade to no annotation
 
-        def _stale_summaries(meta) -> list[dict]:
+        def _retired_summaries(meta) -> list[dict]:
             m = _coerce_jsonb_obj(meta) if not isinstance(meta, dict) else meta
             sids = (m or {}).get("summary_ids") or []
             return [
-                {"summary_id": sid, "superseded_reason": stale_summary_map.get(sid)}
+                {
+                    "summary_id": sid,
+                    "superseded_reason": retired_summary_map[sid][0],
+                    "superseded_by": retired_summary_map[sid][1],
+                }
                 for sid in sids
-                if sid in stale_summary_map
+                if sid in retired_summary_map
             ]
 
         # Build final in the reranker's order. No tier is inserted ahead of that ranking or appended after it.
@@ -7539,9 +7548,9 @@ class MemoryCoordinator:
                     if stale:
                         res["stale_sources"] = stale
                     if rtype == "insight":
-                        stale_sum = _stale_summaries(meta)
-                        if stale_sum:
-                            res["stale_summaries"] = stale_sum
+                        retired_sum = _retired_summaries(meta)
+                        if retired_sum:
+                            res["retired_summaries"] = retired_sum
                     final.append(res)
                     continue
 
@@ -7830,7 +7839,7 @@ class MemoryCoordinator:
         qualified so they cannot be mistaken for ids in this namespace."""
         async with self._acquire() as conn:
             row = await conn.fetchrow(
-                "SELECT id, metadata, source_pg_ids, created_at, superseded, run_id"
+                "SELECT id, metadata, source_pg_ids, created_at, superseded, superseded_reason, superseded_by, run_id"
                 "  FROM community_summaries WHERE id = $1", pg_id,
             )
             if row is None:
@@ -7841,7 +7850,8 @@ class MemoryCoordinator:
                 )
             meta   = _coerce_jsonb_obj(row["metadata"])
             actual = summary_record_type(meta)
-            if record_type != actual:
+            expected = "summary" if record_type == "thematic" else record_type
+            if expected != actual:
                 return web.json_response(
                     {"status": "error", "pg_id": pg_id,
                      "message": (f"{make_ref(record_type, pg_id)} does not exist — id "
@@ -7856,7 +7866,26 @@ class MemoryCoordinator:
                     "  WHERE id = ANY($1::bigint[])", list(row["source_pg_ids"]),
                 ):
                     src_types[r["id"]] = doc_record_type({"type": r["type"]})
-        return web.json_response({
+            retired_summaries = []
+            if actual == "insight":
+                sids = (meta or {}).get("summary_ids") or []
+                if sids:
+                    r_rows = await conn.fetch(
+                        "SELECT id, superseded_reason, superseded_by FROM community_summaries"
+                        " WHERE id = ANY($1) AND superseded",
+                        list(sids),
+                    )
+                    retired_summaries = [
+                        {
+                            "summary_id": r["id"],
+                            "superseded_reason": r["superseded_reason"],
+                            "superseded_by": r["superseded_by"],
+                        }
+                        for r in r_rows
+                    ]
+        row_dict = dict(row) if not isinstance(row, dict) else row
+        sup_by = row_dict.get("superseded_by")
+        resp_data = {
             "pg_id": pg_id,
             "record_type": actual,
             "ref": make_ref(actual, pg_id),
@@ -7869,6 +7898,8 @@ class MemoryCoordinator:
                 [meta["domain"]] if meta.get("domain") else []),
             "created_at": row["created_at"].isoformat() if row["created_at"] else None,
             "superseded": row["superseded"],
+            "superseded_reason": row_dict.get("superseded_reason"),
+            "superseded_by": (make_ref(actual, sup_by) if sup_by is not None else None),
             "run_id": row["run_id"],
             "source_pg_ids": list(row["source_pg_ids"] or []),
             "summary_ids": meta.get("summary_ids") or [],
@@ -7878,7 +7909,10 @@ class MemoryCoordinator:
                  "ref": (make_ref(src_types[sid], sid) if sid in src_types else None)}
                 for sid in (row["source_pg_ids"] or [])
             ],
-        })
+        }
+        if actual == "insight":
+            resp_data["retired_summaries"] = retired_summaries
+        return web.json_response(resp_data)
 
     # ── GET /memory/telemetry ─────────────────────────────────────────────────
 
