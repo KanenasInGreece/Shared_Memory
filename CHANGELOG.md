@@ -7,6 +7,18 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.0.9] - 2026-09-29
+
+The dreaming cycle stops rewriting what has not changed. `API_VERSION` stays 4. The telemetry contract keeps its keys, but two counts change meaning; see below.
+
+### Fixed
+- A thematic summary's lines are written in ascending record order. Before, they followed an unordered graph scan, so a summary could be rewritten, re-embedded and pushed into its history with nothing changed but line order (33 of 204 live refolds). The first sweep after upgrading rewrites each summary once into the new order; after that an unchanged summary is skipped, as intended.
+- When a walked insight component matches an existing insight exactly, nothing is written unless a new thematic summary id or domain is actually added. Before, every sweep rewrote every matching insight. That write no longer touches `updated_at`, which again means "last folded", so an insight's refold-ledger row closes only on a real fold.
+- A failing insight component is attempted once per sweep. Before, it was retried once for every group that reached it, so one truncating fold could run four times in a sweep.
+
+### Changed
+- Because repeats in a sweep are no longer counted, the insight run's attempted and failed counts are lower, and `NREM_FOLD_FAIL_CAP` now counts failing sweeps rather than the groups that reached the component. A component that keeps failing is dead-lettered after three sweeps instead of within one.
+
 ## [1.0.8] - 2026-09-28
 
 The dreaming-cycle code says what it does. Behaviour is unchanged. `API_VERSION` stays 4, and the telemetry contract has no additions, moves, removals or meaning changes.
