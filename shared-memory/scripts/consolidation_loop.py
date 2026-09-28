@@ -19,8 +19,8 @@ from datetime import datetime
 from neo4j import AsyncGraphDatabase
 from ontology import ONT, fact_kind_from_source_ref, origin_location
 from insight_gate import (
-    INSIGHT_AGE_CENSUS_K, walk_group_reached_set, passes_insight_gate,
-    order_components, classify_identity,
+    INSIGHT_AGE_CENSUS_K, CLOSED_RELATION_TYPES, walk_group_reached_set,
+    passes_insight_gate, order_components, classify_identity,
 )
 from project_axis import PROJECT_SQL, fold_eligible
 from nrem_gate import eligible_domain_level_clusters, count_domain_level_cycles  # noqa: F401 — re-exported from nrem_gate; importing this file pulls psycopg2, which telemetry does not ship
@@ -326,7 +326,7 @@ def _fold_identity(record_type, ids):
     failure history. Qualifying every ref by record_type also avoids the
     cross-table pg_id collision decision 822 already diagnosed (technical_docs
     and community_summaries run independent sequences) — relevant because a
-    caller could otherwise mix ids from both, as fetch_refold_insights does.
+    caller could otherwise mix ids from both.
     ``ids`` may contain duplicates/be unsorted; both are normalised here so
     the same logical member set always produces the same string regardless
     of caller ordering."""
@@ -343,9 +343,8 @@ def _judgement_fold_identity(judgement_ids, types) -> str:
     ``_fold_identity`` guards against is specifically technical_docs vs.
     community_summaries, a DIFFERENT table pair). ``types`` maps
     ``{pg_id: 'decision' | 'retrospective'}``; a ``pg_id`` missing from it
-    defaults to 'decision' (the pre-C4 convention) rather than raising, so
-    a caller that only has decision ids (e.g. a legacy re-fold row) still
-    gets a stable key."""
+    defaults to 'decision' rather than raising, so a caller that only has
+    decision ids (e.g. a legacy re-fold row) still gets a stable key."""
     return ",".join(sorted(
         make_ref(str(types.get(int(i), "decision")).lower(), int(i))
         for i in {int(x) for x in judgement_ids}
@@ -475,10 +474,7 @@ class _CycleRec:
         zeroes read exactly like no census at all, which is how a deliberate
         skip comes to look like a stall. `eligible_clusters` is the census's
         own output and is None until it runs, so it is the signal, DERIVED
-        rather than duplicated into a second flag. Until the machine-edge
-        calibration layer was retired this held by accident: every insight
-        cycle fetched a calibration snapshot, and that non-None field alone
-        kept `extra` present."""
+        rather than duplicated into a second flag."""
         if self.eligible_clusters is None and self.insight_gate_skips is None and not (
             self.truncation_failures or self.slot_failures or self.embed_failures
             or self.truncation_failed or self.slot_failed or self.embed_failed
@@ -574,7 +570,8 @@ async def _post_nrem(client: httpx.AsyncClient, payload: dict,
     additive and optional — passed straight through to record_llm_call.
 
     Sends `X-SM-LLM-Role: judge` (R-1: the insight fold is the ONLY NREM LLM
-    path — narrative folds are zero-inference and make no LLM call). A
+    path — the thematic fold itself makes no LLM call, though the facts it
+    folds may already carry REM-generated `rem_summary` text). A
     gateway routing refusal (422/503, X-SM-Fault-Origin: gateway) is recorded
     with a distinguishing note, same as any other non-200 — the LOUD,
     entity-scoped log and the no-retry decision belong to the caller
@@ -600,10 +597,6 @@ async def _post_nrem(client: httpx.AsyncClient, payload: dict,
                     wall_s=time.monotonic() - _start, ceiling_s=ceiling_s,
                     ok=ok, note=note, prompt_chars=prompt_chars)
     return resp
-
-
-# Unused leftover; untagged facts are skipped by fold_eligible, not bucketed here.
-DEFAULT_DOMAIN = "general"
 
 
 def fold_record_line(record, content):
@@ -687,8 +680,8 @@ def thematic_fold_is_current(active_row, summary, pg_ids, entities):
     gate (§2.2: without it "a gating group re-folds an identical insight
     every cycle"). Operator ruling 2026-08-11: already-folded thematic
     summaries are not re-folded unless something changed — supersession
-    included, which needs no case here because Mechanism B RETIRES the
-    invalidated row and a retired row never reaches this check.
+    included, which needs no case here because a superseded constituent
+    changes the computed content directly (see below).
 
     Every comparison failure fails OPEN to folding, so no subset-triggered
     refold (P12 subset supersession, a superseded constituent shrinking
@@ -718,8 +711,7 @@ def insight_cypher_query(judgement_ids) -> str:
     / UNDER_CONDITIONS are deferred TO (§3.2: excluded from the embedded
     TEXT, reachable here). Self-contained, no bind parameters. Pure."""
     ids = _cypher_id_list(judgement_ids)
-    rels = "|".join((ONT.grounded_in, ONT.informed_by, ONT.considered,
-                     ONT.rejected, ONT.under_conditions, ONT.had_outcome))
+    rels = "|".join(CLOSED_RELATION_TYPES)
     return (
         f"MATCH (j) WHERE (j:{ONT.decision} OR j:{ONT.retrospective})"
         f" AND j.pg_id IN [{ids}]"
@@ -870,14 +862,13 @@ def parse_insight_slots(text):
     FIRST-occurrence-wins per pg_id / for PRINCIPLE (multi-role review
     CQR-01, hardening against slot-marker forgery): a judgement's own
     content is RETRIEVED DATA and may itself contain a line shaped like a
-    protocol marker (accidental quotation, or an adversarial attempt to
-    have a LATER, attacker-controlled occurrence overwrite the genuine
-    slot the LLM wrote earlier). `_neutralize_marker_lines` defangs such
-    lines before they ever reach the prompt (see `_insight_slot_items`),
-    but this parser does not trust that alone — it never lets a later
-    match for the same key replace an earlier one, so even a marker that
-    reached the model's own OUTPUT (echoed, not neutralized-away) cannot
-    clobber the real value."""
+    protocol marker. `_neutralize_marker_lines` defangs such lines before
+    they reach the prompt (see `_insight_slot_items`), but this parser
+    does not trust that alone — it never lets a LATER match replace an
+    earlier one for the same key. This stops a marker echoed in the
+    model's own OUTPUT from overwriting an earlier genuine slot; it does
+    NOT verify the first occurrence is genuine — a forged marker written
+    first keeps the forgery."""
     if not text:
         return {}, None
     matches = list(_INSIGHT_SLOT_MARKER_RE.finditer(text))
@@ -1174,20 +1165,19 @@ def close_ledger_rows(conn, pg_ids, context="consolidation"):
     return len(deleted)
 
 
-# Decision pg_id 276: the gate is a HAD_OUTCOME edge, not its rating, and NOTIFY is deaf because decisions are not Fact nodes.
-
-# The predicate lives in insight_gate.py so telemetry and this daemon cannot disagree. An insight has no fixed domain placeholder; domains come from the walk.
-
-
 def fetch_open_retro_decision_ids(conn):
-    """Target decision pg_ids of un-dreamed retrospective rows. An open retro
-    row is the durable re-fold trigger; its wording lives on the HAD_OUTCOME
-    edge (legacy) or the Retrospective record (v2), the row only signals 'not
-    folded yet'. Rows at 'pending'/'failed' still owe the outbox worker a Neo4j
-    write and are not triggers. A retro row on a decision in no insight and no
-    qualifying cluster stays open deliberately — backlog, not a stuck outbox.
-    COALESCE: a v2 row's pg_id is the retro's own id; target_pg_id names the
-    decision (legacy rows carry both, equal)."""
+    """Target decision pg_ids of un-dreamed retrospective rows (decision:276:
+    the gate is a HAD_OUTCOME edge, not the retrospective's rating, and
+    NOTIFY is deaf because decisions are not Fact nodes; the G2/G3 predicate
+    itself lives in insight_gate.py so telemetry and this daemon cannot
+    disagree). An open retro row is the durable re-fold trigger; its wording
+    lives on the HAD_OUTCOME edge (legacy) or the Retrospective record (v2),
+    the row only signals 'not folded yet'. Rows at 'pending'/'failed' still
+    owe the outbox worker a Neo4j write and are not triggers. A retro row on
+    a decision in no insight and no qualifying cluster stays open
+    deliberately — backlog, not a stuck outbox. COALESCE: a v2 row's pg_id
+    is the retro's own id; target_pg_id names the decision (legacy rows
+    carry both, equal)."""
     with conn.cursor() as cur:
         cur.execute(
             "SELECT DISTINCT COALESCE((cypher_params->>'target_pg_id')::bigint, pg_id)"
@@ -1300,20 +1290,18 @@ def append_insight_references(conn, insight_id, summary_id, domain):
 
 
 def fetch_reversal_context(conn, judgement_ids):
-    """Criterion D — the reversal payload obligation (carried outside §3,
-    see HANDOFF.md): when this fold's own constituents are about to close
-    an OPEN ``refold_ledger`` row whose trigger was a REVERSED decision
-    (``trigger_kind='technical_docs'``, ``summary_kind='insight'``), this
-    fold is the DIRECT SUCCESSOR of that reversal — its payload must state
-    what was reverted and why. Driven entirely by ledger trigger
-    provenance, never by walk/gate/component membership, so it needs
-    neither of §2.2a's two open edge cases resolved (whether the reversing
-    retrospective itself satisfies G2 or is walked into the reach) — the
-    reversed decision is excluded from ``judgement_ids`` by I10 either way;
-    this only asks "did closing one of THESE ids' ledger rows trace back to
-    a reversal", which is answered from the ledger, not the graph.
-    Returns ``[{"decision_id", "decision_title", "retro_id",
-    "retro_content"}]`` — empty when this fold is not a reversal successor."""
+    """Criterion D — the reversal payload obligation: when this fold's own
+    constituents are about to close an OPEN ``refold_ledger`` row whose
+    trigger was a REVERSED decision (``trigger_kind='technical_docs'``,
+    ``summary_kind='insight'``), this fold is the DIRECT SUCCESSOR of that
+    reversal — its payload must state what was reverted and why. Driven
+    entirely by ledger trigger provenance, never by walk/gate/component
+    membership — the reversed decision is excluded from ``judgement_ids``
+    by I10 either way; this only asks "did closing one of THESE ids'
+    ledger rows trace back to a reversal", which is answered from the
+    ledger, not the graph. Returns ``[{"decision_id", "decision_title",
+    "retro_id", "retro_content"}]`` — empty when this fold is not a
+    reversal successor."""
     if not judgement_ids:
         return []
     with conn.cursor() as cur:
@@ -1393,17 +1381,13 @@ def supersede_covered_summaries(conn, summary_id, src_ids, level=None, kind="the
     """Mark active summaries whose source_pg_ids the new summary covers
     (subset OR equal — an exact-set re-fold supersedes its predecessor).
 
-    **U5 (§5, plan's "still unfixed" note): kind isolation is now
-    UNCONDITIONAL, never a side effect of ``level`` being set.** It used to
-    apply only when ``level is not None``, and the insight path calls this
-    with ``level=None`` (kind isolation was never actually keeping insight
-    and thematic apart on that path) — the docstring blamed "disjoint id
-    spaces", which is FALSE: facts, decisions and retrospectives all share
-    the single `technical_docs` sequence, so an insight's decision-id source
-    set CAN coincidentally be a subset of a thematic summary's fact-id
-    source set, and vice versa. Pass the caller's own kind explicitly
-    (default ``'thematic'`` — the fact-fold caller's kind) and it is checked
-    on EVERY call, level or no level.
+    Kind isolation is UNCONDITIONAL, checked on every call regardless of
+    ``level`` — pass the caller's own kind explicitly (default
+    ``'thematic'``, the fact-fold caller's kind). ⛔ Facts, decisions and
+    retrospectives share ONE `technical_docs` sequence, so id spaces are
+    NOT disjoint: an insight's decision-id source set CAN coincidentally
+    be a subset of a thematic summary's fact-id source set, and vice versa
+    — never reason from disjoint id spaces (I13).
 
     **P12 (still level-gated, deliberately):** when ``level`` is set, only
     summaries at the **same** level are additionally required — without
@@ -1496,19 +1480,11 @@ def fetch_invalidated_summaries(conn):
     REVERSED decision (`rating='reversed'`, coordinator.py's retrospective
     handler) alike — same column, same test, nothing to keep in sync (§2.2a).
 
-    ⛔ **AMENDED 2026-08-11 (`decision:1207`): TWO LEGS, not three.** The
-    former leg 3 (an INSIGHT summary whose `metadata->'summary_ids'` overlaps
-    a leg-1-retired THEMATIC summary — the thematic→insight LINEAGE cascade,
-    §2.5/§5.2) is **disabled**, not merely untriggered. §5.2 now splits
-    propagation BY TIER: the thematic tier still retires eagerly (leg 1,
-    unchanged), but a superseded thematic summary no longer eagerly
-    supersedes an insight resting on it. That staleness is judged LAZILY, at
-    retrieval, via the ADDITIVE `stale_summaries` annotation coordinator.py's
-    search path adds to an insight result (mirroring `stale_sources`,
-    `decision:384`) — never re-derived here at write time. Reversal→insight
-    (leg 2, §2.2a / I10) is UNCHANGED and stays eager: it is a different
-    trigger (a decision the insight directly names being reversed), refined
-    by `decision:1207` in name only.
+    ⛔ TWO legs, not three (`decision:1207`): thematic→insight lineage (the
+    former leg 3) is disabled — a superseded thematic summary's staleness
+    is judged LAZILY at read time via coordinator.py's `stale_summaries`
+    annotation, never re-derived here; reversal→insight (leg 2, §2.2a/I10)
+    stays eager.
 
     The two legs that remain:
 
@@ -1610,7 +1586,7 @@ def retire_invalidated_summaries(conn):
     `consolidated` flag is NEVER cleared here — `_find_grounded_fact_
     groups` never reads it, so clearing it would be a write with no reader.
     An INSIGHT's `consolidated` flag on its Decision/Retrospective graph
-    nodes IS gate-critical (G3, `insight_gate.py:96`) but lives in Neo4j;
+    nodes IS gate-critical (G3, `insight_gate.passes_insight_gate`) but lives in Neo4j;
     the caller (`ConsolidationDaemon.run_lineage_invalidation_pass`) clears
     it after this commits, using the ``retired`` list this function returns.
 
@@ -1732,16 +1708,19 @@ def close_refold_ledger_rows(conn, context="consolidation"):
     `community_summaries` row of the MATCHING kind (thematic rows check
     non-insight summaries, insight rows check insight summaries — mirrors
     `mark_covered_rows_consolidated`'s covering-summary join shape, kind-
-    scoped the way U5 requires `supersede_covered_summaries` to be), AND
-    that covering summary is no older than the ledger row itself
-    (C3.1 F2 — ``COALESCE(cs.updated_at, cs.created_at) >= o.created_at``).
-    Without the recency bound, a `pg_id` sitting in some OTHER active summary
+    scoped the same way `supersede_covered_summaries` is), AND that
+    covering summary is no older than the ledger row itself (C3.1 F2 —
+    ``COALESCE(cs.updated_at, cs.created_at) >= o.created_at``). Without
+    the recency bound, a `pg_id` sitting in some OTHER active summary
     that merely predates the invalidation (measured live: fact 1149 sits in
     a third, untouched summary) closes the row 'constituent_folded' with
-    nothing having actually folded — the UPSERT sets `updated_at = now()` on
-    every real fold, and a fresh INSERT defaults both columns together, so
-    the bound only ever excludes a summary that could not have been the
-    re-fold this row is waiting for.
+    nothing having actually folded — the THEMATIC upsert sets
+    `updated_at = now()` on every real fold, so for thematic rows the
+    bound excludes a summary that could not have been the re-fold this
+    row is waiting for. For INSIGHT rows the bound is weaker:
+    `append_insight_references`'s 'same'-identity path also sets
+    `updated_at = now()` on every match, fold or not, so an insight row
+    can close 'constituent_folded' without anything having folded.
 
     'dropped'/'constituent_superseded' — defensive: the row's own `pg_id`
     became superseded again after the row opened. Should not occur given
@@ -1973,6 +1952,28 @@ def merge_logs(log_dir: str) -> None:
         except OSError:
             pass
 
+
+def _project_domain_maps(rows):
+    """Shared (project, section) discovery fold over `_find_grounded_fact_groups`'s
+    flat rows: the per-pg_id project/domains maps and the registered
+    (project, section) set both fact and insight discovery partition on.
+    Iteration order is preserved (dict insertion order = row order), so
+    `list(project_map)` matches whichever key set a caller previously
+    derived `pg_ids_all` from. Pure. Returns
+    ``(project_map, domains_map, registered_sections, pg_ids_all)``."""
+    project_map: dict = {}
+    domains_map: dict = {}
+    registered_sections: set = set()
+    for r in rows:
+        pid = r["pg_id"]
+        project_map[pid] = r["project"]
+        doms = domains_map.setdefault(pid, [])
+        if r["domain"] not in doms:
+            doms.append(r["domain"])
+        registered_sections.add((r["project"], r["domain"]))
+    return project_map, domains_map, registered_sections, list(project_map)
+
+
 class ConsolidationDaemon:
     def __init__(self):
         self.pending_pg_ids = set()
@@ -2005,9 +2006,10 @@ class ConsolidationDaemon:
         self._startup_sweep_done = False
 
     def _requeue(self, pg_ids):
-        """Re-queue failed work as event entry points. Starts the backstop
-        clock if it is not already running — without this, re-queued work has
-        no hard backstop and sustained GPU activity can defer it forever."""
+        """Re-queue failed work as event entry points, and stamp
+        `first_notification_time` on the first requeue since it was last
+        cleared. The daemon's actual backstop clock is
+        `_backlog_eligible_since`, not this field."""
         if pg_ids and not self.pending_pg_ids and self.first_notification_time is None:
             self.first_notification_time = datetime.now()
         self.pending_pg_ids.update(pg_ids)
@@ -2260,8 +2262,8 @@ class ConsolidationDaemon:
     async def _call_insight_llm(self, prompt, entity, units, items=None,
                                 only_ids=None, need_principle=True):
         """One truncation-bounded LLM call for the insight-slot protocol
-        (decision:1205) — the same widen-once-then-fail semantics the
-        pre-v0.8.71 free-prose ``generate_insight`` used. Returns the raw
+        (decision:1205) — widen-once-then-fail: one retry at a wider token
+        bound before the fold fails. Returns the raw
         response text, or None. On persistent truncation
         self._last_llm_truncated is set True; on a non-200 status or a
         network/parse exception it stays False — a GENERIC call failure,
@@ -2410,21 +2412,12 @@ class ConsolidationDaemon:
         """Targeted density-based consolidation.
 
         Entry points come from the DURABLE outbox ledger (facts at
-        'rem_reviewed'), not from `pending_pg_ids`. That set answered the wrong
-        question — it named records that had been SAVED, while the cycle needs
-        records ENRICHED — and it was also destructive: it was cleared before
-        the clusters were found, and the no-cluster path returned without
-        requeueing (`_requeue` is exception-only), so a no-op run consumed its
-        own entry points and the facts behind them went unconsidered until some
-        unrelated save happened to re-trigger the cycle.
-
-        Reading the ledger fixes both at once: the predicate is durable, so
-        there is nothing to lose and nothing to requeue — the same rows are
-        still there on the next pass, and they leave only when they consolidate.
-        `pending_pg_ids` survives as the ACTIVITY signal it always really was
-        (it feeds the idle clock and `sweep_due`), and is cleared here because
-        this cycle has now considered everything those notifications could have
-        contributed."""
+        'rem_reviewed'), not from `pending_pg_ids` — that set names records
+        SAVED, not records ENRICHED into a dense cluster, and clearing it
+        early made a no-op run lose its own entry points. `pending_pg_ids`
+        survives as the ACTIVITY signal it always was (feeds the idle clock
+        and `sweep_due`), and is cleared here because this cycle has now
+        considered everything those notifications could have contributed."""
         # Union requeued ids in. A failed fold should still be on the ledger, but a re-queue must not depend on that.
         ids_to_process = sorted(
             set(ids if ids is not None else self._backlog) | set(self.pending_pg_ids))
@@ -2484,15 +2477,13 @@ class ConsolidationDaemon:
         presence alone already proves BOTH axes registered — no separate
         Postgres registry lookup is needed to satisfy that half of §2.1.
 
-        Unlike the old per-call `ids` restriction, this is always a full scan:
-        a group's density must be judged on its WHOLE population, not on
-        whichever facts happened to trigger this pass, so partial-population
-        discovery would silently under- or over-count. The corpus this scan
-        runs over is small (order 10^2 grounded facts) and this is a single
-        cheap read query — the event cycle, the ledger sweep and the global
-        sweep all now call this SAME method (see run_ledger_sweep /
-        run_global_sweep below), collapsing what used to be three
-        semi-duplicated entity Cypher blocks into one.
+        This is always a full scan: a group's density must be judged on its
+        WHOLE population, not on whichever facts happened to trigger this
+        pass, so partial-population discovery would silently under- or
+        over-count. The corpus this scan runs over is small (order 10^2
+        grounded facts) and this is a single cheap read query shared by the
+        event cycle, the ledger sweep and the global sweep (see
+        run_ledger_sweep / run_global_sweep below).
 
         Returns a flat list of rows — one per (fact, domain) pair (a fact
         tagged with several registered sections fans out, matching
@@ -2530,7 +2521,7 @@ class ConsolidationDaemon:
         Postgres retirement (`retire_invalidated_summaries`) is one atomic
         pass. The Neo4j half is this method's own job: a retired INSIGHT's
         member Decision/Retrospective nodes have `consolidated` cleared —
-        gate-critical (G3, `insight_gate.py:96`) — so they read as fresh on
+        gate-critical (G3, `insight_gate.passes_insight_gate`) — so they read as fresh on
         the very next walk. A retired THEMATIC summary needs no graph write
         at all (`_find_grounded_fact_groups` never reads `f.consolidated`).
 
@@ -2593,7 +2584,8 @@ class ConsolidationDaemon:
              'consolidated' (crash between Postgres commit and graph sync),
              then close them. Idempotent, so no graph-state check first.
           3. Evaluate — if the rem_reviewed fact backlog meets the density
-             threshold, feed those pg_ids to the anchored cluster query.
+             threshold, run the full (unanchored) grounded-fact scan and
+             fold what qualifies.
         """
         loop = asyncio.get_running_loop()
         try:
@@ -2664,11 +2656,10 @@ class ConsolidationDaemon:
         coverage is the outbox-anchored run_ledger_sweep. (Retrospective on
         decision pg_id 214; ledger: decision pg_id 267.)
 
-        v2 (C1): `_find_grounded_fact_groups` is ALREADY an unrestricted full
-        scan (see its docstring), so this method is now a thin wrapper around
-        the same discovery+fold the other two entry points use — there is no
-        more "anchored vs unanchored" distinction to draw once entity-hub
-        discovery is gone."""
+        `_find_grounded_fact_groups` is already an unrestricted full scan
+        (see its docstring), so this method is a thin wrapper around the
+        same discovery+fold the other two entry points use — there is no
+        "anchored vs unanchored" distinction left to draw."""
         try:
             rows = await self._find_grounded_fact_groups()
 
@@ -2793,19 +2784,9 @@ class ConsolidationDaemon:
             record_map = await loop.run_in_executor(None, _fetch_records)
 
             # Axis membership comes from the graph walk already in these rows, not a second Postgres lookup. A DOMAIN_OF edge exists only for a registered section.
-            content_by_pid: dict = {}
-            project_map: dict = {}
-            domains_map: dict = {}
-            registered_sections: set = set()
-            for r in rows:
-                pid = r["pg_id"]
-                content_by_pid[pid] = r["content"]
-                project_map[pid] = r["project"]
-                doms = domains_map.setdefault(pid, [])
-                if r["domain"] not in doms:
-                    doms.append(r["domain"])
-                registered_sections.add((r["project"], r["domain"]))
-            pg_ids_all = list(content_by_pid)
+            content_by_pid: dict = {r["pg_id"]: r["content"] for r in rows}
+            project_map, domains_map, registered_sections, pg_ids_all = \
+                _project_domain_maps(rows)
             contents_all = [content_by_pid[pid] for pid in pg_ids_all]
 
             # Only (project, section) folds. There is no entity level and no project-only level.
@@ -2838,7 +2819,7 @@ class ConsolidationDaemon:
                     continue
                 eligible_work_items.append((project, section, contents, pg_ids))
 
-            # The fold is deterministic, so compare it to the active row before embedding. A byte-identical rewrite is skipped; any membership or text change still folds.
+            # Compare the fold's rendered text to the active row before embedding — row order follows the Neo4j scan, which is unordered. A byte-identical rewrite is skipped; any membership, order, or text change still folds.
             active_rows = await loop.run_in_executor(
                 None, lambda: fetch_active_thematic_rows(
                     conn, [(p or "", s or SECTION_NONE)
@@ -3135,19 +3116,18 @@ class ConsolidationDaemon:
                                (kept for the §2.2a-edge-case skip check below
                                and telemetry; the fold itself now consumes
                                `judgement_ids`, not this).
-          ``projects``      -- ``[project]`` (single — a v2 group is one
-                               (project, domain) pair, never cross-project by
-                               construction).
+          ``projects``      -- ``[project]``, the SEEDING group's project
+                               only — the walk itself is unbounded and can
+                               reach judgements in other projects, so a
+                               component can span more than this one name.
           ``domain``         -- the group's domain — the seeding axis; C4
                                uses this for the `summary_ids`/`domains`
                                lookups a fresh fold performs.
-          ``judgement_ids``  -- ✅ C4: the FULL ordered component (decisions
-                               AND retrospectives) — the honest §2.3 reach —
-                               is what `run_insight_cycle` now feeds to
-                               `_fold_insight` (criterion C: the PR #226 seam
-                               is fixed — `_mark_insight_in_graph` matches
-                               both labels, so a Retrospective pg_id is
-                               correctly marked `consolidated`).
+          ``judgement_ids``  -- the full ordered component (decisions and
+                               retrospectives) fed to `_fold_insight`;
+                               `_mark_insight_in_graph` matches both labels,
+                               so a Retrospective pg_id is correctly marked
+                               `consolidated`.
           ``judgement_types`` -- ``{pg_id: 'Decision'|'Retrospective'}`` for
                                this component (from the walk's own `labels`)
                                — lets a caller build a per-id dead-letter key
@@ -3155,41 +3135,24 @@ class ConsolidationDaemon:
                                Postgres round-trip.
           ``has_retrospective`` -- whether this SPECIFIC component contains a
                                Retrospective (G2 is evaluated on the GROUP's
-                               full reach, not per component — a component
-                               can legitimately have none, e.g. a lone
-                               judgement with no neighbours). ⚠ Such a
-                               singleton component (judgement reach of
-                               exactly 1) IS still emitted here by the
-                               finder, but is no longer folded — operator
-                               ruling 2026-08-16 has `run_insight_cycle`
-                               partition it out before the census
-                               (rec.singleton_clusters, never counted as
-                               eligible backlog) and never attempt it. It
-                               folds only once a second judgement joins its
-                               component in a later cycle.
+                               full reach, not per component — a lone
+                               judgement can legitimately have none). A
+                               singleton component (reach of exactly 1) is
+                               still emitted here; see `run_insight_cycle`
+                               for why it is not folded.
 
         A component with ZERO decision ids after the retrospective-only
-        filter is skipped (logged) rather than folded with nothing to name
-        — this is §2.2a edge case #1 (a reversing retrospective as the sole
-        surviving member of its component), left UNRESOLVED per the plan;
-        see this PR's HANDOFF.md for the escalation.
+        filter — a retrospective-only component (fact:1157 ruling 2: a
+        retrospective alone does not fold) — is skipped (logged) rather
+        than folded with nothing to name.
         """
         self._insight_gate_skips = 0
         rows = await self._find_grounded_fact_groups()
         if not rows:
             return []
 
-        project_map: dict = {}
-        domains_map: dict = {}
-        registered_sections: set = set()
-        for r in rows:
-            pid = r["pg_id"]
-            project_map[pid] = r["project"]
-            doms = domains_map.setdefault(pid, [])
-            if r["domain"] not in doms:
-                doms.append(r["domain"])
-            registered_sections.add((r["project"], r["domain"]))
-        pg_ids_all = list(project_map)
+        project_map, domains_map, registered_sections, pg_ids_all = \
+            _project_domain_maps(rows)
 
         # Same partitioner as the fact cycle, not a second derivation.
         groups = eligible_domain_level_clusters(
@@ -3234,7 +3197,7 @@ class ConsolidationDaemon:
         self._insight_gate_skips = gate_skips
         return clusters
 
-    # The pre-C4 edge fetches are gone. Insight text is each judgement's title and rationale; edge detail stays in insight_cypher_query, and _fold_insight does not open a Neo4j session.
+    # Insight text is each judgement's title and rationale; edge detail stays in insight_cypher_query, and _fold_insight does not open a Neo4j session.
 
     async def run_insight_cycle(self):
         """Insight consolidation pass — ledger-driven like run_ledger_sweep
@@ -3320,6 +3283,10 @@ class ConsolidationDaemon:
 
                 clusters = await self._find_fresh_insight_clusters()
                 rec.insight_gate_skips = self._insight_gate_skips
+                # Normalise once per cluster: judgement_ids come from the walk's own label
+                # keys (ints, never None), so every later pass over `clusters` reads this.
+                for c in clusters:
+                    c["ids"] = [int(i) for i in c["judgement_ids"] if i is not None]
 
                 # Identity is the set of judgement pg_ids. 'same' appends onto the existing insight; 'covered' adds nothing; the other classes fold, and subset supersession resolves 'supersedes' at write time.
                 existing_insights = await loop.run_in_executor(
@@ -3366,7 +3333,7 @@ class ConsolidationDaemon:
                 eligible_clusters = []
                 dead_lettered_now = 0
                 for c in clusters:
-                    ids = [int(i) for i in c["judgement_ids"] if i is not None]
+                    ids = c["ids"]
                     if ids and _dead_lettered(c["entity"], ids, c.get("judgement_types") or {}):
                         dead_lettered_now += 1
                         continue
@@ -3377,7 +3344,7 @@ class ConsolidationDaemon:
                 non_singleton_clusters = []
                 singleton_now = 0
                 for c in clusters:
-                    ids = [int(i) for i in c["judgement_ids"] if i is not None]
+                    ids = c["ids"]
                     if len(ids) < 2:
                         singleton_now += 1
                         continue
@@ -3392,9 +3359,7 @@ class ConsolidationDaemon:
                     )
 
                 # Census before folding so a crash still records eligibility. Age uses the full judgement reach, including a component whose only new member is a retrospective.
-                cluster_id_lists = [
-                    [int(i) for i in c["judgement_ids"] if i is not None] for c in clusters
-                ]
+                cluster_id_lists = [c["ids"] for c in clusters]
                 all_member_ids = [i for ids in cluster_id_lists for i in ids]
                 ts_map = await loop.run_in_executor(
                     None, lambda: _fetch_outbox_created_at(all_member_ids))
@@ -3404,7 +3369,7 @@ class ConsolidationDaemon:
                 rec.dead_lettered_clusters = dead_lettered_now
                 rec.singleton_clusters = singleton_now
                 for c in clusters:
-                    ids = [int(i) for i in c["judgement_ids"] if i is not None]
+                    ids = c["ids"]
                     if not ids or any(i in folded for i in ids):
                         continue  # already folded as a re-fold this pass
                     logger.info(

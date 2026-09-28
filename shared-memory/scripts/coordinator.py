@@ -126,7 +126,7 @@ def _short(value: Any, cap: int = 200) -> str:
 
 
 # FRAMEWORK_VERSION is the build string and may drift. API_VERSION is the wire contract with memory_bridge.py; bump it only when shape, auth, or routes break older clients.
-FRAMEWORK_VERSION = "1.0.7"
+FRAMEWORK_VERSION = "1.0.8"
 # API v2: retrospective is a full record. v4: unregistered project is 400 (proposal / new_project / sentinel).
 API_VERSION = 4
 CLIENT_VERSION_HEADER = "X-SM-Api-Version"
@@ -1973,12 +1973,9 @@ def _consolidation_backlog(eligible_clusters) -> int:
     is an ABSENCE OF EVIDENCE, not evidence of backlog: report 0, not a looser
     substitute count.
 
-    Previously this fell back to the NREM density count
-    (``_nrem_cycle_counts``) when no census had been recorded, which answers
-    "does raw candidate material exist" rather than "did it gate" — the two
-    are exactly the distinction I7 draws, and conflating them let a cycle that
-    had never run report a stall the strict gate would never have agreed to.
-    The fallback is removed; it must not be reintroduced. Pure → testable."""
+    Never fall back to the NREM density count (``_nrem_cycle_counts``) — it
+    answers "does material exist", not "did it gate"; the fallback must not
+    be reintroduced. Pure → testable."""
     return eligible_clusters if eligible_clusters is not None else 0
 
 
@@ -1988,11 +1985,8 @@ def _consolidation_stall_verdict(last_success_age, in_flight, has_backlog, thres
     nothing is currently in-flight. Extracted so the verdict is unit-testable
     without a database.
 
-    I7 (`decision:1121`): this function was already correct — ``has_backlog``
-    is trusted as given, so the guarantee that it means GATING backlog (not
-    raw density) lives entirely in what the caller passes as ``has_backlog``,
-    i.e. in ``_consolidation_backlog`` above. Not changed by this fix; cited
-    here so the two functions' contracts are read together."""
+    ``has_backlog`` must be the gating census from ``_consolidation_backlog``
+    (I7), never raw candidate density."""
     if not has_backlog or in_flight:
         return False
     return last_success_age is None or last_success_age > threshold
@@ -2150,8 +2144,9 @@ def _visibility_filter(viewer: str | None, viewer_scope: str | None,
     A caller that asserts no scope cannot match ``'scope'`` rows. Returns the SQL
     fragment and its parameters; ``start`` is the next free asyncpg positional
     index (``$N``). Every read in ``handle_search`` composes this, so a private
-    fact is filtered from Tier-1 AND its Tier-3 synthesis never leaks (the
-    community summary inherits the source cluster's scope/visibility).
+    fact is filtered from Tier-1; every community summary is written
+    ``'global'`` regardless of its sources' visibility (the folds do not
+    consult it), so this clause has nothing to exclude in Tier-3 today.
     """
     if not viewer:
         return "visibility = 'global'", []
@@ -3695,7 +3690,9 @@ class MemoryCoordinator:
         Decision surfaces as a no-op rather than a phantom node.
         """
         retro = params.get("retrospective", {})
-        # decision 276: reversal marks the decision node so the insight gate can skip it. Insights are superseded by the re-fold, not invalidated here.
+        # decision 276: reversal marks the decision node so the insight gate can skip it.
+        # Insights citing it are retired eagerly by the lineage pass's reversal leg
+        # (decision:1207 ③), not by a write here.
         reversal = bool(retro.get("superseded"))
         async with self._neo4j.session() as session:
             if params.get("v") == 2:
@@ -6387,11 +6384,12 @@ class MemoryCoordinator:
     # ── POST /memory/review_hold ──────────────────────────────────────────────
 
     async def handle_review_hold(self, request: web.Request) -> web.Response:
-        """Mark a summary's supersession as reviewed-and-held (decision 384, 8e):
-        the consumer judged a flagged stale source immaterial, so stop surfacing it.
-        Records {old, by} in community_summaries.metadata.reviewed_supersessions
-        (dedup by old). A later supersession of a DIFFERENT source still surfaces;
-        a re-fold (8c) makes a new summary with fresh metadata, so acks never leak."""
+        """Mark a summary's supersession as reviewed-and-held: per decision:384
+        (stale sources are flagged at read time), the consumer judged a flagged
+        stale source immaterial, so stop surfacing it. Records {old, by} in
+        community_summaries.metadata.reviewed_supersessions (dedup by old). A
+        later supersession of a DIFFERENT source still surfaces; a re-fold makes
+        a new summary with fresh metadata, so acks never leak."""
         try:
             body = await request.json()
         except Exception:
@@ -8354,11 +8352,26 @@ class MemoryCoordinator:
         backlog present AND no successful fold within STALL_THRESHOLD AND
         nothing in-flight.
 
-        ⚠ No longer calls ``_nrem_cycle_counts`` here: that density count used
-        to be the no-census fallback and is not any more (I7). It remains a
-        SEPARATE, purely informational gauge elsewhere (``snap["nrem"]`` in
-        the telemetry snapshot) — "raw candidate material exists" is still
-        worth reporting, it just must never stand in for "the gate fired"."""
+        ``_nrem_cycle_counts`` is a separate, purely informational density
+        gauge elsewhere (``snap["nrem"]``) — it must never stand in for "the
+        gate fired"."""
+        # consolidation_runs.extra keys surfaced below as "the latest recorded
+        # value" (one array_agg/FILTER column per key in the SQL). Shared
+        # contract for all six: a NEW key, never an alias for eligible_clusters;
+        # None means no cycle has recorded it yet, not zero.
+        _LATEST_EXTRA_KEYS = (
+            # Dead-lettered at NREM_FOLD_FAIL_CAP, so excluded from eligible_clusters (fact:1189).
+            "dead_lettered_clusters",
+            # The re-fold matched the active summary byte for byte.
+            "unchanged_clusters",
+            # Judgement reach of exactly 1: no insight can fold, so not eligible backlog.
+            "singleton_clusters",
+            # Insight groups that failed G2 or G3. Not backlog.
+            "insight_gate_skips",
+            "truncation_failures",
+            # A protocol miss, not only a capacity one.
+            "slot_failures",
+        )
         query = """
             WITH ranked AS (
               SELECT cycle_type, started_at, finished_at, outcome, error_class, error_msg,
@@ -8375,18 +8388,8 @@ class MemoryCoordinator:
               max(last_success) AS last_success,
               (array_agg(outcome ORDER BY started_at DESC))[1] AS last_outcome,
               EXTRACT(EPOCH FROM now() - max(last_success))::int AS last_success_age,
-              -- C1 fix (merger ruling, fix round on fact:1609/1621): NOT the
-              -- same thing as last_success above. last_success is FILTERed on
-              -- `folds_succeeded > 0`, which a CRASHED run can also satisfy —
-              -- consolidation_loop writes a crashed row with rec.succeeded
-              -- already > 0 when the daemon folded at least one cluster before
-              -- dying. So `last_success` can be NEWER than a crash that is
-              -- itself the very row inflating it, and comparing last_error_at
-              -- against last_success would then call that crash "superseded"
-              -- seconds after it happened. last_completed_at is FILTERed on
-              -- `outcome = 'completed'` instead — a run that actually finished
-              -- clean — and is the only thing `superseded` below may compare
-              -- against.
+              -- Not last_success: a crashed run that folded before dying satisfies
+              -- folds_succeeded>0, so only a completed run may mark a crash superseded.
               max(finished_at) FILTER (WHERE outcome = 'completed') AS last_completed_at,
               -- Per-type timing + throughput (decision: price each cycle type
               -- separately). The whole-cycle timer is skewed by slot contention
@@ -8414,13 +8417,7 @@ class MemoryCoordinator:
                   AS folds_succeeded_24h,
               sum(folds_attempted) FILTER (WHERE started_at > now() - interval '24 hours')
                   AS folds_attempted_24h,
-              -- AR-01 (v0.8.75): truncation_failures/slot_failures are written
-              -- into consolidation_runs.extra by _CycleRec.extra() (same shape
-              -- as dead_lettered_clusters below) but were never rolled up here
-              -- — so the FIRST scaffold-fold protocol failure (slot_failed) was
-              -- invisible to any monitor. Additive keys only; mirrors the
-              -- dead_lettered_clusters extraction pattern for the latest value,
-              -- and folds_succeeded_24h's sum-FILTER shape for the 24h total.
+              -- 24h sums, additive keys only, same sum-FILTER shape as folds_succeeded_24h.
               sum((extra->>'truncation_failures')::int)
                   FILTER (WHERE started_at > now() - interval '24 hours'
                           AND extra ? 'truncation_failures') AS truncation_failures_24h,
@@ -8446,27 +8443,13 @@ class MemoryCoordinator:
               -- newest, which would make a crash read as its own supersession).
               (array_agg(started_at ORDER BY started_at DESC)
                   FILTER (WHERE outcome = 'crashed'))[1] AS last_error_at,
-              -- O9 — age computed in SQL, the same way last_success_age is
-              -- above, rather than a Python `now() - last_error_at` subtraction
-              -- (which duplicated a clock read the DB had already taken and
-              -- risked client/server clock drift). Necessarily repeats the
-              -- array_agg/FILTER expression above rather than referencing
-              -- last_error_at by name — the SELECT list cannot reference its
-              -- own other output columns.
+              -- age in SQL, the same clock as last_success_age.
               EXTRACT(EPOCH FROM now() - (array_agg(started_at ORDER BY started_at DESC)
                   FILTER (WHERE outcome = 'crashed'))[1])::int AS last_error_age,
               (array_agg(eligible_clusters ORDER BY started_at DESC)
                   FILTER (WHERE eligible_clusters IS NOT NULL))[1] AS eligible_clusters,
-              -- R1 fix: paired to the SAME row as eligible_clusters above —
-              -- FILTER on eligible_clusters IS NOT NULL, not on this column's
-              -- own nullness. A row whose census recorded eligible_clusters=0
-              -- also writes eligible_oldest_age_seconds=NULL (no oldest
-              -- cluster exists); filtering on this column separately let the
-              -- age pick up an OLDER row's non-null value while the count
-              -- came from the newest row, producing an impossible pair like
-              -- "eligible 0 (oldest 263684s)". Filtering both arrays on the
-              -- same predicate keeps them on one row, so a NULL age here
-              -- means the latest census itself recorded no oldest age.
+              -- Filtered on eligible_clusters IS NOT NULL so the count and the age
+              -- come from one row (not this column's own nullness).
               (array_agg(eligible_oldest_age_seconds ORDER BY started_at DESC)
                   FILTER (WHERE eligible_clusters IS NOT NULL))[1] AS eligible_oldest_age,
               -- Reason of the most-recent deferral (e.g. 'gpu_busy' | 'backup_drain'),
@@ -8558,29 +8541,9 @@ class MemoryCoordinator:
                 # eligible_oldest_age comes from the same row as eligible_clusters. A zero census must report its own age as null, not a stale value from an earlier row.
                 "eligible_clusters": elig,
                 "eligible_oldest_age_seconds": (r["eligible_oldest_age"] if r else None),
-                # fact:1189, decision:1121: clusters left out of eligible_clusters because they were dead-lettered. None means no census has recorded it yet, not zero.
-                "dead_lettered_clusters": (
-                    int(r["dead_lettered_clusters"])
-                    if r and r["dead_lettered_clusters"] is not None else None),
-                # Clusters skipped because the re-fold matched the active summary byte for byte. None means not recorded yet, not zero.
-                "unchanged_clusters": (
-                    int(r["unchanged_clusters"])
-                    if r and r["unchanged_clusters"] is not None else None),
-                # Left out of eligible_clusters because judgement reach was exactly 1, so no insight can fold. None means not recorded yet, not zero.
-                "singleton_clusters": (
-                    int(r["singleton_clusters"])
-                    if r and r["singleton_clusters"] is not None else None),
-                # Insight groups that failed G2 or G3. None means not recorded yet. Not backlog.
-                "insight_gate_skips": (
-                    int(r["insight_gate_skips"])
-                    if r and r["insight_gate_skips"] is not None else None),
-                # Latest truncation and slot failures. None means not recorded yet. A slot failure is a protocol miss, not only a capacity one.
-                "truncation_failures": (
-                    int(r["truncation_failures"])
-                    if r and r["truncation_failures"] is not None else None),
-                "slot_failures": (
-                    int(r["slot_failures"])
-                    if r and r["slot_failures"] is not None else None),
+                # _LATEST_EXTRA_KEYS: None means no census has recorded the key yet, not zero.
+                **{k: (int(r[k]) if r and r[k] is not None else None)
+                   for k in _LATEST_EXTRA_KEYS},
                 # Why the most-recent deferral happened (None if never deferred);
                 # only meaningful when last_outcome == "deferred".
                 "last_deferred_reason": (r["last_deferred_reason"] if r else None),

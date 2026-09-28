@@ -1,8 +1,9 @@
 """REM writes NO edges and NO labels — it summarises (`decision:1664`).
 
 Entities, attribution, grounding and the decision extras are written at FIRST
-WRITE from the operator's own metadata. REM's only output is `rem_summary` plus
-the `rem_processed` mark, so:
+WRITE from the operator's own metadata. REM writes `rem_summary`, the
+`rem_processed` mark, its own retry counters, and (for a Fact) the expanded
+content — never an edge or a label, so:
 
   * the prompt asks for a summary and nothing else, for every record kind;
   * the Cypher REM builds contains no `MERGE` and no `SET e:<label>`;

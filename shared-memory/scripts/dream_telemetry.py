@@ -1,22 +1,9 @@
-"""Per-call dream-cycle LLM telemetry — measure-first instrumentation for the
-adaptive-timer work (ADR-021).
-
-llama.cpp returns a ``timings`` object on every completion (prompt_n, predicted_n,
-predicted_per_second, …) and the gateway stamps an ``X-SM-LLM-Backend`` response
-header naming the serving backend. Recording both per call gives us, with zero
-extra LLM traffic:
-
-  * observed tok/s per backend  → validate the pool weights + detect model drift
-  * prompt/predicted token counts → validate context-fill (chunk work, ADR future)
-  * wall time vs allocated ceiling → validate the adaptive hard ceiling; a
-    ``ceiling_hit`` flags a generation that ran to the bound (candidate true hang)
-
-This is observability only — nothing here aborts or reroutes. The data tells us
-whether a gateway slot-liveness watcher (ADR-021 task 14b) is actually needed, or
-whether the adaptive ceiling alone suffices.
-
-Writes a structured log line always, and a JSONL record to ``DREAM_METRICS_PATH``
-when set (one object per line; queryable, no schema/migration).
+"""Dream-cycle LLM telemetry, plus the embed/rerank timeout ceilings and
+pair-prefix helpers this module also owns. Telemetry logs a structured line
+always (and JSONL to ``DREAM_METRICS_PATH`` when set) from llama.cpp's
+``timings`` and the gateway's backend header — observability only, nothing
+here aborts or reroutes. The ceilings scale each request's timeout to its
+clamped payload size, so a big job is never killed for being big.
 """
 from __future__ import annotations
 
@@ -35,8 +22,9 @@ DREAM_METRICS_PATH = os.environ.get("DREAM_METRICS_PATH", "").strip() or None
 # Adaptive hard-ceiling floor (seconds). The fixed *_LLM_TIMEOUT magic numbers are
 # replaced by adaptive_ceiling() below; only this floor remains, because a tiny
 # prompt should still be allowed a slow cold-start generation. Advisor-validated
-# shape: max(floor, prompt_chars/100, units*15) — scales with prompt size and the
-# work unit count (NREM cluster facts), so a big job is never killed for being big.
+# shape: max(floor, prompt_chars/100, units*15, max_tokens/LLM_MIN_TOK_S) — scales
+# with prompt size, unit count (NREM cluster facts), and the output bound, so a
+# big job is never killed for being big.
 CEILING_FLOOR_S = float(os.environ.get("LLM_CEILING_FLOOR", "600"))
 
 # Decode follows the output bound, so a ceiling sized only on the input turns a longer narrative into an uncounted timeout. 10 sits under a measured floor of 11.29 tok/s; a long fold must also stay inside the slot-arbiter budget or the daemons fight.
@@ -116,15 +104,13 @@ def as_text(v) -> str:
 
 def prefix_rerank_query(query) -> str:
     """Rank the leading slice of query within the pair budget."""
-    budget = max(0, RERANK_MAX_DOC_CHARS - special_reserve_chars)
-    return as_text(query)[:budget]
+    return as_text(query)[:pair_budget]
 
 
 def prefix_rerank_doc(query, doc) -> str:
     """Rank the leading slice of doc that fits in the pair budget after query."""
-    budget = max(0, RERANK_MAX_DOC_CHARS - special_reserve_chars)
     q = prefix_rerank_query(query)
-    return as_text(doc)[: max(0, budget - len(q))]
+    return as_text(doc)[: max(0, pair_budget - len(q))]
 
 
 def clamp_rerank_doc(text: str) -> str:
@@ -140,9 +126,9 @@ def rerank_ceiling(docs) -> float:
 
     Bounded by construction: every document is clamped to RERANK_MAX_DOC_CHARS,
     so the ceiling can never exceed the full-candidate-set time — at the shipped
-    defaults 20 x 2000 / 800 * 1.5 = 75 s, against a measured true cost of ~30 s
-    for that payload on the reference CPU deployment. Pure → unit-testable
-    without a reranker."""
+    defaults (24,570-char cap) 20 x 24570 / 800 * 1.5 ≈ 921 s; a realistic
+    20 x 2000-char payload measured ~30 s true cost on the reference CPU
+    deployment. Pure → unit-testable without a reranker."""
     if RERANK_MIN_CHARS_S <= 0:
         return RERANK_TIMEOUT_FLOOR_S
     total = sum(len(clamp_rerank_doc(d)) for d in (docs or []))
@@ -290,14 +276,9 @@ def record_llm_call(
     truncation classification (L0-b) is carried in `note`, it never flips `ok`
     (N4: additive keys only, no existing key changes meaning).
 
-    `prompt_chars` (N-4, Model_Attributes_Routing_Plan_2026-08-18): the
-    caller's own char-count of the prompt it built, additive and optional.
-    N-1 found the originally-planned chars/token ratio measurement from
-    dream-metrics history uncomputable because `prompt_n` (from llama.cpp's
-    `timings`) and a char count never co-occurred in the same row — this
-    field is what lets that pairing accumulate going forward, alongside the
-    existing `prompt_n`, for a future from-history re-measurement of the
-    gateway's own CHARS_PER_TOKEN_RATIO."""
+    `prompt_chars` is the caller's own char-count of the prompt it built, additive
+    and optional — it pairs with `prompt_n` so chars/token can be re-measured from
+    history."""
     t = (resp_json or {}).get("timings") or {}
     usage = (resp_json or {}).get("usage") or {}
     tok_s = t.get("predicted_per_second")
