@@ -255,7 +255,7 @@ def test_append_insight_references_adds_new_summary_and_domain():
         {"rowcount": 1, "rows": [({"summary_ids": [12], "domains": ["architecture"]},)]},
         {"rowcount": 1, "rows": []},
     ])
-    assert append_insight_references(conn, 70, 44, "infrastructure") is True
+    assert append_insight_references(conn, 70, 44, "infrastructure") == "appended"
     update_sql, params = conn.executed[1]
     assert update_sql.startswith("UPDATE community_summaries SET metadata")
     written = json.loads(params[0])
@@ -267,13 +267,9 @@ def test_append_insight_references_adds_new_summary_and_domain():
 def test_append_insight_references_deduplicates():
     conn = StubConn(script=[
         {"rowcount": 1, "rows": [({"summary_ids": [12], "domains": ["architecture"]},)]},
-        {"rowcount": 1, "rows": []},
     ])
-    append_insight_references(conn, 70, 12, "architecture")
-    _, params = conn.executed[1]
-    written = json.loads(params[0])
-    assert written["summary_ids"] == [12]
-    assert written["domains"] == ["architecture"]
+    assert append_insight_references(conn, 70, 12, "architecture") == "unchanged"
+    assert len(conn.executed) == 1   # no UPDATE issued
 
 
 def test_append_insight_references_none_summary_id_only_appends_domain():
@@ -281,17 +277,27 @@ def test_append_insight_references_none_summary_id_only_appends_domain():
         {"rowcount": 1, "rows": [({"summary_ids": [], "domains": []},)]},
         {"rowcount": 1, "rows": []},
     ])
-    append_insight_references(conn, 70, None, "infrastructure")
+    assert append_insight_references(conn, 70, None, "infrastructure") == "appended"
     _, params = conn.executed[1]
     written = json.loads(params[0])
     assert written["summary_ids"] == []
     assert written["domains"] == ["infrastructure"]
 
 
-def test_append_insight_references_returns_false_when_retired_meanwhile():
+def test_append_insight_references_returns_retired_when_retired_meanwhile():
     conn = StubConn(script=[{"rowcount": 0, "rows": []}])
-    assert append_insight_references(conn, 70, 12, "architecture") is False
+    assert append_insight_references(conn, 70, 12, "architecture") == "retired"
     assert len(conn.executed) == 1   # no UPDATE issued
+
+
+def test_append_insight_references_update_sql_omits_updated_at():
+    conn = StubConn(script=[
+        {"rowcount": 1, "rows": [({"summary_ids": [12], "domains": ["architecture"]},)]},
+        {"rowcount": 1, "rows": []},
+    ])
+    assert append_insight_references(conn, 70, 44, "infrastructure") == "appended"
+    update_sql, _ = conn.executed[1]
+    assert "updated_at" not in update_sql
 
 
 # ── fetch_reversal_context (criterion D) ──────────────────────────────────────

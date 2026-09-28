@@ -246,3 +246,44 @@ def test_cycle_rec_extra_carries_singleton_clusters():
 def test_cycle_rec_extra_is_none_when_nothing_counted():
     rec = _CycleRec()
     assert rec.extra() is None
+
+
+# ── Fix 3 (A1b): failing component attempted once per pass ─────────────────
+
+@pytest.mark.asyncio
+async def test_failing_component_attempted_once_per_pass(monkeypatch):
+    """Fix 3 (A1b): two clusters with the same judgement_ids [245, 267] from two
+    domains. When _fold_insight returns False, await_count == 1 (preventing duplicate
+    attempts in the same pass). When _fold_insight returns True, await_count == 1."""
+    _wire_common(monkeypatch)
+    monkeypatch.setattr(cl, "_crun_finish", lambda *a, **k: None)
+
+    # 1. False return value (failing component): attempted check restricts to 1 call
+    daemon, _ = daemon_with_fake_graph()
+    daemon._find_fresh_insight_clusters = AsyncMock(return_value=[
+        {"entity": "shared-memory-GitHub/architecture", "decision_ids": [245, 267],
+         "judgement_ids": [245, 267], "judgement_types": {245: "Decision", 267: "Decision"},
+         "projects": ["shared-memory-GitHub"], "domain": "architecture"},
+        {"entity": "shared-memory-GitHub/infrastructure", "decision_ids": [245, 267],
+         "judgement_ids": [245, 267], "judgement_types": {245: "Decision", 267: "Decision"},
+         "projects": ["shared-memory-GitHub"], "domain": "infrastructure"},
+    ])
+    daemon._fold_insight = AsyncMock(return_value=False)
+
+    await daemon.run_insight_cycle()
+    assert daemon._fold_insight.await_count == 1
+
+    # 2. True return value (successful component): folded check also restricts to 1 call
+    daemon_ok, _ = daemon_with_fake_graph()
+    daemon_ok._find_fresh_insight_clusters = AsyncMock(return_value=[
+        {"entity": "shared-memory-GitHub/architecture", "decision_ids": [245, 267],
+         "judgement_ids": [245, 267], "judgement_types": {245: "Decision", 267: "Decision"},
+         "projects": ["shared-memory-GitHub"], "domain": "architecture"},
+        {"entity": "shared-memory-GitHub/infrastructure", "decision_ids": [245, 267],
+         "judgement_ids": [245, 267], "judgement_types": {245: "Decision", 267: "Decision"},
+         "projects": ["shared-memory-GitHub"], "domain": "infrastructure"},
+    ])
+    daemon_ok._fold_insight = AsyncMock(return_value=True)
+
+    await daemon_ok.run_insight_cycle()
+    assert daemon_ok._fold_insight.await_count == 1
