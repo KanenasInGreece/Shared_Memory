@@ -248,11 +248,11 @@ def test_cycle_rec_extra_is_none_when_nothing_counted():
     assert rec.extra() is None
 
 
-# ── Fix 3 (A1b): failing component attempted once per pass ─────────────────
+# ── a failing component is attempted once per pass ─────────────────
 
 @pytest.mark.asyncio
 async def test_failing_component_attempted_once_per_pass(monkeypatch):
-    """Fix 3 (A1b): two clusters with the same judgement_ids [245, 267] from two
+    """Two clusters with the same judgement_ids [245, 267] from two
     domains. When _fold_insight returns False, await_count == 1 (preventing duplicate
     attempts in the same pass). When _fold_insight returns True, await_count == 1."""
     _wire_common(monkeypatch)

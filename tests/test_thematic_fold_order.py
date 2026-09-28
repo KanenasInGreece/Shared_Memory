@@ -7,7 +7,7 @@ from consolidation_loop import render_thematic_fold
 
 
 def test_thematic_fold_order_deterministic_and_ascending_by_pg_id():
-    """decision:1242, decision:2778 — render_thematic_fold orders members by
+    """decision:1242 (skip an unchanged fold) needs deterministic text: render_thematic_fold orders members by
     ascending pg_id so line order is deterministic regardless of Neo4j scan order.
     Asserts both equality between permutations and the ascending pg_id values."""
     record_map = {

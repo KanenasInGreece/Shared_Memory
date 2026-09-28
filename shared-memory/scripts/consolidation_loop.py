@@ -620,7 +620,7 @@ def fold_record_line(record, content):
 
 def render_thematic_fold(contents, pg_ids, record_map=None):
     """Render deterministic fold text for a thematic cluster in ascending pg_id
-    order (decision:1242: deterministic fold skip, decision:2778). Returns
+    order, so the byte-identical skip of decision:1242 (skip an unchanged fold) holds. Returns
     (summary, sorted_pg_ids). Pure, no I/O."""
     record_map = record_map or {}
     paired = sorted(zip(pg_ids, contents), key=lambda x: int(x[0]))
@@ -3225,8 +3225,8 @@ class ConsolidationDaemon:
         match — criterion G), then fold what remains. Failures need no
         re-queue — the ledger is durable and the next sweep retries.
         A failing component is attempted once per pass: it counts one failure
-        per pass so the dead-letter cap (3) bites after 3 sweeps instead of
-        one pass, and attempted/failed counts exclude same-pass repeats."""
+        per pass so NREM_FOLD_FAIL_CAP counts sweeps, not the groups that reach
+        it, and attempted/failed counts exclude same-pass repeats."""
         loop = asyncio.get_running_loop()
         try:
             conn = await loop.run_in_executor(
@@ -3399,7 +3399,7 @@ class ConsolidationDaemon:
                         continue  # already folded as a re-fold this pass
                     f_ids = frozenset(ids)
                     if f_ids in attempted:
-                        logger.info(
+                        logger.debug(
                             "Insight cycle: component %s already attempted this pass — skipping.",
                             sorted(ids),
                         )
