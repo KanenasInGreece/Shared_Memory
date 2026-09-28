@@ -1,4 +1,7 @@
-"""REM daemon: summarise Fact/Decision/Retrospective nodes; write rem_summary and rem_processed only (decision:1664).
+"""REM daemon: summarises long Fact/Decision/Retrospective records into rem_summary,
+expands a Fact's 200-char first-write snippet in the graph to its text (up to 2000
+chars), and records its own retry counters, rem_timing and the outbox status; writes
+no edges or labels (decision:1664 — entities and axes are human-only).
 
 Does not add edges or labels. Short records skip the LLM. MOCK_LLM=1 returns a stub summary. Transport failures do not increment rem_attempts.
 """
@@ -231,9 +234,8 @@ def truncation_is_degenerate(body: str) -> bool:
     distinct ones, worst x12) or a quoted string >=30 chars repeats >=3 times, failing
     open on non-JSON text. Distinguishes loops from exhaustion (fact:1329 — diagnosis
     that release-trace facts dead-lettered at rem_attempts >= 5 from degenerate loops;
-    decision:1330 — REM_MAX_TOKENS_SOLO stays 1500 as dream ceiling; fact:1346 —
-    pre-build architecture review against live code), with thresholds unmeasured per
-    fact:1338 — an unmeasured default must say that it is unmeasured.
+    decision:1330 — REM_MAX_TOKENS_SOLO stays 1500 as dream ceiling), with thresholds
+    unmeasured per fact:1338 — an unmeasured default must say that it is unmeasured.
     """
     if not body or not body.strip():
         return False
@@ -306,10 +308,8 @@ def _parse_llm_json(candidate: str):
 # ── Prompts ───────────────────────────────────────────────────────────────────
 
 def build_single_prompt(content: str, kind: str) -> str:
-    """Summarisation prompt for records over REM_SUMMARY_THRESHOLD (decision:1664 —
-    entities are human-only: the graph receives a record's entity and attribution edges
-    at first write only, so REM writes no edges and no labels and only summarises).
-    """
+    """Summarisation prompt for records over REM_SUMMARY_THRESHOLD
+    (decision:1664 — REM only summarises)."""
     content_label = {KIND_DECISION: "DECISION", KIND_RETRO: "RETROSPECTIVE"}.get(kind, "FACT")
     return (
         "You are a technical knowledge curator summarising a record for a shared memory graph.\n"
@@ -435,10 +435,10 @@ class REMDaemon:
         """Increment monotonic ``rem_pickups`` (and reset ``rem_passed_over``) prior
         to processing to ensure fair queue rotation without affecting dead-letter caps.
         Bumps batches in bulk and solo records individually AFTER the yield checks,
-    never at selection time: a solo record the arbiter's yield never reaches was
-    not picked up, and rotating it anyway would hide the tail this counter
-    exists to expose. Best-effort, so a failed bump never masks the work it
-    precedes.
+        never at selection time: a solo record the arbiter's yield never reaches was
+        not picked up, and rotating it anyway would hide the tail this counter
+        exists to expose. Best-effort, so a failed bump never masks the work it
+        precedes.
         """
         if not pg_ids:
             return
@@ -459,8 +459,8 @@ class REMDaemon:
     async def _bump_rem_passed_over(self, pg_ids: list[int]) -> None:
         """Increment ``rem_passed_over`` for remaining solo records when yielding to
         NREM, tracking starvation until reset by a pickup — never by time, so a
-    persistently-queuing NREM cannot be waited out by the clock, only by the
-    record actually being processed.
+        persistently-queuing NREM cannot be waited out by the clock, only by the
+        record actually being processed.
         """
         if not pg_ids:
             return
@@ -756,10 +756,8 @@ class REMDaemon:
         original_content: str = "",
     ) -> None:
         """Update record content and rem_summary in Neo4j without adding edges or labels
-        (decision:1664 — entities are human-only: the graph receives a record's entity
-        and attribution edges at first write only, so REM writes no edges and no labels
-        and only summarises). Marks rem_processed=true last to ensure failed writes are
-        retried.
+        (decision:1664 — REM only summarises). Marks rem_processed=true last so failed
+        writes are retried.
         """
         anchor = {KIND_DECISION: ONT.decision,
                   KIND_RETRO:    ONT.retrospective}.get(kind, ONT.fact)
@@ -804,10 +802,7 @@ class REMDaemon:
         pg_id: int | None = None,
     ) -> tuple[dict | None, str]:
         """Execute summarisation round-trip for one record over REM_SUMMARY_THRESHOLD
-        (decision:1664 — entities are human-only: the graph receives a record's entity
-        and attribution edges at first write only, so REM writes no edges and no labels
-        and only summarises); returns (result_dict, model_name).
-        """
+        (decision:1664 — REM only summarises); returns (result_dict, model_name)."""
         if len(content) <= REM_SUMMARY_THRESHOLD:
             # Under the threshold REM asks for nothing, so {} is the whole answer and still gets marked processed (decision:1664).
             return {}, "no-call"
@@ -982,10 +977,8 @@ class REMDaemon:
     ) -> tuple[dict[int, dict] | None, dict | None, str]:
         """Summarise multiple facts exceeding REM_SUMMARY_THRESHOLD in one JSONL call,
         returning ``({pg_id: result}, call_timing, model)``. Sub-threshold facts return
-        ``{}`` without LLM calls (decision:1664 — entities are human-only: the graph
-        receives a record's entity and attribution edges at first write only, so REM
-        writes no edges and no labels and only summarises); call-level failures return
-        None without charging attempts.
+        ``{}`` without LLM calls (decision:1664 — REM only summarises); call-level
+        failures return None without charging attempts.
         """
         if not items:
             return {}, None, "local-model"
