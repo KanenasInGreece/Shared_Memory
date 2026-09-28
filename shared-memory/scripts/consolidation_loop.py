@@ -1196,22 +1196,22 @@ def close_ledger_rows(conn, pg_ids, context="consolidation"):
     return len(deleted)
 
 
-def fetch_open_retro_decision_ids(conn):
-    """Target decision pg_ids of un-dreamed retrospective rows (decision:276:
-    the gate is a HAD_OUTCOME edge, not the retrospective's rating, and
-    NOTIFY is deaf because decisions are not Fact nodes; the G2/G3 predicate
-    itself lives in insight_gate.py so telemetry and this daemon cannot
-    disagree). An open retro row is the durable re-fold trigger; its wording
-    lives on the HAD_OUTCOME edge (legacy) or the Retrospective record (v2),
-    the row only signals 'not folded yet'. Rows at 'pending'/'failed' still
-    owe the outbox worker a Neo4j write and are not triggers. A retro row on
-    a decision in no insight and no qualifying cluster stays open
-    deliberately — backlog, not a stuck outbox. COALESCE: a v2 row's pg_id
-    is the retro's own id; target_pg_id names the decision (legacy rows
-    carry both, equal)."""
+def fetch_open_retro_record_ids(conn):
+    """Retrospective record pg_ids of un-dreamed retrospective rows
+    (decision:276: the gate is a HAD_OUTCOME edge, not the retrospective's
+    rating, and NOTIFY is deaf because decisions are not Fact nodes; the
+    G2/G3 predicate itself lives in insight_gate.py so telemetry and this
+    daemon cannot disagree). An open retro row is the durable re-fold trigger;
+    its wording lives on the HAD_OUTCOME edge (legacy) or the Retrospective
+    record (v2), the row only signals 'not folded yet'. Rows at 'pending'/
+    'failed' still owe the outbox worker a Neo4j write and are not triggers.
+    A retro row on a decision in no insight and no qualifying cluster stays
+    open deliberately — backlog, not a stuck outbox. Selected in Python from
+    (pg_id, target) pairs: each row's OWN pg_id is returned (legacy rows
+    carry pg_id = target; v2 rows carry the retrospective's own pg_id)."""
     with conn.cursor() as cur:
         cur.execute(
-            "SELECT DISTINCT COALESCE((cypher_params->>'target_pg_id')::bigint, pg_id)"
+            "SELECT DISTINCT pg_id, (cypher_params->>'target_pg_id')::bigint"
             " FROM neo4j_outbox"
             " WHERE status IN ('applied', 'rem_reviewed')"
             f"  AND {_RETRO_ROW}"
@@ -1220,14 +1220,16 @@ def fetch_open_retro_decision_ids(conn):
 
 
 def fetch_refold_insights(conn, retro_pg_ids):
-    """Active insights whose source decisions have open retrospective rows.
-    Each is re-folded on its exact source_pg_ids so the new narrative carries
-    the cumulative outcome wording; the equal source set rides the
-    covered-subset supersession and replaces the old insight. Returns
+    """Active insights whose source judgements contain open retrospective
+    records (legacy rows carry decision id as pg_id; v2 rows refold only if
+    their retrospective is already in source_pg_ids). Each is re-folded on its
+    exact source_pg_ids so the new narrative carries the cumulative outcome
+    wording; the equal source set rides the covered-subset supersession and
+    replaces the old insight. Returns
     [(summary_id, entity, source_pg_ids, content, metadata)] — ``metadata``
     (C4) lets the caller carry ``summary_ids``/``project`` FORWARD on a
-    re-fold rather than losing them: a re-fold is triggered by a new
-    retrospective, not a change to which thematic summaries this insight
+    re-fold rather than losing them: a re-fold is triggered by an open
+    retrospective row, not a change to which thematic summaries this insight
     rests on, so those must survive unchanged."""
     if not retro_pg_ids:
         return []
@@ -1369,19 +1371,21 @@ def fetch_reversal_context(conn, judgement_ids):
 def fetch_insight_outbox_rows(conn, pg_ids):
     """Snapshot the consumable ledger rows for one fold — decision and
     retrospective rows at applied/rem_reviewed — captured BY ROW ID before the
-    LLM call. A retrospective arriving mid-fold keeps its status and stays
-    open: its wording is not in this narrative, so it must remain a trigger
-    for the next re-fold."""
+    LLM call. Matches on pg_id = ANY(...) only (N6: a row closes only if its
+    pg_id is in source_pg_ids; a v2 retrospective row is consumed only when
+    its retrospective is in this fold, never by target decision alone).
+    A retrospective arriving mid-fold keeps its status and stays open: its
+    wording is not in this narrative, so it must remain a trigger for the next
+    fold."""
     if not pg_ids:
         return []
     with conn.cursor() as cur:
         cur.execute(
             "SELECT id FROM neo4j_outbox"
-            " WHERE (pg_id = ANY(%s)"
-            "        OR (cypher_params->>'target_pg_id')::bigint = ANY(%s))"
+            " WHERE pg_id = ANY(%s)"
             "   AND status IN ('applied', 'rem_reviewed')"
             f"  AND {_DREAM_ROW}",
-            (list(pg_ids), list(pg_ids)),
+            (list(pg_ids),),
         )
         return [r[0] for r in cur.fetchall()]
 
@@ -2223,16 +2227,16 @@ def drop_out_of_scan_refold_rows(conn, scanned_pg_ids, context="consolidation"):
 def fetch_unreconciled_insights(conn):
     """Active insight summaries covering decision/retrospective rows stuck at
     'consolidated' — Postgres committed the insight but the Neo4j marking was
-    not confirmed (crash between the stores). Mirrors fetch_unreconciled for
-    the insight row types; re-applying the marking is idempotent. Returns
-    [(summary_id, entity, source_pg_ids)]."""
+    not confirmed (crash between the stores). Matches on pg_id = ANY(...) only
+    (N6: an insight row reconciles only when its pg_id is in source_pg_ids).
+    Mirrors fetch_unreconciled for the insight row types; re-applying the
+    marking is idempotent. Returns [(summary_id, entity, source_pg_ids)]."""
     with conn.cursor() as cur:
         cur.execute(
             "SELECT DISTINCT cs.id, cs.metadata->>'entity', cs.source_pg_ids"
             "  FROM community_summaries cs"
             "  JOIN neo4j_outbox o"
-            "    ON (o.pg_id = ANY(cs.source_pg_ids)"
-            "        OR (o.cypher_params->>'target_pg_id')::bigint = ANY(cs.source_pg_ids))"
+            "    ON o.pg_id = ANY(cs.source_pg_ids)"
             " WHERE NOT cs.superseded"
             "   AND cs.metadata->>'kind' = 'insight'"
             "   AND o.status = 'consolidated'"
@@ -3731,8 +3735,8 @@ class ConsolidationDaemon:
         """Insight consolidation pass — ledger-driven like run_ledger_sweep
         (decisions have no :Fact node, so the NOTIFY path is structurally deaf
         to them). Four steps: reconcile insight rows stuck between the
-        stores, re-fold active insights whose judgements gained
-        retrospectives, resolve §2.5 identity for fresh clusters (folding a
+        stores, re-fold active insights that already hold open retrospective
+        records, resolve §2.5 identity for fresh clusters (folding a
         genuinely new/grown set, APPENDING a reference on an exact 'same'
         match — criterion G), then fold what remains. Failures need no
         re-queue — the ledger is durable and the next sweep retries.
@@ -3767,8 +3771,8 @@ class ConsolidationDaemon:
                     )
                     logger.info("Insight cycle: reconciled insight %d, closed %d rows.", summary_id, closed)
 
-                # Re-fold active insights that still have un-dreamed retrospectives. Empty retro ids yield nothing.
-                retro_ids = await loop.run_in_executor(None, lambda: fetch_open_retro_decision_ids(conn))
+                # Re-fold active insights that already hold open retrospective records. Empty retro ids yield nothing.
+                retro_ids = await loop.run_in_executor(None, lambda: fetch_open_retro_record_ids(conn))
                 refolds = await loop.run_in_executor(
                     None, lambda: fetch_refold_insights(conn, retro_ids)
                 )

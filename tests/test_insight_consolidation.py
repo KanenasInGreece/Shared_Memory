@@ -48,7 +48,7 @@ from consolidation_loop import (
     fetch_active_thematic_summary_id,
     fetch_insight_outbox_rows,
     fetch_judgement_types,
-    fetch_open_retro_decision_ids,
+    fetch_open_retro_record_ids,
     fetch_refold_insights,
     fetch_reversal_context,
     fetch_unreconciled_insights,
@@ -139,15 +139,13 @@ def daemon_with_fake_graph(results=None):
     return daemon, session
 
 
-# ── fetch_open_retro_decision_ids ─────────────────────────────────────────────
+# ── fetch_open_retro_record_ids ───────────────────────────────────────────────
 
 def test_open_retro_ids_selects_retro_type_only():
-    conn = StubConn(script=[{"rowcount": 2, "rows": [(245,), (267,)]}])
-    assert fetch_open_retro_decision_ids(conn) == [245, 267]
+    conn = StubConn(script=[{"rowcount": 2, "rows": [(245, 245), (267, 267)]}])
+    assert fetch_open_retro_record_ids(conn) == [245, 267]
     sql, _ = conn.executed[0]
-    # v2 rows carry the retro's OWN pg_id; the DECISION id lives in
-    # target_pg_id (legacy rows carry both, equal) — COALESCE keys on it.
-    assert "COALESCE((cypher_params->>'target_pg_id')::bigint, pg_id)" in sql
+    assert "pg_id, (cypher_params->>'target_pg_id')::bigint" in sql
     assert "= 'retrospective'" in sql
 
 
@@ -155,9 +153,16 @@ def test_open_retro_ids_excludes_pending_and_failed_rows():
     # pending/failed rows still owe the outbox worker a Neo4j write — the
     # HAD_OUTCOME edge does not exist yet, so they are not fold triggers.
     conn = StubConn(script=[{"rowcount": 0, "rows": []}])
-    fetch_open_retro_decision_ids(conn)
+    fetch_open_retro_record_ids(conn)
     sql, _ = conn.executed[0]
     assert "status IN ('applied', 'rem_reviewed')" in sql
+
+
+def test_t6_open_retro_record_ids_returns_own_pg_id_not_target():
+    """T6: [(900, 245), (245, 245)] -> [900, 245].
+    Mutation: return the target ([245, 245])."""
+    conn = StubConn(script=[{"rowcount": 2, "rows": [(900, 245), (245, 245)]}])
+    assert fetch_open_retro_record_ids(conn) == [900, 245]
 
 
 # ── fetch_refold_insights (C4: carries `metadata` for summary_ids/project) ────
@@ -186,12 +191,13 @@ def test_refold_no_retro_ids_runs_no_query():
 def test_consumable_rows_snapshot_by_id_decision_and_retro_types():
     conn = StubConn(script=[{"rowcount": 2, "rows": [(101,), (102,)]}])
     assert fetch_insight_outbox_rows(conn, [245, 267]) == [101, 102]
-    sql, _ = conn.executed[0]
+    sql, params = conn.executed[0]
     assert "SELECT id FROM neo4j_outbox" in sql
     assert "IN ('decision', 'retrospective')" in sql
     assert "status IN ('applied', 'rem_reviewed')" in sql
-    # v2 retro rows carry their own pg_id — they are consumed via target_pg_id.
-    assert "(cypher_params->>'target_pg_id')::bigint = ANY(%s)" in sql
+    assert "target_pg_id" not in sql
+    assert "pg_id = ANY(%s)" in sql
+    assert params == ([245, 267],)
 
 
 def test_consumable_rows_empty_pg_ids_runs_no_query():
@@ -510,6 +516,25 @@ def test_unreconciled_insights_query_contract():
     assert "o.status = 'consolidated'" in sql
     assert "IN ('decision', 'retrospective')" in sql
     assert "NOT cs.superseded" in sql
+    assert "target_pg_id" not in sql
+    assert "o.pg_id = ANY(cs.source_pg_ids)" in sql
+
+
+def test_t7_neither_outbox_sql_contains_target_pg_id():
+    """T7: Neither outbox SQL contains target_pg_id, and fetch_insight_outbox_rows
+    params are (ids,). Mutation: restore target_pg_id clause."""
+    conn = StubConn(script=[{"rowcount": 0, "rows": []}])
+    fetch_insight_outbox_rows(conn, [245, 267])
+    sql1, params1 = conn.executed[0]
+    assert "target_pg_id" not in sql1
+    assert "pg_id = ANY(%s)" in sql1
+    assert params1 == ([245, 267],)
+
+    conn2 = StubConn(script=[{"rowcount": 0, "rows": []}])
+    fetch_unreconciled_insights(conn2)
+    sql2, _ = conn2.executed[0]
+    assert "target_pg_id" not in sql2
+    assert "o.pg_id = ANY(cs.source_pg_ids)" in sql2
 
 
 # ── v2 insight gate (Dreaming Cycle Plan to v2, §2.2-§2.4; C2) ────────────────
@@ -937,7 +962,7 @@ async def test_run_insight_cycle_calls_fold_with_compatible_signature(monkeypatc
 
     monkeypatch.setattr(cl.psycopg2, "connect", lambda *a, **k: _Conn())
     monkeypatch.setattr(cl, "fetch_unreconciled_insights", lambda conn: [])
-    monkeypatch.setattr(cl, "fetch_open_retro_decision_ids", lambda conn: [])
+    monkeypatch.setattr(cl, "fetch_open_retro_record_ids", lambda conn: [])
     monkeypatch.setattr(cl, "fetch_refold_insights", lambda conn, ids: [])
     monkeypatch.setattr(cl, "fetch_active_insight_rows", lambda conn: [])
     monkeypatch.setattr(cl, "fetch_active_thematic_summary_id", lambda conn, p, d: None)
@@ -976,7 +1001,7 @@ async def test_run_insight_cycle_dead_lettered_cluster_excluded_from_eligible_ce
 
     monkeypatch.setattr(cl.psycopg2, "connect", lambda *a, **k: _Conn())
     monkeypatch.setattr(cl, "fetch_unreconciled_insights", lambda conn: [])
-    monkeypatch.setattr(cl, "fetch_open_retro_decision_ids", lambda conn: [])
+    monkeypatch.setattr(cl, "fetch_open_retro_record_ids", lambda conn: [])
     monkeypatch.setattr(cl, "fetch_refold_insights", lambda conn, ids: [])
     monkeypatch.setattr(cl, "fetch_active_insight_rows", lambda conn: [])
     monkeypatch.setattr(cl, "fetch_active_thematic_summary_id", lambda conn, p, d: None)
@@ -1042,7 +1067,7 @@ async def test_run_insight_cycle_same_identity_appends_reference_not_a_new_fold(
         return _Conn()
     monkeypatch.setattr(cl.psycopg2, "connect", _connect)
     monkeypatch.setattr(cl, "fetch_unreconciled_insights", lambda c: [])
-    monkeypatch.setattr(cl, "fetch_open_retro_decision_ids", lambda c: [])
+    monkeypatch.setattr(cl, "fetch_open_retro_record_ids", lambda c: [])
     monkeypatch.setattr(cl, "fetch_refold_insights", lambda c, ids: [])
     monkeypatch.setattr(cl, "fetch_active_insight_rows",
                         lambda c: [(70, {245, 267}, {"summary_ids": [], "domains": []})])
@@ -1082,7 +1107,7 @@ async def test_run_insight_cycle_covered_identity_skips_without_appending(monkey
     conn = _Conn()
     monkeypatch.setattr(cl.psycopg2, "connect", lambda *a, **k: conn)
     monkeypatch.setattr(cl, "fetch_unreconciled_insights", lambda c: [])
-    monkeypatch.setattr(cl, "fetch_open_retro_decision_ids", lambda c: [])
+    monkeypatch.setattr(cl, "fetch_open_retro_record_ids", lambda c: [])
     monkeypatch.setattr(cl, "fetch_refold_insights", lambda c, ids: [])
     monkeypatch.setattr(cl, "fetch_active_insight_rows",
                         lambda c: [(70, {245, 267, 999}, {})])
@@ -1099,6 +1124,63 @@ async def test_run_insight_cycle_covered_identity_skips_without_appending(monkey
 
     daemon._fold_insight.assert_not_awaited()
     assert not any(s.startswith("UPDATE community_summaries") for s, _ in conn.executed)
+
+
+@pytest.mark.asyncio
+async def test_t8_run_insight_cycle_v2_retro_folds_once_with_superset(monkeypatch):
+    """T8: insight [245, 267], open v2 retrospective 900 on 245, fresh cluster
+    [245, 267, 900] -> _fold_insight is awaited ONCE, with 900.
+    Mutation: the helper returns targets -> two awaits."""
+    class _Conn(StubConn):
+        def close(self):
+            pass
+
+    conn = _Conn(script=[
+        {"rowcount": 1, "rows": [(900, 245)]},  # fetch_open_retro_record_ids
+    ])
+    first_connect = {"done": False}
+    def _connect(*a, **k):
+        if not first_connect["done"]:
+            first_connect["done"] = True
+            return conn
+        return _Conn()
+
+    monkeypatch.setattr(cl.psycopg2, "connect", _connect)
+    monkeypatch.setattr(cl, "_crun_start", lambda ct: 42)
+    monkeypatch.setattr(cl, "_crun_finish", lambda *a, **k: None)
+    monkeypatch.setattr(cl, "fetch_unreconciled_insights", lambda c: [])
+    monkeypatch.setattr(
+        cl, "fetch_refold_insights",
+        lambda c, ids: (
+            [(70, "OutboxPattern", [245, 267], "old insight text", {})]
+            if any(i in (245, 267) for i in ids)
+            else []
+        ),
+    )
+    monkeypatch.setattr(cl, "fetch_judgement_types", lambda c, ids: {i: "Decision" for i in ids})
+    monkeypatch.setattr(cl, "fetch_fold_dead_letter_counts", lambda: {})
+    monkeypatch.setattr(
+        cl, "fetch_active_insight_rows",
+        lambda c: [(70, {245, 267}, {})],
+    )
+    monkeypatch.setattr(cl, "fetch_active_thematic_summary_id", lambda c, p, d: None)
+    monkeypatch.setattr(cl, "_fetch_outbox_created_at", lambda ids: {})
+
+    daemon, _ = daemon_with_fake_graph()
+    daemon._find_fresh_insight_clusters = AsyncMock(return_value=[
+        {"entity": "OutboxPattern", "decision_ids": [245, 267],
+         "judgement_ids": [245, 267, 900],
+         "judgement_types": {245: "Decision", 267: "Decision", 900: "Retrospective"},
+         "projects": ["shared-memory-GitHub"], "domain": "architecture"},
+    ])
+    daemon._fold_insight = AsyncMock(return_value=True)
+
+    await daemon.run_insight_cycle()
+
+    assert daemon._fold_insight.await_count == 1
+    call_ids = daemon._fold_insight.await_args.args[2]
+    assert 900 in call_ids
+    assert call_ids == [245, 267, 900]
 
 
 # ── insight_cypher_query (§3.2, pure) ─────────────────────────────────────────

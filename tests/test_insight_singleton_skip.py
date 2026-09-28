@@ -139,7 +139,7 @@ def _wire_common(monkeypatch):
     against, no dead-letter history."""
     monkeypatch.setattr(cl.psycopg2, "connect", lambda *a, **k: StubConn())
     monkeypatch.setattr(cl, "fetch_unreconciled_insights", lambda conn: [])
-    monkeypatch.setattr(cl, "fetch_open_retro_decision_ids", lambda conn: [])
+    monkeypatch.setattr(cl, "fetch_open_retro_record_ids", lambda conn: [])
     monkeypatch.setattr(cl, "fetch_refold_insights", lambda conn, ids: [])
     monkeypatch.setattr(cl, "fetch_active_insight_rows", lambda conn: [])
     monkeypatch.setattr(cl, "fetch_active_thematic_summary_id", lambda conn, p, d: None)
