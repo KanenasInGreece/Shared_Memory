@@ -104,15 +104,13 @@ def as_text(v) -> str:
 
 def prefix_rerank_query(query) -> str:
     """Rank the leading slice of query within the pair budget."""
-    budget = max(0, RERANK_MAX_DOC_CHARS - special_reserve_chars)
-    return as_text(query)[:budget]
+    return as_text(query)[:pair_budget]
 
 
 def prefix_rerank_doc(query, doc) -> str:
     """Rank the leading slice of doc that fits in the pair budget after query."""
-    budget = max(0, RERANK_MAX_DOC_CHARS - special_reserve_chars)
     q = prefix_rerank_query(query)
-    return as_text(doc)[: max(0, budget - len(q))]
+    return as_text(doc)[: max(0, pair_budget - len(q))]
 
 
 def clamp_rerank_doc(text: str) -> str:
