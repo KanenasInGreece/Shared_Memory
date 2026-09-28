@@ -8371,18 +8371,8 @@ class MemoryCoordinator:
               max(last_success) AS last_success,
               (array_agg(outcome ORDER BY started_at DESC))[1] AS last_outcome,
               EXTRACT(EPOCH FROM now() - max(last_success))::int AS last_success_age,
-              -- C1 fix (merger ruling, fix round on fact:1609/1621): NOT the
-              -- same thing as last_success above. last_success is FILTERed on
-              -- `folds_succeeded > 0`, which a CRASHED run can also satisfy —
-              -- consolidation_loop writes a crashed row with rec.succeeded
-              -- already > 0 when the daemon folded at least one cluster before
-              -- dying. So `last_success` can be NEWER than a crash that is
-              -- itself the very row inflating it, and comparing last_error_at
-              -- against last_success would then call that crash "superseded"
-              -- seconds after it happened. last_completed_at is FILTERed on
-              -- `outcome = 'completed'` instead — a run that actually finished
-              -- clean — and is the only thing `superseded` below may compare
-              -- against.
+              -- Not last_success: a crashed run that folded before dying satisfies
+              -- folds_succeeded>0, so only a completed run may mark a crash superseded.
               max(finished_at) FILTER (WHERE outcome = 'completed') AS last_completed_at,
               -- Per-type timing + throughput (decision: price each cycle type
               -- separately). The whole-cycle timer is skewed by slot contention
@@ -8410,13 +8400,7 @@ class MemoryCoordinator:
                   AS folds_succeeded_24h,
               sum(folds_attempted) FILTER (WHERE started_at > now() - interval '24 hours')
                   AS folds_attempted_24h,
-              -- AR-01 (v0.8.75): truncation_failures/slot_failures are written
-              -- into consolidation_runs.extra by _CycleRec.extra() (same shape
-              -- as dead_lettered_clusters below) but were never rolled up here
-              -- — so the FIRST scaffold-fold protocol failure (slot_failed) was
-              -- invisible to any monitor. Additive keys only; mirrors the
-              -- dead_lettered_clusters extraction pattern for the latest value,
-              -- and folds_succeeded_24h's sum-FILTER shape for the 24h total.
+              -- 24h sums, additive keys only, same sum-FILTER shape as folds_succeeded_24h.
               sum((extra->>'truncation_failures')::int)
                   FILTER (WHERE started_at > now() - interval '24 hours'
                           AND extra ? 'truncation_failures') AS truncation_failures_24h,
@@ -8442,27 +8426,13 @@ class MemoryCoordinator:
               -- newest, which would make a crash read as its own supersession).
               (array_agg(started_at ORDER BY started_at DESC)
                   FILTER (WHERE outcome = 'crashed'))[1] AS last_error_at,
-              -- O9 — age computed in SQL, the same way last_success_age is
-              -- above, rather than a Python `now() - last_error_at` subtraction
-              -- (which duplicated a clock read the DB had already taken and
-              -- risked client/server clock drift). Necessarily repeats the
-              -- array_agg/FILTER expression above rather than referencing
-              -- last_error_at by name — the SELECT list cannot reference its
-              -- own other output columns.
+              -- age in SQL, the same clock as last_success_age.
               EXTRACT(EPOCH FROM now() - (array_agg(started_at ORDER BY started_at DESC)
                   FILTER (WHERE outcome = 'crashed'))[1])::int AS last_error_age,
               (array_agg(eligible_clusters ORDER BY started_at DESC)
                   FILTER (WHERE eligible_clusters IS NOT NULL))[1] AS eligible_clusters,
-              -- R1 fix: paired to the SAME row as eligible_clusters above —
-              -- FILTER on eligible_clusters IS NOT NULL, not on this column's
-              -- own nullness. A row whose census recorded eligible_clusters=0
-              -- also writes eligible_oldest_age_seconds=NULL (no oldest
-              -- cluster exists); filtering on this column separately let the
-              -- age pick up an OLDER row's non-null value while the count
-              -- came from the newest row, producing an impossible pair like
-              -- "eligible 0 (oldest 263684s)". Filtering both arrays on the
-              -- same predicate keeps them on one row, so a NULL age here
-              -- means the latest census itself recorded no oldest age.
+              -- Filtered on eligible_clusters IS NOT NULL so the count and the age
+              -- come from one row (not this column's own nullness).
               (array_agg(eligible_oldest_age_seconds ORDER BY started_at DESC)
                   FILTER (WHERE eligible_clusters IS NOT NULL))[1] AS eligible_oldest_age,
               -- Reason of the most-recent deferral (e.g. 'gpu_busy' | 'backup_drain'),
