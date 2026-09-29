@@ -113,7 +113,7 @@ lineage summary:87
 review-hold --summary-id 12 --pg-id 42
 ```
 
-`stale_sources` is `[{"old": N, "superseded_by": M}]`. `old` may be a fact, a decision, or a retrospective. A null successor is a retraction. `lineage` the qualified ref. Do not force `fact:`. `retired_summaries` is `[{"summary_id": Y, "superseded_reason": "…", "superseded_by": Z}]` on an insight. A null `superseded_by` depends on `superseded_reason`: `'lineage'` with no successor = the group no longer gates, the insight stands, review it; `'coverage'` = retired by a larger summary. `lineage summary:Y`. An insight's `source_pg_ids` are decisions and retrospectives. A community summary's `source_pg_ids` are facts.
+`stale_sources` is `[{"old": N, "superseded_by": M}]`. `old` may be a fact, a decision, or a retrospective. A null successor is a retraction. `lineage` the qualified ref. Do not force `fact:`. `retired_summaries` is `[{"summary_id": Y, "superseded_reason": "…", "superseded_by": Z, "unsupported": […]}]` on an insight. An insight shows `unsupported` when a superseded fact left a decision without thematic support; restore it by a retrospective on that decision grounded on the new fact (validated or refined), or reverse the decision. A null `superseded_by` depends on `superseded_reason`: `'lineage'` with no successor = the group no longer gates, the insight stands, review it; `'coverage'` = retired by a larger summary. `lineage summary:Y`. An insight's `source_pg_ids` are decisions and retrospectives. A community summary's `source_pg_ids` are facts.
 
 ## Lineage
 

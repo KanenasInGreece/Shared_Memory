@@ -47,7 +47,9 @@ from consolidation_loop import (
     fetch_active_thematic_rows,
     fetch_invalidated_summaries,
     link_thematic_successor,
+    recheck_kept_thematic_ids,
     retire_invalidated_summaries,
+    solid_match,
     thematic_fold_is_current,
 )
 from ontology import ONT
@@ -773,10 +775,12 @@ def test_t10_link_thematic_successor_repointing():
         {"rowcount": 1, "rows": []},
         # 2. SELECT active insights citing 10 FOR UPDATE
         {"rowcount": 3, "rows": [
-            (101, {"kind": "insight", "summary_ids": [10, 20]}),
-            (102, {"kind": "insight", "summary_ids": [20, 10, 30]}),
-            (103, {"kind": "insight", "summary_ids": [10, 11]}),
+            (101, {"kind": "insight", "summary_ids": [10, 20]}, []),
+            (102, {"kind": "insight", "summary_ids": [20, 10, 30]}, []),
+            (103, {"kind": "insight", "summary_ids": [10, 11]}, []),
         ]},
+        # 2b. SELECT id, source_pg_ids FROM community_summaries WHERE id = ANY(...)
+        {"rowcount": 4, "rows": [(10, []), (11, []), (20, []), (30, [])]},
         # 3. UPDATE metadata for 101
         {"rowcount": 1, "rows": []},
         # 4. UPDATE metadata for 102
@@ -786,9 +790,10 @@ def test_t10_link_thematic_successor_repointing():
     ]
     conn = StubConn(script=script)
     with conn.cursor() as cur:
-        repointed = link_thematic_successor(cur, old_id=10, new_id=11)
+        repointed, kept = link_thematic_successor(cur, old_id=10, new_id=11)
 
     assert repointed == [101, 102, 103]
+    assert kept == []
 
     # Verify superseded_by pointer update
     ptr_update = conn.executed[0]
@@ -802,7 +807,7 @@ def test_t10_link_thematic_successor_repointing():
     assert "FOR UPDATE" in insight_query
 
     # Verify updates to metadata
-    meta_updates = [call for call in conn.executed[2:] if "UPDATE community_summaries SET metadata" in call[0]]
+    meta_updates = [call for call in conn.executed[3:] if "UPDATE community_summaries SET metadata" in call[0]]
     assert len(meta_updates) == 3
 
     # Check that updated_at is NEVER written
@@ -867,10 +872,14 @@ async def test_t12_status_of_summary_superseded_by_and_retired_summaries():
         "run_id": 43,
     }
     fake_conn.fetchrow = AsyncMock(return_value=row_insight)
-    # fetch for source types and for retired_summaries
+    # fetch calls for _status_of_summary:
+    # 1. doc types for source_pg_ids [100]
+    # 2. _annotate_retired_summaries: fetch for community_summaries WHERE id = ANY([10])
+    # 3. _annotate_retired_summaries: decisions query for doc [100]
     fake_conn.fetch = AsyncMock(side_effect=[
         [{"id": 100, "type": "decision"}],  # doc type
-        [{"id": 10, "superseded_reason": "lineage", "superseded_by": 11}],  # retired_summaries
+        [{"id": 10, "superseded": True, "superseded_reason": "lineage", "superseded_by": None, "source_pg_ids": []}],
+        [{"decision_id": 100, "fact_ids": []}],  # decisions query
     ])
     resp_ins = await c._status_of_summary(20, "insight")
     assert resp_ins.status == 200
@@ -878,5 +887,353 @@ async def test_t12_status_of_summary_superseded_by_and_retired_summaries():
     assert data_ins["superseded"] is False
     assert data_ins["superseded_by"] is None
     assert data_ins["retired_summaries"] == [
-        {"summary_id": 10, "superseded_reason": "lineage", "superseded_by": 11}
+        {"summary_id": 10, "superseded_reason": "lineage", "superseded_by": None, "unsupported": []}
     ]
+
+
+# ── decision:2801 Tests (S1 - S5 & Review Fold requirements) ──────────────────
+
+# ── S1: solid_match table ────────────────────────────────────────────────────
+
+def test_s1_solid_match_truth_table():
+    """S1: solid_match table: equal sets -> True; old ⊂ new -> True; one thread lost -> False; empty old -> True.
+    Mutations killed:
+      (a) >= -> == fails on old ⊂ new
+      (b) treat empty old as False fails on empty old.
+    """
+    # Equal sets -> True
+    assert solid_match({1, 2}, {1, 2}) is True
+    # old ⊂ new -> True (killed if >= or ==)
+    assert solid_match({1}, {1, 2}) is True
+    # One thread lost -> False
+    assert solid_match({1, 2}, {2, 3}) is False
+    assert solid_match({1}, set()) is False
+    # Empty old -> True (killed if empty old treated as False)
+    assert solid_match(set(), {1}) is True
+    assert solid_match(set(), set()) is True
+
+
+# ── S2: thread support retrospective legs ────────────────────────────────────
+
+def test_s2_thread_support_retrospective_legs():
+    """S2: thread support counts a standing retrospective of D grounded on T (the 1144/1147 case)
+    and does NOT count a retrospective of another decision grounded on T (the 2613/2626 case)
+    nor a superseded retrospective. Synthetic chain used.
+    Mutations killed:
+      (a) drop the retrospective leg: standing retro of D not counted -> fails
+      (b) match retrospectives by any target: retro of another decision counted -> fails
+      (c) ignore superseded on retrospectives: superseded retro counted -> fails.
+    """
+    # Active insight 300 has decision 100.
+    # 1. Standing retro 101 targets decision 100, grounded on fact 1.
+    # 2. Standing retro 102 targets decision 200, grounded on fact 2.
+    # 3. Superseded retro 103 targets decision 100, grounded on fact 3.
+    # Thematic summary 10 has facts [1, 2, 3].
+    # When linking 10 -> 11:
+    # Subtest A: Summary 11 has [1] -> decision 100 counts retro 101 -> solid -> repointed!
+    script_a = [
+        {"rowcount": 1, "rows": []},  # UPDATE superseded_by
+        {"rowcount": 1, "rows": [(300, {"kind": "insight", "summary_ids": [10]}, [100])]},
+        # Batched thread query: standing retro 101 of decision 100 has fact 1
+        {"rowcount": 1, "rows": [(100, [1])]},
+        # Summary facts: 10 has [1, 2, 3], 11 has [1]
+        {"rowcount": 2, "rows": [(10, [1, 2, 3]), (11, [1])]},
+        {"rowcount": 1, "rows": []},  # UPDATE metadata for 300
+    ]
+    conn_a = StubConn(script=script_a)
+    with conn_a.cursor() as cur:
+        repointed_a, kept_a = link_thematic_successor(cur, old_id=10, new_id=11)
+    assert repointed_a == [300]
+    assert kept_a == []
+
+    # Subtest B: Summary 11 has [2] (grounded only by retro 102 of decision 200).
+    # Decision 100 does NOT count retro 102 -> not solid -> kept!
+    script_b = [
+        {"rowcount": 1, "rows": []},  # UPDATE superseded_by
+        {"rowcount": 1, "rows": [(300, {"kind": "insight", "summary_ids": [10]}, [100])]},
+        {"rowcount": 1, "rows": [(100, [1])]},  # thread 100 only has fact 1
+        {"rowcount": 2, "rows": [(10, [1, 2, 3]), (11, [2])]},  # 11 has fact 2
+    ]
+    conn_b = StubConn(script=script_b)
+    with conn_b.cursor() as cur:
+        repointed_b, kept_b = link_thematic_successor(cur, old_id=10, new_id=11)
+    assert repointed_b == []
+    assert kept_b == [300]
+
+    # Subtest C: Summary 11 has [3] (grounded only by superseded retro 103).
+    # Decision 100 does NOT count superseded retro 103 -> not solid -> kept!
+    script_c = [
+        {"rowcount": 1, "rows": []},  # UPDATE superseded_by
+        {"rowcount": 1, "rows": [(300, {"kind": "insight", "summary_ids": [10]}, [100])]},
+        {"rowcount": 1, "rows": [(100, [1])]},  # thread 100 only has fact 1
+        {"rowcount": 2, "rows": [(10, [1, 2, 3]), (11, [3])]},  # 11 has fact 3
+    ]
+    conn_c = StubConn(script=script_c)
+    with conn_c.cursor() as cur:
+        repointed_c, kept_c = link_thematic_successor(cur, old_id=10, new_id=11)
+    assert repointed_c == []
+    assert kept_c == [300]
+
+
+# ── S3: link_thematic_successor solid repoint and kept ───────────────────────
+
+def test_s3_link_thematic_successor_solid_repoint_and_kept():
+    """S3: two insights, one solid, one losing a thread -> first repointed, second keeps old_id;
+    superseded_by set in both cases.
+    Mutation killed: repoint unconditionally (would repoint second insight) -> fails.
+    """
+    script = [
+        # 1. UPDATE community_summaries SET superseded_by = 11 WHERE id = 10
+        {"rowcount": 1, "rows": []},
+        # 2. SELECT active insights citing 10 FOR UPDATE
+        {"rowcount": 2, "rows": [
+            (201, {"kind": "insight", "summary_ids": [10]}, [100]),
+            (202, {"kind": "insight", "summary_ids": [10]}, [101]),
+        ]},
+        # 3. Batched thread query: doc 100 grounded in [1], doc 101 grounded in [2]
+        {"rowcount": 2, "rows": [(100, [1]), (101, [2])]},
+        # 4. Batched summary query: 10 has [1, 2], 11 has [1]
+        {"rowcount": 2, "rows": [(10, [1, 2]), (11, [1])]},
+        # 5. UPDATE metadata for 201 only (202 kept!)
+        {"rowcount": 1, "rows": []},
+    ]
+    conn = StubConn(script=script)
+    with conn.cursor() as cur:
+        repointed, kept = link_thematic_successor(cur, old_id=10, new_id=11)
+
+    assert repointed == [201]
+    assert kept == [202]
+
+    # Verify superseded_by set on old_id
+    assert conn.executed[0][0] == "UPDATE community_summaries SET superseded_by = %s WHERE id = %s"
+    assert conn.executed[0][1] == (11, 10)
+
+    # Verify only insight 201 was updated in metadata
+    meta_updates = [c for c in conn.executed if "UPDATE community_summaries SET metadata" in c[0]]
+    assert len(meta_updates) == 1
+    assert json.loads(meta_updates[0][1][0])["summary_ids"] == [11]
+    assert meta_updates[0][1][1] == 201
+
+
+# ── S4: re-gate links newest lineage-retired row ─────────────────────────────
+
+@pytest.mark.asyncio
+async def test_s4_regate_links_newest_lineage_retired_row(monkeypatch):
+    """S4: re-gate: no active row, a lineage-retired row with superseded_by NULL on the key
+    -> linked; a coverage-retired row or one with superseded_by set -> not linked.
+    Mutation killed: drop the reason filter (would link coverage-retired row) -> fails.
+    """
+    daemon, _ = daemon_with_fake_graph()
+    monkeypatch.delenv("MOCK_LLM", raising=False)
+    monkeypatch.setattr(cl, "DENSITY_THRESHOLD", 1)
+    monkeypatch.setattr(cl, "_crun_start", lambda ct: 101)
+    monkeypatch.setattr(cl, "_crun_finish", lambda *a, **k: None)
+    daemon.get_embedding = AsyncMock(return_value=[0.1] * 4)
+
+    scan_rows = [{"pg_id": 1, "content": "fact 1", "project": "proj", "domain": "ops"}]
+    d = datetime.date(2026, 9, 29)
+
+    # Subtest 1: Lineage-retired row 40 with superseded_by IS NULL on the key -> found and linked!
+    script_1 = [
+        {"rowcount": 1, "rows": [(1, "proj", "fact", None, d, {})]},  # _fetch_records
+        {"rowcount": 0, "rows": []},  # dead-letter
+        {"rowcount": 0, "rows": []},  # fetch_active_thematic_rows: NO active row!
+        {"rowcount": 0, "rows": []},  # census outbox
+        {"rowcount": 0, "rows": []},  # step 5 retire_invalidated_summaries
+        # _write_summary:
+        # INSERT RETURNING id, (xmax = 0) -> (50, True)
+        {"rowcount": 1, "rows": [(50, True)]},
+        # Re-gate lookup query: finds lineage-retired row 40!
+        {"rowcount": 1, "rows": [(40,)]},
+        # link_thematic_successor(cur, 40, 50):
+        # 1. UPDATE community_summaries SET superseded_by = 50 WHERE id = 40
+        {"rowcount": 1, "rows": []},
+        # 2. SELECT active insights citing 40
+        {"rowcount": 0, "rows": []},
+        # Outbox flip
+        {"rowcount": 1, "rows": []},
+        # Post-fold cleanup
+        {"rowcount": 0, "rows": []},  # supersede_covered_summaries
+        {"rowcount": 0, "rows": []},  # close_ledger_rows
+        {"rowcount": 0, "rows": []},  # drop_out_of_scan_refold_rows
+        {"rowcount": 0, "rows": []},  # close_refold_ledger_rows (refolded)
+        {"rowcount": 0, "rows": []},  # close_refold_ledger_rows (dropped)
+    ]
+    conn_1 = StubConn(script=script_1)
+    monkeypatch.setattr(cl.psycopg2, "connect", lambda *a, **k: conn_1)
+    await daemon._consolidate_clusters(scan_rows)
+
+    # Verify re-gate lookup SQL has exact filters:
+    regate_sqls = [c for c in conn_1.executed if "superseded_reason = 'lineage'" in c[0]]
+    assert len(regate_sqls) == 1
+    sql = regate_sqls[0][0]
+    assert "superseded_reason = 'lineage'" in sql
+    assert "superseded_by IS NULL" in sql
+    assert "ORDER BY superseded_at DESC, id DESC" in sql
+    # Verify link executed:
+    link_updates = [c for c in conn_1.executed if "UPDATE community_summaries SET superseded_by = %s WHERE id = %s" in c[0]]
+    assert len(link_updates) == 1
+    assert link_updates[0][1] == (50, 40)
+
+
+# ── S5: read time unsupported lists D, F and F2 ──────────────────────────────
+
+@pytest.mark.asyncio
+async def test_s5_read_time_unsupported_lists_d_f_and_f2():
+    """S5: read time: unsupported lists D, F and F2 for a kept insight; empty when solid.
+    Mutation killed: drop the unsupported field -> fails.
+    """
+    c = co.MemoryCoordinator()
+    fake_conn = MagicMock()
+
+    # Insight 301 citing retired summary 10. Summary 10 has successor 11.
+    # Decision 501 grounded in fact 1. Summary 10 had fact 1. Summary 11 has fact 3 (drops 1).
+    # Fact 1 in technical_docs superseded by 2; Fact 2 is standing (chain end F2=2).
+    # Insight 302 citing retired summary 10.
+    # Decision 502 grounded in fact 3. Summary 11 has fact 3 -> solid!
+    insights_data = [
+        {"id": 301, "summary_ids": [10], "source_pg_ids": [501]},
+        {"id": 302, "summary_ids": [10], "source_pg_ids": [502]},
+    ]
+
+    # Query 1: community_summaries for ANY([10])
+    # Query 2: community_summaries for successor 11 (active end)
+    # Query 3: decisions query for [501, 502]
+    # Query 4: technical_docs for lost fact [1]
+    # Query 5: technical_docs for successor fact 2
+    fake_conn.fetch = AsyncMock(side_effect=[
+        # 1. cited summary 10
+        [{"id": 10, "superseded": True, "superseded_reason": "lineage", "superseded_by": 11, "source_pg_ids": [1]}],
+        # 3. decisions thread query
+        [{"decision_id": 501, "fact_ids": [1]}, {"decision_id": 502, "fact_ids": [3]}],
+        # 4. technical_docs for fact 1
+        [{"id": 1, "superseded": True, "superseded_by": 2}],
+    ])
+    fake_conn.fetchrow = AsyncMock(side_effect=[
+        # 2. successor 11 (active end)
+        {"id": 11, "superseded": False, "superseded_reason": None, "superseded_by": None, "source_pg_ids": [3]},
+        # 5. successor fact 2 (chain end)
+        {"id": 2, "superseded": False, "superseded_by": None},
+    ])
+
+    annotated = await c._annotate_retired_summaries(fake_conn, insights_data)
+
+    # Insight 301 (kept): unsupported lists decision 501, superseded_facts=[1], superseding_facts=[2]
+    ins_301_retired = annotated[301]
+    assert len(ins_301_retired) == 1
+    assert ins_301_retired[0]["summary_id"] == 10
+    assert ins_301_retired[0]["superseded_reason"] == "lineage"
+    assert ins_301_retired[0]["superseded_by"] == 11
+    assert "unsupported" in ins_301_retired[0]
+    assert ins_301_retired[0]["unsupported"] == [
+        {"decision": 501, "superseded_facts": [1], "superseding_facts": [2]}
+    ]
+
+    # Insight 302 (solid): unsupported is empty list
+    ins_302_retired = annotated[302]
+    assert len(ins_302_retired) == 1
+    assert ins_302_retired[0]["summary_id"] == 10
+    assert "unsupported" in ins_302_retired[0]
+    assert ins_302_retired[0]["unsupported"] == []
+
+
+# ── Whole-insight support test (Review Fold 1) ────────────────────────────────
+
+def test_whole_insight_thread_supported_by_other_cited_row_not_lost():
+    """Whole-insight test: an insight cites [10, 20]; decision 100 grounded in fact 1.
+    Summary 10 has [1]; summary 20 ALSO has [1, 9].
+    Summary 10 is replaced by 11 (which drops fact 1).
+    Since summary 20 still carries fact 1, decision 100 retains support across the whole insight.
+    Solid match is True -> insight repointed to [11, 20].
+    Mutation killed: judging support per-row instead of over the whole insight -> fails.
+    """
+    script = [
+        # 1. UPDATE community_summaries SET superseded_by = 11 WHERE id = 10
+        {"rowcount": 1, "rows": []},
+        # 2. SELECT active insights citing 10 FOR UPDATE
+        {"rowcount": 1, "rows": [
+            (701, {"kind": "insight", "summary_ids": [10, 20]}, [100]),
+        ]},
+        # 3. Batched thread query: doc 100 grounded in [1]
+        {"rowcount": 1, "rows": [(100, [1])]},
+        # 4. Batched summary query: 10 has [1], 11 has [8], 20 has [1, 9]
+        {"rowcount": 3, "rows": [(10, [1]), (11, [8]), (20, [1, 9])]},
+        # 5. UPDATE metadata for 701 -> [11, 20]
+        {"rowcount": 1, "rows": []},
+    ]
+    conn = StubConn(script=script)
+    with conn.cursor() as cur:
+        repointed, kept = link_thematic_successor(cur, old_id=10, new_id=11)
+
+    assert repointed == [701]
+    assert kept == []
+
+    meta_updates = [c for c in conn.executed if "UPDATE community_summaries SET metadata" in c[0]]
+    assert len(meta_updates) == 1
+    assert json.loads(meta_updates[0][1][0])["summary_ids"] == [11, 20]
+
+
+# ── Sweep re-check test (Review Fold 2) ───────────────────────────────────────
+
+def test_sweep_recheck_repoints_after_retrospective_grounds_successor():
+    """Sweep re-check: an active insight citing lineage-retired summary 10 (superseded_by = 11)
+    repoints on the next sweep after a retrospective grounds on the new fact in 11.
+    Mutation killed: omit sweep re-check -> fails.
+    """
+    # Active insight 801 cites [10] with decision 100.
+    # Summary 10 is lineage-retired with superseded_by = 11.
+    # Summary 11 is active (superseded = False) with source_pg_ids = [5].
+    # Retrospective 105 targets decision 100 and grounds on fact 5!
+    script = [
+        # 1. Query candidate active insights citing lineage-retired summaries
+        {"rowcount": 1, "rows": [
+            (801, {"kind": "insight", "summary_ids": [10]}, [100]),
+        ]},
+        # 2. Query cited summaries: 10 is lineage-retired, superseded_by = 11
+        {"rowcount": 1, "rows": [
+            (10, True, 11, "lineage", [2]),
+        ]},
+        # 3. Query successor 11: active end
+        {"rowcount": 1, "rows": [
+            (11, False, None, None, [5]),
+        ]},
+        # 4. Batched thread query: decision 100 has fact 5 (via retro 105)
+        {"rowcount": 1, "rows": [
+            (100, [5]),
+        ]},
+        # 5. UPDATE metadata for 801 -> repointed to [11]
+        {"rowcount": 1, "rows": []},
+    ]
+    conn = StubConn(script=script)
+    repointed_count, kept_count = recheck_kept_thematic_ids(conn)
+
+    assert repointed_count == 1
+    assert kept_count == 0
+    assert conn.commits == 1
+
+    meta_updates = [c for c in conn.executed if "UPDATE community_summaries SET metadata" in c[0]]
+    assert len(meta_updates) == 1
+    assert json.loads(meta_updates[0][1][0])["summary_ids"] == [11]
+    assert meta_updates[0][1][1] == 801
+
+
+# ── Vacuous solid match test ──────────────────────────────────────────────────
+
+def test_vacuous_solid_match_when_no_supported_threads():
+    """Vacuous solid match: an insight with no decisions (or decisions with empty grounding)
+    vacuously satisfies solid_match(set(), set()) -> True, so it repoints cleanly.
+    Mutation killed: treat empty old as False -> fails.
+    """
+    script = [
+        {"rowcount": 1, "rows": []},  # UPDATE superseded_by
+        {"rowcount": 1, "rows": [(901, {"kind": "insight", "summary_ids": [10]}, [])]},
+        {"rowcount": 2, "rows": [(10, [1, 2]), (11, [1])]},
+        {"rowcount": 1, "rows": []},  # UPDATE metadata
+    ]
+    conn = StubConn(script=script)
+    with conn.cursor() as cur:
+        repointed, kept = link_thematic_successor(cur, old_id=10, new_id=11)
+
+    assert repointed == [901]
+    assert kept == []
+

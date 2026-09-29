@@ -1728,23 +1728,40 @@ def retire_invalidated_summaries(conn, kinds=("thematic", "insight"), skip_ids=(
     return retired, total_opened
 
 
+def solid_match(threads_old: set, threads_new: set) -> bool:
+    """decision:2801 (an insight follows a new thematic row only when every decision
+    it had support for keeps support): True iff threads_old is a subset of threads_new."""
+    return set(threads_old).issubset(set(threads_new))
+
+
 def link_thematic_successor(cur, old_id, new_id):
-    """decision:2778 (insight successor repointing): link old_id -> new_id via superseded_by,
-    and repoint active insights citing old_id to new_id in place. Metadata only, never updated_at.
-    Deduplicated, first occurrence wins."""
+    """decision:2778 (insight successor repointing) and decision:2801 (an insight follows
+    a new thematic row only when every decision it had support for keeps support): link
+    old_id -> new_id via superseded_by, and repoint active insights citing old_id to new_id
+    only on a solid match across the whole insight. Metadata only, never updated_at.
+    Returns (repointed_ids, kept_ids)."""
     cur.execute(
         "UPDATE community_summaries SET superseded_by = %s WHERE id = %s",
         (new_id, old_id),
     )
     cur.execute(
-        "SELECT id, metadata FROM community_summaries"
+        "SELECT id, metadata, source_pg_ids FROM community_summaries"
         " WHERE NOT superseded AND metadata->>'kind' = 'insight'"
         "   AND metadata->'summary_ids' @> %s FOR UPDATE",
         (json.dumps([old_id]),),
     )
     rows = cur.fetchall()
-    repointed = []
-    for ins_id, meta in rows:
+    if not rows:
+        logger.info(
+            "link_thematic_successor: old_id=%s -> new_id=%s; 0 insights citing old_id",
+            old_id, new_id,
+        )
+        return [], []
+
+    candidate_doc_ids = set()
+    candidate_summary_ids = {old_id, new_id}
+    parsed_insights = []
+    for ins_id, meta, src_ids in rows:
         if isinstance(meta, str):
             try:
                 meta = json.loads(meta)
@@ -1752,7 +1769,54 @@ def link_thematic_successor(cur, old_id, new_id):
                 meta = {}
         elif not isinstance(meta, dict):
             meta = {}
-        old_sids = meta.get("summary_ids", [])
+        sids = meta.get("summary_ids", [])
+        candidate_summary_ids.update(sids)
+        candidate_doc_ids.update(src_ids or [])
+        parsed_insights.append((ins_id, meta, src_ids or [], sids))
+
+    thread_facts_map = {}
+    if candidate_doc_ids:
+        cur.execute("""
+            WITH decisions AS (
+                SELECT id FROM technical_docs
+                WHERE id = ANY(%s) AND metadata->>'type' = 'decision'
+            ),
+            decision_facts AS (
+                SELECT d.id AS decision_id, (jsonb_array_elements(d.metadata->'grounded_in'))::int AS fact_id
+                FROM technical_docs d
+                WHERE d.id IN (SELECT id FROM decisions)
+                  AND jsonb_typeof(d.metadata->'grounded_in') = 'array'
+                UNION
+                SELECT (r.metadata->>'target_pg_id')::bigint AS decision_id, (jsonb_array_elements(r.metadata->'grounded_in'))::int AS fact_id
+                FROM technical_docs r
+                WHERE NOT r.superseded AND r.metadata->>'type' = 'retrospective'
+                  AND r.metadata->>'target_pg_id' IN (SELECT id::text FROM decisions)
+                  AND jsonb_typeof(r.metadata->'grounded_in') = 'array'
+            )
+            SELECT d.id AS decision_id, COALESCE(array_agg(df.fact_id) FILTER (WHERE df.fact_id IS NOT NULL), '{}') AS fact_ids
+            FROM decisions d
+            LEFT JOIN decision_facts df ON d.id = df.decision_id
+            GROUP BY d.id
+        """, (list(candidate_doc_ids),))
+        for d_id, f_ids in cur.fetchall():
+            thread_facts_map[d_id] = set(f_ids or [])
+
+    cur.execute(
+        "SELECT id, source_pg_ids FROM community_summaries WHERE id = ANY(%s)",
+        (list(candidate_summary_ids),),
+    )
+    summary_facts_map = {r[0]: set(r[1] or []) for r in cur.fetchall()}
+
+    repointed = []
+    kept = []
+    for ins_id, meta, src_ids, old_sids in parsed_insights:
+        ins_decisions = [d for d in src_ids if d in thread_facts_map]
+
+        facts_before = set()
+        for sid in old_sids:
+            facts_before.update(summary_facts_map.get(sid, set()))
+        threads_before = {d for d in ins_decisions if thread_facts_map[d] & facts_before}
+
         new_sids = []
         seen = set()
         for sid in old_sids:
@@ -1760,13 +1824,188 @@ def link_thematic_successor(cur, old_id, new_id):
             if target not in seen:
                 seen.add(target)
                 new_sids.append(target)
-        meta["summary_ids"] = new_sids
-        cur.execute(
-            "UPDATE community_summaries SET metadata = %s WHERE id = %s",
-            (json.dumps(meta), ins_id),
-        )
-        repointed.append(ins_id)
-    return repointed
+
+        facts_after = set()
+        for sid in new_sids:
+            facts_after.update(summary_facts_map.get(sid, set()))
+        threads_after = {d for d in ins_decisions if thread_facts_map[d] & facts_after}
+
+        if solid_match(threads_before, threads_after):
+            meta["summary_ids"] = new_sids
+            cur.execute(
+                "UPDATE community_summaries SET metadata = %s WHERE id = %s",
+                (json.dumps(meta), ins_id),
+            )
+            repointed.append(ins_id)
+        else:
+            kept.append(ins_id)
+
+    logger.info(
+        "link_thematic_successor: old_id=%s -> new_id=%s; repointed %d insight(s) %s, kept %d insight(s) %s",
+        old_id, new_id, len(repointed), repointed, len(kept), kept,
+    )
+    return repointed, kept
+
+
+def recheck_kept_thematic_ids(conn):
+    """decision:2801 (an insight follows a new thematic row only when every decision
+    it had support for keeps support): re-check active insights citing lineage-retired
+    thematic summaries, following superseded_by to the chain's active end and repointing
+    when solid match is satisfied."""
+    with conn.cursor() as cur:
+        # Bounded query: active insights citing at least one lineage-retired thematic row
+        cur.execute("""
+            WITH lineage_retired AS (
+                SELECT id FROM community_summaries
+                WHERE COALESCE(metadata->>'kind', 'thematic') <> 'insight'
+                  AND superseded AND superseded_reason = 'lineage'
+            )
+            SELECT cs.id, cs.metadata, cs.source_pg_ids
+            FROM community_summaries cs
+            WHERE NOT cs.superseded AND cs.metadata->>'kind' = 'insight'
+              AND EXISTS (
+                  SELECT 1 FROM jsonb_array_elements_text(COALESCE(cs.metadata->'summary_ids', '[]'::jsonb)) elem
+                  WHERE elem::int IN (SELECT id FROM lineage_retired)
+              )
+            FOR UPDATE
+        """)
+        insight_rows = cur.fetchall()
+        if not insight_rows:
+            return 0, 0
+
+        all_cited_sids = set()
+        all_src_ids = set()
+        insights_parsed = []
+        for ins_id, meta, src_ids in insight_rows:
+            if isinstance(meta, str):
+                try:
+                    meta = json.loads(meta)
+                except Exception:
+                    meta = {}
+            elif not isinstance(meta, dict):
+                meta = {}
+            sids = meta.get("summary_ids", [])
+            all_cited_sids.update(sids)
+            all_src_ids.update(src_ids or [])
+            insights_parsed.append((ins_id, meta, src_ids or [], sids))
+
+        cur.execute("""
+            SELECT id, superseded, superseded_by, superseded_reason, source_pg_ids
+            FROM community_summaries
+            WHERE id = ANY(%s)
+        """, (list(all_cited_sids),))
+        summ_rows = {r[0]: r for r in cur.fetchall()}
+
+        active_ends = {}
+        for sid in all_cited_sids:
+            row = summ_rows.get(sid)
+            if not row or not row[1] or row[3] != "lineage":
+                continue
+            curr_id = sid
+            curr_row = row
+            visited = {curr_id}
+            while curr_row and curr_row[1] and curr_row[2] is not None:
+                next_id = curr_row[2]
+                if next_id in visited:
+                    break
+                visited.add(next_id)
+                if next_id not in summ_rows:
+                    cur.execute("""
+                        SELECT id, superseded, superseded_by, superseded_reason, source_pg_ids
+                        FROM community_summaries WHERE id = %s
+                    """, (next_id,))
+                    nr = cur.fetchone()
+                    if nr:
+                        summ_rows[next_id] = nr
+                        curr_row = nr
+                    else:
+                        curr_row = None
+                else:
+                    curr_row = summ_rows[next_id]
+
+            if curr_row and not curr_row[1]:
+                active_ends[sid] = curr_row[0]
+
+        if not active_ends:
+            return 0, len(insights_parsed)
+
+        thread_facts_map = {}
+        if all_src_ids:
+            cur.execute("""
+                WITH decisions AS (
+                    SELECT id FROM technical_docs
+                    WHERE id = ANY(%s) AND metadata->>'type' = 'decision'
+                ),
+                decision_facts AS (
+                    SELECT d.id AS decision_id, (jsonb_array_elements(d.metadata->'grounded_in'))::int AS fact_id
+                    FROM technical_docs d
+                    WHERE d.id IN (SELECT id FROM decisions)
+                      AND jsonb_typeof(d.metadata->'grounded_in') = 'array'
+                    UNION
+                    SELECT (r.metadata->>'target_pg_id')::bigint AS decision_id, (jsonb_array_elements(r.metadata->'grounded_in'))::int AS fact_id
+                    FROM technical_docs r
+                    WHERE NOT r.superseded AND r.metadata->>'type' = 'retrospective'
+                      AND r.metadata->>'target_pg_id' IN (SELECT id::text FROM decisions)
+                      AND jsonb_typeof(r.metadata->'grounded_in') = 'array'
+                )
+                SELECT d.id AS decision_id, COALESCE(array_agg(df.fact_id) FILTER (WHERE df.fact_id IS NOT NULL), '{}') AS fact_ids
+                FROM decisions d
+                LEFT JOIN decision_facts df ON d.id = df.decision_id
+                GROUP BY d.id
+            """, (list(all_src_ids),))
+            for d_id, f_ids in cur.fetchall():
+                thread_facts_map[d_id] = set(f_ids or [])
+
+        summary_facts_map = {sid: set(r[4] or []) for sid, r in summ_rows.items()}
+
+        repointed_count = 0
+        kept_count = 0
+        for ins_id, meta, src_ids, sids in insights_parsed:
+            repointed_any = False
+            curr_sids = list(sids)
+            for old_sid, active_sid in active_ends.items():
+                if old_sid not in curr_sids:
+                    continue
+                ins_decisions = [d for d in src_ids if d in thread_facts_map]
+
+                facts_before = set()
+                for s in curr_sids:
+                    facts_before.update(summary_facts_map.get(s, set()))
+                threads_before = {d for d in ins_decisions if thread_facts_map[d] & facts_before}
+
+                new_sids = []
+                seen = set()
+                for s in curr_sids:
+                    target = active_sid if s == old_sid else s
+                    if target not in seen:
+                        seen.add(target)
+                        new_sids.append(target)
+
+                facts_after = set()
+                for s in new_sids:
+                    facts_after.update(summary_facts_map.get(s, set()))
+                threads_after = {d for d in ins_decisions if thread_facts_map[d] & facts_after}
+
+                if solid_match(threads_before, threads_after):
+                    curr_sids = new_sids
+                    repointed_any = True
+
+            if repointed_any:
+                meta["summary_ids"] = curr_sids
+                cur.execute(
+                    "UPDATE community_summaries SET metadata = %s WHERE id = %s",
+                    (json.dumps(meta), ins_id),
+                )
+                repointed_count += 1
+            else:
+                kept_count += 1
+
+    conn.commit()
+    logger.info(
+        "Ledger sweep recheck: repointed %d insight(s), kept %d insight(s) citing lineage-retired summaries",
+        repointed_count, kept_count,
+    )
+    return repointed_count, kept_count
 
 
 def fetch_refold_backlog(conn):
@@ -2737,6 +2976,12 @@ class ConsolidationDaemon:
                 if retired_thematic:
                     await self._reconcile_retired_in_graph(retired_thematic)
 
+                # decision:2801 (an insight follows a new thematic row only when every decision it had support for keeps support):
+                # re-check kept lineage-retired thematic ids cited by active insights and repoint when solid.
+                await loop.run_in_executor(
+                    None, lambda: recheck_kept_thematic_ids(conn)
+                )
+
                 # Same widened set as fetch_combined_fact_backlog: outbox union lineage invalidation.
                 backlog = await loop.run_in_executor(None, lambda: fetch_combined_fact_backlog(conn))
             finally:
@@ -3086,7 +3331,9 @@ class ConsolidationDaemon:
                     _meta_json = json.dumps(metadata)
                     _summary, _embedding, _pg_ids = summary, embedding, pg_ids
                     _level = level
+                    regate_old_id = None
                     def _write_summary():
+                        nonlocal regate_old_id
                         with conn.cursor() as cur:
                             if sup_removed and old_id is not None:
                                 # decision:2778: retire old thematic row before inserting its successor.
@@ -3130,12 +3377,37 @@ class ConsolidationDaemon:
                                                 LIMIT 20
                                             ) sub
                                         )
-                                RETURNING id
+                                RETURNING id, (xmax = 0)
                             """, (_summary, _meta_json, _embedding, _pg_ids, run_id))
-                            summary_id = cur.fetchone()[0]
+                            insert_row = cur.fetchone()
+                            summary_id = insert_row[0]
+                            is_inserted = bool(insert_row[1]) if len(insert_row) > 1 else (old_id is None)
                             if sup_removed and old_id is not None:
                                 # decision:2778: link retired row to its fresh successor and repoint referencing insights.
                                 link_thematic_successor(cur, old_id, summary_id)
+                            elif is_inserted:
+                                # decision:2801 (an insight follows a new thematic row only when every decision it had support for keeps support):
+                                # re-gate link connects newest lineage-retired predecessor on the same arbiter key to the fresh row.
+                                cur.execute("""
+                                    SELECT id FROM community_summaries
+                                    WHERE COALESCE(metadata->>'kind', 'thematic') <> 'insight'
+                                      AND COALESCE(metadata->>'entity', '') = %s
+                                      AND COALESCE(metadata->>'project', '') = %s
+                                      AND COALESCE(metadata->>'domain', '') = %s
+                                      AND COALESCE(metadata->>'level', 'entity') = %s
+                                      AND superseded AND superseded_reason = 'lineage' AND superseded_by IS NULL
+                                    ORDER BY superseded_at DESC, id DESC
+                                    LIMIT 1
+                                """, (
+                                    metadata.get("entity") or "",
+                                    metadata.get("project") or "",
+                                    metadata.get("domain") or "",
+                                    metadata.get("level") or "entity",
+                                ))
+                                regate_row = cur.fetchone()
+                                if regate_row:
+                                    regate_old_id = regate_row[0]
+                                    link_thematic_successor(cur, regate_old_id, summary_id)
                             cur.execute(
                                 "UPDATE neo4j_outbox SET status = 'consolidated', consolidated_at = now()"
                                 " WHERE pg_id = ANY(%s)"
@@ -3157,6 +3429,10 @@ class ConsolidationDaemon:
                         superseded_ids = list(superseded_ids or [])
                         if old_id not in superseded_ids:
                             superseded_ids.append(old_id)
+                    if regate_old_id is not None:
+                        superseded_ids = list(superseded_ids or [])
+                        if regate_old_id not in superseded_ids:
+                            superseded_ids.append(regate_old_id)
 
                     await loop.run_in_executor(None, conn.commit)
                     rec.fold(True)

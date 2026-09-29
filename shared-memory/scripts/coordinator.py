@@ -7133,6 +7133,202 @@ class MemoryCoordinator:
             resolved["error"] = "; ".join(dict.fromkeys(errors))
         return project_values, domain_values, resolved
 
+    async def _annotate_retired_summaries(self, conn, insights_data: list[dict]) -> dict[int, list[dict]]:
+        """decision:2801 (an insight follows a new thematic row only when every decision it had support for keeps support):
+        annotate insight retired_summaries with unsupported threads (decision, superseded_facts, superseding_facts).
+        Degrades safely on failure."""
+        if not insights_data:
+            return {}
+
+        all_sids = set()
+        for ins in insights_data:
+            all_sids.update(ins.get("summary_ids") or [])
+
+        if not all_sids:
+            return {ins.get("id"): [] for ins in insights_data if ins.get("id") is not None}
+
+        try:
+            # 1. Fetch cited summaries
+            ssrows = await conn.fetch(
+                "SELECT id, superseded, superseded_reason, superseded_by, source_pg_ids"
+                " FROM community_summaries WHERE id = ANY($1)",
+                list(all_sids),
+            )
+            summ_map = {r["id"]: dict(r) for r in ssrows}
+
+            retired_sids = {sid for sid, r in summ_map.items() if r.get("superseded")}
+            if not retired_sids:
+                return {ins.get("id"): [] for ins in insights_data if ins.get("id") is not None}
+
+            # 2. For lineage-retired summaries, follow chains to active ends
+            lineage_retired = {sid for sid in retired_sids if summ_map[sid].get("superseded_reason") == "lineage"}
+            active_ends = {}
+            for sid in lineage_retired:
+                curr = summ_map[sid]
+                visited = {sid}
+                while curr.get("superseded") and curr.get("superseded_by") is not None:
+                    next_id = curr.get("superseded_by")
+                    if next_id in visited:
+                        break
+                    visited.add(next_id)
+                    if next_id not in summ_map:
+                        nr = await conn.fetchrow(
+                            "SELECT id, superseded, superseded_reason, superseded_by, source_pg_ids"
+                            " FROM community_summaries WHERE id = $1", next_id,
+                        )
+                        if nr:
+                            summ_map[next_id] = dict(nr)
+                            curr = summ_map[next_id]
+                        else:
+                            break
+                    else:
+                        curr = summ_map[next_id]
+                if not curr.get("superseded"):
+                    active_ends[sid] = curr["id"]
+
+            # 3. Pre-fetch threads for all decisions in candidate insights
+            all_doc_ids = set()
+            for ins in insights_data:
+                all_doc_ids.update(ins.get("source_pg_ids") or [])
+
+            thread_facts_map = {}
+            if all_doc_ids:
+                thread_rows = await conn.fetch("""
+                    WITH decisions AS (
+                        SELECT id FROM technical_docs
+                        WHERE id = ANY($1::bigint[]) AND metadata->>'type' = 'decision'
+                    ),
+                    decision_facts AS (
+                        SELECT d.id AS decision_id, (jsonb_array_elements(d.metadata->'grounded_in'))::int AS fact_id
+                        FROM technical_docs d
+                        WHERE d.id IN (SELECT id FROM decisions)
+                          AND jsonb_typeof(d.metadata->'grounded_in') = 'array'
+                        UNION
+                        SELECT (r.metadata->>'target_pg_id')::bigint AS decision_id, (jsonb_array_elements(r.metadata->'grounded_in'))::int AS fact_id
+                        FROM technical_docs r
+                        WHERE NOT r.superseded AND r.metadata->>'type' = 'retrospective'
+                          AND r.metadata->>'target_pg_id' IN (SELECT id::text FROM decisions)
+                          AND jsonb_typeof(r.metadata->'grounded_in') = 'array'
+                    )
+                    SELECT d.id AS decision_id, COALESCE(array_agg(df.fact_id) FILTER (WHERE df.fact_id IS NOT NULL), '{}') AS fact_ids
+                    FROM decisions d
+                    LEFT JOIN decision_facts df ON d.id = df.decision_id
+                    GROUP BY d.id
+                """, list(all_doc_ids))
+                for tr in thread_rows:
+                    thread_facts_map[tr["decision_id"]] = set(tr["fact_ids"] or [])
+
+            # 4. Find all candidate grounding facts across lost threads
+            facts_to_trace = set()
+            lost_threads_per_insight_sid = {}
+
+            for ins in insights_data:
+                ins_id = ins.get("id")
+                sids = ins.get("summary_ids") or []
+                src_ids = ins.get("source_pg_ids") or []
+                ins_decisions = [d for d in src_ids if d in thread_facts_map]
+
+                for sid in sids:
+                    if sid not in lineage_retired:
+                        continue
+                    s_facts = set(summ_map[sid].get("source_pg_ids") or [])
+                    act_id = active_ends.get(sid)
+
+                    new_sids = [act_id if s == sid else s for s in sids if (act_id if s == sid else s) is not None]
+                    facts_after = set()
+                    for s in new_sids:
+                        if s in summ_map:
+                            facts_after.update(summ_map[s].get("source_pg_ids") or [])
+
+                    for d in ins_decisions:
+                        d_grounding = thread_facts_map.get(d, set())
+                        if d_grounding & s_facts:
+                            if not (d_grounding & facts_after):
+                                grounding_in_sid = d_grounding & s_facts
+                                facts_to_trace.update(grounding_in_sid)
+                                lost_threads_per_insight_sid.setdefault((ins_id, sid), []).append(
+                                    (d, grounding_in_sid)
+                                )
+
+            # 5. Trace supersession chains for facts_to_trace in technical_docs
+            fact_chain_map = {}
+            if facts_to_trace:
+                f_rows = await conn.fetch(
+                    "SELECT id, superseded, superseded_by FROM technical_docs WHERE id = ANY($1::bigint[])",
+                    list(facts_to_trace),
+                )
+                td_facts = {r["id"]: dict(r) for r in f_rows}
+                for f_id in facts_to_trace:
+                    f_info = td_facts.get(f_id)
+                    if not f_info or not f_info.get("superseded"):
+                        continue
+                    curr_f = f_info
+                    visited_f = {f_id}
+                    while curr_f.get("superseded") and curr_f.get("superseded_by") is not None:
+                        next_f_id = curr_f.get("superseded_by")
+                        if next_f_id in visited_f:
+                            break
+                        visited_f.add(next_f_id)
+                        if next_f_id not in td_facts:
+                            nf = await conn.fetchrow(
+                                "SELECT id, superseded, superseded_by FROM technical_docs WHERE id = $1",
+                                next_f_id,
+                            )
+                            if nf:
+                                td_facts[next_f_id] = dict(nf)
+                                curr_f = td_facts[next_f_id]
+                            else:
+                                break
+                        else:
+                            curr_f = td_facts[next_f_id]
+                    fact_chain_map[f_id] = curr_f["id"]
+
+            # 6. Build the result mapping
+            result = {}
+            for ins in insights_data:
+                ins_id = ins.get("id")
+                sids = ins.get("summary_ids") or []
+                ins_retired = []
+                for sid in sids:
+                    if sid not in retired_sids:
+                        continue
+                    s_info = summ_map[sid]
+                    reason = s_info.get("superseded_reason")
+                    sup_by = s_info.get("superseded_by")
+
+                    unsupported = []
+                    if reason == "lineage":
+                        lost_list = lost_threads_per_insight_sid.get((ins_id, sid), [])
+                        for d, g_facts in lost_list:
+                            sup_facts = []
+                            sup_by_facts = []
+                            for f in sorted(g_facts):
+                                if f in fact_chain_map:
+                                    sup_facts.append(f)
+                                    sup_by_facts.append(fact_chain_map[f])
+                            unsupported.append({
+                                "decision": d,
+                                "superseded_facts": sup_facts,
+                                "superseding_facts": sup_by_facts,
+                            })
+
+                    ins_retired.append({
+                        "summary_id": sid,
+                        "superseded_reason": reason,
+                        "superseded_by": sup_by,
+                        "unsupported": unsupported,
+                    })
+                result[ins_id] = ins_retired
+
+            return result
+
+        except Exception as e:
+            log.warning(
+                "retired_summaries annotation degraded (%s: %s) — %d summary_ids unchecked",
+                type(e).__name__, e, len(all_sids),
+            )
+            return {}
+
     async def handle_search(self, request: web.Request) -> web.Response:
         try:
             body = await request.json()
@@ -7450,47 +7646,21 @@ class MemoryCoordinator:
                 if pid in stale_map and pid not in acked
             ]
 
-        # Annotate insight retired_summaries at read time from community_summaries via summary_ids, never technical_docs (decision:1207; decision:2778: supersession yardstick surfaces retired constituent summaries lazily without retiring the insight).
-        insight_summary_ids: set[int] = set()
-        if insight:
-            insight_meta = insight.get("metadata")
-            insight_meta = (_coerce_jsonb_obj(insight_meta)
-                             if not isinstance(insight_meta, dict) else insight_meta)
-            insight_summary_ids.update((insight_meta or {}).get("summary_ids") or [])
-        retired_summary_map: dict[int, tuple[str | None, int | None]] = {}
-        if insight_summary_ids:
-            try:
-                async with self._acquire() as conn:
-                    ssrows = await conn.fetch(
-                        "SELECT id, superseded_reason, superseded_by FROM community_summaries"
-                        " WHERE id = ANY($1) AND superseded",
-                        list(insight_summary_ids),
-                    )
-                retired_summary_map = {
-                    r["id"]: (r["superseded_reason"], r["superseded_by"])
-                    for r in ssrows
-                }
-            except Exception as e:
-                # A database fault must not read as no superseded summaries. The annotation is advisory, and the miss is logged.
-                log.warning(
-                    "retired_summaries annotation degraded (%s: %s) — "
-                    "%d summary_ids unchecked",
-                    type(e).__name__, e, len(insight_summary_ids),
-                )
-                retired_summary_map = {}  # degrade to no annotation
+        # Annotate insight retired_summaries at read time from community_summaries via summary_ids (decision:1207; decision:2778; decision:2801).
+        insight_candidates = []
+        for r in (insight, summary):
+            if r is not None and summary_record_type(r.get("metadata")) == "insight":
+                m = _coerce_jsonb_obj(r.get("metadata")) if not isinstance(r.get("metadata"), dict) else r.get("metadata")
+                insight_candidates.append({
+                    "id": r.get("id"),
+                    "summary_ids": (m or {}).get("summary_ids") or [],
+                    "source_pg_ids": list(r.get("source_pg_ids") or []),
+                })
 
-        def _retired_summaries(meta) -> list[dict]:
-            m = _coerce_jsonb_obj(meta) if not isinstance(meta, dict) else meta
-            sids = (m or {}).get("summary_ids") or []
-            return [
-                {
-                    "summary_id": sid,
-                    "superseded_reason": retired_summary_map[sid][0],
-                    "superseded_by": retired_summary_map[sid][1],
-                }
-                for sid in sids
-                if sid in retired_summary_map
-            ]
+        retired_summaries_map: dict[int, list[dict]] = {}
+        if insight_candidates:
+            async with self._acquire() as conn:
+                retired_summaries_map = await self._annotate_retired_summaries(conn, insight_candidates)
 
         # Build final in the reranker's order. No tier is inserted ahead of that ranking or appended after it.
         final: list[dict] = []
@@ -7548,7 +7718,7 @@ class MemoryCoordinator:
                     if stale:
                         res["stale_sources"] = stale
                     if rtype == "insight":
-                        retired_sum = _retired_summaries(meta)
+                        retired_sum = retired_summaries_map.get(row.get("id"), [])
                         if retired_sum:
                             res["retired_summaries"] = retired_sum
                     final.append(res)
@@ -7869,19 +8039,12 @@ class MemoryCoordinator:
             if actual == "insight":
                 sids = (meta or {}).get("summary_ids") or []
                 if sids:
-                    r_rows = await conn.fetch(
-                        "SELECT id, superseded_reason, superseded_by FROM community_summaries"
-                        " WHERE id = ANY($1) AND superseded",
-                        list(sids),
-                    )
-                    retired_summaries = [
-                        {
-                            "summary_id": r["id"],
-                            "superseded_reason": r["superseded_reason"],
-                            "superseded_by": r["superseded_by"],
-                        }
-                        for r in r_rows
-                    ]
+                    ret_map = await self._annotate_retired_summaries(conn, [{
+                        "id": pg_id,
+                        "summary_ids": sids,
+                        "source_pg_ids": list(row["source_pg_ids"] or []),
+                    }])
+                    retired_summaries = ret_map.get(pg_id, [])
         row_dict = dict(row) if not isinstance(row, dict) else row
         sup_by = row_dict.get("superseded_by")
         resp_data = {

@@ -1157,7 +1157,7 @@ async def test_search_insight_result_carries_retired_summaries_when_thematic_sup
     ])
     mock_conn.fetch = AsyncMock(side_effect=[
         [{"id": 1, "content": "fact content", "metadata": {"entities": [], "source": "claude-code"}}],
-        [{"id": 501, "superseded_reason": "lineage", "superseded_by": None}],   # retired_summary_map
+        [{"id": 501, "superseded": True, "superseded_reason": "lineage", "superseded_by": None, "source_pg_ids": []}],   # retired_summary_map
     ])
     mock_session.run = AsyncMock(return_value=_AsyncIter())
 
@@ -1182,7 +1182,7 @@ async def test_search_insight_result_carries_retired_summaries_when_thematic_sup
     results = json.loads(resp.text)["results"]
     insight_result = next(r for r in results if r["tier"] == "insight_summary")
     assert insight_result["retired_summaries"] == [
-        {"summary_id": 501, "superseded_reason": "lineage", "superseded_by": None}]
+        {"summary_id": 501, "superseded_reason": "lineage", "superseded_by": None, "unsupported": []}]
 
     # The query that produced this MUST target community_summaries, NEVER technical_docs
     retired_summary_call = mock_conn.fetch.call_args_list[1]
