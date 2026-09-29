@@ -7,6 +7,21 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.0.10] - 2026-09-29
+
+A superseded fact now retires the thematic summaries that hold it, and insights follow the new summary only when it still supports their decisions. `API_VERSION` stays 4. **Run `migrations/apply.py` before restarting** (migration 043).
+
+### Added
+- Migration 043: `community_summaries.superseded_by`, a pointer from a retired summary to the one that replaced it (self foreign key, `ON DELETE SET NULL`; set only on a superseded row).
+- Search and `lineage` show `retired_summaries` on an insight: each retired thematic summary it still cites, with the reason, its successor, and `unsupported` — the decisions that lost thematic support, with the superseded fact and the fact that replaced it. Restore support with a retrospective on that decision grounded on the new fact, or reverse the decision.
+
+### Changed
+- When a fact that a thematic summary holds is superseded, the next fact run retires that summary and writes a new one that points back to it, instead of rewriting it in place. If the group no longer has enough facts, the summary is retired without a successor. When a group qualifies again, its new summary links back to the one retired without a successor.
+- An insight is repointed to the new summary only if every decision it had thematic support for keeps support across the summaries it cites. Otherwise it keeps the retired id, and each ledger sweep re-checks it and repoints it once support is back.
+- The retired summary's graph node is marked superseded, and search graph context no longer shows retired summaries. The first sweep after upgrading marks every summary retired earlier.
+- `stale_summaries` on an insight is replaced by `retired_summaries`.
+- The hourly ledger sweep always scans, instead of skipping when fewer than three facts are waiting.
+
 ## [1.0.9] - 2026-09-29
 
 The dreaming cycle stops rewriting what has not changed. `API_VERSION` stays 4. The telemetry contract keeps its keys, but two counts change meaning; see below.
