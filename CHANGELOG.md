@@ -7,6 +7,22 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.0.12] - 2026-09-29
+
+Superseding a fact that is the last support of a decision now stops and asks. `API_VERSION` stays 4. No migration.
+
+### Added
+- A supersession that would leave a standing decision with no standing `based_on` fact is refused with `decision_loses_last_ground` (409). The refusal quotes each such decision and nothing is written. Answer per decision:
+  - It still stands: re-send with `acknowledge_standing`, a map of decision id to the operator's own words (CLI: `--acknowledge-standing ID "words"`). The words are stored with the caller on the superseded fact and shown by `lineage`.
+  - The new fact supports it, or argues for reversal: save the new fact, then a retrospective grounded on it as `NEW_ID:based_on`, then retry. The supersession then passes with no question.
+- `fact_already_superseded` (409): a fact that is already superseded cannot be superseded again.
+- `decision_not_visible` (403): an acknowledgement names a decision the caller cannot read. It is not a role refusal; drop that id and ask the operator.
+- `SUPERSEDE_LOCK_KEY` in `.env.example`: the advisory lock the check takes while superseding. It must differ from the other advisory lock ids.
+
+### Changed
+- Both clients and the MCP server show the full refusal for `decision_loses_last_ground` so the quoted decisions reach the agent.
+- A decision's support counts only facts it is `based_on`; an `informed_by` fact does not hold it up.
+
 ## [1.0.11] - 2026-09-29
 
 A new retrospective is folded into its insight once, and only a fold that contains it closes its outbox row. `API_VERSION` stays 4. No migration.

@@ -130,8 +130,10 @@ async def test_supersede_already_superseded():
     c, conn, _ = _coord()
     conn.fetchrow = AsyncMock(return_value={"superseded": True, "type": None})
     resp = await c.handle_supersede(_make_request({"pg_id": 5}))
-    assert resp.status == 400
-    assert "already superseded" in json.loads(resp.text)["message"]
+    assert resp.status == 409
+    body = json.loads(resp.text)
+    assert body["error"] == "fact_already_superseded"
+    assert "already superseded" in body["message"]
 
 
 # ── handle_supersede — bare retract success + GC ──────────────────────────────
@@ -139,9 +141,13 @@ async def test_supersede_already_superseded():
 @pytest.mark.asyncio
 async def test_supersede_bare_retract_flags_writes_outbox_and_purges():
     c, conn, _ = _coord()
-    conn.fetchrow = AsyncMock(return_value={"superseded": False, "type": None})
+    conn.fetchrow = AsyncMock(side_effect=[
+        {"superseded": False, "type": None},
+        {"superseded": False},
+    ])
     conn.fetch = AsyncMock(return_value=[(101,)])  # one orphan fact row purged
-    resp = await c.handle_supersede(_make_request({"pg_id": 5}))
+    with patch.object(c, "_thread_grounds", new=AsyncMock(return_value=[])):
+        resp = await c.handle_supersede(_make_request({"pg_id": 5}))
     assert resp.status == 200
     body = json.loads(resp.text)
     assert body["superseded"] == 5
@@ -163,10 +169,16 @@ async def test_supersede_bare_retract_flags_writes_outbox_and_purges():
 @pytest.mark.asyncio
 async def test_supersede_with_live_successor_rides_along_no_purge():
     c, conn, _ = _coord()
-    conn.fetchrow = AsyncMock(return_value={"superseded": False, "type": None})
+    conn.fetchrow = AsyncMock(side_effect=[
+        {"superseded": False, "type": None},
+        {"superseded": False},
+        {"superseded": False},
+        {"superseded": False},
+    ])
     # successor exists (fetchval #1) AND has a live fact outbox row (fetchval #2)
     conn.fetchval = AsyncMock(side_effect=[1, 1])
-    resp = await c.handle_supersede(_make_request({"pg_id": 5, "by": 9}))
+    with patch.object(c, "_thread_grounds", new=AsyncMock(return_value=[])):
+        resp = await c.handle_supersede(_make_request({"pg_id": 5, "by": 9}))
     assert resp.status == 200
     body = json.loads(resp.text)
     assert body["superseded_by"] == 9
@@ -198,9 +210,10 @@ async def test_save_supersedes_target_not_found():
 @pytest.mark.asyncio
 async def test_save_supersedes_success_flags_and_piggybacks():
     c, conn, _ = _coord()
-    # 1st fetchrow = supersedes target check; 2nd = INSERT RETURNING id
-    conn.fetchrow = AsyncMock(side_effect=[{"superseded": False, "type": None}, {"id": 100}])
-    with patch.object(c, "_embed", new=AsyncMock(return_value=[0.1] * 1024)):
+    # 1st fetchrow = supersedes target check; 2nd = FOR UPDATE; 3rd = INSERT RETURNING id
+    conn.fetchrow = AsyncMock(side_effect=[{"superseded": False, "type": None}, {"superseded": False}, {"id": 100}])
+    with patch.object(c, "_embed", new=AsyncMock(return_value=[0.1] * 1024)), \
+         patch.object(c, "_thread_grounds", new=AsyncMock(return_value=[])):
         req = _make_request({"content": "corrected",
                              "metadata": {"project": "shared-memory-GitHub", "source": "claude", "entities": ["X"],
                                           "supersedes": 7}})

@@ -32,10 +32,11 @@ import os
 import re
 import sys
 from datetime import datetime
+from typing import Any
 
 import httpx
 
-VERSION = "1.0.11"
+VERSION = "1.0.12"
 # Must match GET /health api_version; v4 refuses unregistered project on fact save.
 API_VERSION = 4
 
@@ -418,6 +419,22 @@ def _gateway_message(r) -> str | None:
     return None
 
 
+def _error_token(body: object) -> str | None:
+    """The body's error token when it is a single word distinct from the sentence, so a 403 can name decision_not_visible beside the gateway's own words."""
+    if not isinstance(body, dict):
+        return None
+    code = body.get("error")
+    if not isinstance(code, str) or not code.strip():
+        return None
+    token = code.strip()
+    message = body.get("message")
+    if isinstance(message, str) and message.strip() == token:
+        return None
+    if " " in token:
+        return None
+    return token
+
+
 def _reply_json(r, *, log_auth: bool = False,
                 accept_status: tuple = ()) -> dict:
     """Decode the body only after the HTTP status is known, and pass accept_status to keep a non-2xx body such as a 503 health verdict (fact:1503: a 403 read-only refusal was decoded before the status check and reported as the coordinator being unreachable)."""
@@ -433,12 +450,33 @@ def _reply_json(r, *, log_auth: bool = False,
     # search error to 200 characters), and a long preamble hides the refusal.
     if r.status_code == 403:
         detail = _gateway_message(r) or _body_snippet(r)
-        head = f"Gateway refused this request (HTTP 403): {detail}" if detail else \
-               "Gateway refused this request (HTTP 403)."
+        # Name the machine code beside the sentence. A 403 decision_not_visible is not a role refusal, and the message alone hides that (fact:2809: the operator's words are carried per decision).
+        try:
+            parsed = r.json()
+        except Exception:
+            parsed = None
+        code = _error_token(parsed)
+        if code and detail:
+            head = f"Gateway refused this request (HTTP 403 {code}): {detail}"
+        elif detail:
+            head = f"Gateway refused this request (HTTP 403): {detail}"
+        else:
+            head = "Gateway refused this request (HTTP 403)."
         message = (f"{head} — the gateway ANSWERED and the credential was ACCEPTED, so "
                    f"this is an authorization refusal, not an authentication failure "
                    f"and not a transport fault.")
-        raise GatewayReplyError({"status": "error", "message": message})
+        payload = {"status": "error", "message": message}
+        if code:
+            payload["error"] = code
+        raise GatewayReplyError(payload)
+
+    if r.status_code == 409:
+        try:
+            parsed = r.json()
+            if isinstance(parsed, dict) and parsed.get("error") == "decision_loses_last_ground":
+                return parsed
+        except Exception:
+            pass
 
     if r.status_code >= 400 and r.status_code not in accept_status:
         detail = _gateway_message(r) or _body_snippet(r) or "(empty body)"
@@ -456,6 +494,102 @@ def _reply_json(r, *, log_auth: bool = False,
             f"— this is a malformed reply, not a transport fault. Body began: "
             f"{_body_snippet(r, 120) or '(empty)'}"
         )}) from exc
+
+
+_PLACEHOLDER_CANONICAL = frozenset({
+    "operator acknowledged",
+    "operator reason",
+    "operator words",
+    "operator confirmed",
+    "placeholder",
+    "todo",
+    "tbd",
+    "none",
+    "n/a",
+})
+_ACK_TRAILING_PUNCT = re.compile(r"""[\s.,;:!?"'`]+$""")
+_ACK_ANGLE = re.compile(r"^<[^>]+>$")
+
+
+def _normalised_ack_words(text: str) -> str:
+    """Fold case, internal whitespace, and trailing punctuation so a dotted stand-in compares equal to the bare word."""
+    folded = " ".join(text.split()).lower()
+    previous = None
+    while previous != folded:
+        previous = folded
+        folded = _ACK_TRAILING_PUNCT.sub("", folded).strip()
+    return folded
+
+
+def _is_placeholder_words(text: str) -> bool:
+    """True when the text is empty or a stand-in after that fold, so the client cannot send 'Placeholder.' as the operator's words (fact:2809: the operator's words are carried per decision)."""
+    if not isinstance(text, str):
+        return True
+    folded = _normalised_ack_words(text)
+    if not folded:
+        return True
+    if folded in _PLACEHOLDER_CANONICAL:
+        return True
+    return _ACK_ANGLE.match(folded) is not None
+
+
+def _normalize_cli_ack(raw: Any) -> dict[int, str] | None:
+    """Turn repeatable `--acknowledge-standing ID "words"` into {id: words}, and refuse every other shape.
+    A bare id, an empty string, a placeholder, or an `id:answer` token is a ValueError: this CLI has no colon syntax and must not invent the words (fact:2809: the operator's words are carried per decision)."""
+    if not raw:
+        return None
+
+    def _one(did_part: object, words: str) -> tuple[int, str]:
+        if isinstance(did_part, bool):
+            raise ValueError("acknowledge_standing requires an integer decision id and the operator's words")
+        try:
+            d_id = int(did_part)
+        except (ValueError, TypeError):
+            raise ValueError(
+                "acknowledge_standing form is --acknowledge-standing ID \"operator's words\". "
+                f"Got {did_part!r}. There is no id:answer syntax."
+            ) from None
+        if not words or _is_placeholder_words(words):
+            raise ValueError(
+                f"acknowledge_standing[{d_id}] requires the operator's non-empty words "
+                "(fact:2809, the operator's words are carried per decision). "
+                "A bare id, an empty string, or a placeholder is refused."
+            )
+        return d_id, words.strip()
+
+    if isinstance(raw, dict):
+        out: dict[int, str] = {}
+        for k, v in raw.items():
+            if not isinstance(v, str):
+                raise ValueError(f"acknowledge_standing[{k!r}] must be the operator's words")
+            d_id, words = _one(k, v)
+            out[d_id] = words
+        if not out:
+            raise ValueError("acknowledge_standing map cannot be empty")
+        return out
+
+    if not isinstance(raw, (list, tuple)):
+        raise ValueError(
+            "acknowledge_standing must be repeated --acknowledge-standing ID \"operator's words\""
+        )
+
+    out_map: dict[int, str] = {}
+    for item in raw:
+        if isinstance(item, dict):
+            sub = _normalize_cli_ack(item)
+            if sub:
+                out_map.update(sub)
+            continue
+        if not isinstance(item, (list, tuple)) or len(item) < 2:
+            raise ValueError(
+                "acknowledge_standing form is --acknowledge-standing ID \"operator's words\". "
+                "A bare id is refused (fact:2809, the operator's words are carried per decision)."
+            )
+        d_id, words = _one(item[0], " ".join(str(x) for x in item[1:]))
+        out_map[d_id] = words
+    if not out_map:
+        raise ValueError("acknowledge_standing requires at least one decision id and the operator's words")
+    return out_map
 
 
 def _coordinator_unavailable(exc: Exception, ceiling: float | None = None) -> dict:
@@ -631,11 +765,25 @@ async def save_artifact(content: str, metadata_json: str = "{}") -> dict:
     return result
 
 
-async def supersede_fact(pg_id: int, by: int | None = None) -> dict:
+async def supersede_fact(
+    pg_id: int,
+    by: int | None = None,
+    acknowledge_standing: dict[int, str] | None = None,
+) -> dict:
     """Retract a fact without a replacement, or point `--by` at a successor (decision 381: the old fact is kept and hidden from search; decision 384: the successor is applied when the record is read)."""
     payload: dict = {"pg_id": pg_id}
     if by is not None:
         payload["by"] = by
+    if acknowledge_standing is not None:
+        if not isinstance(acknowledge_standing, dict):
+            return {
+                "status": "error",
+                "message": (
+                    "acknowledge_standing must be a map of {decision_id: operator's words} (HTTP 400). "
+                    "A list is refused (fact:2809, the operator's words are carried per decision)."
+                ),
+            }
+        payload["acknowledge_standing"] = acknowledge_standing
     try:
         async with _async_client(30.0) as client:
             r = await client.post(
@@ -800,6 +948,9 @@ def _save_argparser() -> "argparse.ArgumentParser":
                         "An unregistered name returns 400 domain_unknown with "
                         "near matches; add \"new_domain\": true to the metadata "
                         "to register it, after asking the operator.")
+    p.add_argument("--acknowledge-standing", action="append", nargs="+", metavar="ID_AND_WORDS",
+                   help="decision id and the operator's words, repeated per decision: "
+                        "--acknowledge-standing 2522 \"still stands without the new fact\"")
     return p
 
 
@@ -1445,7 +1596,12 @@ async def main() -> None:
         p = _save_argparser()
         sargs = p.parse_args(sys.argv[2:])
         metadata = sargs.metadata
-        if sargs.supersedes is not None or sargs.domain:
+        try:
+            norm_ack = _normalize_cli_ack(getattr(sargs, "acknowledge_standing", None))
+        except ValueError as exc:
+            print(json.dumps({"status": "error", "message": str(exc)}))
+            sys.exit(1)
+        if sargs.supersedes is not None or sargs.domain or norm_ack:
             try:
                 mobj = json.loads(metadata) if isinstance(metadata, str) else metadata
             except (json.JSONDecodeError, ValueError) as e:
@@ -1457,6 +1613,8 @@ async def main() -> None:
                 mobj["supersedes"] = sargs.supersedes
             if sargs.domain:
                 mobj["domains"] = sargs.domain
+            if norm_ack:
+                mobj["acknowledge_standing"] = norm_ack
             metadata = json.dumps(mobj)
         print(json.dumps(await save_artifact(sargs.content, metadata), indent=2))
     elif action == "supersede":
@@ -1469,8 +1627,16 @@ async def main() -> None:
                        help="pg_id of the fact to retract")
         p.add_argument("--by", type=int, default=None,
                        help="pg_id of an existing successor fact (optional)")
+        p.add_argument("--acknowledge-standing", action="append", nargs="+", metavar="ID_AND_WORDS",
+                       help="decision id and the operator's words, repeated per decision: "
+                            "--acknowledge-standing 2522 \"still stands without the new fact\"")
         sargs = p.parse_args(sys.argv[2:])
-        print(json.dumps(await supersede_fact(sargs.pg_id, sargs.by), indent=2))
+        try:
+            norm_ack = _normalize_cli_ack(getattr(sargs, "acknowledge_standing", None))
+        except ValueError as exc:
+            print(json.dumps({"status": "error", "message": str(exc)}))
+            sys.exit(1)
+        print(json.dumps(await supersede_fact(sargs.pg_id, sargs.by, acknowledge_standing=norm_ack), indent=2))
     elif action == "review-hold":
         p = argparse.ArgumentParser(
             prog="memory_bridge.py review-hold",

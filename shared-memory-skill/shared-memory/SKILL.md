@@ -25,7 +25,7 @@ The gateway is `:8888`. Never call the embedder `:8070` or the reranker `:8071`.
 | Operator confirmed a choice | `save_decision --title "…" --decided-by "…" --rationale "…" [--project NAME] [--domain NAME] [--grounded-in "N:role"] [--alternatives "…"] [--confidence high]` |
 | Outcome of a decision | `save_retrospective --pg-id N --rating STATE --notes "…" --grounded-in "N[:role]" [--source-ref PATH]` |
 | What happened to this record | `lineage fact:N` |
-| Retract a fact, no replacement | `supersede --pg-id N [--by SUCCESSOR]` |
+| Retract a fact, no replacement | `supersede --pg-id N [--by SUCCESSOR] [--acknowledge-standing ID "operator's words"]` |
 | A stale flag is immaterial | `review-hold --summary-id S --pg-id N` |
 | Named structural lookup | `query why-to-check\|who-decided\|agent-decisions\|retrospectives` plus that template's flags |
 | Raw read-only Cypher | `graph "<cypher>"` |
@@ -134,8 +134,10 @@ save_retrospective --pg-id 2675 --rating validated --notes "The index loads." --
 save "the split shipped in v0.9.109" '{"source":"grok","source_ref":"OPERATE.md"}' --supersedes 2672
 ```
 
+When that save is refused with `decision_loses_last_ground`, do not retry the one-step flag. Save the new fact first (no `--supersedes`), then a retrospective grounded on that fact as based_on (`--grounded-in "NEW_ID:based_on"`), then supersede. The one-step flag is only for a fact the decision does not rest on alone. A bare ground defaults to `informed_by` for a discussion fact, so the check would refuse the supersession again.
+
 ```
-supersede --pg-id 2672
+supersede --pg-id 2672 --acknowledge-standing 2522 "still stands without the new fact"
 ```
 
 ```
@@ -154,6 +156,7 @@ Meaning-bearing flags. Type the flag form.
 
 | Flag | Use |
 |---|---|
+| `--acknowledge-standing` | Repeat per decision: `--acknowledge-standing ID "operator's words"`. A map of decision id to the operator's non-empty words. A bare id, an empty string, or a placeholder is refused. There is no `id:answer` syntax. |
 | `--alternatives` | One considered option per flag on `save_decision`. Not comma-split. |
 | `--confidence` | `high`, `medium`, or `low` on a decision. |
 | `--domain` | Section of the project. Repeat the flag. On `search`, a filter. |
@@ -171,6 +174,8 @@ Refusals. Branch on `error`. One recovery; the second-submission essays are in `
 |---|---|
 | `axis_conflict` | Axes are fixed at first write. Supersede. Do not re-save the same content onto other axes. |
 | `cypher_rejected` | Neo4j rejected the Cypher. Fix the query. Retrying it unchanged will not succeed. |
+| `decision_loses_last_ground` | Ask per decision. The 409 lists them under `decisions_needing_answer`, because `acknowledge_standing` is the map you send and a list is refused. Still stands: re-send `--acknowledge-standing ID "operator's words"` for each decision. Supported or reversal: save the new fact, then a retrospective grounded on it as based_on (`--grounded-in "NEW_ID:based_on"`), then supersede. ⛔ Refuse a supersession that removes a decision's last based-on fact until the operator answers (decision:2802); the operator's words are carried per decision (fact:2809). |
+| `decision_not_visible` | The acknowledgement names a decision this caller cannot read. The viewer is the authenticated agent. Do not send that id. |
 | `domain_confusable` | Ask. If it is a different section, re-send `confirm_distinct_from` naming the near match. Otherwise use the existing name. |
 | `domain_not_allowed_on_judgement` | Do not send a domain. A retrospective does not store sections, and the decision's axes do not move onto it. |
 | `domain_spelling_variant` | It is that registered section. Save under that spelling. It cannot be confirmed as new. |
@@ -184,6 +189,7 @@ Refusals. Branch on `error`. One recovery; the second-submission essays are in `
 | `entity_name_too_long` | A concept noun, not a sentence. The cap is `ENTITY_NAME_MAX_LEN` (default 200). |
 | `entity_reserved` | Schema or axis vocabulary is not an entity. Also a registered project name, including this record's own project. Name the concept, or drop it. |
 | `entity_unknown` | Ask. Re-send `new_entities` listing exactly those names, each also in `entities`, or use the registered canonical. |
+| `fact_already_superseded` | The fact is already superseded. Re-read lineage. Nothing was written. |
 | `filters_invalid` | The search `--domain` list is over the 16-entry cap. Narrow it. |
 | `graph_row_cap_exceeded` | Read-only Cypher returned more than `GRAPH_QUERY_ROW_CAP` rows (default 10000). Narrow the query. |
 | `new_entities_invalid` | A list of strings. Each name must also be in `entities`. A name that normalizes to nothing cannot be minted. |
@@ -199,11 +205,11 @@ Graph expansion on a judgement hit returns `belonging`: `{project, domains}`. Th
 Worked contract. Anonymous `/health`, then `--version`:
 
 ```json
-{"status":"ok","version":"1.0.11","api_version":4}
+{"status":"ok","version":"1.0.12","api_version":4}
 ```
 
 ```json
-{"version": "1.0.11", "api_version": 4, "tool": "shared-memory-framework"}
+{"version": "1.0.12", "api_version": 4, "tool": "shared-memory-framework"}
 ```
 
 `doctor` compares this client's `api_version` with the gateway and names which side to upgrade.

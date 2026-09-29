@@ -126,7 +126,7 @@ def _short(value: Any, cap: int = 200) -> str:
 
 
 # FRAMEWORK_VERSION is the build string and may drift. API_VERSION is the wire contract with memory_bridge.py; bump it only when shape, auth, or routes break older clients.
-FRAMEWORK_VERSION = "1.0.11"
+FRAMEWORK_VERSION = "1.0.12"
 # API v2: retrospective is a full record. v4: unregistered project is 400 (proposal / new_project / sentinel).
 API_VERSION = 4
 CLIENT_VERSION_HEADER = "X-SM-Api-Version"
@@ -568,6 +568,268 @@ def _supersession_target_error(pg_id: int, record_type: object) -> str | None:
     return None
 
 
+class _FactAlreadySuperseded(Exception):
+    """Raised inside a transaction when an UPDATE targets an already-superseded fact,
+    triggering transaction rollback before HTTP 409 fact_already_superseded is returned."""
+    pass
+
+
+def _clean_control_chars(text: str) -> str:
+    """Strip ASCII control characters, preserving newline and tab, to prevent terminal escape injection."""
+    if not isinstance(text, str):
+        return ""
+    return "".join(ch for ch in text if ch in ("\n", "\t") or (ord(ch) >= 32 and ord(ch) != 127))
+
+
+def threads_left_ungrounded(rows: list[dict], fact_id: int) -> list[dict]:
+    """Pure decision function: returns decision threads citing fact_id that have no standing grounding fact left once fact_id is superseded."""
+    ungrounded = []
+    for r in rows:
+        grounds = r.get("grounds") or r.get("thread_grounds") or []
+        has_standing_ground = False
+        for g in grounds:
+            gid = g.get("id")
+            if gid == fact_id:
+                continue
+            if not g.get("exists", True):
+                continue
+            gtype = (g.get("type") or "fact").strip().lower()
+            if gtype in ("decision", "retrospective"):
+                continue
+            if g.get("superseded", False):
+                continue
+            # Role check (R1)
+            role = g.get("role")
+            # Only based_on holds the decision up (decision:2802: refuse a supersession that removes a decision's last based-on fact until the operator answers). An explicit informed_by does not.
+            if role is not None:
+                is_based_on = role.strip().lower() in ("based_on", "grounded_in", ONT.grounded_in.lower())
+            elif g.get("source_ref") is not None:
+                fk = fact_kind_from_source_ref(g["source_ref"])
+                is_based_on = (default_grounding_role(fk) == ONT.grounded_in)
+            else:
+                # No stored role and no source_ref. The edge writer defaults that gap to informed_by, so counting it as based_on would keep a decision standing on a fact that does not hold it (decision:2802: only a based_on fact keeps a decision standing).
+                is_based_on = _standing_role(None, None) == "based_on"
+            if is_based_on:
+                has_standing_ground = True
+                break
+        if not has_standing_ground:
+            ungrounded.append(r)
+    return ungrounded
+
+
+def _is_doc_visible(visibility: str, agent_id: str, scope: str,
+                     viewer: str | None, viewer_scope: str | None = None) -> bool:
+    """True if a document is visible to viewer under its visibility mode (global, private, scope)."""
+    if visibility == "global":
+        return True
+    if not viewer:
+        return False
+    if visibility == "private" and agent_id == viewer:
+        return True
+    if visibility == "scope" and viewer_scope and scope == viewer_scope:
+        return True
+    return False
+
+
+_TARGET_PG_ID_DIGITS = re.compile(r"^[0-9]+$")
+
+
+def _target_pg_id_as_bigint(text: object) -> int | None:
+    """Integer a retrospective target_pg_id may be cast to, or None when the text is not a digit string that fits in bigint.
+    1.5 and 1e20 are JSON numbers whose text is not a safe integer; casting them raises and would 500 every supersede (decision:2802: only a based_on fact keeps a decision standing)."""
+    if not isinstance(text, str) or _TARGET_PG_ID_DIGITS.fullmatch(text) is None:
+        return None
+    # Eighteen digits always fit in bigint. A longer digit string, the decimal text of 1e20, still raises.
+    if len(text) > 18:
+        return None
+    return int(text)
+
+
+def _standing_role(explicit: object, source_ref: object) -> str:
+    """Role the last-ground check uses, the same choice `_resolve_typed_grounding` writes on the edge.
+    An unknown explicit word falls back to the fact_kind default, so the check and the graph edge cannot disagree on that record (decision:2802: only a based_on fact keeps a decision standing)."""
+    requested = explicit.strip().lower() if isinstance(explicit, str) else ""
+    if requested in GROUNDING_ROLES:
+        rel = GROUNDING_ROLES[requested]
+        return "based_on" if rel == ONT.grounded_in else requested
+    fk = fact_kind_from_source_ref(source_ref)
+    return "based_on" if default_grounding_role(fk) == ONT.grounded_in else "informed_by"
+
+
+async def _refusal_if_ack_unreadable(conn, decision_id: int, thread_row: dict | None,
+                                     viewer: str | None, viewer_scope: str | None) -> web.Response | None:
+    """403 when the authenticated agent cannot read this decision, so the acknowledgement is refused.
+    A missing row is unreadable too: the caller cannot vouch for an id they cannot read, and a body agent_id does not widen the read (fact:2809: the operator's words are carried per decision)."""
+    if thread_row is not None:
+        visibility = thread_row.get("visibility") or "global"
+        owner = thread_row.get("agent_id") or ""
+        scope = thread_row.get("scope") or "global"
+        readable = _is_doc_visible(visibility, owner, scope, viewer, viewer_scope)
+    else:
+        d_row = await conn.fetchrow(
+            "SELECT visibility, agent_id, scope FROM technical_docs"
+            " WHERE id = $1 AND metadata->>'type' = 'decision'",
+            decision_id,
+        )
+        if d_row is None:
+            readable = False
+        else:
+            readable = _is_doc_visible(
+                d_row.get("visibility") or "global",
+                d_row.get("agent_id") or "",
+                d_row.get("scope") or "global",
+                viewer, viewer_scope,
+            )
+    if readable:
+        return None
+    return web.json_response(
+        {
+            "status": "error",
+            "error": "decision_not_visible",
+            "message": (
+                f"decision {decision_id} is not readable by the authenticated agent; "
+                "an acknowledgement is refused for a decision the caller cannot read "
+                "(fact:2809, the operator's words are carried per decision)"
+            ),
+        },
+        status=403,
+    )
+
+
+_PLACEHOLDER_CANONICAL = frozenset({
+    "operator acknowledged",
+    "operator reason",
+    "operator words",
+    "operator confirmed",
+    "placeholder",
+    "todo",
+    "tbd",
+    "none",
+    "n/a",
+})
+_ACK_TRAILING_PUNCT = re.compile(r"""[\s.,;:!?"'`]+$""")
+_ACK_ANGLE = re.compile(r"^<[^>]+>$")
+
+
+def _normalised_ack_words(text: str) -> str:
+    """Fold case, internal whitespace, and trailing punctuation so a dotted stand-in compares equal to the bare word."""
+    folded = " ".join(text.split()).lower()
+    previous = None
+    while previous != folded:
+        previous = folded
+        folded = _ACK_TRAILING_PUNCT.sub("", folded).strip()
+    return folded
+
+
+def _is_placeholder_words(text: str) -> bool:
+    """True when the text is empty or a stand-in after that fold, so 'Placeholder.' cannot be stored as the operator's words (fact:2809: the operator's words are carried per decision)."""
+    if not isinstance(text, str):
+        return True
+    folded = _normalised_ack_words(text)
+    if not folded:
+        return True
+    if folded in _PLACEHOLDER_CANONICAL:
+        return True
+    return _ACK_ANGLE.match(folded) is not None
+
+
+def _parse_and_validate_acknowledge_standing(raw_ack: Any) -> tuple[dict[int, str] | None, web.Response | None]:
+    """Accept only a map of decision id to the operator's non-empty words, and 400 everything else.
+    A list, an empty string, or a placeholder is refused here so no caller invents the answer (fact:2809: the operator's words are carried per decision)."""
+    if raw_ack is None:
+        return None, None
+    if isinstance(raw_ack, bool) or not isinstance(raw_ack, dict) or not raw_ack:
+        return None, web.json_response(
+            {"status": "error", "message": "acknowledge_standing must be a non-empty map of {decision_id: \"operator's words\"} (fact:2809)"},
+            status=400,
+        )
+
+    out = {}
+    for k, v in raw_ack.items():
+        if isinstance(k, bool):
+            return None, web.json_response(
+                {"status": "error", "message": "acknowledge_standing keys must be integer decision IDs"},
+                status=400,
+            )
+        try:
+            d_id = int(k)
+        except (ValueError, TypeError):
+            return None, web.json_response(
+                {"status": "error", "message": "acknowledge_standing keys must be integer decision IDs"},
+                status=400,
+            )
+        if not isinstance(v, str) or not v.strip():
+            return None, web.json_response(
+                {"status": "error", "message": f"acknowledge_standing[{d_id}] must be a non-empty string with the operator's words (fact:2809)"},
+                status=400,
+            )
+        if _is_placeholder_words(v):
+            return None, web.json_response(
+                {"status": "error", "message": f"acknowledge_standing[{d_id}] contains placeholder text; operator's actual words are required (fact:2809)"},
+                status=400,
+            )
+        out[d_id] = v.strip()
+    return out, None
+
+
+def _format_decision_loses_last_ground_refusal(
+    fact_id: int,
+    unacknowledged: list[dict],
+    viewer: str | None,
+    viewer_scope: str | None,
+    stage: str,
+) -> dict:
+    """Refusal payload when superseding a fact leaves standing decisions ungrounded (HTTP 409)."""
+    unack_ids = [d["id"] for d in unacknowledged]
+    ids_str = ", ".join(f"decision:{i}" for i in unack_ids)
+    ack_example = ", ".join(
+        f'{i}: "the operator\'s words for this decision"' for i in unack_ids
+    )
+    msg_head = (
+        f"Superseding fact {fact_id} would leave {len(unack_ids)} standing decision(s) with no standing grounding fact: [{ids_str}]. "
+        f"Nothing was written ({stage}). Ask the operator about EACH decision. "
+        f"If the decision still stands: re-send acknowledge_standing as a map {{{ack_example}}}. "
+        f"A list of ids, an empty string, or a placeholder is refused. "
+        f"If the new fact supports it or argues for reversal: save the new fact first WITHOUT supersedes, save a retrospective (validated/refined, or reversed) grounded on the new fact as based_on (--grounded-in \"NEW_ID:based_on\"), then retry the supersession. "
+        f"The decisions are listed under decisions_needing_answer. "
+        f"⛔ Refuse a supersession that removes a decision's last based-on fact until the operator answers (decision:2802); the operator's words are carried per decision (fact:2809)."
+    )
+    visible_titles = []
+    rendered_decisions = []
+    for d in unacknowledged:
+        vis = _is_doc_visible(d.get("visibility", "global"), d.get("agent_id", ""), d.get("scope", "global"), viewer, viewer_scope)
+        if vis:
+            title = _clean_control_chars(d.get("title", ""))
+            rationale = _clean_control_chars(d.get("rationale", ""))
+            if title:
+                visible_titles.append(f"decision:{d['id']} \"{title[:100]}\"")
+            rendered_decisions.append({
+                "ref": f"decision:{d['id']}",
+                "pg_id": d["id"],
+                "title": title,
+                "rationale": rationale,
+                "fact_grounds": [g["id"] for g in (d.get("grounds") or []) if g["id"] == fact_id or g.get("role") in ("based_on", "grounded_in")],
+                "retrospectives": d.get("retrospectives", []),
+            })
+        else:
+            rendered_decisions.append({
+                "ref": f"decision:{d['id']}",
+                "pg_id": d["id"],
+                "fact_grounds": [fact_id],
+                "retrospectives": d.get("retrospectives", []),
+            })
+    titles_suffix = f" Decisions: {'; '.join(visible_titles)}." if visible_titles else ""
+    return {
+        "status": "error",
+        "error": "decision_loses_last_ground",
+        "fact": fact_id,
+        "stage": stage,
+        "message": msg_head + titles_suffix,
+        "decisions": rendered_decisions,
+        "decisions_needing_answer": unack_ids,
+    }
+
+
 # fact:1215: entities_provenance is who named each entity, operator or agent. Anything else is a shape error, not a new spelling.
 ENTITIES_PROVENANCE_VALUES = ("operator", "agent")
 
@@ -928,6 +1190,18 @@ _backup_quiesce: bool = False
 
 # Shared with REM and NREM; the key must match both daemons. A disconnect drops the session lock, so a crash cannot wedge the others.
 BACKUP_ADVISORY_LOCK_KEY    = _env_int("BACKUP_ADVISORY_LOCK_KEY", 8765309)
+# One transaction lock for every fact supersession, so the last-ground check and the UPDATE cannot race (decision:2802: refuse a supersession that removes a decision's last based-on fact until the operator answers).
+SUPERSEDE_LOCK_KEY          = _env_int("SUPERSEDE_LOCK_KEY", 8765311)
+
+
+def require_distinct_advisory_lock_keys() -> None:
+    """Refuse to boot when the supersede lock id equals the backup lock, so one env value cannot make the two session locks the same lock."""
+    if SUPERSEDE_LOCK_KEY == BACKUP_ADVISORY_LOCK_KEY:
+        raise RuntimeError(
+            f"SUPERSEDE_LOCK_KEY ({SUPERSEDE_LOCK_KEY}) cannot equal "
+            f"BACKUP_ADVISORY_LOCK_KEY ({BACKUP_ADVISORY_LOCK_KEY}). "
+            "Fact supersession locking must not collide with backup quiesce."
+        )
 # Mirror of rem_loop.REM_MAX_ATTEMPTS for the give-up count. The gateway does not enforce it, so the default must match the daemon.
 REM_MAX_ATTEMPTS            = _env_int("REM_MAX_ATTEMPTS", 5)
 # Mirror of rem_loop.REM_STARVED_THRESHOLD (decision 890). The gateway only reports how many pending rows are at the promotion point, so the default must match the daemon.
@@ -2628,6 +2902,7 @@ class MemoryCoordinator:
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
     async def start(self) -> None:
+        require_distinct_advisory_lock_keys()
         # Logged here, after hive_mind_proxy's basicConfig, so the INFO line reaches the journal. An import-time log was dropped.
         log_encoder_endpoints()
         # Probe pgvector on a standalone connection before create_pool so pool warm-up connections already have hnsw_iterative_scan set.
@@ -3509,6 +3784,150 @@ class MemoryCoordinator:
                     target_id, exc,
                 )
         return promoted
+
+    async def _thread_grounds(self, conn, fact_id: int) -> list[dict]:
+        """Standing decisions whose thread cites fact_id, each ground's role resolved like the graph edge (decision:2802: only a based_on fact keeps a decision standing).
+        A retrospective target_pg_id casts only when its text is a digit string, so 1.5 and 1e20 are skipped instead of raising and failing every supersede."""
+        # Decisions directly citing fact_id or whose non-superseded retrospectives cite fact_id
+        d_rows = await conn.fetch(
+            """
+            SELECT d.id, d.content, d.metadata, d.agent_id, d.scope, d.visibility
+            FROM technical_docs d
+            WHERE d.metadata->>'type' = 'decision'
+              AND NOT d.superseded
+              AND (
+                  (d.metadata->'grounded_in' @> to_jsonb($1::bigint))
+                  OR EXISTS (
+                      SELECT 1 FROM technical_docs r
+                      WHERE r.metadata->>'type' = 'retrospective'
+                        AND NOT r.superseded
+                        AND CASE WHEN (r.metadata->>'target_pg_id') ~ '^[0-9]+$' AND length(r.metadata->>'target_pg_id') <= 18 THEN (r.metadata->>'target_pg_id')::bigint END = d.id
+                        AND r.metadata->'grounded_in' @> to_jsonb($1::bigint)
+                  )
+              )
+            """,
+            fact_id,
+        )
+        if not d_rows:
+            return []
+
+        d_ids = [r["id"] for r in d_rows]
+        r_rows = await conn.fetch(
+            """
+            SELECT r.id, r.metadata, CASE WHEN (r.metadata->>'target_pg_id') ~ '^[0-9]+$' AND length(r.metadata->>'target_pg_id') <= 18 THEN (r.metadata->>'target_pg_id')::bigint END AS target_pg_id
+            FROM technical_docs r
+            WHERE r.metadata->>'type' = 'retrospective'
+              AND NOT r.superseded
+              AND CASE WHEN (r.metadata->>'target_pg_id') ~ '^[0-9]+$' AND length(r.metadata->>'target_pg_id') <= 18 THEN (r.metadata->>'target_pg_id')::bigint END = ANY($1::bigint[])
+            """,
+            d_ids,
+        )
+
+        retros_by_decision: dict[int, list] = {did: [] for did in d_ids}
+        for r in r_rows:
+            tgt = r["target_pg_id"]
+            if tgt in retros_by_decision:
+                retros_by_decision[tgt].append(r)
+
+        # Collect all ground IDs across the threads
+        all_ground_ids: set[int] = set()
+        for d in d_rows:
+            d_meta = _coerce_jsonb_obj(d["metadata"]) or {}
+            gi = d_meta.get("grounded_in")
+            if isinstance(gi, list):
+                for x in gi:
+                    if isinstance(x, int) and not isinstance(x, bool):
+                        all_ground_ids.add(x)
+            for r in retros_by_decision.get(d["id"], []):
+                r_meta = _coerce_jsonb_obj(r["metadata"]) or {}
+                r_gi = r_meta.get("grounded_in")
+                if isinstance(r_gi, list):
+                    for x in r_gi:
+                        if isinstance(x, int) and not isinstance(x, bool):
+                            all_ground_ids.add(x)
+
+        ground_info: dict[int, dict] = {}
+        if all_ground_ids:
+            g_rows = await conn.fetch(
+                """
+                SELECT id, metadata->>'type' AS type, metadata->>'source_ref' AS source_ref, superseded
+                FROM technical_docs WHERE id = ANY($1::bigint[])
+                """,
+                list(all_ground_ids),
+            )
+            for gr in g_rows:
+                ground_info[gr["id"]] = {
+                    "type": gr["type"],
+                    "source_ref": gr["source_ref"],
+                    "superseded": gr["superseded"],
+                    "exists": True,
+                }
+
+        out = []
+        for d in d_rows:
+            d_meta = _coerce_jsonb_obj(d["metadata"]) or {}
+            dec_obj = d_meta.get("decision") if isinstance(d_meta.get("decision"), dict) else {}
+            title = dec_obj.get("title") or d_meta.get("title") or ""
+            rationale = dec_obj.get("rationale")
+            if not rationale:
+                c = d.get("content") or ""
+                rationale = c.splitlines()[0] if c else ""
+
+            d_roles = d_meta.get("grounded_roles") if isinstance(d_meta.get("grounded_roles"), dict) else {}
+            thread_grounds = []
+            seen_grounds = set()
+
+            def _cite_ground(gid, roles):
+                # Keep based_on when any citation in the thread has it. A decision's informed_by must not hide its retrospective's based_on of the same fact (decision:2802: only a based_on fact keeps a decision standing).
+                if not isinstance(gid, int) or isinstance(gid, bool):
+                    return
+                g_data = ground_info.get(gid) or {"type": None, "source_ref": None, "superseded": False, "exists": False}
+                role = _standing_role(roles.get(str(gid)), g_data.get("source_ref"))
+                if gid in seen_grounds:
+                    if role == "based_on":
+                        for existing in thread_grounds:
+                            if existing["id"] == gid:
+                                existing["role"] = "based_on"
+                                break
+                    return
+                seen_grounds.add(gid)
+                thread_grounds.append({
+                    "id": gid,
+                    "type": g_data["type"],
+                    "superseded": g_data["superseded"],
+                    "exists": g_data["exists"],
+                    "source_ref": g_data["source_ref"],
+                    "role": role,
+                })
+
+            # Add decision's grounds
+            gi = d_meta.get("grounded_in")
+            if isinstance(gi, list):
+                for gid in gi:
+                    _cite_ground(gid, d_roles)
+
+            # Add retrospective grounds
+            retro_ids = []
+            for r in retros_by_decision.get(d["id"], []):
+                retro_ids.append(r["id"])
+                r_meta = _coerce_jsonb_obj(r["metadata"]) or {}
+                r_roles = r_meta.get("grounded_roles") if isinstance(r_meta.get("grounded_roles"), dict) else {}
+                r_gi = r_meta.get("grounded_in")
+                if isinstance(r_gi, list):
+                    for gid in r_gi:
+                        _cite_ground(gid, r_roles)
+
+            out.append({
+                "id": d["id"],
+                "title": title,
+                "rationale": rationale,
+                "agent_id": d["agent_id"],
+                "scope": d["scope"],
+                "visibility": d.get("visibility") or "global",
+                "retrospectives": retro_ids,
+                "grounds": thread_grounds,
+            })
+        return out
 
     async def _resolve_typed_grounding(
         self, conn, grounded_ids: list, grounded_roles: dict
@@ -5804,7 +6223,16 @@ class MemoryCoordinator:
         # decision 347: stamp the kernel principal and strip the client claim. The operator cannot supply this.
         if isinstance(metadata, dict):
             _apply_principal(metadata, request.get("principal"))
+            metadata.pop("supersession_ack", None)
+            raw_ack = metadata.pop("acknowledge_standing", None)
             body["metadata"] = metadata
+        else:
+            raw_ack = None
+        if raw_ack is None and isinstance(body, dict):
+            raw_ack = body.pop("acknowledge_standing", None)
+        ack_map, ack_err = _parse_and_validate_acknowledge_standing(raw_ack)
+        if ack_err is not None:
+            return ack_err
 
         if not content:
             return web.json_response(
@@ -5980,21 +6408,39 @@ class MemoryCoordinator:
                     "SELECT superseded, metadata->>'type' AS type"
                     " FROM technical_docs WHERE id = $1", supersedes
                 )
-            if target is None:
-                return web.json_response(
-                    {"status": "error",
-                     "message": f"supersedes target {supersedes} not found"},
-                    status=400,
+                if target is None:
+                    return web.json_response(
+                        {"status": "error",
+                         "message": f"supersedes target {supersedes} not found"},
+                        status=400,
+                    )
+                if target["superseded"]:
+                    return web.json_response(
+                        {"status": "error",
+                         "error": "fact_already_superseded",
+                         "message": f"supersedes target {supersedes} is already superseded"},
+                        status=409,
+                    )
+                bad = _supersession_target_error(supersedes, target["type"])
+                if bad:
+                    return web.json_response({"status": "error", "message": bad}, status=400)
+
+                thread_rows = await self._thread_grounds(conn, supersedes)
+                viewer = request.get("authenticated_agent")
+                if ack_map:
+                    thread_dict = {t["id"]: t for t in thread_rows}
+                    for did in ack_map:
+                        refused = await _refusal_if_ack_unreadable(
+                            conn, did, thread_dict.get(did), viewer, scope)
+                        if refused is not None:
+                            return refused
+            ungrounded = threads_left_ungrounded(thread_rows, supersedes)
+            unacked = [t for t in ungrounded if t["id"] not in (ack_map or {})]
+            if unacked:
+                refusal_body = _format_decision_loses_last_ground_refusal(
+                    supersedes, unacked, viewer, scope, stage="pre-check"
                 )
-            if target["superseded"]:
-                return web.json_response(
-                    {"status": "error",
-                     "message": f"supersedes target {supersedes} is already superseded"},
-                    status=400,
-                )
-            bad = _supersession_target_error(supersedes, target["type"])
-            if bad:
-                return web.json_response({"status": "error", "message": bad}, status=400)
+                return web.json_response(refusal_body, status=409)
 
         # Shape already validated (and the ENTITY GATE'S VALIDATION HALF
         # already run) above, before the project axis.
@@ -6105,120 +6551,184 @@ class MemoryCoordinator:
         # Sort, then get and acquire together, so the bounded registry cannot evict a lock this save is about to hold. Release only what was acquired if the list is cancelled.
         acquired: list[asyncio.Lock] = []
         alt_stats: dict | None = None
+        vouched_ids: list[int] = []
+        unused_ids: list[int] = []
         try:
             for e in sorted(set(entities)):
                 lk = await self._lock_for(e)
                 await lk.acquire()
                 acquired.append(lk)
             async with self._acquire() as conn:
-                async with conn.transaction():
-                    # The pre-check is not the guard. Only FOR UPDATE stops a concurrent save of the same content between the read and the insert.
-                    prior = await conn.fetchval(
-                        "SELECT metadata FROM technical_docs"
-                        " WHERE content_hash = $1 FOR UPDATE",
-                        content_hash,
-                    )
-                    if prior is not None:
-                        conflict = await self._axis_conflict_error(
-                            prior, incoming_project, incoming_domains,
-                            entities, is_judgement,
-                            incoming_type=metadata.get("type"),
-                            incoming_metadata=metadata)
-                        if conflict is not None:
-                            self._count_refusal(conflict)
-                            return web.json_response(conflict, status=409)
+                try:
+                    async with conn.transaction():
+                        if supersedes is not None:
+                            await conn.execute("SELECT pg_advisory_xact_lock($1)", SUPERSEDE_LOCK_KEY)
+                            locked_target = await conn.fetchrow(
+                                "SELECT superseded FROM technical_docs WHERE id = $1 FOR UPDATE", supersedes
+                            )
+                            if locked_target is None or locked_target["superseded"]:
+                                raise _FactAlreadySuperseded()
+                            thread_rows = await self._thread_grounds(conn, supersedes)
+                            viewer = request.get("authenticated_agent")
+                            if ack_map:
+                                thread_dict = {t["id"]: t for t in thread_rows}
+                                for did in ack_map:
+                                    refused = await _refusal_if_ack_unreadable(
+                                        conn, did, thread_dict.get(did), viewer, scope)
+                                    if refused is not None:
+                                        return refused
+                            ungrounded = threads_left_ungrounded(thread_rows, supersedes)
+                            unacked = [t for t in ungrounded if t["id"] not in (ack_map or {})]
+                            if unacked:
+                                refusal_body = _format_decision_loses_last_ground_refusal(
+                                    supersedes, unacked, viewer, scope, stage="in-transaction"
+                                )
+                                return web.json_response(refusal_body, status=409)
 
-                    row = await conn.fetchrow(
-                        """
-                        INSERT INTO technical_docs
-                            (content, metadata, embedding, content_hash,
-                             agent_id, scope, visibility)
-                        VALUES ($1, $2::jsonb, $3::vector, $4, $5, $6, $7)
-                        ON CONFLICT (content_hash) DO UPDATE
-                            SET metadata  = EXCLUDED.metadata,
-                                agent_id  = EXCLUDED.agent_id,
-                                embedding = EXCLUDED.embedding
-                        RETURNING id
-                        """,
-                        content, metadata, str(embedding),
-                        content_hash, agent_id, scope, visibility,
-                    )
-                    pg_id = row["id"]
+                        # The pre-check is not the guard. Only FOR UPDATE stops a concurrent save of the same content between the read and the insert.
+                        prior = await conn.fetchval(
+                            "SELECT metadata FROM technical_docs"
+                            " WHERE content_hash = $1 FOR UPDATE",
+                            content_hash,
+                        )
+                        if prior is not None:
+                            conflict = await self._axis_conflict_error(
+                                prior, incoming_project, incoming_domains,
+                                entities, is_judgement,
+                                incoming_type=metadata.get("type"),
+                                incoming_metadata=metadata)
+                            if conflict is not None:
+                                self._count_refusal(conflict)
+                                return web.json_response(conflict, status=409)
 
-                    # decision 582: pick the role from the stored label and fact_kind. Advisory only; the flat grounded_in list stays for telemetry.
-                    grounded_ids = [
-                        g for g in (metadata.get("grounded_in") or [])
-                        if isinstance(g, int) and not isinstance(g, bool)
-                    ]
-                    grounded_typed = await self._resolve_typed_grounding(
-                        conn, grounded_ids, metadata.get("grounded_roles") or {}
-                    )
+                        row = await conn.fetchrow(
+                            """
+                            INSERT INTO technical_docs
+                                (content, metadata, embedding, content_hash,
+                                 agent_id, scope, visibility)
+                            VALUES ($1, $2::jsonb, $3::vector, $4, $5, $6, $7)
+                            ON CONFLICT (content_hash) DO UPDATE
+                                SET metadata  = CASE
+                                                  WHEN technical_docs.metadata ? 'supersession_ack'
+                                                  THEN EXCLUDED.metadata || jsonb_build_object('supersession_ack', technical_docs.metadata->'supersession_ack')
+                                                  ELSE EXCLUDED.metadata
+                                                END,
+                                    agent_id  = EXCLUDED.agent_id,
+                                    embedding = EXCLUDED.embedding
+                            RETURNING id
+                            """,
+                            content, metadata, str(embedding),
+                            content_hash, agent_id, scope, visibility,
+                        )
+                        pg_id = row["id"]
 
-                    # A parked fact cited as evidence inherits the project its citing judgements agree on. The pg_ids are already resolved to real records here.
-                    await self._promote_grounded_parked_facts(
-                        conn, grounded_typed, agent_id, pg_id
-                    )
-
-                    # Outbox row for this fact, in the same transaction. The outbox worker drains it.
-                    outbox_params = {
-                            "content_snippet": content[:200],
-                            "source": metadata.get("source", "coordinator"),
-                            # A judgement carries no entities, so the key is omitted rather than sent empty.
-                            **({} if is_judgement_type(metadata.get("type"))
-                               else {"entities": entities}),
-                            "agent_id": agent_id,
-                            # Fact provenance edges (person/agent/project) are derived and written only when present (decision:912).
-                            "person": metadata.get("principal"),
-                            # The resolved project, never a section and never the sentinel. A parked record must not count as a project in the insight gate.
-                            "project": project_for_graph(metadata),
-                            # Outbox carries domain NAMES (resolved at apply); judgements never reach here with a value.
-                            "domains": resolve_domains(metadata),
-                            "type": _outbox_row_type(metadata.get("type")),
-                            "decision": metadata.get("decision", {}),
-                            "source_ref": metadata.get("source_ref") or None,
-                            # decision 553: fact_kind is derived from source_ref at first write, not asked separately.
-                            "fact_kind": fact_kind_from_source_ref(
-                                metadata.get("source_ref")
-                            ),
-                            # decision 550: grounded_in is the evidence facts, written 1-1 at first write. source_ref stays the fact's own origin.
-                            "grounded_in": grounded_ids,
-                            # Typed roles + asserted_by for the cross-type writer
-                            # (decision 582): [{pg_id, rel, asserted_by, label}].
-                            "grounded": grounded_typed,
-                            # Mirror supersession on this row so the census does not gain a second outbox type.
-                            "supersedes": (
-                                supersedes if (supersedes is not None
-                                               and supersedes != pg_id) else None
-                            ),
-                    }
-                    _require_outbox_type(outbox_params)
-                    await conn.execute(
-                        """
-                        INSERT INTO neo4j_outbox (pg_id, cypher_params)
-                        VALUES ($1, $2::jsonb)
-                        """,
-                        pg_id,
-                        outbox_params,
-                    )
-
-                    # decision 384: retire the predecessor in the same transaction. The id guard skips a hash collision onto this row itself.
-                    if supersedes is not None and supersedes != pg_id:
-                        await conn.execute(
-                            "UPDATE technical_docs"
-                            " SET superseded = true, superseded_by = $2"
-                            " WHERE id = $1 AND id != $2",
-                            supersedes, pg_id,
+                        # decision 582: pick the role from the stored label and fact_kind. Advisory only; the flat grounded_in list stays for telemetry.
+                        grounded_ids = [
+                            g for g in (metadata.get("grounded_in") or [])
+                            if isinstance(g, int) and not isinstance(g, bool)
+                        ]
+                        grounded_typed = await self._resolve_typed_grounding(
+                            conn, grounded_ids, metadata.get("grounded_roles") or {}
                         )
 
-                    # Store alternative text with the record. The background worker embeds them, so the save path stays one embedding call.
-                    alt_stats = await self._reconcile_decision_alternatives(
-                        conn, pg_id, metadata
-                    )
+                        # A parked fact cited as evidence inherits the project its citing judgements agree on. The pg_ids are already resolved to real records here.
+                        await self._promote_grounded_parked_facts(
+                            conn, grounded_typed, agent_id, pg_id
+                        )
 
-                    # Wake the consolidation daemon
-                    await conn.execute(
-                        "SELECT pg_notify('new_artifact', $1)",
-                        json.dumps({"pg_id": pg_id}),
+                        # Outbox row for this fact, in the same transaction. The outbox worker drains it.
+                        outbox_params = {
+                                "content_snippet": content[:200],
+                                "source": metadata.get("source", "coordinator"),
+                                # A judgement carries no entities, so the key is omitted rather than sent empty.
+                                **({} if is_judgement_type(metadata.get("type"))
+                                   else {"entities": entities}),
+                                "agent_id": agent_id,
+                                # Fact provenance edges (person/agent/project) are derived and written only when present (decision:912).
+                                "person": metadata.get("principal"),
+                                # The resolved project, never a section and never the sentinel. A parked record must not count as a project in the insight gate.
+                                "project": project_for_graph(metadata),
+                                # Outbox carries domain NAMES (resolved at apply); judgements never reach here with a value.
+                                "domains": resolve_domains(metadata),
+                                "type": _outbox_row_type(metadata.get("type")),
+                                "decision": metadata.get("decision", {}),
+                                "source_ref": metadata.get("source_ref") or None,
+                                # decision 553: fact_kind is derived from source_ref at first write, not asked separately.
+                                "fact_kind": fact_kind_from_source_ref(
+                                    metadata.get("source_ref")
+                                ),
+                                # decision 550: grounded_in is the evidence facts, written 1-1 at first write. source_ref stays the fact's own origin.
+                                "grounded_in": grounded_ids,
+                                # Typed roles + asserted_by for the cross-type writer
+                                # (decision 582): [{pg_id, rel, asserted_by, label}].
+                                "grounded": grounded_typed,
+                                # Mirror supersession on this row so the census does not gain a second outbox type.
+                                "supersedes": (
+                                    supersedes if (supersedes is not None
+                                                   and supersedes != pg_id) else None
+                                ),
+                        }
+                        _require_outbox_type(outbox_params)
+                        await conn.execute(
+                            """
+                            INSERT INTO neo4j_outbox (pg_id, cypher_params)
+                            VALUES ($1, $2::jsonb)
+                            """,
+                            pg_id,
+                            outbox_params,
+                        )
+
+                        # decision 384: retire the predecessor in the same transaction. The id guard skips a hash collision onto this row itself.
+                        if supersedes is not None and supersedes != pg_id:
+                            ungrounded_ids = [t["id"] for t in ungrounded]
+                            vouched_ids = sorted(set(ungrounded_ids) & set((ack_map or {}).keys()))
+                            unused_ids = sorted(set((ack_map or {}).keys()) - set(ungrounded_ids))
+
+                            p = request.get("principal")
+                            ack_by_user = p.get("user") if isinstance(p, dict) else (p if isinstance(p, str) else None)
+
+                            if vouched_ids:
+                                ack_obj = {
+                                    "decisions": vouched_ids,
+                                    "answers": {str(did): ack_map[did] for did in vouched_ids},
+                                    "acknowledged_by": ack_by_user,
+                                    "agent_id": viewer,
+                                    "at": datetime.now(timezone.utc).isoformat(),
+                                    "by": pg_id,
+                                }
+                                res_upd = await conn.execute(
+                                    "UPDATE technical_docs"
+                                    " SET superseded = true, superseded_by = $2,"
+                                    "     metadata = COALESCE(metadata, '{}'::jsonb) || jsonb_build_object('supersession_ack', $3::jsonb)"
+                                    " WHERE id = $1 AND id != $2 AND NOT superseded",
+                                    supersedes, pg_id, ack_obj,
+                                )
+                            else:
+                                res_upd = await conn.execute(
+                                    "UPDATE technical_docs"
+                                    " SET superseded = true, superseded_by = $2"
+                                    " WHERE id = $1 AND id != $2 AND NOT superseded",
+                                    supersedes, pg_id,
+                                )
+                            if res_upd == "UPDATE 0":
+                                raise _FactAlreadySuperseded()
+
+                        # Store alternative text with the record. The background worker embeds them, so the save path stays one embedding call.
+                        alt_stats = await self._reconcile_decision_alternatives(
+                            conn, pg_id, metadata
+                        )
+
+                        # Wake the consolidation daemon
+                        await conn.execute(
+                            "SELECT pg_notify('new_artifact', $1)",
+                            json.dumps({"pg_id": pg_id}),
+                        )
+                except _FactAlreadySuperseded:
+                    return web.json_response(
+                        {"status": "error",
+                         "error": "fact_already_superseded",
+                         "message": f"supersedes target {supersedes} is already superseded"},
+                        status=409,
                     )
         finally:
             for lk in acquired:
@@ -6252,7 +6762,7 @@ class MemoryCoordinator:
             " (operator-named vs agent-added) is unknown."
             if entities_provenance_missing else None
         )
-        return web.json_response({
+        resp_data = {
             "status": "success",
             "pg_id": pg_id,
             "neo4j": neo4j_status,
@@ -6264,7 +6774,11 @@ class MemoryCoordinator:
             # Non-null only when the stored project or domain spelling differs from the one supplied.
             "project_resolved": axis_report.get("project_resolved"),
             "domains_resolved": axis_report.get("domains_resolved") or None,
-        })
+            "acknowledged_standing": vouched_ids if (supersedes is not None and vouched_ids) else None,
+        }
+        if supersedes is not None and unused_ids:
+            resp_data["acknowledgement_unused"] = unused_ids
+        return web.json_response(resp_data)
 
     # ── POST /memory/supersede ────────────────────────────────────────────────
 
@@ -6286,6 +6800,15 @@ class MemoryCoordinator:
             )
         pg_id = body.get("pg_id")
         by    = body.get("by")
+        raw_ack = body.get("acknowledge_standing")
+        ack_map, ack_err = _parse_and_validate_acknowledge_standing(raw_ack)
+        if ack_err is not None:
+            return ack_err
+        # The viewer is the authenticated agent only. Search never falls back to a body agent_id, and neither does this read (fact:2809: the operator's words are carried per decision).
+        viewer = request.get("authenticated_agent")
+        raw_scope = body.get("scope")
+        viewer_scope = raw_scope if isinstance(raw_scope, str) else None
+
         if isinstance(pg_id, bool) or not isinstance(pg_id, int):
             return web.json_response(
                 {"status": "error", "message": "pg_id (int) is required"}, status=400
@@ -6310,8 +6833,10 @@ class MemoryCoordinator:
                 )
             if target["superseded"]:
                 return web.json_response(
-                    {"status": "error", "message": f"fact {pg_id} is already superseded"},
-                    status=400,
+                    {"status": "error",
+                     "error": "fact_already_superseded",
+                     "message": f"fact {pg_id} is already superseded"},
+                    status=409,
                 )
             bad = _supersession_target_error(pg_id, target["type"])
             if bad:
@@ -6333,53 +6858,152 @@ class MemoryCoordinator:
                         status=400,
                     )
 
+            # Pre-check thread grounds. The locked re-check below is the one that writes.
+            thread_rows = await self._thread_grounds(conn, pg_id)
+            if ack_map:
+                thread_dict = {t["id"]: t for t in thread_rows}
+                for did in ack_map:
+                    refused = await _refusal_if_ack_unreadable(
+                        conn, did, thread_dict.get(did), viewer, viewer_scope)
+                    if refused is not None:
+                        return refused
+            ungrounded = threads_left_ungrounded(thread_rows, pg_id)
+            unacked = [t for t in ungrounded if t["id"] not in (ack_map or {})]
+            if unacked:
+                refusal_body = _format_decision_loses_last_ground_refusal(
+                    pg_id, unacked, viewer, viewer_scope, stage="pre-check"
+                )
+                return web.json_response(refusal_body, status=409)
+
             purged = 0
-            async with conn.transaction():
-                await conn.execute(
-                    "UPDATE technical_docs SET superseded = true, superseded_by = $2"
-                    " WHERE id = $1",
-                    pg_id, by,
-                )
-                _supersede_params = {"type": "supersede", "old_pg_id": pg_id, "new_pg_id": by}
-                _require_outbox_type(_supersede_params)
-                await conn.execute(
-                    "INSERT INTO neo4j_outbox (pg_id, cypher_params) VALUES ($1, $2::jsonb)",
-                    pg_id,
-                    _supersede_params,
-                )
-                # Ride-along only if a live successor fact row exists to purge us
-                # later; otherwise purge this fact's own dream-cycle row now.
-                ride = False
-                if by is not None:
-                    ride = await conn.fetchval(
-                        "SELECT 1 FROM neo4j_outbox WHERE pg_id = $1"
-                        " AND COALESCE(cypher_params->>'type','fact') = 'fact' LIMIT 1",
-                        by,
-                    ) is not None
-                if not ride:
-                    rows = await conn.fetch(
-                        "DELETE FROM neo4j_outbox WHERE pg_id = $1"
-                        " AND COALESCE(cypher_params->>'type','fact') = 'fact'"
-                        " RETURNING id",
-                        pg_id,
+            vouched_ids: list[int] = []
+            unused_ids: list[int] = []
+            try:
+                async with conn.transaction():
+                    # 1. Advisory xact lock
+                    await conn.execute("SELECT pg_advisory_xact_lock($1)", SUPERSEDE_LOCK_KEY)
+                    # 2. Re-read target FOR UPDATE
+                    locked_target = await conn.fetchrow(
+                        "SELECT superseded FROM technical_docs WHERE id = $1 FOR UPDATE", pg_id
                     )
-                    purged = len(rows)
+                    if locked_target is None or locked_target["superseded"]:
+                        raise _FactAlreadySuperseded()
+                    if by is not None:
+                        locked_succ = await conn.fetchrow(
+                            "SELECT superseded FROM technical_docs WHERE id = $1", by
+                        )
+                        if locked_succ is None:
+                            return web.json_response(
+                                {"status": "error", "message": f"successor {by} not found"},
+                                status=400,
+                            )
+                        if locked_succ["superseded"]:
+                            return web.json_response(
+                                {"status": "error",
+                                 "message": f"successor {by} is itself already superseded"},
+                                status=400,
+                            )
+
+                    # Re-check under the lock. A pre-check that saw no loss can still lose the last ground to a concurrent supersede.
+                    thread_rows = await self._thread_grounds(conn, pg_id)
+                    if ack_map:
+                        thread_dict = {t["id"]: t for t in thread_rows}
+                        for did in ack_map:
+                            refused = await _refusal_if_ack_unreadable(
+                                conn, did, thread_dict.get(did), viewer, viewer_scope)
+                            if refused is not None:
+                                return refused
+                    ungrounded = threads_left_ungrounded(thread_rows, pg_id)
+                    unacked = [t for t in ungrounded if t["id"] not in (ack_map or {})]
+                    if unacked:
+                        refusal_body = _format_decision_loses_last_ground_refusal(
+                            pg_id, unacked, viewer, viewer_scope, stage="in-transaction"
+                        )
+                        return web.json_response(refusal_body, status=409)
+
+                    ungrounded_ids = [t["id"] for t in ungrounded]
+                    vouched_ids = sorted(set(ungrounded_ids) & set((ack_map or {}).keys()))
+                    unused_ids = sorted(set((ack_map or {}).keys()) - set(ungrounded_ids))
+
+                    p = request.get("principal")
+                    ack_by_user = p.get("user") if isinstance(p, dict) else (p if isinstance(p, str) else None)
+
+                    if vouched_ids:
+                        ack_obj = {
+                            "decisions": vouched_ids,
+                            "answers": {str(did): ack_map[did] for did in vouched_ids},
+                            "acknowledged_by": ack_by_user,
+                            "agent_id": viewer,
+                            "at": datetime.now(timezone.utc).isoformat(),
+                            "by": by,
+                        }
+                        res_upd = await conn.execute(
+                            "UPDATE technical_docs SET superseded = true, superseded_by = $2,"
+                            " metadata = COALESCE(metadata, '{}'::jsonb) || jsonb_build_object('supersession_ack', $3::jsonb)"
+                            " WHERE id = $1 AND NOT superseded",
+                            pg_id, by, ack_obj,
+                        )
+                    else:
+                        res_upd = await conn.execute(
+                            "UPDATE technical_docs SET superseded = true, superseded_by = $2"
+                            " WHERE id = $1 AND NOT superseded",
+                            pg_id, by,
+                        )
+                    if res_upd == "UPDATE 0":
+                        # Raise, so the transaction rolls back. A return here would commit an empty update as success-shaped 409.
+                        raise _FactAlreadySuperseded()
+
+                    _supersede_params = {"type": "supersede", "old_pg_id": pg_id, "new_pg_id": by}
+                    _require_outbox_type(_supersede_params)
+                    await conn.execute(
+                        "INSERT INTO neo4j_outbox (pg_id, cypher_params) VALUES ($1, $2::jsonb)",
+                        pg_id,
+                        _supersede_params,
+                    )
+                    # Ride-along only if a live successor fact row exists to purge us
+                    # later; otherwise purge this fact's own dream-cycle row now.
+                    ride = False
+                    if by is not None:
+                        ride = await conn.fetchval(
+                            "SELECT 1 FROM neo4j_outbox WHERE pg_id = $1"
+                            " AND COALESCE(cypher_params->>'type','fact') = 'fact' LIMIT 1",
+                            by,
+                        ) is not None
+                    if not ride:
+                        rows = await conn.fetch(
+                            "DELETE FROM neo4j_outbox WHERE pg_id = $1"
+                            " AND COALESCE(cypher_params->>'type','fact') = 'fact'"
+                            " RETURNING id",
+                            pg_id,
+                        )
+                        purged = len(rows)
+            except _FactAlreadySuperseded:
+                return web.json_response(
+                    {"status": "error",
+                     "error": "fact_already_superseded",
+                     "message": f"fact {pg_id} is already superseded"},
+                    status=409,
+                )
             if purged:
                 log.info(
                     "Supersede: purged %d outbox row(s) for retracted fact %d "
                     "(no live successor to ride with).", purged, pg_id,
                 )
 
-        return web.json_response({
+        resp_data = {
             "status": "success",
             "superseded": pg_id,
             "superseded_by": by,
             "purged_outbox": purged,
+            "acknowledged_standing": vouched_ids if vouched_ids else None,
             "message": (
                 f"Fact {pg_id} superseded"
                 + (f" by {by}." if by is not None else " (retracted, no replacement).")
             ),
-        })
+        }
+        if unused_ids:
+            resp_data["acknowledgement_unused"] = unused_ids
+        return web.json_response(resp_data)
 
     # ── POST /memory/review_hold ──────────────────────────────────────────────
 
@@ -7952,7 +8576,8 @@ class MemoryCoordinator:
         async with self._acquire() as conn:
             rec = await conn.fetchrow(
                 "SELECT metadata->>'type' AS type, created_at, superseded, superseded_by,"
-                "       metadata->'grounded_in' AS grounded_in"
+                "       metadata->'grounded_in' AS grounded_in,"
+                "       metadata->'supersession_ack' AS supersession_ack"
                 " FROM technical_docs WHERE id = $1", pg_id,
             )
             ob = await conn.fetchrow(
@@ -8013,6 +8638,17 @@ class MemoryCoordinator:
             except Exception:
                 gi = None
 
+        ack = None
+        if rec and rec.get("supersession_ack") is not None:
+            ack_raw = rec["supersession_ack"]
+            if isinstance(ack_raw, str):
+                try:
+                    ack = json.loads(ack_raw)
+                except Exception:
+                    ack = None
+            elif isinstance(ack_raw, dict):
+                ack = ack_raw
+
         return web.json_response({
             "pg_id": pg_id,
             # The unambiguous form of the thing just returned — quote THIS back,
@@ -8024,6 +8660,7 @@ class MemoryCoordinator:
             "created_at": _iso(rec["created_at"]) if rec else None,
             "superseded": rec["superseded"] if rec else None,
             "superseded_by": rec["superseded_by"] if rec else None,
+            "supersession_ack": ack,
             "grounded_in": gi if isinstance(gi, list) else None,
             # in-flight dream-cycle stamps — None once the outbox row is deleted
             "neo4j": ob["status"] if ob else "unknown",

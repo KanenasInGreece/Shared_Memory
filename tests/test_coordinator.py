@@ -810,12 +810,15 @@ async def test_handle_supersede_accepts_live_successor():
     mock_conn.fetchrow = AsyncMock(side_effect=[
         {"superseded": False, "type": None},
         {"superseded": False},
+        {"superseded": False},
+        {"superseded": False},
     ])
     mock_conn.fetchval = AsyncMock(return_value=None)   # ride-along probe: no live outbox row
     mock_conn.fetch    = AsyncMock(return_value=[])     # purge query
 
     req = _make_request({"pg_id": 10, "by": 20})
-    resp = await c.handle_supersede(req)
+    with patch.object(c, "_thread_grounds", new=AsyncMock(return_value=[])):
+        resp = await c.handle_supersede(req)
 
     assert resp.status == 200
     body = json.loads(resp.body)
