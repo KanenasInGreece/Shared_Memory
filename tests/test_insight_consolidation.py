@@ -1130,7 +1130,8 @@ async def test_run_insight_cycle_covered_identity_skips_without_appending(monkey
 async def test_t8_run_insight_cycle_v2_retro_folds_once_with_superset(monkeypatch):
     """T8: insight [245, 267], open v2 retrospective 900 on 245, fresh cluster
     [245, 267, 900] -> _fold_insight is awaited ONCE, with 900.
-    Mutation: the helper returns targets -> two awaits."""
+    Mutation: the helper returns targets -> the refold on [245, 267] runs
+    first and fills `folded`, so the one await lacks 900."""
     class _Conn(StubConn):
         def close(self):
             pass

@@ -1371,9 +1371,9 @@ def fetch_reversal_context(conn, judgement_ids):
 def fetch_insight_outbox_rows(conn, pg_ids):
     """Snapshot the consumable ledger rows for one fold — decision and
     retrospective rows at applied/rem_reviewed — captured BY ROW ID before the
-    LLM call. Matches on pg_id = ANY(...) only (N6: a row closes only if its
-    pg_id is in source_pg_ids; a v2 retrospective row is consumed only when
-    its retrospective is in this fold, never by target decision alone).
+    LLM call. Matches on the row's own pg_id only, so a v2 retrospective row
+    is consumed only when its retrospective is in this fold, never through its
+    target decision.
     A retrospective arriving mid-fold keeps its status and stays open: its
     wording is not in this narrative, so it must remain a trigger for the next
     fold."""
@@ -2227,8 +2227,8 @@ def drop_out_of_scan_refold_rows(conn, scanned_pg_ids, context="consolidation"):
 def fetch_unreconciled_insights(conn):
     """Active insight summaries covering decision/retrospective rows stuck at
     'consolidated' — Postgres committed the insight but the Neo4j marking was
-    not confirmed (crash between the stores). Matches on pg_id = ANY(...) only
-    (N6: an insight row reconciles only when its pg_id is in source_pg_ids).
+    not confirmed (crash between the stores). Matches on the row's own pg_id,
+    the same key the fold's close uses.
     Mirrors fetch_unreconciled for the insight row types; re-applying the
     marking is idempotent. Returns [(summary_id, entity, source_pg_ids)]."""
     with conn.cursor() as cur:

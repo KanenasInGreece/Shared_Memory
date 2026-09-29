@@ -18,7 +18,7 @@ For every legacy `(d:Decision)-[o:HAD_OUTCOME {rating,date,notes}]->(d)` edge:
 
 Legacy outbox retro rows are NOT touched: rows already consumed by an insight
 fold were deleted by the ledger close, and surviving open rows remain valid
-re-fold triggers (the insight path keys them on COALESCE(target_pg_id, pg_id)
+re-fold triggers (the insight path keys them on their own pg_id, the decision's,
 and reads the wording from the migrated record after conversion).
 
 Re-runnable: converted self-loops are deleted, so a re-run sees an empty
