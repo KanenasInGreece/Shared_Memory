@@ -10,6 +10,7 @@ Unit tests never reach the network.
 """
 
 import importlib.util
+import inspect
 import json
 import os
 import sys
@@ -79,6 +80,76 @@ def _coord():
     neo4j.session = MagicMock(return_value=_async_ctx(session))
     c._neo4j = neo4j
     return c, conn, session
+
+
+class _recording_tx:
+    """Records the exception that left the block. A normal return commits; a raise rolls back."""
+
+    def __init__(self):
+        self.exc_type = None
+
+    async def __aenter__(self):
+        return None
+
+    async def __aexit__(self, exc_type, exc, tb):
+        self.exc_type = exc_type
+        return False
+
+
+def _losing_decision(did=2522, title="Use SQLite WAL mode", visibility="global",
+                     agent_id="claude", rationale="In context of deadlocks, chose WAL mode"):
+    return {
+        "id": did,
+        "title": title,
+        "rationale": rationale,
+        "visibility": visibility,
+        "agent_id": agent_id,
+        "scope": "global",
+        "retrospectives": [],
+        "grounds": [{"id": 2672, "type": "fact", "superseded": False, "role": "based_on", "exists": True}],
+    }
+
+
+def _load_py(mod_name: str, path: str):
+    spec = importlib.util.spec_from_file_location(mod_name, path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _load_memory_bridge(mod_name: str, path: str):
+    """Load a client copy without reading a skill or gateway .env."""
+    saved = os.environ.get("SECURE_ENV_FILE", None)
+    os.environ["SECURE_ENV_FILE"] = ""
+    try:
+        return _load_py(mod_name, path)
+    finally:
+        if saved is None:
+            os.environ.pop("SECURE_ENV_FILE", None)
+        else:
+            os.environ["SECURE_ENV_FILE"] = saved
+
+
+def _load_vector_skill(mod_name: str = "vector_skill_fr2b"):
+    """Load the MCP client without reading mcp/.env."""
+    saved = os.environ.get("VECTOR_SKILL_ENV", None)
+    os.environ["VECTOR_SKILL_ENV"] = "/tmp/fr2b-no-such-env"
+    try:
+        path = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "mcp", "vector-skill.py"))
+        return _load_py(mod_name, path)
+    finally:
+        if saved is None:
+            os.environ.pop("VECTOR_SKILL_ENV", None)
+        else:
+            os.environ["VECTOR_SKILL_ENV"] = saved
+
+
+def _http(status: int, body: dict) -> MagicMock:
+    r = MagicMock()
+    r.status_code = status
+    r.json = MagicMock(return_value=body)
+    r.text = json.dumps(body)
+    return r
 
 
 # ── T1 Pure ───────────────────────────────────────────────────────────────────
@@ -415,8 +486,12 @@ async def test_t7_acknowledgement_handling_and_metadata():
         update_args = update_calls[0].args
         assert update_args[1] == 2672
         assert update_args[2] is None
-        # $3 is json string of supersession_ack
-        ack_payload = json.loads(update_args[3])
+        # $3 is the dict the pool's jsonb codec encodes. A str here is the double-encode.
+        ack_payload = update_args[3]
+        assert isinstance(ack_payload, dict)
+        sql = str(update_args[0])
+        assert "NOT superseded" in sql
+        assert "COALESCE(metadata, '{}'::jsonb)" in sql
         assert ack_payload["decisions"] == [2522, 2675]
         assert ack_payload["acknowledged_by"] == "operator_xenofon"
         assert ack_payload["answers"]["2522"] == "Operator confirmed 2522"
@@ -498,6 +573,19 @@ async def test_t8_save_path_refusal_and_ack_handling():
         inserted_metadata = insert_calls[0].args[2]
         assert "acknowledge_standing" not in inserted_metadata
         assert "supersession_ack" not in inserted_metadata
+        insert_sql = str(insert_calls[0].args[0])
+        assert "metadata ? 'supersession_ack'" in insert_sql
+
+        update_calls = [
+            call for call in conn.execute.call_args_list
+            if "UPDATE technical_docs" in str(call.args[0])
+        ]
+        assert len(update_calls) == 1
+        update_sql = str(update_calls[0].args[0])
+        assert "NOT superseded" in update_sql
+        assert "COALESCE(metadata, '{}'::jsonb)" in update_sql
+        assert isinstance(update_calls[0].args[3], dict)
+        assert update_calls[0].args[3]["answers"]["2522"] == "Still stands"
 
 
 # ── T9 Handler ────────────────────────────────────────────────────────────────
@@ -546,16 +634,13 @@ async def test_t9_in_transaction_order_and_advisory_lock():
 @pytest.mark.asyncio
 async def test_t10_clients_preserve_409_rationale():
     """T10 Clients: mb returns decisions[0]["rationale"] intact from a 409 body;
-    vs renders the title and rationale; --acknowledge-standing 5 --acknowledge-standing 7 gives [5, 7].
+    vs renders the title and rationale; a bare id is refused and words stay a map.
     Kills mutation: fall back to _reply_json -> rationale gone -> dies.
     """
-    # Test memory_bridge.py
     mb_path = os.path.normpath(
         os.path.join(os.path.dirname(__file__), "..", "shared-memory", "scripts", "memory_bridge.py")
     )
-    spec = importlib.util.spec_from_file_location("memory_bridge", mb_path)
-    mb_mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mb_mod)
+    mb_mod = _load_memory_bridge("memory_bridge_t10", mb_path)
 
     # 1. Test mb supersede_fact preserves full 409 body
     mock_resp_409 = MagicMock()
@@ -584,25 +669,32 @@ async def test_t10_clients_preserve_409_rationale():
         assert res["error"] == "decision_loses_last_ground"
         assert res["decisions"][0]["rationale"] == "Untruncated critical rationale that must not be lost"
 
-    # 2. Test CLI parsing of --acknowledge-standing
-    sargs_5_7 = mb_mod._normalize_cli_ack([["5"], ["7"]])
-    assert sargs_5_7 == [5, 7]
+    # 2. Bare ids, empty words, placeholders, and colon tokens are refused. Words stay a map.
+    with pytest.raises(ValueError):
+        mb_mod._normalize_cli_ack([["5"], ["7"]])
+    with pytest.raises(ValueError):
+        mb_mod._normalize_cli_ack([["5", "   "]])
+    with pytest.raises(ValueError):
+        mb_mod._normalize_cli_ack([["5", "Operator acknowledged"]])
+    with pytest.raises(ValueError) as colon_exc:
+        mb_mod._normalize_cli_ack([["5:words", "still stands"]])
+    assert colon_exc.value.__cause__ is None
+    assert "id:answer" in str(colon_exc.value)
 
     sargs_words = mb_mod._normalize_cli_ack([["5", "stands firmly"], ["7", "verified again"]])
     assert sargs_words == {5: "stands firmly", 7: "verified again"}
 
     # 3. Test vector_skill render
-    vs_path = os.path.normpath(
-        os.path.join(os.path.dirname(__file__), "..", "mcp", "vector-skill.py")
-    )
-    spec_vs = importlib.util.spec_from_file_location("vector_skill", vs_path)
-    vs_mod = importlib.util.module_from_spec(spec_vs)
-    spec_vs.loader.exec_module(vs_mod)
+    vs_mod = _load_vector_skill("vector_skill_t10")
 
     rendered = vs_mod._render_decision_loses_last_ground(payload_409)
     assert "Ship skill index" in rendered
     assert "Untruncated critical rationale that must not be lost" in rendered
     assert "decision:2522" in rendered
+    assert "provide acknowledge_standing with:" not in rendered
+    assert "save the new fact first" in rendered
+    assert "decision:2802" in rendered
+    assert "fact:2809" in rendered
 
     # 4. Test vector_skill supersede tool
     with patch.object(vs_mod.httpx.AsyncClient, "post", return_value=mock_resp_409):
@@ -636,6 +728,41 @@ def test_t11_documentation_names_refusal_code():
     assert "decision_loses_last_ground" in sys_prompt
     assert "decision_loses_last_ground" in usage1
     assert "decision_loses_last_ground" in usage2
+    assert usage1 == usage2
+    assert "decision:2802" in usage1 and "fact:2809" in usage1
+    assert "decision:2751" not in usage1
+    assert "There is no `id:answer` syntax" in usage1
+    assert "(or `--acknowledge-standing ID" not in usage1
+
+    skill1 = open(os.path.join(root, "shared-memory", "SKILL.md"), encoding="utf-8").read()
+    skill2 = open(os.path.join(root, "shared-memory-skill", "shared-memory", "SKILL.md"), encoding="utf-8").read()
+    assert skill1 == skill2
+    assert '--acknowledge-standing ID "operator\'s words"' in skill1
+    assert "--acknowledge-standing ID]" not in skill1
+    assert "Decision id(s) or" not in skill1
+    assert "decision_not_visible" in skill1
+    assert "Save the new fact first" in skill1
+    assert "decision:2802" in skill1 and "fact:2809" in skill1
+    assert "decision:2751" not in skill1
+
+    assert "decision:2751" not in sys_prompt
+    assert "list of IDs" not in sys_prompt
+    assert "save the new fact first" in sys_prompt
+    assert "decision:2802" in sys_prompt and "fact:2809" in sys_prompt
+
+    snippet = open(os.path.join(root, "mcp", "CONSTITUTION_SNIPPET_MCP.md"), encoding="utf-8").read()
+    assert "decision:2802" in snippet and "fact:2809" in snippet
+    assert "decision:2751" not in snippet
+    assert "save the new fact" in snippet
+
+    schema1 = open(os.path.join(root, "shared-memory", "Documentation", "schema.md"), encoding="utf-8").read()
+    schema2 = open(
+        os.path.join(root, "shared-memory-skill", "shared-memory", "Documentation", "schema.md"),
+        encoding="utf-8",
+    ).read()
+    assert schema1 == schema2
+    assert "as a JSON object" in schema1
+    assert "decision:2802" in schema1 and "fact:2809" in schema1
 
 
 # ── Double Supersession & Control Chars & Visibility ──────────────────────────
@@ -737,3 +864,454 @@ def test_visibility_filter_pure():
     # anonymous caller (viewer is None) cannot see private or scoped docs
     assert is_vis("private", "agent_a", "global", None, None) is False
     assert is_vis("scope", "agent_a", "project_x", None, "project_x") is False
+
+
+def _root() -> str:
+    return os.path.normpath(os.path.join(os.path.dirname(__file__), ".."))
+
+
+def _bridge_paths() -> list[str]:
+    root = _root()
+    return [
+        os.path.join(root, "shared-memory", "scripts", "memory_bridge.py"),
+        os.path.join(root, "shared-memory-skill", "shared-memory", "scripts", "memory_bridge.py"),
+    ]
+
+
+async def _fetchrow_success(sql, *args):
+    text = str(sql)
+    if "INSERT INTO technical_docs" in text:
+        return {"id": 999}
+    if "FOR UPDATE" in text:
+        return {"superseded": False}
+    return {"superseded": False, "type": "fact"}
+
+
+# ── M2b / M3b: _thread_grounds role resolution ───────────────────────────────
+
+@pytest.mark.asyncio
+async def test_thread_grounds_resolves_roles_like_the_edge():
+    """Explicit informed_by stays informed_by. No role uses the fact_kind default.
+    An unknown explicit word falls back the same way. Kills M2b and M3b.
+    """
+    c, conn, _ = _coord()
+
+    def dec(did, gid, roles=None):
+        meta = {"type": "decision", "grounded_in": [gid], "decision": {"title": f"D{did}", "rationale": "r"}}
+        if roles is not None:
+            meta["grounded_roles"] = roles
+        return {
+            "id": did, "content": f"D{did} title", "metadata": meta,
+            "agent_id": "claude", "scope": "global", "visibility": "global",
+        }
+
+    decisions = [
+        dec(1, 10, {"10": "informed_by"}),
+        dec(2, 11),
+        dec(3, 12),
+        dec(4, 13, {"13": "not_a_role"}),
+        dec(5, 14),
+        dec(6, 16, {"16": "not_a_role"}),
+    ]
+    retros = [{
+        "id": 90,
+        "target_pg_id": 1,
+        "metadata": {
+            "type": "retrospective",
+            "target_pg_id": 1,
+            "grounded_in": [15],
+            "grounded_roles": {"15": "informed_by"},
+        },
+    }]
+    grounds = [
+        {"id": 10, "type": "fact", "source_ref": "shared-memory/scripts/coordinator.py", "superseded": False},
+        {"id": 11, "type": "fact", "source_ref": "discussion_context", "superseded": False},
+        {"id": 12, "type": "fact", "source_ref": "tests/test_supersession_last_ground.py", "superseded": False},
+        {"id": 13, "type": "fact", "source_ref": "tests/test_foo.py", "superseded": False},
+        {"id": 14, "type": "fact", "source_ref": "shared-memory/scripts/coordinator.py", "superseded": False},
+        {"id": 15, "type": "fact", "source_ref": "shared-memory/scripts/coordinator.py", "superseded": False},
+        {"id": 16, "type": "fact", "source_ref": "discussion_context", "superseded": False},
+    ]
+    conn.fetch = AsyncMock(side_effect=[decisions, retros, grounds])
+    rows = await c._thread_grounds(conn, 10)
+    role = {}
+    for row in rows:
+        for g in row["grounds"]:
+            role[(row["id"], g["id"])] = g["role"]
+    assert role[(1, 10)] == "informed_by"
+    assert role[(1, 15)] == "informed_by"
+    assert role[(2, 11)] == "informed_by"
+    assert role[(3, 12)] == "based_on"
+    assert role[(4, 13)] == "based_on"
+    assert role[(5, 14)] == "based_on"
+    assert role[(6, 16)] == "informed_by"
+
+
+def test_target_pg_id_cast_is_guarded():
+    """Both casts require a JSON number, so one bad retrospective cannot 500 every supersede."""
+    src = inspect.getsource(MemoryCoordinator._thread_grounds)
+    assert src.count("jsonb_typeof(r.metadata->'target_pg_id') = 'number'") == 2
+
+
+def test_upsert_and_updates_keep_ack_shape():
+    """Kills M7 (drop the keep-on-upsert) and M8/M8b (drop NOT superseded / COALESCE)."""
+    save_src = inspect.getsource(MemoryCoordinator.handle_save)
+    sup_src = inspect.getsource(MemoryCoordinator.handle_supersede)
+    assert "metadata ? 'supersession_ack'" in save_src
+    assert save_src.count("AND NOT superseded") >= 2
+    assert sup_src.count("AND NOT superseded") >= 2
+    needle = "COALESCE(metadata, '{}'::jsonb) || jsonb_build_object('supersession_ack'"
+    assert needle in save_src
+    assert needle in sup_src
+
+
+def test_equal_lock_keys_refuse_boot():
+    """An env value equal to the backup lock must not boot. Kills a missing startup check."""
+    assert "require_distinct_advisory_lock_keys()" in inspect.getsource(MemoryCoordinator.start)
+    old_s = coordinator_mod.SUPERSEDE_LOCK_KEY
+    old_b = coordinator_mod.BACKUP_ADVISORY_LOCK_KEY
+    try:
+        coordinator_mod.SUPERSEDE_LOCK_KEY = 7
+        coordinator_mod.BACKUP_ADVISORY_LOCK_KEY = 7
+        with pytest.raises(RuntimeError):
+            coordinator_mod.require_distinct_advisory_lock_keys()
+    finally:
+        coordinator_mod.SUPERSEDE_LOCK_KEY = old_s
+        coordinator_mod.BACKUP_ADVISORY_LOCK_KEY = old_b
+    coordinator_mod.require_distinct_advisory_lock_keys()
+
+
+# ── M4 / M4b / alias ──────────────────────────────────────────────────────────
+
+_BAD_ACKS = [
+    {"2522": ""},
+    {"2522": "   "},
+    {"2522": "Operator acknowledged"},
+    {"2522": "TODO"},
+    {"2522": "<operator reason>"},
+    {"2522": "n/a"},
+    {},
+    [2522, 2675],
+    ["2522"],
+    True,
+]
+
+
+@pytest.mark.asyncio
+async def test_wordless_map_and_list_are_400_on_both_handlers():
+    """Kills M4 and M4b. A wordless map or a list is 400, not a fabricated acknowledgement."""
+    for raw in _BAD_ACKS:
+        c, conn, _ = _coord()
+        conn.fetchrow = AsyncMock(side_effect=_fetchrow_success)
+        with patch.object(c, "_thread_grounds", new=AsyncMock(return_value=[_losing_decision()])):
+            resp = await c.handle_supersede(_make_request({
+                "pg_id": 2672,
+                "acknowledge_standing": raw,
+            }))
+        assert resp.status == 400, raw
+        assert "acknowledge_standing" in json.loads(resp.text)["message"]
+        assert conn.transaction.call_count == 0
+
+        c2, conn2, _ = _coord()
+        conn2.fetchrow = AsyncMock(side_effect=_fetchrow_success)
+        with patch.object(c2, "_thread_grounds", new=AsyncMock(return_value=[_losing_decision()])), \
+             patch.object(c2, "_embed", new=AsyncMock(return_value=[0.1])), \
+             patch.object(c2, "_commit_axis_registrations", new=AsyncMock()):
+            resp2 = await c2.handle_save(_make_request({
+                "content": "new correction fact",
+                "metadata": {
+                    "project": "shared-memory-GitHub",
+                    "source": "claude",
+                    "supersedes": 2672,
+                    "acknowledge_standing": raw,
+                },
+            }))
+        assert resp2.status == 400, raw
+        assert "acknowledge_standing" in json.loads(resp2.text)["message"]
+        assert conn2.transaction.call_count == 0
+
+
+@pytest.mark.asyncio
+async def test_body_acknowledge_alias_does_not_count():
+    """The undocumented body key `acknowledge` is not an acknowledgement."""
+    c, conn, _ = _coord()
+    conn.fetchrow = AsyncMock(return_value={"superseded": False, "type": "fact"})
+    with patch.object(c, "_thread_grounds", new=AsyncMock(return_value=[_losing_decision()])):
+        resp = await c.handle_supersede(_make_request({
+            "pg_id": 2672,
+            "acknowledge": {"2522": "the operator says it still stands"},
+        }))
+    body = json.loads(resp.text)
+    assert resp.status == 409
+    assert body["error"] == "decision_loses_last_ground"
+    assert conn.transaction.call_count == 0
+
+
+# ── M5 / M14 ──────────────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_private_title_is_absent_from_the_payload():
+    """Kills M14. A private decision the caller cannot read contributes no title or rationale."""
+    c, conn, _ = _coord()
+    conn.fetchrow = AsyncMock(return_value={"superseded": False, "type": "fact"})
+    private = _losing_decision(2522, title="SECRET TITLE", visibility="private",
+                               agent_id="owner", rationale="SECRET RATIONALE")
+    public = _losing_decision(2675, title="Public title", rationale="Public rationale")
+    with patch.object(c, "_thread_grounds", new=AsyncMock(return_value=[private, public])):
+        resp = await c.handle_supersede(_make_request(
+            {"pg_id": 2672, "agent_id": "owner"},
+            authenticated_agent="attacker",
+        ))
+    body = json.loads(resp.text)
+    assert resp.status == 409
+    by_id = {d["pg_id"]: d for d in body["decisions"]}
+    assert "title" not in by_id[2522]
+    assert "rationale" not in by_id[2522]
+    assert by_id[2675]["title"] == "Public title"
+    assert "SECRET TITLE" not in resp.text
+    assert "SECRET RATIONALE" not in resp.text
+
+
+@pytest.mark.asyncio
+async def test_ack_of_unreadable_decision_is_403():
+    """Kills M5. Viewer is the authenticated agent. A missing row is unreadable.
+    A body agent_id does not widen the read.
+    """
+    thread = [_losing_decision(2522, title="SECRET", visibility="private", agent_id="owner")]
+
+    c, conn, _ = _coord()
+    conn.fetchrow = AsyncMock(return_value={"superseded": False, "type": "fact"})
+    with patch.object(c, "_thread_grounds", new=AsyncMock(return_value=thread)):
+        resp = await c.handle_supersede(_make_request(
+            {
+                "pg_id": 2672,
+                "agent_id": "owner",
+                "acknowledge_standing": {"2522": "the operator says it still stands"},
+            },
+            authenticated_agent=None,
+        ))
+    assert resp.status == 403
+    assert json.loads(resp.text)["error"] == "decision_not_visible"
+    assert conn.transaction.call_count == 0
+
+    c2, conn2, _ = _coord()
+    conn2.fetchrow = AsyncMock(side_effect=[
+        {"superseded": False, "type": "fact"},
+        None,
+    ])
+    with patch.object(c2, "_thread_grounds", new=AsyncMock(return_value=[])):
+        resp2 = await c2.handle_supersede(_make_request({
+            "pg_id": 2672,
+            "acknowledge_standing": {"9999": "the operator says it still stands"},
+        }))
+    assert resp2.status == 403
+    assert json.loads(resp2.text)["error"] == "decision_not_visible"
+    assert conn2.transaction.call_count == 0
+
+    c3, conn3, _ = _coord()
+    conn3.fetchrow = AsyncMock(side_effect=_fetchrow_success)
+    with patch.object(c3, "_thread_grounds", new=AsyncMock(return_value=thread)):
+        resp3 = await c3.handle_supersede(_make_request(
+            {"pg_id": 2672, "acknowledge_standing": {"2522": "the operator says it still stands"}},
+            authenticated_agent="owner",
+        ))
+    assert resp3.status == 200
+
+    c4, conn4, _ = _coord()
+    conn4.fetchrow = AsyncMock(return_value={"superseded": False, "type": "fact"})
+    embed = AsyncMock(return_value=[0.1])
+    with patch.object(c4, "_thread_grounds", new=AsyncMock(return_value=thread)), \
+         patch.object(c4, "_embed", new=embed), \
+         patch.object(c4, "_commit_axis_registrations", new=AsyncMock()):
+        resp4 = await c4.handle_save(_make_request(
+            {
+                "content": "new correction fact",
+                "agent_id": "owner",
+                "metadata": {
+                    "project": "shared-memory-GitHub",
+                    "source": "claude",
+                    "supersedes": 2672,
+                    "acknowledge_standing": {"2522": "the operator says it still stands"},
+                },
+            },
+            authenticated_agent="attacker",
+        ))
+    assert resp4.status == 403
+    assert json.loads(resp4.text)["error"] == "decision_not_visible"
+    embed.assert_not_called()
+
+
+# ── M12 / M8 update-0 / M15 ───────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_locked_row_already_superseded_rolls_back():
+    """Kills M12. FOR UPDATE seeing superseded raises, so the transaction rolls back."""
+    c, conn, _ = _coord()
+    tx = _recording_tx()
+    conn.transaction = MagicMock(return_value=tx)
+    conn.fetchrow = AsyncMock(side_effect=[
+        {"superseded": False, "type": "fact"},
+        {"superseded": True},
+    ])
+    with patch.object(c, "_thread_grounds", new=AsyncMock(return_value=[])):
+        resp = await c.handle_supersede(_make_request({"pg_id": 2672}))
+    assert resp.status == 409
+    assert json.loads(resp.text)["error"] == "fact_already_superseded"
+    assert tx.exc_type is coordinator_mod._FactAlreadySuperseded
+    assert not any("UPDATE technical_docs" in str(call.args[0]) for call in conn.execute.call_args_list)
+
+
+@pytest.mark.asyncio
+async def test_update_zero_rolls_back_on_both_paths():
+    """Kills M8/M8b/M12. UPDATE 0 raises inside the transaction instead of returning."""
+    c, conn, _ = _coord()
+    tx = _recording_tx()
+    conn.transaction = MagicMock(return_value=tx)
+    conn.fetchrow = AsyncMock(side_effect=[
+        {"superseded": False, "type": "fact"},
+        {"superseded": False},
+    ])
+
+    async def exec_zero(sql, *args):
+        if "UPDATE technical_docs" in str(sql):
+            return "UPDATE 0"
+        return "UPDATE 1"
+
+    conn.execute = AsyncMock(side_effect=exec_zero)
+    with patch.object(c, "_thread_grounds", new=AsyncMock(return_value=[])):
+        resp = await c.handle_supersede(_make_request({"pg_id": 2672}))
+    assert resp.status == 409
+    assert json.loads(resp.text)["error"] == "fact_already_superseded"
+    assert tx.exc_type is coordinator_mod._FactAlreadySuperseded
+    sqls = [str(call.args[0]) for call in conn.execute.call_args_list]
+    assert any("UPDATE technical_docs" in s and "NOT superseded" in s for s in sqls)
+    assert not any("neo4j_outbox" in s for s in sqls)
+
+    c2, conn2, _ = _coord()
+    tx2 = _recording_tx()
+    conn2.transaction = MagicMock(return_value=tx2)
+    conn2.fetchrow = AsyncMock(side_effect=_fetchrow_success)
+    conn2.execute = AsyncMock(side_effect=exec_zero)
+    with patch.object(c2, "_thread_grounds", new=AsyncMock(return_value=[_losing_decision()])), \
+         patch.object(c2, "_embed", new=AsyncMock(return_value=[0.1])), \
+         patch.object(c2, "_commit_axis_registrations", new=AsyncMock()):
+        resp2 = await c2.handle_save(_make_request({
+            "content": "new correction fact",
+            "metadata": {
+                "project": "shared-memory-GitHub",
+                "source": "claude",
+                "supersedes": 2672,
+                "acknowledge_standing": {"2522": "still stands without the new fact"},
+            },
+        }))
+    assert resp2.status == 409
+    assert json.loads(resp2.text)["error"] == "fact_already_superseded"
+    assert tx2.exc_type is coordinator_mod._FactAlreadySuperseded
+
+
+@pytest.mark.asyncio
+async def test_in_transaction_recheck_fires_when_precheck_was_clean():
+    """Kills M15. Pre-check [] and the locked read [D] is 409 stage in-transaction, and nothing is written."""
+    decision = _losing_decision()
+
+    c, conn, _ = _coord()
+    conn.fetchrow = AsyncMock(side_effect=[
+        {"superseded": False, "type": "fact"},
+        {"superseded": False},
+    ])
+    grounds = AsyncMock(side_effect=[[], [decision]])
+    with patch.object(c, "_thread_grounds", new=grounds):
+        resp = await c.handle_supersede(_make_request({"pg_id": 2672}))
+    body = json.loads(resp.text)
+    assert resp.status == 409
+    assert body["error"] == "decision_loses_last_ground"
+    assert body["stage"] == "in-transaction"
+    assert grounds.await_count == 2
+    assert not any("UPDATE technical_docs" in str(call.args[0]) for call in conn.execute.call_args_list)
+
+    c2, conn2, _ = _coord()
+    conn2.fetchrow = AsyncMock(side_effect=_fetchrow_success)
+    grounds2 = AsyncMock(side_effect=[[], [decision]])
+    with patch.object(c2, "_thread_grounds", new=grounds2), \
+         patch.object(c2, "_embed", new=AsyncMock(return_value=[0.1])), \
+         patch.object(c2, "_commit_axis_registrations", new=AsyncMock()):
+        resp2 = await c2.handle_save(_make_request({
+            "content": "new correction fact",
+            "metadata": {
+                "project": "shared-memory-GitHub",
+                "source": "claude",
+                "supersedes": 2672,
+            },
+        }))
+    body2 = json.loads(resp2.text)
+    assert resp2.status == 409
+    assert body2["stage"] == "in-transaction"
+    assert grounds2.await_count == 2
+    assert not any(
+        "INSERT INTO technical_docs" in str(call.args[0]) for call in conn2.fetchrow.call_args_list
+    )
+
+
+# ── M10a / M10b ───────────────────────────────────────────────────────────────
+
+def test_other_409_still_raises_on_both_clients_and_mcp():
+    """Kills M10a and M10b. Only decision_loses_last_ground is returned; axis_conflict still raises."""
+    body_other = {"status": "error", "error": "axis_conflict", "message": "axes are fixed"}
+    body_ground = {"status": "error", "error": "decision_loses_last_ground", "decisions": []}
+    for i, path in enumerate(_bridge_paths()):
+        mb = _load_memory_bridge(f"memory_bridge_m10_{i}", path)
+        with pytest.raises(mb.GatewayReplyError):
+            mb._reply_json(_http(409, body_other))
+        kept = mb._reply_json(_http(409, body_ground))
+        assert kept["error"] == "decision_loses_last_ground"
+        with pytest.raises(ValueError):
+            mb._normalize_cli_ack([["5"], ["7"]])
+        assert "Operator acknowledged" not in inspect.getsource(mb._normalize_cli_ack)
+
+    vs = _load_vector_skill("vector_skill_m10")
+    with pytest.raises(vs.GatewayReplyError):
+        vs._reply_json(_http(409, body_other), "supersede")
+    kept_vs = vs._reply_json(_http(409, body_ground), "supersede")
+    assert kept_vs["error"] == "decision_loses_last_ground"
+
+
+@pytest.mark.asyncio
+async def test_mcp_refuses_list_and_placeholder_before_post():
+    """The MCP tool is a map only. A list, an empty string, or a placeholder never reaches the gateway."""
+    vs = _load_vector_skill("vector_skill_mcp_ack")
+    fn = vs.supersede
+    while hasattr(fn, "__wrapped__"):
+        fn = fn.__wrapped__
+    src = inspect.getsource(fn)
+    assert "dict[str, str]" in src
+    assert "list[int]" not in src
+    doc = inspect.getdoc(fn) or ""
+    assert "save the new fact" in doc
+    assert "decision:2802" in doc and "fact:2809" in doc
+    assert "decision:2751" not in doc
+
+    class _NoPost:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("refused acknowledgement was posted")
+
+    with patch.object(vs.httpx, "AsyncClient", _NoPost):
+        for raw in ([5], {"5": ""}, {"5": "TODO"}, {"5": "Operator acknowledged"}, {}):
+            result = await vs.supersede(2672, acknowledge_standing=raw)
+            assert "400" in result
+            assert "fact:2809" in result
+
+
+@pytest.mark.asyncio
+async def test_client_list_ack_does_not_post():
+    """supersede_fact refuses a list locally. Kills M4b on both copies."""
+    for i, path in enumerate(_bridge_paths()):
+        mb = _load_memory_bridge(f"memory_bridge_list_{i}", path)
+
+        def _boom(*args, **kwargs):
+            raise AssertionError("list acknowledgement was posted")
+
+        with patch.object(mb, "_async_client", _boom):
+            res = await mb.supersede_fact(2672, acknowledge_standing=[5, 7])
+        assert res["status"] == "error"
+        assert "400" in res["message"]
+        assert "fact:2809" in res["message"]

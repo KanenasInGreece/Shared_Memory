@@ -137,11 +137,11 @@ save_retrospective --pg-id 42 --rating reversed --notes "The global lock won." -
 `--supersedes` and `supersede` refuse a decision or a retrospective. A new retrospective on the same `--pg-id` is the live verdict.
 
 If superseding a fact would leave standing decisions with no other standing fact grounds, the gateway refuses with HTTP 409 `decision_loses_last_ground`. Ask the operator about each decision. The second submission depends on the operator's answer:
-1. **Decision still stands:** re-send with `--acknowledge-standing ID` (or `--acknowledge-standing ID "operator's words"`). Repeat the flag for each orphaned decision.
+1. **Decision still stands:** re-send `--acknowledge-standing ID "the operator's words"` once per decision. A bare id, an empty string, or a placeholder is refused. There is no `id:answer` syntax.
 2. **New fact supports the decision:** save the new fact first WITHOUT `--supersedes`, save a retrospective (`validated` or `refined`) grounded on the new fact, then supersede the old fact with `--by <new_id>`. The thread now has a standing fact, so no acknowledgement is needed.
 3. **New fact argues for reversal:** save the new fact first WITHOUT `--supersedes`, save a retrospective (`reversed`) grounded on the new fact, then supersede the old fact with `--by <new_id>`. The decision is now superseded, so no acknowledgement is needed.
 
-⛔ Never acknowledge without the operator's answer on each id (decision:2751).
+⛔ Refuse a supersession that removes a decision's last based-on fact until the operator answers (decision:2802); the operator's words are carried per decision (fact:2809).
 
 If a fact is already superseded, the gateway refuses with HTTP 409 `fact_already_superseded`. Re-read `lineage fact:N` to inspect the successor or retraction.
 

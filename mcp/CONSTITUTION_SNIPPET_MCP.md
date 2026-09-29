@@ -94,7 +94,7 @@ Every fact needs a registered `project` in its metadata. This host has no workin
 
 `save_artifact`, `save_decision`, `save_retrospective`, and `supersede` return 403 when the role cannot write. That 403 is the role. Do not retry it. Say the record was not saved.
 
-When superseding a fact that grounds decisions (`decision_loses_last_ground`), ask the operator per decision; ⛔ never acknowledge without the operator's answer on each id.
+When superseding a fact that grounds decisions (`decision_loses_last_ground`), ask the operator per decision. If it still stands, re-send `acknowledge_standing` as a map of decision id to the operator's non-empty words. A list, an empty string, or a placeholder is refused. If the new fact supports it or argues for reversal, save the new fact, then the retrospective grounded on it, then supersede. ⛔ Refuse a supersession that removes a decision's last based-on fact until the operator answers (decision:2802); the operator's words are carried per decision (fact:2809).
 
 Never register a database MCP alongside this one. A direct connection goes past the gateway.
 

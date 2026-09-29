@@ -500,10 +500,42 @@ def _reply_json(r, tool: str) -> dict:
             f"{_body_snippet(r, 120) or '(empty)'}") from exc
 
 
+_PLACEHOLDER_WORDS_RE = re.compile(
+    r"^(?:<[^>]+>|operator\s+(?:acknowledged|reason|words|confirmed)|placeholder|todo|tbd|none|n/a)$",
+    re.IGNORECASE,
+)
+
+
+def _ack_map_refusal(acknowledge_standing) -> str | None:
+    """Refuse a list, an empty string, or a placeholder before the tool forwards it.
+    The gateway is the authority, and this stops the client from sending a shape that invents the operator's words (fact:2809: the operator's words are carried per decision)."""
+    if acknowledge_standing is None:
+        return None
+    if not isinstance(acknowledge_standing, dict) or isinstance(acknowledge_standing, list) or not acknowledge_standing:
+        return (
+            "Error: HTTP 400: acknowledge_standing must be a map of {decision_id: "
+            "\"the operator's words\"}. A list of ids is refused "
+            "(fact:2809, the operator's words are carried per decision)."
+        )
+    for key, words in acknowledge_standing.items():
+        if isinstance(key, bool):
+            return "Error: HTTP 400: acknowledge_standing keys must be decision ids."
+        try:
+            int(key)
+        except (TypeError, ValueError):
+            return f"Error: HTTP 400: acknowledge_standing key {key!r} is not a decision id."
+        if not isinstance(words, str) or not words.strip() or _PLACEHOLDER_WORDS_RE.match(words.strip()):
+            return (
+                f"Error: HTTP 400: acknowledge_standing[{key}] requires the operator's "
+                "non-empty words. An empty string or a placeholder is refused "
+                "(fact:2809, the operator's words are carried per decision)."
+            )
+    return None
+
+
 def _render_decision_loses_last_ground(body: dict) -> str:
-    """Render HTTP 409 decision_loses_last_ground refusal with full rationale and recovery instructions.
-    ⛔ Never compress a prohibition away (decision:2751).
-    """
+    """Render the 409 with each decision's rationale and the fact-first recovery, and do not teach a wordless acknowledgement.
+    ⛔ Refuse a supersession that removes a decision's last based-on fact until the operator answers (decision:2802); the operator's words are carried per decision (fact:2809)."""
     msg = body.get("message", "")
     lines = [
         f"Refusal (HTTP 409 decision_loses_last_ground): {msg}",
@@ -512,9 +544,12 @@ def _render_decision_loses_last_ground(body: dict) -> str:
     ]
     for d in body.get("decisions", []):
         ref = d.get("ref") or f"decision:{d.get('pg_id')}"
-        title = d.get("title", "")
-        rationale = d.get("rationale", "")
-        lines.append(f"  - {ref}: \"{title}\"")
+        title = d.get("title")
+        rationale = d.get("rationale")
+        if title:
+            lines.append(f"  - {ref}: \"{title}\"")
+        else:
+            lines.append(f"  - {ref}")
         if rationale:
             lines.append(f"    Rationale: {rationale}")
         fg = d.get("fact_grounds")
@@ -524,12 +559,25 @@ def _render_decision_loses_last_ground(body: dict) -> str:
         if retros:
             lines.append(f"    Retrospectives: {retros}")
 
-    ack_with = body.get("acknowledge_with") or body.get("acknowledge_standing")
-    if ack_with:
-        lines.append("")
-        lines.append(f"To proceed with still-standing decisions, provide acknowledge_standing with: {ack_with}")
-        lines.append("⛔ Never acknowledge without the operator's answer on each id.")
-
+    ids = []
+    for d in body.get("decisions") or []:
+        if d.get("pg_id") is not None:
+            ids.append(str(d["pg_id"]))
+    id_list = ", ".join(ids) if ids else "each decision id in this refusal"
+    lines.append("")
+    lines.append(
+        "If a decision still stands, re-send acknowledge_standing as a map of "
+        f"{{decision_id: \"the operator's words\"}} for {id_list}. "
+        "A list of ids, an empty string, or a placeholder is refused with HTTP 400."
+    )
+    lines.append(
+        "If the new fact supports the decision or argues for reversal: save the new fact first, "
+        "then the retrospective grounded on it, then supersede."
+    )
+    lines.append(
+        "⛔ Refuse a supersession that removes a decision's last based-on fact until the operator "
+        "answers (decision:2802); the operator's words are carried per decision (fact:2809)."
+    )
     return "\n".join(lines)
 
 
@@ -1123,7 +1171,7 @@ async def save_retrospective(
 async def supersede(
     pg_id: int,
     by: int = 0,
-    acknowledge_standing: list[int] | dict[str, str] | None = None,
+    acknowledge_standing: dict[str, str] | None = None,
 ) -> str:
     """Retract or supersede an existing FACT (decision 381/384).
 
@@ -1142,21 +1190,29 @@ async def supersede(
     verdict is the one that counts.
 
     Use when a stored fact is wrong or outdated and you are NOT saving a
-    replacement in the same call. To save a correction that supersedes an old
-    fact in one step, instead call save_artifact with "supersedes": <old_pg_id>
-    in its metadata_json.
+    replacement in the same call. When the decision already has another standing
+    based-on fact, call save_artifact with "supersedes": <old_pg_id> in its
+    metadata_json. When it does not, save the new fact first, then the
+    retrospective grounded on it, then supersede.
 
     If superseding this fact would leave standing decisions with no other
     standing fact grounds, the gateway returns HTTP 409 decision_loses_last_ground.
-    Ask the operator about each decision. If they confirm it still stands,
-    re-send with acknowledge_standing.
-    ⛔ Never acknowledge without the operator's answer on each id (decision:2751).
+    Ask the operator about each decision. If the decision still stands, re-send
+    acknowledge_standing as a map of {decision_id: the operator's words}. If the
+    new fact supports it or argues for reversal, save the new fact, then the
+    retrospective grounded on it, then supersede.
+    ⛔ Refuse a supersession that removes a decision's last based-on fact until
+    the operator answers (decision:2802); the operator's words are carried per
+    decision (fact:2809).
 
     Required: pg_id (the fact to retract).
     Optional: by (pg_id of an existing successor fact to point at; omit / 0 = none).
-    Optional: acknowledge_standing (list of decision IDs or map of {id: operator_answer}
-    acknowledging decisions that still stand despite losing their last grounding fact).
+    Optional: acknowledge_standing, a map {decision_id: the operator's non-empty
+    words}. A list, an empty string, or a placeholder is refused with HTTP 400.
     """
+    refused = _ack_map_refusal(acknowledge_standing)
+    if refused is not None:
+        return refused
     coordinator_url = COORDINATOR_BASE
     payload: dict = {"pg_id": pg_id}
     if by and by > 0:

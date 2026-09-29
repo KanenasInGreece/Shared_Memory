@@ -32,6 +32,7 @@ import os
 import re
 import sys
 from datetime import datetime
+from typing import Any
 
 import httpx
 
@@ -466,39 +467,79 @@ def _reply_json(r, *, log_auth: bool = False,
         )}) from exc
 
 
-def _normalize_cli_ack(raw: list[list[str]] | list[Any] | None) -> list[int] | dict[int, str] | None:
-    """Normalize CLI --acknowledge-standing entries.
-    Supports either integer IDs: --acknowledge-standing 5 --acknowledge-standing 7 -> [5, 7]
-    or ID with reason: --acknowledge-standing 5 "stands firmly" -> {5: "stands firmly"}
-    """
+_PLACEHOLDER_WORDS_RE = re.compile(
+    r"^(?:<[^>]+>|operator\s+(?:acknowledged|reason|words|confirmed)|placeholder|todo|tbd|none|n/a)$",
+    re.IGNORECASE,
+)
+
+
+def _is_placeholder_words(text: str) -> bool:
+    """True when the text is empty or a stand-in, so the client cannot invent the operator's words (fact:2809: the operator's words are carried per decision)."""
+    if not isinstance(text, str):
+        return True
+    s = text.strip()
+    if not s:
+        return True
+    return bool(_PLACEHOLDER_WORDS_RE.match(s))
+
+
+def _normalize_cli_ack(raw: Any) -> dict[int, str] | None:
+    """Turn repeatable `--acknowledge-standing ID "words"` into {id: words}, and refuse every other shape.
+    A bare id, an empty string, a placeholder, or an `id:answer` token is a ValueError: this CLI has no colon syntax and must not invent the words (fact:2809: the operator's words are carried per decision)."""
     if not raw:
         return None
-    has_words = any(isinstance(item, (list, tuple)) and len(item) >= 2 for item in raw)
-    if has_words:
-        out_map = {}
-        for item in raw:
-            if isinstance(item, (list, tuple)):
-                if len(item) >= 2:
-                    out_map[int(item[0])] = " ".join(str(x) for x in item[1:]).strip()
-                elif len(item) == 1:
-                    out_map[int(item[0])] = "Operator acknowledged"
-            elif isinstance(item, int):
-                out_map[item] = "Operator acknowledged"
-            elif isinstance(item, str):
-                parts = item.split(maxsplit=1)
-                if len(parts) == 2:
-                    out_map[int(parts[0])] = parts[1].strip()
-                else:
-                    out_map[int(parts[0])] = "Operator acknowledged"
-        return out_map
-    else:
-        out_list = []
-        for item in raw:
-            if isinstance(item, (list, tuple)):
-                out_list.append(int(item[0]))
-            else:
-                out_list.append(int(item))
-        return out_list
+
+    def _one(did_part: object, words: str) -> tuple[int, str]:
+        if isinstance(did_part, bool):
+            raise ValueError("acknowledge_standing requires an integer decision id and the operator's words")
+        try:
+            d_id = int(did_part)
+        except (ValueError, TypeError):
+            raise ValueError(
+                "acknowledge_standing form is --acknowledge-standing ID \"operator's words\". "
+                f"Got {did_part!r}. There is no id:answer syntax."
+            ) from None
+        if not words or _is_placeholder_words(words):
+            raise ValueError(
+                f"acknowledge_standing[{d_id}] requires the operator's non-empty words "
+                "(fact:2809, the operator's words are carried per decision). "
+                "A bare id, an empty string, or a placeholder is refused."
+            )
+        return d_id, words.strip()
+
+    if isinstance(raw, dict):
+        out: dict[int, str] = {}
+        for k, v in raw.items():
+            if not isinstance(v, str):
+                raise ValueError(f"acknowledge_standing[{k!r}] must be the operator's words")
+            d_id, words = _one(k, v)
+            out[d_id] = words
+        if not out:
+            raise ValueError("acknowledge_standing map cannot be empty")
+        return out
+
+    if not isinstance(raw, (list, tuple)):
+        raise ValueError(
+            "acknowledge_standing must be repeated --acknowledge-standing ID \"operator's words\""
+        )
+
+    out_map: dict[int, str] = {}
+    for item in raw:
+        if isinstance(item, dict):
+            sub = _normalize_cli_ack(item)
+            if sub:
+                out_map.update(sub)
+            continue
+        if not isinstance(item, (list, tuple)) or len(item) < 2:
+            raise ValueError(
+                "acknowledge_standing form is --acknowledge-standing ID \"operator's words\". "
+                "A bare id is refused (fact:2809, the operator's words are carried per decision)."
+            )
+        d_id, words = _one(item[0], " ".join(str(x) for x in item[1:]))
+        out_map[d_id] = words
+    if not out_map:
+        raise ValueError("acknowledge_standing requires at least one decision id and the operator's words")
+    return out_map
 
 
 def _coordinator_unavailable(exc: Exception, ceiling: float | None = None) -> dict:
@@ -677,16 +718,22 @@ async def save_artifact(content: str, metadata_json: str = "{}") -> dict:
 async def supersede_fact(
     pg_id: int,
     by: int | None = None,
-    acknowledge_standing: list[int] | dict[int, str] | None = None,
-    acknowledge: list[int] | dict[int, str] | None = None,
+    acknowledge_standing: dict[int, str] | None = None,
 ) -> dict:
     """Retract a fact without a replacement, or point `--by` at a successor (decision 381: the old fact is kept and hidden from search; decision 384: the successor is applied when the record is read)."""
     payload: dict = {"pg_id": pg_id}
     if by is not None:
         payload["by"] = by
-    ack = acknowledge_standing if acknowledge_standing is not None else acknowledge
-    if ack is not None:
-        payload["acknowledge_standing"] = ack
+    if acknowledge_standing is not None:
+        if not isinstance(acknowledge_standing, dict):
+            return {
+                "status": "error",
+                "message": (
+                    "acknowledge_standing must be a map of {decision_id: operator's words} (HTTP 400). "
+                    "A list is refused (fact:2809, the operator's words are carried per decision)."
+                ),
+            }
+        payload["acknowledge_standing"] = acknowledge_standing
     try:
         async with _async_client(30.0) as client:
             r = await client.post(
@@ -852,7 +899,8 @@ def _save_argparser() -> "argparse.ArgumentParser":
                         "near matches; add \"new_domain\": true to the metadata "
                         "to register it, after asking the operator.")
     p.add_argument("--acknowledge-standing", action="append", nargs="+", metavar="ID_AND_WORDS",
-                   help="pg_id of standing decision to acknowledge (optionally followed by operator reason)")
+                   help="decision id and the operator's words, repeated per decision: "
+                        "--acknowledge-standing 2522 \"still stands without the new fact\"")
     return p
 
 
@@ -1498,7 +1546,11 @@ async def main() -> None:
         p = _save_argparser()
         sargs = p.parse_args(sys.argv[2:])
         metadata = sargs.metadata
-        norm_ack = _normalize_cli_ack(getattr(sargs, "acknowledge_standing", None))
+        try:
+            norm_ack = _normalize_cli_ack(getattr(sargs, "acknowledge_standing", None))
+        except ValueError as exc:
+            print(json.dumps({"status": "error", "message": str(exc)}))
+            sys.exit(1)
         if sargs.supersedes is not None or sargs.domain or norm_ack:
             try:
                 mobj = json.loads(metadata) if isinstance(metadata, str) else metadata
@@ -1526,9 +1578,14 @@ async def main() -> None:
         p.add_argument("--by", type=int, default=None,
                        help="pg_id of an existing successor fact (optional)")
         p.add_argument("--acknowledge-standing", action="append", nargs="+", metavar="ID_AND_WORDS",
-                       help="pg_id of standing decision to acknowledge (optionally followed by operator reason)")
+                       help="decision id and the operator's words, repeated per decision: "
+                            "--acknowledge-standing 2522 \"still stands without the new fact\"")
         sargs = p.parse_args(sys.argv[2:])
-        norm_ack = _normalize_cli_ack(getattr(sargs, "acknowledge_standing", None))
+        try:
+            norm_ack = _normalize_cli_ack(getattr(sargs, "acknowledge_standing", None))
+        except ValueError as exc:
+            print(json.dumps({"status": "error", "message": str(exc)}))
+            sys.exit(1)
         print(json.dumps(await supersede_fact(sargs.pg_id, sargs.by, acknowledge_standing=norm_ack), indent=2))
     elif action == "review-hold":
         p = argparse.ArgumentParser(
