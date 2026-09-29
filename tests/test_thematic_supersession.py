@@ -49,6 +49,7 @@ from consolidation_loop import (
     link_thematic_successor,
     recheck_kept_thematic_ids,
     retire_invalidated_summaries,
+    resolve_standing_ids,
     solid_match,
     thematic_fold_is_current,
 )
@@ -156,7 +157,7 @@ def daemon_with_fake_graph(results=None):
 
 @pytest.mark.asyncio
 async def test_t1_superseded_constituent_retires_and_folds_successor_atomically(monkeypatch):
-    """T1: Active row 10 src [1,2,3,4], fact 2 superseded by 5, scan [1,3,4,5].
+    """T1: Active row 10 src [1,2,3,4], fact 2 superseded by 5 via two-hop chain (2 -> 6 -> 5), scan [1,3,4,5].
     Expect, in order and with ONE commit:
       retire UPDATE on id 10 ('lineage')
       -> ledger rows for 1,3,4,5 with trigger 2 and none for 2 (I15)
@@ -168,7 +169,8 @@ async def test_t1_superseded_constituent_retires_and_folds_successor_atomically(
     Mutations killed:
       (a) remove retire -> upsert returns 10 and test fails
       (b) commit between retire and insert -> commits > 1 fails
-      (c) drop pointer UPDATE -> fails.
+      (c) drop pointer UPDATE -> fails
+      (d) one hop instead of chain end in resolve_standing_ids at fold link -> stops at 6 (superseded) and misses 5 -> fails.
     """
     daemon, session = daemon_with_fake_graph()
     monkeypatch.delenv("MOCK_LLM", raising=False)
@@ -210,7 +212,7 @@ async def test_t1_superseded_constituent_retires_and_folds_successor_atomically(
         #    a) _retire_summary: UPDATE community_summaries SET superseded = true ... WHERE id = 10
         {"rowcount": 1, "rows": []},
         #    b) resolve_standing_ids for [1, 2, 3, 4]:
-        #       1 -> 1 (live), 3 -> 3 (live), 4 -> 4 (live), 2 -> 5 (superseded_by 5, live)
+        #       1 -> 1 (live), 3 -> 3 (live), 4 -> 4 (live), 2 -> 5 (two-hop chain: 2 superseded by 6, 6 superseded by 5, live)
         #       Chain returns (start_id, cur_id, still_sup)
         {"rowcount": 4, "rows": [
             (1, 1, False),
@@ -974,6 +976,15 @@ def test_s2_thread_support_retrospective_legs():
     assert repointed_c == []
     assert kept_c == [300]
 
+    # S2 thread SQL pin: the retrospective leg, target_pg_id = the decision, the standing (NOT superseded) filter, and jsonb_typeof number filter
+    thread_sqls = [c[0] for c in conn_a.executed if "decision_facts AS" in c[0]]
+    assert len(thread_sqls) == 1
+    sql_a = thread_sqls[0]
+    assert "r.metadata->>'type' = 'retrospective'" in sql_a
+    assert "r.metadata->>'target_pg_id' IN (SELECT id::text FROM decisions)" in sql_a
+    assert "NOT r.superseded" in sql_a
+    assert "jsonb_typeof(elem) = 'number'" in sql_a
+
 
 # ── S3: link_thematic_successor solid repoint and kept ───────────────────────
 
@@ -1069,7 +1080,7 @@ async def test_s4_regate_links_newest_lineage_retired_row(monkeypatch):
     sql = regate_sqls[0][0]
     assert "superseded_reason = 'lineage'" in sql
     assert "superseded_by IS NULL" in sql
-    assert "ORDER BY superseded_at DESC, id DESC" in sql
+    assert "ORDER BY superseded_at DESC NULLS LAST, id DESC" in sql
     # Verify link executed:
     link_updates = [c for c in conn_1.executed if "UPDATE community_summaries SET superseded_by = %s WHERE id = %s" in c[0]]
     assert len(link_updates) == 1
@@ -1081,44 +1092,54 @@ async def test_s4_regate_links_newest_lineage_retired_row(monkeypatch):
 @pytest.mark.asyncio
 async def test_s5_read_time_unsupported_lists_d_f_and_f2():
     """S5: read time: unsupported lists D, F and F2 for a kept insight; empty when solid.
+    Two-hop chains: summary chain 10 -> 11 (superseded) -> 12 (active);
+    fact chain 1 -> 2 (superseded) -> 3 (active).
+    Mutation killed: one hop instead of chain end -> fails.
     Mutation killed: drop the unsupported field -> fails.
     """
     c = co.MemoryCoordinator()
     fake_conn = MagicMock()
 
-    # Insight 301 citing retired summary 10. Summary 10 has successor 11.
-    # Decision 501 grounded in fact 1. Summary 10 had fact 1. Summary 11 has fact 3 (drops 1).
-    # Fact 1 in technical_docs superseded by 2; Fact 2 is standing (chain end F2=2).
+    # Insight 301 citing retired summary 10. Summary 10 has successor 11 (superseded), 11 has successor 12 (active end).
+    # Summary 10 has fact 1, 4. Summary 11 has fact 3. Summary 12 has fact 4.
+    # Decision 501 grounded in fact 1. Summary 12 drops fact 1.
+    # Fact 1 in technical_docs superseded by 2; Fact 2 superseded by 3; Fact 3 is standing (chain end F2=3).
     # Insight 302 citing retired summary 10.
-    # Decision 502 grounded in fact 3. Summary 11 has fact 3 -> solid!
+    # Decision 502 grounded in fact 4. Summary 12 has fact 4 -> solid!
     insights_data = [
         {"id": 301, "summary_ids": [10], "source_pg_ids": [501]},
         {"id": 302, "summary_ids": [10], "source_pg_ids": [502]},
     ]
 
     # Query 1: community_summaries for ANY([10])
-    # Query 2: community_summaries for successor 11 (active end)
-    # Query 3: decisions query for [501, 502]
-    # Query 4: technical_docs for lost fact [1]
-    # Query 5: technical_docs for successor fact 2
+    # Query 2 (fetchrow): community_summaries for mid successor 11 (superseded)
+    # Query 3 (fetchrow): community_summaries for active end 12 (active)
+    # Query 4: decisions thread query for [501, 502]
+    # Query 5: technical_docs for lost fact [1]
+    # Query 6 (fetchrow): technical_docs for mid fact 2 (superseded)
+    # Query 7 (fetchrow): technical_docs for active end fact 3 (active)
     fake_conn.fetch = AsyncMock(side_effect=[
         # 1. cited summary 10
-        [{"id": 10, "superseded": True, "superseded_reason": "lineage", "superseded_by": 11, "source_pg_ids": [1]}],
-        # 3. decisions thread query
-        [{"decision_id": 501, "fact_ids": [1]}, {"decision_id": 502, "fact_ids": [3]}],
-        # 4. technical_docs for fact 1
+        [{"id": 10, "superseded": True, "superseded_reason": "lineage", "superseded_by": 11, "source_pg_ids": [1, 4]}],
+        # 4. decisions thread query
+        [{"decision_id": 501, "fact_ids": [1]}, {"decision_id": 502, "fact_ids": [4]}],
+        # 5. technical_docs for fact 1
         [{"id": 1, "superseded": True, "superseded_by": 2}],
     ])
     fake_conn.fetchrow = AsyncMock(side_effect=[
-        # 2. successor 11 (active end)
-        {"id": 11, "superseded": False, "superseded_reason": None, "superseded_by": None, "source_pg_ids": [3]},
-        # 5. successor fact 2 (chain end)
-        {"id": 2, "superseded": False, "superseded_by": None},
+        # 2. mid successor 11 (superseded)
+        {"id": 11, "superseded": True, "superseded_reason": "lineage", "superseded_by": 12, "source_pg_ids": [3]},
+        # 3. active end 12 (active)
+        {"id": 12, "superseded": False, "superseded_reason": None, "superseded_by": None, "source_pg_ids": [4]},
+        # 6. mid fact 2 (superseded)
+        {"id": 2, "superseded": True, "superseded_by": 3},
+        # 7. active end fact 3 (active)
+        {"id": 3, "superseded": False, "superseded_by": None},
     ])
 
     annotated = await c._annotate_retired_summaries(fake_conn, insights_data)
 
-    # Insight 301 (kept): unsupported lists decision 501, superseded_facts=[1], superseding_facts=[2]
+    # Insight 301 (kept): unsupported lists decision 501, superseded_facts=[1], superseding_facts=[3] (chain end)
     ins_301_retired = annotated[301]
     assert len(ins_301_retired) == 1
     assert ins_301_retired[0]["summary_id"] == 10
@@ -1126,10 +1147,10 @@ async def test_s5_read_time_unsupported_lists_d_f_and_f2():
     assert ins_301_retired[0]["superseded_by"] == 11
     assert "unsupported" in ins_301_retired[0]
     assert ins_301_retired[0]["unsupported"] == [
-        {"decision": 501, "superseded_facts": [1], "superseding_facts": [2]}
+        {"decision": 501, "superseded_facts": [1], "superseding_facts": [3]}
     ]
 
-    # Insight 302 (solid): unsupported is empty list
+    # Insight 302 (solid): unsupported is empty list because active end 12 carries fact 4
     ins_302_retired = annotated[302]
     assert len(ins_302_retired) == 1
     assert ins_302_retired[0]["summary_id"] == 10
@@ -1176,13 +1197,17 @@ def test_whole_insight_thread_supported_by_other_cited_row_not_lost():
 # ── Sweep re-check test (Review Fold 2) ───────────────────────────────────────
 
 def test_sweep_recheck_repoints_after_retrospective_grounds_successor():
-    """Sweep re-check: an active insight citing lineage-retired summary 10 (superseded_by = 11)
-    repoints on the next sweep after a retrospective grounds on the new fact in 11.
-    Mutation killed: omit sweep re-check -> fails.
+    """Sweep re-check: an active insight citing lineage-retired summary 10 (superseded_by = 11,
+    11 superseded_by = 12) repoints on the next sweep after a retrospective grounds on the new fact in 12.
+    Two-hop chain: 10 -> 11 (superseded) -> 12 (active end).
+    Mutations killed:
+      (a) omit sweep re-check -> fails
+      (b) one hop instead of chain end in recheck -> fails (repoints to 11 or leaves kept).
     """
     # Active insight 801 cites [10] with decision 100.
     # Summary 10 is lineage-retired with superseded_by = 11.
-    # Summary 11 is active (superseded = False) with source_pg_ids = [5].
+    # Summary 11 is lineage-retired with superseded_by = 12.
+    # Summary 12 is active (superseded = False) with source_pg_ids = [5].
     # Retrospective 105 targets decision 100 and grounds on fact 5!
     script = [
         # 1. Query candidate active insights citing lineage-retired summaries
@@ -1193,15 +1218,19 @@ def test_sweep_recheck_repoints_after_retrospective_grounds_successor():
         {"rowcount": 1, "rows": [
             (10, True, 11, "lineage", [2]),
         ]},
-        # 3. Query successor 11: active end
+        # 3. Query mid successor 11: lineage-retired, superseded_by = 12
         {"rowcount": 1, "rows": [
-            (11, False, None, None, [5]),
+            (11, True, 12, "lineage", [4]),
         ]},
-        # 4. Batched thread query: decision 100 has fact 5 (via retro 105)
+        # 4. Query active end 12: active
+        {"rowcount": 1, "rows": [
+            (12, False, None, None, [5]),
+        ]},
+        # 5. Batched thread query: decision 100 has fact 5 (via retro 105)
         {"rowcount": 1, "rows": [
             (100, [5]),
         ]},
-        # 5. UPDATE metadata for 801 -> repointed to [11]
+        # 6. UPDATE metadata for 801 -> repointed to [12]
         {"rowcount": 1, "rows": []},
     ]
     conn = StubConn(script=script)
@@ -1213,7 +1242,7 @@ def test_sweep_recheck_repoints_after_retrospective_grounds_successor():
 
     meta_updates = [c for c in conn.executed if "UPDATE community_summaries SET metadata" in c[0]]
     assert len(meta_updates) == 1
-    assert json.loads(meta_updates[0][1][0])["summary_ids"] == [11]
+    assert json.loads(meta_updates[0][1][0])["summary_ids"] == [12]
     assert meta_updates[0][1][1] == 801
 
 
@@ -1236,4 +1265,210 @@ def test_vacuous_solid_match_when_no_supported_threads():
 
     assert repointed == [901]
     assert kept == []
+
+
+# ── Additional Sixth Pass Tests ──────────────────────────────────────────────
+
+def test_resolve_standing_ids_two_hop_chain():
+    """Two-hop chain test at fold link (resolve_standing_ids):
+    Constituent fact 2 superseded by 6, 6 superseded by 5 (standing).
+    Chain resolves to standing id 5.
+    Mutation killed: one hop instead of chain end -> fails.
+    """
+    conn = StubConn(script=[
+        {"rowcount": 1, "rows": [(2, 5, False)]},
+    ])
+    out = resolve_standing_ids(conn, [2])
+    assert out == {2: (5, False)}
+    sql, params = conn.executed[0]
+    assert "WITH RECURSIVE" in sql
+    assert "ORDER BY start_id, depth DESC" in sql
+
+
+@pytest.mark.asyncio
+async def test_read_time_whole_insight_two_kept_retired_rows_sharing_fact_neither_successor():
+    """Read-time whole-insight test (F1): an insight cites [10, 20].
+    Decision 100 is grounded in fact 1.
+    Both kept retired rows 10 and 20 share fact 1 (source_pg_ids: 10 has [1], 20 has [1, 9]).
+    Row 10 has successor 11 (source_pg_ids: [8]).
+    Row 20 has successor 21 (source_pg_ids: [9]).
+    Fact 1 is in NEITHER successor (11 has [8], 21 has [9]).
+    Fact 1 is superseded in technical_docs by fact 2 (active).
+    Under whole-insight evaluation, decision 100 lost support across the whole insight and is listed in unsupported.
+    Mutation killed: judge per row at read time (would treat the other retired row as preserving support) -> fails.
+    """
+    c = co.MemoryCoordinator()
+    fake_conn = MagicMock()
+
+    insights_data = [
+        {"id": 401, "summary_ids": [10, 20], "source_pg_ids": [100]},
+    ]
+
+    fake_conn.fetch = AsyncMock(side_effect=[
+        # 1. cited summaries 10 and 20
+        [
+            {"id": 10, "superseded": True, "superseded_reason": "lineage", "superseded_by": 11, "source_pg_ids": [1]},
+            {"id": 20, "superseded": True, "superseded_reason": "lineage", "superseded_by": 21, "source_pg_ids": [1, 9]},
+        ],
+        # 2. decisions thread query for [100]
+        [{"decision_id": 100, "fact_ids": [1]}],
+        # 3. technical_docs for fact 1
+        [{"id": 1, "superseded": True, "superseded_by": 2}],
+    ])
+    fake_conn.fetchrow = AsyncMock(side_effect=[
+        # 1. successor 11 (active)
+        {"id": 11, "superseded": False, "superseded_reason": None, "superseded_by": None, "source_pg_ids": [8]},
+        # 2. successor 21 (active)
+        {"id": 21, "superseded": False, "superseded_reason": None, "superseded_by": None, "source_pg_ids": [9]},
+        # 3. fact 2 (active chain end)
+        {"id": 2, "superseded": False, "superseded_by": None},
+    ])
+
+    annotated = await c._annotate_retired_summaries(fake_conn, insights_data)
+    ins_401 = annotated[401]
+    assert len(ins_401) == 2
+    # Both retired rows 10 and 20 list decision 100 in unsupported
+    assert ins_401[0]["summary_id"] == 10
+    assert ins_401[0]["unsupported"] == [
+        {"decision": 100, "superseded_facts": [1], "superseding_facts": [2]}
+    ]
+    assert ins_401[1]["summary_id"] == 20
+    assert ins_401[1]["unsupported"] == [
+        {"decision": 100, "superseded_facts": [1], "superseding_facts": [2]}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_read_time_coverage_retired_and_null_reason_rows_yield_no_unsupported():
+    """Read time on a coverage-retired and a NULL-reason row -> unsupported is empty list.
+    Mutation killed: drop the lineage-only filter -> fails at both sites.
+    """
+    c = co.MemoryCoordinator()
+    fake_conn = MagicMock()
+
+    insights_data = [
+        {"id": 501, "summary_ids": [10, 20], "source_pg_ids": [100]},
+    ]
+
+    # 1. Summary 10 is coverage-retired with successor 15
+    # 2. Summary 20 is retired with NULL reason and NULL successor
+    fake_conn.fetch = AsyncMock(side_effect=[
+        [
+            {"id": 10, "superseded": True, "superseded_reason": "coverage", "superseded_by": 15, "source_pg_ids": [1]},
+            {"id": 20, "superseded": True, "superseded_reason": None, "superseded_by": None, "source_pg_ids": [2]},
+        ],
+        # decisions thread query (if called)
+        [{"decision_id": 100, "fact_ids": [1, 2]}],
+    ])
+
+    annotated = await c._annotate_retired_summaries(fake_conn, insights_data)
+    ins_501 = annotated[501]
+    assert len(ins_501) == 2
+    assert ins_501[0]["summary_id"] == 10
+    assert ins_501[0]["superseded_reason"] == "coverage"
+    assert ins_501[0]["unsupported"] == []
+
+    assert ins_501[1]["summary_id"] == 20
+    assert ins_501[1]["superseded_reason"] is None
+    assert ins_501[1]["unsupported"] == []
+
+
+def test_recheck_kept_case_thread_still_lost_does_not_repoint():
+    """Recheck kept case: an insight whose thread is still lost (no retrospective grounding
+    the decision on the successor's new facts) does NOT repoint.
+    Mutation killed: recheck repoints unconditionally -> fails.
+    """
+    # Active insight 802 cites [10] with decision 100.
+    # Summary 10 is lineage-retired with superseded_by = 11, source_pg_ids = [1].
+    # Summary 11 is active with source_pg_ids = [5].
+    # Decision 100 is grounded in fact 1 (not in 11, no retrospective on 5).
+    script = [
+        # 1. Candidate active insights citing lineage-retired summaries
+        {"rowcount": 1, "rows": [
+            (802, {"kind": "insight", "summary_ids": [10]}, [100]),
+        ]},
+        # 2. Query cited summaries
+        {"rowcount": 1, "rows": [
+            (10, True, 11, "lineage", [1]),
+        ]},
+        # 3. Query successor 11
+        {"rowcount": 1, "rows": [
+            (11, False, None, None, [5]),
+        ]},
+        # 4. Batched thread query: decision 100 only has fact 1
+        {"rowcount": 1, "rows": [
+            (100, [1]),
+        ]},
+    ]
+    conn = StubConn(script=script)
+    repointed_count, kept_count = recheck_kept_thematic_ids(conn)
+
+    assert repointed_count == 0
+    assert kept_count == 1
+    # No metadata update query executed for 802
+    meta_updates = [c for c in conn.executed if "UPDATE community_summaries SET metadata" in c[0]]
+    assert len(meta_updates) == 0
+
+
+@pytest.mark.asyncio
+async def test_daemon_ledger_sweep_calls_recheck(monkeypatch):
+    """The daemon's ledger sweep calls recheck_kept_thematic_ids.
+    Mutation killed: skip the recheck call -> fails.
+    """
+    daemon, session = daemon_with_fake_graph()
+    monkeypatch.setattr(cl, "PG_CONN", "fake_dsn")
+    fake_conn = MagicMock()
+    monkeypatch.setattr(cl.psycopg2, "connect", lambda *a, **k: fake_conn)
+    monkeypatch.setattr(cl, "mark_covered_rows_consolidated", lambda conn: 0)
+    monkeypatch.setattr(cl, "fetch_unreconciled", lambda conn: [])
+    monkeypatch.setattr(cl, "fetch_superseded_thematic_summaries", lambda conn: [])
+    monkeypatch.setattr(cl, "fetch_combined_fact_backlog", lambda conn: [])
+    daemon._find_grounded_fact_groups = AsyncMock(return_value=[])
+
+    mock_recheck = MagicMock(return_value=(0, 0))
+    monkeypatch.setattr(cl, "recheck_kept_thematic_ids", mock_recheck)
+
+    await daemon.run_ledger_sweep()
+
+    assert mock_recheck.call_count == 1
+    assert mock_recheck.call_args[0][0] == fake_conn
+
+
+@pytest.mark.asyncio
+async def test_f2_retracted_fact_yields_empty_superseding_facts():
+    """F2: a retracted fact (superseded with no successor in technical_docs) yields
+    an empty superseding_facts list in unsupported, not reporting itself as its own successor.
+    Mutation killed: record retracted fact in superseding_facts -> fails.
+    """
+    c = co.MemoryCoordinator()
+    fake_conn = MagicMock()
+
+    insights_data = [
+        {"id": 601, "summary_ids": [10], "source_pg_ids": [501]},
+    ]
+
+    # Summary 10 is lineage-retired with successor 11.
+    # Summary 10 has fact 1. Summary 11 has fact 2 (drops 1).
+    # Decision 501 is grounded in fact 1.
+    # Fact 1 is retracted: superseded = True, superseded_by = None.
+    fake_conn.fetch = AsyncMock(side_effect=[
+        # 1. cited summary 10
+        [{"id": 10, "superseded": True, "superseded_reason": "lineage", "superseded_by": 11, "source_pg_ids": [1]}],
+        # 3. decisions thread query
+        [{"decision_id": 501, "fact_ids": [1]}],
+        # 4. technical_docs for fact 1 (retracted: superseded=True, superseded_by=None)
+        [{"id": 1, "superseded": True, "superseded_by": None}],
+    ])
+    fake_conn.fetchrow = AsyncMock(side_effect=[
+        # 2. successor 11 (active)
+        {"id": 11, "superseded": False, "superseded_reason": None, "superseded_by": None, "source_pg_ids": [2]},
+    ])
+
+    annotated = await c._annotate_retired_summaries(fake_conn, insights_data)
+    ins_601 = annotated[601]
+    assert len(ins_601) == 1
+    assert ins_601[0]["unsupported"] == [
+        {"decision": 501, "superseded_facts": [1], "superseding_facts": []}
+    ]
+
 

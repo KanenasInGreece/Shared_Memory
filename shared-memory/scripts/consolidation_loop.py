@@ -1782,16 +1782,26 @@ def link_thematic_successor(cur, old_id, new_id):
                 WHERE id = ANY(%s) AND metadata->>'type' = 'decision'
             ),
             decision_facts AS (
-                SELECT d.id AS decision_id, (jsonb_array_elements(d.metadata->'grounded_in'))::int AS fact_id
-                FROM technical_docs d
+                SELECT d.id AS decision_id, elem::int AS fact_id
+                FROM technical_docs d,
+                     jsonb_array_elements(
+                         CASE WHEN jsonb_typeof(d.metadata->'grounded_in') = 'array'
+                              THEN d.metadata->'grounded_in' ELSE '[]'::jsonb END
+                     ) elem
                 WHERE d.id IN (SELECT id FROM decisions)
                   AND jsonb_typeof(d.metadata->'grounded_in') = 'array'
+                  AND jsonb_typeof(elem) = 'number'
                 UNION
-                SELECT (r.metadata->>'target_pg_id')::bigint AS decision_id, (jsonb_array_elements(r.metadata->'grounded_in'))::int AS fact_id
-                FROM technical_docs r
+                SELECT (r.metadata->>'target_pg_id')::bigint AS decision_id, elem::int AS fact_id
+                FROM technical_docs r,
+                     jsonb_array_elements(
+                         CASE WHEN jsonb_typeof(r.metadata->'grounded_in') = 'array'
+                              THEN r.metadata->'grounded_in' ELSE '[]'::jsonb END
+                     ) elem
                 WHERE NOT r.superseded AND r.metadata->>'type' = 'retrospective'
                   AND r.metadata->>'target_pg_id' IN (SELECT id::text FROM decisions)
                   AND jsonb_typeof(r.metadata->'grounded_in') = 'array'
+                  AND jsonb_typeof(elem) = 'number'
             )
             SELECT d.id AS decision_id, COALESCE(array_agg(df.fact_id) FILTER (WHERE df.fact_id IS NOT NULL), '{}') AS fact_ids
             FROM decisions d
@@ -1937,16 +1947,26 @@ def recheck_kept_thematic_ids(conn):
                     WHERE id = ANY(%s) AND metadata->>'type' = 'decision'
                 ),
                 decision_facts AS (
-                    SELECT d.id AS decision_id, (jsonb_array_elements(d.metadata->'grounded_in'))::int AS fact_id
-                    FROM technical_docs d
+                    SELECT d.id AS decision_id, elem::int AS fact_id
+                    FROM technical_docs d,
+                         jsonb_array_elements(
+                             CASE WHEN jsonb_typeof(d.metadata->'grounded_in') = 'array'
+                                  THEN d.metadata->'grounded_in' ELSE '[]'::jsonb END
+                         ) elem
                     WHERE d.id IN (SELECT id FROM decisions)
                       AND jsonb_typeof(d.metadata->'grounded_in') = 'array'
+                      AND jsonb_typeof(elem) = 'number'
                     UNION
-                    SELECT (r.metadata->>'target_pg_id')::bigint AS decision_id, (jsonb_array_elements(r.metadata->'grounded_in'))::int AS fact_id
-                    FROM technical_docs r
+                    SELECT (r.metadata->>'target_pg_id')::bigint AS decision_id, elem::int AS fact_id
+                    FROM technical_docs r,
+                         jsonb_array_elements(
+                             CASE WHEN jsonb_typeof(r.metadata->'grounded_in') = 'array'
+                                  THEN r.metadata->'grounded_in' ELSE '[]'::jsonb END
+                         ) elem
                     WHERE NOT r.superseded AND r.metadata->>'type' = 'retrospective'
                       AND r.metadata->>'target_pg_id' IN (SELECT id::text FROM decisions)
                       AND jsonb_typeof(r.metadata->'grounded_in') = 'array'
+                      AND jsonb_typeof(elem) = 'number'
                 )
                 SELECT d.id AS decision_id, COALESCE(array_agg(df.fact_id) FILTER (WHERE df.fact_id IS NOT NULL), '{}') AS fact_ids
                 FROM decisions d
@@ -1963,7 +1983,8 @@ def recheck_kept_thematic_ids(conn):
         for ins_id, meta, src_ids, sids in insights_parsed:
             repointed_any = False
             curr_sids = list(sids)
-            for old_sid, active_sid in active_ends.items():
+            # F7: substitute ids in sorted order (deterministic between sweeps)
+            for old_sid, active_sid in sorted(active_ends.items()):
                 if old_sid not in curr_sids:
                     continue
                 ins_decisions = [d for d in src_ids if d in thread_facts_map]
@@ -3396,7 +3417,7 @@ class ConsolidationDaemon:
                                       AND COALESCE(metadata->>'domain', '') = %s
                                       AND COALESCE(metadata->>'level', 'entity') = %s
                                       AND superseded AND superseded_reason = 'lineage' AND superseded_by IS NULL
-                                    ORDER BY superseded_at DESC, id DESC
+                                    ORDER BY superseded_at DESC NULLS LAST, id DESC
                                     LIMIT 1
                                 """, (
                                     metadata.get("entity") or "",
