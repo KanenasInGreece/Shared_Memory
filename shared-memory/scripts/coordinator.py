@@ -568,6 +568,170 @@ def _supersession_target_error(pg_id: int, record_type: object) -> str | None:
     return None
 
 
+def _clean_control_chars(text: str) -> str:
+    """Strip ASCII control characters, preserving newline and tab, to prevent terminal escape injection (Opus R6)."""
+    if not isinstance(text, str):
+        return ""
+    return "".join(ch for ch in text if ch in ("\n", "\t") or (ord(ch) >= 32 and ord(ch) != 127))
+
+
+def threads_left_ungrounded(rows: list[dict], fact_id: int) -> list[dict]:
+    """Pure decision function: which decision threads citing fact_id have NO standing
+    grounding fact remaining once fact_id is superseded?
+
+    A ground keeps a thread standing iff:
+      1. ground id != fact_id
+      2. row exists in technical_docs (Opus R4: missing ground row = not standing)
+      3. type NOT IN ('decision', 'retrospective') (None/fact counts as fact)
+      4. NOT superseded
+      5. role is 'based_on' (R1: operator ruling fact:2809 — informed_by never supports)
+    """
+    ungrounded = []
+    for r in rows:
+        grounds = r.get("grounds") or r.get("thread_grounds") or []
+        has_standing_ground = False
+        for g in grounds:
+            gid = g.get("id")
+            if gid == fact_id:
+                continue
+            if not g.get("exists", True):
+                continue
+            gtype = (g.get("type") or "fact").strip().lower()
+            if gtype in ("decision", "retrospective"):
+                continue
+            if g.get("superseded", False):
+                continue
+            # Role check (R1)
+            role = g.get("role")
+            if role is not None:
+                is_based_on = role.strip().lower() in ("based_on", "grounded_in", ONT.grounded_in.lower())
+            elif g.get("source_ref") is not None:
+                fk = fact_kind_from_source_ref(g["source_ref"])
+                is_based_on = (default_grounding_role(fk) == ONT.grounded_in)
+            else:
+                is_based_on = True
+            if is_based_on:
+                has_standing_ground = True
+                break
+        if not has_standing_ground:
+            ungrounded.append(r)
+    return ungrounded
+
+
+def _is_doc_visible(visibility: str, agent_id: str, scope: str,
+                     viewer: str | None, viewer_scope: str | None) -> bool:
+    """Is a document visible to the caller? (Opus R5: visibility-scoped redaction)"""
+    if visibility == "global":
+        return True
+    if not viewer:
+        return False
+    if visibility == "private" and agent_id == viewer:
+        return True
+    if visibility == "scope" and viewer_scope and scope == viewer_scope:
+        return True
+    return False
+
+
+def _parse_and_validate_acknowledge_standing(raw_ack: Any) -> tuple[dict[int, str] | None, web.Response | None]:
+    """Parse and validate acknowledge_standing map {decision_id: operator_words}.
+    Returns (normalized_dict, None) or (None, 400_response).
+    """
+    if raw_ack is None:
+        return None, None
+    if isinstance(raw_ack, bool) or not isinstance(raw_ack, (dict, list)):
+        return None, web.json_response(
+            {"status": "error", "message": "acknowledge_standing must be a map of {decision_id: \"operator's words\"}"},
+            status=400,
+        )
+    if isinstance(raw_ack, list):
+        out = {}
+        for item in raw_ack:
+            if isinstance(item, bool) or not isinstance(item, int):
+                return None, web.json_response(
+                    {"status": "error", "message": "acknowledge_standing must be a map of {decision_id: \"operator's words\"}"},
+                    status=400,
+                )
+            out[item] = "Operator acknowledged"
+        return out, None
+
+    out = {}
+    for k, v in raw_ack.items():
+        if isinstance(k, bool):
+            return None, web.json_response(
+                {"status": "error", "message": "acknowledge_standing keys must be integer decision IDs"},
+                status=400,
+            )
+        try:
+            d_id = int(k)
+        except (ValueError, TypeError):
+            return None, web.json_response(
+                {"status": "error", "message": "acknowledge_standing keys must be integer decision IDs"},
+                status=400,
+            )
+        if not isinstance(v, str) or not v.strip():
+            return None, web.json_response(
+                {"status": "error", "message": f"acknowledge_standing[{d_id}] must be a non-empty string with the operator's words"},
+                status=400,
+            )
+        out[d_id] = v.strip()
+    return out, None
+
+
+def _format_decision_loses_last_ground_refusal(
+    fact_id: int,
+    unacknowledged: list[dict],
+    viewer: str | None,
+    viewer_scope: str | None,
+    stage: str,
+) -> dict:
+    """Refusal payload when superseding a fact leaves standing decisions ungrounded (HTTP 409).
+    Literal 'error': 'decision_loses_last_ground' for _ingress_errors discovery.
+    Recovery instructions and IDs FIRST in the message, titles after (Review Fold #8).
+    """
+    unack_ids = [d["id"] for d in unacknowledged]
+    ids_str = ", ".join(f"decision:{i}" for i in unack_ids)
+    msg_head = (
+        f"Superseding fact {fact_id} would leave {len(unack_ids)} standing decision(s) with no standing grounding fact: [{ids_str}]. "
+        f"Nothing was written ({stage}). Ask the operator about EACH decision. "
+        f"If the decision still stands: re-send with acknowledge_standing matching {{{', '.join(f'{i}: <operator reason>' for i in unack_ids)}}}. "
+        f"If the new fact supports it or argues for reversal: save the new fact first WITHOUT supersedes, save a retrospective (validated/refined, or reversed) grounded on it, then retry the supersession."
+    )
+    visible_titles = []
+    rendered_decisions = []
+    for d in unacknowledged:
+        vis = _is_doc_visible(d.get("visibility", "global"), d.get("agent_id", ""), d.get("scope", "global"), viewer, viewer_scope)
+        if vis:
+            title = _clean_control_chars(d.get("title", ""))
+            rationale = _clean_control_chars(d.get("rationale", ""))
+            if title:
+                visible_titles.append(f"decision:{d['id']} \"{title[:100]}\"")
+            rendered_decisions.append({
+                "ref": f"decision:{d['id']}",
+                "pg_id": d["id"],
+                "title": title,
+                "rationale": rationale,
+                "fact_grounds": [g["id"] for g in (d.get("grounds") or []) if g["id"] == fact_id or g.get("role") in ("based_on", "grounded_in")],
+                "retrospectives": d.get("retrospectives", []),
+            })
+        else:
+            rendered_decisions.append({
+                "ref": f"decision:{d['id']}",
+                "pg_id": d["id"],
+                "fact_grounds": [fact_id],
+                "retrospectives": d.get("retrospectives", []),
+            })
+    titles_suffix = f" Decisions: {'; '.join(visible_titles)}." if visible_titles else ""
+    return {
+        "status": "error",
+        "error": "decision_loses_last_ground",
+        "fact": fact_id,
+        "stage": stage,
+        "message": msg_head + titles_suffix,
+        "decisions": rendered_decisions,
+        "acknowledge_standing": unack_ids,
+    }
+
+
 # fact:1215: entities_provenance is who named each entity, operator or agent. Anything else is a shape error, not a new spelling.
 ENTITIES_PROVENANCE_VALUES = ("operator", "agent")
 
@@ -928,6 +1092,8 @@ _backup_quiesce: bool = False
 
 # Shared with REM and NREM; the key must match both daemons. A disconnect drops the session lock, so a crash cannot wedge the others.
 BACKUP_ADVISORY_LOCK_KEY    = _env_int("BACKUP_ADVISORY_LOCK_KEY", 8765309)
+# Global transaction advisory lock key for serialising fact supersessions gateway-wide (PR 2b, decision:2802).
+SUPERSEDE_LOCK_KEY          = _env_int("SUPERSEDE_LOCK_KEY", 8765311)
 # Mirror of rem_loop.REM_MAX_ATTEMPTS for the give-up count. The gateway does not enforce it, so the default must match the daemon.
 REM_MAX_ATTEMPTS            = _env_int("REM_MAX_ATTEMPTS", 5)
 # Mirror of rem_loop.REM_STARVED_THRESHOLD (decision 890). The gateway only reports how many pending rows are at the promotion point, so the default must match the daemon.
@@ -3510,6 +3676,160 @@ class MemoryCoordinator:
                 )
         return promoted
 
+    async def _thread_grounds(self, conn, fact_id: int) -> list[dict]:
+        """One row per STANDING decision whose thread cites fact_id (PR 2b, decision:2802).
+        Thread = decision + non-superseded retrospectives with target_pg_id = decision.id.
+        Pure decision function threads_left_ungrounded determines if the thread is left ungrounded.
+        """
+        # Decisions directly citing fact_id or whose non-superseded retrospectives cite fact_id
+        d_rows = await conn.fetch(
+            """
+            SELECT d.id, d.content, d.metadata, d.agent_id, d.scope, d.visibility
+            FROM technical_docs d
+            WHERE d.metadata->>'type' = 'decision'
+              AND NOT d.superseded
+              AND (
+                  (d.metadata->'grounded_in' @> to_jsonb($1::bigint))
+                  OR EXISTS (
+                      SELECT 1 FROM technical_docs r
+                      WHERE r.metadata->>'type' = 'retrospective'
+                        AND NOT r.superseded
+                        AND (r.metadata->>'target_pg_id')::bigint = d.id
+                        AND r.metadata->'grounded_in' @> to_jsonb($1::bigint)
+                  )
+              )
+            """,
+            fact_id,
+        )
+        if not d_rows:
+            return []
+
+        d_ids = [r["id"] for r in d_rows]
+        r_rows = await conn.fetch(
+            """
+            SELECT r.id, r.metadata, (r.metadata->>'target_pg_id')::bigint AS target_pg_id
+            FROM technical_docs r
+            WHERE r.metadata->>'type' = 'retrospective'
+              AND NOT r.superseded
+              AND (r.metadata->>'target_pg_id')::bigint = ANY($1::bigint[])
+            """,
+            d_ids,
+        )
+
+        retros_by_decision: dict[int, list] = {did: [] for did in d_ids}
+        for r in r_rows:
+            tgt = r["target_pg_id"]
+            if tgt in retros_by_decision:
+                retros_by_decision[tgt].append(r)
+
+        # Collect all ground IDs across the threads
+        all_ground_ids: set[int] = set()
+        for d in d_rows:
+            d_meta = _coerce_jsonb_obj(d["metadata"]) or {}
+            gi = d_meta.get("grounded_in")
+            if isinstance(gi, list):
+                for x in gi:
+                    if isinstance(x, int) and not isinstance(x, bool):
+                        all_ground_ids.add(x)
+            for r in retros_by_decision.get(d["id"], []):
+                r_meta = _coerce_jsonb_obj(r["metadata"]) or {}
+                r_gi = r_meta.get("grounded_in")
+                if isinstance(r_gi, list):
+                    for x in r_gi:
+                        if isinstance(x, int) and not isinstance(x, bool):
+                            all_ground_ids.add(x)
+
+        ground_info: dict[int, dict] = {}
+        if all_ground_ids:
+            g_rows = await conn.fetch(
+                """
+                SELECT id, metadata->>'type' AS type, metadata->>'source_ref' AS source_ref, superseded
+                FROM technical_docs WHERE id = ANY($1::bigint[])
+                """,
+                list(all_ground_ids),
+            )
+            for gr in g_rows:
+                ground_info[gr["id"]] = {
+                    "type": gr["type"],
+                    "source_ref": gr["source_ref"],
+                    "superseded": gr["superseded"],
+                    "exists": True,
+                }
+
+        out = []
+        for d in d_rows:
+            d_meta = _coerce_jsonb_obj(d["metadata"]) or {}
+            dec_obj = d_meta.get("decision") if isinstance(d_meta.get("decision"), dict) else {}
+            title = dec_obj.get("title") or d_meta.get("title") or ""
+            rationale = dec_obj.get("rationale")
+            if not rationale:
+                c = d.get("content") or ""
+                rationale = c.splitlines()[0] if c else ""
+
+            d_roles = d_meta.get("grounded_roles") if isinstance(d_meta.get("grounded_roles"), dict) else {}
+            thread_grounds = []
+            seen_grounds = set()
+
+            # Add decision's grounds
+            gi = d_meta.get("grounded_in")
+            if isinstance(gi, list):
+                for gid in gi:
+                    if isinstance(gid, int) and not isinstance(gid, bool) and gid not in seen_grounds:
+                        seen_grounds.add(gid)
+                        g_data = ground_info.get(gid) or {"type": None, "source_ref": None, "superseded": False, "exists": False}
+                        # Determine role (R1)
+                        if str(gid) in d_roles:
+                            role = str(d_roles[str(gid)]).strip().lower()
+                        else:
+                            fk = fact_kind_from_source_ref(g_data.get("source_ref"))
+                            role = "based_on" if default_grounding_role(fk) == ONT.grounded_in else "informed_by"
+                        thread_grounds.append({
+                            "id": gid,
+                            "type": g_data["type"],
+                            "superseded": g_data["superseded"],
+                            "exists": g_data["exists"],
+                            "source_ref": g_data["source_ref"],
+                            "role": role,
+                        })
+
+            # Add retrospective grounds
+            retro_ids = []
+            for r in retros_by_decision.get(d["id"], []):
+                retro_ids.append(r["id"])
+                r_meta = _coerce_jsonb_obj(r["metadata"]) or {}
+                r_roles = r_meta.get("grounded_roles") if isinstance(r_meta.get("grounded_roles"), dict) else {}
+                r_gi = r_meta.get("grounded_in")
+                if isinstance(r_gi, list):
+                    for gid in r_gi:
+                        if isinstance(gid, int) and not isinstance(gid, bool) and gid not in seen_grounds:
+                            seen_grounds.add(gid)
+                            g_data = ground_info.get(gid) or {"type": None, "source_ref": None, "superseded": False, "exists": False}
+                            if str(gid) in r_roles:
+                                role = str(r_roles[str(gid)]).strip().lower()
+                            else:
+                                fk = fact_kind_from_source_ref(g_data.get("source_ref"))
+                                role = "based_on" if default_grounding_role(fk) == ONT.grounded_in else "informed_by"
+                            thread_grounds.append({
+                                "id": gid,
+                                "type": g_data["type"],
+                                "superseded": g_data["superseded"],
+                                "exists": g_data["exists"],
+                                "source_ref": g_data["source_ref"],
+                                "role": role,
+                            })
+
+            out.append({
+                "id": d["id"],
+                "title": title,
+                "rationale": rationale,
+                "agent_id": d["agent_id"],
+                "scope": d["scope"],
+                "visibility": d.get("visibility") or "global",
+                "retrospectives": retro_ids,
+                "grounds": thread_grounds,
+            })
+        return out
+
     async def _resolve_typed_grounding(
         self, conn, grounded_ids: list, grounded_roles: dict
     ) -> list:
@@ -5804,7 +6124,16 @@ class MemoryCoordinator:
         # decision 347: stamp the kernel principal and strip the client claim. The operator cannot supply this.
         if isinstance(metadata, dict):
             _apply_principal(metadata, request.get("principal"))
+            metadata.pop("supersession_ack", None)
+            raw_ack = metadata.pop("acknowledge_standing", None)
             body["metadata"] = metadata
+        else:
+            raw_ack = None
+        if raw_ack is None and isinstance(body, dict):
+            raw_ack = body.pop("acknowledge_standing", None)
+        ack_map, ack_err = _parse_and_validate_acknowledge_standing(raw_ack)
+        if ack_err is not None:
+            return ack_err
 
         if not content:
             return web.json_response(
@@ -5980,21 +6309,33 @@ class MemoryCoordinator:
                     "SELECT superseded, metadata->>'type' AS type"
                     " FROM technical_docs WHERE id = $1", supersedes
                 )
-            if target is None:
-                return web.json_response(
-                    {"status": "error",
-                     "message": f"supersedes target {supersedes} not found"},
-                    status=400,
+                if target is None:
+                    return web.json_response(
+                        {"status": "error",
+                         "message": f"supersedes target {supersedes} not found"},
+                        status=400,
+                    )
+                if target["superseded"]:
+                    return web.json_response(
+                        {"status": "error",
+                         "error": "fact_already_superseded",
+                         "message": f"supersedes target {supersedes} is already superseded"},
+                        status=409,
+                    )
+                bad = _supersession_target_error(supersedes, target["type"])
+                if bad:
+                    return web.json_response({"status": "error", "message": bad}, status=400)
+
+                thread_rows = await self._thread_grounds(conn, supersedes)
+            ungrounded = threads_left_ungrounded(thread_rows, supersedes)
+            unacked = [t for t in ungrounded if t["id"] not in (ack_map or {})]
+            if unacked:
+                viewer = request.get("authenticated_agent") or agent_id
+                viewer_scope = scope
+                refusal_body = _format_decision_loses_last_ground_refusal(
+                    supersedes, unacked, viewer, viewer_scope, stage="pre-check"
                 )
-            if target["superseded"]:
-                return web.json_response(
-                    {"status": "error",
-                     "message": f"supersedes target {supersedes} is already superseded"},
-                    status=400,
-                )
-            bad = _supersession_target_error(supersedes, target["type"])
-            if bad:
-                return web.json_response({"status": "error", "message": bad}, status=400)
+                return web.json_response(refusal_body, status=409)
 
         # Shape already validated (and the ENTITY GATE'S VALIDATION HALF
         # already run) above, before the project axis.
@@ -6105,6 +6446,8 @@ class MemoryCoordinator:
         # Sort, then get and acquire together, so the bounded registry cannot evict a lock this save is about to hold. Release only what was acquired if the list is cancelled.
         acquired: list[asyncio.Lock] = []
         alt_stats: dict | None = None
+        vouched_ids: list[int] = []
+        unused_ids: list[int] = []
         try:
             for e in sorted(set(entities)):
                 lk = await self._lock_for(e)
@@ -6112,6 +6455,29 @@ class MemoryCoordinator:
                 acquired.append(lk)
             async with self._acquire() as conn:
                 async with conn.transaction():
+                    if supersedes is not None:
+                        await conn.execute("SELECT pg_advisory_xact_lock($1)", SUPERSEDE_LOCK_KEY)
+                        locked_target = await conn.fetchrow(
+                            "SELECT superseded FROM technical_docs WHERE id = $1 FOR UPDATE", supersedes
+                        )
+                        if locked_target is None or locked_target["superseded"]:
+                            return web.json_response(
+                                {"status": "error",
+                                 "error": "fact_already_superseded",
+                                 "message": f"supersedes target {supersedes} is already superseded"},
+                                status=409,
+                            )
+                        thread_rows = await self._thread_grounds(conn, supersedes)
+                        ungrounded = threads_left_ungrounded(thread_rows, supersedes)
+                        unacked = [t for t in ungrounded if t["id"] not in (ack_map or {})]
+                        if unacked:
+                            viewer = request.get("authenticated_agent") or agent_id
+                            viewer_scope = scope
+                            refusal_body = _format_decision_loses_last_ground_refusal(
+                                supersedes, unacked, viewer, viewer_scope, stage="in-transaction"
+                            )
+                            return web.json_response(refusal_body, status=409)
+
                     # The pre-check is not the guard. Only FOR UPDATE stops a concurrent save of the same content between the read and the insert.
                     prior = await conn.fetchval(
                         "SELECT metadata FROM technical_docs"
@@ -6135,7 +6501,11 @@ class MemoryCoordinator:
                              agent_id, scope, visibility)
                         VALUES ($1, $2::jsonb, $3::vector, $4, $5, $6, $7)
                         ON CONFLICT (content_hash) DO UPDATE
-                            SET metadata  = EXCLUDED.metadata,
+                            SET metadata  = CASE
+                                              WHEN technical_docs.metadata ? 'supersession_ack'
+                                              THEN EXCLUDED.metadata || jsonb_build_object('supersession_ack', technical_docs.metadata->'supersession_ack')
+                                              ELSE EXCLUDED.metadata
+                                            END,
                                 agent_id  = EXCLUDED.agent_id,
                                 embedding = EXCLUDED.embedding
                         RETURNING id
@@ -6203,12 +6573,43 @@ class MemoryCoordinator:
 
                     # decision 384: retire the predecessor in the same transaction. The id guard skips a hash collision onto this row itself.
                     if supersedes is not None and supersedes != pg_id:
-                        await conn.execute(
-                            "UPDATE technical_docs"
-                            " SET superseded = true, superseded_by = $2"
-                            " WHERE id = $1 AND id != $2",
-                            supersedes, pg_id,
-                        )
+                        ungrounded_ids = [t["id"] for t in ungrounded]
+                        vouched_ids = sorted(set(ungrounded_ids) & set((ack_map or {}).keys()))
+                        unused_ids = sorted(set((ack_map or {}).keys()) - set(ungrounded_ids))
+
+                        p = request.get("principal")
+                        ack_by_user = p.get("user") if isinstance(p, dict) else (p if isinstance(p, str) else None)
+
+                        if vouched_ids:
+                            ack_obj = {
+                                "decisions": vouched_ids,
+                                "answers": {str(did): ack_map[did] for did in vouched_ids},
+                                "acknowledged_by": ack_by_user,
+                                "agent_id": request.get("authenticated_agent") or agent_id,
+                                "at": datetime.now(timezone.utc).isoformat(),
+                                "by": pg_id,
+                            }
+                            res_upd = await conn.execute(
+                                "UPDATE technical_docs"
+                                " SET superseded = true, superseded_by = $2,"
+                                "     metadata = metadata || jsonb_build_object('supersession_ack', $3::jsonb)"
+                                " WHERE id = $1 AND id != $2 AND NOT superseded",
+                                supersedes, pg_id, json.dumps(ack_obj),
+                            )
+                        else:
+                            res_upd = await conn.execute(
+                                "UPDATE technical_docs"
+                                " SET superseded = true, superseded_by = $2"
+                                " WHERE id = $1 AND id != $2 AND NOT superseded",
+                                supersedes, pg_id,
+                            )
+                        if res_upd == "UPDATE 0":
+                            return web.json_response(
+                                {"status": "error",
+                                 "error": "fact_already_superseded",
+                                 "message": f"supersedes target {supersedes} is already superseded"},
+                                status=409,
+                            )
 
                     # Store alternative text with the record. The background worker embeds them, so the save path stays one embedding call.
                     alt_stats = await self._reconcile_decision_alternatives(
@@ -6252,7 +6653,7 @@ class MemoryCoordinator:
             " (operator-named vs agent-added) is unknown."
             if entities_provenance_missing else None
         )
-        return web.json_response({
+        resp_data = {
             "status": "success",
             "pg_id": pg_id,
             "neo4j": neo4j_status,
@@ -6264,7 +6665,11 @@ class MemoryCoordinator:
             # Non-null only when the stored project or domain spelling differs from the one supplied.
             "project_resolved": axis_report.get("project_resolved"),
             "domains_resolved": axis_report.get("domains_resolved") or None,
-        })
+            "acknowledged_standing": vouched_ids if (supersedes is not None and vouched_ids) else None,
+        }
+        if supersedes is not None and unused_ids:
+            resp_data["acknowledgement_unused"] = unused_ids
+        return web.json_response(resp_data)
 
     # ── POST /memory/supersede ────────────────────────────────────────────────
 
@@ -6286,6 +6691,14 @@ class MemoryCoordinator:
             )
         pg_id = body.get("pg_id")
         by    = body.get("by")
+        raw_ack = body.get("acknowledge_standing")
+        if raw_ack is None:
+            raw_ack = body.get("acknowledge")
+        ack_map, ack_err = _parse_and_validate_acknowledge_standing(raw_ack)
+        if ack_err is not None:
+            return ack_err
+        agent_id = request.get("authenticated_agent") or body.get("agent_id", "unknown")
+
         if isinstance(pg_id, bool) or not isinstance(pg_id, int):
             return web.json_response(
                 {"status": "error", "message": "pg_id (int) is required"}, status=400
@@ -6310,8 +6723,10 @@ class MemoryCoordinator:
                 )
             if target["superseded"]:
                 return web.json_response(
-                    {"status": "error", "message": f"fact {pg_id} is already superseded"},
-                    status=400,
+                    {"status": "error",
+                     "error": "fact_already_superseded",
+                     "message": f"fact {pg_id} is already superseded"},
+                    status=409,
                 )
             bad = _supersession_target_error(pg_id, target["type"])
             if bad:
@@ -6333,13 +6748,99 @@ class MemoryCoordinator:
                         status=400,
                     )
 
-            purged = 0
-            async with conn.transaction():
-                await conn.execute(
-                    "UPDATE technical_docs SET superseded = true, superseded_by = $2"
-                    " WHERE id = $1",
-                    pg_id, by,
+            # Pre-check thread grounds
+            thread_rows = await self._thread_grounds(conn, pg_id)
+            ungrounded = threads_left_ungrounded(thread_rows, pg_id)
+            unacked = [t for t in ungrounded if t["id"] not in (ack_map or {})]
+            if unacked:
+                viewer = request.get("authenticated_agent") or agent_id
+                viewer_scope = body.get("scope")
+                refusal_body = _format_decision_loses_last_ground_refusal(
+                    pg_id, unacked, viewer, viewer_scope, stage="pre-check"
                 )
+                return web.json_response(refusal_body, status=409)
+
+            purged = 0
+            vouched_ids: list[int] = []
+            unused_ids: list[int] = []
+            async with conn.transaction():
+                # 1. Advisory xact lock
+                await conn.execute("SELECT pg_advisory_xact_lock($1)", SUPERSEDE_LOCK_KEY)
+                # 2. Re-read target FOR UPDATE
+                locked_target = await conn.fetchrow(
+                    "SELECT superseded FROM technical_docs WHERE id = $1 FOR UPDATE", pg_id
+                )
+                if locked_target is None or locked_target["superseded"]:
+                    return web.json_response(
+                        {"status": "error",
+                         "error": "fact_already_superseded",
+                         "message": f"fact {pg_id} is already superseded"},
+                        status=409,
+                    )
+                if by is not None:
+                    locked_succ = await conn.fetchrow(
+                        "SELECT superseded FROM technical_docs WHERE id = $1", by
+                    )
+                    if locked_succ is None:
+                        return web.json_response(
+                            {"status": "error", "message": f"successor {by} not found"},
+                            status=400,
+                        )
+                    if locked_succ["superseded"]:
+                        return web.json_response(
+                            {"status": "error",
+                             "message": f"successor {by} is itself already superseded"},
+                            status=400,
+                        )
+
+                # 3. Re-check thread grounds under lock
+                thread_rows = await self._thread_grounds(conn, pg_id)
+                ungrounded = threads_left_ungrounded(thread_rows, pg_id)
+                unacked = [t for t in ungrounded if t["id"] not in (ack_map or {})]
+                if unacked:
+                    viewer = request.get("authenticated_agent") or agent_id
+                    viewer_scope = body.get("scope")
+                    refusal_body = _format_decision_loses_last_ground_refusal(
+                        pg_id, unacked, viewer, viewer_scope, stage="in-transaction"
+                    )
+                    return web.json_response(refusal_body, status=409)
+
+                ungrounded_ids = [t["id"] for t in ungrounded]
+                vouched_ids = sorted(set(ungrounded_ids) & set((ack_map or {}).keys()))
+                unused_ids = sorted(set((ack_map or {}).keys()) - set(ungrounded_ids))
+
+                p = request.get("principal")
+                ack_by_user = p.get("user") if isinstance(p, dict) else (p if isinstance(p, str) else None)
+
+                if vouched_ids:
+                    ack_obj = {
+                        "decisions": vouched_ids,
+                        "answers": {str(did): ack_map[did] for did in vouched_ids},
+                        "acknowledged_by": ack_by_user,
+                        "agent_id": request.get("authenticated_agent") or agent_id,
+                        "at": datetime.now(timezone.utc).isoformat(),
+                        "by": by,
+                    }
+                    res_upd = await conn.execute(
+                        "UPDATE technical_docs SET superseded = true, superseded_by = $2,"
+                        " metadata = metadata || jsonb_build_object('supersession_ack', $3::jsonb)"
+                        " WHERE id = $1 AND NOT superseded",
+                        pg_id, by, json.dumps(ack_obj),
+                    )
+                else:
+                    res_upd = await conn.execute(
+                        "UPDATE technical_docs SET superseded = true, superseded_by = $2"
+                        " WHERE id = $1 AND NOT superseded",
+                        pg_id, by,
+                    )
+                if res_upd == "UPDATE 0":
+                    return web.json_response(
+                        {"status": "error",
+                         "error": "fact_already_superseded",
+                         "message": f"fact {pg_id} is already superseded"},
+                        status=409,
+                    )
+
                 _supersede_params = {"type": "supersede", "old_pg_id": pg_id, "new_pg_id": by}
                 _require_outbox_type(_supersede_params)
                 await conn.execute(
@@ -6370,16 +6871,20 @@ class MemoryCoordinator:
                     "(no live successor to ride with).", purged, pg_id,
                 )
 
-        return web.json_response({
+        resp_data = {
             "status": "success",
             "superseded": pg_id,
             "superseded_by": by,
             "purged_outbox": purged,
+            "acknowledged_standing": vouched_ids if vouched_ids else None,
             "message": (
                 f"Fact {pg_id} superseded"
                 + (f" by {by}." if by is not None else " (retracted, no replacement).")
             ),
-        })
+        }
+        if unused_ids:
+            resp_data["acknowledgement_unused"] = unused_ids
+        return web.json_response(resp_data)
 
     # ── POST /memory/review_hold ──────────────────────────────────────────────
 
@@ -7952,7 +8457,8 @@ class MemoryCoordinator:
         async with self._acquire() as conn:
             rec = await conn.fetchrow(
                 "SELECT metadata->>'type' AS type, created_at, superseded, superseded_by,"
-                "       metadata->'grounded_in' AS grounded_in"
+                "       metadata->'grounded_in' AS grounded_in,"
+                "       metadata->'supersession_ack' AS supersession_ack"
                 " FROM technical_docs WHERE id = $1", pg_id,
             )
             ob = await conn.fetchrow(
@@ -8013,6 +8519,17 @@ class MemoryCoordinator:
             except Exception:
                 gi = None
 
+        ack = None
+        if rec and rec.get("supersession_ack") is not None:
+            ack_raw = rec["supersession_ack"]
+            if isinstance(ack_raw, str):
+                try:
+                    ack = json.loads(ack_raw)
+                except Exception:
+                    ack = None
+            elif isinstance(ack_raw, dict):
+                ack = ack_raw
+
         return web.json_response({
             "pg_id": pg_id,
             # The unambiguous form of the thing just returned — quote THIS back,
@@ -8024,6 +8541,7 @@ class MemoryCoordinator:
             "created_at": _iso(rec["created_at"]) if rec else None,
             "superseded": rec["superseded"] if rec else None,
             "superseded_by": rec["superseded_by"] if rec else None,
+            "supersession_ack": ack,
             "grounded_in": gi if isinstance(gi, list) else None,
             # in-flight dream-cycle stamps — None once the outbox row is deleted
             "neo4j": ob["status"] if ob else "unknown",

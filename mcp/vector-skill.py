@@ -475,6 +475,14 @@ def _reply_json(r, tool: str) -> dict:
             f"an authorization refusal, not an authentication failure and not a "
             f"transport fault.")
 
+    if r.status_code == 409:
+        try:
+            parsed = r.json()
+            if isinstance(parsed, dict) and parsed.get("error") == "decision_loses_last_ground":
+                return parsed
+        except Exception:
+            pass
+
     if r.status_code >= 400:
         detail = _gateway_message(r) or _body_snippet(r) or "(empty body)"
         raise GatewayReplyError(
@@ -490,6 +498,39 @@ def _reply_json(r, tool: str) -> dict:
             f"LIVE and ANSWERED — this is a malformed reply, not a transport fault. "
             f"Body began: "
             f"{_body_snippet(r, 120) or '(empty)'}") from exc
+
+
+def _render_decision_loses_last_ground(body: dict) -> str:
+    """Render HTTP 409 decision_loses_last_ground refusal with full rationale and recovery instructions.
+    ⛔ Never compress a prohibition away (decision:2751).
+    """
+    msg = body.get("message", "")
+    lines = [
+        f"Refusal (HTTP 409 decision_loses_last_ground): {msg}",
+        "",
+        "Affected decisions:",
+    ]
+    for d in body.get("decisions", []):
+        ref = d.get("ref") or f"decision:{d.get('pg_id')}"
+        title = d.get("title", "")
+        rationale = d.get("rationale", "")
+        lines.append(f"  - {ref}: \"{title}\"")
+        if rationale:
+            lines.append(f"    Rationale: {rationale}")
+        fg = d.get("fact_grounds")
+        if fg:
+            lines.append(f"    Fact grounds: {fg}")
+        retros = d.get("retrospectives")
+        if retros:
+            lines.append(f"    Retrospectives: {retros}")
+
+    ack_with = body.get("acknowledge_with") or body.get("acknowledge_standing")
+    if ack_with:
+        lines.append("")
+        lines.append(f"To proceed with still-standing decisions, provide acknowledge_standing with: {ack_with}")
+        lines.append("⛔ Never acknowledge without the operator's answer on each id.")
+
+    return "\n".join(lines)
 
 
 def _valid_ref(ref: str) -> bool:
@@ -794,6 +835,10 @@ async def save_artifact(content: str, metadata_json: str = "{}") -> str:
         return (f"{_unavailable(exc)} Save aborted to protect memory "
                 f"integrity — an unembedded record is invisible to search.")
 
+    if result.get("error") == "decision_loses_last_ground":
+        _append_log("vector_skill", 2, "save_rejected", {"message": result.get("message", "")}, content)
+        return _render_decision_loses_last_ground(result)
+
     if result.get("status") != "success":
         # The coordinator refused the save, so its message is surfaced verbatim.
         _append_log("vector_skill", 2, "save_rejected", {"message": result.get("message", result)}, content)
@@ -1075,7 +1120,11 @@ async def save_retrospective(
 
 
 @mcp.tool()
-async def supersede(pg_id: int, by: int = 0) -> str:
+async def supersede(
+    pg_id: int,
+    by: int = 0,
+    acknowledge_standing: list[int] | dict[str, str] | None = None,
+) -> str:
     """Retract or supersede an existing FACT (decision 381/384).
 
     Requires a write-capable agent token: a read-only token receives an
@@ -1097,13 +1146,23 @@ async def supersede(pg_id: int, by: int = 0) -> str:
     fact in one step, instead call save_artifact with "supersedes": <old_pg_id>
     in its metadata_json.
 
+    If superseding this fact would leave standing decisions with no other
+    standing fact grounds, the gateway returns HTTP 409 decision_loses_last_ground.
+    Ask the operator about each decision. If they confirm it still stands,
+    re-send with acknowledge_standing.
+    ⛔ Never acknowledge without the operator's answer on each id (decision:2751).
+
     Required: pg_id (the fact to retract).
     Optional: by (pg_id of an existing successor fact to point at; omit / 0 = none).
+    Optional: acknowledge_standing (list of decision IDs or map of {id: operator_answer}
+    acknowledging decisions that still stand despite losing their last grounding fact).
     """
     coordinator_url = COORDINATOR_BASE
-    payload = {"pg_id": pg_id}
+    payload: dict = {"pg_id": pg_id}
     if by and by > 0:
         payload["by"] = by
+    if acknowledge_standing is not None:
+        payload["acknowledge_standing"] = acknowledge_standing
     try:
         async with httpx.AsyncClient(timeout=30.0, trust_env=False) as client:
             r = await client.post(
@@ -1116,6 +1175,8 @@ async def supersede(pg_id: int, by: int = 0) -> str:
         return exc.message
     except Exception as exc:
         return _unavailable(exc)
+    if result.get("error") == "decision_loses_last_ground":
+        return _render_decision_loses_last_ground(result)
     if result.get("status") == "success":
         return result.get("message", f"Fact {pg_id} superseded.")
     return f"Error: {result.get('message', result)}"

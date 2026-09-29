@@ -440,6 +440,14 @@ def _reply_json(r, *, log_auth: bool = False,
                    f"and not a transport fault.")
         raise GatewayReplyError({"status": "error", "message": message})
 
+    if r.status_code == 409:
+        try:
+            parsed = r.json()
+            if isinstance(parsed, dict) and parsed.get("error") == "decision_loses_last_ground":
+                return parsed
+        except Exception:
+            pass
+
     if r.status_code >= 400 and r.status_code not in accept_status:
         detail = _gateway_message(r) or _body_snippet(r) or "(empty body)"
         raise GatewayReplyError({"status": "error", "message": (
@@ -456,6 +464,41 @@ def _reply_json(r, *, log_auth: bool = False,
             f"— this is a malformed reply, not a transport fault. Body began: "
             f"{_body_snippet(r, 120) or '(empty)'}"
         )}) from exc
+
+
+def _normalize_cli_ack(raw: list[list[str]] | list[Any] | None) -> list[int] | dict[int, str] | None:
+    """Normalize CLI --acknowledge-standing entries.
+    Supports either integer IDs: --acknowledge-standing 5 --acknowledge-standing 7 -> [5, 7]
+    or ID with reason: --acknowledge-standing 5 "stands firmly" -> {5: "stands firmly"}
+    """
+    if not raw:
+        return None
+    has_words = any(isinstance(item, (list, tuple)) and len(item) >= 2 for item in raw)
+    if has_words:
+        out_map = {}
+        for item in raw:
+            if isinstance(item, (list, tuple)):
+                if len(item) >= 2:
+                    out_map[int(item[0])] = " ".join(str(x) for x in item[1:]).strip()
+                elif len(item) == 1:
+                    out_map[int(item[0])] = "Operator acknowledged"
+            elif isinstance(item, int):
+                out_map[item] = "Operator acknowledged"
+            elif isinstance(item, str):
+                parts = item.split(maxsplit=1)
+                if len(parts) == 2:
+                    out_map[int(parts[0])] = parts[1].strip()
+                else:
+                    out_map[int(parts[0])] = "Operator acknowledged"
+        return out_map
+    else:
+        out_list = []
+        for item in raw:
+            if isinstance(item, (list, tuple)):
+                out_list.append(int(item[0]))
+            else:
+                out_list.append(int(item))
+        return out_list
 
 
 def _coordinator_unavailable(exc: Exception, ceiling: float | None = None) -> dict:
@@ -631,11 +674,19 @@ async def save_artifact(content: str, metadata_json: str = "{}") -> dict:
     return result
 
 
-async def supersede_fact(pg_id: int, by: int | None = None) -> dict:
+async def supersede_fact(
+    pg_id: int,
+    by: int | None = None,
+    acknowledge_standing: list[int] | dict[int, str] | None = None,
+    acknowledge: list[int] | dict[int, str] | None = None,
+) -> dict:
     """Retract a fact without a replacement, or point `--by` at a successor (decision 381: the old fact is kept and hidden from search; decision 384: the successor is applied when the record is read)."""
     payload: dict = {"pg_id": pg_id}
     if by is not None:
         payload["by"] = by
+    ack = acknowledge_standing if acknowledge_standing is not None else acknowledge
+    if ack is not None:
+        payload["acknowledge_standing"] = ack
     try:
         async with _async_client(30.0) as client:
             r = await client.post(
@@ -800,6 +851,8 @@ def _save_argparser() -> "argparse.ArgumentParser":
                         "An unregistered name returns 400 domain_unknown with "
                         "near matches; add \"new_domain\": true to the metadata "
                         "to register it, after asking the operator.")
+    p.add_argument("--acknowledge-standing", action="append", nargs="+", metavar="ID_AND_WORDS",
+                   help="pg_id of standing decision to acknowledge (optionally followed by operator reason)")
     return p
 
 
@@ -1445,7 +1498,8 @@ async def main() -> None:
         p = _save_argparser()
         sargs = p.parse_args(sys.argv[2:])
         metadata = sargs.metadata
-        if sargs.supersedes is not None or sargs.domain:
+        norm_ack = _normalize_cli_ack(getattr(sargs, "acknowledge_standing", None))
+        if sargs.supersedes is not None or sargs.domain or norm_ack:
             try:
                 mobj = json.loads(metadata) if isinstance(metadata, str) else metadata
             except (json.JSONDecodeError, ValueError) as e:
@@ -1457,6 +1511,8 @@ async def main() -> None:
                 mobj["supersedes"] = sargs.supersedes
             if sargs.domain:
                 mobj["domains"] = sargs.domain
+            if norm_ack:
+                mobj["acknowledge_standing"] = norm_ack
             metadata = json.dumps(mobj)
         print(json.dumps(await save_artifact(sargs.content, metadata), indent=2))
     elif action == "supersede":
@@ -1469,8 +1525,11 @@ async def main() -> None:
                        help="pg_id of the fact to retract")
         p.add_argument("--by", type=int, default=None,
                        help="pg_id of an existing successor fact (optional)")
+        p.add_argument("--acknowledge-standing", action="append", nargs="+", metavar="ID_AND_WORDS",
+                       help="pg_id of standing decision to acknowledge (optionally followed by operator reason)")
         sargs = p.parse_args(sys.argv[2:])
-        print(json.dumps(await supersede_fact(sargs.pg_id, sargs.by), indent=2))
+        norm_ack = _normalize_cli_ack(getattr(sargs, "acknowledge_standing", None))
+        print(json.dumps(await supersede_fact(sargs.pg_id, sargs.by, acknowledge_standing=norm_ack), indent=2))
     elif action == "review-hold":
         p = argparse.ArgumentParser(
             prog="memory_bridge.py review-hold",

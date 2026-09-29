@@ -25,7 +25,7 @@ The gateway is `:8888`. Never call the embedder `:8070` or the reranker `:8071`.
 | Operator confirmed a choice | `save_decision --title "…" --decided-by "…" --rationale "…" [--project NAME] [--domain NAME] [--grounded-in "N:role"] [--alternatives "…"] [--confidence high]` |
 | Outcome of a decision | `save_retrospective --pg-id N --rating STATE --notes "…" --grounded-in "N[:role]" [--source-ref PATH]` |
 | What happened to this record | `lineage fact:N` |
-| Retract a fact, no replacement | `supersede --pg-id N [--by SUCCESSOR]` |
+| Retract a fact, no replacement | `supersede --pg-id N [--by SUCCESSOR] [--acknowledge-standing ID]` |
 | A stale flag is immaterial | `review-hold --summary-id S --pg-id N` |
 | Named structural lookup | `query why-to-check\|who-decided\|agent-decisions\|retrospectives` plus that template's flags |
 | Raw read-only Cypher | `graph "<cypher>"` |
@@ -154,6 +154,7 @@ Meaning-bearing flags. Type the flag form.
 
 | Flag | Use |
 |---|---|
+| `--acknowledge-standing` | Decision id(s) or `id:answer` map when superseding leaves standing decisions without other standing ground facts. |
 | `--alternatives` | One considered option per flag on `save_decision`. Not comma-split. |
 | `--confidence` | `high`, `medium`, or `low` on a decision. |
 | `--domain` | Section of the project. Repeat the flag. On `search`, a filter. |
@@ -171,6 +172,7 @@ Refusals. Branch on `error`. One recovery; the second-submission essays are in `
 |---|---|
 | `axis_conflict` | Axes are fixed at first write. Supersede. Do not re-save the same content onto other axes. |
 | `cypher_rejected` | Neo4j rejected the Cypher. Fix the query. Retrying it unchanged will not succeed. |
+| `decision_loses_last_ground` | Ask per decision. Still stands: re-send with `--acknowledge-standing ID`. Supported or reversal: save new fact first, save retrospective (validated/refined or reversed) grounded on it, then supersede. ⛔ Never acknowledge without the operator's answer on each id. |
 | `domain_confusable` | Ask. If it is a different section, re-send `confirm_distinct_from` naming the near match. Otherwise use the existing name. |
 | `domain_not_allowed_on_judgement` | Do not send a domain. A retrospective does not store sections, and the decision's axes do not move onto it. |
 | `domain_spelling_variant` | It is that registered section. Save under that spelling. It cannot be confirmed as new. |
@@ -184,6 +186,7 @@ Refusals. Branch on `error`. One recovery; the second-submission essays are in `
 | `entity_name_too_long` | A concept noun, not a sentence. The cap is `ENTITY_NAME_MAX_LEN` (default 200). |
 | `entity_reserved` | Schema or axis vocabulary is not an entity. Also a registered project name, including this record's own project. Name the concept, or drop it. |
 | `entity_unknown` | Ask. Re-send `new_entities` listing exactly those names, each also in `entities`, or use the registered canonical. |
+| `fact_already_superseded` | The fact is already superseded. Re-read lineage. Nothing was written. |
 | `filters_invalid` | The search `--domain` list is over the 16-entry cap. Narrow it. |
 | `graph_row_cap_exceeded` | Read-only Cypher returned more than `GRAPH_QUERY_ROW_CAP` rows (default 10000). Narrow the query. |
 | `new_entities_invalid` | A list of strings. Each name must also be in `entities`. A name that normalizes to nothing cannot be minted. |
