@@ -7136,7 +7136,6 @@ class MemoryCoordinator:
     async def _annotate_retired_summaries(self, conn, insights_data: list[dict]) -> dict[int, list[dict]]:
         """decision:2801 (an insight follows a new thematic row only when every decision it had support for keeps support):
         annotate insight retired_summaries with unsupported threads (decision, superseded_facts, superseding_facts).
-        Deduplicates summary_ids (first occurrence wins).
         Degrades safely on failure."""
         if not insights_data:
             return {}
@@ -7162,6 +7161,7 @@ class MemoryCoordinator:
                 return {ins.get("id"): [] for ins in insights_data if ins.get("id") is not None}
 
             # 2. For lineage-retired summaries, follow chains to active ends
+            # This filter only skips work: a non-lineage retired row is never substituted, so its facts keep counting (decision:2751).
             lineage_retired = {sid for sid in retired_sids if summ_map[sid].get("superseded_reason") == "lineage"}
             active_ends = {}
             for sid in lineage_retired:
@@ -7239,7 +7239,7 @@ class MemoryCoordinator:
                 src_ids = ins.get("source_pg_ids") or []
                 ins_decisions = [d for d in src_ids if d in thread_facts_map]
 
-                # F1 (decision:2801: solid match across whole insight): replace EVERY lineage-retired
+                # decision:2801 (an insight follows a new thematic row only when every decision it had support for keeps support): replace EVERY lineage-retired
                 # cited id by its chain's active end at once, then judge which threads lost support.
                 new_sids = []
                 for s in sids:
@@ -7301,7 +7301,7 @@ class MemoryCoordinator:
                                 break
                         else:
                             curr_f = td_facts[next_f_id]
-                    # F2: record chain end in superseding_facts only when that end is NOT superseded.
+                    # Record chain end in superseding_facts only when that end is NOT superseded (decision:2751).
                     # A retracted fact (superseded, no successor) contributes nothing there.
                     if not curr_f.get("superseded"):
                         fact_chain_map[f_id] = curr_f["id"]
@@ -7322,6 +7322,7 @@ class MemoryCoordinator:
                     sup_by = s_info.get("superseded_by")
 
                     unsupported = []
+                    # This filter only skips work: a non-lineage retired row is never substituted, so its facts keep counting (decision:2751).
                     if reason == "lineage":
                         lost_list = lost_threads_per_insight_sid.get((ins_id, sid), [])
                         for d, g_facts in lost_list:
@@ -7672,8 +7673,8 @@ class MemoryCoordinator:
                 if pid in stale_map and pid not in acked
             ]
 
-        # ⛔ Prohibition: community_summaries only — never technical_docs (independent sequences; decision:1207: the earlier lazy annotation; decision:2778: the supersession yardstick; decision:2801).
-        # Annotate insight retired_summaries at read time from community_summaries via summary_ids (first occurrence wins).
+        # ⛔ Prohibition: community_summaries only — never technical_docs (independent sequences; decision:1207: the earlier lazy annotation; decision:2778: the supersession yardstick; decision:2801 (an insight follows a new thematic row only when every decision it had support for keeps support)).
+        # Annotate insight retired_summaries at read time from community_summaries via summary_ids (decision:2751).
         insight_candidates = []
         for r in (insight, summary):
             if r is not None and summary_record_type(r.get("metadata")) == "insight":

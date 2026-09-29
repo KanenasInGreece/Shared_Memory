@@ -170,7 +170,7 @@ async def test_t1_superseded_constituent_retires_and_folds_successor_atomically(
       (a) remove retire -> upsert returns 10 and test fails
       (b) commit between retire and insert -> commits > 1 fails
       (c) drop pointer UPDATE -> fails
-      (d) one hop instead of chain end in resolve_standing_ids at fold link -> stops at 6 (superseded) and misses 5 -> fails.
+      (d) pins the SQL text of resolve_standing_ids; the behaviour is proved on real SQL by the coordinator.
     """
     daemon, session = daemon_with_fake_graph()
     monkeypatch.delenv("MOCK_LLM", raising=False)
@@ -1273,7 +1273,7 @@ def test_resolve_standing_ids_two_hop_chain():
     """Two-hop chain test at fold link (resolve_standing_ids):
     Constituent fact 2 superseded by 6, 6 superseded by 5 (standing).
     Chain resolves to standing id 5.
-    Mutation killed: one hop instead of chain end -> fails.
+    Pins the SQL text (WITH RECURSIVE, ORDER BY depth DESC); the behaviour is proved on real SQL by the coordinator.
     """
     conn = StubConn(script=[
         {"rowcount": 1, "rows": [(2, 5, False)]},
@@ -1340,8 +1340,9 @@ async def test_read_time_whole_insight_two_kept_retired_rows_sharing_fact_neithe
 
 @pytest.mark.asyncio
 async def test_read_time_coverage_retired_and_null_reason_rows_yield_no_unsupported():
-    """Read time on a coverage-retired and a NULL-reason row -> unsupported is empty list.
-    Mutation killed: drop the lineage-only filter -> fails at both sites.
+    """Documents that read time on a coverage-retired and a NULL-reason row yields an empty
+    unsupported list. The lineage-only filter is redundant (a non-lineage retired row is never
+    substituted, so its facts keep counting) and only skips work.
     """
     c = co.MemoryCoordinator()
     fake_conn = MagicMock()
@@ -1470,5 +1471,52 @@ async def test_f2_retracted_fact_yields_empty_superseding_facts():
     assert ins_601[0]["unsupported"] == [
         {"decision": 501, "superseded_facts": [1], "superseding_facts": []}
     ]
+
+
+def test_sweep_recheck_substitutes_several_retired_ids_in_sorted_order():
+    """decision:2801 / decision:2751: the sweep recheck substitutes several retired ids
+    in sorted order. With two retired rows (20 and 10), substituting old_id 10 (-> 11)
+    before old_id 20 (-> 21) produces deterministic ordering [21, 11] in summary_ids.
+    """
+    def active_end_responder(sql, params):
+        if params == (11,):
+            return {"rowcount": 1, "rows": [(11, False, None, None, [1])]}
+        if params == (21,):
+            return {"rowcount": 1, "rows": [(21, False, None, None, [2])]}
+        return {"rowcount": 0, "rows": []}
+
+    script = [
+        # 1. Query candidate active insights citing lineage-retired summaries
+        {"rowcount": 1, "rows": [
+            (850, {"kind": "insight", "summary_ids": [20, 10]}, [100]),
+        ]},
+        # 2. Query cited summaries (both are lineage-retired)
+        {"rowcount": 2, "rows": [
+            (20, True, 21, "lineage", [2]),
+            (10, True, 11, "lineage", [1]),
+        ]},
+        # 3 & 4. Query active ends for 20 and 10
+        active_end_responder,
+        active_end_responder,
+        # 5. Batched thread query: decision 100 grounded in [1, 2]
+        {"rowcount": 1, "rows": [
+            (100, [1, 2]),
+        ]},
+        # 6. UPDATE metadata for 850
+        {"rowcount": 1, "rows": []},
+    ]
+    conn = StubConn(script=script)
+    repointed_count, kept_count = recheck_kept_thematic_ids(conn)
+
+    assert repointed_count == 1
+    assert kept_count == 0
+    assert conn.commits == 1
+
+    meta_updates = [c for c in conn.executed if "UPDATE community_summaries SET metadata" in c[0]]
+    assert len(meta_updates) == 1
+    meta = json.loads(meta_updates[0][1][0])
+    assert meta["summary_ids"] == [21, 11]
+    assert meta_updates[0][1][1] == 850
+
 
 

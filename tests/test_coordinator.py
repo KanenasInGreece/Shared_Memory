@@ -1355,6 +1355,71 @@ async def test_search_retired_summaries_db_failure_degrades_with_a_logged_warnin
     assert "1" in msg   # count of summary_ids left unchecked
 
 
+@pytest.mark.asyncio
+async def test_search_lineage_path_db_acquire_failure_omits_retired_summaries(caplog):
+    """decision:2801 / decision:2751: on the lineage annotation path (retired_summaries),
+    a failure acquiring the database connection from the pool degrades safely with a warning
+    and omits retired_summaries from the result rather than returning [].
+    """
+    c, mock_conn, mock_session = _coordinator_with_mocks()
+
+    mock_conn.fetchrow = AsyncMock(side_effect=[
+        {
+            "id": 900,
+            "content": "Insight: the outbox pattern holds",
+            "metadata": {"kind": "insight", "summary_ids": [501],
+                         "project": "shared-memory-GitHub", "domains": ["architecture"]},
+            "source_pg_ids": [],
+        },
+        None,
+    ])
+    mock_conn.fetch = AsyncMock(return_value=[
+        {"id": 1, "content": "fact content", "metadata": {"entities": [], "source": "claude-code"}}
+    ])
+    mock_session.run = AsyncMock(return_value=_AsyncIter())
+
+    mock_reranker = MagicMock()
+    mock_reranker.raise_for_status = MagicMock()
+    mock_reranker.json = MagicMock(return_value={
+        "results": [{"index": 0, "relevance_score": 2.0},
+                    {"index": 1, "relevance_score": 1.0}]
+    })
+
+    # Stub pool.acquire: the first acquire is for the main search query (succeeds).
+    # The second acquire is on the lineage path for _annotate_retired_summaries (raises).
+    acquire_count = 0
+    def failing_acquire(*args, **kwargs):
+        nonlocal acquire_count
+        acquire_count += 1
+        if acquire_count > 1:
+            raise RuntimeError("pool acquisition timed out on lineage path")
+        return _async_ctx(mock_conn)
+
+    c._pool.acquire = MagicMock(side_effect=failing_acquire)
+
+    with caplog.at_level(logging.WARNING, logger="coordinator"):
+        with patch.object(c, "_embed", new=AsyncMock(return_value=[0.1] * 1024)):
+            with patch("httpx.AsyncClient") as mock_cls:
+                mock_http = AsyncMock()
+                mock_http.post = AsyncMock(return_value=mock_reranker)
+                mock_cls.return_value.__aenter__ = AsyncMock(return_value=mock_http)
+                mock_cls.return_value.__aexit__ = AsyncMock(return_value=None)
+
+                req = _make_request({"query": "outbox pattern", "limit": 5})
+                resp = await c.handle_search(req)
+
+    assert resp.status == 200
+    results = json.loads(resp.text)["results"]
+    insight_result = next(r for r in results if r["tier"] == "insight_summary")
+    assert "retired_summaries" not in insight_result
+    assert insight_result.get("retired_summaries") is None
+
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    msg = " ".join(r.getMessage() for r in warnings)
+    assert "retired_summaries annotation degraded" in msg
+    assert "pool acquisition timed out on lineage path" in msg
+    assert "1 summary_ids unchecked" in msg
+
 
 @pytest.mark.asyncio
 async def test_search_stale_sources_db_failure_degrades_with_a_logged_warning(caplog):

@@ -1738,8 +1738,8 @@ def link_thematic_successor(cur, old_id, new_id):
     """decision:2778 (insight successor repointing) and decision:2801 (an insight follows
     a new thematic row only when every decision it had support for keeps support): link
     old_id -> new_id via superseded_by, and repoint active insights citing old_id to new_id
-    only on a solid match across the whole insight. Metadata only, never updated_at.
-    Returns (repointed_ids, kept_ids)."""
+    only on a solid match across the whole insight. Deduplicates summary_ids (first occurrence wins).
+    Metadata only, never updated_at. Returns (repointed_ids, kept_ids)."""
     cur.execute(
         "UPDATE community_summaries SET superseded_by = %s WHERE id = %s",
         (new_id, old_id),
@@ -1983,7 +1983,7 @@ def recheck_kept_thematic_ids(conn):
         for ins_id, meta, src_ids, sids in insights_parsed:
             repointed_any = False
             curr_sids = list(sids)
-            # F7: substitute ids in sorted order (deterministic between sweeps)
+            # Substitute ids in sorted order: deterministic between sweeps (decision:2751).
             for old_sid, active_sid in sorted(active_ends.items()):
                 if old_sid not in curr_sids:
                     continue
