@@ -7,6 +7,14 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.0.11] - 2026-09-29
+
+A new retrospective is folded into its insight once, and only a fold that contains it closes its outbox row. `API_VERSION` stays 4. No migration.
+
+### Fixed
+- A new-style retrospective no longer re-folds its decision's insight on the unchanged judgement set, which cost a second full fold and left the insight briefly without the retrospective. The fresh path folds the grown set in the same sweep.
+- An insight fold closes an outbox row only when that row's own record is in the fold. Before, a retrospective's row was closed through its target decision even though the retrospective was not folded. A retrospective that no fold picks up now stays visible as `outbox.rem_reviewed` instead of disappearing.
+
 ## [1.0.10] - 2026-09-29
 
 A superseded fact now retires the thematic summaries that hold it, and insights follow the new summary only when it still supports their decisions. `API_VERSION` stays 4. **Run `migrations/apply.py` before restarting** (migration 043).
