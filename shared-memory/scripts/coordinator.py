@@ -6829,7 +6829,7 @@ class MemoryCoordinator:
             result = await session.run(
                 f"MATCH (n {{pg_id: $pg_id}}) WHERE {anchor_where}"
                 " OPTIONAL MATCH (n)-[r]-(related)"
-                "   WHERE NOT (related:CommunitySummary AND coalesce(related.superseded,false))"
+                f"   WHERE NOT (related:{ONT.community_summary} AND coalesce(related.superseded,false))"
                 # Pull genuinely-referenced entity alias siblings (decision:890); stray Decision ALIASES edges do not surface.
                 f" OPTIONAL MATCH (related)-[:{ONT.aliases}]-(al:{ONT.entity})"
                 f"   WHERE EXISTS {{"
@@ -6968,7 +6968,7 @@ class MemoryCoordinator:
                 " CALL (pg_id) {"
                 f"   MATCH (n {{pg_id: pg_id}}) WHERE {anchor_where}"
                 "   OPTIONAL MATCH (n)-[r]-(related)"
-                "     WHERE NOT (related:CommunitySummary AND coalesce(related.superseded,false))"
+                f"     WHERE NOT (related:{ONT.community_summary} AND coalesce(related.superseded,false))"
                 f"   OPTIONAL MATCH (related)-[:{ONT.aliases}]-(al:{ONT.entity})"
                 f"     WHERE EXISTS {{"
                 f"       MATCH (related)<-[:{ONT.entity_link}]-(m)"
@@ -7450,7 +7450,7 @@ class MemoryCoordinator:
                 if pid in stale_map and pid not in acked
             ]
 
-        # Annotate insight retired_summaries at read time from community_summaries via summary_ids, never technical_docs (decision:1207, decision:2778).
+        # Annotate insight retired_summaries at read time from community_summaries via summary_ids, never technical_docs (decision:1207; decision:2778: supersession yardstick surfaces retired constituent summaries lazily without retiring the insight).
         insight_summary_ids: set[int] = set()
         if insight:
             insight_meta = insight.get("metadata")
@@ -7850,8 +7850,7 @@ class MemoryCoordinator:
                 )
             meta   = _coerce_jsonb_obj(row["metadata"])
             actual = summary_record_type(meta)
-            expected = "summary" if record_type == "thematic" else record_type
-            if expected != actual:
+            if record_type != actual:
                 return web.json_response(
                     {"status": "error", "pg_id": pg_id,
                      "message": (f"{make_ref(record_type, pg_id)} does not exist — id "

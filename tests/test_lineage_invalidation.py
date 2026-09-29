@@ -430,7 +430,7 @@ async def test_i12_retiring_insight_clears_consolidated_on_graph_nodes(monkeypat
     monkeypatch.setattr(cl.psycopg2, "connect", lambda *a, **k: fake_conn)
     monkeypatch.setattr(
         cl, "retire_invalidated_summaries",
-        lambda conn: ([(70, "insight", [245, 267])], 2),
+        lambda conn, **k: ([(70, "insight", [245, 267])], 2),
     )
     await daemon.run_lineage_invalidation_pass()
     assert len(session.calls) == 1
@@ -459,7 +459,7 @@ async def test_i12_nothing_retired_touches_neither_store_further(monkeypatch):
     daemon, session = daemon_with_fake_graph()
     fake_conn = MagicMock()
     monkeypatch.setattr(cl.psycopg2, "connect", lambda *a, **k: fake_conn)
-    monkeypatch.setattr(cl, "retire_invalidated_summaries", lambda conn: ([], 0))
+    monkeypatch.setattr(cl, "retire_invalidated_summaries", lambda conn, **k: ([], 0))
     await daemon.run_lineage_invalidation_pass()
     assert session.calls == []
 

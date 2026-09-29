@@ -1,7 +1,7 @@
 """Tests for PR 2: A superseded fact retires its thematic summary, and insights follow it.
 
 Covers:
-- Fix 1: A4 supersession retires the row and folds a new one (rule 2)
+- decision:2778: constituent supersession retires the row and folds a successor
   - T1: Active row 10 src [1,2,3,4], fact 2 superseded by 5, scan [1,3,4,5].
         Expect, in order and with ONE commit:
         retire UPDATE on id 10 ('lineage')
@@ -19,10 +19,12 @@ Covers:
   - T4b: Non-gating row holding no superseded fact -> not retired.
   - T6: Graph: SUPERSEDES Cypher contains SET old.superseded = true;
         no-successor retirement marks the CommunitySummary node.
+  - Step 5 graph mark: no-successor retirement calls graph marker with retired ids.
   - T7: Lineage invalidation pass retires no thematic row (kinds=("insight",)).
   - T8: run_ledger_sweep with an empty backlog still consolidates.
+  - Sweep reconciliation: re-applies superseded=true and SUPERSEDES edge for PG-superseded thematic rows.
   - T9: coordinator: both expanders' Cypher carries the CommunitySummary superseded exclusion.
-- Fix 2: A4b (reduced) insights follow the successor (rule 5)
+- decision:2778: insights follow the successor
   - T10: link_thematic_successor repointing, order, dedup, superseded insight untouched,
          and no updated_at in the UPDATE.
   - T12: _status_of_summary returns qualified superseded_by and retired_summaries.
@@ -61,7 +63,14 @@ class StubCursor:
 
     def execute(self, sql, params=None):
         self.executed.append((" ".join(sql.split()), params))
-        self._current = self._script.pop(0) if self._script else {"rowcount": 0, "rows": []}
+        if self._script:
+            item = self._script.pop(0)
+            if callable(item):
+                self._current = item(sql, params)
+            else:
+                self._current = item
+        else:
+            self._current = {"rowcount": 0, "rows": []}
 
     @property
     def rowcount(self):
@@ -94,6 +103,7 @@ class StubConn:
 
     def commit(self):
         self.commits += 1
+        self.executed.append(("COMMIT", None))
 
     def rollback(self):
         self.rollbacks += 1
@@ -271,10 +281,18 @@ async def test_t1_superseded_constituent_retires_and_folds_successor_atomically(
         assert params[3] == "technical_docs"
         assert params[4] == 2        # trigger_id is fact 2
 
-    # Assert exactly ONE commit for the atomic fold transaction
-    # (plus any separate commits from drop/close passes)
-    # The atomic fold transaction itself must commit once without intermediate commits!
-    assert conn.commits >= 1
+    # Assert EXACTLY one commit for the atomic fold transaction, and that NO commit
+    # happens between the retire UPDATE and the INSERT (mutation: commit between them must fail).
+    commits = [i for i, (sql, _) in enumerate(conn.executed) if sql == "COMMIT"]
+    commits_between = [i for i in commits if retire_idx < i < insert_idx]
+    assert len(commits_between) == 0, f"Found {len(commits_between)} commit(s) between retire UPDATE and INSERT"
+
+    # Exactly one commit closes the fold transaction before graph sync
+    close_ledger_idx = next(i for i, (sql, _) in enumerate(conn.executed)
+                            if "DELETE FROM neo4j_outbox" in sql)
+    fold_commits = [i for i in commits if retire_idx < i < close_ledger_idx]
+    assert len(fold_commits) == 1, f"Expected exactly 1 commit for fold transaction, found {len(fold_commits)}"
+    assert conn.commits == 4, f"Expected exactly 4 commits total across sweep, found {conn.commits}"
 
 
 # ── T2: Removed ungrounded member & pure accumulation upsert in place ────────
@@ -414,7 +432,9 @@ async def test_t3_group_drops_below_density_retired_without_successor_and_ledger
 @pytest.mark.asyncio
 async def test_t4_unchanged_gating_row_with_pg_superseded_fact_logs_warning_and_skips_retire(monkeypatch, caplog):
     """T4: Unchanged gating row with a PG-superseded fact -> WARNING logged, no retire.
-    Mutation killed: drop gating ids from skip_ids.
+    Asserts skip_ids passed to step 5 contain the active id of every gating key
+    (unchanged and changed).
+    Mutation killed: drop gating ids from skip_ids -> fails.
     """
     daemon, session = daemon_with_fake_graph()
     monkeypatch.delenv("MOCK_LLM", raising=False)
@@ -423,30 +443,61 @@ async def test_t4_unchanged_gating_row_with_pg_superseded_fact_logs_warning_and_
     monkeypatch.setattr(cl, "_crun_finish", lambda *a, **k: None)
     daemon.get_embedding = AsyncMock(return_value=[0.1] * 4)
 
-    content = "[FACT kind=discussion recorded=2026-09-29 pg_id=1] fact 1\n[FACT kind=discussion recorded=2026-09-29 pg_id=2] fact 2"
+    content_ops = "[FACT kind=discussion recorded=2026-09-29 pg_id=1] fact 1\n[FACT kind=discussion recorded=2026-09-29 pg_id=2] fact 2"
     scan_rows = [
         {"pg_id": 1, "content": "fact 1", "project": "proj", "domain": "ops"},
         {"pg_id": 2, "content": "fact 2", "project": "proj", "domain": "ops"},
+        {"pg_id": 3, "content": "fact 3", "project": "proj", "domain": "dev"},
+        {"pg_id": 4, "content": "fact 4", "project": "proj", "domain": "dev"},
     ]
     d = datetime.date(2026, 9, 29)
 
     script = [
-        {"rowcount": 2, "rows": [
+        # 1. _fetch_records for 1, 2, 3, 4
+        {"rowcount": 4, "rows": [
             (1, "proj", "fact", None, d, {}),
             (2, "proj", "fact", None, d, {}),
+            (3, "proj", "fact", None, d, {}),
+            (4, "proj", "fact", None, d, {}),
         ]},
+        # 2. dead letter
         {"rowcount": 0, "rows": []},
-        # Active row 10 matches content -> unchanged cluster
-        {"rowcount": 1, "rows": [
-            ("proj", "ops", 10, content, [1, 2], []),
+        # 3. Active rows:
+        #    - (proj, ops) has id 10 matching content -> unchanged gating key
+        #    - (proj, dev) has id 20 differing content -> changed gating key
+        {"rowcount": 2, "rows": [
+            ("proj", "ops", 10, content_ops, [1, 2], []),
+            ("proj", "dev", 20, "old content dev", [3, 4], []),
         ]},
-        # Step 4 check: fact 2 in the unchanged row is PG-superseded!
+        # 4. Census outbox timestamps for changed member ids [3, 4]
+        {"rowcount": 2, "rows": []},
+        # 5. Step 4 check: fact 2 in the unchanged row is PG-superseded!
         {"rowcount": 1, "rows": [(2,)]},
-        # Step 5 retire_invalidated_summaries with skip_ids=(10,): returns nothing
+        # 6. Step 5 retire_invalidated_summaries with skip_ids=(10, 20): returns nothing
         {"rowcount": 0, "rows": []},
+        # 7. Summary write for (proj, dev): in-place upsert returns 20
+        {"rowcount": 1, "rows": [(20,)]},
+        # 8. Outbox flip
+        {"rowcount": 2, "rows": []},
+        # 9. Supersede covered
+        {"rowcount": 0, "rows": []},
+        # 10. close_ledger_rows
+        {"rowcount": 0, "rows": []},
+        # 11. Post-loop drop passes
+        {"rowcount": 0, "rows": []},  # drop_out_of_scan_refold_rows
+        {"rowcount": 0, "rows": []},  # close_refold_ledger_rows (refolded)
+        {"rowcount": 0, "rows": []},  # close_refold_ledger_rows (dropped)
     ]
     conn = StubConn(script=script)
     monkeypatch.setattr(cl.psycopg2, "connect", lambda *a, **k: conn)
+
+    # Spy on retire_invalidated_summaries to capture skip_ids passed to step 5
+    retire_calls = []
+    orig_retire = cl.retire_invalidated_summaries
+    def spy_retire(conn, kinds=("thematic", "insight"), skip_ids=()):
+        retire_calls.append({"kinds": kinds, "skip_ids": tuple(skip_ids)})
+        return orig_retire(conn, kinds=kinds, skip_ids=skip_ids)
+    monkeypatch.setattr(cl, "retire_invalidated_summaries", spy_retire)
 
     with caplog.at_level(logging.WARNING, logger=cl.logger.name):
         await daemon._consolidate_clusters(scan_rows)
@@ -455,25 +506,55 @@ async def test_t4_unchanged_gating_row_with_pg_superseded_fact_logs_warning_and_
     warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
     assert any("store disagreement" in m.lower() or "disagree" in m.lower() for m in warnings)
 
+    # Assert skip_ids actually passed contains the active id of every gating key (unchanged 10 and changed 20)
+    assert len(retire_calls) == 1
+    passed_skip = retire_calls[0]["skip_ids"]
+    assert 10 in passed_skip, "skip_ids must contain active id of unchanged gating key"
+    assert 20 in passed_skip, "skip_ids must contain active id of changed gating key"
+
+    # Also assert the SQL query executed in step 5 carried both active gating IDs
+    leg1_call = next((sql, params) for sql, params in conn.executed
+                     if "FROM community_summaries cs" in sql and "JOIN technical_docs t" in sql)
+    assert leg1_call[1] is not None
+    assert 10 in leg1_call[1][0]
+    assert 20 in leg1_call[1][0]
+
     # Active row 10 was NOT retired
-    assert not any("UPDATE community_summaries SET superseded = true" in sql
-                   for sql, _ in conn.executed)
+    assert not any("UPDATE community_summaries SET superseded = true" in sql and params == (10,)
+                   for sql, params in conn.executed)
 
 
 def test_t4b_non_gating_row_holding_no_superseded_fact_is_not_retired():
     """T4b: A non-gating row holding NO superseded fact is not retired.
-    Mutation killed: widen step 5 predicate -> fails.
+    Mutation killed: widen leg-1 predicate (e.g. drop superseded check) -> fails in T4b itself.
     """
-    # leg 1 query returns active thematic summaries holding superseded facts.
-    # A non-gating row with live facts only is NOT returned by leg 1.
+    def leg1_responder(sql, params):
+        # The non-gating summary 30 holds fact 100 which is NOT superseded.
+        # If the predicate properly checks COALESCE(t.superseded, false) = true, no rows match.
+        # If a mutation widens the predicate by omitting/relaxing the superseded check,
+        # it returns summary 30.
+        if "t.superseded" in sql and "true" in sql:
+            return {"rowcount": 0, "rows": []}
+        return {"rowcount": 1, "rows": [(30, [100], 100)]}
+
     conn = StubConn(script=[
-        {"rowcount": 0, "rows": []},  # leg 1 returns nothing
+        leg1_responder,
+        # If widened predicate returned summary 30, subsequent calls would execute retirement:
+        {"rowcount": 1, "rows": []},  # retire UPDATE
+        {"rowcount": 1, "rows": [(100, 100, False)]},  # resolve_standing_ids
+        {"rowcount": 1, "rows": []},  # refold_ledger insert
     ])
     retired, opened = retire_invalidated_summaries(conn, kinds=("thematic",), skip_ids=())
     assert retired == []
     assert opened == 0
     assert not any("UPDATE community_summaries SET superseded = true" in sql
                    for sql, _ in conn.executed)
+
+    # Assert leg-1 query executed with the narrow predicate
+    leg1_sql = conn.executed[0][0]
+    assert "COALESCE(t.superseded, false) = true" in leg1_sql
+    assert "NOT cs.superseded" in leg1_sql
+    assert "COALESCE(cs.metadata->>'kind', 'thematic') <> 'insight'" in leg1_sql
 
 
 # ── T6: Graph markings ───────────────────────────────────────────────────────
@@ -508,6 +589,64 @@ async def test_t6_graph_supersedes_cypher_and_no_successor_retirement():
     assert "CommunitySummary" in query
     assert "s.superseded = true" in query
     assert params["ids"] == [25]
+
+
+@pytest.mark.asyncio
+async def test_step5_calls_graph_marker_with_retired_ids(monkeypatch):
+    """Step 5 calls _mark_summaries_retired_in_graph with the retired summary ids.
+    Mutation killed: skip the call -> fails.
+    Also verifies Neo4j failure is logged and does not crash the run (R3).
+    """
+    daemon, session = daemon_with_fake_graph()
+    monkeypatch.delenv("MOCK_LLM", raising=False)
+    monkeypatch.setattr(cl, "DENSITY_THRESHOLD", 3)
+    monkeypatch.setattr(cl, "_crun_start", lambda ct: 105)
+    monkeypatch.setattr(cl, "_crun_finish", lambda *a, **k: None)
+
+    # 1 member below threshold 3 -> no eligible clusters
+    scan_rows = [
+        {"pg_id": 1, "content": "fact 1", "project": "proj", "domain": "ops"},
+    ]
+    d = datetime.date(2026, 9, 29)
+    script = [
+        {"rowcount": 1, "rows": [(1, "proj", "fact", None, d, {})]},
+        {"rowcount": 0, "rows": []},
+        # Drop passes after loop
+        {"rowcount": 0, "rows": []},
+        {"rowcount": 0, "rows": []},
+        {"rowcount": 0, "rows": []},
+    ]
+    conn = StubConn(script=script)
+    monkeypatch.setattr(cl.psycopg2, "connect", lambda *a, **k: conn)
+
+    # Mock retire_invalidated_summaries in step 5 returning retired thematic summaries [30, 31]
+    monkeypatch.setattr(
+        cl, "retire_invalidated_summaries",
+        lambda conn, kinds=("thematic",), skip_ids=(): ([(30, "thematic", [10]), (31, "thematic", [11])], 2),
+    )
+
+    marked_ids = []
+    async def fake_mark(ids):
+        marked_ids.extend(ids)
+    daemon._mark_summaries_retired_in_graph = AsyncMock(side_effect=fake_mark)
+
+    await daemon._consolidate_clusters(scan_rows)
+
+    assert daemon._mark_summaries_retired_in_graph.await_count == 1
+    assert marked_ids == [30, 31]
+
+    # Verify R3: Neo4j exception does not crash _consolidate_clusters
+    daemon._mark_summaries_retired_in_graph = AsyncMock(side_effect=RuntimeError("Neo4j connection dropped"))
+    conn2 = StubConn(script=[
+        {"rowcount": 1, "rows": [(1, "proj", "fact", None, d, {})]},
+        {"rowcount": 0, "rows": []},
+        {"rowcount": 0, "rows": []},
+        {"rowcount": 0, "rows": []},
+        {"rowcount": 0, "rows": []},
+    ])
+    monkeypatch.setattr(cl.psycopg2, "connect", lambda *a, **k: conn2)
+    # Must complete without raising RuntimeError
+    await daemon._consolidate_clusters(scan_rows)
 
 
 # ── T7: Lineage invalidation pass retires no thematic row ────────────────────
@@ -561,6 +700,42 @@ async def test_t8_run_ledger_sweep_with_empty_backlog_still_consolidates(monkeyp
     assert daemon._consolidate_clusters.await_count == 1
 
 
+@pytest.mark.asyncio
+async def test_ledger_sweep_reconciles_superseded_thematic_summaries_in_graph(monkeypatch):
+    """The ledger-sweep reconciliation scan re-applies superseded=true and the SUPERSEDES
+    edge for PG-superseded thematic rows.
+    Mutation killed: remove the scan -> fails.
+    """
+    daemon, session = daemon_with_fake_graph()
+    monkeypatch.setattr(cl, "PG_CONN", "fake_dsn")
+    fake_conn = MagicMock()
+    monkeypatch.setattr(cl.psycopg2, "connect", lambda *a, **k: fake_conn)
+    monkeypatch.setattr(cl, "mark_covered_rows_consolidated", lambda conn: 0)
+    monkeypatch.setattr(cl, "fetch_unreconciled", lambda conn: [])
+    # Return PG-superseded thematic summaries: 10 has successor 11; 25 has no successor (None)
+    monkeypatch.setattr(
+        cl, "fetch_superseded_thematic_summaries",
+        lambda conn: [(10, 11), (25, None)],
+    )
+    monkeypatch.setattr(cl, "fetch_combined_fact_backlog", lambda conn: [])
+    daemon._find_grounded_fact_groups = AsyncMock(return_value=[])
+
+    await daemon.run_ledger_sweep()
+
+    # Verify session calls for reconciliation
+    # 1. Setting s.superseded = true for all PG-superseded summaries [10, 25]
+    flag_calls = [c for c in session.calls if "s.superseded = true" in c[0] and "CommunitySummary" in c[0]]
+    assert len(flag_calls) >= 1
+    flag_params = [c[1] for c in flag_calls if "ids" in c[1]]
+    assert any(p["ids"] == [10, 25] for p in flag_params)
+
+    # 2. Merging SUPERSEDES edge for pairs: [[10, 11]]
+    edge_calls = [c for c in session.calls if "MERGE (new)-[:SUPERSEDES]->(old)" in c[0]]
+    assert len(edge_calls) == 1
+    assert edge_calls[0][1]["pairs"] == [[10, 11]]
+    assert "old.superseded = true" in edge_calls[0][0]
+
+
 # ── T9: coordinator graph expanders exclude superseded summaries ─────────────
 
 def test_t9_coordinator_expanders_exclude_superseded_community_summaries():
@@ -573,9 +748,9 @@ def test_t9_coordinator_expanders_exclude_superseded_community_summaries():
 
     expected_predicate = "coalesce(related.superseded,false)"
     assert expected_predicate in src_single
-    assert "CommunitySummary" in src_single
+    assert "ONT.community_summary" in src_single or "CommunitySummary" in src_single
     assert expected_predicate in src_batch
-    assert "CommunitySummary" in src_batch
+    assert "ONT.community_summary" in src_batch or "CommunitySummary" in src_batch
 
 
 # ── T10: link_thematic_successor repointing ──────────────────────────────────
@@ -673,7 +848,7 @@ async def test_t12_status_of_summary_superseded_by_and_retired_summaries():
     fake_conn.fetch = AsyncMock(return_value=[])
     c._acquire = MagicMock(return_value=_AsyncCtx(fake_conn))
 
-    resp = await c._status_of_summary(10, "thematic")
+    resp = await c._status_of_summary(10, "summary")
     assert resp.status == 200
     data = json.loads(resp.text)
     assert data["superseded"] is True

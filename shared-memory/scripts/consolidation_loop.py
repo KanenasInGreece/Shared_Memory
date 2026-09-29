@@ -700,7 +700,7 @@ def thematic_fold_is_current(active_row, summary, pg_ids, entities):
     every cycle"). Operator ruling 2026-08-11: already-folded thematic
     summaries are not re-folded unless something changed — supersession
     included, which retires the old row and folds a fresh one with a
-    successor pointer (Fix 1, A4).
+    successor pointer (decision:2778: constituent supersession retires the active summary and folds a successor).
 
     Every comparison failure fails OPEN to folding, so no subset-triggered
     refold (P12 subset supersession, a superseded constituent shrinking
@@ -714,7 +714,7 @@ def thematic_fold_is_current(active_row, summary, pg_ids, entities):
     write, which is exactly the churn this check exists to stop. Pure."""
     if not active_row:
         return False
-    row_id, stored_content, stored_src, stored_entities = active_row
+    _, stored_content, stored_src, stored_entities = active_row
     if stored_content != summary:
         return False
     if set(stored_src or []) != set(pg_ids or []):
@@ -1516,13 +1516,16 @@ def fetch_invalidated_summaries(conn, kinds=("thematic", "insight"), skip_ids=()
     REVERSED decision (`rating='reversed'`, coordinator.py's retrospective
     handler) alike — same column, same test, nothing to keep in sync (§2.2a).
 
-    ⛔ TWO legs, not three (`decision:1207`): thematic→insight lineage (the
-    former leg 3) is disabled — a superseded thematic summary's staleness
-    is judged LAZILY at read time via coordinator.py's `retired_summaries`
-    annotation, never re-derived here; reversal→insight (leg 2, §2.2a/I10)
-    stays eager.
+    ⛔ TWO legs, not three (`decision:1207`, `decision:2778`): thematic→insight
+    lineage (the former leg 3) is disabled — an insight's staleness against retired
+    thematic summaries is judged LAZILY at read time via coordinator.py's
+    `retired_summaries` annotation, never re-derived here (`decision:2778`: supersession
+    yardstick). Callers select legs via ``kinds`` and exclude active groups via ``skip_ids``:
+    the fact consolidation path (`_consolidate_clusters`) owns thematic retirement,
+    while the sweep invalidation pass (`run_lineage_invalidation_pass`) owns insight
+    invalidation (reversal→insight, leg 2).
 
-    The two legs that remain:
+    The two legs:
 
       1. THEMATIC summaries (`kind != 'insight'`) whose `source_pg_ids`
          holds a superseded fact.
@@ -1582,8 +1585,8 @@ def fetch_invalidated_summaries(conn, kinds=("thematic", "insight"), skip_ids=()
                            "kind": "insight", "trigger_kind": "technical_docs",
                            "trigger_id": trig})
 
-        # decision:2778: do not reinstate the thematic-to-insight lineage query.
-        # Rule 4: a superseded grounding fact does not retire an insight while its decision stands.
+        # decision:2778 (supersession yardstick): do not reinstate the thematic-to-insight lineage query;
+        # a superseded grounding fact does not retire an insight while its decision stands.
     return out
 
 
@@ -1627,12 +1630,10 @@ def resolve_standing_ids(conn, pg_ids):
 
 
 def _retire_summary(cur, conn, summary_id, kind="thematic", source_pg_ids=None, triggers=None):
-    """Extract of the per-summary invalidation retirement:
-    1) UPDATE community_summaries SET superseded = true, superseded_at = now(),
-       superseded_reason = 'lineage' WHERE id = %s AND NOT superseded
-    2) resolve_standing_ids for source_pg_ids
-    3) INSERT refold_ledger rows for eligible constituents and triggers
-    Does NOT commit."""
+    """Retire an invalidated community summary (`superseded_reason='lineage'`) and
+    open refold ledger rows for its still-standing constituents to re-enter future
+    consolidation cycles (`decision:2778`: supersession yardstick). Leaves transaction
+    uncommitted so the caller can combine retirement with successor insertion or batch commit."""
     cur.execute(
         "UPDATE community_summaries SET superseded = true,"
         "  superseded_at = now(), superseded_reason = 'lineage'"
@@ -1712,6 +1713,8 @@ def retire_invalidated_summaries(conn, kinds=("thematic", "insight"), skip_ids=(
     total_opened = 0
     with conn.cursor() as cur:
         for summary_id, info in by_summary.items():
+            # A concurrent sweep or fold pass may have retired the row between fetch and here;
+            # rowcount == 0 skips it so no duplicate refold_ledger rows are opened.
             success, opened = _retire_summary(
                 cur, conn, summary_id,
                 kind=info["kind"],
@@ -1726,9 +1729,9 @@ def retire_invalidated_summaries(conn, kinds=("thematic", "insight"), skip_ids=(
 
 
 def link_thematic_successor(cur, old_id, new_id):
-    """Rule 5 (A4b reduced): link old_id -> new_id via superseded_by, and
-    repoint active insights citing old_id to new_id in place.
-    Metadata only, never updated_at. Deduplicated, first occurrence wins."""
+    """decision:2778 (insight successor repointing): link old_id -> new_id via superseded_by,
+    and repoint active insights citing old_id to new_id in place. Metadata only, never updated_at.
+    Deduplicated, first occurrence wins."""
     cur.execute(
         "UPDATE community_summaries SET superseded_by = %s WHERE id = %s",
         (new_id, old_id),
@@ -2635,10 +2638,12 @@ class ConsolidationDaemon:
 
         Postgres retirement (`retire_invalidated_summaries`, kinds=("insight",))
         is one atomic pass — thematic invalidation is owned by the fact
-        consolidation path (Fix 1, A4). The Neo4j half is this method's own job:
-        a retired INSIGHT's member Decision/Retrospective nodes have `consolidated`
-        cleared — gate-critical (G3, `insight_gate.passes_insight_gate`) — so they
-        read as fresh on the very next walk."""
+        consolidation path (`decision:2778`: supersession yardstick). The Neo4j half is
+        this method's own job: a retired INSIGHT's member Decision/Retrospective nodes
+        have `consolidated` cleared — gate-critical (G3, `insight_gate.passes_insight_gate`)
+        — so they read as fresh on the very next walk. (Caveat: Fact nodes never have
+        `consolidated` cleared — `_find_grounded_fact_groups` is a full scan that never
+        reads it, so clearing it would be a write with no reader.)"""
         loop = asyncio.get_running_loop()
         try:
             conn = await loop.run_in_executor(
@@ -2648,12 +2653,9 @@ class ConsolidationDaemon:
             logger.error(f"Lineage invalidation [{context}]: Postgres unavailable: {str(e)}")
             return
         try:
-            def _do_retire():
-                try:
-                    return retire_invalidated_summaries(conn, kinds=("insight",))
-                except TypeError:
-                    return retire_invalidated_summaries(conn)
-            retired, opened = await loop.run_in_executor(None, _do_retire)
+            retired, opened = await loop.run_in_executor(
+                None, lambda: retire_invalidated_summaries(conn, kinds=("insight",))
+            )
             if not retired:
                 return
             logger.info(
@@ -2728,7 +2730,7 @@ class ConsolidationDaemon:
                     )
                     logger.info("Ledger sweep: reconciled summary %d, closed %d rows.", summary_id, closed)
 
-                # Reconcile PG-retired thematic rows in graph (Fix 1 step 9)
+                # Reconcile PG-retired thematic rows in graph (decision:2778: graph status sync for retired summaries)
                 retired_thematic = await loop.run_in_executor(
                     None, lambda: fetch_superseded_thematic_summaries(conn)
                 )
@@ -2967,7 +2969,7 @@ class ConsolidationDaemon:
                 member_id_lists, ts_map, DENSITY_THRESHOLD)
             rec.dead_lettered_clusters = dead_lettered_count
 
-            # Step 4: batched read for superseded facts in removed members and unchanged gating rows
+            # decision:2778: batched read for superseded facts in removed members and unchanged gating rows
             removed_by_key = {}
             all_removed_ids = set()
             for project, section, summary, pg_ids, entities in fold_work_items:
@@ -3016,7 +3018,7 @@ class ConsolidationDaemon:
                 for k, rem in removed_by_key.items()
             }
 
-            # Step 5: retire invalidated summaries for non-gating groups with no successor
+            # decision:2778: retire invalidated summaries for non-gating groups with no successor
             gating_keys = {(p or "", s or SECTION_NONE) for p, s, _c, _i in eligible_work_items}
             gating_skip_ids = sorted({active_rows[k][0] for k in gating_keys if k in active_rows})
             retired_summaries, _ = await loop.run_in_executor(
@@ -3025,7 +3027,14 @@ class ConsolidationDaemon:
             )
             if retired_summaries:
                 retired_ids = [sid for sid, _kind, _src in retired_summaries]
-                await self._mark_summaries_retired_in_graph(retired_ids)
+                try:
+                    await self._mark_summaries_retired_in_graph(retired_ids)
+                except Exception as e:
+                    logger.error(
+                        "Graph sync failed for no-successor retired summaries %s — "
+                        "Postgres retirement is committed; ledger sweep reconciliation will retry: %s",
+                        retired_ids, e,
+                    )
 
             # Every item folds at domain level with an empty entity. These are constants, not per-item fields.
             entity = ""
@@ -3080,101 +3089,60 @@ class ConsolidationDaemon:
                     def _write_summary():
                         with conn.cursor() as cur:
                             if sup_removed and old_id is not None:
-                                # Fix 1 Step 6: atomic retirement of old row + insertion of successor
+                                # decision:2778: retire old thematic row before inserting its successor.
                                 _retire_summary(
                                     cur, conn, old_id, kind="thematic",
                                     source_pg_ids=stored_src,
                                     triggers=[("technical_docs", x) for x in sup_removed],
                                 )
-                                cur.execute("""
-                                    INSERT INTO community_summaries (content, metadata, embedding, source_pg_ids, run_id)
-                                    VALUES (%s, %s, %s, %s, %s)
-                                    ON CONFLICT (
-                                        (COALESCE(metadata->>'entity', '')),
-                                        (COALESCE(metadata->>'project', '')),
-                                        (COALESCE(metadata->>'domain', '')),
-                                        (COALESCE(metadata->>'level', 'entity'))
-                                    )
-                                        WHERE COALESCE(metadata->>'kind', 'thematic') <> 'insight'
-                                              AND NOT superseded
-                                        DO UPDATE
-                                        SET content         = EXCLUDED.content,
-                                            embedding       = EXCLUDED.embedding,
-                                            metadata        = EXCLUDED.metadata,
-                                            source_pg_ids   = EXCLUDED.source_pg_ids,
-                                            updated_at      = now(),
-                                            run_id          = EXCLUDED.run_id,
-                                            summary_history = (
-                                                SELECT jsonb_agg(entry)
-                                                FROM (
-                                                    SELECT entry FROM jsonb_array_elements(
-                                                        COALESCE(community_summaries.summary_history, '[]'::jsonb)
-                                                        || jsonb_build_array(jsonb_build_object(
-                                                            'content',        community_summaries.content,
-                                                            'source_pg_ids',  community_summaries.source_pg_ids,
-                                                            'timestamp',      community_summaries.metadata->>'timestamp'
-                                                        ))
-                                                    ) AS entry
-                                                    ORDER BY (entry->>'timestamp') DESC
-                                                    LIMIT 20
-                                                ) sub
-                                            )
-                                    RETURNING id
-                                """, (_summary, _meta_json, _embedding, _pg_ids, run_id))
-                                summary_id = cur.fetchone()[0]
+                            # ⛔ Prohibition: ON CONFLICT predicate MUST include AND NOT superseded (migration 032).
+                            # Without it, an in-place conflict update would resurrect a retired row instead of inserting a fresh successor.
+                            cur.execute("""
+                                INSERT INTO community_summaries (content, metadata, embedding, source_pg_ids, run_id)
+                                VALUES (%s, %s, %s, %s, %s)
+                                ON CONFLICT (
+                                    (COALESCE(metadata->>'entity', '')),
+                                    (COALESCE(metadata->>'project', '')),
+                                    (COALESCE(metadata->>'domain', '')),
+                                    (COALESCE(metadata->>'level', 'entity'))
+                                )
+                                    WHERE COALESCE(metadata->>'kind', 'thematic') <> 'insight'
+                                          AND NOT superseded
+                                    DO UPDATE
+                                    SET content         = EXCLUDED.content,
+                                        embedding       = EXCLUDED.embedding,
+                                        metadata        = EXCLUDED.metadata,
+                                        source_pg_ids   = EXCLUDED.source_pg_ids,
+                                        updated_at      = now(),
+                                        run_id          = EXCLUDED.run_id,
+                                        summary_history = (
+                                            SELECT jsonb_agg(entry)
+                                            FROM (
+                                                SELECT entry FROM jsonb_array_elements(
+                                                    COALESCE(community_summaries.summary_history, '[]'::jsonb)
+                                                    || jsonb_build_array(jsonb_build_object(
+                                                        'content',        community_summaries.content,
+                                                        'source_pg_ids',  community_summaries.source_pg_ids,
+                                                        'timestamp',      community_summaries.metadata->>'timestamp'
+                                                    ))
+                                                ) AS entry
+                                                ORDER BY (entry->>'timestamp') DESC
+                                                LIMIT 20
+                                            ) sub
+                                        )
+                                RETURNING id
+                            """, (_summary, _meta_json, _embedding, _pg_ids, run_id))
+                            summary_id = cur.fetchone()[0]
+                            if sup_removed and old_id is not None:
+                                # decision:2778: link retired row to its fresh successor and repoint referencing insights.
                                 link_thematic_successor(cur, old_id, summary_id)
-                                cur.execute(
-                                    "UPDATE neo4j_outbox SET status = 'consolidated', consolidated_at = now()"
-                                    " WHERE pg_id = ANY(%s)"
-                                    "   AND status IN ('applied', 'rem_reviewed')",
-                                    (_pg_ids,),
-                                )
-                                return summary_id
-                            else:
-                                # In-place upsert
-                                cur.execute("""
-                                    INSERT INTO community_summaries (content, metadata, embedding, source_pg_ids, run_id)
-                                    VALUES (%s, %s, %s, %s, %s)
-                                    ON CONFLICT (
-                                        (COALESCE(metadata->>'entity', '')),
-                                        (COALESCE(metadata->>'project', '')),
-                                        (COALESCE(metadata->>'domain', '')),
-                                        (COALESCE(metadata->>'level', 'entity'))
-                                    )
-                                        WHERE COALESCE(metadata->>'kind', 'thematic') <> 'insight'
-                                              AND NOT superseded
-                                        DO UPDATE
-                                        SET content         = EXCLUDED.content,
-                                            embedding       = EXCLUDED.embedding,
-                                            metadata        = EXCLUDED.metadata,
-                                            source_pg_ids   = EXCLUDED.source_pg_ids,
-                                            updated_at      = now(),
-                                            run_id          = EXCLUDED.run_id,
-                                            summary_history = (
-                                                SELECT jsonb_agg(entry)
-                                                FROM (
-                                                    SELECT entry FROM jsonb_array_elements(
-                                                        COALESCE(community_summaries.summary_history, '[]'::jsonb)
-                                                        || jsonb_build_array(jsonb_build_object(
-                                                            'content',        community_summaries.content,
-                                                            'source_pg_ids',  community_summaries.source_pg_ids,
-                                                            'timestamp',      community_summaries.metadata->>'timestamp'
-                                                        ))
-                                                    ) AS entry
-                                                    ORDER BY (entry->>'timestamp') DESC
-                                                    LIMIT 20
-                                                ) sub
-                                            )
-                                    RETURNING id
-                                """, (_summary, _meta_json, _embedding, _pg_ids, run_id))
-                                summary_id = cur.fetchone()[0]
-                                cur.execute(
-                                    "UPDATE neo4j_outbox SET status = 'consolidated', consolidated_at = now()"
-                                    " WHERE pg_id = ANY(%s)"
-                                    "   AND status IN ('applied', 'rem_reviewed')",
-                                    (_pg_ids,),
-                                )
-                                return summary_id
+                            cur.execute(
+                                "UPDATE neo4j_outbox SET status = 'consolidated', consolidated_at = now()"
+                                " WHERE pg_id = ANY(%s)"
+                                "   AND status IN ('applied', 'rem_reviewed')",
+                                (_pg_ids,),
+                            )
+                            return summary_id
                     summary_pg_id = await loop.run_in_executor(None, _write_summary)
 
                     # P12: same-level subset supersession only.
@@ -3224,7 +3192,7 @@ class ConsolidationDaemon:
                         label, summary_pg_id, e,
                     )
 
-            # Step 7: drop below-density and out-of-scan refold rows AFTER the fold loop
+            # decision:2778: drop below-density and out-of-scan refold rows after the fold loop so non-gating rows are retired first
             all_gated_member_ids = [pid for w in work_items for pid in w[3]]
             below_density_ids = sorted(set(pg_ids_all) - set(all_gated_member_ids))
             await loop.run_in_executor(
