@@ -138,8 +138,12 @@ save_retrospective --pg-id 42 --rating reversed --notes "The global lock won." -
 
 If superseding a fact would leave standing decisions with no other standing fact grounds, the gateway refuses with HTTP 409 `decision_loses_last_ground`. Ask the operator about each decision. The second submission depends on the operator's answer:
 1. **Decision still stands:** re-send `--acknowledge-standing ID "the operator's words"` once per decision. A bare id, an empty string, or a placeholder is refused. There is no `id:answer` syntax.
-2. **New fact supports the decision:** save the new fact first WITHOUT `--supersedes`, save a retrospective (`validated` or `refined`) grounded on the new fact, then supersede the old fact with `--by <new_id>`. The thread now has a standing fact, so no acknowledgement is needed.
-3. **New fact argues for reversal:** save the new fact first WITHOUT `--supersedes`, save a retrospective (`reversed`) grounded on the new fact, then supersede the old fact with `--by <new_id>`. The decision is now superseded, so no acknowledgement is needed.
+2. **New fact supports the decision:** save the new fact first WITHOUT `--supersedes`, save a retrospective (`validated` or `refined`) grounded on the new fact as based_on (`--grounded-in "NEW_ID:based_on"`), then supersede the old fact with `--by <new_id>`. The thread now has a standing fact, so no acknowledgement is needed. A bare id on a discussion fact becomes `informed_by`, and the check would refuse again.
+3. **New fact argues for reversal:** save the new fact first WITHOUT `--supersedes`, save a retrospective (`reversed`) grounded on the new fact as based_on (`--grounded-in "NEW_ID:based_on"`), then supersede the old fact with `--by <new_id>`. The decision is now superseded, so no acknowledgement is needed.
+
+The 409 body lists those decisions under `decisions_needing_answer`. It does not list ids under `acknowledge_standing`, because that key is the map of the operator's words and a list is refused.
+
+HTTP 403 `decision_not_visible` is not a role refusal. Drop that decision id from `acknowledge_standing` (the caller cannot read it) and ask the operator.
 
 ⛔ Refuse a supersession that removes a decision's last based-on fact until the operator answers (decision:2802); the operator's words are carried per decision (fact:2809).
 

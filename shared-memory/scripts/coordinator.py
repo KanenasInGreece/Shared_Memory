@@ -607,7 +607,8 @@ def threads_left_ungrounded(rows: list[dict], fact_id: int) -> list[dict]:
                 fk = fact_kind_from_source_ref(g["source_ref"])
                 is_based_on = (default_grounding_role(fk) == ONT.grounded_in)
             else:
-                is_based_on = True
+                # No stored role and no source_ref. The edge writer defaults that gap to informed_by, so counting it as based_on would keep a decision standing on a fact that does not hold it (decision:2802: only a based_on fact keeps a decision standing).
+                is_based_on = _standing_role(None, None) == "based_on"
             if is_based_on:
                 has_standing_ground = True
                 break
@@ -628,6 +629,20 @@ def _is_doc_visible(visibility: str, agent_id: str, scope: str,
     if visibility == "scope" and viewer_scope and scope == viewer_scope:
         return True
     return False
+
+
+_TARGET_PG_ID_DIGITS = re.compile(r"^[0-9]+$")
+
+
+def _target_pg_id_as_bigint(text: object) -> int | None:
+    """Integer a retrospective target_pg_id may be cast to, or None when the text is not a digit string that fits in bigint.
+    1.5 and 1e20 are JSON numbers whose text is not a safe integer; casting them raises and would 500 every supersede (decision:2802: only a based_on fact keeps a decision standing)."""
+    if not isinstance(text, str) or _TARGET_PG_ID_DIGITS.fullmatch(text) is None:
+        return None
+    # Eighteen digits always fit in bigint. A longer digit string, the decimal text of 1e20, still raises.
+    if len(text) > 18:
+        return None
+    return int(text)
 
 
 def _standing_role(explicit: object, source_ref: object) -> str:
@@ -681,20 +696,41 @@ async def _refusal_if_ack_unreadable(conn, decision_id: int, thread_row: dict | 
     )
 
 
-_PLACEHOLDER_WORDS_RE = re.compile(
-    r"^(?:<[^>]+>|operator\s+(?:acknowledged|reason|words|confirmed)|placeholder|todo|tbd|none|n/a)$",
-    re.IGNORECASE,
-)
+_PLACEHOLDER_CANONICAL = frozenset({
+    "operator acknowledged",
+    "operator reason",
+    "operator words",
+    "operator confirmed",
+    "placeholder",
+    "todo",
+    "tbd",
+    "none",
+    "n/a",
+})
+_ACK_TRAILING_PUNCT = re.compile(r"""[\s.,;:!?"'`]+$""")
+_ACK_ANGLE = re.compile(r"^<[^>]+>$")
+
+
+def _normalised_ack_words(text: str) -> str:
+    """Fold case, internal whitespace, and trailing punctuation so a dotted stand-in compares equal to the bare word."""
+    folded = " ".join(text.split()).lower()
+    previous = None
+    while previous != folded:
+        previous = folded
+        folded = _ACK_TRAILING_PUNCT.sub("", folded).strip()
+    return folded
 
 
 def _is_placeholder_words(text: str) -> bool:
-    """True when the text is empty or a stand-in, so the gateway cannot store words the operator did not say (fact:2809: the operator's words are carried per decision)."""
+    """True when the text is empty or a stand-in after that fold, so 'Placeholder.' cannot be stored as the operator's words (fact:2809: the operator's words are carried per decision)."""
     if not isinstance(text, str):
         return True
-    s = text.strip()
-    if not s:
+    folded = _normalised_ack_words(text)
+    if not folded:
         return True
-    return bool(_PLACEHOLDER_WORDS_RE.match(s))
+    if folded in _PLACEHOLDER_CANONICAL:
+        return True
+    return _ACK_ANGLE.match(folded) is not None
 
 
 def _parse_and_validate_acknowledge_standing(raw_ack: Any) -> tuple[dict[int, str] | None, web.Response | None]:
@@ -754,7 +790,8 @@ def _format_decision_loses_last_ground_refusal(
         f"Nothing was written ({stage}). Ask the operator about EACH decision. "
         f"If the decision still stands: re-send acknowledge_standing as a map {{{ack_example}}}. "
         f"A list of ids, an empty string, or a placeholder is refused. "
-        f"If the new fact supports it or argues for reversal: save the new fact first WITHOUT supersedes, save a retrospective (validated/refined, or reversed) grounded on it, then retry the supersession. "
+        f"If the new fact supports it or argues for reversal: save the new fact first WITHOUT supersedes, save a retrospective (validated/refined, or reversed) grounded on the new fact as based_on (--grounded-in \"NEW_ID:based_on\"), then retry the supersession. "
+        f"The decisions are listed under decisions_needing_answer. "
         f"⛔ Refuse a supersession that removes a decision's last based-on fact until the operator answers (decision:2802); the operator's words are carried per decision (fact:2809)."
     )
     visible_titles = []
@@ -789,7 +826,7 @@ def _format_decision_loses_last_ground_refusal(
         "stage": stage,
         "message": msg_head + titles_suffix,
         "decisions": rendered_decisions,
-        "acknowledge_standing": unack_ids,
+        "decisions_needing_answer": unack_ids,
     }
 
 
@@ -3750,7 +3787,7 @@ class MemoryCoordinator:
 
     async def _thread_grounds(self, conn, fact_id: int) -> list[dict]:
         """Standing decisions whose thread cites fact_id, each ground's role resolved like the graph edge (decision:2802: only a based_on fact keeps a decision standing).
-        A retrospective whose target_pg_id is not a JSON number is skipped, so one bad row cannot 500 every supersede."""
+        A retrospective target_pg_id casts only when its text is a digit string, so 1.5 and 1e20 are skipped instead of raising and failing every supersede."""
         # Decisions directly citing fact_id or whose non-superseded retrospectives cite fact_id
         d_rows = await conn.fetch(
             """
@@ -3764,8 +3801,7 @@ class MemoryCoordinator:
                       SELECT 1 FROM technical_docs r
                       WHERE r.metadata->>'type' = 'retrospective'
                         AND NOT r.superseded
-                        AND jsonb_typeof(r.metadata->'target_pg_id') = 'number'
-                        AND (r.metadata->>'target_pg_id')::bigint = d.id
+                        AND CASE WHEN (r.metadata->>'target_pg_id') ~ '^[0-9]+$' AND length(r.metadata->>'target_pg_id') <= 18 THEN (r.metadata->>'target_pg_id')::bigint END = d.id
                         AND r.metadata->'grounded_in' @> to_jsonb($1::bigint)
                   )
               )
@@ -3778,12 +3814,11 @@ class MemoryCoordinator:
         d_ids = [r["id"] for r in d_rows]
         r_rows = await conn.fetch(
             """
-            SELECT r.id, r.metadata, (r.metadata->>'target_pg_id')::bigint AS target_pg_id
+            SELECT r.id, r.metadata, CASE WHEN (r.metadata->>'target_pg_id') ~ '^[0-9]+$' AND length(r.metadata->>'target_pg_id') <= 18 THEN (r.metadata->>'target_pg_id')::bigint END AS target_pg_id
             FROM technical_docs r
             WHERE r.metadata->>'type' = 'retrospective'
               AND NOT r.superseded
-              AND jsonb_typeof(r.metadata->'target_pg_id') = 'number'
-              AND (r.metadata->>'target_pg_id')::bigint = ANY($1::bigint[])
+              AND CASE WHEN (r.metadata->>'target_pg_id') ~ '^[0-9]+$' AND length(r.metadata->>'target_pg_id') <= 18 THEN (r.metadata->>'target_pg_id')::bigint END = ANY($1::bigint[])
             """,
             d_ids,
         )
@@ -3842,22 +3877,34 @@ class MemoryCoordinator:
             thread_grounds = []
             seen_grounds = set()
 
+            def _cite_ground(gid, roles):
+                # Keep based_on when any citation in the thread has it. A decision's informed_by must not hide its retrospective's based_on of the same fact (decision:2802: only a based_on fact keeps a decision standing).
+                if not isinstance(gid, int) or isinstance(gid, bool):
+                    return
+                g_data = ground_info.get(gid) or {"type": None, "source_ref": None, "superseded": False, "exists": False}
+                role = _standing_role(roles.get(str(gid)), g_data.get("source_ref"))
+                if gid in seen_grounds:
+                    if role == "based_on":
+                        for existing in thread_grounds:
+                            if existing["id"] == gid:
+                                existing["role"] = "based_on"
+                                break
+                    return
+                seen_grounds.add(gid)
+                thread_grounds.append({
+                    "id": gid,
+                    "type": g_data["type"],
+                    "superseded": g_data["superseded"],
+                    "exists": g_data["exists"],
+                    "source_ref": g_data["source_ref"],
+                    "role": role,
+                })
+
             # Add decision's grounds
             gi = d_meta.get("grounded_in")
             if isinstance(gi, list):
                 for gid in gi:
-                    if isinstance(gid, int) and not isinstance(gid, bool) and gid not in seen_grounds:
-                        seen_grounds.add(gid)
-                        g_data = ground_info.get(gid) or {"type": None, "source_ref": None, "superseded": False, "exists": False}
-                        role = _standing_role(d_roles.get(str(gid)), g_data.get("source_ref"))
-                        thread_grounds.append({
-                            "id": gid,
-                            "type": g_data["type"],
-                            "superseded": g_data["superseded"],
-                            "exists": g_data["exists"],
-                            "source_ref": g_data["source_ref"],
-                            "role": role,
-                        })
+                    _cite_ground(gid, d_roles)
 
             # Add retrospective grounds
             retro_ids = []
@@ -3868,18 +3915,7 @@ class MemoryCoordinator:
                 r_gi = r_meta.get("grounded_in")
                 if isinstance(r_gi, list):
                     for gid in r_gi:
-                        if isinstance(gid, int) and not isinstance(gid, bool) and gid not in seen_grounds:
-                            seen_grounds.add(gid)
-                            g_data = ground_info.get(gid) or {"type": None, "source_ref": None, "superseded": False, "exists": False}
-                            role = _standing_role(r_roles.get(str(gid)), g_data.get("source_ref"))
-                            thread_grounds.append({
-                                "id": gid,
-                                "type": g_data["type"],
-                                "superseded": g_data["superseded"],
-                                "exists": g_data["exists"],
-                                "source_ref": g_data["source_ref"],
-                                "role": role,
-                            })
+                        _cite_ground(gid, r_roles)
 
             out.append({
                 "id": d["id"],

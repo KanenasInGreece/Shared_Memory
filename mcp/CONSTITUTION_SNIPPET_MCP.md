@@ -92,9 +92,9 @@ Confirm with the operator first. Do not auto-decide. After a discussion that set
 
 Every fact needs a registered `project` in its metadata. This host has no working directory to derive one from, so ask the operator which project applies rather than inferring one; `general_discussion` is the answer for a record that belongs to none.
 
-`save_artifact`, `save_decision`, `save_retrospective`, and `supersede` return 403 when the role cannot write. That 403 is the role. Do not retry it. Say the record was not saved.
+`save_artifact`, `save_decision`, `save_retrospective`, and `supersede` return 403 when the role cannot write. That 403 is the role. Do not retry it. Say the record was not saved. A 403 `decision_not_visible` is not a role refusal: drop that decision id from `acknowledge_standing` (the caller cannot read it) and ask the operator.
 
-When superseding a fact that grounds decisions (`decision_loses_last_ground`), ask the operator per decision. If it still stands, re-send `acknowledge_standing` as a map of decision id to the operator's non-empty words. A list, an empty string, or a placeholder is refused. If the new fact supports it or argues for reversal, save the new fact, then the retrospective grounded on it, then supersede. ⛔ Refuse a supersession that removes a decision's last based-on fact until the operator answers (decision:2802); the operator's words are carried per decision (fact:2809).
+When superseding a fact that grounds decisions (`decision_loses_last_ground`), ask the operator per decision. The body lists them under `decisions_needing_answer`, because `acknowledge_standing` is the map you send and a list is refused. If it still stands, re-send `acknowledge_standing` as a map of decision id to the operator's non-empty words. A list, an empty string, or a placeholder is refused. If the new fact supports it or argues for reversal, save the new fact, then a retrospective grounded on it as based_on (`--grounded-in "NEW_ID:based_on"`), then supersede. A bare ground on a discussion fact becomes `informed_by`, and the check would refuse again. ⛔ Refuse a supersession that removes a decision's last based-on fact until the operator answers (decision:2802); the operator's words are carried per decision (fact:2809).
 
 Never register a database MCP alongside this one. A direct connection goes past the gateway.
 

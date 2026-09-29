@@ -419,6 +419,22 @@ def _gateway_message(r) -> str | None:
     return None
 
 
+def _error_token(body: object) -> str | None:
+    """The body's error token when it is a single word distinct from the sentence, so a 403 can name decision_not_visible beside the gateway's own words."""
+    if not isinstance(body, dict):
+        return None
+    code = body.get("error")
+    if not isinstance(code, str) or not code.strip():
+        return None
+    token = code.strip()
+    message = body.get("message")
+    if isinstance(message, str) and message.strip() == token:
+        return None
+    if " " in token:
+        return None
+    return token
+
+
 def _reply_json(r, *, log_auth: bool = False,
                 accept_status: tuple = ()) -> dict:
     """Decode the body only after the HTTP status is known, and pass accept_status to keep a non-2xx body such as a 503 health verdict (fact:1503: a 403 read-only refusal was decoded before the status check and reported as the coordinator being unreachable)."""
@@ -434,12 +450,25 @@ def _reply_json(r, *, log_auth: bool = False,
     # search error to 200 characters), and a long preamble hides the refusal.
     if r.status_code == 403:
         detail = _gateway_message(r) or _body_snippet(r)
-        head = f"Gateway refused this request (HTTP 403): {detail}" if detail else \
-               "Gateway refused this request (HTTP 403)."
+        # Name the machine code beside the sentence. A 403 decision_not_visible is not a role refusal, and the message alone hides that (fact:2809: the operator's words are carried per decision).
+        try:
+            parsed = r.json()
+        except Exception:
+            parsed = None
+        code = _error_token(parsed)
+        if code and detail:
+            head = f"Gateway refused this request (HTTP 403 {code}): {detail}"
+        elif detail:
+            head = f"Gateway refused this request (HTTP 403): {detail}"
+        else:
+            head = "Gateway refused this request (HTTP 403)."
         message = (f"{head} — the gateway ANSWERED and the credential was ACCEPTED, so "
                    f"this is an authorization refusal, not an authentication failure "
                    f"and not a transport fault.")
-        raise GatewayReplyError({"status": "error", "message": message})
+        payload = {"status": "error", "message": message}
+        if code:
+            payload["error"] = code
+        raise GatewayReplyError(payload)
 
     if r.status_code == 409:
         try:
@@ -467,20 +496,41 @@ def _reply_json(r, *, log_auth: bool = False,
         )}) from exc
 
 
-_PLACEHOLDER_WORDS_RE = re.compile(
-    r"^(?:<[^>]+>|operator\s+(?:acknowledged|reason|words|confirmed)|placeholder|todo|tbd|none|n/a)$",
-    re.IGNORECASE,
-)
+_PLACEHOLDER_CANONICAL = frozenset({
+    "operator acknowledged",
+    "operator reason",
+    "operator words",
+    "operator confirmed",
+    "placeholder",
+    "todo",
+    "tbd",
+    "none",
+    "n/a",
+})
+_ACK_TRAILING_PUNCT = re.compile(r"""[\s.,;:!?"'`]+$""")
+_ACK_ANGLE = re.compile(r"^<[^>]+>$")
+
+
+def _normalised_ack_words(text: str) -> str:
+    """Fold case, internal whitespace, and trailing punctuation so a dotted stand-in compares equal to the bare word."""
+    folded = " ".join(text.split()).lower()
+    previous = None
+    while previous != folded:
+        previous = folded
+        folded = _ACK_TRAILING_PUNCT.sub("", folded).strip()
+    return folded
 
 
 def _is_placeholder_words(text: str) -> bool:
-    """True when the text is empty or a stand-in, so the client cannot invent the operator's words (fact:2809: the operator's words are carried per decision)."""
+    """True when the text is empty or a stand-in after that fold, so the client cannot send 'Placeholder.' as the operator's words (fact:2809: the operator's words are carried per decision)."""
     if not isinstance(text, str):
         return True
-    s = text.strip()
-    if not s:
+    folded = _normalised_ack_words(text)
+    if not folded:
         return True
-    return bool(_PLACEHOLDER_WORDS_RE.match(s))
+    if folded in _PLACEHOLDER_CANONICAL:
+        return True
+    return _ACK_ANGLE.match(folded) is not None
 
 
 def _normalize_cli_ack(raw: Any) -> dict[int, str] | None:

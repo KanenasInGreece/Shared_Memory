@@ -390,7 +390,9 @@ async def test_t6_supersede_refusal_writes_nothing_and_fires_pre_check():
     assert body["error"] == "decision_loses_last_ground"
     assert body["fact"] == 2672
     assert body["stage"] == "pre-check"
-    assert body["acknowledge_standing"] == [2522]
+    assert body["decisions_needing_answer"] == [2522]
+    assert "acknowledge_standing" not in body
+    assert ":based_on" in body["message"]
     assert len(body["decisions"]) == 1
     assert body["decisions"][0]["pg_id"] == 2522
     assert body["decisions"][0]["title"] == "Use SQLite WAL mode"
@@ -455,7 +457,8 @@ async def test_t7_acknowledgement_handling_and_metadata():
         assert resp_partial.status == 409
         body_partial = json.loads(resp_partial.text)
         assert body_partial["error"] == "decision_loses_last_ground"
-        assert body_partial["acknowledge_standing"] == [2675]
+        assert body_partial["decisions_needing_answer"] == [2675]
+        assert "acknowledge_standing" not in body_partial
         assert [d["pg_id"] for d in body_partial["decisions"]] == [2675]
 
     # Sub-case C: Complete acknowledgement [2522, 2675] -> UPDATE carries supersession_ack.decisions == [2522, 2675]
@@ -657,7 +660,7 @@ async def test_t10_clients_preserve_409_rationale():
                 "rationale": "Untruncated critical rationale that must not be lost",
             }
         ],
-        "acknowledge_standing": [2522],
+        "decisions_needing_answer": [2522],
     }
     mock_resp_409.json = MagicMock(return_value=payload_409)
 
@@ -693,8 +696,11 @@ async def test_t10_clients_preserve_409_rationale():
     assert "decision:2522" in rendered
     assert "provide acknowledge_standing with:" not in rendered
     assert "save the new fact first" in rendered
+    assert "NEW_ID:based_on" in rendered
     assert "decision:2802" in rendered
     assert "fact:2809" in rendered
+    assert "decisions_needing_answer" in inspect.getsource(vs_mod._render_decision_loses_last_ground)
+    assert 'get("acknowledge_standing"' not in inspect.getsource(vs_mod._render_decision_loses_last_ground)
 
     # 4. Test vector_skill supersede tool
     with patch.object(vs_mod.httpx.AsyncClient, "post", return_value=mock_resp_409):
@@ -731,6 +737,10 @@ def test_t11_documentation_names_refusal_code():
     assert usage1 == usage2
     assert "decision:2802" in usage1 and "fact:2809" in usage1
     assert "decision:2751" not in usage1
+    assert 'NEW_ID:based_on' in usage1
+    assert "decision_not_visible" in usage1
+    assert "not a role refusal" in usage1
+    assert "decisions_needing_answer" in usage1
     assert "There is no `id:answer` syntax" in usage1
     assert "(or `--acknowledge-standing ID" not in usage1
 
@@ -742,18 +752,28 @@ def test_t11_documentation_names_refusal_code():
     assert "Decision id(s) or" not in skill1
     assert "decision_not_visible" in skill1
     assert "Save the new fact first" in skill1
+    assert 'NEW_ID:based_on' in skill1
+    assert "decisions_needing_answer" in skill1
     assert "decision:2802" in skill1 and "fact:2809" in skill1
     assert "decision:2751" not in skill1
 
     assert "decision:2751" not in sys_prompt
     assert "list of IDs" not in sys_prompt
     assert "save the new fact first" in sys_prompt
+    assert "NEW_ID:based_on" in sys_prompt
+    assert "decision_not_visible" in sys_prompt
+    assert "not a role refusal" in sys_prompt
+    assert "decisions_needing_answer" in sys_prompt
     assert "decision:2802" in sys_prompt and "fact:2809" in sys_prompt
 
     snippet = open(os.path.join(root, "mcp", "CONSTITUTION_SNIPPET_MCP.md"), encoding="utf-8").read()
     assert "decision:2802" in snippet and "fact:2809" in snippet
     assert "decision:2751" not in snippet
     assert "save the new fact" in snippet
+    assert "NEW_ID:based_on" in snippet
+    assert "decision_not_visible" in snippet
+    assert "not a role refusal" in snippet
+    assert "decisions_needing_answer" in snippet
 
     schema1 = open(os.path.join(root, "shared-memory", "Documentation", "schema.md"), encoding="utf-8").read()
     schema2 = open(
@@ -947,10 +967,133 @@ async def test_thread_grounds_resolves_roles_like_the_edge():
     assert role[(6, 16)] == "informed_by"
 
 
-def test_target_pg_id_cast_is_guarded():
-    """Both casts require a JSON number, so one bad retrospective cannot 500 every supersede."""
+@pytest.mark.asyncio
+async def test_retrospective_based_on_keeps_a_fact_the_decision_lists_as_informed_by():
+    """A decision's informed_by citation must not hide a standing retrospective's based_on of the same fact.
+    Superseding the decision's other based_on fact then passes: the thread still stands, so no 409.
+    Kills mutation: keep the first role seen and ignore a later based_on.
+    """
+    c, conn, _ = _coord()
+    decision_id = 2522
+    losing = 2672
+    kept = 2673
+
+    def decision_row(roles):
+        return {
+            "id": decision_id,
+            "content": "Keep the index\nbecause the split shipped",
+            "metadata": {
+                "type": "decision",
+                "grounded_in": [losing, kept],
+                "grounded_roles": roles,
+                "decision": {"title": "Keep the index", "rationale": "the split shipped"},
+            },
+            "agent_id": "claude",
+            "scope": "global",
+            "visibility": "global",
+        }
+
+    def retro_row(roles):
+        return {
+            "id": 9001,
+            "target_pg_id": decision_id,
+            "metadata": {
+                "type": "retrospective",
+                "target_pg_id": decision_id,
+                "grounded_in": [kept],
+                "grounded_roles": roles,
+            },
+        }
+
+    grounds = [
+        {"id": losing, "type": "fact", "source_ref": "discussion_context", "superseded": False},
+        {"id": kept, "type": "fact", "source_ref": "discussion_context", "superseded": False},
+    ]
+
+    async def fetch(sql, *args):
+        text = str(sql)
+        if "source_ref" in text:
+            return grounds
+        if "FROM technical_docs d" in text:
+            return [decision_row({"2672": "based_on", "2673": "informed_by"})]
+        if "ANY($1::bigint[])" in text:
+            return [retro_row({"2673": "based_on"})]
+        return []
+
+    async def fetchrow(sql, *args):
+        if "FOR UPDATE" in str(sql):
+            return {"superseded": False}
+        return {"superseded": False, "type": "fact"}
+
+    conn.fetch = AsyncMock(side_effect=fetch)
+    conn.fetchrow = AsyncMock(side_effect=fetchrow)
+    conn.fetchval = AsyncMock(return_value=None)
+
+    rows = await c._thread_grounds(conn, losing)
+    role = {g["id"]: g["role"] for g in rows[0]["grounds"]}
+    assert role[kept] == "based_on"
+    assert role[losing] == "based_on"
+
+    # The other order must not downgrade: a retrospective's informed_by cannot erase based_on.
+    async def fetch_keep(sql, *args):
+        text = str(sql)
+        if "source_ref" in text:
+            return grounds
+        if "FROM technical_docs d" in text:
+            return [decision_row({"2672": "based_on", "2673": "based_on"})]
+        if "ANY($1::bigint[])" in text:
+            return [retro_row({"2673": "informed_by"})]
+        return []
+
+    conn.fetch = AsyncMock(side_effect=fetch_keep)
+    kept_rows = await c._thread_grounds(conn, losing)
+    kept_role = {g["id"]: g["role"] for g in kept_rows[0]["grounds"]}
+    assert kept_role[kept] == "based_on"
+
+    conn.fetch = AsyncMock(side_effect=fetch)
+    resp = await c.handle_supersede(_make_request({"pg_id": losing}))
+    body = json.loads(resp.text)
+    assert resp.status != 409
+    assert body.get("error") != "decision_loses_last_ground"
+    assert resp.status == 200
+
+
+def test_target_pg_id_cast_rejects_non_integers():
+    """A retrospective target casts only as a digit string. 1.5 and 1e20 must not reach ::bigint.
+    Kills mutation: guard with jsonb_typeof = number, which still admits both.
+    """
+    import re
     src = inspect.getsource(MemoryCoordinator._thread_grounds)
-    assert src.count("jsonb_typeof(r.metadata->'target_pg_id') = 'number'") == 2
+    needle = (
+        "CASE WHEN (r.metadata->>'target_pg_id') ~ '^[0-9]+$' "
+        "AND length(r.metadata->>'target_pg_id') <= 18 "
+        "THEN (r.metadata->>'target_pg_id')::bigint END"
+    )
+    assert src.count(needle) >= 2
+    assert "jsonb_typeof(r.metadata->'target_pg_id')" not in src
+    found = re.findall(r"~ '(\^\[0-9\]\+\$)'", src)
+    assert len(found) >= 2
+    rx = re.compile(found[0])
+    mirror = coordinator_mod._target_pg_id_as_bigint
+    digits_18 = "1" * 18
+    samples = {
+        "1.5": None,
+        "1e20": None,
+        "1E20": None,
+        "1e+20": None,
+        "12": 12,
+        "0": 0,
+        "": None,
+        " 12": None,
+        "+12": None,
+        "12.0": None,
+        digits_18: int(digits_18),
+        "1" * 21: None,
+    }
+    for text, expected in samples.items():
+        assert mirror(text) == expected, text
+        sql_accepts = rx.fullmatch(text) is not None and len(text) <= 18
+        assert sql_accepts == (expected is not None), text
 
 
 def test_upsert_and_updates_keep_ack_shape():
@@ -1287,6 +1430,9 @@ async def test_mcp_refuses_list_and_placeholder_before_post():
     assert "list[int]" not in src
     doc = inspect.getdoc(fn) or ""
     assert "save the new fact" in doc
+    assert "NEW_ID:based_on" in doc
+    assert "decision_not_visible" in doc
+    assert "not a role refusal" in doc
     assert "decision:2802" in doc and "fact:2809" in doc
     assert "decision:2751" not in doc
 
@@ -1315,3 +1461,136 @@ async def test_client_list_ack_does_not_post():
         assert res["status"] == "error"
         assert "400" in res["message"]
         assert "fact:2809" in res["message"]
+
+
+def test_ground_with_no_role_and_no_source_follows_standing_role():
+    """A ground with no role and no source resolves like _standing_role, which is not based_on.
+    Kills mutation: treat that gap as a standing based_on fact.
+    """
+    role = coordinator_mod._standing_role(None, None)
+    rows = [{
+        "id": 2522,
+        "grounds": [
+            {"id": 2672, "type": "fact", "superseded": False, "exists": True, "role": "based_on"},
+            {"id": 2673, "type": "fact", "superseded": False, "exists": True},
+        ],
+    }]
+    lost = threads_left_ungrounded(rows, 2672)
+    if role == "based_on":
+        assert lost == []
+    else:
+        assert [r["id"] for r in lost] == [2522]
+
+
+_PUNCT_PLACEHOLDERS = (
+    "Placeholder.",
+    "TODO!",
+    "operator acknowledged.",
+    "  N/A.  ",
+    "tbd...",
+    "<operator reason>.",
+)
+_REAL_ACK = "The operator confirmed this decision still stands."
+
+
+def test_placeholder_folds_case_punctuation_and_whitespace():
+    """A stand-in is refused after case, trailing punctuation, and whitespace are folded.
+    Kills mutation: exact-match the raw string, so 'Placeholder.' is stored.
+    """
+    assert coordinator_mod._is_placeholder_words(_REAL_ACK) is False
+    for words in _PUNCT_PLACEHOLDERS:
+        assert coordinator_mod._is_placeholder_words(words) is True, words
+    for i, path in enumerate(_bridge_paths()):
+        mb = _load_memory_bridge(f"memory_bridge_punct_{i}", path)
+        assert mb._is_placeholder_words(_REAL_ACK) is False
+        for words in _PUNCT_PLACEHOLDERS:
+            with pytest.raises(ValueError):
+                mb._normalize_cli_ack([["5", words]])
+
+
+@pytest.mark.asyncio
+async def test_placeholder_punctuation_is_400_on_the_gateway_and_mcp():
+    """The gateway and the MCP tool refuse a punctuated stand-in before any write."""
+    c, conn, _ = _coord()
+    conn.fetchrow = AsyncMock(return_value={"superseded": False, "type": "fact"})
+    with patch.object(c, "_thread_grounds", new=AsyncMock(return_value=[_losing_decision()])):
+        resp = await c.handle_supersede(_make_request({
+            "pg_id": 2672,
+            "acknowledge_standing": {"2522": "Placeholder."},
+        }))
+    assert resp.status == 400
+    assert conn.transaction.call_count == 0
+
+    vs = _load_vector_skill("vector_skill_punct")
+
+    class _NoPost:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("punctuated placeholder was posted")
+
+    with patch.object(vs.httpx, "AsyncClient", _NoPost):
+        result = await vs.supersede(2672, acknowledge_standing={"2522": "TODO!"})
+    assert "400" in result
+    assert vs._is_placeholder_words(_REAL_ACK) is False
+
+
+def test_clients_surface_decision_not_visible_code_on_403():
+    """A 403 branch names the error code, not only the sentence.
+    Kills mutation: render message and drop error, so decision_not_visible looks like a role refusal.
+    """
+    body = {
+        "status": "error",
+        "error": "decision_not_visible",
+        "message": "decision 2522 is not readable by the authenticated agent",
+    }
+    for i, path in enumerate(_bridge_paths()):
+        mb = _load_memory_bridge(f"memory_bridge_403_{i}", path)
+        with pytest.raises(mb.GatewayReplyError) as caught:
+            mb._reply_json(_http(403, body))
+        payload = caught.value.payload
+        assert payload.get("error") == "decision_not_visible"
+        assert "decision_not_visible" in payload["message"]
+        assert "decision 2522 is not readable" in payload["message"]
+
+    vs = _load_vector_skill("vector_skill_403_code")
+    with pytest.raises(vs.GatewayReplyError) as caught_vs:
+        vs._reply_json(_http(403, body), "supersede")
+    assert "decision_not_visible" in caught_vs.value.message
+    assert "decision 2522 is not readable" in caught_vs.value.message
+
+
+@pytest.mark.asyncio
+async def test_locked_row_already_superseded_on_save_rolls_back():
+    """The save path raises when FOR UPDATE sees the target already superseded, so the insert does not commit.
+    Kills mutation: drop the locked already-superseded check on handle_save.
+    """
+    c, conn, _ = _coord()
+    tx = _recording_tx()
+    conn.transaction = MagicMock(return_value=tx)
+
+    async def fetchrow(sql, *args):
+        text = str(sql)
+        if "FOR UPDATE" in text:
+            return {"superseded": True}
+        if "INSERT INTO technical_docs" in text:
+            return {"id": 999}
+        return {"superseded": False, "type": "fact"}
+
+    conn.fetchrow = AsyncMock(side_effect=fetchrow)
+    with patch.object(c, "_thread_grounds", new=AsyncMock(return_value=[])), \
+         patch.object(c, "_embed", new=AsyncMock(return_value=[0.1])), \
+         patch.object(c, "_commit_axis_registrations", new=AsyncMock()):
+        resp = await c.handle_save(_make_request({
+            "content": "new correction fact",
+            "metadata": {
+                "project": "shared-memory-GitHub",
+                "source": "claude",
+                "supersedes": 2672,
+            },
+        }))
+    body = json.loads(resp.text)
+    assert resp.status == 409
+    assert body["error"] == "fact_already_superseded"
+    assert tx.exc_type is coordinator_mod._FactAlreadySuperseded
+    assert not any(
+        "INSERT INTO technical_docs" in str(call.args[0]) for call in conn.fetchrow.call_args_list
+    )

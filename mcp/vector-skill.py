@@ -458,6 +458,22 @@ def _gateway_message(r) -> str | None:
     return None
 
 
+def _error_token(body: object) -> str | None:
+    """The body's error token when it is a single word distinct from the sentence, so a 403 can name decision_not_visible beside the gateway's own words."""
+    if not isinstance(body, dict):
+        return None
+    code = body.get("error")
+    if not isinstance(code, str) or not code.strip():
+        return None
+    token = code.strip()
+    message = body.get("message")
+    if isinstance(message, str) and message.strip() == token:
+        return None
+    if " " in token:
+        return None
+    return token
+
+
 def _reply_json(r, tool: str) -> dict:
     """Decode JSON only after the status class is known (fact:1503)."""
     # _auth_rejected has already logged `auth_failed`, which is what
@@ -466,10 +482,20 @@ def _reply_json(r, tool: str) -> dict:
         raise GatewayReplyError(_auth_rejected(tool), logged_event="auth_failed")
 
     # The gateway's own words come before this client's framing.
+    # The error code is part of that answer: decision_not_visible is not a role refusal, and the sentence alone hides the code.
     if r.status_code == 403:
         detail = _gateway_message(r) or _body_snippet(r)
-        head = (f"Error: the gateway refused this request (HTTP 403): {detail}"
-                if detail else "Error: the gateway refused this request (HTTP 403).")
+        try:
+            parsed = r.json()
+        except Exception:
+            parsed = None
+        code = _error_token(parsed)
+        if code and detail:
+            head = f"Error: the gateway refused this request (HTTP 403 {code}): {detail}"
+        elif detail:
+            head = f"Error: the gateway refused this request (HTTP 403): {detail}"
+        else:
+            head = "Error: the gateway refused this request (HTTP 403)."
         raise GatewayReplyError(
             f"{head} — the gateway ANSWERED and the credential was ACCEPTED, so this is "
             f"an authorization refusal, not an authentication failure and not a "
@@ -500,10 +526,41 @@ def _reply_json(r, tool: str) -> dict:
             f"{_body_snippet(r, 120) or '(empty)'}") from exc
 
 
-_PLACEHOLDER_WORDS_RE = re.compile(
-    r"^(?:<[^>]+>|operator\s+(?:acknowledged|reason|words|confirmed)|placeholder|todo|tbd|none|n/a)$",
-    re.IGNORECASE,
-)
+_PLACEHOLDER_CANONICAL = frozenset({
+    "operator acknowledged",
+    "operator reason",
+    "operator words",
+    "operator confirmed",
+    "placeholder",
+    "todo",
+    "tbd",
+    "none",
+    "n/a",
+})
+_ACK_TRAILING_PUNCT = re.compile(r"""[\s.,;:!?"'`]+$""")
+_ACK_ANGLE = re.compile(r"^<[^>]+>$")
+
+
+def _normalised_ack_words(text: str) -> str:
+    """Fold case, internal whitespace, and trailing punctuation so a dotted stand-in compares equal to the bare word."""
+    folded = " ".join(text.split()).lower()
+    previous = None
+    while previous != folded:
+        previous = folded
+        folded = _ACK_TRAILING_PUNCT.sub("", folded).strip()
+    return folded
+
+
+def _is_placeholder_words(text: str) -> bool:
+    """True when the text is empty or a stand-in after that fold, so the tool cannot forward 'TODO!' as the operator's words (fact:2809: the operator's words are carried per decision)."""
+    if not isinstance(text, str):
+        return True
+    folded = _normalised_ack_words(text)
+    if not folded:
+        return True
+    if folded in _PLACEHOLDER_CANONICAL:
+        return True
+    return _ACK_ANGLE.match(folded) is not None
 
 
 def _ack_map_refusal(acknowledge_standing) -> str | None:
@@ -524,7 +581,7 @@ def _ack_map_refusal(acknowledge_standing) -> str | None:
             int(key)
         except (TypeError, ValueError):
             return f"Error: HTTP 400: acknowledge_standing key {key!r} is not a decision id."
-        if not isinstance(words, str) or not words.strip() or _PLACEHOLDER_WORDS_RE.match(words.strip()):
+        if not isinstance(words, str) or _is_placeholder_words(words):
             return (
                 f"Error: HTTP 400: acknowledge_standing[{key}] requires the operator's "
                 "non-empty words. An empty string or a placeholder is refused "
@@ -560,19 +617,24 @@ def _render_decision_loses_last_ground(body: dict) -> str:
             lines.append(f"    Retrospectives: {retros}")
 
     ids = []
-    for d in body.get("decisions") or []:
-        if d.get("pg_id") is not None:
-            ids.append(str(d["pg_id"]))
+    named = body.get("decisions_needing_answer")
+    if isinstance(named, list) and named:
+        ids = [str(i) for i in named]
+    else:
+        for d in body.get("decisions") or []:
+            if d.get("pg_id") is not None:
+                ids.append(str(d["pg_id"]))
     id_list = ", ".join(ids) if ids else "each decision id in this refusal"
     lines.append("")
     lines.append(
         "If a decision still stands, re-send acknowledge_standing as a map of "
         f"{{decision_id: \"the operator's words\"}} for {id_list}. "
-        "A list of ids, an empty string, or a placeholder is refused with HTTP 400."
+        "A list of ids, an empty string, or a placeholder is refused with HTTP 400. "
+        "The refusal lists those decisions under decisions_needing_answer."
     )
     lines.append(
         "If the new fact supports the decision or argues for reversal: save the new fact first, "
-        "then the retrospective grounded on it, then supersede."
+        "then a retrospective grounded on it as based_on (--grounded-in \"NEW_ID:based_on\"), then supersede."
     )
     lines.append(
         "⛔ Refuse a supersession that removes a decision's last based-on fact until the operator "
@@ -1177,6 +1239,8 @@ async def supersede(
 
     Requires a write-capable agent token: a read-only token receives an
     honest HTTP 403 role refusal from the gateway — expected, do not retry.
+    A 403 decision_not_visible is not a role refusal: drop that decision id
+    from acknowledge_standing (the caller cannot read it) and ask the operator.
 
     Soft: the old fact is KEPT for provenance but flagged, hidden from search,
     and excluded from consolidation. Supersession is EXPLICIT; never infer it
@@ -1192,15 +1256,19 @@ async def supersede(
     Use when a stored fact is wrong or outdated and you are NOT saving a
     replacement in the same call. When the decision already has another standing
     based-on fact, call save_artifact with "supersedes": <old_pg_id> in its
-    metadata_json. When it does not, save the new fact first, then the
-    retrospective grounded on it, then supersede.
+    metadata_json. When it does not, save the new fact first, then a
+    retrospective grounded on it as based_on (--grounded-in "NEW_ID:based_on"),
+    then supersede.
 
     If superseding this fact would leave standing decisions with no other
     standing fact grounds, the gateway returns HTTP 409 decision_loses_last_ground.
-    Ask the operator about each decision. If the decision still stands, re-send
+    Ask the operator about each decision. The body lists them under
+    decisions_needing_answer, not under acknowledge_standing: that key is the
+    map you send, and a list is refused. If the decision still stands, re-send
     acknowledge_standing as a map of {decision_id: the operator's words}. If the
-    new fact supports it or argues for reversal, save the new fact, then the
-    retrospective grounded on it, then supersede.
+    new fact supports it or argues for reversal, save the new fact, then a
+    retrospective grounded on it as based_on (--grounded-in "NEW_ID:based_on"),
+    then supersede.
     ⛔ Refuse a supersession that removes a decision's last based-on fact until
     the operator answers (decision:2802); the operator's words are carried per
     decision (fact:2809).

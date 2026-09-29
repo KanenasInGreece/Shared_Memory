@@ -134,7 +134,7 @@ save_retrospective --pg-id 2675 --rating validated --notes "The index loads." --
 save "the split shipped in v0.9.109" '{"source":"grok","source_ref":"OPERATE.md"}' --supersedes 2672
 ```
 
-When that save is refused with `decision_loses_last_ground`, do not retry the one-step flag. Save the new fact first (no `--supersedes`), then the retrospective grounded on it, then supersede. The one-step flag is only for a fact the decision does not rest on alone.
+When that save is refused with `decision_loses_last_ground`, do not retry the one-step flag. Save the new fact first (no `--supersedes`), then a retrospective grounded on that fact as based_on (`--grounded-in "NEW_ID:based_on"`), then supersede. The one-step flag is only for a fact the decision does not rest on alone. A bare ground defaults to `informed_by` for a discussion fact, so the check would refuse the supersession again.
 
 ```
 supersede --pg-id 2672 --acknowledge-standing 2522 "still stands without the new fact"
@@ -174,7 +174,7 @@ Refusals. Branch on `error`. One recovery; the second-submission essays are in `
 |---|---|
 | `axis_conflict` | Axes are fixed at first write. Supersede. Do not re-save the same content onto other axes. |
 | `cypher_rejected` | Neo4j rejected the Cypher. Fix the query. Retrying it unchanged will not succeed. |
-| `decision_loses_last_ground` | Ask per decision. Still stands: re-send `--acknowledge-standing ID "operator's words"` for each decision. Supported or reversal: save the new fact, then the retrospective grounded on it, then supersede. ⛔ Refuse a supersession that removes a decision's last based-on fact until the operator answers (decision:2802); the operator's words are carried per decision (fact:2809). |
+| `decision_loses_last_ground` | Ask per decision. The 409 lists them under `decisions_needing_answer`, because `acknowledge_standing` is the map you send and a list is refused. Still stands: re-send `--acknowledge-standing ID "operator's words"` for each decision. Supported or reversal: save the new fact, then a retrospective grounded on it as based_on (`--grounded-in "NEW_ID:based_on"`), then supersede. ⛔ Refuse a supersession that removes a decision's last based-on fact until the operator answers (decision:2802); the operator's words are carried per decision (fact:2809). |
 | `decision_not_visible` | The acknowledgement names a decision this caller cannot read. The viewer is the authenticated agent. Do not send that id. |
 | `domain_confusable` | Ask. If it is a different section, re-send `confirm_distinct_from` naming the near match. Otherwise use the existing name. |
 | `domain_not_allowed_on_judgement` | Do not send a domain. A retrospective does not store sections, and the decision's axes do not move onto it. |
