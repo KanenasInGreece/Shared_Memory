@@ -573,8 +573,11 @@ def _thematic_conn_script(insert_id=90):
         # fold is now zero/low-inference (§3.1) and recomputes the group's
         # FULL current membership fresh every time; there is no cumulative
         # "previous + new" narrative to fetch and merge any more.
-        # 4. summary INSERT  5. outbox flip  6. supersession SELECT
-        {"rowcount": 1, "rows": [(insert_id,)]},
+        # 4. summary INSERT (RETURNING id, xmax=0)
+        {"rowcount": 1, "rows": [(insert_id, True)]},
+        # 4b. re-gate lookup on arbiter key (decision:2801) — returns no row
+        {"rowcount": 0, "rows": []},
+        # 5. outbox flip  6. supersession SELECT
         {"rowcount": 2, "rows": []},
         {"rowcount": 0, "rows": []},
         # 7. close_ledger_rows DELETE  8. superseded-predecessor purge

@@ -664,7 +664,7 @@ def thematic_cypher_query(pg_ids) -> str:
 
 def fetch_active_thematic_rows(conn, keys):
     """The ACTIVE thematic summary per (project, section) axis key, for the
-    output-identity check below — `{(project, section): (content,
+    output-identity check below — `{(project, section): (id, content,
     source_pg_ids, entities)}`. Superseded rows are deliberately invisible
     here: a summary Mechanism B retired MUST read as "no current row" so its
     group re-folds on the next pass (C3.1 F0's arbiter makes the same
@@ -677,7 +677,7 @@ def fetch_active_thematic_rows(conn, keys):
         cur.execute(
             "SELECT COALESCE(metadata->>'project', ''),"
             "       COALESCE(metadata->>'domain', ''),"
-            "       content, source_pg_ids, metadata->'entities'"
+            "       id, content, source_pg_ids, metadata->'entities'"
             "  FROM community_summaries"
             " WHERE NOT superseded"
             "   AND COALESCE(metadata->>'kind', 'thematic') <> 'insight'"
@@ -687,8 +687,8 @@ def fetch_active_thematic_rows(conn, keys):
             "        COALESCE(metadata->>'domain', '')) IN %s",
             (LEVEL_ENTITY, LEVEL_DOMAIN, tuple(keys)),
         )
-        return {(p, d): (content, src, ents)
-                for p, d, content, src, ents in cur.fetchall()}
+        return {(p, d): (row_id, content, src, ents)
+                for p, d, row_id, content, src, ents in cur.fetchall()}
 
 
 def thematic_fold_is_current(active_row, summary, pg_ids, entities):
@@ -699,8 +699,8 @@ def thematic_fold_is_current(active_row, summary, pg_ids, entities):
     gate (§2.2: without it "a gating group re-folds an identical insight
     every cycle"). Operator ruling 2026-08-11: already-folded thematic
     summaries are not re-folded unless something changed — supersession
-    included, which needs no case here because a superseded constituent
-    changes the computed content directly (see below).
+    included, which retires the old row and folds a fresh one with a
+    successor pointer (decision:2778: constituent supersession retires the active summary and folds a successor).
 
     Every comparison failure fails OPEN to folding, so no subset-triggered
     refold (P12 subset supersession, a superseded constituent shrinking
@@ -714,7 +714,7 @@ def thematic_fold_is_current(active_row, summary, pg_ids, entities):
     write, which is exactly the churn this check exists to stop. Pure."""
     if not active_row:
         return False
-    stored_content, stored_src, stored_entities = active_row
+    _, stored_content, stored_src, stored_entities = active_row
     if stored_content != summary:
         return False
     if set(stored_src or []) != set(pg_ids or []):
@@ -1128,6 +1128,18 @@ def fetch_unreconciled(conn):
         return cur.fetchall()
 
 
+def fetch_superseded_thematic_summaries(conn):
+    """PG-retired thematic summaries for graph reconciliation:
+    `[(id, superseded_by)]`."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT id, superseded_by FROM community_summaries"
+            " WHERE superseded"
+            "   AND COALESCE(metadata->>'kind', 'thematic') <> 'insight'"
+        )
+        return cur.fetchall()
+
+
 def close_ledger_rows(conn, pg_ids, context="consolidation"):
     """Final ledger transition: delete 'consolidated' rows once the Neo4j
     marking has succeeded. Row absence = both stores conclusively synced.
@@ -1493,7 +1505,7 @@ def close_ledger_rows_by_id(conn, row_ids, context="insight"):
 # retrospective:1178 refines decision:384: invalidation is read from stored lists, re-gating from the graph, and the ledger is only the clock.
 # Mechanism B writes no outbox rows. A reversal shrinks the covered set, so subset coverage cannot retire the old row.
 
-def fetch_invalidated_summaries(conn):
+def fetch_invalidated_summaries(conn, kinds=("thematic", "insight"), skip_ids=()):
     """U2 — identify ACTIVE summaries holding an invalid member, by REVERSE
     LOOKUP on their own stored id lists — NEVER by set comparison (§5.2: a
     reversal makes the covered set SMALLER, so subset coverage, Mechanism A,
@@ -1504,13 +1516,16 @@ def fetch_invalidated_summaries(conn):
     REVERSED decision (`rating='reversed'`, coordinator.py's retrospective
     handler) alike — same column, same test, nothing to keep in sync (§2.2a).
 
-    ⛔ TWO legs, not three (`decision:1207`): thematic→insight lineage (the
-    former leg 3) is disabled — a superseded thematic summary's staleness
-    is judged LAZILY at read time via coordinator.py's `stale_summaries`
-    annotation, never re-derived here; reversal→insight (leg 2, §2.2a/I10)
-    stays eager.
+    ⛔ TWO legs, not three (`decision:1207`, `decision:2778`): thematic→insight
+    lineage (the former leg 3) is disabled — an insight's staleness against retired
+    thematic summaries is judged LAZILY at read time via coordinator.py's
+    `retired_summaries` annotation, never re-derived here (`decision:2778`: supersession
+    yardstick). Callers select legs via ``kinds`` and exclude active groups via ``skip_ids``:
+    the fact consolidation path (`_consolidate_clusters`) owns thematic retirement,
+    while the sweep invalidation pass (`run_lineage_invalidation_pass`) owns insight
+    invalidation (reversal→insight, leg 2).
 
-    The two legs that remain:
+    The two legs:
 
       1. THEMATIC summaries (`kind != 'insight'`) whose `source_pg_ids`
          holds a superseded fact.
@@ -1527,36 +1542,51 @@ def fetch_invalidated_summaries(conn):
     ``trigger_kind`` ('technical_docs'|'community_summaries'), ``trigger_id``.
     """
     out = []
+    kinds = tuple(kinds or ())
+    skip_ids = list(skip_ids or [])
     with conn.cursor() as cur:
-        # Leg 1 stays eager: a thematic summary that still holds a superseded fact.
-        cur.execute(
-            "SELECT DISTINCT cs.id, cs.source_pg_ids, t.id"
-            "  FROM community_summaries cs"
-            "  JOIN technical_docs t ON t.id = ANY(cs.source_pg_ids)"
-            " WHERE NOT cs.superseded"
-            "   AND COALESCE(cs.metadata->>'kind', 'thematic') <> 'insight'"
-            "   AND COALESCE(t.superseded, false) = true"
-        )
-        for sid, src, trig in cur.fetchall():
-            out.append({"summary_id": sid, "source_pg_ids": list(src or []),
-                       "kind": "thematic", "trigger_kind": "technical_docs",
-                       "trigger_id": trig})
+        if "thematic" in kinds:
+            # Leg 1: a thematic summary that still holds a superseded fact.
+            sql = (
+                "SELECT DISTINCT cs.id, cs.source_pg_ids, t.id"
+                "  FROM community_summaries cs"
+                "  JOIN technical_docs t ON t.id = ANY(cs.source_pg_ids)"
+                " WHERE NOT cs.superseded"
+                "   AND COALESCE(cs.metadata->>'kind', 'thematic') <> 'insight'"
+                "   AND COALESCE(t.superseded, false) = true"
+            )
+            params = []
+            if skip_ids:
+                sql += "   AND NOT (cs.id = ANY(%s))"
+                params.append(skip_ids)
+            cur.execute(sql, tuple(params) if params else None)
+            for sid, src, trig in cur.fetchall():
+                out.append({"summary_id": sid, "source_pg_ids": list(src or []),
+                           "kind": "thematic", "trigger_kind": "technical_docs",
+                           "trigger_id": trig})
 
-        # Leg 2 stays eager: the reversed decision is a member of the insight, not a thematic summary under it.
-        cur.execute(
-            "SELECT DISTINCT cs.id, cs.source_pg_ids, t.id"
-            "  FROM community_summaries cs"
-            "  JOIN technical_docs t ON t.id = ANY(cs.source_pg_ids)"
-            " WHERE NOT cs.superseded"
-            "   AND cs.metadata->>'kind' = 'insight'"
-            "   AND COALESCE(t.superseded, false) = true"
-        )
-        for sid, src, trig in cur.fetchall():
-            out.append({"summary_id": sid, "source_pg_ids": list(src or []),
-                       "kind": "insight", "trigger_kind": "technical_docs",
-                       "trigger_id": trig})
+        if "insight" in kinds:
+            # Leg 2 stays eager: the reversed decision is a member of the insight, not a thematic summary under it.
+            sql = (
+                "SELECT DISTINCT cs.id, cs.source_pg_ids, t.id"
+                "  FROM community_summaries cs"
+                "  JOIN technical_docs t ON t.id = ANY(cs.source_pg_ids)"
+                " WHERE NOT cs.superseded"
+                "   AND cs.metadata->>'kind' = 'insight'"
+                "   AND COALESCE(t.superseded, false) = true"
+            )
+            params = []
+            if skip_ids:
+                sql += "   AND NOT (cs.id = ANY(%s))"
+                params.append(skip_ids)
+            cur.execute(sql, tuple(params) if params else None)
+            for sid, src, trig in cur.fetchall():
+                out.append({"summary_id": sid, "source_pg_ids": list(src or []),
+                           "kind": "insight", "trigger_kind": "technical_docs",
+                           "trigger_id": trig})
 
-        # decision:1207: do not reinstate the thematic-to-insight lineage query. Search annotates stale summaries in coordinator.py.
+        # decision:2778 (supersession yardstick): do not reinstate the thematic-to-insight lineage query;
+        # a superseded grounding fact does not retire an insight while its decision stands.
     return out
 
 
@@ -1599,7 +1629,44 @@ def resolve_standing_ids(conn, pg_ids):
         return {r[0]: (r[1], r[2]) for r in cur.fetchall()}
 
 
-def retire_invalidated_summaries(conn):
+def _retire_summary(cur, conn, summary_id, kind="thematic", source_pg_ids=None, triggers=None):
+    """Retire an invalidated community summary (`superseded_reason='lineage'`) and
+    open refold ledger rows for its still-standing constituents to re-enter future
+    consolidation cycles (`decision:2778`: supersession yardstick). Leaves transaction
+    uncommitted so the caller can combine retirement with successor insertion or batch commit."""
+    cur.execute(
+        "UPDATE community_summaries SET superseded = true,"
+        "  superseded_at = now(), superseded_reason = 'lineage'"
+        " WHERE id = %s AND NOT superseded",
+        (summary_id,),
+    )
+    if cur.rowcount == 0:
+        return False, 0
+
+    if source_pg_ids is None:
+        cur.execute("SELECT source_pg_ids FROM community_summaries WHERE id = %s", (summary_id,))
+        row = cur.fetchone()
+        source_pg_ids = list(row[0] or []) if row else []
+
+    triggers = triggers or []
+    standing = resolve_standing_ids(conn, source_pg_ids)
+    eligible_ids = sorted({
+        sid for sid, still_sup in standing.values() if not still_sup
+    })
+    opened = 0
+    for trigger_kind, trigger_id in triggers:
+        for pg_id in eligible_ids:
+            cur.execute(
+                "INSERT INTO refold_ledger"
+                "  (pg_id, summary_id, summary_kind, trigger_kind, trigger_id)"
+                " VALUES (%s, %s, %s, %s, %s)",
+                (pg_id, summary_id, kind, trigger_kind, trigger_id),
+            )
+            opened += 1
+    return True, opened
+
+
+def retire_invalidated_summaries(conn, kinds=("thematic", "insight"), skip_ids=()):
     """U3 + U4 — retire every summary `fetch_invalidated_summaries` finds and
     open the `refold_ledger` clock for its still-eligible constituents,
     ATOMICALLY: one Postgres transaction for the whole pass (a retirement
@@ -1628,7 +1695,7 @@ def retire_invalidated_summaries(conn):
     ``[(summary_id, kind, source_pg_ids)]`` (drives the caller's Neo4j
     pass); ``opened`` is the total refold_ledger row count, for the log line.
     """
-    matches = fetch_invalidated_summaries(conn)
+    matches = fetch_invalidated_summaries(conn, kinds=kinds, skip_ids=skip_ids)
     if not matches:
         return [], 0
 
@@ -1643,35 +1710,323 @@ def retire_invalidated_summaries(conn):
             entry["triggers"].append(trig)
 
     retired = []
-    opened = 0
+    total_opened = 0
     with conn.cursor() as cur:
         for summary_id, info in by_summary.items():
-            cur.execute(
-                "UPDATE community_summaries SET superseded = true,"
-                "  superseded_at = now(), superseded_reason = 'lineage'"
-                " WHERE id = %s AND NOT superseded",
-                (summary_id,),
+            # A concurrent sweep or fold pass may have retired the row between fetch and here;
+            # rowcount == 0 skips it so no duplicate refold_ledger rows are opened.
+            success, opened = _retire_summary(
+                cur, conn, summary_id,
+                kind=info["kind"],
+                source_pg_ids=info["source_pg_ids"],
+                triggers=info["triggers"],
             )
-            if cur.rowcount == 0:
-                # Already retired by a concurrent pass or Mechanism A. That retirement owns the ledger entry.
-                continue
-            retired.append((summary_id, info["kind"], info["source_pg_ids"]))
-
-            standing = resolve_standing_ids(conn, info["source_pg_ids"])
-            eligible_ids = sorted({
-                sid for sid, still_sup in standing.values() if not still_sup
-            })
-            for trigger_kind, trigger_id in info["triggers"]:
-                for pg_id in eligible_ids:
-                    cur.execute(
-                        "INSERT INTO refold_ledger"
-                        "  (pg_id, summary_id, summary_kind, trigger_kind, trigger_id)"
-                        " VALUES (%s, %s, %s, %s, %s)",
-                        (pg_id, summary_id, info["kind"], trigger_kind, trigger_id),
-                    )
-                    opened += 1
+            if success:
+                retired.append((summary_id, info["kind"], info["source_pg_ids"]))
+                total_opened += opened
     conn.commit()
-    return retired, opened
+    return retired, total_opened
+
+
+def solid_match(threads_old: set, threads_new: set) -> bool:
+    """decision:2801 (an insight follows a new thematic row only when every decision
+    it had support for keeps support): True iff threads_old is a subset of threads_new."""
+    return set(threads_old).issubset(set(threads_new))
+
+
+def link_thematic_successor(cur, old_id, new_id):
+    """decision:2778 (insight successor repointing) and decision:2801 (an insight follows
+    a new thematic row only when every decision it had support for keeps support): link
+    old_id -> new_id via superseded_by, and repoint active insights citing old_id to new_id
+    only on a solid match across the whole insight. Deduplicates summary_ids (first occurrence wins).
+    Metadata only, never updated_at. Returns (repointed_ids, kept_ids)."""
+    cur.execute(
+        "UPDATE community_summaries SET superseded_by = %s WHERE id = %s",
+        (new_id, old_id),
+    )
+    cur.execute(
+        "SELECT id, metadata, source_pg_ids FROM community_summaries"
+        " WHERE NOT superseded AND metadata->>'kind' = 'insight'"
+        "   AND metadata->'summary_ids' @> %s FOR UPDATE",
+        (json.dumps([old_id]),),
+    )
+    rows = cur.fetchall()
+    if not rows:
+        logger.info(
+            "link_thematic_successor: old_id=%s -> new_id=%s; 0 insights citing old_id",
+            old_id, new_id,
+        )
+        return [], []
+
+    candidate_doc_ids = set()
+    candidate_summary_ids = {old_id, new_id}
+    parsed_insights = []
+    for ins_id, meta, src_ids in rows:
+        if isinstance(meta, str):
+            try:
+                meta = json.loads(meta)
+            except Exception:
+                meta = {}
+        elif not isinstance(meta, dict):
+            meta = {}
+        sids = meta.get("summary_ids", [])
+        candidate_summary_ids.update(sids)
+        candidate_doc_ids.update(src_ids or [])
+        parsed_insights.append((ins_id, meta, src_ids or [], sids))
+
+    thread_facts_map = {}
+    if candidate_doc_ids:
+        cur.execute("""
+            WITH decisions AS (
+                SELECT id FROM technical_docs
+                WHERE id = ANY(%s) AND metadata->>'type' = 'decision'
+            ),
+            decision_facts AS (
+                SELECT d.id AS decision_id, elem::int AS fact_id
+                FROM technical_docs d,
+                     jsonb_array_elements(
+                         CASE WHEN jsonb_typeof(d.metadata->'grounded_in') = 'array'
+                              THEN d.metadata->'grounded_in' ELSE '[]'::jsonb END
+                     ) elem
+                WHERE d.id IN (SELECT id FROM decisions)
+                  AND jsonb_typeof(d.metadata->'grounded_in') = 'array'
+                  AND jsonb_typeof(elem) = 'number'
+                UNION
+                SELECT (r.metadata->>'target_pg_id')::bigint AS decision_id, elem::int AS fact_id
+                FROM technical_docs r,
+                     jsonb_array_elements(
+                         CASE WHEN jsonb_typeof(r.metadata->'grounded_in') = 'array'
+                              THEN r.metadata->'grounded_in' ELSE '[]'::jsonb END
+                     ) elem
+                WHERE NOT r.superseded AND r.metadata->>'type' = 'retrospective'
+                  AND r.metadata->>'target_pg_id' IN (SELECT id::text FROM decisions)
+                  AND jsonb_typeof(r.metadata->'grounded_in') = 'array'
+                  AND jsonb_typeof(elem) = 'number'
+            )
+            SELECT d.id AS decision_id, COALESCE(array_agg(df.fact_id) FILTER (WHERE df.fact_id IS NOT NULL), '{}') AS fact_ids
+            FROM decisions d
+            LEFT JOIN decision_facts df ON d.id = df.decision_id
+            GROUP BY d.id
+        """, (list(candidate_doc_ids),))
+        for d_id, f_ids in cur.fetchall():
+            thread_facts_map[d_id] = set(f_ids or [])
+
+    cur.execute(
+        "SELECT id, source_pg_ids FROM community_summaries WHERE id = ANY(%s)",
+        (list(candidate_summary_ids),),
+    )
+    summary_facts_map = {r[0]: set(r[1] or []) for r in cur.fetchall()}
+
+    repointed = []
+    kept = []
+    for ins_id, meta, src_ids, old_sids in parsed_insights:
+        ins_decisions = [d for d in src_ids if d in thread_facts_map]
+
+        facts_before = set()
+        for sid in old_sids:
+            facts_before.update(summary_facts_map.get(sid, set()))
+        threads_before = {d for d in ins_decisions if thread_facts_map[d] & facts_before}
+
+        new_sids = []
+        seen = set()
+        for sid in old_sids:
+            target = new_id if sid == old_id else sid
+            if target not in seen:
+                seen.add(target)
+                new_sids.append(target)
+
+        facts_after = set()
+        for sid in new_sids:
+            facts_after.update(summary_facts_map.get(sid, set()))
+        threads_after = {d for d in ins_decisions if thread_facts_map[d] & facts_after}
+
+        if solid_match(threads_before, threads_after):
+            meta["summary_ids"] = new_sids
+            cur.execute(
+                "UPDATE community_summaries SET metadata = %s WHERE id = %s",
+                (json.dumps(meta), ins_id),
+            )
+            repointed.append(ins_id)
+        else:
+            kept.append(ins_id)
+
+    logger.info(
+        "link_thematic_successor: old_id=%s -> new_id=%s; repointed %d insight(s) %s, kept %d insight(s) %s",
+        old_id, new_id, len(repointed), repointed, len(kept), kept,
+    )
+    return repointed, kept
+
+
+def recheck_kept_thematic_ids(conn):
+    """decision:2801 (an insight follows a new thematic row only when every decision
+    it had support for keeps support): re-check active insights citing lineage-retired
+    thematic summaries, following superseded_by to the chain's active end and repointing
+    when solid match is satisfied."""
+    with conn.cursor() as cur:
+        # Bounded query: active insights citing at least one lineage-retired thematic row
+        cur.execute("""
+            WITH lineage_retired AS (
+                SELECT id FROM community_summaries
+                WHERE COALESCE(metadata->>'kind', 'thematic') <> 'insight'
+                  AND superseded AND superseded_reason = 'lineage'
+            )
+            SELECT cs.id, cs.metadata, cs.source_pg_ids
+            FROM community_summaries cs
+            WHERE NOT cs.superseded AND cs.metadata->>'kind' = 'insight'
+              AND EXISTS (
+                  SELECT 1 FROM jsonb_array_elements_text(COALESCE(cs.metadata->'summary_ids', '[]'::jsonb)) elem
+                  WHERE elem::int IN (SELECT id FROM lineage_retired)
+              )
+            FOR UPDATE
+        """)
+        insight_rows = cur.fetchall()
+        if not insight_rows:
+            return 0, 0
+
+        all_cited_sids = set()
+        all_src_ids = set()
+        insights_parsed = []
+        for ins_id, meta, src_ids in insight_rows:
+            if isinstance(meta, str):
+                try:
+                    meta = json.loads(meta)
+                except Exception:
+                    meta = {}
+            elif not isinstance(meta, dict):
+                meta = {}
+            sids = meta.get("summary_ids", [])
+            all_cited_sids.update(sids)
+            all_src_ids.update(src_ids or [])
+            insights_parsed.append((ins_id, meta, src_ids or [], sids))
+
+        cur.execute("""
+            SELECT id, superseded, superseded_by, superseded_reason, source_pg_ids
+            FROM community_summaries
+            WHERE id = ANY(%s)
+        """, (list(all_cited_sids),))
+        summ_rows = {r[0]: r for r in cur.fetchall()}
+
+        active_ends = {}
+        for sid in all_cited_sids:
+            row = summ_rows.get(sid)
+            if not row or not row[1] or row[3] != "lineage":
+                continue
+            curr_id = sid
+            curr_row = row
+            visited = {curr_id}
+            while curr_row and curr_row[1] and curr_row[2] is not None:
+                next_id = curr_row[2]
+                if next_id in visited:
+                    break
+                visited.add(next_id)
+                if next_id not in summ_rows:
+                    cur.execute("""
+                        SELECT id, superseded, superseded_by, superseded_reason, source_pg_ids
+                        FROM community_summaries WHERE id = %s
+                    """, (next_id,))
+                    nr = cur.fetchone()
+                    if nr:
+                        summ_rows[next_id] = nr
+                        curr_row = nr
+                    else:
+                        curr_row = None
+                else:
+                    curr_row = summ_rows[next_id]
+
+            if curr_row and not curr_row[1]:
+                active_ends[sid] = curr_row[0]
+
+        if not active_ends:
+            return 0, len(insights_parsed)
+
+        thread_facts_map = {}
+        if all_src_ids:
+            cur.execute("""
+                WITH decisions AS (
+                    SELECT id FROM technical_docs
+                    WHERE id = ANY(%s) AND metadata->>'type' = 'decision'
+                ),
+                decision_facts AS (
+                    SELECT d.id AS decision_id, elem::int AS fact_id
+                    FROM technical_docs d,
+                         jsonb_array_elements(
+                             CASE WHEN jsonb_typeof(d.metadata->'grounded_in') = 'array'
+                                  THEN d.metadata->'grounded_in' ELSE '[]'::jsonb END
+                         ) elem
+                    WHERE d.id IN (SELECT id FROM decisions)
+                      AND jsonb_typeof(d.metadata->'grounded_in') = 'array'
+                      AND jsonb_typeof(elem) = 'number'
+                    UNION
+                    SELECT (r.metadata->>'target_pg_id')::bigint AS decision_id, elem::int AS fact_id
+                    FROM technical_docs r,
+                         jsonb_array_elements(
+                             CASE WHEN jsonb_typeof(r.metadata->'grounded_in') = 'array'
+                                  THEN r.metadata->'grounded_in' ELSE '[]'::jsonb END
+                         ) elem
+                    WHERE NOT r.superseded AND r.metadata->>'type' = 'retrospective'
+                      AND r.metadata->>'target_pg_id' IN (SELECT id::text FROM decisions)
+                      AND jsonb_typeof(r.metadata->'grounded_in') = 'array'
+                      AND jsonb_typeof(elem) = 'number'
+                )
+                SELECT d.id AS decision_id, COALESCE(array_agg(df.fact_id) FILTER (WHERE df.fact_id IS NOT NULL), '{}') AS fact_ids
+                FROM decisions d
+                LEFT JOIN decision_facts df ON d.id = df.decision_id
+                GROUP BY d.id
+            """, (list(all_src_ids),))
+            for d_id, f_ids in cur.fetchall():
+                thread_facts_map[d_id] = set(f_ids or [])
+
+        summary_facts_map = {sid: set(r[4] or []) for sid, r in summ_rows.items()}
+
+        repointed_count = 0
+        kept_count = 0
+        for ins_id, meta, src_ids, sids in insights_parsed:
+            repointed_any = False
+            curr_sids = list(sids)
+            # Substitute ids in sorted order: deterministic between sweeps (decision:2751).
+            for old_sid, active_sid in sorted(active_ends.items()):
+                if old_sid not in curr_sids:
+                    continue
+                ins_decisions = [d for d in src_ids if d in thread_facts_map]
+
+                facts_before = set()
+                for s in curr_sids:
+                    facts_before.update(summary_facts_map.get(s, set()))
+                threads_before = {d for d in ins_decisions if thread_facts_map[d] & facts_before}
+
+                new_sids = []
+                seen = set()
+                for s in curr_sids:
+                    target = active_sid if s == old_sid else s
+                    if target not in seen:
+                        seen.add(target)
+                        new_sids.append(target)
+
+                facts_after = set()
+                for s in new_sids:
+                    facts_after.update(summary_facts_map.get(s, set()))
+                threads_after = {d for d in ins_decisions if thread_facts_map[d] & facts_after}
+
+                if solid_match(threads_before, threads_after):
+                    curr_sids = new_sids
+                    repointed_any = True
+
+            if repointed_any:
+                meta["summary_ids"] = curr_sids
+                cur.execute(
+                    "UPDATE community_summaries SET metadata = %s WHERE id = %s",
+                    (json.dumps(meta), ins_id),
+                )
+                repointed_count += 1
+            else:
+                kept_count += 1
+
+    conn.commit()
+    logger.info(
+        "Ledger sweep recheck: repointed %d insight(s), kept %d insight(s) citing lineage-retired summaries",
+        repointed_count, kept_count,
+    )
+    return repointed_count, kept_count
 
 
 def fetch_refold_backlog(conn):
@@ -2541,18 +2896,14 @@ class ConsolidationDaemon:
         re-derive groups from the graph this same tick — no reader ever sees
         a stale summary and its just-opened ledger row at once.
 
-        Postgres retirement (`retire_invalidated_summaries`) is one atomic
-        pass. The Neo4j half is this method's own job: a retired INSIGHT's
-        member Decision/Retrospective nodes have `consolidated` cleared —
-        gate-critical (G3, `insight_gate.passes_insight_gate`) — so they read as fresh on
-        the very next walk. A retired THEMATIC summary needs no graph write
-        at all (`_find_grounded_fact_groups` never reads `f.consolidated`).
-
-        Postgres commits first; the graph write follows the same best-effort
-        contract as every other two-store marking here (`_mark_insight_in_
-        graph` et al.) — on failure this logs and returns, because there is
-        currently no reconciliation query for "retired but not yet cleared
-        in the graph" (see the C3 report's recommendation on this gap)."""
+        Postgres retirement (`retire_invalidated_summaries`, kinds=("insight",))
+        is one atomic pass — thematic invalidation is owned by the fact
+        consolidation path (`decision:2778`: supersession yardstick). The Neo4j half is
+        this method's own job: a retired INSIGHT's member Decision/Retrospective nodes
+        have `consolidated` cleared — gate-critical (G3, `insight_gate.passes_insight_gate`)
+        — so they read as fresh on the very next walk. (Caveat: Fact nodes never have
+        `consolidated` cleared — `_find_grounded_fact_groups` is a full scan that never
+        reads it, so clearing it would be a write with no reader.)"""
         loop = asyncio.get_running_loop()
         try:
             conn = await loop.run_in_executor(
@@ -2563,7 +2914,8 @@ class ConsolidationDaemon:
             return
         try:
             retired, opened = await loop.run_in_executor(
-                None, lambda: retire_invalidated_summaries(conn))
+                None, lambda: retire_invalidated_summaries(conn, kinds=("insight",))
+            )
             if not retired:
                 return
             logger.info(
@@ -2606,8 +2958,9 @@ class ConsolidationDaemon:
           2. Reconcile — re-apply the Neo4j marking for rows stuck at
              'consolidated' (crash between Postgres commit and graph sync),
              then close them. Idempotent, so no graph-state check first.
-          3. Evaluate — if the rem_reviewed fact backlog meets the density
-             threshold, run the full (unanchored) grounded-fact scan and
+             Also re-applies graph flags and SUPERSEDES edges for PG-retired
+             thematic summaries.
+          3. Evaluate — run the full (unanchored) grounded-fact scan and
              fold what qualifies.
         """
         loop = asyncio.get_running_loop()
@@ -2637,20 +2990,23 @@ class ConsolidationDaemon:
                     )
                     logger.info("Ledger sweep: reconciled summary %d, closed %d rows.", summary_id, closed)
 
+                # Reconcile PG-retired thematic rows in graph (decision:2778: graph status sync for retired summaries)
+                retired_thematic = await loop.run_in_executor(
+                    None, lambda: fetch_superseded_thematic_summaries(conn)
+                )
+                if retired_thematic:
+                    await self._reconcile_retired_in_graph(retired_thematic)
+
+                # decision:2801 (an insight follows a new thematic row only when every decision it had support for keeps support):
+                # re-check kept lineage-retired thematic ids cited by active insights and repoint when solid.
+                await loop.run_in_executor(
+                    None, lambda: recheck_kept_thematic_ids(conn)
+                )
+
                 # Same widened set as fetch_combined_fact_backlog: outbox union lineage invalidation.
                 backlog = await loop.run_in_executor(None, lambda: fetch_combined_fact_backlog(conn))
             finally:
                 await loop.run_in_executor(None, conn.close)
-
-            if len(backlog) < DENSITY_THRESHOLD:
-                if backlog:
-                    logger.info(
-                        "Ledger sweep: %d facts awaiting NREM (< %d) — no cluster can be due.",
-                        len(backlog), DENSITY_THRESHOLD,
-                    )
-                await loop.run_in_executor(
-                    None, lambda: _crun_record_idle("fact_consolidation"))
-                return
 
             rows = await self._find_grounded_fact_groups()
             if not rows:
@@ -2879,17 +3235,72 @@ class ConsolidationDaemon:
                 member_id_lists, ts_map, DENSITY_THRESHOLD)
             rec.dead_lettered_clusters = dead_lettered_count
 
-            # A scanned fact that never met density is not backlog. Close its open refold_ledger row instead of leaving it forever.
-            all_gated_member_ids = [pid for w in work_items for pid in w[3]]
-            below_density_ids = sorted(set(pg_ids_all) - set(all_gated_member_ids))
-            await loop.run_in_executor(
-                None, lambda: drop_below_density_refold_rows(
-                    conn, below_density_ids, context="fact_consolidation"))
+            # decision:2778: batched read for superseded facts in removed members and unchanged gating rows
+            removed_by_key = {}
+            all_removed_ids = set()
+            for project, section, summary, pg_ids, entities in fold_work_items:
+                k = (project or "", section or SECTION_NONE)
+                act = active_rows.get(k)
+                if act and act[2]:
+                    rem = set(act[2]) - set(pg_ids)
+                    if rem:
+                        removed_by_key[k] = rem
+                        all_removed_ids.update(rem)
 
-            # A pg_id that never entered the scan cannot be closed as below-density. Close it with a distinct reason.
-            await loop.run_in_executor(
-                None, lambda: drop_out_of_scan_refold_rows(
-                    conn, pg_ids_all, context="fact_consolidation"))
+            unchanged_active_ids = {}
+            for p, s, _c, _i in eligible_work_items:
+                k = (p or "", s or SECTION_NONE)
+                if k not in [(w[0] or "", w[1] or SECTION_NONE) for w in fold_work_items]:
+                    act = active_rows.get(k)
+                    if act and act[2]:
+                        unchanged_active_ids[k] = (act[0], list(act[2]))
+
+            all_unchanged_member_ids = {pid for _, members in unchanged_active_ids.values() for pid in members}
+            ids_to_check = sorted(all_removed_ids | all_unchanged_member_ids)
+
+            superseded_in_pg = set()
+            if ids_to_check:
+                def _fetch_superseded_members():
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            "SELECT id FROM technical_docs"
+                            " WHERE id = ANY(%s) AND COALESCE(superseded, false) = true",
+                            (ids_to_check,),
+                        )
+                        return {r[0] for r in cur.fetchall()}
+                superseded_in_pg = await loop.run_in_executor(None, _fetch_superseded_members)
+
+            # Divergence check on unchanged gating rows: log WARNING, do NOT retire
+            for k, (row_id, members) in unchanged_active_ids.items():
+                held_sup = [m for m in members if m in superseded_in_pg]
+                if held_sup:
+                    logger.warning(
+                        "Store disagreement: unchanged gating row %d (%s/%s) holds PG-superseded fact(s) %s",
+                        row_id, k[0], k[1], held_sup,
+                    )
+
+            sup_removed_by_key = {
+                k: sorted(rem & superseded_in_pg)
+                for k, rem in removed_by_key.items()
+            }
+
+            # decision:2778: retire invalidated summaries for non-gating groups with no successor
+            gating_keys = {(p or "", s or SECTION_NONE) for p, s, _c, _i in eligible_work_items}
+            gating_skip_ids = sorted({active_rows[k][0] for k in gating_keys if k in active_rows})
+            retired_summaries, _ = await loop.run_in_executor(
+                None, lambda: retire_invalidated_summaries(
+                    conn, kinds=("thematic",), skip_ids=tuple(gating_skip_ids))
+            )
+            if retired_summaries:
+                retired_ids = [sid for sid, _kind, _src in retired_summaries]
+                try:
+                    await self._mark_summaries_retired_in_graph(retired_ids)
+                except Exception as e:
+                    logger.error(
+                        "Graph sync failed for no-successor retired summaries %s — "
+                        "Postgres retirement is committed; ledger sweep reconciliation will retry: %s",
+                        retired_ids, e,
+                    )
 
             # Every item folds at domain level with an empty entity. These are constants, not per-item fields.
             entity = ""
@@ -2898,6 +3309,11 @@ class ConsolidationDaemon:
 
             for project, section, summary, pg_ids, entities in fold_work_items:
                 label = f"domain:{project}/{section or SECTION_NONE}"
+                key = (project or "", section or SECTION_NONE)
+                sup_removed = sup_removed_by_key.get(key, [])
+                active_row = active_rows.get(key)
+                old_id = active_row[0] if active_row else None
+                stored_src = active_row[2] if active_row else []
 
                 # Zero-inference index: each member's own text, recomputed from the full current membership. This loop runs only when that text differs from the active row.
                 topic = f"{project}/{section}"
@@ -2936,9 +3352,19 @@ class ConsolidationDaemon:
                     _meta_json = json.dumps(metadata)
                     _summary, _embedding, _pg_ids = summary, embedding, pg_ids
                     _level = level
+                    regate_old_id = None
                     def _write_summary():
+                        nonlocal regate_old_id
                         with conn.cursor() as cur:
-                            # ON CONFLICT must include AND NOT superseded (migration 032). Otherwise a lineage-retired row matches, and the UPDATE never clears superseded.
+                            if sup_removed and old_id is not None:
+                                # decision:2778: retire old thematic row before inserting its successor.
+                                _retire_summary(
+                                    cur, conn, old_id, kind="thematic",
+                                    source_pg_ids=stored_src,
+                                    triggers=[("technical_docs", x) for x in sup_removed],
+                                )
+                            # ⛔ Prohibition: ON CONFLICT predicate MUST include AND NOT superseded (migration 032).
+                            # Without it, an in-place conflict update would resurrect a retired row instead of inserting a fresh successor.
                             cur.execute("""
                                 INSERT INTO community_summaries (content, metadata, embedding, source_pg_ids, run_id)
                                 VALUES (%s, %s, %s, %s, %s)
@@ -2972,9 +3398,37 @@ class ConsolidationDaemon:
                                                 LIMIT 20
                                             ) sub
                                         )
-                                RETURNING id
+                                RETURNING id, (xmax = 0)
                             """, (_summary, _meta_json, _embedding, _pg_ids, run_id))
-                            summary_id = cur.fetchone()[0]
+                            insert_row = cur.fetchone()
+                            summary_id = insert_row[0]
+                            is_inserted = bool(insert_row[1]) if len(insert_row) > 1 else (old_id is None)
+                            if sup_removed and old_id is not None:
+                                # decision:2778: link retired row to its fresh successor and repoint referencing insights.
+                                link_thematic_successor(cur, old_id, summary_id)
+                            elif is_inserted:
+                                # decision:2801 (an insight follows a new thematic row only when every decision it had support for keeps support):
+                                # re-gate link connects newest lineage-retired predecessor on the same arbiter key to the fresh row.
+                                cur.execute("""
+                                    SELECT id FROM community_summaries
+                                    WHERE COALESCE(metadata->>'kind', 'thematic') <> 'insight'
+                                      AND COALESCE(metadata->>'entity', '') = %s
+                                      AND COALESCE(metadata->>'project', '') = %s
+                                      AND COALESCE(metadata->>'domain', '') = %s
+                                      AND COALESCE(metadata->>'level', 'entity') = %s
+                                      AND superseded AND superseded_reason = 'lineage' AND superseded_by IS NULL
+                                    ORDER BY superseded_at DESC NULLS LAST, id DESC
+                                    LIMIT 1
+                                """, (
+                                    metadata.get("entity") or "",
+                                    metadata.get("project") or "",
+                                    metadata.get("domain") or "",
+                                    metadata.get("level") or "entity",
+                                ))
+                                regate_row = cur.fetchone()
+                                if regate_row:
+                                    regate_old_id = regate_row[0]
+                                    link_thematic_successor(cur, regate_old_id, summary_id)
                             cur.execute(
                                 "UPDATE neo4j_outbox SET status = 'consolidated', consolidated_at = now()"
                                 " WHERE pg_id = ANY(%s)"
@@ -2992,6 +3446,14 @@ class ConsolidationDaemon:
                             project=project or "",
                             domain=section or SECTION_NONE),
                     )
+                    if sup_removed and old_id is not None:
+                        superseded_ids = list(superseded_ids or [])
+                        if old_id not in superseded_ids:
+                            superseded_ids.append(old_id)
+                    if regate_old_id is not None:
+                        superseded_ids = list(superseded_ids or [])
+                        if regate_old_id not in superseded_ids:
+                            superseded_ids.append(regate_old_id)
 
                     await loop.run_in_executor(None, conn.commit)
                     rec.fold(True)
@@ -3026,6 +3488,17 @@ class ConsolidationDaemon:
                         "ledger reconciliation will retry: %s",
                         label, summary_pg_id, e,
                     )
+
+            # decision:2778: drop below-density and out-of-scan refold rows after the fold loop so non-gating rows are retired first
+            all_gated_member_ids = [pid for w in work_items for pid in w[3]]
+            below_density_ids = sorted(set(pg_ids_all) - set(all_gated_member_ids))
+            await loop.run_in_executor(
+                None, lambda: drop_below_density_refold_rows(
+                    conn, below_density_ids, context="fact_consolidation"))
+
+            await loop.run_in_executor(
+                None, lambda: drop_out_of_scan_refold_rows(
+                    conn, pg_ids_all, context="fact_consolidation"))
 
             # Beside the outbox close: refold_ledger rows this pass covered become refolded.
             await loop.run_in_executor(
@@ -3089,8 +3562,47 @@ class ConsolidationDaemon:
                     f"MATCH (new:{ONT.community_summary} {{pg_id: $new_id}})"
                     f" UNWIND $old_ids AS old_pg_id"
                     f" MATCH (old:{ONT.community_summary} {{pg_id: old_pg_id}})"
-                    f" MERGE (new)-[:{ONT.supersedes}]->(old)",
+                    f" MERGE (new)-[:{ONT.supersedes}]->(old)"
+                    f" SET old.superseded = true, old.superseded_at = datetime()",
                     new_id=summary_pg_id, old_ids=superseded_ids
+                )
+
+    async def _mark_summaries_retired_in_graph(self, ids):
+        """Mark no-successor lineage-retired CommunitySummary nodes in Neo4j."""
+        if not ids:
+            return
+        async with self.driver.session() as session:
+            await session.run(
+                f"UNWIND $ids AS sid"
+                f" MATCH (s:{ONT.community_summary} {{pg_id: sid}})"
+                f" SET s.superseded = true, s.superseded_at = datetime()",
+                ids=list(ids),
+            )
+
+    async def _reconcile_retired_in_graph(self, rows):
+        """Re-apply graph flags and SUPERSEDES edges for PG-retired thematic rows.
+        Idempotent."""
+        rows = [r for r in rows if isinstance(r, (list, tuple)) and len(r) >= 2]
+        if not rows:
+            return
+        async with self.driver.session() as session:
+            all_ids = [int(r[0]) for r in rows if r[0] is not None]
+            if all_ids:
+                await session.run(
+                    f"UNWIND $ids AS sid"
+                    f" MATCH (s:{ONT.community_summary} {{pg_id: sid}})"
+                    f" SET s.superseded = true, s.superseded_at = coalesce(s.superseded_at, datetime())",
+                    ids=all_ids,
+                )
+            pairs = [[int(r[0]), int(r[1])] for r in rows if r[0] is not None and r[1] is not None]
+            if pairs:
+                await session.run(
+                    f"UNWIND $pairs AS p"
+                    f" MATCH (old:{ONT.community_summary} {{pg_id: p[0]}})"
+                    f" MATCH (new:{ONT.community_summary} {{pg_id: p[1]}})"
+                    f" MERGE (new)-[:{ONT.supersedes}]->(old)"
+                    f" SET old.superseded = true, old.superseded_at = coalesce(old.superseded_at, datetime())",
+                    pairs=pairs,
                 )
 
     # Insight consolidation (decision pg_id 276).

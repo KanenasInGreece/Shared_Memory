@@ -180,7 +180,7 @@ def _wire(monkeypatch, daemon, conn, finish):
 # ── The pure comparison ──────────────────────────────────────────────────────
 
 def test_identical_output_is_current():
-    row = (_CURRENT_CONTENT, [1, 2], ["Widget"])
+    row = (10, _CURRENT_CONTENT, [1, 2], ["Widget"])
     assert thematic_fold_is_current(row, _CURRENT_CONTENT, [1, 2], ["Widget"])
 
 
@@ -193,30 +193,30 @@ def test_no_active_row_is_never_current():
 def test_content_divergence_folds():
     """Any text change — membership, rem_summary re-condensation, kind,
     origin, even pure line re-ordering — fails the check and re-folds."""
-    row = (_CURRENT_CONTENT + " (stale)", [1, 2], ["Widget"])
+    row = (10, _CURRENT_CONTENT + " (stale)", [1, 2], ["Widget"])
     assert not thematic_fold_is_current(row, _CURRENT_CONTENT, [1, 2], ["Widget"])
 
 
 def test_source_set_divergence_folds():
     """A superseded constituent shrinks the member set; a new fact grows it.
     Either way the stored set no longer matches and the group re-folds."""
-    row = (_CURRENT_CONTENT, [1, 2, 3], ["Widget"])
+    row = (10, _CURRENT_CONTENT, [1, 2, 3], ["Widget"])
     assert not thematic_fold_is_current(row, _CURRENT_CONTENT, [1, 2], ["Widget"])
 
 
 def test_entity_divergence_folds():
     """`entities` is the one §3.1 payload field that can move without the
     text moving — it is compared in its own right."""
-    row = (_CURRENT_CONTENT, [1, 2], ["Widget", "Gadget"])
+    row = (10, _CURRENT_CONTENT, [1, 2], ["Widget", "Gadget"])
     assert not thematic_fold_is_current(row, _CURRENT_CONTENT, [1, 2], ["Widget"])
 
 
 def test_comparison_is_order_insensitive_on_sets_only():
     """source_pg_ids and entities compare as SETS (storage order is not
     semantic); content compares as EXACT BYTES (its order is the artifact)."""
-    row = (_CURRENT_CONTENT, [2, 1], ["Widget"])
+    row = (10, _CURRENT_CONTENT, [2, 1], ["Widget"])
     assert thematic_fold_is_current(row, _CURRENT_CONTENT, [1, 2], ["Widget"])
-    row = (_CURRENT_CONTENT, [1, 2], None)
+    row = (10, _CURRENT_CONTENT, [1, 2], None)
     assert not thematic_fold_is_current(row, _CURRENT_CONTENT, [1, 2], ["Widget"])
     assert thematic_fold_is_current(row, _CURRENT_CONTENT, [1, 2], [])
 
@@ -251,8 +251,12 @@ async def test_current_cluster_is_skipped_without_embedding_or_write(monkeypatch
     clusters (stall-verdict guard), and extra carries unchanged_clusters=1."""
     monkeypatch.delenv("MOCK_LLM", raising=False)
     daemon, session = daemon_with_fake_graph()
-    conn = StubConn(script=_script(
-        [("general", "ops", _CURRENT_CONTENT, [1, 2], ["Widget"])]))
+    script = _script(
+        [("general", "ops", 10, _CURRENT_CONTENT, [1, 2], ["Widget"])])
+    # Step 4 check for unchanged gating rows, then Step 5 retire_invalidated_summaries check
+    script.append({"rowcount": 0, "rows": []})
+    script.append({"rowcount": 0, "rows": []})
+    conn = StubConn(script=script)
     finish = {}
     _wire(monkeypatch, daemon, conn, finish)
 
@@ -275,13 +279,14 @@ async def test_divergent_active_row_still_folds(monkeypatch):
     monkeypatch.delenv("MOCK_LLM", raising=False)
     daemon, session = daemon_with_fake_graph()
     script = _script(
-        [("general", "ops", "an older fold of this group", [1, 2], ["Widget"])])
+        [("general", "ops", 10, "an older fold of this group", [1, 2], ["Widget"])])
     script += [
+        {"rowcount": 0, "rows": []},          # step 5 retire_invalidated_summaries
         {"rowcount": 2, "rows": []},          # census outbox timestamps
-        {"rowcount": 0, "rows": []},          # drop_out_of_scan close
         {"rowcount": 1, "rows": [(90,)]},     # summary INSERT
         {"rowcount": 2, "rows": []},          # outbox flip
         {"rowcount": 0, "rows": []},          # supersession SELECT
+        {"rowcount": 0, "rows": []},          # post-loop drop_out_of_scan close
     ]
     conn = StubConn(script=script)
     finish = {}
@@ -309,13 +314,14 @@ async def test_entity_only_divergence_still_folds(monkeypatch):
     monkeypatch.delenv("MOCK_LLM", raising=False)
     daemon, _session = daemon_with_fake_graph()
     script = _script(
-        [("general", "ops", _CURRENT_CONTENT, [1, 2], ["Widget", "Gadget"])])
+        [("general", "ops", 10, _CURRENT_CONTENT, [1, 2], ["Widget", "Gadget"])])
     script += [
-        {"rowcount": 2, "rows": []},
-        {"rowcount": 0, "rows": []},
-        {"rowcount": 1, "rows": [(90,)]},
-        {"rowcount": 2, "rows": []},
-        {"rowcount": 0, "rows": []},
+        {"rowcount": 0, "rows": []},          # step 5 retire_invalidated_summaries
+        {"rowcount": 2, "rows": []},          # census outbox timestamps
+        {"rowcount": 1, "rows": [(90,)]},     # summary INSERT
+        {"rowcount": 2, "rows": []},          # outbox flip
+        {"rowcount": 0, "rows": []},          # supersession SELECT
+        {"rowcount": 0, "rows": []},          # post-loop drop_out_of_scan close
     ]
     conn = StubConn(script=script)
     finish = {}

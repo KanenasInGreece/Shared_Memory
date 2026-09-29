@@ -1131,17 +1131,16 @@ async def test_search_community_summary_surfaces_traceback_pointers():
     assert cs["metadata"]["domain"] == "shared-memory"
 
 
-# ── stale_summaries — lazy thematic→insight lineage annotation (decision:1207) ─
+# ── retired_summaries — lazy thematic→insight lineage annotation (PR 2, Fix 2) ──
 #
-# §2.5/§5.2 AMENDED: the eager lineage cascade (consolidation_loop.py's former
-# leg 3) is disabled — a superseded thematic summary no longer eagerly
-# supersedes an insight resting on it. Instead the insight's search result
-# gains an ADDITIVE `stale_summaries` key at READ time, keyed on the
-# insight's own `summary_ids`, mirroring `stale_sources`'s philosophy.
+# A superseded thematic summary no longer eagerly supersedes an insight resting on it.
+# With eager substitution (link_thematic_successor), any id remaining in summary_ids
+# that is superseded means the group no longer gates. At read time, the insight search
+# result carries `retired_summaries` with superseded_reason and superseded_by.
 
 @pytest.mark.asyncio
-async def test_search_insight_result_carries_stale_summaries_when_thematic_superseded():
-    """(d) — MUTATION-CHECKED: dropping the `stale_summaries` assignment in
+async def test_search_insight_result_carries_retired_summaries_when_thematic_superseded():
+    """T11 — MUTATION-CHECKED: dropping the `retired_summaries` assignment in
     coordinator.py's search path (the `if rtype == "insight": ...` block)
     makes this test fail."""
     c, mock_conn, mock_session = _coordinator_with_mocks()
@@ -1158,7 +1157,7 @@ async def test_search_insight_result_carries_stale_summaries_when_thematic_super
     ])
     mock_conn.fetch = AsyncMock(side_effect=[
         [{"id": 1, "content": "fact content", "metadata": {"entities": [], "source": "claude-code"}}],
-        [{"id": 501, "superseded_reason": "lineage"}],   # stale_summary_map
+        [{"id": 501, "superseded": True, "superseded_reason": "lineage", "superseded_by": None, "source_pg_ids": []}],   # retired_summary_map
     ])
     mock_session.run = AsyncMock(return_value=_AsyncIter())
 
@@ -1182,22 +1181,20 @@ async def test_search_insight_result_carries_stale_summaries_when_thematic_super
     assert resp.status == 200
     results = json.loads(resp.text)["results"]
     insight_result = next(r for r in results if r["tier"] == "insight_summary")
-    assert insight_result["stale_summaries"] == [
-        {"summary_id": 501, "superseded_reason": "lineage"}]
+    assert insight_result["retired_summaries"] == [
+        {"summary_id": 501, "superseded_reason": "lineage", "superseded_by": None, "unsupported": []}]
 
-    # (d), second half — the query that produced this MUST target
-    # community_summaries, NEVER technical_docs: the two id sequences
-    # overlap (§3.2's documented trap), so joining the wrong table would
-    # silently mis-annotate.
-    stale_summary_call = mock_conn.fetch.call_args_list[1]
-    sql = stale_summary_call.args[0]
+    # The query that produced this MUST target community_summaries, NEVER technical_docs
+    retired_summary_call = mock_conn.fetch.call_args_list[1]
+    sql = retired_summary_call.args[0]
     assert "community_summaries" in sql
     assert "technical_docs" not in sql
+    assert "superseded_by" in sql
 
 
 @pytest.mark.asyncio
-async def test_search_insight_result_omits_stale_summaries_when_thematic_live():
-    """(d) — the companion case: an insight over LIVE (non-superseded)
+async def test_search_insight_result_omits_retired_summaries_when_thematic_live():
+    """T11 — the companion case: an insight over LIVE (non-superseded)
     thematic summaries must NOT carry the key at all (additive, not a
     default-present field)."""
     c, mock_conn, mock_session = _coordinator_with_mocks()
@@ -1214,7 +1211,7 @@ async def test_search_insight_result_omits_stale_summaries_when_thematic_live():
     ])
     mock_conn.fetch = AsyncMock(side_effect=[
         [{"id": 1, "content": "fact content", "metadata": {"entities": [], "source": "claude-code"}}],
-        [],   # stale_summary_map — summary 501 is NOT superseded
+        [],   # retired_summary_map — summary 501 is NOT superseded
     ])
     mock_session.run = AsyncMock(return_value=_AsyncIter())
 
@@ -1238,18 +1235,18 @@ async def test_search_insight_result_omits_stale_summaries_when_thematic_live():
     assert resp.status == 200
     results = json.loads(resp.text)["results"]
     insight_result = next(r for r in results if r["tier"] == "insight_summary")
-    assert "stale_summaries" not in insight_result
+    assert "retired_summaries" not in insight_result
 
 
 @pytest.mark.asyncio
-async def test_search_stale_summaries_never_reads_from_a_colliding_technical_docs_id():
-    """§3.2's documented trap: `community_summaries.id` and `technical_docs.id`
+async def test_search_retired_summaries_never_reads_from_a_colliding_technical_docs_id():
+    """T11 — §3.2's documented trap: `community_summaries.id` and `technical_docs.id`
     are different, OVERLAPPING sequences. An insight whose `source_pg_ids`
     happens to share the integer 501 with a SUPERSEDED `technical_docs` row
     (triggering `stale_sources`, the pre-existing mechanism), while its own
     `summary_ids` also names 501 — a DIFFERENT, LIVE `community_summaries`
     row — must get `stale_sources` from the first and must NOT get
-    `stale_summaries` from the collision. The two annotations are read from
+    `retired_summaries` from the collision. The two annotations are read from
     different tables and must never cross-contaminate."""
     c, mock_conn, mock_session = _coordinator_with_mocks()
 
@@ -1266,7 +1263,7 @@ async def test_search_stale_summaries_never_reads_from_a_colliding_technical_doc
     mock_conn.fetch = AsyncMock(side_effect=[
         [{"id": 1, "content": "fact content", "metadata": {"entities": [], "source": "claude-code"}}],
         [{"id": 501, "superseded_by": 900}],   # stale_map — technical_docs id 501 IS superseded
-        [],                                       # stale_summary_map — community_summaries id 501 is LIVE
+        [],                                       # retired_summary_map — community_summaries id 501 is LIVE
     ])
     mock_session.run = AsyncMock(return_value=_AsyncIter())
 
@@ -1291,20 +1288,18 @@ async def test_search_stale_summaries_never_reads_from_a_colliding_technical_doc
     results = json.loads(resp.text)["results"]
     insight_result = next(r for r in results if r["tier"] == "insight_summary")
     assert insight_result["stale_sources"] == [{"old": 501, "superseded_by": 900}]
-    assert "stale_summaries" not in insight_result
+    assert "retired_summaries" not in insight_result
 
 
 @pytest.mark.asyncio
-async def test_search_stale_summaries_db_failure_degrades_with_a_logged_warning(caplog):
-    """CQ-1 (multi-role review of PR #232) — FAILURE != IDLE. A transient DB
-    fault on the `stale_summary_map` fetch must not read as "no superseded
+async def test_search_retired_summaries_db_failure_degrades_with_a_logged_warning(caplog):
+    """T11 — CQ-1 (multi-role review of PR #232) — FAILURE != IDLE. A transient DB
+    fault on the `retired_summary_map` fetch must not read as "no superseded
     summaries" with zero trace: the search still succeeds and the annotation
     is simply absent (advisory, never load-bearing), but the degrade is
     logged. MUTATION-CHECKED: removing the `log.warning(...)` call in
     coordinator.py's except path makes this test fail on the second
-    assertion while the first still passes — proving the test actually pins
-    the LOG, not just the degrade-to-no-annotation behaviour (already pinned
-    by the omits-when-live test above)."""
+    assertion while the first still passes."""
     c, mock_conn, mock_session = _coordinator_with_mocks()
 
     mock_conn.fetchrow = AsyncMock(side_effect=[
@@ -1349,15 +1344,81 @@ async def test_search_stale_summaries_db_failure_degrades_with_a_logged_warning(
     assert resp.status == 200
     results = json.loads(resp.text)["results"]
     insight_result = next(r for r in results if r["tier"] == "insight_summary")
-    assert "stale_summaries" not in insight_result
+    assert "retired_summaries" not in insight_result
 
     # The degrade was LOGGED, not silent.
     warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
     msg = " ".join(r.getMessage() for r in warnings)
-    assert "stale_summaries" in msg
+    assert "retired_summaries" in msg
     assert "RuntimeError" in msg
     assert "connection reset by peer" in msg
     assert "1" in msg   # count of summary_ids left unchecked
+
+
+@pytest.mark.asyncio
+async def test_search_lineage_path_db_acquire_failure_omits_retired_summaries(caplog):
+    """decision:2801 / decision:2751: on the lineage annotation path (retired_summaries),
+    a failure acquiring the database connection from the pool degrades safely with a warning
+    and omits retired_summaries from the result rather than returning [].
+    """
+    c, mock_conn, mock_session = _coordinator_with_mocks()
+
+    mock_conn.fetchrow = AsyncMock(side_effect=[
+        {
+            "id": 900,
+            "content": "Insight: the outbox pattern holds",
+            "metadata": {"kind": "insight", "summary_ids": [501],
+                         "project": "shared-memory-GitHub", "domains": ["architecture"]},
+            "source_pg_ids": [],
+        },
+        None,
+    ])
+    mock_conn.fetch = AsyncMock(return_value=[
+        {"id": 1, "content": "fact content", "metadata": {"entities": [], "source": "claude-code"}}
+    ])
+    mock_session.run = AsyncMock(return_value=_AsyncIter())
+
+    mock_reranker = MagicMock()
+    mock_reranker.raise_for_status = MagicMock()
+    mock_reranker.json = MagicMock(return_value={
+        "results": [{"index": 0, "relevance_score": 2.0},
+                    {"index": 1, "relevance_score": 1.0}]
+    })
+
+    # Stub pool.acquire: the first acquire is for the main search query (succeeds).
+    # The second acquire is on the lineage path for _annotate_retired_summaries (raises).
+    acquire_count = 0
+    def failing_acquire(*args, **kwargs):
+        nonlocal acquire_count
+        acquire_count += 1
+        if acquire_count > 1:
+            raise RuntimeError("pool acquisition timed out on lineage path")
+        return _async_ctx(mock_conn)
+
+    c._pool.acquire = MagicMock(side_effect=failing_acquire)
+
+    with caplog.at_level(logging.WARNING, logger="coordinator"):
+        with patch.object(c, "_embed", new=AsyncMock(return_value=[0.1] * 1024)):
+            with patch("httpx.AsyncClient") as mock_cls:
+                mock_http = AsyncMock()
+                mock_http.post = AsyncMock(return_value=mock_reranker)
+                mock_cls.return_value.__aenter__ = AsyncMock(return_value=mock_http)
+                mock_cls.return_value.__aexit__ = AsyncMock(return_value=None)
+
+                req = _make_request({"query": "outbox pattern", "limit": 5})
+                resp = await c.handle_search(req)
+
+    assert resp.status == 200
+    results = json.loads(resp.text)["results"]
+    insight_result = next(r for r in results if r["tier"] == "insight_summary")
+    assert "retired_summaries" not in insight_result
+    assert insight_result.get("retired_summaries") is None
+
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    msg = " ".join(r.getMessage() for r in warnings)
+    assert "retired_summaries annotation degraded" in msg
+    assert "pool acquisition timed out on lineage path" in msg
+    assert "1 summary_ids unchecked" in msg
 
 
 @pytest.mark.asyncio

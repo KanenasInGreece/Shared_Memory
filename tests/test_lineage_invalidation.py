@@ -430,7 +430,7 @@ async def test_i12_retiring_insight_clears_consolidated_on_graph_nodes(monkeypat
     monkeypatch.setattr(cl.psycopg2, "connect", lambda *a, **k: fake_conn)
     monkeypatch.setattr(
         cl, "retire_invalidated_summaries",
-        lambda conn: ([(70, "insight", [245, 267])], 2),
+        lambda conn, **k: ([(70, "insight", [245, 267])], 2),
     )
     await daemon.run_lineage_invalidation_pass()
     assert len(session.calls) == 1
@@ -441,19 +441,17 @@ async def test_i12_retiring_insight_clears_consolidated_on_graph_nodes(monkeypat
 
 
 @pytest.mark.asyncio
-async def test_i12_thematic_retirement_never_touches_the_graph(monkeypatch):
-    """Facts: do NOT clear f.consolidated — _find_grounded_fact_groups has no
-    reader for it (its own docstring: "A fact's own `consolidated` flag
-    plays NO part here")."""
+async def test_i12_thematic_retirement_never_touches_the_graph():
+    """A thematic retirement never writes Fact.consolidated; marks only the CommunitySummary."""
     daemon, session = daemon_with_fake_graph()
-    fake_conn = MagicMock()
-    monkeypatch.setattr(cl.psycopg2, "connect", lambda *a, **k: fake_conn)
-    monkeypatch.setattr(
-        cl, "retire_invalidated_summaries",
-        lambda conn: ([(50, "thematic", [1, 2, 3])], 3),
-    )
-    await daemon.run_lineage_invalidation_pass()
-    assert session.calls == []
+    await daemon._mark_summaries_retired_in_graph([50])
+    assert len(session.calls) == 1
+    query, params = session.calls[0]
+    assert "CommunitySummary" in query
+    assert "s.superseded = true" in query
+    assert "Fact" not in query
+    assert "consolidated" not in query
+    assert params == {"ids": [50]}
 
 
 @pytest.mark.asyncio
@@ -461,7 +459,7 @@ async def test_i12_nothing_retired_touches_neither_store_further(monkeypatch):
     daemon, session = daemon_with_fake_graph()
     fake_conn = MagicMock()
     monkeypatch.setattr(cl.psycopg2, "connect", lambda *a, **k: fake_conn)
-    monkeypatch.setattr(cl, "retire_invalidated_summaries", lambda conn: ([], 0))
+    monkeypatch.setattr(cl, "retire_invalidated_summaries", lambda conn, **k: ([], 0))
     await daemon.run_lineage_invalidation_pass()
     assert session.calls == []
 
