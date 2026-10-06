@@ -7,6 +7,22 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.0.13] - 2026-10-06
+
+Every read surface now returns a record's text from Postgres, or says that what it returned is the graph's capped copy. `API_VERSION` stays 4. No migration.
+
+### Added
+- `lineage <ref>` (`GET /memory/status/{ref}`) returns `content`, `content_chars` and `content_truncated`. A fact, decision or retrospective is returned whole. A summary or insight is cut at `READ_FULL_TEXT_BUDGET_CHARS` and flagged. A record the caller cannot read returns `content: null` with `content_withheld: "not_visible"`.
+- `graph` (`POST /memory/graph`) fills `content` from Postgres on a record node returned as a row value or inside a returned list, whole while the budget lasts. Every such node carries `content_source` (`postgres` or `graph`). A node left on its graph copy also carries `content_chars`, `content_truncated` and `ref`, so `lineage <ref>` reads it whole. A projected property (`RETURN n.content`), a path, a relationship and a map value are unchanged.
+- A `graph_context` neighbour in a search hit carries `ref` and `content_chars` when the caller can read the record.
+- `READ_FULL_TEXT_BUDGET_CHARS` in `.env.example` (default 16000): the whole-text budget of one graph response, and the cut applied to a summary on `lineage`.
+
+### Changed
+- A summary neighbour in `graph_context` takes its snippet from Postgres. A summary neighbour whose row is retired or missing is no longer returned; it used to arrive with a null snippet.
+
+### Fixed
+- A known record could not be read in full by id: `lineage` returned no text, and a graph node holds at most 2,000 characters of a fact, 200 of a retrospective, and no `content` for a decision.
+
 ## [1.0.12] - 2026-09-29
 
 Superseding a fact that is the last support of a decision now stops and asks. `API_VERSION` stays 4. No migration.
