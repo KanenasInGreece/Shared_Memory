@@ -24,7 +24,8 @@ The gateway is `:8888`. Never call the embedder `:8070` or the reranker `:8071`.
 | Durable result of work | `save "<content>" ['<metadata-json>'] [--domain NAME] [--supersedes PG_ID]` |
 | Operator confirmed a choice | `save_decision --title "…" --decided-by "…" --rationale "…" [--project NAME] [--domain NAME] [--grounded-in "N:role"] [--alternatives "…"] [--confidence high]` |
 | Outcome of a decision | `save_retrospective --pg-id N --rating STATE --notes "…" --grounded-in "N[:role]" [--source-ref PATH]` |
-| Read a known record: its whole text and what happened to it | `lineage fact:N` |
+| What happened to this record | `lineage fact:N` |
+| Read a known record whole (step two) | `search --ref fact:N [--ref decision:M]` |
 | Retract a fact, no replacement | `supersede --pg-id N [--by SUCCESSOR] [--acknowledge-standing ID "operator's words"]` |
 | A stale flag is immaterial | `review-hold --summary-id S --pg-id N` |
 | Named structural lookup | `query why-to-check\|who-decided\|agent-decisions\|retrospectives` plus that template's flags |
@@ -32,7 +33,7 @@ The gateway is `:8888`. Never call the embedder `:8070` or the reranker `:8071`.
 
 Named templates: `why-to-check` (`--title` required, optional `--project`), `who-decided` (`--title`, `--project`), `agent-decisions` (`--assisted-by`, `--project`), `retrospectives` (`--rating`). They call `POST /memory/graph`. They do not hit search or telemetry. `graph` and named CLI `query` templates require `full` or `admin`. `search`, `lineage`/`status`, and `telemetry` remain for `read`. `/health` is anonymous, not a read-role grant. When auth is configured, a bare curl is only `status`, `version`, and `api_version`. A full payload that includes `"auth_required": false` means auth is off.
 
-Text lives in Postgres; a graph node holds a capped copy. `lineage` returns `content`: the whole text of a fact, decision or retrospective this caller can read (`content_withheld: "not_visible"` otherwise); a summary is cut at the budget (default 16,000 characters) and `content_truncated` says so. `graph` reads Postgres for a record node returned as a row value or inside a returned list: whole text while the budget lasts, marked `content_source: "postgres"`; after that the node keeps its capped copy, marked `content_source: "graph"`, with `content_chars`, `content_truncated` and `ref`. A node this caller cannot read keeps its capped copy and carries only `content_source: "graph"`. Read that record with `lineage <ref>`. A projected property (`RETURN n.content`), a path, a map, and the named `query` templates always give the capped copy. In a search hit, a `graph_context` neighbour this caller can read carries `ref` and `content_chars`.
+Reading is two steps. `search "<query>"` returns ranked records whole, each with `graph_context`. A `graph` node, a `graph_context` neighbour, or a `lineage` reply is an index entry, not the record: a short copy (`content` or `snippet`) and, when this caller can read it, `ref` and `content_chars`. Step two is `search --ref <ref>`: that record whole from Postgres, unranked, with its `graph_context`; `obsolete` on it means superseded or reversed, so follow `superseded_by` or `lifecycle.ref`. Never answer from the short copy. No `content_chars`, or `found: false`, means there is nothing to read. A projected value, a path, a map, or a named `query` is not that record.
 
 `save` has no `--project` flag. The client derives the project, or you set `"project"` in the metadata JSON. An explicit value wins.
 
@@ -75,6 +76,12 @@ lineage fact:2678
 ```
 query why-to-check --title "AGENTS.md recut"
 ```
+
+```
+search --ref fact:2672
+```
+
+→ that record whole, unranked: step two, for a `ref` taken from a neighbour, a node or `lineage`. `"obsolete": "superseded"` with `"superseded_by": "fact:2678"` means read that one.
 
 Filters are flags. `search "reranker --project shared-memory-GitHub --domain delivery"` searches those words. It does not set the flags.
 
@@ -164,6 +171,7 @@ Meaning-bearing flags. Type the flag form.
 | `--domain` | Section of the project. Repeat the flag. On `search`, a filter. |
 | `--grounded-in` | `id[:role],…`. Required on a retrospective. Optional on a decision. |
 | `--rating` | Retrospective outcome state. Also the filter on `query retrospectives`. |
+| `--ref` | On `search`: read these records by ref instead of ranking a query. Repeat the flag. No query with it. |
 | `--since` | Search filter. ISO date or datetime. Not query text. |
 | `--source-ref` | Path or `discussion_context`. On a retrospective, the measuring instrument. |
 | `--supersedes` | Fact only. Soft-retires that pg_id (kept, hidden from search). |
@@ -199,6 +207,7 @@ Refusals. Branch on `error`. One recovery; the second-submission essays are in `
 | `project_spelling_variant` | It is that registered project. Save under that name. A rename is not a save. |
 | `project_unnameable` | Name the project with at least one letter or digit. |
 | `registry_unavailable` | The registry could not be read (503). Nothing was written. Retry. |
+| `refs_invalid` | `--ref` takes at most 16 refs by default (`type:id`). Fix the list. |
 | `unavailable` | A telemetry probe (`encoders` or `gateway`) failed. Read the sibling block. The rest of the snapshot may still be valid. |
 | `unknown_type` | On `save`, omit `type` or send `fact`. A decision uses its own command. Do not invent a type. |
 
@@ -207,11 +216,11 @@ Graph expansion on a judgement hit returns `belonging`: `{project, domains}`. Th
 Worked contract. Anonymous `/health`, then `--version`:
 
 ```json
-{"status":"ok","version":"1.0.13","api_version":4}
+{"status":"ok","version":"1.0.14","api_version":4}
 ```
 
 ```json
-{"version": "1.0.13", "api_version": 4, "tool": "shared-memory-framework"}
+{"version": "1.0.14", "api_version": 4, "tool": "shared-memory-framework"}
 ```
 
 `doctor` compares this client's `api_version` with the gateway and names which side to upgrade.

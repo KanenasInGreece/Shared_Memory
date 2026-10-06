@@ -7,6 +7,24 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.0.14] - 2026-10-07
+
+Reading is two steps: an index first, then the records an agent chooses, whole, by ref. `API_VERSION` stays 4. No migration. Update the gateway and the skills together: a 1.0.13 skill tells agents to read text with `lineage`, which no longer returns it.
+
+### Added
+- Search by ref. `search --ref fact:N [--ref decision:M]` (`refs` on `POST /memory/search`; `refs=` on the MCP search tool) skips embedding and reranking and returns exactly the named records whole from Postgres, in the order asked, each with its graph expansion. Entries carry `by_ref: true`. One that is not returned says why: `found: false` with `reason` `missing`, `wrong_type` (with `actual_ref`) or `not_visible`.
+- Search by ref returns superseded and reversed records, which a ranked search hides. They carry `obsolete` (`superseded` or `reversed`) and a pointer: `superseded_by` as a qualified ref, or the reversing retrospective in `lifecycle.ref`.
+- A ref reads exactly one table, chosen by its type; a bare integer is a `technical_docs` id. `refs_invalid` (400) refuses a malformed list. `SEARCH_REFS_CAP` in `.env.example` (default 16).
+- `lineage` returns `related`: every record this one directly affects or is affected by, each with `ref`, `rel`, `dir` and a 120-character copy. `LINEAGE_RELATED_CAP` in `.env.example` (default 50); `related_more` marks a cut list.
+- `lineage` returns `snippet` and `content_chars` for a record the caller can read.
+- A summary or insight hit carries `summary_refs`, its `summary_ids` as qualified refs, and each `retired_summaries` entry carries `ref` and `superseded_by_ref`. A bare summary id passed to search by ref would read an unrelated record.
+
+### Changed
+- `graph` returns index entries only. A record node keeps its stored properties and gains `ref`, `content_chars` and `content_truncated`; a summary node gains a 120-character `snippet`. It no longer fills `content` from Postgres.
+
+### Removed
+- Released in 1.0.13 and withdrawn here: `content`, `content_truncated` and `content_withheld` on `lineage`; `content_source` on graph nodes; `READ_FULL_TEXT_BUDGET_CHARS`. Read a record's text with search by ref.
+
 ## [1.0.13] - 2026-10-06
 
 Every read surface now returns a record's text from Postgres, or says that what it returned is the graph's capped copy. `API_VERSION` stays 4. No migration.

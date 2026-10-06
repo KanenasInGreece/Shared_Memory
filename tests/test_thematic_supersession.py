@@ -893,7 +893,8 @@ async def test_t12_status_of_summary_superseded_by_and_retired_summaries():
     assert data_ins["superseded"] is False
     assert data_ins["superseded_by"] is None
     assert data_ins["retired_summaries"] == [
-        {"summary_id": 10, "superseded_reason": "lineage", "superseded_by": None, "unsupported": []}
+        {"summary_id": 10, "superseded_reason": "lineage", "superseded_by": None,
+         "unsupported": [], "ref": "summary:10"}
     ]
 
 
@@ -1364,6 +1365,9 @@ async def test_read_time_coverage_retired_and_null_reason_rows_yield_no_unsuppor
         ],
         # decisions thread query (if called)
         [{"decision_id": 100, "fact_ids": [1, 2]}],
+        # successor 15 is not in the first fetch
+        [{"id": 15, "metadata": None, "superseded": False, "superseded_reason": None,
+          "superseded_by": None, "source_pg_ids": []}],
     ])
 
     annotated = await c._annotate_retired_summaries(fake_conn, insights_data)
@@ -1372,10 +1376,14 @@ async def test_read_time_coverage_retired_and_null_reason_rows_yield_no_unsuppor
     assert ins_501[0]["summary_id"] == 10
     assert ins_501[0]["superseded_reason"] == "coverage"
     assert ins_501[0]["unsupported"] == []
+    assert ins_501[0]["ref"] == "summary:10"
+    assert ins_501[0]["superseded_by_ref"] == "summary:15"
 
     assert ins_501[1]["summary_id"] == 20
     assert ins_501[1]["superseded_reason"] is None
     assert ins_501[1]["unsupported"] == []
+    assert ins_501[1]["ref"] == "summary:20"
+    assert "superseded_by_ref" not in ins_501[1]
 
 
 def test_recheck_kept_case_thread_still_lost_does_not_repoint():
