@@ -510,6 +510,12 @@ def _reply_json(r, tool: str) -> dict:
             pass
 
     if r.status_code >= 400:
+        try:
+            parsed = r.json()
+        except Exception:
+            parsed = None
+        if isinstance(parsed, dict) and parsed.get("error") == "refs_invalid":
+            return parsed
         detail = _gateway_message(r) or _body_snippet(r) or "(empty body)"
         raise GatewayReplyError(
             f"Error: the gateway answered HTTP {r.status_code}: {detail} — it is UP at "
@@ -760,16 +766,8 @@ async def _search_payload(query: str, limit: int = 5, project: str = "",
     if since:
         body["since"] = since
     try:
-        async with httpx.AsyncClient(
-            timeout=httpx.Timeout(ceiling, connect=5.0),
-            trust_env=False,
-        ) as client:
-            r = await client.post(
-                f"{COORDINATOR_BASE}/memory/search",
-                json=body,
-                headers=_auth_headers(),
-            )
-            return _reply_json(r, "hybrid_search_and_rerank")
+        r = await _post_memory_search(body, ceiling)
+        return _reply_json(r, "hybrid_search_and_rerank")
     except GatewayReplyError as exc:
         logger.error(f"Search refused: {exc.message}")
         return exc.message
@@ -778,10 +776,52 @@ async def _search_payload(query: str, limit: int = 5, project: str = "",
         return _unavailable(exc, ceiling)
 
 
+def _search_refs(refs) -> list[str] | str:
+    """Refs to read whole, an error when a list item is not a string, or empty when this call stays a ranked search.
+
+    A string is comma-separated. A list is already split, so a comma inside one item stays one ref.
+    """
+    if isinstance(refs, str):
+        return [part.strip() for part in refs.split(",") if part.strip()]
+    if isinstance(refs, list):
+        if any(not isinstance(part, str) for part in refs):
+            return "Error: every ref must be a string type:id"
+        return [part.strip() for part in refs if part.strip()]
+    return []
+
+
+async def _post_memory_search(body: dict, ceiling: float):
+    """The one search client. A ranked query and a by-ref read both post through it."""
+    async with httpx.AsyncClient(
+        timeout=httpx.Timeout(ceiling, connect=5.0),
+        trust_env=False,
+    ) as client:
+        return await client.post(
+            f"{COORDINATOR_BASE}/memory/search",
+            json=body,
+            headers=_auth_headers(),
+        )
+
+
+async def _search_refs_payload(refs: list[str]) -> dict | str:
+    """POST only the refs. Ranking fields are a different call, and this one must not send them."""
+    ceiling = search_ceiling(await _gateway_capability(), await _gateway_capacity())
+    try:
+        r = await _post_memory_search({"refs": refs}, ceiling)
+        return _reply_json(r, "hybrid_search_and_rerank")
+    except GatewayReplyError as exc:
+        logger.error("Search by ref refused (%s)", type(exc).__name__)
+        return exc.message
+    except Exception as exc:
+        logger.error("Search by ref failed (%s)", type(exc).__name__)
+        return _unavailable(exc, ceiling)
+
+
 @mcp.tool()
-async def hybrid_search_and_rerank(query: str, limit: int = 5, project: str = "",
+async def hybrid_search_and_rerank(query: str = "", limit: int = 5, project: str = "",
                                    domains: list[str] | str = "",
-                                   since: str = "") -> str:
+                                   since: str = "",
+                                   refs: list[str] | str = "") -> str:
     """
     Search the shared memory: Tier-3 thematic/insight narratives for orientation,
     Tier-1 facts for precision, expanded through the entity graph.
@@ -801,10 +841,28 @@ async def hybrid_search_and_rerank(query: str, limit: int = 5, project: str = ""
     project/domain name is not refused, it simply matches nothing (the read
     path never blocks on registry state).
 
+    `refs` names records to read instead of ranking a query: a non-empty list, or one comma-separated string, returns those records and ignores the query. The named records come back whole, unranked, obsolete ones included and marked.
+
     The wait for this call is sized from the gateway's own published backend
     capability, not a constant — set SEARCH_TIMEOUT_S (env) to pin an explicit
     override instead.
     """
+    named = _search_refs(refs)
+    if isinstance(named, str):
+        return named
+    if named:
+        logger.info("Search by ref: %d named", len(named))
+        payload = await _search_refs_payload(named)
+        if isinstance(payload, str):
+            return payload
+        if isinstance(payload, dict) and payload.get("error") == "refs_invalid":
+            return json.dumps(payload, indent=2, default=str)
+        results = payload.get("results", payload)
+        if isinstance(results, dict) and results.get("status") == "error":
+            return f"Error: {results.get('message', 'search failed')}"
+        return json.dumps(results, indent=2, default=str)
+    if not (query or "").strip():
+        return "Error: query is required"
     logger.info(f"Search: {query[:50]}...")
     start = datetime.now()
     payload = await _search_payload(query, limit, project=project,
@@ -1453,11 +1511,7 @@ async def memory_telemetry() -> str:
 
 @mcp.tool()
 async def record_lineage(ref: str) -> str:
-    """Answer "what does this record say, and what happened to it?" — returns
-    the text as content (whole for a fact, decision or retrospective the caller
-    can read; a summary or insight cut at the budget and flagged), its state, its
-    dream-cycle stamps (applied → rem_reviewed → consolidated), and which
-    summary it was folded into, with the fact→summary latency.
+    """It says what happened to one record and names, in `related`, every record it directly affects or is affected by, with `snippet` and `content_chars`. Read the text with `hybrid_search_and_rerank(refs=...)`. For a record this caller cannot read it carries neither `snippet` nor `content_chars`, and no `related`.
 
     This is a READ — GET /memory/status/{ref} makes no mutation, so it is on
     the gateway's read-role allowlist and a read-only agent token reaches it
@@ -1489,10 +1543,12 @@ async def graph_query(cypher: str) -> str:
     """
     Run a READ-ONLY Cypher query against the knowledge graph.
 
-    A record node returned as a row value or in a returned list carries
-    Postgres content within a budget, marked by content_source; a projected
-    property is the node's capped copy. A node this caller cannot read keeps
-    its capped copy and carries only `content_source: "graph"`.
+    A record node returned as a row value or in a returned list is an
+    index entry — its `content` is the node's short copy; `ref`,
+    `content_chars` and `content_truncated` describe the record; read it
+    with `hybrid_search_and_rerank(refs=[ref])`. A projected property is the node's capped
+    copy. A node this caller cannot read keeps its stored properties and
+    gains nothing.
 
     Requires a token with full or admin role (read-only tokens receive 403).
     The gateway enforces read-only: CREATE, DELETE, DETACH DELETE, SET, MERGE,

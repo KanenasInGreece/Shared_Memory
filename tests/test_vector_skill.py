@@ -164,6 +164,80 @@ async def test_mcp_hybrid_search_goes_through_the_gateway():
 
 
 @pytest.mark.asyncio
+async def test_mcp_search_by_ref_posts_the_list_and_keeps_obsolete_fields():
+    """refs as a comma-separated string or a list posts that list and returns found, reason, obsolete, and superseded_by."""
+    both = {"results": [
+        {"ref": "fact:1", "by_ref": True, "found": False, "reason": "missing"},
+        {"ref": "decision:2", "by_ref": True, "obsolete": "superseded",
+         "superseded_by": "fact:9"},
+    ]}
+    one = {"results": [
+        {"ref": "fact:1", "by_ref": True, "found": False, "reason": "missing",
+         "obsolete": "superseded", "superseded_by": "fact:9"},
+    ]}
+    responses = [
+        MagicMock(status_code=200, json=lambda: both),
+        MagicMock(status_code=200, json=lambda: one),
+    ]
+
+    async def _quiet():
+        return None
+
+    with patch.object(vector_skill, "_gateway_capability", _quiet), \
+         patch.object(vector_skill, "_gateway_capacity", _quiet), \
+         patch("httpx.AsyncClient.post", side_effect=responses) as mock_post:
+        comma = await vector_skill.hybrid_search_and_rerank(refs="fact:1,decision:2")
+        listed = await vector_skill.hybrid_search_and_rerank(refs=["fact:1"])
+
+    assert mock_post.call_args_list[0].kwargs["json"] == {"refs": ["fact:1", "decision:2"]}
+    assert mock_post.call_args_list[1].kwargs["json"] == {"refs": ["fact:1"]}
+    for rendered in (comma, listed):
+        assert '"found": false' in rendered
+        assert '"reason": "missing"' in rendered
+        assert '"obsolete": "superseded"' in rendered
+        assert '"superseded_by": "fact:9"' in rendered
+    assert json.loads(listed) == one["results"]
+
+
+@pytest.mark.asyncio
+async def test_mcp_empty_refs_runs_a_normal_search():
+    """refs of "" or [] sends no refs key. An empty refs with an empty query is the query-required error."""
+    payload = {"results": []}
+    mock_response = MagicMock(status_code=200, json=lambda: payload)
+
+    async def _quiet():
+        return None
+
+    with patch.object(vector_skill, "_gateway_capability", _quiet), \
+         patch.object(vector_skill, "_gateway_capacity", _quiet), \
+         patch("httpx.AsyncClient.post", return_value=mock_response) as mock_post:
+        await vector_skill.hybrid_search_and_rerank(MOCK_QUERY, refs="")
+        await vector_skill.hybrid_search_and_rerank(MOCK_QUERY, refs=[])
+        missing = await vector_skill.hybrid_search_and_rerank(refs="")
+
+    assert mock_post.call_args_list[0].kwargs["json"]["query"] == MOCK_QUERY
+    assert "refs" not in mock_post.call_args_list[0].kwargs["json"]
+    assert mock_post.call_args_list[1].kwargs["json"]["query"] == MOCK_QUERY
+    assert "refs" not in mock_post.call_args_list[1].kwargs["json"]
+    assert missing == "Error: query is required"
+    assert mock_post.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_mcp_non_string_ref_is_an_error_and_sends_nothing():
+    """refs=[7, "fact:1"] returns the string-type:id error and posts no search."""
+    async def _quiet():
+        return None
+
+    with patch.object(vector_skill, "_gateway_capability", _quiet), \
+         patch.object(vector_skill, "_gateway_capacity", _quiet), \
+         patch("httpx.AsyncClient.post") as mock_post:
+        rendered = await vector_skill.hybrid_search_and_rerank(refs=[7, "fact:1"])
+    assert rendered == "Error: every ref must be a string type:id"
+    assert mock_post.call_count == 0
+
+
+@pytest.mark.asyncio
 async def test_mcp_hybrid_search_reports_a_down_gateway_plainly():
     """The gateway is now the only path to memory, so an outage is a hard failure.
     Saying so beats returning an empty result set that reads as 'nothing found'."""

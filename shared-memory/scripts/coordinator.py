@@ -2113,8 +2113,8 @@ from dream_telemetry import (EMBED_CHARS_PER_TOKEN, EMBED_MAX_CHARS,  # noqa: E4
 
 # Edges shown per search hit. The Cypher orders asserted and typed relations ahead of bare MENTIONS so the cap keeps the signal.
 GRAPH_EXPANSION_LIMIT = _env_int("GRAPH_EXPANSION_LIMIT", 15)
-
-READ_FULL_TEXT_BUDGET_CHARS = max(0, _env_int("READ_FULL_TEXT_BUDGET_CHARS", 16000))
+# How many direct neighbours one lineage reply names. The query reads one past this cap so a truncated reply can say there are more.
+LINEAGE_RELATED_CAP = max(1, _env_int("LINEAGE_RELATED_CAP", 50))
 
 
 def _eligible_graph_node_info(val: Any) -> tuple[str, int] | None:
@@ -2139,29 +2139,6 @@ def _eligible_graph_node_info(val: Any) -> tuple[str, int] | None:
     return None
 
 
-def allocate_full_text(lengths: list[tuple], budget: int) -> set:
-    """Which records get their whole text. `lengths` is (key, content_chars) in first-seen order.
-
-    The key is (table, id), never a bare id. A record gets whole text when its
-    length fits in what remains; one that does not fit is skipped and the walk
-    continues. A key seen again is ignored: it spends nothing more, and its
-    first length stands.
-    """
-    chosen: set = set()
-    remaining = budget
-    seen: set = set()
-    for item in lengths:
-        if not item or len(item) < 2:
-            continue
-        key, chars = item[0], item[1]
-        if key in seen:
-            continue
-        seen.add(key)
-        if chars is not None and chars <= remaining:
-            chosen.add(key)
-            remaining -= chars
-    return chosen
-
 # Row cap on read-only Cypher queries submitted to /memory/graph. Rejects
 # oversized result sets with HTTP 400 before serialization.
 GRAPH_QUERY_ROW_CAP = _env_int("GRAPH_QUERY_ROW_CAP", 10000)
@@ -2171,6 +2148,8 @@ SEARCH_CANDIDATE_FLOOR = _env_int("SEARCH_CANDIDATE_FLOOR", 20)
 
 # Cap the domains filter. A silent truncate would return 200 for a partial filter and an empty result would look authoritative (PR 235).
 SEARCH_DOMAINS_FILTER_CAP = _env_int("SEARCH_DOMAINS_FILTER_CAP", 16)
+# How many refs one search-by-ref call may name. Counted before duplicates are dropped, so repeating a ref cannot buy a larger read.
+SEARCH_REFS_CAP = max(1, _env_int("SEARCH_REFS_CAP", 16))
 
 # decision:1736: RELATION_ASSERTED_INHERITED is gone. Belonging is derived on read, so nothing writes that copied edge; leftover inherited edges are legacy data, not framework code.
 
@@ -2586,6 +2565,30 @@ def _coerce_jsonb_obj(value):
         except (ValueError, TypeError):
             return value
     return value
+
+
+def _row_metadata(row) -> dict | None:
+    """The metadata object on a row, for reading. A string is parsed. Anything else is not an object, and the row's metadata is left as it was."""
+    if not isinstance(row, dict):
+        return None
+    raw = row.get("metadata")
+    if isinstance(raw, str):
+        raw = _coerce_jsonb_obj(raw)
+    return raw if isinstance(raw, dict) else None
+
+
+def _stale_sources(source_pg_ids, meta, stale_map) -> list[dict]:
+    # Hide a pair the operator already held. A later supersession of a different source is a new pair and still surfaces.
+    m = _coerce_jsonb_obj(meta) if not isinstance(meta, dict) else meta
+    acked = {
+        e["old"] for e in (m or {}).get("reviewed_supersessions", [])
+        if isinstance(e, dict) and "old" in e
+    }
+    return [
+        {"old": pid, "superseded_by": stale_map[pid]}
+        for pid in (source_pg_ids or [])
+        if pid in stale_map and pid not in acked
+    ]
 
 
 def _json_safe(value):
@@ -7450,35 +7453,6 @@ class MemoryCoordinator:
 
         return out
 
-    async def _record_text_whole(self, conn, doc_ids, summary_ids) -> dict:
-        """Fetch whole Postgres content for chosen records in technical_docs and community_summaries.
-
-        Called only by handle_graph, only with ids allocate_full_text chose.
-        At most one query per table, for exactly the ids passed.
-        Returns {(table, id): content_str}.
-        """
-        doc_list = sorted({int(i) for i in doc_ids if i is not None and not isinstance(i, bool)})
-        sum_list = sorted({int(i) for i in summary_ids if i is not None and not isinstance(i, bool)})
-        out: dict = {}
-
-        if doc_list:
-            rows = await conn.fetch(
-                "SELECT id, content FROM technical_docs WHERE id = ANY($1::bigint[])",
-                doc_list,
-            )
-            for r in rows:
-                out[("technical_docs", r["id"])] = r["content"]
-
-        if sum_list:
-            rows = await conn.fetch(
-                "SELECT id, content FROM community_summaries WHERE id = ANY($1::bigint[])",
-                sum_list,
-            )
-            for r in rows:
-                out[("community_summaries", r["id"])] = r["content"]
-
-        return out
-
     # Judgement labels whose belonging is derived. A fact already has its own edges; a summary has none.
     _DERIVED_BELONGING_LABELS = (ONT.decision, ONT.retrospective)
 
@@ -7969,7 +7943,7 @@ class MemoryCoordinator:
         try:
             # 1. Fetch cited summaries
             ssrows = await conn.fetch(
-                "SELECT id, superseded, superseded_reason, superseded_by, source_pg_ids"
+                "SELECT id, metadata, superseded, superseded_reason, superseded_by, source_pg_ids"
                 " FROM community_summaries WHERE id = ANY($1)",
                 list(all_sids),
             )
@@ -7993,7 +7967,7 @@ class MemoryCoordinator:
                     visited.add(next_id)
                     if next_id not in summ_map:
                         nr = await conn.fetchrow(
-                            "SELECT id, superseded, superseded_reason, superseded_by, source_pg_ids"
+                            "SELECT id, metadata, superseded, superseded_reason, superseded_by, source_pg_ids"
                             " FROM community_summaries WHERE id = $1", next_id,
                         )
                         if nr:
@@ -8127,6 +8101,22 @@ class MemoryCoordinator:
                     else:
                         fact_chain_map[f_id] = None
 
+            # A successor that the chain walk did not load still has to be read before its ref can be named.
+            missing_succ: list[int] = []
+            for sid in retired_sids:
+                sup_by = summ_map[sid].get("superseded_by")
+                if isinstance(sup_by, bool) or not isinstance(sup_by, int):
+                    continue
+                if sup_by not in summ_map and sup_by not in missing_succ:
+                    missing_succ.append(sup_by)
+            if missing_succ:
+                for row in await conn.fetch(
+                    "SELECT id, metadata, superseded, superseded_reason, superseded_by,"
+                    " source_pg_ids FROM community_summaries WHERE id = ANY($1::bigint[])",
+                    missing_succ,
+                ):
+                    summ_map[row["id"]] = dict(row)
+
             # 6. Build the result mapping
             result = {}
             for ins in insights_data:
@@ -8158,12 +8148,17 @@ class MemoryCoordinator:
                                 "superseding_facts": sup_by_facts,
                             })
 
-                    ins_retired.append({
+                    entry = {
                         "summary_id": sid,
                         "superseded_reason": reason,
                         "superseded_by": sup_by,
                         "unsupported": unsupported,
-                    })
+                        "ref": make_ref(summary_record_type(_row_metadata(s_info)), sid),
+                    }
+                    if sup_by is not None and sup_by in summ_map:
+                        entry["superseded_by_ref"] = make_ref(
+                            summary_record_type(_row_metadata(summ_map[sup_by])), sup_by)
+                    ins_retired.append(entry)
                 result[ins_id] = ins_retired
 
             return result
@@ -8175,6 +8170,189 @@ class MemoryCoordinator:
             )
             return {}
 
+    async def _load_stale_map(self, prov_ids) -> dict:
+        """Superseded technical_docs ids among a narrative's sources. A fault yields an empty map and a warning, never a failed search."""
+        stale_map: dict[int, int | None] = {}
+        if not prov_ids:
+            return stale_map
+        try:
+            async with self._acquire() as conn:
+                srows = await conn.fetch(
+                    "SELECT id, superseded_by FROM technical_docs"
+                    " WHERE id = ANY($1) AND superseded",
+                    list(prov_ids),
+                )
+            stale_map = {r["id"]: r["superseded_by"] for r in srows}
+        except Exception as e:
+            # A database fault must not read as no superseded sources. The annotation is advisory, and the miss is logged.
+            log.warning(
+                "stale_sources annotation degraded (%s: %s) — "
+                "%d source ids unchecked",
+                type(e).__name__, e, len(prov_ids),
+            )
+            stale_map = {}  # column missing (pre-013) — degrade to no annotation
+        return stale_map
+
+    async def _annotate_narrative_entries(self, entries: list[dict]) -> None:
+        """Add retired_summaries and summary_refs onto summary and insight entries already built.
+
+        The two lookups are separate. A fault in one leaves the other in place, and neither rewrites metadata.
+        """
+        # ⛔ Prohibition: community_summaries only — never technical_docs (independent sequences; decision:1207: the earlier lazy annotation; decision:2778: the supersession yardstick; decision:2801 (an insight follows a new thematic row only when every decision it had support for keeps support)).
+        # Annotate insight retired_summaries at read time from community_summaries via summary_ids (decision:2751).
+        insight_candidates = []
+        for entry in entries:
+            if entry.get("record_type") != "insight":
+                continue
+            raw = entry.get("metadata")
+            meta = raw if isinstance(raw, dict) else (
+                _coerce_jsonb_obj(raw) if isinstance(raw, str) else raw)
+            insight_candidates.append({
+                "id": entry.get("pg_id"),
+                "summary_ids": (meta or {}).get("summary_ids") or [],
+                "source_pg_ids": list(entry.get("source_pg_ids") or []),
+            })
+
+        retired_map: dict = {}
+        if insight_candidates:
+            all_sids = [sid for cand in insight_candidates for sid in cand.get("summary_ids") or []]
+            try:
+                async with self._acquire() as conn:
+                    retired_map = await self._annotate_retired_summaries(
+                        conn, insight_candidates)
+            except Exception as exc:
+                # A database fault must not read as no superseded summaries. The annotation is advisory, and the miss is logged.
+                log.warning(
+                    "retired_summaries annotation degraded (%s: %s) — "
+                    "%d summary_ids unchecked",
+                    type(exc).__name__, exc, len(all_sids),
+                )
+                retired_map = {}
+            if not isinstance(retired_map, dict):
+                retired_map = {}
+            for entry in entries:
+                if entry.get("record_type") != "insight":
+                    continue
+                retired = retired_map.get(entry.get("pg_id"), [])
+                if retired:
+                    entry["retired_summaries"] = retired
+
+        # After the retired lookup, so a caller that counts that acquire still sees it first.
+        ref_jobs = []
+        for entry in entries:
+            if entry.get("record_type") not in ("summary", "insight"):
+                continue
+            raw = entry.get("metadata")
+            if not isinstance(raw, dict):
+                continue
+            ids = raw.get("summary_ids")
+            if not isinstance(ids, list) or not ids:
+                continue
+            ref_jobs.append((entry, ids))
+        if not ref_jobs:
+            return
+        wanted: list[int] = []
+        for _entry, ids in ref_jobs:
+            for sid in ids:
+                if isinstance(sid, bool) or not isinstance(sid, int):
+                    continue
+                if sid not in wanted:
+                    wanted.append(sid)
+        if not wanted:
+            for entry, _ids in ref_jobs:
+                entry["summary_refs"] = []
+            return
+        try:
+            async with self._acquire() as conn:
+                rows = await conn.fetch(
+                    "SELECT id, metadata FROM community_summaries"
+                    " WHERE id = ANY($1::bigint[])",
+                    wanted,
+                )
+        except Exception as exc:
+            log.warning(
+                "summary_refs annotation degraded (%s: %s) — "
+                "%d summary_ids unchecked",
+                type(exc).__name__, exc, len(wanted),
+            )
+            return
+        kinds: dict[int, str] = {}
+        for row in rows:
+            kinds[row["id"]] = summary_record_type(_row_metadata(dict(row)))
+        for entry, ids in ref_jobs:
+            refs = []
+            for sid in ids:
+                if isinstance(sid, bool) or not isinstance(sid, int):
+                    continue
+                kind = kinds.get(sid)
+                if kind is None:
+                    continue
+                refs.append(make_ref(kind, sid))
+            entry["summary_refs"] = refs
+
+    async def _attach_decision_lifecycle(
+        self, results: list[dict], *, viewer=None, viewer_scope=None,
+        enforce_visibility: bool = False,
+    ) -> None:
+        # Attach each returned decision's current verdict in place (does not inflate limit) (decision:1109).
+        decision_ids = [r["pg_id"] for r in results
+                        if r.get("record_type") == "decision"
+                        and r.get("pg_id") is not None]
+        if not decision_ids:
+            return
+        try:
+            async with self._neo4j.session() as session:
+                lifecycle = await self._resolve_decision_lifecycle(
+                    session, decision_ids)
+        except Exception:
+            lifecycle = {}
+        # Fetch the retrospective text for refined, mixed, and reversed. The rating word does not carry the reasoning.
+        wanted = [v["retrospective_pg_id"] for v in lifecycle.values()
+                  if v["rating"] in self._QUALIFYING_RATINGS
+                  and v.get("retrospective_pg_id") is not None]
+        notes: dict[int, str] = {}
+        if wanted:
+            try:
+                # A normal search still returns the text. By ref passes enforce_visibility so a private retrospective stays hidden.
+                if enforce_visibility:
+                    sql = (
+                        "SELECT id, content, visibility, agent_id, scope"
+                        " FROM technical_docs WHERE id = ANY($1::bigint[])"
+                    )
+                else:
+                    sql = (
+                        "SELECT id, content FROM technical_docs"
+                        " WHERE id = ANY($1::bigint[])"
+                    )
+                async with self._acquire() as conn:
+                    rows = await conn.fetch(sql, wanted)
+                for row in rows:
+                    if enforce_visibility and not _is_doc_visible(
+                        row.get("visibility") or "global",
+                        row.get("agent_id") or "",
+                        row.get("scope") or "global",
+                        viewer, viewer_scope,
+                    ):
+                        continue
+                    notes[row["id"]] = row["content"]
+            except Exception:
+                notes = {}
+        for r in results:
+            state = lifecycle.get(r.get("pg_id")) if \
+                r.get("record_type") == "decision" else None
+            if not state:
+                continue
+            entry = {
+                "rating": state["rating"],
+                # decision 822: a qualified ref, because a bare integer resolves against the wrong table.
+                "ref": make_ref("retrospective", state["retrospective_pg_id"]),
+                "retrospective_pg_id": state["retrospective_pg_id"],
+            }
+            text = notes.get(state["retrospective_pg_id"])
+            if text is not None:
+                entry["retrospective_content"] = text
+            r["lifecycle"] = entry
+
     async def handle_search(self, request: web.Request) -> web.Response:
         try:
             body = await request.json()
@@ -8182,6 +8360,10 @@ class MemoryCoordinator:
             return web.json_response(
                 {"status": "error", "message": "request body must be JSON"}, status=400
             )
+
+        # By ref ignores limit and query. Validating them first would refuse a read the caller named.
+        if isinstance(body, dict) and "refs" in body:
+            return await self._search_by_ref(request, body)
 
         query = body.get("query", "")
         limit = body.get("limit", 5)
@@ -8460,64 +8642,7 @@ class MemoryCoordinator:
             prov_ids.update(insight.get("source_pg_ids") or [])
         if summary:
             prov_ids.update(summary.get("source_pg_ids") or [])
-        stale_map: dict[int, int | None] = {}
-        if prov_ids:
-            try:
-                async with self._acquire() as conn:
-                    srows = await conn.fetch(
-                        "SELECT id, superseded_by FROM technical_docs"
-                        " WHERE id = ANY($1) AND superseded",
-                        list(prov_ids),
-                    )
-                stale_map = {r["id"]: r["superseded_by"] for r in srows}
-            except Exception as e:
-                # A database fault must not read as no superseded sources. The annotation is advisory, and the miss is logged.
-                log.warning(
-                    "stale_sources annotation degraded (%s: %s) — "
-                    "%d source ids unchecked",
-                    type(e).__name__, e, len(prov_ids),
-                )
-                stale_map = {}  # column missing (pre-013) — degrade to no annotation
-
-        def _stale_sources(source_pg_ids, meta) -> list[dict]:
-            # Hide a pair the operator already held. A later supersession of a different source is a new pair and still surfaces.
-            m = _coerce_jsonb_obj(meta) if not isinstance(meta, dict) else meta
-            acked = {
-                e["old"] for e in (m or {}).get("reviewed_supersessions", [])
-                if isinstance(e, dict) and "old" in e
-            }
-            return [
-                {"old": pid, "superseded_by": stale_map[pid]}
-                for pid in (source_pg_ids or [])
-                if pid in stale_map and pid not in acked
-            ]
-
-        # ⛔ Prohibition: community_summaries only — never technical_docs (independent sequences; decision:1207: the earlier lazy annotation; decision:2778: the supersession yardstick; decision:2801 (an insight follows a new thematic row only when every decision it had support for keeps support)).
-        # Annotate insight retired_summaries at read time from community_summaries via summary_ids (decision:2751).
-        insight_candidates = []
-        for r in (insight, summary):
-            if r is not None and summary_record_type(r.get("metadata")) == "insight":
-                m = _coerce_jsonb_obj(r.get("metadata")) if not isinstance(r.get("metadata"), dict) else r.get("metadata")
-                insight_candidates.append({
-                    "id": r.get("id"),
-                    "summary_ids": (m or {}).get("summary_ids") or [],
-                    "source_pg_ids": list(r.get("source_pg_ids") or []),
-                })
-
-        retired_summaries_map: dict[int, list[dict]] = {}
-        if insight_candidates:
-            all_sids = [sid for c in insight_candidates for sid in c.get("summary_ids") or []]
-            try:
-                async with self._acquire() as conn:
-                    retired_summaries_map = await self._annotate_retired_summaries(conn, insight_candidates)
-            except Exception as e:
-                # A database fault must not read as no superseded summaries. The annotation is advisory, and the miss is logged.
-                log.warning(
-                    "retired_summaries annotation degraded (%s: %s) — "
-                    "%d summary_ids unchecked",
-                    type(e).__name__, e, len(all_sids),
-                )
-                retired_summaries_map = {}
+        stale_map = await self._load_stale_map(prov_ids)
 
         # Build final in the reranker's order. No tier is inserted ahead of that ranking or appended after it.
         final: list[dict] = []
@@ -8573,13 +8698,9 @@ class MemoryCoordinator:
                         "graph_context": (summary_ctx.get(row.get("id"), [])
                                           if row.get("id") is not None else []),
                     }
-                    stale = _stale_sources(row["source_pg_ids"], meta)
+                    stale = _stale_sources(row["source_pg_ids"], meta, stale_map)
                     if stale:
                         res["stale_sources"] = stale
-                    if rtype == "insight":
-                        retired_sum = retired_summaries_map.get(row.get("id"), [])
-                        if retired_sum:
-                            res["retired_summaries"] = retired_sum
                     final.append(res)
                     continue
 
@@ -8609,52 +8730,218 @@ class MemoryCoordinator:
                     "graph_context": ctx,
                 })
 
-        # Attach each returned decision's current verdict in place (does not inflate limit) (decision:1109).
-        decision_ids = [r["pg_id"] for r in final
-                        if r.get("record_type") == "decision"
-                        and r.get("pg_id") is not None]
-        if decision_ids:
-            try:
-                async with self._neo4j.session() as session:
-                    lifecycle = await self._resolve_decision_lifecycle(
-                        session, decision_ids)
-            except Exception:
-                lifecycle = {}
-            # Fetch the retrospective text for refined, mixed, and reversed. The rating word does not carry the reasoning.
-            wanted = [v["retrospective_pg_id"] for v in lifecycle.values()
-                      if v["rating"] in self._QUALIFYING_RATINGS
-                      and v.get("retrospective_pg_id") is not None]
-            notes: dict[int, str] = {}
-            if wanted:
-                try:
-                    async with self._acquire() as conn:
-                        for row in await conn.fetch(
-                            "SELECT id, content FROM technical_docs"
-                            " WHERE id = ANY($1::bigint[])", wanted,
-                        ):
-                            notes[row["id"]] = row["content"]
-                except Exception:
-                    notes = {}
-            for r in final:
-                state = lifecycle.get(r.get("pg_id")) if \
-                    r.get("record_type") == "decision" else None
-                if not state:
-                    continue
-                entry = {
-                    "rating": state["rating"],
-                    # decision 822: a qualified ref, because a bare integer resolves against the wrong table.
-                    "ref": make_ref("retrospective", state["retrospective_pg_id"]),
-                    "retrospective_pg_id": state["retrospective_pg_id"],
-                }
-                text = notes.get(state["retrospective_pg_id"])
-                if text is not None:
-                    entry["retrospective_content"] = text
-                r["lifecycle"] = entry
+        await self._annotate_narrative_entries(final)
+        await self._attach_decision_lifecycle(final)
 
         # Latest-retro-as-verdict: same-decision retrospectives newest-first.
         final = _order_retros_latest_first(final)
         return web.json_response(_with_filters_resolved(
             {"status": "success", "results": final}, filters_resolved))
+
+    async def _search_by_ref(self, request, body):
+        """Return the named records whole, in the order asked, with no embedding and no rerank.
+
+        An unreadable row is refused before the type check. A wrong-type answer would reveal that an unreadable record exists and what it is.
+        """
+        refs = body.get("refs")
+        if not isinstance(refs, list):
+            message = "refs must be a non-empty list of type:id strings"
+        elif not refs:
+            message = "refs must name at least one record"
+        elif len(refs) > SEARCH_REFS_CAP:
+            message = (
+                f"refs names {len(refs)} items, over the {SEARCH_REFS_CAP}-item cap"
+            )
+        else:
+            message = None
+        parsed = []
+        seen: set[str] = set()
+        if message is None:
+            for item in refs:
+                if not isinstance(item, str):
+                    message = f"a refs item is not a string ({_short(item, 80)})"
+                    break
+                try:
+                    rtype, pid = parse_ref(item)
+                except ValueError:
+                    message = f"a refs item does not parse ({_short(item, 80)})"
+                    break
+                if not 0 < pid < 2**63:
+                    message = f"a refs item is outside signed bigint ({_short(item, 80)})"
+                    break
+                key = item.strip()
+                if key in seen:
+                    continue
+                seen.add(key)
+                parsed.append((item, rtype, pid))
+        if message is not None:
+            return web.json_response(
+                {"status": "error", "error": "refs_invalid", "message": message},
+                status=400,
+            )
+
+        viewer = request.get("authenticated_agent")
+        scope = body.get("scope")
+        doc_ids = list(dict.fromkeys(
+            pid for _asked, rtype, pid in parsed if rtype not in REF_TYPES_SUMMARIES))
+        sum_ids = list(dict.fromkeys(
+            pid for _asked, rtype, pid in parsed if rtype in REF_TYPES_SUMMARIES))
+
+        async with self._acquire() as conn:
+            docs: dict = {}
+            if doc_ids:
+                for row in await conn.fetch(
+                    "SELECT id, content, metadata, created_at, superseded,"
+                    " superseded_by, visibility, agent_id, scope"
+                    " FROM technical_docs WHERE id = ANY($1::bigint[])",
+                    doc_ids,
+                ):
+                    docs[row["id"]] = row
+            summaries: dict = {}
+            if sum_ids:
+                for row in await conn.fetch(
+                    "SELECT id, content, metadata, source_pg_ids, superseded,"
+                    " superseded_by, visibility, agent_id, scope"
+                    " FROM community_summaries WHERE id = ANY($1::bigint[])",
+                    sum_ids,
+                ):
+                    summaries[row["id"]] = row
+
+            slots: list[dict] = []
+            found_docs: list[dict] = []
+            found_sums: list[dict] = []
+            succ_ids: list[int] = []
+            pending_succ: list[tuple[dict, int]] = []
+            for asked, rtype, pid in parsed:
+                row = summaries.get(pid) if rtype in REF_TYPES_SUMMARIES else docs.get(pid)
+                if row is None:
+                    slots.append({
+                        "ref": asked, "by_ref": True, "found": False, "reason": "missing",
+                    })
+                    continue
+                # Visibility before type. Parsing metadata first would read a record this caller cannot see.
+                if not _is_doc_visible(
+                    row.get("visibility") or "global",
+                    row.get("agent_id") or "",
+                    row.get("scope") or "global",
+                    viewer, scope,
+                ):
+                    slots.append({
+                        "ref": asked, "by_ref": True, "found": False,
+                        "reason": "not_visible",
+                    })
+                    continue
+                meta = _coerce_jsonb_obj(row.get("metadata"))
+                if not isinstance(meta, dict):
+                    meta = {}
+                if rtype in REF_TYPES_SUMMARIES:
+                    real = summary_record_type(meta)
+                else:
+                    real = doc_record_type(meta)
+                if rtype is not None and rtype != real:
+                    slots.append({
+                        "ref": asked, "by_ref": True, "found": False,
+                        "reason": "wrong_type", "actual_ref": make_ref(real, pid),
+                    })
+                    continue
+                if rtype in REF_TYPES_SUMMARIES:
+                    entry = {
+                        "tier": ("insight_summary" if real == "insight"
+                                 else "community_summary"),
+                        "record_type": real,
+                        "ref": make_ref(real, pid),
+                        "pg_id": pid,
+                        "content": row.get("content"),
+                        "metadata": meta,
+                        "source_pg_ids": list(row.get("source_pg_ids") or []),
+                        "graph_context": [],
+                        "by_ref": True,
+                    }
+                    found_sums.append(entry)
+                else:
+                    created = row.get("created_at")
+                    entry = {
+                        "tier": "fact",
+                        "pg_id": pid,
+                        "record_type": real,
+                        "ref": make_ref(real, pid),
+                        "content": row.get("content"),
+                        "metadata": meta,
+                        "created_at": (created.isoformat()
+                                       if hasattr(created, "isoformat") else None),
+                        "graph_context": [],
+                        "by_ref": True,
+                    }
+                    found_docs.append(entry)
+                if row.get("superseded"):
+                    entry["obsolete"] = "superseded"
+                    succ = row.get("superseded_by")
+                    if succ is not None:
+                        if rtype in REF_TYPES_SUMMARIES:
+                            entry["superseded_by"] = make_ref(real, succ)
+                        else:
+                            succ_ids.append(succ)
+                            pending_succ.append((entry, succ))
+                slots.append(entry)
+
+            succ_types: dict[int, str] = {}
+            if succ_ids:
+                for row in await conn.fetch(
+                    "SELECT id, metadata->>'type' AS type FROM technical_docs"
+                    " WHERE id = ANY($1::bigint[])",
+                    list(dict.fromkeys(succ_ids)),
+                ):
+                    succ_types[row["id"]] = doc_record_type({"type": row.get("type")})
+        for entry, succ in pending_succ:
+            kind = succ_types.get(succ)
+            if kind is not None:
+                entry["superseded_by"] = make_ref(kind, succ)
+
+        if found_docs or found_sums:
+            try:
+                async with self._neo4j.session() as session:
+                    summary_ctx = await self._expand_graph_context_batch(
+                        session, [e["pg_id"] for e in found_sums],
+                        (ONT.community_summary,),
+                        viewer=viewer, viewer_scope=scope,
+                    )
+                    fact_ctx = await self._expand_graph_context_batch(
+                        session, [e["pg_id"] for e in found_docs],
+                        (ONT.fact, ONT.decision, ONT.retrospective),
+                        viewer=viewer, viewer_scope=scope,
+                    )
+                for entry in found_sums:
+                    entry["graph_context"] = summary_ctx.get(entry["pg_id"], [])
+                for entry in found_docs:
+                    entry["graph_context"] = fact_ctx.get(entry["pg_id"], [])
+            except Exception as exc:
+                log.debug(
+                    "search by ref: graph expansion unavailable (%s)",
+                    type(exc).__name__,
+                )
+
+        found = found_docs + found_sums
+        await self._attach_decision_lifecycle(
+            found, viewer=viewer, viewer_scope=scope, enforce_visibility=True,
+        )
+        for entry in found:
+            life = entry.get("lifecycle")
+            if isinstance(life, dict) and life.get("rating") == "reversed":
+                entry["obsolete"] = "reversed"
+
+        prov_ids: set[int] = set()
+        for entry in found_sums:
+            prov_ids.update(entry.get("source_pg_ids") or [])
+        stale_map = await self._load_stale_map(prov_ids)
+        for entry in found_sums:
+            stale = _stale_sources(
+                entry.get("source_pg_ids"), entry.get("metadata"), stale_map)
+            if stale:
+                entry["stale_sources"] = stale
+
+        await self._annotate_narrative_entries(found_sums)
+
+        return web.json_response({"status": "success", "results": slots})
 
     # ── POST /memory/graph ────────────────────────────────────────────────────
 
@@ -8773,14 +9060,11 @@ class MemoryCoordinator:
             updates_by_pos: dict[tuple[int, Any, int | None], dict] = {}
             lookup_succeeded = False
             index_map: dict = {}
-            whole_map: dict = {}
             readable_keys: set[tuple[str, int]] = set()
-            chosen_keys: set[tuple[str, int]] = set()
 
             try:
                 async with self._acquire() as conn:
                     index_map = await self._record_text_index(conn, doc_ids, summary_ids)
-                    lengths: list[tuple[tuple[str, int], int]] = []
                     for key in considered_keys:
                         row = index_map.get(key)
                         if not row:
@@ -8793,13 +9077,6 @@ class MemoryCoordinator:
                             if not _is_doc_visible(vis, owner, scope_val, viewer, viewer_scope=None):
                                 continue
                         readable_keys.add(key)
-                        lengths.append((key, row.get("content_chars") or 0))
-
-                    chosen_keys = allocate_full_text(lengths, READ_FULL_TEXT_BUDGET_CHARS)
-                    chosen_doc_ids = [kid for tbl, kid in considered_keys if (tbl, kid) in chosen_keys and tbl == "technical_docs"]
-                    chosen_sum_ids = [kid for tbl, kid in considered_keys if (tbl, kid) in chosen_keys and tbl == "community_summaries"]
-
-                    whole_map = await self._record_text_whole(conn, chosen_doc_ids, chosen_sum_ids)
                 lookup_succeeded = True
             except Exception as exc:
                 log.warning("graph query text hydration failed: %s", exc)
@@ -8807,37 +9084,22 @@ class MemoryCoordinator:
             try:
                 if lookup_succeeded:
                     for pos, key in eligible_entries:
-                        row_idx, k, list_idx = pos
-                        target_node = records[row_idx][k] if list_idx is None else records[row_idx][k][list_idx]
-                        if key in chosen_keys and whole_map.get(key) is not None:
+                        if key in readable_keys:
                             row = index_map[key]
-                            updates_by_pos[pos] = {
-                                "content": whole_map[key],
-                                "content_chars": row.get("content_chars") or 0,
-                                "content_truncated": False,
-                                "content_source": "postgres",
-                                "ref": row.get("ref"),
-                            }
-                        elif key in readable_keys:
-                            row = index_map[key]
+                            row_idx, k, list_idx = pos
+                            target_node = records[row_idx][k] if list_idx is None else records[row_idx][k][list_idx]
                             existing_content = target_node.get("content") if isinstance(target_node, dict) else None
+                            node_content_len = len(existing_content) if isinstance(existing_content, str) else 0
                             c_chars = row.get("content_chars") or 0
-                            is_trunc = (len(str(existing_content)) < c_chars) if existing_content is not None else (c_chars > 0)
-                            updates_by_pos[pos] = {
-                                "content_chars": c_chars,
-                                "content_truncated": is_trunc,
-                                "content_source": "graph",
+                            upd = {
                                 "ref": row.get("ref"),
+                                "content_chars": c_chars,
+                                "content_truncated": c_chars > node_content_len,
                             }
-                        else:
-                            updates_by_pos[pos] = {
-                                "content_source": "graph",
-                            }
-                else:
-                    for pos, key in eligible_entries:
-                        updates_by_pos[pos] = {
-                            "content_source": "graph",
-                        }
+                            tbl, _ = key
+                            if tbl == "community_summaries":
+                                upd["snippet"] = row.get("snippet")
+                            updates_by_pos[pos] = upd
 
                 for pos, update_dict in updates_by_pos.items():
                     row_idx, k, list_idx = pos
@@ -8856,6 +9118,96 @@ class MemoryCoordinator:
             return web.json_response({"status": "error", "message": "query failed"}, status=500)
 
         return web.json_response(text=body)
+
+    async def _lineage_related(self, pg_id: int, viewer) -> dict | None:
+        """Name each record directly connected to this one, without its text.
+
+        A neighbour this caller cannot read is omitted. Any failure returns None so lineage still answers from Postgres.
+        """
+        def _cell(rec, key):
+            getter = getattr(rec, "get", None)
+            if callable(getter):
+                try:
+                    return getter(key)
+                except Exception:
+                    return None
+            try:
+                return rec[key]
+            except Exception:
+                return None
+
+        # The cap in force for this call. One row past it is how a cut list is told from a complete one.
+        cap = LINEAGE_RELATED_CAP
+        cypher = (
+            "MATCH (n) WHERE n.pg_id = $pg_id AND ("
+            f"n:{ONT.fact} OR n:{ONT.decision} OR n:{ONT.retrospective}) "
+            "MATCH (n)-[r]-(m) "
+            "WHERE m.pg_id IS NOT NULL "
+            f"AND NOT m:{ONT.community_summary} AND NOT m:{ONT.entity} "
+            "RETURN type(r) AS rel, startNode(r) = n AS outward, labels(m) AS labels, "
+            "m.pg_id AS pg_id, "
+            "left(coalesce(m.content, m.title, m.rationale, m.notes, m.rem_summary), 120) AS snippet "
+            "ORDER BY m.pg_id "
+            "LIMIT $cap"
+        )
+        spine = {ONT.fact, ONT.decision, ONT.retrospective}
+        dropped = {ONT.community_summary, ONT.entity}
+        try:
+            async with self._neo4j.session(default_access_mode="READ") as session:
+                result = await session.run(cypher, pg_id=pg_id, cap=cap + 1)
+                raw = []
+                async for rec in result:
+                    raw.append(rec)
+            more = len(raw) > cap
+            raw = raw[:cap]
+            parsed = []
+            ids = []
+            for rec in raw:
+                labels = _cell(rec, "labels") or []
+                if not isinstance(labels, (list, tuple, set)):
+                    continue
+                label_set = set(labels)
+                if label_set & dropped or not (label_set & spine):
+                    continue
+                pid = _cell(rec, "pg_id")
+                if isinstance(pid, bool) or not isinstance(pid, int):
+                    continue
+                rel = _cell(rec, "rel")
+                if not isinstance(rel, str) or not rel:
+                    continue
+                snippet = _cell(rec, "snippet")
+                if not isinstance(snippet, str):
+                    snippet = ""
+                parsed.append((pid, rel, "out" if _cell(rec, "outward") else "in", snippet))
+                ids.append(pid)
+            index: dict = {}
+            if ids:
+                async with self._acquire() as conn:
+                    index = await self._record_text_index(conn, ids, [])
+            related = []
+            for pid, rel, direction, snippet in parsed:
+                row = index.get(("technical_docs", pid))
+                if not row:
+                    continue
+                if not _is_doc_visible(
+                    row.get("visibility") or "global",
+                    row.get("agent_id") or "",
+                    row.get("scope") or "global",
+                    viewer,
+                    None,
+                ):
+                    continue
+                ref = row.get("ref")
+                if not isinstance(ref, str):
+                    continue
+                related.append({"ref": ref, "rel": rel, "dir": direction, "snippet": snippet})
+            out = {"related": related}
+            if more:
+                out["related_more"] = True
+            return out
+        except Exception as exc:
+            log.warning("lineage related unavailable (%s)", type(exc).__name__)
+            return None
 
     # ── GET /memory/status/{pg_id} ────────────────────────────────────────────
 
@@ -8879,14 +9231,16 @@ class MemoryCoordinator:
 
         # The sequences are independent, so a summary id looked up in technical_docs would succeed and return the wrong record.
         if record_type in REF_TYPES_SUMMARIES:
-            return await self._status_of_summary(pg_id, record_type)
+            return await self._status_of_summary(
+                pg_id, record_type, viewer=request.get("authenticated_agent"))
 
         async with self._acquire() as conn:
             rec = await conn.fetchrow(
                 "SELECT metadata->>'type' AS type, created_at, superseded, superseded_by,"
                 "       metadata->'grounded_in' AS grounded_in,"
                 "       metadata->'supersession_ack' AS supersession_ack,"
-                "       content, visibility, agent_id, scope"
+                "       length(content) AS content_chars, left(content, 120) AS snippet,"
+                "       visibility, agent_id, scope"
                 " FROM technical_docs WHERE id = $1", pg_id,
             )
             ob = await conn.fetchrow(
@@ -8959,24 +9313,6 @@ class MemoryCoordinator:
                 ack = ack_raw
 
         viewer = request.get("authenticated_agent")
-        text_fields = {}
-        if rec is not None:
-            vis = rec.get("visibility") or "global"
-            owner = rec.get("agent_id") or ""
-            scope_val = rec.get("scope") or "global"
-            if _is_doc_visible(vis, owner, scope_val, viewer, viewer_scope=None):
-                c_val = rec.get("content")
-                text_fields = {
-                    "content": c_val,
-                    "content_chars": len(c_val) if c_val is not None else 0,
-                    "content_truncated": False,
-                }
-            else:
-                text_fields = {
-                    "content": None,
-                    "content_withheld": "not_visible",
-                }
-
         resp_dict = {
             "pg_id": pg_id,
             # The unambiguous form of the thing just returned — quote THIS back,
@@ -8984,7 +9320,16 @@ class MemoryCoordinator:
             "record_type": actual_type,
             "ref": make_ref(actual_type, pg_id),
         }
-        resp_dict.update(text_fields)
+        readable = False
+        if rec is not None:
+            vis = rec.get("visibility") or "global"
+            owner = rec.get("agent_id") or ""
+            scope_val = rec.get("scope") or "global"
+            # Lineage has no body scope. A scope record stays withheld here; search by ref is the read that takes one.
+            if _is_doc_visible(vis, owner, scope_val, viewer, viewer_scope=None):
+                readable = True
+                resp_dict["content_chars"] = rec.get("content_chars")
+                resp_dict["snippet"] = rec.get("snippet")
         resp_dict.update({
             "exists": rec is not None,
             "type": rec["type"] if rec else None,
@@ -9002,9 +9347,13 @@ class MemoryCoordinator:
             # what it became (durable — from the source_pg_ids reverse lookup)
             "consolidated_into": consolidated_into,
         })
+        if readable:
+            related = await self._lineage_related(pg_id, viewer)
+            if related:
+                resp_dict.update(related)
         return web.json_response(resp_dict)
 
-    async def _status_of_summary(self, pg_id: int, record_type: str) -> web.Response:
+    async def _status_of_summary(self, pg_id: int, record_type: str, viewer=None) -> web.Response:
         """Status of a `community_summaries` row — the other id namespace.
 
         Reached only from a QUALIFIED reference (`summary:87` / `insight:87`),
@@ -9017,8 +9366,9 @@ class MemoryCoordinator:
         async with self._acquire() as conn:
             row = await conn.fetchrow(
                 "SELECT id, metadata, source_pg_ids, created_at, superseded, superseded_reason, superseded_by, run_id,"
-                "       left(content, $2) AS content, length(content) AS content_chars"
-                "  FROM community_summaries WHERE id = $1", pg_id, READ_FULL_TEXT_BUDGET_CHARS,
+                "       length(content) AS content_chars, left(content, 120) AS snippet,"
+                "       visibility, agent_id, scope"
+                "  FROM community_summaries WHERE id = $1", pg_id,
             )
             if row is None:
                 return web.json_response(
@@ -9058,16 +9408,23 @@ class MemoryCoordinator:
                     retired_summaries = []
         row_dict = dict(row) if not isinstance(row, dict) else row
         sup_by = row_dict.get("superseded_by")
-        c_text = row_dict.get("content")
-        c_chars = row_dict.get("content_chars") or 0
-        c_trunc = (len(c_text) < c_chars) if c_text is not None else (c_chars > 0)
+        # A row that omits visibility is global, so that record still carries the index fields.
+        visible = _is_doc_visible(
+            row_dict.get("visibility") or "global",
+            row_dict.get("agent_id") or "",
+            row_dict.get("scope") or "global",
+            viewer,
+            None,
+        )
         resp_data = {
             "pg_id": pg_id,
             "record_type": actual,
             "ref": make_ref(actual, pg_id),
-            "content": c_text,
-            "content_chars": c_chars,
-            "content_truncated": c_trunc,
+        }
+        if visible:
+            resp_data["content_chars"] = row_dict.get("content_chars")
+            resp_data["snippet"] = row_dict.get("snippet")
+        resp_data.update({
             "exists": True,
             "entity": meta.get("entity"),
             # Thematic domain plus insight domains both exposed (thematic domains degrades to a one-element list).
@@ -9088,7 +9445,7 @@ class MemoryCoordinator:
                  "ref": (make_ref(src_types[sid], sid) if sid in src_types else None)}
                 for sid in (row["source_pg_ids"] or [])
             ],
-        }
+        })
         if actual == "insight" and retired_summaries is not None:
             resp_data["retired_summaries"] = retired_summaries
         return web.json_response(resp_data)

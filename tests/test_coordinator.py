@@ -1185,7 +1185,8 @@ async def test_search_insight_result_carries_retired_summaries_when_thematic_sup
     results = json.loads(resp.text)["results"]
     insight_result = next(r for r in results if r["tier"] == "insight_summary")
     assert insight_result["retired_summaries"] == [
-        {"summary_id": 501, "superseded_reason": "lineage", "superseded_by": None, "unsupported": []}]
+        {"summary_id": 501, "superseded_reason": "lineage", "superseded_by": None,
+         "unsupported": [], "ref": "summary:501"}]
 
     # The query that produced this MUST target community_summaries, NEVER technical_docs
     retired_summary_call = mock_conn.fetch.call_args_list[1]

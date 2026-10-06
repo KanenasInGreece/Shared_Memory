@@ -8,7 +8,7 @@ coordinator owns those connections.
 CLI usage:
     python memory_bridge.py --version
     python memory_bridge.py save   "<content>" '<metadata_json>'
-    python memory_bridge.py search "<query>" [limit]
+    python memory_bridge.py search "<query>" [limit] | search --ref <type:id> [--ref <type:id> ...]
     python memory_bridge.py graph  "<cypher>"
     python memory_bridge.py save_decision --title "..." --decided-by "..." \
         --project "..." --rationale "..." --grounded-in "601:based_on,602" \
@@ -479,6 +479,12 @@ def _reply_json(r, *, log_auth: bool = False,
             pass
 
     if r.status_code >= 400 and r.status_code not in accept_status:
+        try:
+            parsed = r.json()
+        except Exception:
+            parsed = None
+        if isinstance(parsed, dict) and parsed.get("error") == "refs_invalid":
+            return parsed
         detail = _gateway_message(r) or _body_snippet(r) or "(empty body)"
         raise GatewayReplyError({"status": "error", "message": (
             f"Gateway answered HTTP {r.status_code}: {detail} — it is UP at "
@@ -831,6 +837,47 @@ async def _search_payload(query: str, limit: int = 5, project: str = None,
         body["domains"] = domains
     if since:
         body["since"] = since
+    try:
+        async with _async_client(ceiling) as client:
+            r = await client.post(
+                f"{COORDINATOR_BASE}/memory/search",
+                json=body,
+                headers=_request_headers(),
+            )
+            return _reply_json(r, log_auth=True)
+    except GatewayReplyError as exc:
+        return exc.payload
+    except Exception as exc:
+        return await _warn_on_skew(_coordinator_unavailable(exc, ceiling))
+
+
+_SEARCH_REF_USAGE = (
+    "Usage: memory_bridge.py search --ref <type:id> [--ref <type:id> ...]"
+)
+
+
+def _search_ref_usage() -> None:
+    """By-ref usage is JSON on stdout and exit 1. Argparse's own exit is 2, and that is not this contract."""
+    print(json.dumps({"error": _SEARCH_REF_USAGE}))
+    raise SystemExit(1)
+
+
+def _search_ref_argparser() -> "argparse.ArgumentParser":
+    """Only --ref, repeated. Anything else beside it is a usage error, not a ranked search."""
+    p = argparse.ArgumentParser(prog="memory_bridge.py search", add_help=False)
+    p.add_argument("--ref", action="append", default=None, metavar="TYPE_ID")
+
+    def _error(_message):
+        _search_ref_usage()
+
+    p.error = _error
+    return p
+
+
+async def _search_by_ref_payload(refs: list) -> dict:
+    """Read the named records. The body is only those refs; a query would rank a different call."""
+    ceiling = search_ceiling(await _gateway_capability(), await _gateway_capacity())
+    body = {"refs": list(refs)}
     try:
         async with _async_client(ceiling) as client:
             r = await client.post(
@@ -1568,10 +1615,22 @@ async def main() -> None:
             sys.exit(1)
         print(json.dumps(query_graph(sys.argv[2]), indent=2))
     elif action == "search":
+        # --ref anywhere after the verb is the by-ref read. Reading argv[2] first would treat the flag as a query.
+        tail = sys.argv[2:]
+        if any(arg == "--ref" or arg.startswith("--ref=") for arg in tail):
+            if any(arg.startswith("--ref=") for arg in tail):
+                _search_ref_usage()
+            parsed, unknown = _search_ref_argparser().parse_known_args(tail)
+            if unknown or not parsed.ref:
+                _search_ref_usage()
+            payload = await _search_by_ref_payload(parsed.ref)
+            print(json.dumps(payload.get("results", payload), indent=2))
+            return
         if len(sys.argv) < 3:
             print(json.dumps({
                 "error": "Usage: memory_bridge.py search <query> [limit] "
-                         "[--project NAME] [--domain NAME ...] [--since ISO_DATE]"
+                         "[--project NAME] [--domain NAME ...] [--since ISO_DATE] "
+                         "| search --ref <type:id> [--ref <type:id> ...]"
             }))
             sys.exit(1)
         query = sys.argv[2]

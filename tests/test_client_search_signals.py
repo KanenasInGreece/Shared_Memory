@@ -685,3 +685,129 @@ def test_stale_projection_note_parity_between_both_doors(capability):
     assert (memory_bridge._stale_projection_note(capability)
             == vector_skill._stale_projection_note(capability))
 
+
+# ── search --ref posts the list and refuses anything else beside it ─────────
+
+_REF_USAGE = {
+    "error": "Usage: memory_bridge.py search --ref <type:id> [--ref <type:id> ...]"
+}
+
+
+class _RecordingClient:
+    def __init__(self):
+        self.bodies = []
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_a):
+        return False
+
+    async def post(self, _url, json=None, headers=None):
+        self.bodies.append(json)
+        response = MagicMock()
+        response.status_code = 200
+        response.json = lambda: {"status": "success", "results": [{"ref": "fact:1", "by_ref": True}]}
+        return response
+
+
+async def _no_capability():
+    return None
+
+
+@pytest.mark.asyncio
+async def test_cli_search_ref_posts_exactly_the_refs_list(capsys):
+    """search --ref fact:1 --ref decision:2 posts {"refs": ["fact:1", "decision:2"]} and nothing else."""
+    client = _RecordingClient()
+    argv_backup = sys.argv
+    try:
+        sys.argv = ["memory_bridge.py", "search", "--ref", "fact:1", "--ref", "decision:2"]
+        with patch.object(memory_bridge, "_async_client", return_value=client), \
+             patch.object(memory_bridge, "_gateway_capability", _no_capability), \
+             patch.object(memory_bridge, "_gateway_capacity", _no_capability):
+            await memory_bridge.main()
+    finally:
+        sys.argv = argv_backup
+    assert client.bodies == [{"refs": ["fact:1", "decision:2"]}]
+    import json as _json
+    assert _json.loads(capsys.readouterr().out) == [{"ref": "fact:1", "by_ref": True}]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("argv", [
+    ["memory_bridge.py", "search", "q", "--ref", "fact:1"],
+    ["memory_bridge.py", "search", "--ref"],
+    ["memory_bridge.py", "search", "--ref=fact:1"],
+])
+async def test_cli_search_ref_misuse_is_usage_json_exit_1(argv, capsys):
+    """A query beside --ref, a bare --ref, or the equals form prints the usage JSON and exits 1."""
+    argv_backup = sys.argv
+    try:
+        sys.argv = argv
+        with pytest.raises(SystemExit) as exc:
+            await memory_bridge.main()
+    finally:
+        sys.argv = argv_backup
+    assert exc.value.code == 1
+    import json as _json
+    assert _json.loads(capsys.readouterr().out) == _REF_USAGE
+
+
+_REFS_INVALID = {
+    "status": "error",
+    "error": "refs_invalid",
+    "message": "a refs item is not a string ('7')",
+}
+
+
+class _RefsInvalidClient:
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_a):
+        return False
+
+    async def post(self, _url, json=None, headers=None):
+        import json as _json
+        response = MagicMock()
+        response.status_code = 400
+        response.text = _json.dumps(_REFS_INVALID)
+        response.json = lambda: dict(_REFS_INVALID)
+        return response
+
+
+@pytest.mark.asyncio
+async def test_cli_prints_a_refs_invalid_reply_unchanged(capsys):
+    """A gateway refs_invalid body is printed as the gateway sent it."""
+    client = _RefsInvalidClient()
+    argv_backup = sys.argv
+    try:
+        sys.argv = ["memory_bridge.py", "search", "--ref", "7"]
+        with patch.object(memory_bridge, "_async_client", return_value=client), \
+             patch.object(memory_bridge, "_gateway_capability", _no_capability), \
+             patch.object(memory_bridge, "_gateway_capacity", _no_capability):
+            await memory_bridge.main()
+    finally:
+        sys.argv = argv_backup
+    import json as _json
+    assert _json.loads(capsys.readouterr().out) == _REFS_INVALID
+
+
+@pytest.mark.asyncio
+async def test_mcp_prints_a_refs_invalid_reply_unchanged():
+    """The MCP tool returns a gateway refs_invalid body unchanged."""
+    import json as _json
+    response = MagicMock(status_code=400)
+    response.text = _json.dumps(_REFS_INVALID)
+    response.json = lambda: dict(_REFS_INVALID)
+
+    async def _quiet():
+        return None
+
+    with patch.object(vector_skill, "_gateway_capability", _quiet), \
+         patch.object(vector_skill, "_gateway_capacity", _quiet), \
+         patch("httpx.AsyncClient.post", return_value=response):
+        rendered = await vector_skill.hybrid_search_and_rerank(refs=["fact:1"])
+    assert _json.loads(rendered) == _REFS_INVALID
+    assert not str(rendered).startswith("Error:")
+
