@@ -1453,9 +1453,11 @@ async def memory_telemetry() -> str:
 
 @mcp.tool()
 async def record_lineage(ref: str) -> str:
-    """Answer "what happened to this record?" — its state, its dream-cycle
-    stamps (applied → rem_reviewed → consolidated), and which summary it was
-    folded into, with the fact→summary latency.
+    """Answer "what does this record say, and what happened to it?" — returns
+    the text as content (whole for a fact, decision or retrospective the caller
+    can read; a summary or insight cut at the budget and flagged), its state, its
+    dream-cycle stamps (applied → rem_reviewed → consolidated), and which
+    summary it was folded into, with the fact→summary latency.
 
     This is a READ — GET /memory/status/{ref} makes no mutation, so it is on
     the gateway's read-role allowlist and a read-only agent token reaches it
@@ -1486,6 +1488,11 @@ async def record_lineage(ref: str) -> str:
 async def graph_query(cypher: str) -> str:
     """
     Run a READ-ONLY Cypher query against the knowledge graph.
+
+    A record node returned as a row value or in a returned list carries
+    Postgres content within a budget, marked by content_source; a projected
+    property is the node's capped copy. A node this caller cannot read keeps
+    its capped copy and carries only `content_source: "graph"`.
 
     Requires a token with full or admin role (read-only tokens receive 403).
     The gateway enforces read-only: CREATE, DELETE, DETACH DELETE, SET, MERGE,

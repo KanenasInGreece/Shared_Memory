@@ -850,6 +850,8 @@ async def test_t12_status_of_summary_superseded_by_and_retired_summaries():
         "superseded_reason": "lineage",
         "superseded_by": 11,
         "run_id": 42,
+        "content": "thematic summary content",
+        "content_chars": 24,
     }
     fake_conn.fetchrow = AsyncMock(return_value=row_thematic)
     fake_conn.fetch = AsyncMock(return_value=[])
@@ -872,6 +874,8 @@ async def test_t12_status_of_summary_superseded_by_and_retired_summaries():
         "superseded_reason": None,
         "superseded_by": None,
         "run_id": 43,
+        "content": "insight content",
+        "content_chars": 15,
     }
     fake_conn.fetchrow = AsyncMock(return_value=row_insight)
     # fetch calls for _status_of_summary:

@@ -125,6 +125,8 @@ lineage 816
 
 `fact:816` is the fact. `summary:87` is the narrative. A bare `816` is the facts table, so a bare id copied off a summary is the wrong record. A qualified ref of the wrong type is a 404 that names the right ref.
 
+`lineage <ref>` also returns `content` from Postgres, with `content_chars` and `content_truncated`. A fact, decision or retrospective is whole. A summary or insight is cut at the budget; its sources are listed; `lineage` reads each one this caller can read. `content: null` with `content_withheld: "not_visible"` means this caller cannot read that record.
+
 ## Supersede
 
 ```

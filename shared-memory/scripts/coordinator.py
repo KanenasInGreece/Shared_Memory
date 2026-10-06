@@ -30,6 +30,7 @@ import httpx
 from aiohttp import web
 from neo4j import AsyncGraphDatabase
 from neo4j.exceptions import ClientError
+from neo4j.graph import Node
 
 from log_hygiene import AsyncLineWriter, scrub_url_credentials
 from agent_roles import effective_role, read_only_agents
@@ -2112,6 +2113,54 @@ from dream_telemetry import (EMBED_CHARS_PER_TOKEN, EMBED_MAX_CHARS,  # noqa: E4
 
 # Edges shown per search hit. The Cypher orders asserted and typed relations ahead of bare MENTIONS so the cap keeps the signal.
 GRAPH_EXPANSION_LIMIT = _env_int("GRAPH_EXPANSION_LIMIT", 15)
+
+READ_FULL_TEXT_BUDGET_CHARS = max(0, _env_int("READ_FULL_TEXT_BUDGET_CHARS", 16000))
+
+
+def _eligible_graph_node_info(val: Any) -> tuple[str, int] | None:
+    """If val is an eligible neo4j Node, returns (table, pg_id), else None.
+
+    Eligible: neo4j.graph.Node with integer pg_id (not bool) and ONT record label.
+    Everything else (scalar projection, Path, relationship, map, entity node) returns None.
+    """
+    if not isinstance(val, Node):
+        return None
+    pg_id = val.get("pg_id") if hasattr(val, "get") else None
+    if pg_id is None or isinstance(pg_id, bool) or not isinstance(pg_id, int):
+        return None
+    labels = getattr(val, "labels", None)
+    if not labels:
+        return None
+    labels_set = set(labels)
+    if any(lbl in labels_set for lbl in (ONT.fact, ONT.decision, ONT.retrospective)):
+        return ("technical_docs", pg_id)
+    if ONT.community_summary in labels_set:
+        return ("community_summaries", pg_id)
+    return None
+
+
+def allocate_full_text(lengths: list[tuple], budget: int) -> set:
+    """Which records get their whole text. `lengths` is (key, content_chars) in first-seen order.
+
+    The key is (table, id), never a bare id. A record gets whole text when its
+    length fits in what remains; one that does not fit is skipped and the walk
+    continues. A key seen again is ignored: it spends nothing more, and its
+    first length stands.
+    """
+    chosen: set = set()
+    remaining = budget
+    seen: set = set()
+    for item in lengths:
+        if not item or len(item) < 2:
+            continue
+        key, chars = item[0], item[1]
+        if key in seen:
+            continue
+        seen.add(key)
+        if chars is not None and chars <= remaining:
+            chosen.add(key)
+            remaining -= chars
+    return chosen
 
 # Row cap on read-only Cypher queries submitted to /memory/graph. Rejects
 # oversized result sets with HTTP 400 before serialization.
@@ -7361,6 +7410,75 @@ class MemoryCoordinator:
                 len(wanted), exc,
             )
 
+    async def _record_text_index(self, conn, doc_ids, summary_ids) -> dict:
+        """Fetch metadata, character count, and ref for records in technical_docs and community_summaries.
+
+        At most one query per table. doc_ids and summary_ids are collections of
+        integer ids. Returns {(table, id): row_dict} with ref already computed.
+        """
+        doc_list = sorted({int(i) for i in doc_ids if i is not None and not isinstance(i, bool)})
+        sum_list = sorted({int(i) for i in summary_ids if i is not None and not isinstance(i, bool)})
+        out: dict = {}
+
+        if doc_list:
+            rows = await conn.fetch(
+                "SELECT id, length(content) AS content_chars, metadata->>'type' AS type, "
+                "       superseded, visibility, agent_id, scope "
+                "FROM technical_docs WHERE id = ANY($1::bigint[])",
+                doc_list,
+            )
+            for r in rows:
+                d = dict(r)
+                rec_type = doc_record_type({"type": d.get("type")})
+                d["ref"] = make_ref(rec_type, d["id"])
+                out[("technical_docs", d["id"])] = d
+
+        if sum_list:
+            rows = await conn.fetch(
+                "SELECT id, length(content) AS content_chars, left(content, 120) AS snippet, "
+                "       superseded, metadata "
+                "FROM community_summaries WHERE id = ANY($1::bigint[])",
+                sum_list,
+            )
+            for r in rows:
+                d = dict(r)
+                meta = _coerce_jsonb_obj(d.get("metadata"))
+                d["metadata"] = meta
+                rec_type = summary_record_type(meta)
+                d["ref"] = make_ref(rec_type, d["id"])
+                out[("community_summaries", d["id"])] = d
+
+        return out
+
+    async def _record_text_whole(self, conn, doc_ids, summary_ids) -> dict:
+        """Fetch whole Postgres content for chosen records in technical_docs and community_summaries.
+
+        Called only by handle_graph, only with ids allocate_full_text chose.
+        At most one query per table, for exactly the ids passed.
+        Returns {(table, id): content_str}.
+        """
+        doc_list = sorted({int(i) for i in doc_ids if i is not None and not isinstance(i, bool)})
+        sum_list = sorted({int(i) for i in summary_ids if i is not None and not isinstance(i, bool)})
+        out: dict = {}
+
+        if doc_list:
+            rows = await conn.fetch(
+                "SELECT id, content FROM technical_docs WHERE id = ANY($1::bigint[])",
+                doc_list,
+            )
+            for r in rows:
+                out[("technical_docs", r["id"])] = r["content"]
+
+        if sum_list:
+            rows = await conn.fetch(
+                "SELECT id, content FROM community_summaries WHERE id = ANY($1::bigint[])",
+                sum_list,
+            )
+            for r in rows:
+                out[("community_summaries", r["id"])] = r["content"]
+
+        return out
+
     # Judgement labels whose belonging is derived. A fact already has its own edges; a summary has none.
     _DERIVED_BELONGING_LABELS = (ONT.decision, ONT.retrospective)
 
@@ -7419,8 +7537,80 @@ class MemoryCoordinator:
         """
         return {"belonging": belonging}
 
+    async def _hydrate_and_filter_neighbors(
+        self, anchor_map: dict[Any, list[dict]],
+        viewer: str | None = None, viewer_scope: str | None = None,
+    ) -> None:
+        """Hydrate ref/content_chars on visible neighbors and filter dead/superseded summaries.
+
+        Only queries _record_text_index in one acquire for all anchors together.
+        Fail-open: any exception leaves entries untouched and logs a warning.
+        """
+        all_entries = [e for entries in anchor_map.values() for e in entries]
+        doc_ids = set()
+        summary_ids = set()
+        for e in all_entries:
+            pid = e.get("pg_id")
+            if pid is None or isinstance(pid, bool) or not isinstance(pid, int):
+                continue
+            lbl = e.get("label")
+            if lbl in (ONT.fact, ONT.decision, ONT.retrospective):
+                doc_ids.add(pid)
+            elif lbl == ONT.community_summary:
+                summary_ids.add(pid)
+
+        if not doc_ids and not summary_ids:
+            return
+
+        try:
+            async with self._acquire() as conn:
+                index_map = await self._record_text_index(conn, doc_ids, summary_ids)
+            new_map = {}
+            for aid, entries in anchor_map.items():
+                kept = []
+                for e in entries:
+                    pid = e.get("pg_id")
+                    if pid is None or isinstance(pid, bool) or not isinstance(pid, int):
+                        kept.append(e)
+                        continue
+                    lbl = e.get("label")
+                    if lbl in (ONT.fact, ONT.decision, ONT.retrospective):
+                        row = index_map.get(("technical_docs", pid))
+                        entry_out = dict(e)
+                        if row is not None:
+                            vis = row.get("visibility") or "global"
+                            owner = row.get("agent_id") or ""
+                            scope_val = row.get("scope") or "global"
+                            if _is_doc_visible(vis, owner, scope_val, viewer, viewer_scope):
+                                entry_out["ref"] = row["ref"]
+                                entry_out["content_chars"] = row["content_chars"]
+                        kept.append(entry_out)
+                    elif lbl == ONT.community_summary:
+                        row = index_map.get(("community_summaries", pid))
+                        if row is not None and not row.get("superseded", False):
+                            entry_out = dict(e)
+                            entry_out["snippet"] = row.get("snippet")
+                            entry_out["ref"] = row["ref"]
+                            entry_out["content_chars"] = row["content_chars"]
+                            kept.append(entry_out)
+                        else:
+                            # row missing or superseded: REMOVED from that hit's graph_context
+                            pass
+                    else:
+                        kept.append(e)
+                new_map[aid] = kept
+            for aid, kept in new_map.items():
+                anchor_map[aid] = kept
+        except Exception as exc:
+            log.warning(
+                "graph context: neighbor text index failed (%s: %s) — hits keep their graph context without it",
+                type(exc).__name__, exc,
+            )
+
     async def _expand_graph_context(self, session, pg_id: int,
-                                    anchor_labels: tuple[str, ...]) -> list[dict]:
+                                    anchor_labels: tuple[str, ...],
+                                    viewer: str | None = None,
+                                    viewer_scope: str | None = None) -> list[dict]:
         """Read-contract graph expansion for one anchored record.
 
         Anchors on any of ``anchor_labels`` (by ``pg_id``) and returns one entry
@@ -7508,6 +7698,9 @@ class MemoryCoordinator:
         except Exception:
             return []
         await self._attach_decision_payload(ctx)
+        ctx_map = {pg_id: ctx}
+        await self._hydrate_and_filter_neighbors(ctx_map, viewer=viewer, viewer_scope=viewer_scope)
+        ctx[:] = ctx_map[pg_id]
         # decision:1736: a judgement hit also carries where it belongs, derived. Facts already have their own edges, and a summary-only expansion skips this.
         if any(lbl in self._DERIVED_BELONGING_LABELS for lbl in anchor_labels):
             belonging = await self._derived_belonging(session, [pg_id])
@@ -7562,6 +7755,7 @@ class MemoryCoordinator:
 
     async def _expand_graph_context_batch(
         self, session, pg_ids: list[int], anchor_labels: tuple[str, ...],
+        viewer: str | None = None, viewer_scope: str | None = None,
     ) -> dict[int, list[dict]]:
         """Batched form of `_expand_graph_context`: one Neo4j round-trip for
         every anchor in `pg_ids` instead of one round-trip per anchor.
@@ -7651,6 +7845,7 @@ class MemoryCoordinator:
         # this function exists for would be undone by a query per anchor.
         await self._attach_decision_payload(
             [entry for entries in out.values() for entry in entries])
+        await self._hydrate_and_filter_neighbors(out, viewer=viewer, viewer_scope=viewer_scope)
         # One more round trip for the whole batch, not one per hit. Fact anchors come back with no row.
         if any(lbl in self._DERIVED_BELONGING_LABELS for lbl in anchor_labels):
             for pid, belonging in (
@@ -8335,13 +8530,15 @@ class MemoryCoordinator:
                 session,
                 [r.get("id") for r in surviving_t3 if r.get("id") is not None],
                 (ONT.community_summary,),
+                viewer=viewer, viewer_scope=scope,
             )
 
             # Anchor every record label. Decisions and retrospectives get graph context too, not only facts.
             fact_pg_ids = [ids[h["index"] - n_t3] for h in ranked
                            if h["index"] >= n_t3]
             fact_ctx = await self._expand_graph_context_batch(
-                session, fact_pg_ids, (ONT.fact, ONT.decision, ONT.retrospective)
+                session, fact_pg_ids, (ONT.fact, ONT.decision, ONT.retrospective),
+                viewer=viewer, viewer_scope=scope,
             )
 
             for hit in ranked:
@@ -8534,10 +8731,121 @@ class MemoryCoordinator:
                 status=400,
             )
 
+        eligible_entries: list[tuple[tuple[int, Any, int | None], tuple[str, int]]] = []
+        try:
+            for row_idx, r in enumerate(records):
+                keys = r.keys() if hasattr(r, "keys") else (list(r.keys()) if isinstance(r, dict) else [])
+                for k in keys:
+                    try:
+                        val = r[k]
+                    except Exception:
+                        continue
+                    info = _eligible_graph_node_info(val)
+                    if info is not None:
+                        eligible_entries.append(((row_idx, k, None), info))
+                    elif isinstance(val, (list, tuple)):
+                        for list_idx, item in enumerate(val):
+                            item_info = _eligible_graph_node_info(item)
+                            if item_info is not None:
+                                eligible_entries.append(((row_idx, k, list_idx), item_info))
+        except Exception as exc:
+            log.warning("graph query node discovery failed: %s", exc)
+            eligible_entries = []
+
         records = [
             r.data() if callable(getattr(r, "data", None)) and not isinstance(r, dict) else dict(r)
             for r in records
         ]
+
+        if eligible_entries:
+            distinct_keys: list[tuple[str, int]] = []
+            seen_keys: set[tuple[str, int]] = set()
+            for pos, key in eligible_entries:
+                if key not in seen_keys:
+                    seen_keys.add(key)
+                    distinct_keys.append(key)
+
+            considered_keys = distinct_keys[:GRAPH_QUERY_ROW_CAP]
+            doc_ids = [kid for tbl, kid in considered_keys if tbl == "technical_docs"]
+            summary_ids = [kid for tbl, kid in considered_keys if tbl == "community_summaries"]
+
+            viewer = request.get("authenticated_agent")
+            updates_by_pos: dict[tuple[int, Any, int | None], dict] = {}
+            lookup_succeeded = False
+            index_map: dict = {}
+            whole_map: dict = {}
+            readable_keys: set[tuple[str, int]] = set()
+            chosen_keys: set[tuple[str, int]] = set()
+
+            try:
+                async with self._acquire() as conn:
+                    index_map = await self._record_text_index(conn, doc_ids, summary_ids)
+                    lengths: list[tuple[tuple[str, int], int]] = []
+                    for key in considered_keys:
+                        row = index_map.get(key)
+                        if not row:
+                            continue
+                        tbl, kid = key
+                        if tbl == "technical_docs":
+                            vis = row.get("visibility") or "global"
+                            owner = row.get("agent_id") or ""
+                            scope_val = row.get("scope") or "global"
+                            if not _is_doc_visible(vis, owner, scope_val, viewer, viewer_scope=None):
+                                continue
+                        readable_keys.add(key)
+                        lengths.append((key, row.get("content_chars") or 0))
+
+                    chosen_keys = allocate_full_text(lengths, READ_FULL_TEXT_BUDGET_CHARS)
+                    chosen_doc_ids = [kid for tbl, kid in considered_keys if (tbl, kid) in chosen_keys and tbl == "technical_docs"]
+                    chosen_sum_ids = [kid for tbl, kid in considered_keys if (tbl, kid) in chosen_keys and tbl == "community_summaries"]
+
+                    whole_map = await self._record_text_whole(conn, chosen_doc_ids, chosen_sum_ids)
+                lookup_succeeded = True
+            except Exception as exc:
+                log.warning("graph query text hydration failed: %s", exc)
+
+            try:
+                if lookup_succeeded:
+                    for pos, key in eligible_entries:
+                        row_idx, k, list_idx = pos
+                        target_node = records[row_idx][k] if list_idx is None else records[row_idx][k][list_idx]
+                        if key in chosen_keys and whole_map.get(key) is not None:
+                            row = index_map[key]
+                            updates_by_pos[pos] = {
+                                "content": whole_map[key],
+                                "content_chars": row.get("content_chars") or 0,
+                                "content_truncated": False,
+                                "content_source": "postgres",
+                                "ref": row.get("ref"),
+                            }
+                        elif key in readable_keys:
+                            row = index_map[key]
+                            existing_content = target_node.get("content") if isinstance(target_node, dict) else None
+                            c_chars = row.get("content_chars") or 0
+                            is_trunc = (len(str(existing_content)) < c_chars) if existing_content is not None else (c_chars > 0)
+                            updates_by_pos[pos] = {
+                                "content_chars": c_chars,
+                                "content_truncated": is_trunc,
+                                "content_source": "graph",
+                                "ref": row.get("ref"),
+                            }
+                        else:
+                            updates_by_pos[pos] = {
+                                "content_source": "graph",
+                            }
+                else:
+                    for pos, key in eligible_entries:
+                        updates_by_pos[pos] = {
+                            "content_source": "graph",
+                        }
+
+                for pos, update_dict in updates_by_pos.items():
+                    row_idx, k, list_idx = pos
+                    target_node = records[row_idx][k] if list_idx is None else records[row_idx][k][list_idx]
+                    if isinstance(target_node, dict):
+                        target_node.update(update_dict)
+            except Exception as exc:
+                log.warning("graph query node write-back failed: %s", exc)
 
         # json.dumps TypeError/ValueError is our coercion bug, not a Neo4j tx failure.
         try:
@@ -8577,7 +8885,8 @@ class MemoryCoordinator:
             rec = await conn.fetchrow(
                 "SELECT metadata->>'type' AS type, created_at, superseded, superseded_by,"
                 "       metadata->'grounded_in' AS grounded_in,"
-                "       metadata->'supersession_ack' AS supersession_ack"
+                "       metadata->'supersession_ack' AS supersession_ack,"
+                "       content, visibility, agent_id, scope"
                 " FROM technical_docs WHERE id = $1", pg_id,
             )
             ob = await conn.fetchrow(
@@ -8649,12 +8958,34 @@ class MemoryCoordinator:
             elif isinstance(ack_raw, dict):
                 ack = ack_raw
 
-        return web.json_response({
+        viewer = request.get("authenticated_agent")
+        text_fields = {}
+        if rec is not None:
+            vis = rec.get("visibility") or "global"
+            owner = rec.get("agent_id") or ""
+            scope_val = rec.get("scope") or "global"
+            if _is_doc_visible(vis, owner, scope_val, viewer, viewer_scope=None):
+                c_val = rec.get("content")
+                text_fields = {
+                    "content": c_val,
+                    "content_chars": len(c_val) if c_val is not None else 0,
+                    "content_truncated": False,
+                }
+            else:
+                text_fields = {
+                    "content": None,
+                    "content_withheld": "not_visible",
+                }
+
+        resp_dict = {
             "pg_id": pg_id,
             # The unambiguous form of the thing just returned — quote THIS back,
             # not the bare id, and the reference can never resolve elsewhere.
             "record_type": actual_type,
             "ref": make_ref(actual_type, pg_id),
+        }
+        resp_dict.update(text_fields)
+        resp_dict.update({
             "exists": rec is not None,
             "type": rec["type"] if rec else None,
             "created_at": _iso(rec["created_at"]) if rec else None,
@@ -8671,6 +9002,7 @@ class MemoryCoordinator:
             # what it became (durable — from the source_pg_ids reverse lookup)
             "consolidated_into": consolidated_into,
         })
+        return web.json_response(resp_dict)
 
     async def _status_of_summary(self, pg_id: int, record_type: str) -> web.Response:
         """Status of a `community_summaries` row — the other id namespace.
@@ -8684,8 +9016,9 @@ class MemoryCoordinator:
         qualified so they cannot be mistaken for ids in this namespace."""
         async with self._acquire() as conn:
             row = await conn.fetchrow(
-                "SELECT id, metadata, source_pg_ids, created_at, superseded, superseded_reason, superseded_by, run_id"
-                "  FROM community_summaries WHERE id = $1", pg_id,
+                "SELECT id, metadata, source_pg_ids, created_at, superseded, superseded_reason, superseded_by, run_id,"
+                "       left(content, $2) AS content, length(content) AS content_chars"
+                "  FROM community_summaries WHERE id = $1", pg_id, READ_FULL_TEXT_BUDGET_CHARS,
             )
             if row is None:
                 return web.json_response(
@@ -8725,10 +9058,16 @@ class MemoryCoordinator:
                     retired_summaries = []
         row_dict = dict(row) if not isinstance(row, dict) else row
         sup_by = row_dict.get("superseded_by")
+        c_text = row_dict.get("content")
+        c_chars = row_dict.get("content_chars") or 0
+        c_trunc = (len(c_text) < c_chars) if c_text is not None else (c_chars > 0)
         resp_data = {
             "pg_id": pg_id,
             "record_type": actual,
             "ref": make_ref(actual, pg_id),
+            "content": c_text,
+            "content_chars": c_chars,
+            "content_truncated": c_trunc,
             "exists": True,
             "entity": meta.get("entity"),
             # Thematic domain plus insight domains both exposed (thematic domains degrades to a one-element list).
