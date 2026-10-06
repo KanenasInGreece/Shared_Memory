@@ -24,13 +24,15 @@ The gateway is `:8888`. Never call the embedder `:8070` or the reranker `:8071`.
 | Durable result of work | `save "<content>" ['<metadata-json>'] [--domain NAME] [--supersedes PG_ID]` |
 | Operator confirmed a choice | `save_decision --title "…" --decided-by "…" --rationale "…" [--project NAME] [--domain NAME] [--grounded-in "N:role"] [--alternatives "…"] [--confidence high]` |
 | Outcome of a decision | `save_retrospective --pg-id N --rating STATE --notes "…" --grounded-in "N[:role]" [--source-ref PATH]` |
-| What happened to this record | `lineage fact:N` |
+| Read a known record: its whole text and what happened to it | `lineage fact:N` |
 | Retract a fact, no replacement | `supersede --pg-id N [--by SUCCESSOR] [--acknowledge-standing ID "operator's words"]` |
 | A stale flag is immaterial | `review-hold --summary-id S --pg-id N` |
 | Named structural lookup | `query why-to-check\|who-decided\|agent-decisions\|retrospectives` plus that template's flags |
 | Raw read-only Cypher | `graph "<cypher>"` |
 
 Named templates: `why-to-check` (`--title` required, optional `--project`), `who-decided` (`--title`, `--project`), `agent-decisions` (`--assisted-by`, `--project`), `retrospectives` (`--rating`). They call `POST /memory/graph`. They do not hit search or telemetry. `graph` and named CLI `query` templates require `full` or `admin`. `search`, `lineage`/`status`, and `telemetry` remain for `read`. `/health` is anonymous, not a read-role grant. When auth is configured, a bare curl is only `status`, `version`, and `api_version`. A full payload that includes `"auth_required": false` means auth is off.
+
+Text lives in Postgres; a graph node holds a capped copy. `lineage` returns `content`: the whole text of a fact, decision or retrospective this caller can read (`content_withheld: "not_visible"` otherwise); a summary is cut at the budget (default 16,000 characters) and `content_truncated` says so. `graph` reads Postgres for a record node returned as a row value or inside a returned list: whole text while the budget lasts, marked `content_source: "postgres"`; after that the node keeps its capped copy, marked `content_source: "graph"`, with `content_chars`, `content_truncated` and `ref`. A node this caller cannot read keeps its capped copy and carries only `content_source: "graph"`. Read that record with `lineage <ref>`. A projected property (`RETURN n.content`), a path, a map, and the named `query` templates always give the capped copy. In a search hit, a `graph_context` neighbour this caller can read carries `ref` and `content_chars`.
 
 `save` has no `--project` flag. The client derives the project, or you set `"project"` in the metadata JSON. An explicit value wins.
 
@@ -205,11 +207,11 @@ Graph expansion on a judgement hit returns `belonging`: `{project, domains}`. Th
 Worked contract. Anonymous `/health`, then `--version`:
 
 ```json
-{"status":"ok","version":"1.0.12","api_version":4}
+{"status":"ok","version":"1.0.13","api_version":4}
 ```
 
 ```json
-{"version": "1.0.12", "api_version": 4, "tool": "shared-memory-framework"}
+{"version": "1.0.13", "api_version": 4, "tool": "shared-memory-framework"}
 ```
 
 `doctor` compares this client's `api_version` with the gateway and names which side to upgrade.

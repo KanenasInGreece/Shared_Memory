@@ -265,17 +265,24 @@ async def test_pgid_keyed_neighbor_surfaces_with_label_pgid_snippet():
 
 @pytest.mark.asyncio
 async def test_pgid_keyed_neighbor_without_text_gets_null_snippet():
-    """A pg_id-keyed neighbor with no text-bearing property (e.g. a bare
-    CommunitySummary node) surfaces with snippet=None — still not dropped."""
-    c, _, mock_session = _coordinator_with_mocks()
+    """A summary neighbour with a live Postgres row surfaces with the Postgres
+    snippet and its ref/content_chars, rather than keeping null.
+    """
+    c, mock_conn, mock_session = _coordinator_with_mocks()
     mock_session.run = AsyncMock(return_value=_AsyncRows([
         _row(labels=["CommunitySummary"], name=None, pg_id=88,
              rel_type="SUMMARIZED_BY", rel_props={}, snippet=None),
     ]))
+    mock_conn.fetch = AsyncMock(return_value=[
+        {"id": 88, "content_chars": 45, "snippet": "Postgres snippet text",
+         "superseded": False, "metadata": {}},
+    ])
     ctx = await c._expand_graph_context(
         mock_session, 42, (coordinator_mod.ONT.fact,))
     assert ctx[0]["pg_id"] == 88
-    assert ctx[0]["snippet"] is None
+    assert ctx[0]["snippet"] == "Postgres snippet text"
+    assert ctx[0]["ref"] == "summary:88"
+    assert ctx[0]["content_chars"] == 45
 
 
 # ── (b′) ADR node props on the one-hop neighbor (decision 909) ────────────────
@@ -365,9 +372,9 @@ async def test_decision_neighbor_payload_comes_from_postgres_not_the_graph():
 
 @pytest.mark.asyncio
 async def test_only_decision_neighbors_are_dereferenced():
-    """A Fact/Entity neighbor is never looked up in technical_docs — the
-    payload query exists for decisions, and a walk that has no decision in it
-    must cost ZERO extra queries (the property decision 909 was protecting)."""
+    """A Fact/Entity neighbor does not trigger the decision payload query,
+    though it is looked up in the text index.
+    """
     c, mock_conn, mock_session = _coordinator_with_mocks()
     mock_session.run = AsyncMock(return_value=_AsyncRows([
         _row(labels=["Fact"], name=None, pg_id=601, rel_type="GROUNDED_IN",
@@ -376,10 +383,15 @@ async def test_only_decision_neighbors_are_dereferenced():
         _row(labels=["Entity"], name="Postgres", pg_id=None,
              rel_type="MENTIONS", direction="out", rel_props={}, snippet=None),
     ]))
+    mock_conn.fetch = AsyncMock(return_value=[
+        {"id": 601, "content_chars": 10, "type": "fact", "superseded": False,
+         "visibility": "global", "agent_id": None, "scope": None},
+    ])
     ctx = await c._expand_graph_context(
         mock_session, 123, (coordinator_mod.ONT.community_summary,))
     assert ctx[0]["adr_props"] == {"fact_kind": "measured"}
-    mock_conn.fetch.assert_not_awaited()
+    assert not any("metadata->'decision'" in call.args[0] for call in mock_conn.fetch.await_args_list)
+    assert any("technical_docs" in call.args[0] for call in mock_conn.fetch.await_args_list)
 
 
 @pytest.mark.asyncio
@@ -417,7 +429,8 @@ async def test_a_failed_payload_dereference_never_fails_the_walk():
 async def test_batched_expansion_dereferences_every_anchor_in_one_query():
     """The batch form exists to make the walk one round-trip; a per-anchor
     payload query would undo that. Two anchors, two decision neighbors, ONE
-    dereference carrying both ids."""
+    decision payload query and at most one index query per table.
+    """
     c, mock_conn, mock_session = _coordinator_with_mocks()
     mock_session.run = AsyncMock(return_value=_AsyncRows([
         _row(labels=["Decision"], name=None, anchor_pg_id=91, rel_pg_id=579,
@@ -427,17 +440,29 @@ async def test_batched_expansion_dereferences_every_anchor_in_one_query():
              rel_type="SUMMARIZED_BY", direction="in", rel_props={},
              snippet="the outbox is atomic"),
     ]))
-    mock_conn.fetch = AsyncMock(return_value=[
+    payload_rows = [
         {"id": 579, "alternatives": ["keep the flat GROUNDED_IN"], "confidence": "high"},
         {"id": 580, "alternatives": None, "confidence": "medium"},
-    ])
+    ]
+    index_rows = [
+        {"id": 579, "content_chars": 120, "type": "decision", "superseded": False,
+         "visibility": "global", "agent_id": None, "scope": None},
+        {"id": 580, "content_chars": 150, "type": "decision", "superseded": False,
+         "visibility": "global", "agent_id": None, "scope": None},
+    ]
+    mock_conn.fetch = AsyncMock(side_effect=[payload_rows, index_rows])
     out = await c._expand_graph_context_batch(
         mock_session, [91, 92], (coordinator_mod.ONT.community_summary,))
     assert out[91][0]["adr_props"] == {
         "alternatives": ["keep the flat GROUNDED_IN"], "confidence": "high"}
     assert out[92][0]["adr_props"] == {"confidence": "medium"}
-    assert mock_conn.fetch.await_count == 1
-    assert mock_conn.fetch.await_args.args[1] == [579, 580]
+    assert mock_conn.fetch.await_count == 2
+    payload_calls = [call for call in mock_conn.fetch.await_args_list if "metadata->'decision'" in call.args[0]]
+    index_calls = [call for call in mock_conn.fetch.await_args_list if "technical_docs" in call.args[0] and "metadata->'decision'" not in call.args[0]]
+    assert len(payload_calls) == 1
+    assert payload_calls[0].args[1] == [579, 580]
+    assert len(index_calls) == 1
+    assert index_calls[0].args[1] == [579, 580]
 
 
 @pytest.mark.asyncio
@@ -461,13 +486,18 @@ async def test_fact_neighbor_surfaces_fact_kind_and_source_ref():
 async def test_neighbor_without_adr_props_omits_the_key():
     """A neighbor carrying no ADR node property gets no adr_props key at all —
     additive, so existing consumers are unaffected."""
-    c, _, mock_session = _coordinator_with_mocks()
+    c, mock_conn, mock_session = _coordinator_with_mocks()
     mock_session.run = AsyncMock(return_value=_AsyncRows([
         _row(labels=["CommunitySummary"], name=None, pg_id=88,
              rel_type="SUMMARIZED_BY", rel_props={}, snippet=None),
     ]))
+    mock_conn.fetch = AsyncMock(return_value=[
+        {"id": 88, "content_chars": 50, "snippet": "live summary",
+         "superseded": False, "metadata": {}},
+    ])
     ctx = await c._expand_graph_context(
         mock_session, 42, (coordinator_mod.ONT.fact,))
+    assert len(ctx) == 1
     assert "adr_props" not in ctx[0]
 
 

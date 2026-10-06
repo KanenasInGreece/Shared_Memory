@@ -840,6 +840,10 @@ async def test_lineage_returns_supersession_ack():
             "decisions": [2522],
             "acknowledged_by": "operator",
         },
+        "content": "grounding fact text",
+        "visibility": "global",
+        "agent_id": "demo-agent",
+        "scope": "global",
     }
     conn.fetchrow = AsyncMock(side_effect=[rec_row, None])
 
