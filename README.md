@@ -721,7 +721,9 @@ call walks any record's whole story:
 
 ```bash
 memory_bridge.py lineage decision:43
-# → saved → enriched → folded into insight 217, and when, and by which cycle
+# → saved → enriched → folded into insight 217, and every record it rests on or that rests on it, by ref
+memory_bridge.py search --ref decision:43
+# → that record whole, with its alternatives
 ```
 
 ## 11. Three diagnostic tests
