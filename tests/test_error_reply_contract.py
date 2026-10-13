@@ -637,7 +637,7 @@ async def test_mcp_401_save_logs_auth_failed_once_and_never_save_rejected(monkey
         result = await vector_skill.save_artifact(
             "canary", '{"source":"test-model","project":"shared-memory-GitHub"}')
 
-    assert "Error:" in result
+    assert json.loads(result)["status"] == "error"
     assert recorder.count("auth_failed") == 1, (
         f"a 401 must write exactly one auth_failed line, got {recorder.events}")
     assert recorder.count("save_rejected") == 0, (

@@ -79,8 +79,9 @@ async def test_mcp_save_artifact_success():
             MOCK_CONTENT, '{"source":"qwen3-27b","project":"shared-memory-GitHub","entities":["TestEntity"]}'
         )
 
-    assert "Success" in result
-    assert f"pg_id={MOCK_PG_ID}" in result
+    # The reply is the gateway's object as JSON, the same text the CLI prints.
+    assert json.loads(result)["pg_id"] == MOCK_PG_ID
+    assert json.loads(result)["status"] == "success"
     # Routed to the gateway save endpoint with metadata as an OBJECT (the codec
     # serialises once — a stringified metadata here would double-encode).
     call = mock_post.call_args
@@ -88,20 +89,24 @@ async def test_mcp_save_artifact_success():
     payload = call.kwargs["json"]
     assert isinstance(payload["metadata"], dict)
     assert payload["metadata"]["entities"] == ["TestEntity"]
-    # Loaded model name preserved even though auth may overwrite source.
-    assert payload["metadata"]["model"] == "qwen3-27b"
+    # Only what the caller supplied: the CLI sends no timestamp and no model.
+    assert payload["metadata"] == {
+        "source": "qwen3-27b", "project": "shared-memory-GitHub",
+        "entities": ["TestEntity"]}
 
 
 @pytest.mark.asyncio
 async def test_mcp_save_artifact_gateway_down():
-    """save_artifact returns a readable error, naming the unit to start, when the gateway is unreachable."""
-    with patch("httpx.AsyncClient.post", side_effect=Exception("connection refused")):
-        result = await vector_skill.save_artifact(
+    """save_artifact returns the CLI's error object when the gateway is unreachable."""
+    with patch("httpx.AsyncClient.post", side_effect=Exception("connection refused")), \
+         patch.object(vector_skill, "check_gateway_compat",
+                      AsyncMock(return_value={"compat": "ok"})):
+        result = json.loads(await vector_skill.save_artifact(
             MOCK_CONTENT, '{"source":"qwen3-27b","project":"shared-memory-GitHub"}'
-        )
-    assert "Error" in result
-    assert "unreachable" in result.lower()
-    assert "hive-mind-gateway.service" in result
+        ))
+    assert result["status"] == "error"
+    assert "unreachable" in result["message"].lower()
+    assert "connection refused" in result["message"]
 
 
 @pytest.mark.asyncio
@@ -117,18 +122,21 @@ async def test_mcp_save_artifact_surfaces_coordinator_error():
         result = await vector_skill.save_artifact(
             MOCK_CONTENT, '{"source":"qwen3-27b","project":"shared-memory-GitHub"}'
         )
-    assert "Error" in result
-    assert "Embedding service unreachable" in result
+    result = json.loads(result)
+    assert result["status"] == "error"
+    assert "Embedding service unreachable" in result["message"]
 
 
 @pytest.mark.asyncio
-async def test_mcp_save_artifact_missing_source_rejected_client_side():
-    """source is required — rejected before any network call."""
-    with patch("httpx.AsyncClient.post") as mock_post:
-        result = await vector_skill.save_artifact(MOCK_CONTENT, '{"entities":["X"]}')
-    assert "Error" in result
-    assert "source is required" in result
-    mock_post.assert_not_called()
+async def test_mcp_save_artifact_without_source_is_sent_as_the_cli_sends_it():
+    """No source is required: the gateway records the verified agent as source. A save without one reaches the gateway with exactly the caller's metadata."""
+    mock_response = MagicMock(status_code=200, json=lambda: {"status": "success", "pg_id": 5})
+    with patch("httpx.AsyncClient.post", return_value=mock_response) as mock_post:
+        result = json.loads(await vector_skill.save_artifact(
+            MOCK_CONTENT, '{"project":"shared-memory-GitHub","model":"qwen3"}'))
+    assert result["status"] == "success"
+    assert mock_post.call_args.kwargs["json"]["metadata"] == {
+        "project": "shared-memory-GitHub", "model": "qwen3"}
 
 @pytest.mark.asyncio
 async def test_mcp_hybrid_search_goes_through_the_gateway():
@@ -153,12 +161,8 @@ async def test_mcp_hybrid_search_goes_through_the_gateway():
     call = mock_post.call_args
     assert call.args[0].endswith("/memory/search")
     assert call.kwargs["json"]["query"] == MOCK_QUERY
-    # rendered
-    assert "Global Context Summary" in result and "Global summary text" in result
-    assert "Insight (cross-project principle)" in result
-    assert "Unified Memory Results" in result
-    assert "Score: 0.88" in result
-    assert "BELONGS_TO -> SharedMem" in result
+    # The CLI's record list, verbatim: every field the gateway sent survives.
+    assert json.loads(result) == payload["results"]
     # qualified refs surfaced, never a bare id for a summary
     assert "summary:87" in result and f"fact:{MOCK_PG_ID}" in result
 
@@ -219,7 +223,7 @@ async def test_mcp_empty_refs_runs_a_normal_search():
     assert "refs" not in mock_post.call_args_list[0].kwargs["json"]
     assert mock_post.call_args_list[1].kwargs["json"]["query"] == MOCK_QUERY
     assert "refs" not in mock_post.call_args_list[1].kwargs["json"]
-    assert missing == "Error: query is required"
+    assert json.loads(missing) == {"status": "error", "message": "query is required"}
     assert mock_post.call_count == 2
 
 
@@ -233,7 +237,8 @@ async def test_mcp_non_string_ref_is_an_error_and_sends_nothing():
          patch.object(vector_skill, "_gateway_capacity", _quiet), \
          patch("httpx.AsyncClient.post") as mock_post:
         rendered = await vector_skill.hybrid_search_and_rerank(refs=[7, "fact:1"])
-    assert rendered == "Error: every ref must be a string type:id"
+    assert json.loads(rendered) == {"status": "error",
+                                    "message": "every ref must be a string type:id"}
     assert mock_post.call_count == 0
 
 
@@ -241,10 +246,12 @@ async def test_mcp_non_string_ref_is_an_error_and_sends_nothing():
 async def test_mcp_hybrid_search_reports_a_down_gateway_plainly():
     """The gateway is now the only path to memory, so an outage is a hard failure.
     Saying so beats returning an empty result set that reads as 'nothing found'."""
-    with patch("httpx.AsyncClient.post", side_effect=RuntimeError("connection refused")):
-        result = await vector_skill.hybrid_search_and_rerank(MOCK_QUERY)
-    assert "unreachable" in result.lower()
-    assert "hive-mind-gateway" in result
+    with patch("httpx.AsyncClient.post", side_effect=RuntimeError("connection refused")), \
+         patch.object(vector_skill, "check_gateway_compat",
+                      AsyncMock(return_value={"compat": "ok"})):
+        result = json.loads(await vector_skill.hybrid_search_and_rerank(MOCK_QUERY))
+    assert result["status"] == "error"
+    assert "unreachable" in result["message"].lower()
 
 
 @pytest.mark.asyncio
@@ -265,8 +272,7 @@ async def test_mcp_save_decision_success():
             confidence="high",
         )
 
-    assert "pg_id=77" in result
-    assert "Use asyncpg over psycopg2" in result
+    assert json.loads(result) == {"status": "success", "pg_id": 77}
     call_kwargs = mock_post.call_args
     payload = call_kwargs[1]["json"] if "json" in call_kwargs[1] else call_kwargs.kwargs["json"]
     assert payload["metadata"]["type"] == "decision"
@@ -376,15 +382,16 @@ async def test_mcp_save_decision_treats_a_lone_string_as_one_alternative():
 
 @pytest.mark.asyncio
 async def test_mcp_save_decision_coordinator_down():
-    """save_decision returns a readable error, naming the unit to start, when the coordinator is unreachable."""
-    with patch("httpx.AsyncClient.post", side_effect=Exception("connection refused")):
-        result = await vector_skill.save_decision(
+    """save_decision returns the CLI's error object when the coordinator is unreachable."""
+    with patch("httpx.AsyncClient.post", side_effect=Exception("connection refused")), \
+         patch.object(vector_skill, "check_gateway_compat",
+                      AsyncMock(return_value={"compat": "ok"})):
+        result = json.loads(await vector_skill.save_decision(
             title="T", decided_by="X", project="P",
             rationale="R", source="test-model",
-        )
-    assert "Error" in result
-    assert "unreachable" in result.lower()
-    assert "hive-mind-gateway.service" in result
+        ))
+    assert result["status"] == "error"
+    assert "unreachable" in result["message"].lower()
 
 
 @pytest.mark.asyncio
@@ -403,12 +410,12 @@ async def test_mcp_save_decision_coordinator_returns_400():
         "message": "decision save missing required fields: ['rationale']",
     }
     with patch("httpx.AsyncClient.post", return_value=mock_response):
-        result = await vector_skill.save_decision(
+        result = json.loads(await vector_skill.save_decision(
             title="T", decided_by="X", project="P",
             rationale="", source="test-model",
-        )
-    assert "Error" in result
-    assert "rationale" in result
+        ))
+    assert result["status"] == "error"
+    assert "rationale" in result["message"]
 
 
 @pytest.mark.asyncio
@@ -425,8 +432,7 @@ async def test_mcp_save_retrospective_success():
             pg_id=43, rating="validated", notes="held up in prod", source="qwen3",
         )
 
-    assert "Decision pg_id=43" in result
-    assert "record pg_id=91" in result
+    assert json.loads(result) == {"status": "success", "pg_id": 91, "target_pg_id": 43}
     call_kwargs = mock_post.call_args
     payload = call_kwargs[1]["json"] if "json" in call_kwargs[1] else call_kwargs.kwargs["json"]
     assert payload["pg_id"] == 43
@@ -483,19 +489,47 @@ async def test_mcp_check_memory_health_names_version_skew():
 
 @pytest.mark.asyncio
 async def test_mcp_check_memory_health_unreachable_gateway():
-    with patch("httpx.AsyncClient.get", side_effect=RuntimeError("refused")):
+    with patch("httpx.AsyncClient.get", side_effect=RuntimeError("refused")), \
+         patch.object(vector_skill, "check_gateway_compat",
+                      AsyncMock(return_value={"compat": "ok"})):
         result = json.loads(await vector_skill.check_memory_health())
-    assert result["status"] == "unreachable"
+    assert result["status"] == "error"
+    assert "unreachable" in result["message"].lower()
+    assert "refused" in result["message"]
+
+
+@pytest.mark.asyncio
+async def test_mcp_check_memory_health_timeout_is_not_reported_as_down():
+    import httpx
+    with patch("httpx.AsyncClient.get", side_effect=httpx.ReadTimeout("")), \
+         patch.object(vector_skill, "check_gateway_compat",
+                      AsyncMock(return_value={"compat": "ok"})):
+        result = json.loads(await vector_skill.check_memory_health())
+    assert result["status"] == "error"
+    assert "UP and SLOW" in result["message"]
+    assert "systemctl" not in result["message"]
+
+
+@pytest.mark.asyncio
+async def test_mcp_check_memory_health_keeps_the_503_verdict():
+    body = {"status": "down", "version": "1.0.14", "api_version": 4, "role": "full",
+            "dependencies": {"embedder": {"state": "down", "reason": "no vector"}}}
+    resp = MagicMock(status_code=503, json=lambda: body)
+    with patch("httpx.AsyncClient.get", return_value=resp):
+        result = json.loads(await vector_skill.check_memory_health())
+    assert result["status"] == "down"
+    assert result["dependencies"]["embedder"]["reason"] == "no vector"
+    assert result["client"]["tool"] == "vector-skill"
 
 
 @pytest.mark.asyncio
 async def test_mcp_record_lineage_requires_a_valid_ref():
     """A bare id is accepted for compatibility; a malformed or wrongly-typed
     qualified ref is refused before it can resolve against the wrong table."""
-    bad = await vector_skill.record_lineage("summary:notanumber")
-    assert "Error" in bad
-    bad2 = await vector_skill.record_lineage("widget:12")
-    assert "Error" in bad2
+    bad = json.loads(await vector_skill.record_lineage("summary:notanumber"))
+    assert "type:id" in bad["error"]
+    bad2 = json.loads(await vector_skill.record_lineage("widget:12"))
+    assert "type:id" in bad2["error"]
 
     mock_response = MagicMock(status_code=200, json=lambda: {"pg_id": 87, "exists": True})
     with patch("httpx.AsyncClient.get", return_value=mock_response) as mock_get:
@@ -542,8 +576,8 @@ async def test_mcp_supersede_surfaces_coordinator_error():
     mock_response.status_code = 200
     mock_response.json = lambda: {"status": "error", "message": "fact 7 is already superseded"}
     with patch("httpx.AsyncClient.post", return_value=mock_response):
-        result = await vector_skill.supersede(7)
-    assert "Error" in result and "already superseded" in result
+        result = json.loads(await vector_skill.supersede(7))
+    assert result == {"status": "error", "message": "fact 7 is already superseded"}
 
 
 @pytest.mark.asyncio

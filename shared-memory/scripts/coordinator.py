@@ -127,7 +127,7 @@ def _short(value: Any, cap: int = 200) -> str:
 
 
 # FRAMEWORK_VERSION is the build string and may drift. API_VERSION is the wire contract with memory_bridge.py; bump it only when shape, auth, or routes break older clients.
-FRAMEWORK_VERSION = "1.0.14"
+FRAMEWORK_VERSION = "1.0.15"
 # API v2: retrospective is a full record. v4: unregistered project is 400 (proposal / new_project / sentinel).
 API_VERSION = 4
 CLIENT_VERSION_HEADER = "X-SM-Api-Version"
@@ -836,6 +836,13 @@ ENTITIES_PROVENANCE_VALUES = ("operator", "agent")
 
 # Only facts carry entities; judgements inherit topics from grounded facts. Ask via is_judgement_type(), never a raw-string tuple (decision:1664, fact:970).
 JUDGEMENT_LABELS = (ONT.decision, ONT.retrospective)
+
+
+def _carries_project_value(metadata: dict) -> bool:
+    """Does the record send any project value at all, valid or not? A number, a list or a blank string counts; absent and JSON null do not. Pure."""
+    blob = metadata.get("decision")
+    return (metadata.get("project") is not None
+            or (isinstance(blob, dict) and blob.get("project") is not None))
 
 
 def is_judgement_type(record_type: object) -> bool:
@@ -4544,12 +4551,12 @@ class MemoryCoordinator:
         to carry an advisory would make forty call sites unpack a tuple to learn
         nothing they asked for.
         """
-        # Retrospectives inherit the project of the decision they judge, so this check would demand a value the caller never sends. Decisions stay in the check: an unregistered name used to become a project node.
-        if metadata.get("type") == "retrospective":
-            return None
-
         # Check project, not a domain chain. A section must not vouch for the project it belongs to.
         supplied = resolve_project(metadata)
+        # Retrospectives inherit the project of the decision they judge, so this check would demand a value the caller never sends. One that does send a project faces the check like any record. Decisions stay in the check: an unregistered name used to become a project node.
+        if metadata.get("type") == "retrospective" and not _carries_project_value(metadata):
+            return None
+
         if not supplied:
             return await self._project_rejection("project_required", None)
 
@@ -5140,6 +5147,30 @@ class MemoryCoordinator:
             )
         return [r["name"] for r in rows]
 
+    @staticmethod
+    def _domain_shape_error(metadata: dict) -> dict | None:
+        """400 when `domain` or `domains` holds anything but a string or a list of strings, at the top level or inside the `decision` blob. Pure."""
+        blob = metadata.get("decision")
+        places = [("metadata", metadata)]
+        if isinstance(blob, dict):
+            places.append(("metadata.decision", blob))
+        for where, holder in places:
+            for key in DOMAIN_KEYS:
+                value = holder.get(key)
+                if value is None or isinstance(value, str):
+                    continue
+                if isinstance(value, list) and all(isinstance(v, str) for v in value):
+                    continue
+                return {
+                    "status": "error",
+                    "error": "domain_shape_invalid",
+                    "message": (
+                        f"{where}.{key} has the wrong shape: a section is a "
+                        "string or a list of strings. Nothing was written."
+                    ),
+                }
+        return None
+
     def _domain_on_judgement_rejection(self, record_type: str) -> dict:
         """The 400 a retrospective gets for naming a domain.
 
@@ -5201,6 +5232,7 @@ class MemoryCoordinator:
         "domain_unknown": "new_domain_refused",
         "domain_without_project": "new_domain_refused",
         "domain_not_allowed_on_judgement": "new_domain_refused",
+        "domain_shape_invalid": "new_domain_refused",
     }
 
     def _count_refusal(self, payload: object) -> None:
@@ -5542,7 +5574,7 @@ class MemoryCoordinator:
         ⚠ COMPARED THROUGH THE RESOLVERS, NEVER ON THE LITERAL KEYS.
         `resolve_project`/`resolve_domains` read the `decision` blob first and
         the top level second, and they accept a bare string where a list is
-        expected — so 152 legacy facts carrying a singular `domain` resolve to
+        expected — so legacy facts carrying a singular `domain` resolve to
         exactly what a modern `domains` list resolves to, instead of
         false-conflicting on the key name.
 
@@ -6290,14 +6322,10 @@ class MemoryCoordinator:
             return web.json_response(
                 {"status": "error", "message": "content is required"}, status=400
             )
-        try:
-            _require_outbox_type({
-                "type": _outbox_row_type(
-                    metadata.get("type") if isinstance(metadata, dict) else None
-                ),
-            })
-        except ValueError:
-            raw_type = metadata.get("type") if isinstance(metadata, dict) else None
+        # The internal outbox types (supersede, project_of, domain_of) are written by the gateway and operator scripts, never chosen by a client.
+        raw_type = metadata.get("type") if isinstance(metadata, dict) else None
+        if (isinstance(raw_type, str) and raw_type.strip()
+                and raw_type.strip().lower() not in REF_TYPES_DOCS):
             return web.json_response(
                 {
                     "status": "error",
@@ -6325,6 +6353,11 @@ class MemoryCoordinator:
                 },
                 status=400,
             )
+
+        # Every check below compares the type exactly, so a differently cased spelling would skip them.
+        _sent_type = metadata.get("type")
+        if isinstance(_sent_type, str) and _sent_type.strip().lower() in REF_TYPES_DOCS:
+            metadata["type"] = _sent_type.strip().lower()
 
         # Reject a bad decision shape here. A corrupt outbox row would replay it on every restart.
         if metadata.get("type") == "decision":
@@ -6416,6 +6449,11 @@ class MemoryCoordinator:
             axis_report["project_resolved"] = {
                 **_ingress, **decision_project_rewrite}
 
+        shape_error = self._domain_shape_error(metadata)
+        if shape_error is not None:
+            self._count_refusal(shape_error)
+            return web.json_response(shape_error, status=400)
+
         # Domain resolves after project (canonical name in hand); an unreadable registry is 503, not a silent accept.
         try:
             domain_error = await self._domain_ingress_error(
@@ -6440,11 +6478,13 @@ class MemoryCoordinator:
             self._count_refusal(domain_error)
             return web.json_response(domain_error, status=400)
 
-        # Materialise a decision's asserted domains to metadata top-level after ingress rewrite (additive; blob unchanged) (decision:1214).
-        if metadata.get("type") == "decision":
-            decision_domains = resolve_domains(metadata)
-            if decision_domains:
-                metadata["domains"] = decision_domains
+        # Sections live under `domains` only, after ingress has rewritten spellings. A decision's blob is unchanged (decision:1214).
+        resolved_sections = resolve_domains(metadata)
+        if resolved_sections:
+            metadata["domains"] = resolved_sections
+        else:
+            metadata.pop("domains", None)
+        metadata.pop("domain", None)
 
         # decision 381, refined by 384: supersedes is checked before embed, and dependents are flagged at retrieval rather than rewritten here.
         supersedes = metadata.get("supersedes")

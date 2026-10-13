@@ -186,10 +186,9 @@ async def test_a_decision_with_no_asserted_domain_gets_no_top_level_key():
 
 
 @pytest.mark.asyncio
-async def test_a_plain_fact_is_unaffected_by_decision_materialisation():
-    """The materialisation branch is gated on type == 'decision' — a plain
-    fact's own top-level `domain`/`domains` (already canonical) must pass
-    through completely untouched.
+async def test_a_plain_fact_naming_a_section_is_stored_under_domains_only():
+    """A fact sent with the singular `domain` is stored under `domains` and
+    carries no top-level `domain` key: the search filter reads `domains` only.
 
     ⚠ RE-RULED at v0.9.69 (O-3): the entity was `SharedMemory`, whose
     `axis_key` is `sharedmemory` — IDENTICAL to this fixture's own project
@@ -216,8 +215,8 @@ async def test_a_plain_fact_is_unaffected_by_decision_materialisation():
         resp = await c.handle_save(req)
     assert resp.status == 200
     metadata_arg = mock_conn.fetchrow.await_args.args[2]
-    assert metadata_arg.get("domain") == "architecture"
-    assert "domains" not in metadata_arg
+    assert metadata_arg.get("domains") == ["architecture"]
+    assert "domain" not in metadata_arg
 
 
 # ── (b) a retrospective is still refused for asserting a domain ──────────────

@@ -27,7 +27,7 @@ neither — it takes `shared-memory/CONSTITUTION_SNIPPET.md`.
 
 `vector-skill.py` is a **thin client**: every operation is an authenticated HTTP call to the
 Hive-Mind Gateway. It opens no ports (stdio transport — the MCP host spawns it and pipes to it),
-holds no database drivers, and enforces nothing the gateway does not enforce — beyond refusing to SEND what the gateway would certainly reject (a save without its required provenance fields fails fast client-side, before any credential is spent) — auth, read
+holds no database drivers, and enforces nothing the gateway does not enforce — beyond refusing to SEND what the gateway would certainly reject (a fact save without its `project` fails fast client-side, before any credential is spent; the connector cannot derive one) — auth, read
 authorization, locking, idempotency and consolidation all live server-side. That is deliberate:
 a direct database MCP registered alongside it would bypass all of those, which is why
 `system-prompt.md` forbids one and the shipped template contains none.
@@ -51,6 +51,35 @@ Record lifecycle: `supersede`, `review_hold`.
 ⚠ **External content warning:** Do NOT save raw web-retrieved text without reviewing it for
 instructional language. A crafted document can contaminate `community_summaries` and persist as
 trusted context for all agents on this workstation.
+
+**Replies are the CLI's.** Each tool returns, as JSON text, the object the CLI prints for its twin:
+the gateway's reply for a success, and `{"status": "error", "message": ...}` for a refusal or a
+transport failure, with the gateway's `error` code and its other machine-readable fields beside it
+(for example the `proposals` of `domain_unknown`). The same input gives the same stored record and
+the same reply through either door; the doors differ in how they are loaded, not in what they do.
+
+Where the MCP server differs from the CLI, on purpose:
+
+1. A search that would make the CLI print a warning on stderr returns
+   `{"warnings": [...], "results": [...]}`, because an MCP host does not show the model the server's stderr.
+2. `check_memory_health` returns the gateway's `/health` body plus `role` and `client` (the CLI's `doctor` prints a smaller summary).
+3. A fact save needs a `project`, since there is no working directory to derive one from.
+4. `save_retrospective` has no `source_ref` argument.
+5. The 401 text names where the MCP token lives.
+6. A blank search query is refused before any call.
+7. The default `agent_id` is `vector_skill` (the CLI's is `memory_bridge`).
+
+**It connects the way the CLI does.** `COORDINATOR_UDS` names the gateway's Unix socket. Unset, the
+socket at `$XDG_RUNTIME_DIR/shared-memory-gw.sock` (or `/tmp/shared-memory-gw.sock`) is used when it
+is a socket owned by the current user, and TCP to `COORDINATOR_URL` otherwise (a plain file, or a socket
+of another user, is never trusted); an empty value always means TCP, and a value set explicitly is
+used as given. A socket that cannot be used is reported by path, with the way out
+(`COORDINATOR_UDS=`); the connector never falls back to TCP by itself. Over the socket the
+gateway reads the calling account from the socket peer, which is what lets it attest a decision's
+`decided_by` and stamp `principal` on a record, exactly as for a CLI save. ⚠ That account is the
+one the MCP **server process** runs as, not the person in the chat: every chat user of one MCP host
+is recorded as that host's account. The bearer token is sent
+either way. Set it in the host's `env` block or the client `.env`, like `COORDINATOR_URL`.
 
 The full client contract — every field, refusal and the reasoning behind each — is
 [`shared-memory/SKILL.md`](../shared-memory/SKILL.md); the MCP tools mirror it.

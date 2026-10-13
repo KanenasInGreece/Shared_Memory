@@ -19,6 +19,7 @@ units are about the two other client blind spots in the same area:
 
 Both front doors, mirroring the parity discipline of test_search_ceiling.py.
 """
+import json
 import importlib.util
 import os
 import sys
@@ -132,13 +133,13 @@ async def test_cli_search_prints_no_stderr_note_when_fully_ranked(capsys):
     assert captured.err == ""
 
 
-# ── B2: MCP — note prepended to the rendered text when it returns text ───────
+# ── B2: MCP — the notes go to stderr and the reply is the CLI's JSON ─────────
 
 MOCK_QUERY = "mcp unranked test"
 
 
 @pytest.mark.asyncio
-async def test_mcp_search_prepends_unranked_note_when_any_row_is_unranked():
+async def test_mcp_search_prints_unranked_note_when_any_row_is_unranked(capsys):
     payload = {"results": [
         {"pg_id": 1, "ref": "fact:1", "record_type": "fact", "content": "a",
          "ranked": True, "score": 0.9},
@@ -151,9 +152,13 @@ async def test_mcp_search_prepends_unranked_note_when_any_row_is_unranked():
     with patch("httpx.AsyncClient.post", return_value=mock_response):
         result = await vector_skill.hybrid_search_and_rerank(MOCK_QUERY)
 
-    assert result.startswith("NOTE: 2 of 3 results are UNRANKED")
-    assert "backend_capability on /health" in result
-    assert "Unified Memory Results" in result   # rendering still happens after
+    err = capsys.readouterr().err
+    assert "2 of 3 results are UNRANKED" in err
+    assert "backend_capability on /health" in err
+    # The note also travels in the reply, because the model never sees stderr.
+    reply = json.loads(result)
+    assert reply["warnings"] == [vector_skill._unranked_warning(payload["results"])]
+    assert reply["results"] == payload["results"]
 
 
 @pytest.mark.asyncio
@@ -259,31 +264,34 @@ async def test_cli_search_prints_fallback_warning_on_empty_keyword_fallback(caps
 # (e) MCP door — rendered text starts with the NOTE-prefixed headline
 
 @pytest.mark.asyncio
-async def test_mcp_search_prepends_fallback_note_on_empty_keyword_fallback():
+async def test_mcp_search_prints_fallback_note_on_empty_keyword_fallback(capsys):
     payload = _keyword_fallback_payload(0)
     mock_response = MagicMock(status_code=200, json=lambda: payload)
     with patch("httpx.AsyncClient.post", return_value=mock_response):
         result = await vector_skill.hybrid_search_and_rerank(MOCK_QUERY)
-    assert result.startswith("NOTE: EMBEDDING UNAVAILABLE")
-    assert "0 result(s)" in result
+    err = capsys.readouterr().err
+    assert "EMBEDDING UNAVAILABLE" in err
+    assert "0 result(s)" in err
+    # An empty list beside this warning means the ranked search was unavailable.
+    reply = json.loads(result)
+    assert reply == {"warnings": [vector_skill._fallback_warning(payload)], "results": []}
 
 
 @pytest.mark.asyncio
-async def test_mcp_search_note_order_matches_cli_when_both_fire():
+async def test_mcp_search_note_order_matches_cli_when_both_fire(capsys):
     """Nit (delta review): the CLI door prints the unranked line, then the
     fallback line (two sequential stderr prints, top to bottom). The MCP door
-    builds its text by PREPENDING, so it must prepend fallback first and
-    unranked second to land on the SAME final top-to-bottom order — otherwise
-    the two front doors show the pair in opposite order."""
+    prints them the same way, in the same order."""
     payload = {"status": "success", "fallback": "keyword", "results": [
         {"pg_id": 1, "content": "a", "ranked": False},
     ]}
     mock_response = MagicMock(status_code=200, json=lambda: payload)
     with patch("httpx.AsyncClient.post", return_value=mock_response):
-        result = await vector_skill.hybrid_search_and_rerank(MOCK_QUERY)
+        await vector_skill.hybrid_search_and_rerank(MOCK_QUERY)
 
-    unranked_pos = result.find("UNRANKED")
-    fallback_pos = result.find("EMBEDDING UNAVAILABLE")
+    err = capsys.readouterr().err
+    unranked_pos = err.find("UNRANKED")
+    fallback_pos = err.find("EMBEDDING UNAVAILABLE")
     assert unranked_pos != -1 and fallback_pos != -1
     assert unranked_pos < fallback_pos, (
         "MCP shows the fallback note before the unranked note — "
@@ -533,15 +541,15 @@ def test_unranked_warning_all_unranked():
 
 
 @pytest.mark.asyncio
-async def test_mcp_search_note_when_all_unranked():
+async def test_mcp_search_note_when_all_unranked(capsys):
     payload = {"results": [
         {"pg_id": 1, "ref": "fact:1", "record_type": "fact", "content": "a",
          "ranked": False, "score": 0.5},
     ]}
     mock_response = MagicMock(status_code=200, json=lambda: payload)
     with patch("httpx.AsyncClient.post", return_value=mock_response):
-        result = await vector_skill.hybrid_search_and_rerank(MOCK_QUERY)
-    assert result.startswith("NOTE: 1 of 1 results are UNRANKED")
+        await vector_skill.hybrid_search_and_rerank(MOCK_QUERY)
+    assert "1 of 1 results are UNRANKED" in capsys.readouterr().err
 
 
 # ── T-07: both doors share the identical unranked SENTENCE ──────────────────

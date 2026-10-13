@@ -3,7 +3,7 @@
 
 # The Telemetry Contract
 
-Contract version **1.0.14**. Every key the gateway emits on `GET /health` and `GET /memory/telemetry`, what it means, what it is measured in, when it arrived, and where it is going.
+Contract version **1.0.15**. Every key the gateway emits on `GET /health` and `GET /memory/telemetry`, what it means, what it is measured in, when it arrived, and where it is going.
 
 ## The roles
 
@@ -704,7 +704,7 @@ The envelope is `{"status": "success", "telemetry": {…}}`; paths below are rel
 | `registry.refusals.entity_confusable` | int | — | 0.9.74 | — | — | — | — |
 | `registry.refusals.entity_reserved` | int | — | 0.9.74 | — | — | — | — |
 | `registry.refusals.entity_unknown` | int | — | 0.9.74 | — | — | — | — |
-| `registry.refusals.new_domain_refused` | int | — | 0.9.74 | — | — | — | aggregates the domain-naming refusals: domain_unnameable, domain_spelling_variant, domain_confusable, domain_unknown, domain_without_project, domain_not_allowed_on_judgement |
+| `registry.refusals.new_domain_refused` | int | — | 0.9.74 | — | — | — | aggregates the domain-naming refusals: domain_unnameable, domain_spelling_variant, domain_confusable, domain_unknown, domain_without_project, domain_not_allowed_on_judgement, domain_shape_invalid |
 | `registry.refusals.new_project_refused` | int | — | 0.9.74 | — | — | — | aggregates the project-naming refusals: project_unnameable, project_spelling_variant, project_confusable |
 
 ### credentials

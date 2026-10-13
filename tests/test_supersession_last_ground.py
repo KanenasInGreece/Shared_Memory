@@ -690,34 +690,20 @@ async def test_t10_clients_preserve_409_rationale():
     # 3. Test vector_skill render
     vs_mod = _load_vector_skill("vector_skill_t10")
 
-    rendered = vs_mod._render_decision_loses_last_ground(payload_409)
-    assert "Ship skill index" in rendered
-    assert "Untruncated critical rationale that must not be lost" in rendered
-    assert "decision:2522" in rendered
-    assert "provide acknowledge_standing with:" not in rendered
-    assert "save the new fact first" in rendered
-    assert "NEW_ID:based_on" in rendered
-    assert "decision:2802" in rendered
-    assert "fact:2809" in rendered
-    assert "decisions_needing_answer" in inspect.getsource(vs_mod._render_decision_loses_last_ground)
-    assert 'get("acknowledge_standing"' not in inspect.getsource(vs_mod._render_decision_loses_last_ground)
-
-    # 4. Test vector_skill supersede tool
+    # 3. The MCP tools return the 409 body as the CLI object, rationale intact.
     with patch.object(vs_mod.httpx.AsyncClient, "post", return_value=mock_resp_409):
-        res_vs = await vs_mod.supersede(2672)
-        assert "Refusal (HTTP 409 decision_loses_last_ground)" in res_vs
-        assert "Ship skill index" in res_vs
-        assert "Untruncated critical rationale that must not be lost" in res_vs
+        res_vs = json.loads(await vs_mod.supersede(2672))
+        assert res_vs == payload_409
+        assert res_vs["decisions"][0]["rationale"] == "Untruncated critical rationale that must not be lost"
+        assert res_vs["decisions_needing_answer"] == [2522]
 
-    # 5. Test vector_skill save_artifact tool
+    # 4. The same through save_artifact.
     with patch.object(vs_mod.httpx.AsyncClient, "post", return_value=mock_resp_409):
-        res_save = await vs_mod.save_artifact(
+        res_save = json.loads(await vs_mod.save_artifact(
             "some content",
             json.dumps({"source": "claude", "project": "shared-memory", "supersedes": 2672})
-        )
-        assert "Refusal (HTTP 409 decision_loses_last_ground)" in res_save
-        assert "Ship skill index" in res_save
-        assert "Untruncated critical rationale that must not be lost" in res_save
+        ))
+        assert res_save == payload_409
 
 
 # ── T11 Documentation ─────────────────────────────────────────────────────────
@@ -1440,15 +1426,29 @@ async def test_mcp_refuses_list_and_placeholder_before_post():
     assert "decision:2802" in doc and "fact:2809" in doc
     assert "decision:2751" not in doc
 
-    class _NoPost:
-        def __init__(self, *args, **kwargs):
-            raise AssertionError("refused acknowledgement was posted")
+    built = []
 
+    class _NoPost:
+        # Records instead of raising: a raise inside the tool's try block would be
+        # turned into an "unreachable" error that also looks like a refusal.
+        def __init__(self, *args, **kwargs):
+            built.append((args, kwargs))
+
+    expected = {
+        "list": ([5], "must be a map of {decision_id: the operator's words}"),
+        "empty": ({"5": ""}, "requires the operator's non-empty words"),
+        "todo": ({"5": "TODO"}, "requires the operator's non-empty words"),
+        "ack": ({"5": "Operator acknowledged"}, "requires the operator's non-empty words"),
+        "empty_map": ({}, "map cannot be empty"),
+        "bad_key": ({"abc": "words"}, "is not a decision id"),
+    }
     with patch.object(vs.httpx, "AsyncClient", _NoPost):
-        for raw in ([5], {"5": ""}, {"5": "TODO"}, {"5": "Operator acknowledged"}, {}):
-            result = await vs.supersede(2672, acknowledge_standing=raw)
-            assert "400" in result
-            assert "fact:2809" in result
+        for name, (raw, wording) in expected.items():
+            result = json.loads(await vs.supersede(2672, acknowledge_standing=raw))
+            assert result["status"] == "error", name
+            assert wording in result["message"], (name, result)
+            assert "unreachable" not in result["message"], name
+    assert built == [], "a refused acknowledgement reached the network layer"
 
 
 @pytest.mark.asyncio
@@ -1527,13 +1527,19 @@ async def test_placeholder_punctuation_is_400_on_the_gateway_and_mcp():
 
     vs = _load_vector_skill("vector_skill_punct")
 
+    built = []
+
     class _NoPost:
         def __init__(self, *args, **kwargs):
-            raise AssertionError("punctuated placeholder was posted")
+            built.append((args, kwargs))
 
     with patch.object(vs.httpx, "AsyncClient", _NoPost):
-        result = await vs.supersede(2672, acknowledge_standing={"2522": "TODO!"})
-    assert "400" in result
+        result = json.loads(await vs.supersede(2672, acknowledge_standing={"2522": "TODO!"}))
+    assert result["status"] == "error"
+    assert "requires the operator's non-empty words" in result["message"]
+    assert "unreachable" not in result["message"]
+    assert "fact:2809" in result["message"]
+    assert built == [], "a punctuated placeholder reached the network layer"
     assert vs._is_placeholder_words(_REAL_ACK) is False
 
 

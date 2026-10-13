@@ -219,6 +219,9 @@ def apply(conn, sql_file: Path) -> None:
     stay permanently short of it.
     """
     sql = sql_file.read_text()
+    notices = getattr(conn, "notices", None)
+    if isinstance(notices, list):
+        del notices[:]
     with conn:
         with conn.cursor() as cur:
             cur.execute(sql)
@@ -228,6 +231,8 @@ def apply(conn, sql_file: Path) -> None:
                 (sql_file.name,),
             )
     print(f"  applied: {sql_file.name}")
+    for notice in (notices if isinstance(notices, list) else []):
+        print(f"    {notice.strip()}")
 
 
 def main() -> int:

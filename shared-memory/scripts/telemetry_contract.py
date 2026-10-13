@@ -83,7 +83,7 @@ __all__ = [
 ]
 
 #: Not a free-running today: this is the fifth version pin, so a missed bump is visible (decision:1832).
-VERSION = "1.0.14"
+VERSION = "1.0.15"
 
 
 def _version_tuple(v: str) -> tuple:
@@ -898,7 +898,8 @@ TELEMETRY: dict[str, dict] = {
                                                note=(
         "aggregates the domain-naming refusals: domain_unnameable, "
         "domain_spelling_variant, domain_confusable, domain_unknown, "
-        "domain_without_project, domain_not_allowed_on_judgement")),
+        "domain_without_project, domain_not_allowed_on_judgement, "
+        "domain_shape_invalid")),
 
     # ── clients (NEW, 0.9.74) ───────────────────────────────────────────────
     "clients.versions_seen": _k("dict", "versions", since=INTRODUCED_0_9_74,

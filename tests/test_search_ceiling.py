@@ -207,16 +207,15 @@ def test_s6_cli_read_timeout_is_not_reported_as_a_dead_gateway():
 
 def test_s6b_mcp_read_timeout_is_not_reported_as_a_dead_gateway():
     """S6 on the other door — which told the reader to start a running service."""
-    timed_out = vector_skill._unavailable(httpx.ReadTimeout(""), 215.0)
+    timed_out = vector_skill._coordinator_unavailable(httpx.ReadTimeout(""), 215.0)["message"]
 
     assert "unreachable" not in timed_out.lower()
     assert "systemctl" not in timed_out
     assert "215s" in timed_out
     assert "SEARCH_TIMEOUT_S" in timed_out
 
-    dead = vector_skill._unavailable(httpx.ConnectError("refused"))
+    dead = vector_skill._coordinator_unavailable(httpx.ConnectError("refused"))["message"]
     assert "unreachable" in dead.lower()
-    assert "systemctl" in dead
 
 
 @pytest.mark.asyncio

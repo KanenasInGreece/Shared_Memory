@@ -7,6 +7,32 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.0.15] - 2026-10-13
+
+A fact's sections are stored in one place and found by the section filter; a save can no longer go around the project check through its record type; the MCP server gives the same outcome as the CLI skill. `API_VERSION` stays 4. Migration 044 runs on update. Update the gateway and the skills together.
+
+### Fixed
+- A fact saved with its section as `"domain"` inside the metadata JSON was filed in the graph under that section but not returned by `search --domain`, because the filter reads `metadata.domains` only. The gateway now stores every record's sections under `domains` only, in the registered spelling, and removes the singular key; a re-save can no longer strip a section. Both clients send `domains`, and the documents teach one form: the `--domain` flag on the CLI, `"domains": [...]` in MCP metadata. A `"domain"` key is still accepted.
+- A record type that differed from `decision` or `retrospective` only by letter case or surrounding spaces skipped the checks made on the exact spelling. The type is normalised once, before any check reads it.
+- A retrospective sent through `POST /memory/save` that named a project skipped the project check. It now faces the same registry and alias check as any other record; a project value that does not resolve is refused with `project_required`. A retrospective that names no project is accepted as before.
+- Both clients dropped the gateway's refusal code on a 400. A 4xx whose body carries `error` now reaches the caller with `"error": <code>` and the gateway's other machine-readable fields (for example the proposals of `domain_unknown`).
+
+### Added
+- Migration `044_fact_domains_plural_key.sql`. For facts only: it moves a singular section key to `domains`, drops a singular copy that `domains` already contains, and counts, without changing, rows whose two keys disagree. It prints `044: N moved, N repaired in place, N left for the operator`. `apply.py` now prints the notices a migration raises.
+- `update_framework.sh` step "count facts still carrying a top-level domain key (read only)", after the restart. When the count is not zero it prints the repair command (`apply.py 044_fact_domains_plural_key.sql --force`) and `count_singular_domain.py --list`, which shows the ids. It rewrites nothing.
+- Refusal `domain_shape_invalid` (400): a section value that is not a string or a list of strings, at the top level or inside a `decision` blob. It is counted under `new_domain_refused`.
+- `COORDINATOR_UDS` for the MCP server: it connects over the gateway's Unix socket by the CLI's rule, so the gateway records the same verified caller for both doors. The socket attests the MCP server process's account, not the person in the chat.
+
+### Changed
+- `POST /memory/save` accepts only `fact`, `decision` and `retrospective` as `metadata.type`. Any other string, including the internal row types `supersede`, `project_of` and `domain_of`, is refused with `unknown_type`. The gateway's own supersede path and the operator scripts that write those rows are unchanged.
+- The MCP tools return the JSON the CLI prints for the same action, in place of prose. A search that would make the CLI print a warning returns `{"warnings": [...], "results": [...]}`, because an MCP host does not show the model the server's error stream. `mcp/README.md` lists the remaining deliberate differences from the CLI.
+- An MCP save no longer adds `timestamp` and `model` to the metadata and no longer requires `source`; the gateway records the verified agent as `source`. A string section in an MCP call is one name and is no longer split on commas. MCP search and telemetry wait as long as the CLI does.
+- Both clients use the default gateway socket only when it is a socket owned by the current user; otherwise they use TCP. A socket that cannot be used is reported by its path, with the way to switch to TCP.
+- An empty `domains` sent by a client is not stored.
+
+### Monitor
+- `breakdown.domains` and `records_with_domains` in telemetry step up after migration 044; the key names do not change. `new_domain_refused` now also counts `domain_shape_invalid`.
+
 ## [1.0.14] - 2026-10-07
 
 Reading is two steps: an index first, then the records an agent chooses, whole, by ref. `API_VERSION` stays 4. No migration. Update the gateway and the skills together: a 1.0.13 skill tells agents to read text with `lineage`, which no longer returns it.

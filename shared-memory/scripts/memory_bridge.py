@@ -30,13 +30,14 @@ import json
 import logging
 import os
 import re
+import stat
 import sys
 from datetime import datetime
 from typing import Any
 
 import httpx
 
-VERSION = "1.0.14"
+VERSION = "1.0.15"
 # Must match GET /health api_version; v4 refuses unregistered project on fact save.
 API_VERSION = 4
 
@@ -199,7 +200,12 @@ def _uds_path() -> str | None:
     if p is None:
         base = os.environ.get("XDG_RUNTIME_DIR") or "/tmp"
         cand = os.path.join(base, "shared-memory-gw.sock")
-        p = cand if os.path.exists(cand) else ""
+        # The default path is trusted only as a socket this user owns, because any local user can create /tmp/shared-memory-gw.sock and the bearer token goes to whatever listens there.
+        try:
+            st = os.stat(cand)
+            p = cand if stat.S_ISSOCK(st.st_mode) and st.st_uid == os.getuid() else ""
+        except OSError:
+            p = ""
     return p or None
 
 
@@ -435,6 +441,20 @@ def _error_token(body: object) -> str | None:
     return token
 
 
+def _refusal_object(message: str, parsed: object) -> dict:
+    """The error object for a 4xx, carrying the gateway's own error code and every other machine-readable field it sent, because a caller branches on those and the sentence alone loses them."""
+    out: dict = {"status": "error"}
+    code = _error_token(parsed)
+    if code:
+        out["error"] = code
+    out["message"] = message
+    if isinstance(parsed, dict):
+        for key, value in parsed.items():
+            if key not in ("status", "message", "error"):
+                out[key] = value
+    return out
+
+
 def _reply_json(r, *, log_auth: bool = False,
                 accept_status: tuple = ()) -> dict:
     """Decode the body only after the HTTP status is known, and pass accept_status to keep a non-2xx body such as a 503 health verdict (fact:1503: a 403 read-only refusal was decoded before the status check and reported as the coordinator being unreachable)."""
@@ -465,10 +485,7 @@ def _reply_json(r, *, log_auth: bool = False,
         message = (f"{head} — the gateway ANSWERED and the credential was ACCEPTED, so "
                    f"this is an authorization refusal, not an authentication failure "
                    f"and not a transport fault.")
-        payload = {"status": "error", "message": message}
-        if code:
-            payload["error"] = code
-        raise GatewayReplyError(payload)
+        raise GatewayReplyError(_refusal_object(message, parsed))
 
     if r.status_code == 409:
         try:
@@ -486,10 +503,11 @@ def _reply_json(r, *, log_auth: bool = False,
         if isinstance(parsed, dict) and parsed.get("error") == "refs_invalid":
             return parsed
         detail = _gateway_message(r) or _body_snippet(r) or "(empty body)"
-        raise GatewayReplyError({"status": "error", "message": (
-            f"Gateway answered HTTP {r.status_code}: {detail} — it is UP at "
-            f"{COORDINATOR_BASE} and refused or failed this request."
-        )})
+        message = (f"Gateway answered HTTP {r.status_code}: {detail} — it is UP at "
+                   f"{COORDINATOR_BASE} and refused or failed this request.")
+        if r.status_code < 500:
+            raise GatewayReplyError(_refusal_object(message, parsed))
+        raise GatewayReplyError({"status": "error", "message": message})
 
     try:
         return r.json()
@@ -613,6 +631,17 @@ def _coordinator_unavailable(exc: Exception, ceiling: float | None = None) -> di
                 f"SEARCH_TIMEOUT_S if its projection exceeds that ceiling."
             ),
         }
+    uds = _uds_path()
+    if uds:
+        # No silent fall back to TCP: the gateway would then see a different caller.
+        return {
+            "status": "error",
+            "message": (
+                f"Memory coordinator unreachable over the socket {uds} ({exc}) — the socket "
+                f"may be stale or not yours to use. This client does not fall back to TCP by "
+                f"itself; set COORDINATOR_UDS= (empty) to make it use {COORDINATOR_BASE}."
+            ),
+        }
     return {
         "status": "error",
         "message": (
@@ -705,6 +734,61 @@ async def _warn_on_skew(result: dict) -> dict:
     return result
 
 
+def _normalize_domains(metadata: dict) -> dict:
+    """Fold 'domain' and 'domains' into 'domains' when both have valid shapes.
+
+    Acts only when domain (if present) is a string or list of strings, AND
+    domains (if present) is a string or list of strings. For any other shape
+    it returns the object untouched. The gateway refuses such values; the
+    client never repairs or drops what it does not understand.
+
+    Computes one list: singular values first, then plural; each stripped;
+    blanks and duplicates dropped, first occurrence kept.
+    If the list is empty, returns the object untouched.
+    Otherwise sets 'domains' to the list and deletes 'domain'.
+    """
+    domain_val = metadata.get("domain")
+    domains_val = metadata.get("domains")
+
+    if domain_val is None:
+        return metadata
+
+    if not (isinstance(domain_val, str) or (isinstance(domain_val, list) and all(isinstance(v, str) for v in domain_val))):
+        return metadata
+
+    if domains_val is not None:
+        if not (isinstance(domains_val, str) or (isinstance(domains_val, list) and all(isinstance(v, str) for v in domains_val))):
+            return metadata
+
+    out = []
+    seen = set()
+
+    domain_values = domain_val if isinstance(domain_val, list) else [domain_val]
+    for value in domain_values:
+        if isinstance(value, str):
+            name = value.strip()
+            if name and name not in seen:
+                seen.add(name)
+                out.append(name)
+
+    if domains_val is not None:
+        domains_values = domains_val if isinstance(domains_val, list) else [domains_val]
+        for value in domains_values:
+            if isinstance(value, str):
+                name = value.strip()
+                if name and name not in seen:
+                    seen.add(name)
+                    out.append(name)
+
+    if not out:
+        return metadata
+
+    metadata["domains"] = out
+    del metadata["domain"]
+
+    return metadata
+
+
 async def save_artifact(content: str, metadata_json: str = "{}") -> dict:
     if isinstance(metadata_json, str):
         try:
@@ -718,6 +802,9 @@ async def save_artifact(content: str, metadata_json: str = "{}") -> dict:
     if not isinstance(metadata, dict):
         _append_log("memory_bridge", 2, "bad_metadata_type", {"got": type(metadata).__name__, "content_preview": content[:100]}, content)
         return {"status": "error", "message": f"Metadata must be a JSON object, got {type(metadata).__name__}"}
+
+    # Normalize domain and domains keys
+    metadata = _normalize_domains(metadata)
 
     # Fill project only when the caller left it empty. An untagged fact uses the consolidation
     # fallback, so it fragments away from its project's cluster and never reaches a summary.

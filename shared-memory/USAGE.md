@@ -79,20 +79,20 @@ save_decision --title "…" --decided-by "Xenofon" --rationale "…" --new-proje
 `project_spelling_variant`: save the registered spelling. `project_confusable`: `--distinct-from` names the neighbour. `project_unnameable`: use a letter or digit.
 
 ```
-save "…" '{"source":"grok","domain":"delivery"}'
+save "…" '{"source":"grok","source_ref":"OPERATE.md"}' --domain delivery
 save_decision --title "…" --decided-by "Xenofon" --rationale "…" --domain delivery --domain operations
 ```
 
-Repeat the flag. Do not comma-pack. Omit `domain` and the record stores no section. It does not inherit one. `--domain` on search matches stored `metadata.domains` only.
+Repeat the flag. Do not comma-pack. Omit `--domain` and the record stores no section. It does not inherit one. `--domain` on search matches stored `metadata.domains` only.
 
 ```
-save "…" '{"source":"grok","project":"new-name","new_project":true,"domain":"delivery","new_domain":true}'
+save "…" '{"source":"grok","project":"new-name","new_project":true,"new_domain":true}' --domain delivery
 ```
 
-`new_domain: true` and `--new-domain` only after the operator confirms. `domain_unknown`: pick a proposal or declare it. `domain_spelling_variant`: use the registered spelling. `domain_confusable`: `confirm_distinct_from` names the near section. `domain_without_project`: `general_discussion` has no sections. `domain_not_allowed_on_judgement`: drop the domain from the retrospective.
+`new_domain: true` and `--new-domain` only after the operator confirms. `domain_unknown`: pick a proposal or declare it. `domain_shape_invalid`: a section is a string or a list of strings. `domain_spelling_variant`: use the registered spelling. `domain_confusable`: `confirm_distinct_from` names the near section. `domain_without_project`: `general_discussion` has no sections. `domain_not_allowed_on_judgement`: drop the domain from the retrospective.
 
 ```
-save "same words" '{"source":"grok","domain":"other"}' 
+save "same words" '{"source":"grok"}' --domain other
 ```
 
 Same content, other axes: `axis_conflict`. Supersede instead. `registry_unavailable` (503): nothing was written. Retry.
