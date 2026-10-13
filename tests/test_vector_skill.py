@@ -128,13 +128,15 @@ async def test_mcp_save_artifact_surfaces_coordinator_error():
 
 
 @pytest.mark.asyncio
-async def test_mcp_save_artifact_missing_source_rejected_client_side():
-    """source is required — rejected before any network call."""
-    with patch("httpx.AsyncClient.post") as mock_post:
-        result = json.loads(await vector_skill.save_artifact(MOCK_CONTENT, '{"entities":["X"]}'))
-    assert result["status"] == "error"
-    assert "source is required" in result["message"]
-    mock_post.assert_not_called()
+async def test_mcp_save_artifact_without_source_is_sent_as_the_cli_sends_it():
+    """No source is required: the gateway records the verified agent as source. A save without one reaches the gateway with exactly the caller's metadata."""
+    mock_response = MagicMock(status_code=200, json=lambda: {"status": "success", "pg_id": 5})
+    with patch("httpx.AsyncClient.post", return_value=mock_response) as mock_post:
+        result = json.loads(await vector_skill.save_artifact(
+            MOCK_CONTENT, '{"project":"shared-memory-GitHub","model":"qwen3"}'))
+    assert result["status"] == "success"
+    assert mock_post.call_args.kwargs["json"]["metadata"] == {
+        "project": "shared-memory-GitHub", "model": "qwen3"}
 
 @pytest.mark.asyncio
 async def test_mcp_hybrid_search_goes_through_the_gateway():
@@ -487,9 +489,37 @@ async def test_mcp_check_memory_health_names_version_skew():
 
 @pytest.mark.asyncio
 async def test_mcp_check_memory_health_unreachable_gateway():
-    with patch("httpx.AsyncClient.get", side_effect=RuntimeError("refused")):
+    with patch("httpx.AsyncClient.get", side_effect=RuntimeError("refused")), \
+         patch.object(vector_skill, "check_gateway_compat",
+                      AsyncMock(return_value={"compat": "ok"})):
         result = json.loads(await vector_skill.check_memory_health())
-    assert result["status"] == "unreachable"
+    assert result["status"] == "error"
+    assert "unreachable" in result["message"].lower()
+    assert "refused" in result["message"]
+
+
+@pytest.mark.asyncio
+async def test_mcp_check_memory_health_timeout_is_not_reported_as_down():
+    import httpx
+    with patch("httpx.AsyncClient.get", side_effect=httpx.ReadTimeout("")), \
+         patch.object(vector_skill, "check_gateway_compat",
+                      AsyncMock(return_value={"compat": "ok"})):
+        result = json.loads(await vector_skill.check_memory_health())
+    assert result["status"] == "error"
+    assert "UP and SLOW" in result["message"]
+    assert "systemctl" not in result["message"]
+
+
+@pytest.mark.asyncio
+async def test_mcp_check_memory_health_keeps_the_503_verdict():
+    body = {"status": "down", "version": "1.0.14", "api_version": 4, "role": "full",
+            "dependencies": {"embedder": {"state": "down", "reason": "no vector"}}}
+    resp = MagicMock(status_code=503, json=lambda: body)
+    with patch("httpx.AsyncClient.get", return_value=resp):
+        result = json.loads(await vector_skill.check_memory_health())
+    assert result["status"] == "down"
+    assert result["dependencies"]["embedder"]["reason"] == "no vector"
+    assert result["client"]["tool"] == "vector-skill"
 
 
 @pytest.mark.asyncio

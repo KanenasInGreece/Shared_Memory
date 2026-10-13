@@ -155,8 +155,10 @@ async def test_mcp_search_prints_unranked_note_when_any_row_is_unranked(capsys):
     err = capsys.readouterr().err
     assert "2 of 3 results are UNRANKED" in err
     assert "backend_capability on /health" in err
-    # The reply is the CLI's record list and carries no note text.
-    assert json.loads(result) == payload["results"]
+    # The note also travels in the reply, because the model never sees stderr.
+    reply = json.loads(result)
+    assert reply["warnings"] == [vector_skill._unranked_warning(payload["results"])]
+    assert reply["results"] == payload["results"]
 
 
 @pytest.mark.asyncio
@@ -270,7 +272,9 @@ async def test_mcp_search_prints_fallback_note_on_empty_keyword_fallback(capsys)
     err = capsys.readouterr().err
     assert "EMBEDDING UNAVAILABLE" in err
     assert "0 result(s)" in err
-    assert json.loads(result) == []
+    # An empty list beside this warning means the ranked search was unavailable.
+    reply = json.loads(result)
+    assert reply == {"warnings": [vector_skill._fallback_warning(payload)], "results": []}
 
 
 @pytest.mark.asyncio

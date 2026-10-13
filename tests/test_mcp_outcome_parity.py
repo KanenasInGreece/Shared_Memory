@@ -12,7 +12,10 @@ import asyncio
 import importlib.util
 import json
 import os
+import socket
 import sys
+import tempfile
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -39,6 +42,13 @@ def _load(name, path):
 
 mb = _load("memory_bridge_parity", _BRIDGE)
 vs = _load("vector_skill_parity", _VECTOR)
+
+
+def _bridges():
+    out = []
+    for i, path in enumerate((_BRIDGE, _BRIDGE_COPY)):
+        out.append(_load(f"memory_bridge_p5_{i}", path))
+    return out
 
 
 class _Resp:
@@ -117,7 +127,9 @@ async def _cli(monkeypatch, capsys, *argv):
         await mb.main()
     except SystemExit:
         pass
-    return capsys.readouterr().out.strip()
+    captured = capsys.readouterr()
+    _cli.err = captured.err
+    return captured.out.strip()
 
 
 # ── P1: no attribute the skill does not send ────────────────────────────────
@@ -183,6 +195,14 @@ _CASES = {
         ["supersede", "--pg-id", "7", "--by", "8",
          "--acknowledge-standing", "5", "  still stands  "],
         lambda: vs.supersede(7, 8, {"5": "  still stands  "}),
+    ),
+    "save_no_source": (
+        ["save", "fact text", json.dumps({"project": "proj-a", "model": "qwen3"})],
+        lambda: vs.save_artifact("fact text", json.dumps({"project": "proj-a", "model": "qwen3"})),
+    ),
+    "supersede_negative_by": (
+        ["supersede", "--pg-id", "7", "--by=-1"],
+        lambda: vs.supersede(7, -1),
     ),
     "supersede_no_successor": (
         ["supersede", "--pg-id", "7"],
@@ -412,13 +432,138 @@ def test_p2b_falls_back_to_tcp(env, monkeypatch, tmp_path):
     assert isinstance(client, httpx.AsyncClient)
 
 
-def test_p2b_the_default_socket_is_used_when_it_exists(monkeypatch, tmp_path):
+def _uds_modules():
+    return [vs] + _bridges()
+
+
+@pytest.fixture
+def short_dir():
+    d = tempfile.mkdtemp(prefix="smp-")
+    yield d
+    for name in os.listdir(d):
+        os.unlink(os.path.join(d, name))
+    os.rmdir(d)
+
+
+@pytest.mark.parametrize("mod", _uds_modules(), ids=["mcp", "cli", "cli_copy"])
+def test_p2b_the_default_socket_is_used_only_as_a_socket_this_user_owns(
+        mod, monkeypatch, short_dir):
     monkeypatch.delenv("COORDINATOR_UDS", raising=False)
-    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
-    assert vs._uds_path() is None
-    (tmp_path / "shared-memory-gw.sock").write_text("")
-    assert vs._uds_path() == str(tmp_path / "shared-memory-gw.sock")
-    assert vs._uds_path() == mb._uds_path()
+    monkeypatch.setenv("XDG_RUNTIME_DIR", short_dir)
+    path = os.path.join(short_dir, "shared-memory-gw.sock")
+    assert mod._uds_path() is None                      # nothing there
+
+    open(path, "w").close()                              # a plain file is not a socket
+    assert mod._uds_path() is None
+    os.unlink(path)
+
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    srv.bind(path)
+    try:
+        assert mod._uds_path() == path                   # a socket of ours is used
+
+        real_stat = os.stat
+
+        def other_owner(p, *a, **kw):
+            st = real_stat(p, *a, **kw)
+            if p == path:
+                return SimpleNamespace(st_mode=st.st_mode, st_uid=os.getuid() + 1)
+            return st
+
+        monkeypatch.setattr(os, "stat", other_owner)
+        assert mod._uds_path() is None                   # a socket of another user is not
+        monkeypatch.undo()
+    finally:
+        srv.close()
+
+
+@pytest.mark.parametrize("mod", _uds_modules(), ids=["mcp", "cli", "cli_copy"])
+def test_p2b_an_explicit_socket_is_used_as_given(mod, monkeypatch, short_dir):
+    path = os.path.join(short_dir, "named.sock")
+    open(path, "w").close()          # not even a socket: an explicit value is the operator's word
+    monkeypatch.setenv("COORDINATOR_UDS", path)
+    assert mod._uds_path() == path
+
+
+# ── An unusable socket is named, and never silently replaced by TCP ─────────
+
+@pytest.mark.asyncio
+async def test_a_dead_socket_error_names_the_socket_and_the_way_out(
+        monkeypatch, capsys, short_dir):
+    path = os.path.join(short_dir, "stale.sock")      # never created: connect fails
+    monkeypatch.setenv("COORDINATOR_UDS", path)
+    for mod in (mb, vs):
+        monkeypatch.setattr(mod, "COORDINATOR_BASE", BASE)
+        monkeypatch.setattr(mod, "AGENT_ID", "shared_agent")
+        monkeypatch.setattr(mod, "_CAPABILITY_CACHE", {})
+        monkeypatch.setattr(mod, "_CAPACITY_CACHE", None)
+
+        async def _ok():
+            return {"compat": "ok"}
+
+        monkeypatch.setattr(mod, "check_gateway_compat", _ok)
+    arg = json.dumps({"source": "s", "project": "pj"})
+    printed = json.loads(await _cli(monkeypatch, capsys, "save", "c", arg))
+    returned = json.loads(await vs.save_artifact("c", arg))
+    assert returned == printed
+    assert path in printed["message"]
+    assert "COORDINATOR_UDS= (empty)" in printed["message"]
+    assert BASE in printed["message"]                   # the TCP target is named only as the way out
+    assert "is hive_mind_proxy.py running" not in printed["message"]
+
+
+@pytest.mark.parametrize("mod", _uds_modules(), ids=["mcp", "cli", "cli_copy"])
+def test_no_socket_means_the_old_unreachable_wording(mod, monkeypatch):
+    monkeypatch.setenv("COORDINATOR_UDS", "")
+    message = mod._coordinator_unavailable(httpx.ConnectError("refused"))["message"]
+    assert "is hive_mind_proxy.py running" in message
+    assert "COORDINATOR_UDS" not in message
+
+
+# ── The warnings a CLI agent sees on stderr reach the MCP model in the reply ─
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("shape", ["fallback_empty", "unranked", "both"])
+async def test_a_search_with_a_note_returns_the_warnings_with_the_results(
+        shape, gateway, monkeypatch, capsys):
+    rows = {"fallback_empty": [],
+            "unranked": [{"pg_id": 1, "ref": "fact:1", "content": "a", "ranked": False}],
+            "both": [{"pg_id": 1, "ref": "fact:1", "content": "a", "ranked": False}]}[shape]
+    body = {"status": "success", "results": rows}
+    if shape != "unranked":
+        body["fallback"] = "keyword"
+    gateway({"*": (200, body)})
+    await _cli(monkeypatch, capsys, "search", "q")
+    cli_stderr = [line for line in _cli.err.splitlines() if line]
+    result = json.loads(await vs.hybrid_search_and_rerank("q"))
+    assert cli_stderr, "the CLI printed no note for this reply"
+    assert result == {"warnings": cli_stderr, "results": rows}
+
+
+@pytest.mark.asyncio
+async def test_a_search_without_a_note_returns_the_bare_list(gateway):
+    rows = [{"pg_id": 1, "ref": "fact:1", "content": "a", "ranked": True}]
+    gateway({"*": (200, {"results": rows})})
+    assert json.loads(await vs.hybrid_search_and_rerank("q")) == rows
+
+
+# ── The one allowed difference: the 401 wording ─────────────────────────────
+
+@pytest.mark.asyncio
+async def test_a_401_is_the_one_reply_whose_wording_differs(gateway, monkeypatch, capsys):
+    gateway({"*": (401, "Authorization required")})
+    for mod in (mb, vs):
+        monkeypatch.setattr(mod, "_AGENT_TOKEN_FROM_FILE", "")
+    monkeypatch.delenv("AGENT_TOKEN", raising=False)
+    arg = json.dumps({"source": "s", "project": "pj"})
+    cli = json.loads(await _cli(monkeypatch, capsys, "save", "c", arg))
+    mcp = json.loads(await vs.save_artifact("c", arg))
+    assert cli["status"] == mcp["status"] == "error"
+    assert cli["message"].startswith("No AGENT_TOKEN was sent and this gateway requires")
+    assert "this agent's .env" in cli["message"]
+    assert mcp["message"].startswith("No AGENT_TOKEN was sent and the gateway requires")
+    assert "VECTOR_SKILL_ENV" in mcp["message"]
+    assert cli != mcp
 
 
 @pytest.mark.asyncio
@@ -452,13 +597,6 @@ async def test_p2c_no_client_is_built_with_trust_env_enabled(
 
 
 # ── P5: both doors pass on the refusal code ─────────────────────────────────
-
-def _bridges():
-    out = []
-    for i, path in enumerate((_BRIDGE, _BRIDGE_COPY)):
-        out.append(_load(f"memory_bridge_p5_{i}", path))
-    return out
-
 
 _REFUSAL = {
     "status": "error", "error": "domain_unknown",
@@ -536,3 +674,35 @@ async def test_p5c_through_every_mcp_door_the_other_fields_survive(call, gateway
 def test_p5d_the_two_memory_bridge_copies_are_identical():
     with open(_BRIDGE, "rb") as a, open(_BRIDGE_COPY, "rb") as b:
         assert a.read() == b.read()
+
+
+def test_the_two_default_agent_ids_are_the_documented_ones(monkeypatch):
+    monkeypatch.delenv("AGENT_ID", raising=False)
+    assert _load("memory_bridge_default_id", _BRIDGE).AGENT_ID == "memory_bridge"
+    assert _load("vector_skill_default_id", _VECTOR).AGENT_ID == "vector_skill"
+
+
+@pytest.mark.asyncio
+async def test_check_memory_health_on_success_returns_health_with_role_and_client(gateway):
+    health = {"status": "ok", "version": "1.0.14", "api_version": 4,
+              "agent": "a1", "dependencies": {"postgres": {"state": "ok"}},
+              "warnings": []}
+    gateway({"/health": (200, health)})
+    result = json.loads(await vs.check_memory_health())
+    assert result["role"] == "not reported (token not accepted — anonymous payload)"
+    assert result == {**health, "role": result["role"],
+                      "client": {"tool": "vector-skill", "version": vs.VERSION,
+                                 "api_version": vs.API_VERSION}}
+
+
+@pytest.mark.asyncio
+async def test_search_and_telemetry_wait_as_long_as_the_cli_does(gateway, monkeypatch):
+    gateway({"*": (200, {"results": []})})
+    seen = []
+    real = vs._async_client
+    monkeypatch.setattr(vs, "_async_client", lambda t: (seen.append(t), real(t))[1])
+    await vs.hybrid_search_and_rerank("q")
+    await vs.memory_telemetry()
+    ceiling = mb.search_ceiling(None, None)
+    assert seen[0] == ceiling          # one value for connect and read, as the CLI
+    assert seen[1] == 15.0             # the CLI's telemetry wait

@@ -30,6 +30,7 @@ import json
 import logging
 import os
 import re
+import stat
 import sys
 from datetime import datetime
 from typing import Any
@@ -199,7 +200,12 @@ def _uds_path() -> str | None:
     if p is None:
         base = os.environ.get("XDG_RUNTIME_DIR") or "/tmp"
         cand = os.path.join(base, "shared-memory-gw.sock")
-        p = cand if os.path.exists(cand) else ""
+        # The default path is trusted only as a socket this user owns, because any local user can create /tmp/shared-memory-gw.sock and the bearer token goes to whatever listens there.
+        try:
+            st = os.stat(cand)
+            p = cand if stat.S_ISSOCK(st.st_mode) and st.st_uid == os.getuid() else ""
+        except OSError:
+            p = ""
     return p or None
 
 
@@ -623,6 +629,17 @@ def _coordinator_unavailable(exc: Exception, ceiling: float | None = None) -> di
                 f"SLOW, not down. A search costs what the reranker costs. Read "
                 f"`backend_capability` on {COORDINATOR_BASE}/health, and raise "
                 f"SEARCH_TIMEOUT_S if its projection exceeds that ceiling."
+            ),
+        }
+    uds = _uds_path()
+    if uds:
+        # No silent fall back to TCP: the gateway would then see a different caller.
+        return {
+            "status": "error",
+            "message": (
+                f"Memory coordinator unreachable over the socket {uds} ({exc}) — the socket "
+                f"may be stale or not yours to use. This client does not fall back to TCP by "
+                f"itself; set COORDINATOR_UDS= (empty) to make it use {COORDINATOR_BASE}."
             ),
         }
     return {
