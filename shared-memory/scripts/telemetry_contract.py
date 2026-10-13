@@ -898,7 +898,8 @@ TELEMETRY: dict[str, dict] = {
                                                note=(
         "aggregates the domain-naming refusals: domain_unnameable, "
         "domain_spelling_variant, domain_confusable, domain_unknown, "
-        "domain_without_project, domain_not_allowed_on_judgement")),
+        "domain_without_project, domain_not_allowed_on_judgement, "
+        "domain_shape_invalid")),
 
     # ── clients (NEW, 0.9.74) ───────────────────────────────────────────────
     "clients.versions_seen": _k("dict", "versions", since=INTRODUCED_0_9_74,

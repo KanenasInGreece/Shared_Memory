@@ -704,7 +704,7 @@ The envelope is `{"status": "success", "telemetry": {…}}`; paths below are rel
 | `registry.refusals.entity_confusable` | int | — | 0.9.74 | — | — | — | — |
 | `registry.refusals.entity_reserved` | int | — | 0.9.74 | — | — | — | — |
 | `registry.refusals.entity_unknown` | int | — | 0.9.74 | — | — | — | — |
-| `registry.refusals.new_domain_refused` | int | — | 0.9.74 | — | — | — | aggregates the domain-naming refusals: domain_unnameable, domain_spelling_variant, domain_confusable, domain_unknown, domain_without_project, domain_not_allowed_on_judgement |
+| `registry.refusals.new_domain_refused` | int | — | 0.9.74 | — | — | — | aggregates the domain-naming refusals: domain_unnameable, domain_spelling_variant, domain_confusable, domain_unknown, domain_without_project, domain_not_allowed_on_judgement, domain_shape_invalid |
 | `registry.refusals.new_project_refused` | int | — | 0.9.74 | — | — | — | aggregates the project-naming refusals: project_unnameable, project_spelling_variant, project_confusable |
 
 ### credentials

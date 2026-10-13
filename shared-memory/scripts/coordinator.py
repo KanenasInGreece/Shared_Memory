@@ -56,7 +56,7 @@ from domain_axis import (
     DOMAIN_PROPOSAL_LIMIT, DOMAIN_CONFUSABLE_SQL, DOMAIN_CONFUSABLE_SIMILARITY,
     DOMAIN_ALIAS_RESOLVE_SQL, DOMAIN_REGISTER_SQL, DOMAIN_KEYS,
     DOMAIN_NAMES_SQL, DOMAIN_ALIASES_SQL, DOMAIN_NAME_OR_KEY_SQL,
-    domain_merge_cypher, names_a_domain, resolve_domains,
+    domain_merge_cypher, names_a_domain, resolve_domains, _domains_from,
 )
 from insight_gate import walk_group_reached_set, passes_insight_gate
 from project_promotion import (
@@ -5140,6 +5140,30 @@ class MemoryCoordinator:
             )
         return [r["name"] for r in rows]
 
+    @staticmethod
+    def _domain_shape_error(metadata: dict) -> dict | None:
+        """400 when `domain` or `domains` holds anything but a string or a list of strings, at the top level or inside the `decision` blob. Pure."""
+        blob = metadata.get("decision")
+        places = [("metadata", metadata)]
+        if isinstance(blob, dict):
+            places.append(("metadata.decision", blob))
+        for where, holder in places:
+            for key in DOMAIN_KEYS:
+                value = holder.get(key)
+                if value is None or isinstance(value, str):
+                    continue
+                if isinstance(value, list) and all(isinstance(v, str) for v in value):
+                    continue
+                return {
+                    "status": "error",
+                    "error": "domain_shape_invalid",
+                    "message": (
+                        f"{where}.{key} has the wrong shape: a section is a "
+                        "string or a list of strings. Nothing was written."
+                    ),
+                }
+        return None
+
     def _domain_on_judgement_rejection(self, record_type: str) -> dict:
         """The 400 a retrospective gets for naming a domain.
 
@@ -5201,6 +5225,7 @@ class MemoryCoordinator:
         "domain_unknown": "new_domain_refused",
         "domain_without_project": "new_domain_refused",
         "domain_not_allowed_on_judgement": "new_domain_refused",
+        "domain_shape_invalid": "new_domain_refused",
     }
 
     def _count_refusal(self, payload: object) -> None:
@@ -5542,7 +5567,7 @@ class MemoryCoordinator:
         ⚠ COMPARED THROUGH THE RESOLVERS, NEVER ON THE LITERAL KEYS.
         `resolve_project`/`resolve_domains` read the `decision` blob first and
         the top level second, and they accept a bare string where a list is
-        expected — so 152 legacy facts carrying a singular `domain` resolve to
+        expected — so legacy facts carrying a singular `domain` resolve to
         exactly what a modern `domains` list resolves to, instead of
         false-conflicting on the key name.
 
@@ -5612,7 +5637,14 @@ class MemoryCoordinator:
                     axis_key(resolved_stored) != axis_key(project):
                 return _refusal("project", existing_project, project)
 
-        existing_domains = resolve_domains(stored)
+        # A stale singular beside a correct plural must not make a re-save naming the plural a conflict, so the plural alone speaks for the stored record. A decision's blob still wins.
+        stored_plural = stored.get("domains")
+        if _domains_from(stored.get("decision")):
+            existing_domains = resolve_domains(stored)
+        elif isinstance(stored_plural, list):
+            existing_domains = _domains_from({"domains": stored_plural})
+        else:
+            existing_domains = resolve_domains(stored)
         # Compare domains by key, not by alias. An alias lookup calls _project_identity, which raises on a registry blip and would turn that into a refused re-save. A real section rename still conflicts; that gap stays open.
         if {axis_key(d) for d in existing_domains} != \
                 {axis_key(d) for d in (domains or [])}:
@@ -6326,6 +6358,11 @@ class MemoryCoordinator:
                 status=400,
             )
 
+        # Every check below compares the type exactly, so a differently cased spelling would skip them.
+        _sent_type = metadata.get("type")
+        if isinstance(_sent_type, str) and _sent_type.strip().lower() in REF_TYPES_DOCS:
+            metadata["type"] = _sent_type.strip().lower()
+
         # Reject a bad decision shape here. A corrupt outbox row would replay it on every restart.
         if metadata.get("type") == "decision":
             decision_data = metadata.get("decision")
@@ -6416,6 +6453,11 @@ class MemoryCoordinator:
             axis_report["project_resolved"] = {
                 **_ingress, **decision_project_rewrite}
 
+        shape_error = self._domain_shape_error(metadata)
+        if shape_error is not None:
+            self._count_refusal(shape_error)
+            return web.json_response(shape_error, status=400)
+
         # Domain resolves after project (canonical name in hand); an unreadable registry is 503, not a silent accept.
         try:
             domain_error = await self._domain_ingress_error(
@@ -6440,11 +6482,11 @@ class MemoryCoordinator:
             self._count_refusal(domain_error)
             return web.json_response(domain_error, status=400)
 
-        # Materialise a decision's asserted domains to metadata top-level after ingress rewrite (additive; blob unchanged) (decision:1214).
-        if metadata.get("type") == "decision":
-            decision_domains = resolve_domains(metadata)
-            if decision_domains:
-                metadata["domains"] = decision_domains
+        # Sections live under `domains` only, after ingress has rewritten spellings. A decision's blob is unchanged (decision:1214).
+        resolved_sections = resolve_domains(metadata)
+        if resolved_sections:
+            metadata["domains"] = resolved_sections
+        metadata.pop("domain", None)
 
         # decision 381, refined by 384: supersedes is checked before embed, and dependents are flagged at retrieval rather than rewritten here.
         supersedes = metadata.get("supersedes")

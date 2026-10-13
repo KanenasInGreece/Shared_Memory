@@ -486,6 +486,22 @@ else
         "$REPO_ROOT/shared-memory/scripts/backfill_domain_of.py" --apply
 fi
 
+# Report only. The ledger never runs a migration twice, and the old gateway can store a singular `domain` between the migration and the restart, so the operator is told what is left and repairs it on purpose.
+report_singular_domain_count() {
+    local count
+    count="$("$@")" || { ylw "   could not count facts with a top-level domain key - skipped"; return 0; }
+    echo "   facts still carrying a top-level domain key: $count"
+    if [[ "$count" =~ ^[0-9]+$ && "$count" != "0" ]]; then
+        echo "   To repair them, run:"
+        echo "       uv run --with psycopg2-binary python $REPO_ROOT/shared-memory/migrations/apply.py 044_fact_domains_plural_key.sql --force"
+        echo "   Rows whose two keys disagree are left for you to judge."
+    fi
+    return 0
+}
+run_soft "count facts still carrying a top-level domain key (read only)" \
+    report_singular_domain_count uv run --with psycopg2-binary python \
+    "$REPO_ROOT/shared-memory/migrations/count_singular_domain.py"
+
 # Refresh skills after the restart. Before it, update_skill.sh compares the new client to the old gateway and reports an incompatibility that the restart is about to remove.
 run_soft "refresh installed agent skills" bash "$REPO_ROOT/shared-memory/scripts/sync_skills.sh"
 rc=$?

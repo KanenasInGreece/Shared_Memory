@@ -327,20 +327,18 @@ def test_c7_no_domain_in_examples():
         tree = ast.parse(mcp_content)
         save_artifact_func = None
         for node in ast.walk(tree):
-            if isinstance(node, ast.FunctionDef) and node.name == "save_artifact":
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == "save_artifact":
                 save_artifact_func = node
                 break
 
-        if save_artifact_func:
-            docstring = ast.get_docstring(save_artifact_func)
-            if docstring:
-                for i, line in enumerate(docstring.split('\n')):
-                    if ('"domain":' in line or '\\"domain\\":' in line):
-                        # Check if it's the exempt sentence
-                        line_stripped = line.strip()
-                        is_exempt = any(line_stripped == exempt.strip() for exempt in exempt_sentences)
-                        if not is_exempt:
-                            pytest.fail(f"Found 'domain' in save_artifact docstring line {i+1}: {line}")
+        assert save_artifact_func is not None, "save_artifact not found in mcp/vector-skill.py"
+        docstring = ast.get_docstring(save_artifact_func)
+        assert docstring, "save_artifact has no docstring"
+        for i, line in enumerate(docstring.split('\n')):
+            if ('"domain":' in line or '\\"domain\\":' in line):
+                # The docstring wraps its one allowed sentence, so the match is on the sentence's opening words.
+                if 'A bare string "domain": "NAME" is still accepted' not in line:
+                    pytest.fail(f"Found 'domain' in save_artifact docstring line {i+1}: {line}")
     except SyntaxError:
         pytest.fail("Could not parse mcp/vector-skill.py")
 
