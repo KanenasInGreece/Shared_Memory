@@ -1426,15 +1426,29 @@ async def test_mcp_refuses_list_and_placeholder_before_post():
     assert "decision:2802" in doc and "fact:2809" in doc
     assert "decision:2751" not in doc
 
-    class _NoPost:
-        def __init__(self, *args, **kwargs):
-            raise AssertionError("refused acknowledgement was posted")
+    built = []
 
+    class _NoPost:
+        # Records instead of raising: a raise inside the tool's try block would be
+        # turned into an "unreachable" error that also looks like a refusal.
+        def __init__(self, *args, **kwargs):
+            built.append((args, kwargs))
+
+    expected = {
+        "list": ([5], "must be a map of {decision_id: the operator's words}"),
+        "empty": ({"5": ""}, "requires the operator's non-empty words"),
+        "todo": ({"5": "TODO"}, "requires the operator's non-empty words"),
+        "ack": ({"5": "Operator acknowledged"}, "requires the operator's non-empty words"),
+        "empty_map": ({}, "map cannot be empty"),
+        "bad_key": ({"abc": "words"}, "is not a decision id"),
+    }
     with patch.object(vs.httpx, "AsyncClient", _NoPost):
-        for raw in ([5], {"5": ""}, {"5": "TODO"}, {"5": "Operator acknowledged"}, {}):
+        for name, (raw, wording) in expected.items():
             result = json.loads(await vs.supersede(2672, acknowledge_standing=raw))
-            assert result["status"] == "error"
-            assert result["message"]
+            assert result["status"] == "error", name
+            assert wording in result["message"], (name, result)
+            assert "unreachable" not in result["message"], name
+    assert built == [], "a refused acknowledgement reached the network layer"
 
 
 @pytest.mark.asyncio
@@ -1513,14 +1527,19 @@ async def test_placeholder_punctuation_is_400_on_the_gateway_and_mcp():
 
     vs = _load_vector_skill("vector_skill_punct")
 
+    built = []
+
     class _NoPost:
         def __init__(self, *args, **kwargs):
-            raise AssertionError("punctuated placeholder was posted")
+            built.append((args, kwargs))
 
     with patch.object(vs.httpx, "AsyncClient", _NoPost):
         result = json.loads(await vs.supersede(2672, acknowledge_standing={"2522": "TODO!"}))
     assert result["status"] == "error"
+    assert "requires the operator's non-empty words" in result["message"]
+    assert "unreachable" not in result["message"]
     assert "fact:2809" in result["message"]
+    assert built == [], "a punctuated placeholder reached the network layer"
     assert vs._is_placeholder_words(_REAL_ACK) is False
 
 

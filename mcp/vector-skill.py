@@ -29,13 +29,16 @@ memory_telemetry, record_lineage, graph_query.
 
 OUTCOME PARITY with the CLI skill (memory_bridge.py): the same input stores the
 same record and gets the same JSON reply through either door. Each tool
-returns, as a JSON string, the object the CLI prints for its twin. The
+returns, as a JSON string, the object the CLI prints for its twin, except
+check_memory_health, which returns /health plus `role` and `client`. The
 connection follows the CLI's rule too, so the gateway can read the calling
-account from the socket peer:
+account (this server process's account, not the person in the chat) from the
+socket peer:
 
   COORDINATOR_UDS   the gateway's Unix socket. Unset: $XDG_RUNTIME_DIR (or /tmp)
-                    /shared-memory-gw.sock when that file exists, else TCP.
-                    Empty: always TCP. The bearer token is sent either way.
+                    /shared-memory-gw.sock when that path is a socket owned by
+                    this user, else TCP. Empty: always TCP. A value set here is
+                    used as given. The bearer token is sent either way.
 """
 import asyncio
 import concurrent.futures
@@ -43,6 +46,7 @@ import json
 import logging
 import os
 import re
+import stat
 import sys
 from datetime import datetime
 
@@ -227,7 +231,12 @@ def _uds_path() -> str | None:
     if p is None:
         base = os.environ.get("XDG_RUNTIME_DIR") or "/tmp"
         cand = os.path.join(base, "shared-memory-gw.sock")
-        p = cand if os.path.exists(cand) else ""
+        # The default path is trusted only as a socket this user owns, because any local user can create /tmp/shared-memory-gw.sock and the bearer token goes to whatever listens there.
+        try:
+            st = os.stat(cand)
+            p = cand if stat.S_ISSOCK(st.st_mode) and st.st_uid == os.getuid() else ""
+        except OSError:
+            p = ""
     return p or None
 
 
@@ -452,6 +461,17 @@ def _coordinator_unavailable(exc: Exception, ceiling: float | None = None) -> di
                 f"SEARCH_TIMEOUT_S if its projection exceeds that ceiling."
             ),
         }
+    uds = _uds_path()
+    if uds:
+        # No silent fall back to TCP: the gateway would then see a different caller.
+        return {
+            "status": "error",
+            "message": (
+                f"Memory coordinator unreachable over the socket {uds} ({exc}) — the socket "
+                f"may be stale or not yours to use. This client does not fall back to TCP by "
+                f"itself; set COORDINATOR_UDS= (empty) to make it use {COORDINATOR_BASE}."
+            ),
+        }
     return {
         "status": "error",
         "message": (
@@ -588,9 +608,9 @@ def _refusal_object(message: str, parsed: object) -> dict:
     return out
 
 
-def _reply_json(r, tool: str) -> dict:
+def _reply_json(r, tool: str, accept_status: tuple = ()) -> dict:
     """Decode JSON only after the status class is known (fact:1503)."""
-    # _auth_error has already logged `auth_failed`, which is what
+    # _auth_rejected has already logged `auth_failed`, which is what
     # `logged_event` tells the catch block.
     if r.status_code == 401:
         raise GatewayReplyError(_auth_rejected(tool), logged_event="auth_failed")
@@ -623,7 +643,7 @@ def _reply_json(r, tool: str) -> dict:
         except Exception:
             pass
 
-    if r.status_code >= 400:
+    if r.status_code >= 400 and r.status_code not in accept_status:
         try:
             parsed = r.json()
         except Exception:
@@ -685,30 +705,31 @@ def _is_placeholder_words(text: str) -> bool:
 
 
 def _normalize_ack(raw: dict) -> dict[int, str]:
-    """Turn the tool's {decision_id: operator's words} map into the {int: words} map the CLI sends, with the CLI's own refusals as ValueError text.
+    """Turn the tool's {decision_id: operator's words} map into the {int: words} map the CLI sends, refusing what the CLI refuses as ValueError text worded for this tool's argument.
     A key that is not a decision id, an empty string, or a placeholder is refused: this client must not invent the operator's words (fact:2809: the operator's words are carried per decision)."""
     if not isinstance(raw, dict):
         raise ValueError(
-            "acknowledge_standing must be repeated --acknowledge-standing ID \"operator's words\""
+            "acknowledge_standing must be a map of {decision_id: the operator's words}. "
+            "A list of ids is refused (fact:2809, the operator's words are carried per decision)."
         )
     out: dict[int, str] = {}
     for k, v in raw.items():
         if not isinstance(v, str):
             raise ValueError(f"acknowledge_standing[{k!r}] must be the operator's words")
         if isinstance(k, bool):
-            raise ValueError("acknowledge_standing requires an integer decision id and the operator's words")
+            raise ValueError("acknowledge_standing keys must be decision ids")
         try:
             d_id = int(k)
         except (ValueError, TypeError):
             raise ValueError(
-                "acknowledge_standing form is --acknowledge-standing ID \"operator's words\". "
-                f"Got {k!r}. There is no id:answer syntax."
+                f"acknowledge_standing key {k!r} is not a decision id; the form is "
+                "{decision_id: the operator's words}."
             ) from None
         if not v or _is_placeholder_words(v):
             raise ValueError(
                 f"acknowledge_standing[{d_id}] requires the operator's non-empty words "
                 "(fact:2809, the operator's words are carried per decision). "
-                "A bare id, an empty string, or a placeholder is refused."
+                "An empty string or a placeholder is refused."
             )
         out[d_id] = v.strip()
     if not out:
@@ -818,7 +839,7 @@ def _search_refs(refs) -> list[str] | dict:
 
 async def _post_memory_search(body: dict, ceiling: float):
     """The one search client. A ranked query and a by-ref read both post through it."""
-    async with _async_client(httpx.Timeout(ceiling, connect=5.0)) as client:
+    async with _async_client(ceiling) as client:
         return await client.post(
             f"{COORDINATOR_BASE}/memory/search",
             json=body,
@@ -852,7 +873,12 @@ async def hybrid_search_and_rerank(query: str = "", limit: int = 5, project: str
     Returns, as JSON text, the same list of record objects the CLI's `search`
     prints (each with `ref`, `record_type`, `score`, `content`,
     `graph_context`, and where they apply `lifecycle`, `obsolete` and
-    `stale_sources`). A refusal or a transport failure returns the CLI's error
+    `stale_sources`). When the CLI would print a note on stderr for the same
+    search (unranked rows, the keyword fallback served because the embedder is
+    down, a stale cost projection), the reply is instead the object
+    {"warnings": [<those exact texts>], "results": [<the list>]}. Read
+    `warnings` first: an empty `results` beside a keyword-fallback warning
+    means the ranked search was unavailable, not that nothing is known. A refusal or a transport failure returns the CLI's error
     object, {"status": "error", "message": ...}, with the gateway's `error`
     code beside it when it sent one.
 
@@ -889,18 +915,22 @@ async def hybrid_search_and_rerank(query: str = "", limit: int = 5, project: str
     payload = await _search_payload(query, limit, project=project,
                                      domains=domains, since=since)
     results = _results_of(payload)
-    # The CLI prints these on stderr and keeps stdout to the JSON; here they go the same way.
+    # The texts the CLI prints on stderr. An MCP host does not show this server's stderr to the model, so they also travel in the reply.
+    warnings = []
     warning = _unranked_warning(results)
     if warning:
-        print(warning, file=sys.stderr)
+        warnings.append(warning)
     fallback_warning = _fallback_warning(payload)
     if fallback_warning:
-        print(fallback_warning, file=sys.stderr)
+        warnings.append(fallback_warning)
     stale_note = _stale_projection_note(await _gateway_capability())
     if stale_note:
-        print(f"NOTE: {stale_note} — the ceiling above still used its last "
-              f"number as a lower bound (see backend_capability on /health)",
-              file=sys.stderr)
+        warnings.append(f"NOTE: {stale_note} — the ceiling above still used its last "
+                        f"number as a lower bound (see backend_capability on /health)")
+    for text in warnings:
+        print(text, file=sys.stderr)
+    if warnings:
+        return _as_json({"warnings": warnings, "results": results})
     return _as_json(results)
 
 
@@ -983,6 +1013,11 @@ async def save_artifact(content: str, metadata_json: str = "{}") -> str:
 
     Idempotent: identical content reuses the existing row.
 
+    The gateway records the verified agent of the token as the record's
+    `source`, whatever the caller sends, so none is required here. A caller who
+    wants the model name kept puts it under its own key in the metadata (for
+    example "model").
+
     metadata_json MUST carry "project" on a fact — the canonical value is the
     project folder name, checked against a registry. A save with none, or with an
     unregistered value, returns 400 carrying an "error" of project_required or
@@ -1032,14 +1067,6 @@ async def save_artifact(content: str, metadata_json: str = "{}") -> str:
     # Normalize domain and domains keys
     m_data = _normalize_domains(m_data)
 
-    if not m_data.get("source"):
-        _append_log("vector_skill", 2, "missing_source", {"content_preview": content[:100]}, content)
-        return _as_json(_error_obj(
-            "metadata.source is required — set it to the loaded model name "
-            "(e.g. 'qwen3-27b', 'llama3-70b'). "
-            "Facts without provenance are rejected to protect memory integrity."
-        ))
-
     # Project is required on a fact here as on the CLI door, and there is no
     # cwd to derive it from, because the host launches this server anywhere.
     if m_data.get("type") not in ("decision", "retrospective") and not m_data.get("project"):
@@ -1080,7 +1107,7 @@ async def _post_save(tool: str, content: str, metadata: dict):
             return _reply_json(r, tool)
     except GatewayReplyError as exc:
         # One refused save is one audit line: a 401 was already logged by
-        # _auth_error, and every other class logs `save_rejected` here.
+        # _auth_rejected, and every other class logs `save_rejected` here.
         if exc.logged_event is None:
             _append_log("vector_skill", 2, "save_rejected", {"message": exc.message}, content)
         return _as_json(exc.payload)
@@ -1356,11 +1383,11 @@ async def supersede(
     """Retract or supersede an existing FACT (decision 381/384).
 
     Returns, as JSON text, the object the CLI prints for its twin: the
-    gateway's reply (`status`, `pg_id`, `neo4j`, `message`, and the `*_resolved`
-    fields it adds). A refusal or a transport failure returns the CLI's error
-    object, {"status": "error", "message": ...}, with the gateway's `error`
-    code and its other machine-readable fields (for example the `proposals` of
-    `domain_unknown`, or `decisions_needing_answer`) beside it.
+    gateway's reply (`status`, `message`, and the ids it echoes). A refusal or
+    a transport failure returns the CLI's error object, {"status": "error",
+    "message": ...}, with the gateway's `error` code and its other
+    machine-readable fields (for example `decisions_needing_answer` on a 409
+    `decision_loses_last_ground`) beside it.
 
     Requires a write-capable agent token: a read-only token receives an
     honest HTTP 403 role refusal from the gateway — expected, do not retry.
@@ -1399,12 +1426,13 @@ async def supersede(
     decision (fact:2809).
 
     Required: pg_id (the fact to retract).
-    Optional: by (pg_id of an existing successor fact to point at; omit / 0 = none).
+    Optional: by (pg_id of an existing successor fact to point at; 0 = none, any other value is sent as given and the gateway judges it).
     Optional: acknowledge_standing, a map {decision_id: the operator's non-empty
-    words}. A list, an empty string, or a placeholder is refused with HTTP 400.
+    words}. A list, an empty string, or a placeholder is refused by this tool
+    before any call, as an error object.
     """
     payload: dict = {"pg_id": pg_id}
-    if by and by > 0:
+    if by:
         payload["by"] = by
     if acknowledge_standing is not None:
         try:
@@ -1430,11 +1458,10 @@ async def review_hold(summary_id: int, pg_id: int) -> str:
     """Mark a summary's flagged stale source as reviewed-and-held (decision 384).
 
     Returns, as JSON text, the object the CLI prints for its twin: the
-    gateway's reply (`status`, `pg_id`, `neo4j`, `message`, and the `*_resolved`
-    fields it adds). A refusal or a transport failure returns the CLI's error
-    object, {"status": "error", "message": ...}, with the gateway's `error`
-    code and its other machine-readable fields (for example the `proposals` of
-    `domain_unknown`, or `decisions_needing_answer`) beside it.
+    gateway's reply (`status`, `message`, and the ids it echoes). A refusal or
+    a transport failure returns the CLI's error object, {"status": "error",
+    "message": ...}, with the gateway's `error` code and its other
+    machine-readable fields beside it.
 
     Requires a write-capable agent token: a read-only token receives an
     honest HTTP 403 role refusal from the gateway — expected, do not retry.
@@ -1492,8 +1519,11 @@ def _role_diagnosis(payload: dict) -> str:
 async def check_memory_health() -> str:
     """
     Full-stack diagnostic for the shared-memory infrastructure, returned as JSON
-    text. A refusal returns the CLI's error object, {"status": "error",
-    "message": ...}, with the gateway's `error` code beside it when it sent one.
+    text: the gateway's /health body plus `role` and `client` (this is not a
+    CLI object; the CLI's `doctor` prints a smaller compatibility summary). A
+    503 returns its body, the encoder verdict. A refusal or a transport failure
+    returns the CLI's error object, {"status": "error", "message": ...}, with
+    the gateway's `error` code beside it when it sent one.
 
     Reports what the gateway reports rather than opening its own database
     connection to count rows. The gateway is the component that knows whether
@@ -1521,15 +1551,12 @@ async def check_memory_health() -> str:
         async with _async_client(10.0) as client:
             resp = await client.get(f"{COORDINATOR_BASE}/health",
                                     headers=_auth_headers())
-        payload = _reply_json(resp, "check_memory_health")
+        # A 503 from /health is the encoder verdict, so its body is kept.
+        payload = _reply_json(resp, "check_memory_health", accept_status=(503,))
     except GatewayReplyError as exc:
         return _as_json(exc.payload)
     except Exception as exc:
-        return json.dumps({"status": "unreachable",
-                           "gateway": COORDINATOR_BASE,
-                           "error": str(exc),
-                           "hint": "systemctl --user start hive-mind-gateway.service"},
-                          indent=2)
+        return _as_json(await _warn_on_skew(_coordinator_unavailable(exc)))
     # Both ride on the authenticated payload: `agent` passes through when
     # present, and `role` always gets a line from the three-way diagnosis.
     payload["role"] = _role_diagnosis(payload)
@@ -1563,7 +1590,7 @@ async def memory_telemetry() -> str:
     The full key-by-key contract is Documentation/telemetry-contract.md.
     """
     try:
-        async with _async_client(10.0) as client:
+        async with _async_client(15.0) as client:
             resp = await client.get(
                 f"{COORDINATOR_BASE}/memory/telemetry", headers=_auth_headers()
             )
