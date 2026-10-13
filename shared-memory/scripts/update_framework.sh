@@ -494,7 +494,9 @@ report_singular_domain_count() {
     if [[ "$count" =~ ^[0-9]+$ && "$count" != "0" ]]; then
         echo "   To repair them, run:"
         echo "       uv run --with psycopg2-binary python $REPO_ROOT/shared-memory/migrations/apply.py 044_fact_domains_plural_key.sql --force"
-        echo "   Rows whose two keys disagree are left for you to judge."
+        echo "   If the count is unchanged after the repair, the rows left have two keys that disagree or a value"
+        echo "   that names nothing; those are left for you to judge. Their ids:"
+        echo "       uv run --with psycopg2-binary python $REPO_ROOT/shared-memory/migrations/count_singular_domain.py --list"
     fi
     return 0
 }

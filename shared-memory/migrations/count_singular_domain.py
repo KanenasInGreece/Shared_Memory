@@ -1,7 +1,6 @@
-"""Read-only: print how many facts still carry a top-level `domain` key.
+"""Read-only: count the facts that still carry a top-level `domain` key, or with --list print their ids.
 
-The count is migration 044's guard (a fact-like record whose `decision` blob names no section) plus the
-presence of the key. Prints one number and nothing else; update_framework.sh reads it after the restart.
+The guard is migration 044's, word for word. Prints numbers only; update_framework.sh reads the count after the restart.
 """
 
 import sys
@@ -10,15 +9,25 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import apply as apply_mod  # noqa: E402
 
-COUNT_SQL = """
-SELECT count(*) FROM technical_docs t
- WHERE jsonb_typeof(t.metadata) = 'object'
+GUARD = """jsonb_typeof(t.metadata) = 'object'
    AND lower(regexp_replace(coalesce(t.metadata->>'type', ''), '^\\s+|\\s+$', '', 'g'))
        NOT IN ('decision', 'retrospective')
    AND NOT coalesce(jsonb_typeof(t.metadata->'decision') = 'object'
-                    AND t.metadata->'decision' ?| array['domain', 'domains'], false)
-   AND t.metadata ? 'domain'
-"""
+                    AND ((SELECT jsonb_agg(v ORDER BY o) FROM (SELECT v, min(ord) o FROM (
+          SELECT regexp_replace(e #>> '{}', '^\\s+|\\s+$', '', 'g') v, ord
+            FROM jsonb_array_elements(CASE jsonb_typeof(t.metadata->'decision'->'domain') WHEN 'array' THEN t.metadata->'decision'->'domain'
+                 WHEN 'string' THEN jsonb_build_array(t.metadata->'decision'->'domain') ELSE '[]'::jsonb END)
+                 WITH ORDINALITY a(e, ord)
+           WHERE jsonb_typeof(e) = 'string') q WHERE v <> '' GROUP BY v) g) IS NOT NULL
+                         OR (SELECT jsonb_agg(v ORDER BY o) FROM (SELECT v, min(ord) o FROM (
+          SELECT regexp_replace(e #>> '{}', '^\\s+|\\s+$', '', 'g') v, ord
+            FROM jsonb_array_elements(CASE jsonb_typeof(t.metadata->'decision'->'domains') WHEN 'array' THEN t.metadata->'decision'->'domains'
+                 WHEN 'string' THEN jsonb_build_array(t.metadata->'decision'->'domains') ELSE '[]'::jsonb END)
+                 WITH ORDINALITY a(e, ord)
+           WHERE jsonb_typeof(e) = 'string') q WHERE v <> '' GROUP BY v) g) IS NOT NULL), false)"""
+
+COUNT_SQL = "SELECT count(*) FROM technical_docs t WHERE " + GUARD + " AND t.metadata ? 'domain'"
+LIST_SQL = "SELECT t.id FROM technical_docs t WHERE " + GUARD + " AND t.metadata ? 'domain' ORDER BY t.id"
 
 
 def main() -> int:
@@ -27,8 +36,13 @@ def main() -> int:
     try:
         conn.set_session(readonly=True)
         with conn.cursor() as cur:
-            cur.execute(COUNT_SQL)
-            print(cur.fetchone()[0])
+            if "--list" in sys.argv[1:]:
+                cur.execute(LIST_SQL)
+                for (pg_id,) in cur.fetchall():
+                    print(pg_id)
+            else:
+                cur.execute(COUNT_SQL)
+                print(cur.fetchone()[0])
     finally:
         conn.close()
     return 0

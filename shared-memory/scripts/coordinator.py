@@ -56,7 +56,7 @@ from domain_axis import (
     DOMAIN_PROPOSAL_LIMIT, DOMAIN_CONFUSABLE_SQL, DOMAIN_CONFUSABLE_SIMILARITY,
     DOMAIN_ALIAS_RESOLVE_SQL, DOMAIN_REGISTER_SQL, DOMAIN_KEYS,
     DOMAIN_NAMES_SQL, DOMAIN_ALIASES_SQL, DOMAIN_NAME_OR_KEY_SQL,
-    domain_merge_cypher, names_a_domain, resolve_domains, _domains_from,
+    domain_merge_cypher, names_a_domain, resolve_domains,
 )
 from insight_gate import walk_group_reached_set, passes_insight_gate
 from project_promotion import (
@@ -5637,14 +5637,7 @@ class MemoryCoordinator:
                     axis_key(resolved_stored) != axis_key(project):
                 return _refusal("project", existing_project, project)
 
-        # A stale singular beside a correct plural must not make a re-save naming the plural a conflict, so the plural alone speaks for the stored record. A decision's blob still wins.
-        stored_plural = stored.get("domains")
-        if _domains_from(stored.get("decision")):
-            existing_domains = resolve_domains(stored)
-        elif isinstance(stored_plural, list):
-            existing_domains = _domains_from({"domains": stored_plural})
-        else:
-            existing_domains = resolve_domains(stored)
+        existing_domains = resolve_domains(stored)
         # Compare domains by key, not by alias. An alias lookup calls _project_identity, which raises on a registry blip and would turn that into a refused re-save. A real section rename still conflicts; that gap stays open.
         if {axis_key(d) for d in existing_domains} != \
                 {axis_key(d) for d in (domains or [])}:
@@ -6486,6 +6479,8 @@ class MemoryCoordinator:
         resolved_sections = resolve_domains(metadata)
         if resolved_sections:
             metadata["domains"] = resolved_sections
+        else:
+            metadata.pop("domains", None)
         metadata.pop("domain", None)
 
         # decision 381, refined by 384: supersedes is checked before embed, and dependents are flagged at retrieval rather than rewritten here.

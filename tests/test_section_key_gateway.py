@@ -30,8 +30,23 @@ def _load(name: str, path: Path):
     return mod
 
 
-coordinator_mod = _load("coordinator_section_key", _SCRIPTS / "coordinator.py")
-MemoryCoordinator = coordinator_mod.MemoryCoordinator
+_STATE: dict = {}
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _gateway_modules():
+    """Loading the gateway and apply.py edits sys.path and sys.modules; both are put back afterwards."""
+    saved_path = list(sys.path)
+    had_apply = "apply" in sys.modules
+    saved_apply = sys.modules.get("apply")
+    _STATE["coordinator"] = _load("coordinator_section_key", _SCRIPTS / "coordinator.py")
+    yield
+    _STATE.clear()
+    sys.path[:] = saved_path
+    if had_apply:
+        sys.modules["apply"] = saved_apply
+    else:
+        sys.modules.pop("apply", None)
 
 
 class _ctx:
@@ -56,7 +71,7 @@ def _request(body: dict) -> MagicMock:
 
 
 def _coordinator():
-    c = MemoryCoordinator()
+    c = _STATE["coordinator"].MemoryCoordinator()
     conn = AsyncMock()
     conn.fetchrow = AsyncMock(return_value={"id": 99})
     conn.execute = AsyncMock(return_value="DELETE 0")
@@ -125,8 +140,7 @@ async def test_g3_a_record_that_names_no_section_gains_no_domains_and_keeps_no_b
     assert resp.status == 200
     stored = _stored(conn)
     assert "domain" not in stored
-    # A `domains` key the caller sent stays as sent; one it did not send is never added.
-    assert stored.get("domains", "absent") == sections.get("domains", "absent")
+    assert "domains" not in stored
 
 
 @pytest.mark.asyncio
@@ -202,14 +216,13 @@ async def test_g7_a_decision_in_another_spelling_is_stored_as_decision():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("sent", ["domain_of", "project_of", "supersede", "", "  ", "Domain_Of", " Supersede "])
+@pytest.mark.parametrize("sent", [
+    "domain_of", "project_of", "supersede", "", "  ", "Domain_Of", " Supersede ", 5, ["fact"],
+])
 async def test_g8_other_types_are_stored_as_sent(sent):
     resp, _, conn = await _run({"type": sent})
-    if resp.status == 200:
-        assert _stored(conn)["type"] == sent
-    else:
-        # a refused type is refused as sent, never rewritten into one that passes
-        assert json.loads(resp.text).get("error") in ("unknown_type", None)
+    assert resp.status == 200, resp.text
+    assert _stored(conn)["type"] == sent
 
 
 @pytest.mark.asyncio
@@ -248,6 +261,16 @@ async def test_g9_a_wrong_shaped_section_in_a_decision_blob_is_refused(key, bad)
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("key", ["domain", "domains"])
+@pytest.mark.parametrize("bad", _BAD)
+async def test_g9_a_fact_whose_decision_blob_alone_carries_a_wrong_shaped_section_is_refused(key, bad):
+    resp, _, conn = await _run({"decision": {key: bad}})
+    assert resp.status == 400
+    assert json.loads(resp.text)["error"] == "domain_shape_invalid"
+    conn.fetchrow.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_g9_the_shape_refusal_wins_over_the_judgement_refusal():
     resp, _, _ = await _run({"type": "retrospective", "domain": {"a": 1}})
     assert json.loads(resp.text)["error"] == "domain_shape_invalid"
@@ -262,50 +285,27 @@ async def test_g10_empty_and_null_sections_are_not_refused(key, ok):
 
 
 @pytest.mark.asyncio
-async def test_g11_a_shape_refusal_is_counted():
+async def test_g11_a_shape_refusal_is_counted_on_the_counter_it_maps_to():
     c, conn = _coordinator()
+    key = c._REFUSAL_COUNTER["domain_shape_invalid"]
     before = c._registry_refusals.snapshot()
     resp, _, _ = await _run({"domain": 5}, c, conn)
     assert resp.status == 400
     after = c._registry_refusals.snapshot()
-    assert json.dumps(after) != json.dumps(before)
-    assert c._REFUSAL_COUNTER["domain_shape_invalid"] == "new_domain_refused"
+    assert key == "new_domain_refused"
+    assert after[key] == before.get(key, 0) + 1
+    assert {k: v for k, v in after.items() if k != key} == \
+        {k: v for k, v in before.items() if k != key}
 
 
-# ── G12: the stored side of the conflict check reads `domains` ────────────────
-
-@pytest.mark.asyncio
-async def test_g12_a_resave_naming_the_plural_is_not_a_conflict_beside_a_stale_singular():
-    c, _ = _coordinator()
-    stored = {"project": "widget_works", "domain": "A", "domains": ["B"]}
-    assert await c._axis_conflict_error(stored, "widget_works", ["B"], [], False) is None
-
+# ── the stored side of the conflict check is unchanged: the union of both keys ──
 
 @pytest.mark.asyncio
-async def test_g12_a_resave_naming_a_different_section_is_still_a_conflict():
+async def test_a_stored_singular_beside_an_empty_plural_still_conflicts_with_a_save_naming_nothing():
     c, _ = _coordinator()
-    stored = {"project": "widget_works", "domain": "A", "domains": ["B"]}
-    err = await c._axis_conflict_error(stored, "widget_works", ["A"], [], False)
-    assert err is not None and err["axis"] == "domains"
-
-
-@pytest.mark.asyncio
-async def test_g12_a_stored_singular_alone_still_counts():
-    c, _ = _coordinator()
-    stored = {"project": "widget_works", "domain": "A"}
-    assert await c._axis_conflict_error(stored, "widget_works", ["A"], [], False) is None
-    err = await c._axis_conflict_error(stored, "widget_works", ["B"], [], False)
-    assert err is not None
-
-
-@pytest.mark.asyncio
-async def test_g12_a_decisions_blob_still_wins_over_the_plural():
-    c, _ = _coordinator()
-    stored = {"type": "decision", "project": "widget_works", "domains": ["B"],
-              "decision": {"project": "widget_works", "domains": ["A"]}}
-    assert await c._axis_conflict_error(
-        stored, "widget_works", ["A"], [], True, incoming_type="decision",
-        incoming_metadata={"type": "decision"}) is None
+    stored = {"project": "widget_works", "domain": "A", "domains": []}
+    err = await c._axis_conflict_error(stored, "widget_works", [], [], False)
+    assert err is not None and err["error"] == "axis_conflict" and err["axis"] == "domains"
 
 
 # ── outbox and graph payload unchanged ────────────────────────────────────────
@@ -313,8 +313,46 @@ async def test_g12_a_decisions_blob_still_wins_over_the_plural():
 @pytest.mark.asyncio
 async def test_the_outbox_payload_carries_the_same_sections():
     _, _, conn = await _run({"domain": "assembly"})
-    params = _outbox_domains(conn)
-    assert "assembly" in str(params)
+    assert _outbox_domains(conn)["domains"] == ["assembly"]
+
+
+# ── decisions: top level and blob together ───────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_a_decision_naming_a_section_only_at_the_top_level_gets_domains_and_loses_domain():
+    meta = _decision()
+    meta["domain"] = "assembly"
+    resp, _, conn = await _run(meta)
+    assert resp.status == 200
+    stored = _stored(conn)
+    assert stored["domains"] == ["assembly"]
+    assert "domain" not in stored
+    assert stored["decision"] == _decision()["decision"]
+
+
+@pytest.mark.asyncio
+async def test_a_decision_with_sections_in_the_blob_and_the_top_level_stores_the_blobs():
+    meta = _decision(domains=["assembly"])
+    meta["domain"] = "paint"
+    resp, _, conn = await _run(meta)
+    assert resp.status == 200
+    stored = _stored(conn)
+    assert stored["domains"] == ["assembly"]
+    assert "domain" not in stored
+    assert stored["decision"]["domains"] == ["assembly"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("sections", [
+    {"domains": []}, {"domains": ["", " "]}, {"domains": ""}, {"domains": " "},
+    {"domains": None}, {"domain": "", "domains": []}, {"domain": None, "domains": None},
+])
+async def test_a_client_sent_domains_that_names_nothing_is_not_stored(sections):
+    resp, _, conn = await _run(sections)
+    assert resp.status == 200
+    stored = _stored(conn)
+    assert "domains" not in stored
+    assert "domain" not in stored
 
 
 # ── G13: apply.py prints a migration's notices, and only its own ──────────────
@@ -421,15 +459,35 @@ def test_g14_a_failing_count_never_fails_the_update():
     assert "--force" not in r.stdout
 
 
+def _executed_lines(text: str) -> list[str]:
+    """Statements with backslash continuations joined; echo/printf/comment lines dropped."""
+    joined = re.sub(r"\\\n\s*", " ", text)
+    return [l.strip() for l in joined.splitlines()
+            if l.strip() and not re.match(r"\s*(echo|printf|#)", l)]
+
+
 def test_g14_the_step_runs_soft_after_the_restart_and_is_not_a_rewrite():
     lines = _SCRIPT.splitlines()
     restart = next(i for i, l in enumerate(lines) if l.startswith('run "restart the gateway"'))
     step = next(i for i, l in enumerate(lines) if l.startswith('run_soft "count facts still carrying'))
     assert step > restart
-    block = "\n".join(lines[step:step + 3])
-    assert "count_singular_domain.py" in block
-    assert "apply.py" not in block
-    assert not re.search(r"^\s*(run|run_soft)\b.*apply\.py.*--force", _SCRIPT, re.M)
+    end = step
+    while lines[end].rstrip().endswith("\\"):
+        end += 1
+    statement = "\n".join(lines[step:end + 1])
+    assert "count_singular_domain.py" in statement
+    for text in (_function_source(), statement):
+        executed = _executed_lines(text)
+        assert executed
+        offenders = [l for l in executed if "apply.py" in l]
+        assert not offenders, offenders
+
+
+def test_g14_the_nonzero_hint_names_the_list_command_and_the_unchanged_count_sentence():
+    r = _run_report("echo 7")
+    assert "count_singular_domain.py --list" in r.stdout
+    assert "unchanged after the repair" in r.stdout
+    assert "left for you to judge" in r.stdout
 
 
 def test_g14_the_count_script_only_reads():
@@ -460,3 +518,39 @@ def test_migration_044_is_one_do_block_on_technical_docs_only():
     assert "community_summaries" not in code
     assert code.count("UPDATE technical_docs") == 2
     assert "RAISE NOTICE" in code
+
+
+# -- the guard is one text, in every step and in the count script --
+
+def _squash(text: str) -> str:
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _guard_from_count_script() -> str:
+    src = (_MIGRATIONS / "count_singular_domain.py").read_text()
+    m = re.search(r'GUARD = """(.*?)"""', src, re.S)
+    assert m
+    return _squash(m.group(1).replace("\\\\", "\\"))
+
+
+def test_the_migration_guard_is_the_count_scripts_guard_in_all_three_steps():
+    sql = _squash((_MIGRATIONS / "044_fact_domains_plural_key.sql").read_text())
+    guard = _guard_from_count_script()
+    assert sql.count(guard) == 3
+
+
+def test_the_guard_excludes_a_decision_blob_only_when_it_resolves_to_a_section():
+    guard = _guard_from_count_script()
+    assert "IS NOT NULL" in guard
+    assert "?|" not in guard
+
+
+def test_migration_044_step_one_treats_an_empty_plural_as_absent_and_step_two_rewrites_a_string():
+    sql = _squash((_MIGRATIONS / "044_fact_domains_plural_key.sql").read_text())
+    assert "jsonb_typeof(t.metadata->'domains') IN ('array', 'string') AND (SELECT jsonb_agg" in sql
+    assert "WHEN jsonb_typeof(t.metadata->'domains') = 'string'" in sql
+
+
+def test_the_count_script_lists_ids_read_only():
+    src = (_MIGRATIONS / "count_singular_domain.py").read_text()
+    assert '"--list"' in src and "SELECT t.id" in src and "readonly=True" in src
