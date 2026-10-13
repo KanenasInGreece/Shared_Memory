@@ -14,9 +14,6 @@ import os
 import sys
 import httpx
 from unittest.mock import MagicMock, patch, AsyncMock
-import tempfile
-import shutil
-import difflib
 
 # Load memory_bridge exactly as test_memory_bridge.py does
 def load_memory_bridge():
@@ -36,28 +33,12 @@ def load_vector_skill():
     spec.loader.exec_module(module)
     return module
 
+# Import the real domain_axis._domains_from for comparison
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "shared-memory", "scripts"))
+from domain_axis import _domains_from
+
 memory_bridge = load_memory_bridge()
 vector_skill = load_vector_skill()
-
-# Reference implementation of domain_axis._domains_from for testing
-def domains_from_reference(blob) -> list:
-    """Domain names carried by one dict, under either key. Pure.
-    This matches domain_axis._domains_from exactly."""
-    out = []
-    seen = set()
-    if not isinstance(blob, dict):
-        return out
-    for key in ("domain", "domains"):
-        raw = blob.get(key)
-        values = raw if isinstance(raw, (list, tuple)) else [raw]
-        for value in values:
-            if not isinstance(value, str):
-                continue
-            name = value.strip()
-            if name and name not in seen:
-                seen.add(name)
-                out.append(name)
-    return out
 
 
 # ── C1: The client turns a list-valued "domain" into a nested list ────────────
@@ -73,7 +54,7 @@ def test_c1_domain_list_not_nested():
 # ── C2: The client function matches domain_axis._domains_from on all inputs ────
 
 def test_c2_normalize_domains_matches_reference_comprehensive():
-    """C2: Client and reference implementation agree on all test table rows."""
+    """C2: Client and domain_axis._domains_from agree on all test table rows."""
     # Positive cases (client should normalize)
     positive_cases = [
         ({"domain": "delivery"}, ["delivery"]),
@@ -94,15 +75,15 @@ def test_c2_normalize_domains_matches_reference_comprehensive():
         {},  # empty
     ]
 
-    # Test positive cases
+    # Test positive cases - verify client computes same list as domain_axis
     for metadata, expected in positive_cases:
         result = memory_bridge._normalize_domains(metadata.copy())
         computed = result.get("domains")
-        reference = domains_from_reference(metadata)
+        reference = _domains_from(metadata)
         assert computed == expected, f"For {metadata}, got {computed}, expected {expected}"
-        assert computed == reference, f"Mismatch with reference for {metadata}: got {computed}, reference {reference}"
+        assert computed == reference, f"Mismatch with _domains_from for {metadata}: got {computed}, reference {reference}"
 
-    # Test untouched cases - must be identical (same object, unchanged content)
+    # Test untouched cases - verify they return unchanged
     for metadata in untouched_cases:
         result = memory_bridge._normalize_domains(metadata.copy())
         # For untouched cases, the result should be unchanged
@@ -244,149 +225,3 @@ def test_c8_domain_shape_invalid_in_skill_md():
             content = f.read()
 
         assert "domain_shape_invalid" in content, f"'domain_shape_invalid' not found in {filepath}"
-
-
-# ── Mutation checks: verify tests fail when code is mutated ──────────────────
-
-def test_mutations_c1_wraps_list():
-    """Mutation C1: Verify test fails if domain list becomes nested."""
-    # Create a mutated version that wraps lists
-    metadata = {"domain": ["ops", "delivery"]}
-
-    # This is the mutation: wrapping the list
-    def mutated_normalize(metadata):
-        """Mutated version that wraps lists."""
-        domain_val = metadata.get("domain")
-        if domain_val is not None and isinstance(domain_val, list):
-            metadata["domains"] = [domain_val]  # MUTATION: wrap in another list
-            del metadata["domain"]
-        return metadata
-
-    result = mutated_normalize(metadata.copy())
-    # This assertion should fail with the mutation
-    try:
-        assert result.get("domains") == ["ops", "delivery"]
-        pytest.fail("Mutation test C1 failed: mutation was not detected")
-    except AssertionError:
-        pass  # Expected: the assertion should fail with the mutation
-
-
-def test_mutations_c2_skips_strip():
-    """Mutation C2: Verify test fails if strip() is removed."""
-    metadata = {"domain": " delivery "}
-
-    # This is the mutation: no strip
-    def mutated_normalize(metadata):
-        """Mutated version that skips strip."""
-        domain_val = metadata.get("domain")
-        out = []
-        if isinstance(domain_val, str):
-            # MUTATION: no strip()
-            name = domain_val  # Missing: .strip()
-            if name:
-                out.append(name)
-        if out:
-            metadata["domains"] = out
-            del metadata["domain"]
-        return metadata
-
-    result = mutated_normalize(metadata.copy())
-    reference = domains_from_reference(metadata)
-    # This assertion should fail with the mutation
-    try:
-        assert result.get("domains") == reference
-        pytest.fail("Mutation test C2 failed: mutation was not detected")
-    except AssertionError:
-        pass  # Expected: the assertion should fail with the mutation
-
-
-def test_mutations_c3_modifies_invalid():
-    """Mutation C3: Verify test fails if invalid shapes are modified."""
-    metadata = {"domain": 5}
-
-    # This is the mutation: accepting invalid shapes
-    def mutated_normalize(metadata):
-        """Mutated version that accepts invalid shapes."""
-        domain_val = metadata.get("domain")
-        # MUTATION: no type check
-        out = []
-        out.append(str(domain_val))  # Convert to string anyway
-        if out:
-            metadata["domains"] = out
-            if "domain" in metadata:
-                del metadata["domain"]
-        return metadata
-
-    result = mutated_normalize(metadata.copy())
-    # This should fail the test
-    try:
-        assert result == {"domain": 5}
-        pytest.fail("Mutation test C3 failed: mutation was not detected")
-    except AssertionError:
-        pass  # Expected: the assertion should fail with the mutation
-
-
-def test_mutations_c4_no_normalize_call():
-    """Mutation C4: Verify test fails if normalize_domains is not called in save_artifact."""
-    # This is a conceptual test - the actual mutation would be in the code
-    # We verify here that the pattern would fail
-    metadata = {"source": "test", "domain": "delivery"}
-
-    # Simulating what happens if normalize is not called
-    # The original metadata would be sent with "domain" key still present
-    assert "domain" in metadata, "If normalize is not called, domain stays"
-
-    # Call the real function to verify it removes domain
-    result = memory_bridge._normalize_domains(metadata.copy())
-    assert "domains" in result, "After normalize, domains should be present"
-    assert "domain" not in result, "After normalize, domain should be absent"
-
-
-def test_mutations_c5_mcp_no_normalize_call():
-    """Mutation C5: Verify test fails if normalize_domains is not called in MCP save_artifact."""
-    metadata = {"source": "test", "project": "shared-memory-GitHub", "domain": "delivery"}
-
-    # Call the real function to verify it removes domain
-    result = vector_skill._normalize_domains(metadata.copy())
-    assert "domains" in result, "After normalize, domains should be present"
-    assert "domain" not in result, "After normalize, domain should be absent"
-
-
-def test_mutations_c6_copies_differ():
-    """Mutation C6: Conceptual test - copies must be identical."""
-    path_cli = os.path.join(os.path.dirname(__file__), "..", "shared-memory", "scripts", "memory_bridge.py")
-    path_skill = os.path.join(os.path.dirname(__file__), "..", "shared-memory-skill", "shared-memory", "scripts", "memory_bridge.py")
-
-    with open(path_cli, 'r') as f:
-        cli = f.read()
-    with open(path_skill, 'r') as f:
-        skill = f.read()
-
-    assert cli == skill, "Copies must be identical"
-
-
-def test_mutations_c7_domain_in_example():
-    """Mutation C7: Conceptual test - no "domain" should be in examples."""
-    # Verify current examples use --domain or "domains"
-    skill_file = os.path.join(os.path.dirname(__file__), "..", "shared-memory", "SKILL.md")
-    with open(skill_file, 'r') as f:
-        content = f.read()
-
-    # Find a save example and verify it doesn't have "domain" in the JSON
-    import re
-    saves = re.findall(r'save "[^"]*" \'[^\']*\'', content)
-    for save_example in saves:
-        # If there's a JSON in the example, it should not have "domain": ...
-        if '{"' in save_example:
-            json_part = re.search(r'\{[^}]*\}', save_example)
-            if json_part:
-                assert '"domain":' not in json_part.group(), f"Found 'domain' in example: {save_example}"
-
-
-def test_mutations_c8_refusal_missing():
-    """Mutation C8: Conceptual test - refusal code must be present."""
-    skill_file = os.path.join(os.path.dirname(__file__), "..", "shared-memory", "SKILL.md")
-    with open(skill_file, 'r') as f:
-        content = f.read()
-
-    assert "domain_shape_invalid" in content, "Refusal code must be documented"
