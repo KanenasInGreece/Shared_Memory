@@ -838,6 +838,13 @@ ENTITIES_PROVENANCE_VALUES = ("operator", "agent")
 JUDGEMENT_LABELS = (ONT.decision, ONT.retrospective)
 
 
+def _carries_project_value(metadata: dict) -> bool:
+    """Does the record send any project value at all, valid or not? A number, a list or a blank string counts; absent and JSON null do not. Pure."""
+    blob = metadata.get("decision")
+    return (metadata.get("project") is not None
+            or (isinstance(blob, dict) and blob.get("project") is not None))
+
+
 def is_judgement_type(record_type: object) -> bool:
     """Is this record type a JUDGEMENT? Pure.
 
@@ -4547,7 +4554,7 @@ class MemoryCoordinator:
         # Check project, not a domain chain. A section must not vouch for the project it belongs to.
         supplied = resolve_project(metadata)
         # Retrospectives inherit the project of the decision they judge, so this check would demand a value the caller never sends. One that does send a project faces the check like any record. Decisions stay in the check: an unregistered name used to become a project node.
-        if metadata.get("type") == "retrospective" and not supplied:
+        if metadata.get("type") == "retrospective" and not _carries_project_value(metadata):
             return None
 
         if not supplied:

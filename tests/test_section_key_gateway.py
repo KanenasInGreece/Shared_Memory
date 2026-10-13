@@ -392,6 +392,49 @@ async def test_t2_a_retrospective_that_names_no_project_is_still_accepted():
     assert resp.status == 200, resp.text
 
 
+_MALFORMED_PROJECTS = [12345, ["unlisted_thing"], "   ", "", {"a": 1}, True]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("spelling", ["retrospective", "Retrospective"])
+@pytest.mark.parametrize("bad", _MALFORMED_PROJECTS)
+async def test_t2e_a_retrospective_with_a_malformed_or_blank_project_is_refused(spelling, bad):
+    c, conn = _coordinator()
+    _registry(c, registered=("orbit-relay",))
+    body = {"content": "a verdict", "metadata": {"source": "claude-code", "type": spelling, "project": bad}}
+    with patch.object(c, "_embed", new=AsyncMock(return_value=[0.1] * 1024)):
+        resp = await c.handle_save(_request(body))
+    assert resp.status == 400
+    assert json.loads(resp.text)["error"] == "project_required"
+    conn.fetchrow.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad", _MALFORMED_PROJECTS)
+async def test_t2e_a_retrospective_with_a_malformed_project_in_its_decision_blob_is_refused(bad):
+    c, conn = _coordinator()
+    _registry(c, registered=("orbit-relay",))
+    body = {"content": "a verdict", "metadata": {
+        "source": "claude-code", "type": "retrospective", "decision": {"project": bad}}}
+    with patch.object(c, "_embed", new=AsyncMock(return_value=[0.1] * 1024)):
+        resp = await c.handle_save(_request(body))
+    assert resp.status == 400
+    assert json.loads(resp.text)["error"] == "project_required"
+    conn.fetchrow.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("meta", [{"project": None}, {"decision": {"project": None}},
+                                  {"project": None, "decision": {"note": "x"}}])
+async def test_t2e_a_retrospective_whose_project_is_null_or_absent_is_still_accepted(meta):
+    c, conn = _coordinator()
+    _registry(c, registered=("orbit-relay",))
+    body = {"content": "a verdict", "metadata": {"source": "claude-code", "type": "retrospective", **meta}}
+    with patch.object(c, "_embed", new=AsyncMock(return_value=[0.1] * 1024)):
+        resp = await c.handle_save(_request(body))
+    assert resp.status == 200, resp.text
+
+
 @pytest.mark.asyncio
 async def test_t2d_the_dedicated_retrospective_endpoint_never_runs_the_project_check():
     c, conn = _coordinator()
@@ -428,6 +471,68 @@ async def test_t3a_a_save_can_create_a_new_project_and_its_section_from_another_
     c._register_project.assert_awaited_once()
     assert c._register_project.await_args.args[0] == "brand_new_thing"
     c._register_domain.assert_awaited_once()
+
+
+# ── T3b/T3c through handle_save, with the real _new_project_refusal ──────────
+
+def _real_refusal_coordinator(registered=("orbit-relay", "alpha-service"), near=()):
+    c, conn = _coordinator()
+    _registry(c, registered=registered)
+    mod = _STATE["coordinator"]
+
+    async def fetch(sql, *args):
+        if sql == mod.CONFUSABLE_SQL:
+            return [{"name": n} for n in near]
+        if sql == mod.PROJECT_NAMES_SQL:
+            return [{"name": n} for n in registered]
+        if sql == mod.ACTIVE_ALIASES_SQL:
+            return []
+        return []
+
+    conn.fetch = AsyncMock(side_effect=fetch)
+    return c, conn
+
+
+def _typed(spelling, **meta):
+    return {"type": spelling, **meta} if spelling != "fact" else dict(meta)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("spelling", ["fact", "retrospective"])
+async def test_t3b_a_key_identical_spelling_declared_new_is_refused_naming_the_registered_one(spelling):
+    c, conn = _real_refusal_coordinator()
+    resp, _, _ = await _run(_typed(spelling, project="Orbit_Relay", new_project=True), c, conn)
+    assert resp.status == 400
+    body = json.loads(resp.text)
+    assert body["error"] == "project_spelling_variant"
+    assert "orbit-relay" in body["message"]
+    c._register_project.assert_not_awaited()
+    conn.fetchrow.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("spelling", ["fact", "retrospective"])
+async def test_t3c_a_confusable_name_declared_new_is_challenged(spelling):
+    c, conn = _real_refusal_coordinator(near=("alpha-service",))
+    resp, _, _ = await _run(_typed(spelling, project="alpha-servize", new_project=True), c, conn)
+    assert resp.status == 400
+    body = json.loads(resp.text)
+    assert body["error"] == "project_confusable"
+    assert "alpha-service" in body["message"]
+    c._register_project.assert_not_awaited()
+    conn.fetchrow.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("spelling", ["fact", "retrospective"])
+async def test_t3c_naming_the_neighbour_lets_a_confusable_name_register(spelling):
+    c, conn = _real_refusal_coordinator(near=("alpha-service",))
+    resp, _, _ = await _run(
+        _typed(spelling, project="alpha-servize", new_project=True,
+               confirm_distinct_from=["alpha-service"]), c, conn)
+    assert resp.status == 200, resp.text
+    c._register_project.assert_awaited_once()
+    assert c._register_project.await_args.args[0] == "alpha-servize"
 
 
 # ── decisions: top level and blob together ───────────────────────────────────
