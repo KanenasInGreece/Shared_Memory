@@ -4544,12 +4544,12 @@ class MemoryCoordinator:
         to carry an advisory would make forty call sites unpack a tuple to learn
         nothing they asked for.
         """
-        # Retrospectives inherit the project of the decision they judge, so this check would demand a value the caller never sends. Decisions stay in the check: an unregistered name used to become a project node.
-        if metadata.get("type") == "retrospective":
-            return None
-
         # Check project, not a domain chain. A section must not vouch for the project it belongs to.
         supplied = resolve_project(metadata)
+        # Retrospectives inherit the project of the decision they judge, so this check would demand a value the caller never sends. One that does send a project faces the check like any record. Decisions stay in the check: an unregistered name used to become a project node.
+        if metadata.get("type") == "retrospective" and not supplied:
+            return None
+
         if not supplied:
             return await self._project_rejection("project_required", None)
 
@@ -6315,14 +6315,10 @@ class MemoryCoordinator:
             return web.json_response(
                 {"status": "error", "message": "content is required"}, status=400
             )
-        try:
-            _require_outbox_type({
-                "type": _outbox_row_type(
-                    metadata.get("type") if isinstance(metadata, dict) else None
-                ),
-            })
-        except ValueError:
-            raw_type = metadata.get("type") if isinstance(metadata, dict) else None
+        # The internal outbox types (supersede, project_of, domain_of) are written by the gateway and operator scripts, never chosen by a client.
+        raw_type = metadata.get("type") if isinstance(metadata, dict) else None
+        if (isinstance(raw_type, str) and raw_type.strip()
+                and raw_type.strip().lower() not in REF_TYPES_DOCS):
             return web.json_response(
                 {
                     "status": "error",

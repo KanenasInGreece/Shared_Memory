@@ -215,14 +215,47 @@ async def test_g7_a_decision_in_another_spelling_is_stored_as_decision():
     assert _stored(conn)["type"] == "decision"
 
 
+_INTERNAL = ["supersede", "project_of", "domain_of", "Supersede", " domain_of ", "PROJECT_OF", "bogus"]
+
+
 @pytest.mark.asyncio
-@pytest.mark.parametrize("sent", [
-    "domain_of", "project_of", "supersede", "", "  ", "Domain_Of", " Supersede ", 5, ["fact"],
-])
-async def test_g8_other_types_are_stored_as_sent(sent):
+@pytest.mark.parametrize("sent", _INTERNAL)
+async def test_t1a_an_internal_or_unknown_type_is_refused_and_nothing_is_stored_or_enqueued(sent):
+    resp, _, conn = await _run({"type": sent})
+    assert resp.status == 400
+    assert json.loads(resp.text)["error"] == "unknown_type"
+    conn.fetchrow.assert_not_awaited()
+    assert not [x for x in conn.execute.call_args_list if "neo4j_outbox" in x.args[0]]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("sent", ["", "  ", "fact", "Fact", " FACT ", 5, ["fact"]])
+async def test_t1b_a_fact_is_accepted_and_a_client_type_is_stored_canonical(sent):
     resp, _, conn = await _run({"type": sent})
     assert resp.status == 200, resp.text
-    assert _stored(conn)["type"] == sent
+    expected = sent.strip().lower() if isinstance(sent, str) and sent.strip().lower() == "fact" else sent
+    assert _stored(conn)["type"] == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("sent", ["decision", "Decision"])
+async def test_t1b_a_well_formed_decision_is_accepted(sent):
+    meta = _decision(domains=["assembly"])
+    meta["type"] = sent
+    resp, _, _ = await _run(meta)
+    assert resp.status == 200
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("sent", ["retrospective", "Retrospective", " RETROSPECTIVE "])
+async def test_t1b_a_well_formed_retrospective_is_accepted(sent):
+    resp, _, _ = await _run({"type": sent})
+    assert resp.status == 200
+
+
+def test_t1d_the_outbox_whitelist_still_admits_the_internal_row_types():
+    for t in ("fact", "decision", "retrospective", "supersede", "project_of", "domain_of"):
+        _STATE["coordinator"]._require_outbox_type({"type": t})
 
 
 @pytest.mark.asyncio
@@ -314,6 +347,87 @@ async def test_a_stored_singular_beside_an_empty_plural_still_conflicts_with_a_s
 async def test_the_outbox_payload_carries_the_same_sections():
     _, _, conn = await _run({"domain": "assembly"})
     assert _outbox_domains(conn)["domains"] == ["assembly"]
+
+
+# ── T2: a retrospective that names a project faces the project check ─────────
+
+def _registry(c, registered=(), aliases=None):
+    aliases = dict(aliases or {})
+    c._project_registered = AsyncMock(side_effect=lambda n: n in registered)
+    c._resolve_project_alias = AsyncMock(side_effect=lambda n: aliases.get(n))
+    c._project_spellings = AsyncMock(return_value=(list(registered), aliases, None))
+    c._register_project = AsyncMock()
+    return c
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("spelling", ["retrospective", "Retrospective"])
+async def test_t2a_a_retrospective_naming_an_unregistered_project_is_refused(spelling):
+    c, conn = _coordinator()
+    _registry(c, registered=("orbit-relay",))
+    resp, _, _ = await _run({"type": spelling, "project": "unlisted_thing"}, c, conn)
+    assert resp.status == 400
+    assert json.loads(resp.text)["error"] == "project_unknown"
+    conn.fetchrow.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("spelling", ["retrospective", "Retrospective"])
+async def test_t2b_a_retrospective_naming_a_variant_or_alias_is_stored_under_the_registered_name(spelling):
+    for sent in ("Orbit_Relay", "old_orbit"):
+        c, conn = _coordinator()
+        _registry(c, registered=("orbit-relay",), aliases={"old_orbit": "orbit-relay"})
+        resp, _, _ = await _run({"type": spelling, "project": sent}, c, conn)
+        assert resp.status == 200, resp.text
+        assert _stored(conn)["project"] == "orbit-relay"
+
+
+@pytest.mark.asyncio
+async def test_t2_a_retrospective_that_names_no_project_is_still_accepted():
+    c, conn = _coordinator()
+    _registry(c, registered=("orbit-relay",))
+    body = {"content": "a verdict", "metadata": {"source": "claude-code", "type": "retrospective"}}
+    with patch.object(c, "_embed", new=AsyncMock(return_value=[0.1] * 1024)):
+        resp = await c.handle_save(_request(body))
+    assert resp.status == 200, resp.text
+
+
+@pytest.mark.asyncio
+async def test_t2d_the_dedicated_retrospective_endpoint_never_runs_the_project_check():
+    c, conn = _coordinator()
+    _registry(c, registered=())
+    c._project_ingress_error = AsyncMock(side_effect=AssertionError("project check called"))
+    conn.fetchrow = AsyncMock(side_effect=[
+        {"id": 240, "type": "decision", "project": "unlisted_thing"},
+        {"id": 911},
+    ])
+    with patch.object(c, "_embed", new=AsyncMock(return_value=[0.1] * 1024)):
+        resp = await c.handle_retrospective(_request(
+            {"pg_id": 240, "rating": "validated", "notes": "held up", "grounded_in": [700]}))
+    assert resp.status == 200, resp.text
+    c._project_ingress_error.assert_not_awaited()
+
+
+# ── T3: another project, a new project and its sections, near-matches ────────
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("spelling", ["fact", "decision"])
+async def test_t3a_a_save_can_create_a_new_project_and_its_section_from_another_project(spelling):
+    c, conn = _coordinator()
+    _registry(c, registered=("home-project",))
+    c._new_project_refusal = AsyncMock(return_value=None)
+    c._register_domain = AsyncMock()
+    c._project_identity = AsyncMock(return_value=77)
+    meta = {"project": "brand_new_thing", "new_project": True,
+            "domain": "telemetry", "new_domain": True, "cwd": "/work/home-project"}
+    if spelling == "decision":
+        meta.update(_decision(project="brand_new_thing"))
+        meta["decision"]["project"] = "brand_new_thing"
+    resp, _, _ = await _run(meta, c, conn)
+    assert resp.status == 200, resp.text
+    c._register_project.assert_awaited_once()
+    assert c._register_project.await_args.args[0] == "brand_new_thing"
+    c._register_domain.assert_awaited_once()
 
 
 # ── decisions: top level and blob together ───────────────────────────────────
