@@ -8,6 +8,7 @@ import json
 import importlib.util
 import os
 import sys
+import ast
 import inspect
 from unittest.mock import MagicMock, patch
 import pytest
@@ -72,20 +73,42 @@ def setup_mcp_modules():
 
 # ── C1, C2, C3: Test all three copies of _normalize_domains ────────────────────
 
-@pytest.mark.parametrize("module_key", ["memory_bridge_cli", "memory_bridge_skill"])
-def test_c1_domain_list_not_nested(setup_modules, module_key):
+@pytest.mark.parametrize("module_key", [
+    "memory_bridge_cli",
+    "memory_bridge_skill",
+    pytest.param("mcp", marks=pytest.mark.skipif(
+        not pytest.importorskip("fastmcp", minversion=None),
+        reason="fastmcp not available"
+    ))
+])
+def test_c1_domain_list_not_nested(setup_modules, setup_mcp_modules, module_key):
     """C1: Verify list-valued domain is not wrapped in another list in all copies."""
-    module = setup_modules[module_key]
+    if module_key == "mcp":
+        module = setup_mcp_modules["vector_skill"]
+    else:
+        module = setup_modules[module_key]
+
     metadata = {"domain": ["ops", "delivery"]}
     result = module._normalize_domains(metadata.copy())
     assert result.get("domains") == ["ops", "delivery"]
     assert "domain" not in result
 
 
-@pytest.mark.parametrize("module_key", ["memory_bridge_cli", "memory_bridge_skill"])
-def test_c2_normalize_domains_matches_reference_comprehensive(setup_modules, module_key):
+@pytest.mark.parametrize("module_key", [
+    "memory_bridge_cli",
+    "memory_bridge_skill",
+    pytest.param("mcp", marks=pytest.mark.skipif(
+        not pytest.importorskip("fastmcp", minversion=None),
+        reason="fastmcp not available"
+    ))
+])
+def test_c2_normalize_domains_matches_reference_comprehensive(setup_modules, setup_mcp_modules, module_key):
     """C2: Client and domain_axis._domains_from agree on all test table rows in all copies."""
-    module = setup_modules[module_key]
+    if module_key == "mcp":
+        module = setup_mcp_modules["vector_skill"]
+    else:
+        module = setup_modules[module_key]
+
     _domains_from = setup_modules["_domains_from"]
 
     # Positive cases (client should normalize)
@@ -108,24 +131,35 @@ def test_c2_normalize_domains_matches_reference_comprehensive(setup_modules, mod
         {},
     ]
 
-    # Test positive cases - verify client computes same list as domain_axis
+    # Test positive cases
     for metadata, expected in positive_cases:
         result = module._normalize_domains(metadata.copy())
         computed = result.get("domains")
         reference = _domains_from(metadata)
-        assert computed == expected, f"For {metadata}, got {computed}, expected {expected}"
-        assert computed == reference, f"Mismatch with _domains_from for {metadata}: got {computed}, reference {reference}"
+        assert computed == expected
+        assert computed == reference
 
-    # Test untouched cases - verify they return unchanged
+    # Test untouched cases
     for metadata in untouched_cases:
         result = module._normalize_domains(metadata.copy())
-        assert result == metadata, f"Expected {metadata} to be untouched, but got {result}"
+        assert result == metadata
 
 
-@pytest.mark.parametrize("module_key", ["memory_bridge_cli", "memory_bridge_skill"])
-def test_c3_invalid_shapes_returned_untouched(setup_modules, module_key):
+@pytest.mark.parametrize("module_key", [
+    "memory_bridge_cli",
+    "memory_bridge_skill",
+    pytest.param("mcp", marks=pytest.mark.skipif(
+        not pytest.importorskip("fastmcp", minversion=None),
+        reason="fastmcp not available"
+    ))
+])
+def test_c3_invalid_shapes_returned_untouched(setup_modules, setup_mcp_modules, module_key):
     """C3: Client returns invalid shapes untouched in all copies."""
-    module = setup_modules[module_key]
+    if module_key == "mcp":
+        module = setup_mcp_modules["vector_skill"]
+    else:
+        module = setup_modules[module_key]
+
     invalid_cases = [
         {"domain": 5},
         {"domain": [["a"]]},
@@ -140,42 +174,25 @@ def test_c3_invalid_shapes_returned_untouched(setup_modules, module_key):
     for metadata in invalid_cases:
         orig = metadata.copy()
         result = module._normalize_domains(metadata.copy())
-        assert result == orig, f"Expected {orig} to be untouched, but got {result}"
+        assert result == orig
 
 
-def test_normalize_domains_text_identical_across_all_files(setup_modules):
-    """Verify _normalize_domains source text is identical in all three files."""
-    cli_module = setup_modules["memory_bridge_cli"]
-    skill_module = setup_modules["memory_bridge_skill"]
+def test_normalize_domains_text_identical_across_all_files(setup_modules, setup_mcp_modules):
+    """Verify _normalize_domains source text is identical in all three files using ast."""
+    import ast
 
-    # Get source from the two loaded modules
-    cli_source = inspect.getsource(cli_module._normalize_domains)
-    skill_source = inspect.getsource(skill_module._normalize_domains)
+    # Extract from CLI module
+    cli_source = inspect.getsource(setup_modules["memory_bridge_cli"]._normalize_domains)
 
-    # Get source from the third file (CLI file)
-    cli_file_path = os.path.join(os.path.dirname(__file__), "..", "shared-memory", "scripts", "memory_bridge.py")
-    with open(cli_file_path, 'r') as f:
-        cli_file_content = f.read()
+    # Extract from skill module
+    skill_source = inspect.getsource(setup_modules["memory_bridge_skill"]._normalize_domains)
 
-    # Extract _normalize_domains function from file
-    import re
-    match = re.search(r'(def _normalize_domains\(.*?\n(?:    .*\n)*)', cli_file_content, re.MULTILINE)
-    assert match, "Could not find _normalize_domains in CLI file"
-    cli_file_source = match.group(1)
-
-    # Get source from MCP file
-    mcp_file_path = os.path.join(os.path.dirname(__file__), "..", "mcp", "vector-skill.py")
-    with open(mcp_file_path, 'r') as f:
-        mcp_file_content = f.read()
-
-    match = re.search(r'(def _normalize_domains\(.*?\n(?:    .*\n)*)', mcp_file_content, re.MULTILINE)
-    assert match, "Could not find _normalize_domains in MCP file"
-    mcp_file_source = match.group(1)
+    # Extract from MCP module
+    mcp_source = inspect.getsource(setup_mcp_modules["vector_skill"]._normalize_domains)
 
     # Compare all three
     assert cli_source == skill_source, "CLI and skill module _normalize_domains differ"
-    # Note: we can't do exact text match with files because of import differences,
-    # but we verify they do the same thing via the functional tests above
+    assert cli_source == mcp_source, "CLI and MCP module _normalize_domains differ"
 
 
 # ── C4: CLI entry point test ────────────────────────────────────────────────────
@@ -188,17 +205,15 @@ def test_c4_cli_main_domain_to_domains_no_flag(setup_modules):
     mock_resp.json = lambda: {"status": "success", "pg_id": 42}
 
     with patch("httpx.AsyncClient.post", return_value=mock_resp) as mock_post:
-        with patch("sys.argv", ["memory_bridge.py", "save", "test content", '{"source":"test","domain":"delivery"}']):
-            import asyncio
-            result = asyncio.run(module.save_artifact("test content", '{"source":"test","domain":"delivery"}'))
+        import asyncio
+        result = asyncio.run(module.save_artifact("test content", '{"source":"test","domain":"delivery"}'))
 
-            # Verify POST was called with normalized domains
-            assert mock_post.called
-            posted_data = mock_post.call_args.kwargs["json"]
-            metadata = posted_data.get("metadata", {})
-            assert "domains" in metadata
-            assert metadata["domains"] == ["delivery"]
-            assert "domain" not in metadata
+        assert mock_post.called
+        posted_data = mock_post.call_args.kwargs["json"]
+        metadata = posted_data.get("metadata", {})
+        assert "domains" in metadata
+        assert metadata["domains"] == ["delivery"]
+        assert "domain" not in metadata
 
 
 def test_c4_cli_main_domain_with_flag(setup_modules):
@@ -208,14 +223,11 @@ def test_c4_cli_main_domain_with_flag(setup_modules):
     mock_resp = MagicMock(status_code=200)
     mock_resp.json = lambda: {"status": "success", "pg_id": 42}
 
-    # When --domain flag is used, it adds to metadata.domains
     with patch("httpx.AsyncClient.post", return_value=mock_resp) as mock_post:
         import asyncio
         metadata_with_domain = {"source": "test", "domain": "delivery"}
-        # Simulate what CLI does: it normalizes and then adds flag values
         result = asyncio.run(module.save_artifact("test content", json.dumps(metadata_with_domain)))
 
-        # The flag handling is in main(), but save_artifact should normalize
         assert mock_post.called
         posted_data = mock_post.call_args.kwargs["json"]
         metadata = posted_data.get("metadata", {})
@@ -268,49 +280,69 @@ def test_c6_memory_bridge_copies_identical():
 # ── C7: No save example with "domain" in JSON, check all surfaces ───────────────
 
 def test_c7_no_domain_in_examples():
-    """C7: Save examples do not carry top-level "domain" in metadata JSON."""
+    """C7: Save examples do not carry "domain" in metadata JSON."""
     files_to_check = [
         os.path.join(os.path.dirname(__file__), "..", "shared-memory", "SKILL.md"),
         os.path.join(os.path.dirname(__file__), "..", "shared-memory", "USAGE.md"),
         os.path.join(os.path.dirname(__file__), "..", "shared-memory-skill", "shared-memory", "SKILL.md"),
         os.path.join(os.path.dirname(__file__), "..", "shared-memory-skill", "shared-memory", "USAGE.md"),
-        os.path.join(os.path.dirname(__file__), "..", "mcp", "vector-skill.py"),
         os.path.join(os.path.dirname(__file__), "..", "mcp", "system-prompt.md"),
     ]
 
-    # Sentences that are exempt from this check (where "domain" is mentioned as still accepted)
+    # Exact exempt sentences
     exempt_sentences = [
         'A `"domain"` key inside the metadata JSON is still accepted and is stored as `domains`.',
         'A bare string `"domain": "NAME"` is still accepted and normalized to `domains`.',
-        'A `"domain"` key inside the metadata JSON is still accepted and stored as `domains`.',
+        'A bare string `"domain": "NAME"` is still accepted and normalized to `domains`. A value that is not a string or list of strings returns 400 `domain_shape_invalid`.',
     ]
 
-    import re
+    # Check text documents
     for filepath in files_to_check:
         if not os.path.exists(filepath):
-            continue
+            pytest.fail(f"Required file missing: {filepath}")
 
         with open(filepath, 'r') as f:
-            content = f.read()
+            lines = f.readlines()
 
-        # Look for save examples with "domain" or \"domain\": in them
-        # Match both /"domain": and /\"domain\":/
-        pattern = r'(save[^`\n]*["\'].*?["\':]domain["\'].*?["\'])'
-        for match in re.finditer(pattern, content):
-            matched_text = match.group(1)
+        for i, line in enumerate(lines):
+            # Check if line contains a save example
+            if ('save "' in line or 'save_artifact(' in line) and ('"' in line or "'" in line):
+                # Check for exact "domain": or \"domain\":
+                if '"domain":' in line or '\\"domain\\":' in line:
+                    # Check if this line is an exempt sentence
+                    line_stripped = line.strip()
+                    is_exempt = any(line_stripped == exempt.strip() for exempt in exempt_sentences)
+                    if not is_exempt:
+                        pytest.fail(f"Found 'domain' in save example in {filepath} line {i+1}: {line.rstrip()}")
 
-            # Check if this line is in an exempt sentence
-            line_start = content.rfind('\n', 0, match.start()) + 1
-            line_end = content.find('\n', match.end())
-            if line_end == -1:
-                line_end = len(content)
-            context = content[line_start:line_end]
+    # Check MCP docstring
+    mcp_file = os.path.join(os.path.dirname(__file__), "..", "mcp", "vector-skill.py")
+    if not os.path.exists(mcp_file):
+        pytest.fail(f"Required file missing: {mcp_file}")
 
-            # Check if context contains an exempt sentence
-            is_exempt = any(exempt in content[max(0, match.start()-200):match.end()+200] for exempt in exempt_sentences)
+    with open(mcp_file, 'r') as f:
+        mcp_content = f.read()
 
-            if not is_exempt:
-                pytest.fail(f"Found save example with 'domain' in JSON in {filepath}: {matched_text[:100]}")
+    try:
+        tree = ast.parse(mcp_content)
+        save_artifact_func = None
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef) and node.name == "save_artifact":
+                save_artifact_func = node
+                break
+
+        if save_artifact_func:
+            docstring = ast.get_docstring(save_artifact_func)
+            if docstring:
+                for i, line in enumerate(docstring.split('\n')):
+                    if ('"domain":' in line or '\\"domain\\":' in line):
+                        # Check if it's the exempt sentence
+                        line_stripped = line.strip()
+                        is_exempt = any(line_stripped == exempt.strip() for exempt in exempt_sentences)
+                        if not is_exempt:
+                            pytest.fail(f"Found 'domain' in save_artifact docstring line {i+1}: {line}")
+    except SyntaxError:
+        pytest.fail("Could not parse mcp/vector-skill.py")
 
 
 # ── C8: domain_shape_invalid in refusal table ──────────────────────────────────
@@ -326,8 +358,7 @@ def test_c8_domain_shape_invalid_in_refusal_table():
         with open(filepath, 'r') as f:
             content = f.read()
 
-        # Look for a table row starting with `domain_shape_invalid`
+        # Look for a table row starting with | `domain_shape_invalid` |
         import re
-        # Match a line that starts with | `domain_shape_invalid` |
         match = re.search(r'^\|\s*`domain_shape_invalid`\s*\|', content, re.MULTILINE)
         assert match, f"'`domain_shape_invalid`' not found as a table row in {filepath}"
