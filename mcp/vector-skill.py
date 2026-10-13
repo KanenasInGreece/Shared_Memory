@@ -908,32 +908,19 @@ def _normalize_domains(metadata: dict) -> dict:
     domain_val = metadata.get("domain")
     domains_val = metadata.get("domains")
 
-    # Check if domain has a valid shape (if present)
-    if domain_val is not None:
-        if isinstance(domain_val, str):
-            pass  # valid
-        elif isinstance(domain_val, list) and all(isinstance(v, str) for v in domain_val):
-            pass  # valid
-        else:
-            return metadata  # invalid shape
-    else:
-        # Only normalize if domain is present
+    if domain_val is None:
         return metadata
 
-    # Check if domains has a valid shape (if present)
-    if domains_val is not None:
-        if isinstance(domains_val, str):
-            pass  # valid
-        elif isinstance(domains_val, list) and all(isinstance(v, str) for v in domains_val):
-            pass  # valid
-        else:
-            return metadata  # invalid shape
+    if not (isinstance(domain_val, str) or (isinstance(domain_val, list) and all(isinstance(v, str) for v in domain_val))):
+        return metadata
 
-    # Compute the list like domain_axis._domains_from
+    if domains_val is not None:
+        if not (isinstance(domains_val, str) or (isinstance(domains_val, list) and all(isinstance(v, str) for v in domains_val))):
+            return metadata
+
     out = []
     seen = set()
 
-    # Process domain values first
     domain_values = domain_val if isinstance(domain_val, list) else [domain_val]
     for value in domain_values:
         if isinstance(value, str):
@@ -942,7 +929,6 @@ def _normalize_domains(metadata: dict) -> dict:
                 seen.add(name)
                 out.append(name)
 
-    # Then process domains values
     if domains_val is not None:
         domains_values = domains_val if isinstance(domains_val, list) else [domains_val]
         for value in domains_values:
@@ -952,11 +938,9 @@ def _normalize_domains(metadata: dict) -> dict:
                     seen.add(name)
                     out.append(name)
 
-    # If the list is empty, return untouched
     if not out:
         return metadata
 
-    # Otherwise set domains and delete domain
     metadata["domains"] = out
     del metadata["domain"]
 
