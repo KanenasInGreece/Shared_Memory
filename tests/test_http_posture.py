@@ -31,11 +31,11 @@ Mutation table (measured in a scratchpad copy, never in this checkout,
 
 | mutation | must kill | must NOT kill |
 |---|---|---|
-| remove `trust_env=False` from `memory_bridge.py:369` (sync TCP) | `test_census_no_escape_hatch_and_literal_trust_env`, `test_cli_sync_client_tcp_trust_env_false`, `test_environment_proxy_variables_ignored_with_trust_env_false` | aiohttp/MCP/coordinator value tests; `test_census_total_constructor_count_is_29` |
+| remove `trust_env=False` from `memory_bridge.py:369` (sync TCP) | `test_census_no_escape_hatch_and_literal_trust_env`, `test_cli_sync_client_tcp_trust_env_false`, `test_environment_proxy_variables_ignored_with_trust_env_false` | aiohttp/MCP/coordinator value tests; `test_census_total_constructor_count_is_20` |
 | remove it from `memory_bridge.py:362` (async TCP) | `test_census_no_escape_hatch_and_literal_trust_env`, `test_cli_async_client_tcp_trust_env_false`, `test_cli_real_search_action_trust_env_false` | the environment leg; every other value test |
 | remove it from `hive_mind_proxy.py:1845`'s `ClientSession(...)` | `test_census_aiohttp_clientsession_trust_env`, `test_aiohttp_start_session_trust_env_false` | every httpx test |
 | add `proxy="http://127.0.0.1:1"` beside an existing `trust_env=False` | `test_census_no_escape_hatch_and_literal_trust_env` only | everything else |
-| add `httpx.get("http://127.0.0.1:1/")` as an unreachable statement inside `pool_has_free_slot` (after its final `return True`) | `test_census_no_bare_verb_calls` only | all value tests, `test_census_total_constructor_count_is_29` |
+| add `httpx.get("http://127.0.0.1:1/")` as an unreachable statement inside `pool_has_free_slot` (after its final `return True`) | `test_census_no_bare_verb_calls` only | all value tests, `test_census_total_constructor_count_is_20` |
 
 The census COUNT assertion and its PER-CALL keyword assertion are different
 guards — a keyword removal never changes how many constructor calls exist,
@@ -173,18 +173,18 @@ def _httpx_transport_calls():
     return calls
 
 
-def test_census_transport_constructors_trust_env_false_and_count_is_4():
-    """The four UNIX-socket transports of the CLI factories (two per
-    `memory_bridge.py` copy) each pass a literal trust_env=False and carry no
-    escape-hatch keyword. Count pinned at 4 (a VALUE, `fact:1309`) — a fifth
-    transport updates this number in the same PR.
+def test_census_transport_constructors_trust_env_false_and_count_is_5():
+    """The five UNIX-socket transports (two per `memory_bridge.py` copy, one
+    in `mcp/vector-skill.py`'s single client factory) each pass a literal
+    trust_env=False and carry no escape-hatch keyword. Count pinned at 5 (a
+    VALUE, `fact:1309`) — a sixth transport updates this number in the same PR.
 
     Mutation: remove `trust_env=False` from one `httpx.HTTPTransport(uds=uds, …)`
     call and only this test dies; add `verify=…` or `proxy=…` to one and only
     this test dies.
     """
     calls = _httpx_transport_calls()
-    assert len(calls) == 4, [(p, ln) for p, ln, _, _ in calls]
+    assert len(calls) == 5, [(p, ln) for p, ln, _, _ in calls]
     for path, lineno, attr, node in calls:
         kw = {k.arg: k.value for k in node.keywords}
         assert "trust_env" in kw, f"{path}:{lineno} {attr} has no trust_env"
@@ -194,13 +194,15 @@ def test_census_transport_constructors_trust_env_false_and_count_is_4():
             assert bad not in kw, f"{path}:{lineno} {attr} carries escape-hatch keyword {bad}"
 
 
-def test_census_total_constructor_count_is_29():
-    """The 29 sites `fact:2106`/`decision:2113` measured (12 in
+def test_census_total_constructor_count_is_20():
+    """The 20 sites left after `mcp/vector-skill.py` moved to one client
+    factory (`fact:2106`/`decision:2113` had measured 29: 12 in
     `coordinator.py`+daemons+CLI, 11 in `vector-skill.py`, 4 in the two
-    `memory_bridge.py` copies + the 2 tooling scripts — see the brief's
-    table) are the ONLY `httpx.Client`/`httpx.AsyncClient` constructions in
-    the walked trees. A LITERAL 29 (`fact:1309`): a 30th unmarked
-    constructor is a new httpx client the framework grew without this rule.
+    `memory_bridge.py` copies + the 2 tooling scripts; `vector-skill.py` now
+    holds 2, one per socket/TCP branch) are the ONLY
+    `httpx.Client`/`httpx.AsyncClient` constructions in the walked trees. A
+    LITERAL 20 (`fact:1309`): a 21st unmarked constructor is a new httpx
+    client the framework grew without this rule.
 
     Mutation: removing a `trust_env=False` keyword from an existing call
     never changes this count — that failure belongs to
@@ -210,8 +212,8 @@ def test_census_total_constructor_count_is_29():
     that failure belongs to `test_census_no_bare_verb_calls`.
     """
     calls = _httpx_constructor_calls()
-    assert len(calls) == 29, (
-        f"expected exactly 29 httpx.Client/AsyncClient constructor calls "
+    assert len(calls) == 20, (
+        f"expected exactly 20 httpx.Client/AsyncClient constructor calls "
         f"under {WALKED_ROOTS}, found {len(calls)}: "
         f"{[(os.path.relpath(p, REPO_ROOT), ln) for p, ln, _, _ in calls]}"
     )
@@ -226,7 +228,7 @@ def test_census_no_bare_verb_calls():
     Mutation: adding `httpx.get("http://127.0.0.1:1/")` as an unreachable
     statement inside `pool_has_free_slot` (after its own `return True`, never
     at module level — the daemons import this module) kills ONLY this test;
-    the constructor count in `test_census_total_constructor_count_is_29`
+    the constructor count in `test_census_total_constructor_count_is_20`
     is unaffected because a bare verb call is not a `Client`/`AsyncClient`
     construction.
     """
@@ -246,7 +248,7 @@ def test_census_no_escape_hatch_and_literal_trust_env():
     """Assertion 2: keyword PRESENCE alone does not enforce the ruling —
     `trust_env=False, proxy=os.environ.get(...)` would pass a
     keyword-presence-only check while still reading the environment through
-    `proxy=`. Every one of the 29 calls must carry `trust_env` as a LITERAL
+    `proxy=`. Every one of the 20 calls must carry `trust_env` as a LITERAL
     `ast.Constant(False)` (never a `Name`/`Call`/`Subscript`, which could
     vary at runtime) and must carry NONE of `proxy`, `proxies`, `mounts`,
     `verify`, `cert` as a keyword.

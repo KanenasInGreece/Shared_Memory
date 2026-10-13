@@ -52,6 +52,19 @@ Record lifecycle: `supersede`, `review_hold`.
 instructional language. A crafted document can contaminate `community_summaries` and persist as
 trusted context for all agents on this workstation.
 
+**Replies are the CLI's.** Each tool returns, as JSON text, the object the CLI prints for its twin:
+the gateway's reply for a success, and `{"status": "error", "message": ...}` for a refusal or a
+transport failure, with the gateway's `error` code and its other machine-readable fields beside it
+(for example the `proposals` of `domain_unknown`). The same input gives the same stored record and
+the same reply through either door; the doors differ in how they are loaded, not in what they do.
+
+**It connects the way the CLI does.** `COORDINATOR_UDS` names the gateway's Unix socket. Unset, the
+socket at `$XDG_RUNTIME_DIR/shared-memory-gw.sock` (or `/tmp/shared-memory-gw.sock`) is used when it
+exists, and TCP to `COORDINATOR_URL` otherwise; an empty value always means TCP. Over the socket the
+gateway reads the calling account from the socket peer, which is what lets it attest a decision's
+`decided_by` and stamp `principal` on a record, exactly as for a CLI save. The bearer token is sent
+either way. Set it in the host's `env` block or the client `.env`, like `COORDINATOR_URL`.
+
 The full client contract — every field, refusal and the reasoning behind each — is
 [`shared-memory/SKILL.md`](../shared-memory/SKILL.md); the MCP tools mirror it.
 

@@ -218,6 +218,10 @@ On a 401: check that this client's `AGENT_TOKEN` matches its entry in the gatewa
 
 The same token carries your ROLE (standing rule 3). A 403 on a save is a role refusal when the identity cannot write, not a broken token — an identity registered read-only cannot write, by design, and the distinction matters because a 401 is fixed by re-minting and a role 403 never is. A 403 `decision_not_visible` is not a role refusal: drop that decision id from `acknowledge_standing` (the caller cannot read it) and ask the operator.
 
+## What a tool returns
+
+Every tool answers with JSON text, the same object the CLI skill prints for the same call. A success is the gateway's reply (`status`, `pg_id`, `neo4j`, `message`, and the `*_resolved` fields). A search returns the list of record objects. A refusal or a transport failure is `{"status": "error", "message": ...}`; when the gateway sent a code it is in `error`, with its other fields beside it (for example the `proposals` of `domain_unknown`, or `decisions_needing_answer`). Branch on `error`, not on the wording of `message`. The notes about unranked or keyword-fallback results go to the server's stderr, not into the reply.
+
 ## Consolidation
 
 Every save fires a Postgres `pg_notify`. The daemon synthesises community summaries after a 15-min idle window. If `WARNING: Consolidation daemon not running` appears in a save response, restart the gateway — notifications are not re-delivered.

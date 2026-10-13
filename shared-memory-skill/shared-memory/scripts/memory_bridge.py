@@ -435,6 +435,20 @@ def _error_token(body: object) -> str | None:
     return token
 
 
+def _refusal_object(message: str, parsed: object) -> dict:
+    """The error object for a 4xx, carrying the gateway's own error code and every other machine-readable field it sent, because a caller branches on those and the sentence alone loses them."""
+    out: dict = {"status": "error"}
+    code = _error_token(parsed)
+    if code:
+        out["error"] = code
+    out["message"] = message
+    if isinstance(parsed, dict):
+        for key, value in parsed.items():
+            if key not in ("status", "message", "error"):
+                out[key] = value
+    return out
+
+
 def _reply_json(r, *, log_auth: bool = False,
                 accept_status: tuple = ()) -> dict:
     """Decode the body only after the HTTP status is known, and pass accept_status to keep a non-2xx body such as a 503 health verdict (fact:1503: a 403 read-only refusal was decoded before the status check and reported as the coordinator being unreachable)."""
@@ -465,10 +479,7 @@ def _reply_json(r, *, log_auth: bool = False,
         message = (f"{head} — the gateway ANSWERED and the credential was ACCEPTED, so "
                    f"this is an authorization refusal, not an authentication failure "
                    f"and not a transport fault.")
-        payload = {"status": "error", "message": message}
-        if code:
-            payload["error"] = code
-        raise GatewayReplyError(payload)
+        raise GatewayReplyError(_refusal_object(message, parsed))
 
     if r.status_code == 409:
         try:
@@ -486,10 +497,11 @@ def _reply_json(r, *, log_auth: bool = False,
         if isinstance(parsed, dict) and parsed.get("error") == "refs_invalid":
             return parsed
         detail = _gateway_message(r) or _body_snippet(r) or "(empty body)"
-        raise GatewayReplyError({"status": "error", "message": (
-            f"Gateway answered HTTP {r.status_code}: {detail} — it is UP at "
-            f"{COORDINATOR_BASE} and refused or failed this request."
-        )})
+        message = (f"Gateway answered HTTP {r.status_code}: {detail} — it is UP at "
+                   f"{COORDINATOR_BASE} and refused or failed this request.")
+        if r.status_code < 500:
+            raise GatewayReplyError(_refusal_object(message, parsed))
+        raise GatewayReplyError({"status": "error", "message": message})
 
     try:
         return r.json()
