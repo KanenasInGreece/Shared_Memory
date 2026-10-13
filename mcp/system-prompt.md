@@ -83,10 +83,10 @@ graph_query("MATCH (n:Fact) RETURN n.pg_id LIMIT 5")
 `full` or `admin` only. `read` receives 403.
 
 ```
-save_artifact("v0.9.110 shipped", "{\"source\":\"lm_studio\",\"project\":\"shared-memory-GitHub\",\"source_ref\":\"OPERATE.md\"}")
+save_artifact("v0.9.110 shipped", "{\"source\":\"lm_studio\",\"project\":\"shared-memory-GitHub\",\"source_ref\":\"OPERATE.md\",\"domains\":[\"delivery\"]}")
 ```
 
-Omit `domain` and the record stores no section. It does not inherit one. `project` is required.
+Omit `domains` and the record stores no section. It does not inherit one. `project` is required. A bare string `"domain": "NAME"` is still accepted and normalized to `domains`. A value that is not a string or list of strings returns 400 `domain_shape_invalid`.
 
 ```
 save_decision(title="Ship the skill index", decided_by="Xenofon", project="shared-memory-GitHub", rationale="In the context of a 70KB refusal, we chose a 15KB index over keeping the essay, accepting a second file.", source="lm_studio", grounded_in="2672:based_on", alternatives=["keep the 70KB file"], confidence="high")

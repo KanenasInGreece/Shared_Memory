@@ -892,6 +892,77 @@ async def hybrid_search_and_rerank(query: str = "", limit: int = 5, project: str
     return rendered
 
 
+def _normalize_domains(metadata: dict) -> dict:
+    """Fold 'domain' and 'domains' into 'domains' when both have valid shapes.
+
+    Acts only when domain (if present) is a string or list of strings, AND
+    domains (if present) is a string or list of strings. For any other shape
+    it returns the object untouched. The gateway refuses such values; the
+    client never repairs or drops what it does not understand.
+
+    Computes one list: singular values first, then plural; each stripped;
+    blanks and duplicates dropped, first occurrence kept.
+    If the list is empty, returns the object untouched.
+    Otherwise sets 'domains' to the list and deletes 'domain'.
+    """
+    domain_val = metadata.get("domain")
+    domains_val = metadata.get("domains")
+
+    # Check if domain has a valid shape (if present)
+    if domain_val is not None:
+        if isinstance(domain_val, str):
+            pass  # valid
+        elif isinstance(domain_val, list) and all(isinstance(v, str) for v in domain_val):
+            pass  # valid
+        else:
+            return metadata  # invalid shape
+    else:
+        # Only normalize if domain is present
+        return metadata
+
+    # Check if domains has a valid shape (if present)
+    if domains_val is not None:
+        if isinstance(domains_val, str):
+            pass  # valid
+        elif isinstance(domains_val, list) and all(isinstance(v, str) for v in domains_val):
+            pass  # valid
+        else:
+            return metadata  # invalid shape
+
+    # Compute the list like domain_axis._domains_from
+    out = []
+    seen = set()
+
+    # Process domain values first
+    domain_values = domain_val if isinstance(domain_val, list) else [domain_val]
+    for value in domain_values:
+        if isinstance(value, str):
+            name = value.strip()
+            if name and name not in seen:
+                seen.add(name)
+                out.append(name)
+
+    # Then process domains values
+    if domains_val is not None:
+        domains_values = domains_val if isinstance(domains_val, list) else [domains_val]
+        for value in domains_values:
+            if isinstance(value, str):
+                name = value.strip()
+                if name and name not in seen:
+                    seen.add(name)
+                    out.append(name)
+
+    # If the list is empty, return untouched
+    if not out:
+        return metadata
+
+    # Otherwise set domains and delete domain
+    metadata["domains"] = out
+    del metadata["domain"]
+
+    return metadata
+
+
 @mcp.tool()
 async def save_artifact(content: str, metadata_json: str = "{}") -> str:
     """Store an artifact in shared memory through the Hive-Mind Gateway.
@@ -918,14 +989,16 @@ async def save_artifact(content: str, metadata_json: str = "{}") -> str:
     that belongs to no project (it saves and searches normally but is never
     folded into a project's narrative).
 
-    metadata_json MAY carry "domain" — a registered SECTION of that project, as
-    a string or a list ("domains" is accepted for the list form). Sections are
-    project-local: the same name under two projects is two sections. The same
-    protocol as project applies — an unregistered value returns 400 with
-    "error": "domain_unknown" plus proposals (matched on a section's DESCRIPTION
-    as well as its name), and "new_domain": true registers it after the operator
-    confirms. Ask only when the project already HAS registered sections; a record
-    with no domain is filed under its project, which is always correct.
+    metadata_json MAY carry "domains": ["SECTION_NAME"] — registered SECTIONS of that
+    project as a list of strings. A bare string "domain": "NAME" is still accepted
+    and normalized to "domains". Sections are project-local: the same name under two
+    projects is two sections. The same protocol as project applies — an unregistered
+    value returns 400 with "error": "domain_unknown" plus proposals (matched on a
+    section's DESCRIPTION as well as its name), and "new_domain": true registers it
+    after the operator confirms. A value that is not a string or list of strings
+    returns 400 "domain_shape_invalid". Ask only when the project already HAS
+    registered sections; a record with no domain is filed under its project, which
+    is always correct.
 
     ⛔ A RETROSPECTIVE MUST NOT CARRY ONE (400
     "domain_not_allowed_on_judgement"). Facts and decisions assert their own
@@ -952,6 +1025,9 @@ async def save_artifact(content: str, metadata_json: str = "{}") -> str:
     if not isinstance(m_data, dict):
         _append_log("vector_skill", 2, "bad_metadata_type", {"got": type(m_data).__name__, "content_preview": content[:100]}, content)
         return f"Error: Metadata must be a JSON object, got {type(m_data).__name__}"
+
+    # Normalize domain and domains keys
+    m_data = _normalize_domains(m_data)
 
     if not m_data.get("source"):
         _append_log("vector_skill", 2, "missing_source", {"content_preview": content[:100]}, content)

@@ -705,6 +705,77 @@ async def _warn_on_skew(result: dict) -> dict:
     return result
 
 
+def _normalize_domains(metadata: dict) -> dict:
+    """Fold 'domain' and 'domains' into 'domains' when both have valid shapes.
+
+    Acts only when domain (if present) is a string or list of strings, AND
+    domains (if present) is a string or list of strings. For any other shape
+    it returns the object untouched. The gateway refuses such values; the
+    client never repairs or drops what it does not understand.
+
+    Computes one list: singular values first, then plural; each stripped;
+    blanks and duplicates dropped, first occurrence kept.
+    If the list is empty, returns the object untouched.
+    Otherwise sets 'domains' to the list and deletes 'domain'.
+    """
+    domain_val = metadata.get("domain")
+    domains_val = metadata.get("domains")
+
+    # Check if domain has a valid shape (if present)
+    if domain_val is not None:
+        if isinstance(domain_val, str):
+            pass  # valid
+        elif isinstance(domain_val, list) and all(isinstance(v, str) for v in domain_val):
+            pass  # valid
+        else:
+            return metadata  # invalid shape
+    else:
+        # Only normalize if domain is present
+        return metadata
+
+    # Check if domains has a valid shape (if present)
+    if domains_val is not None:
+        if isinstance(domains_val, str):
+            pass  # valid
+        elif isinstance(domains_val, list) and all(isinstance(v, str) for v in domains_val):
+            pass  # valid
+        else:
+            return metadata  # invalid shape
+
+    # Compute the list like domain_axis._domains_from
+    out = []
+    seen = set()
+
+    # Process domain values first
+    domain_values = domain_val if isinstance(domain_val, list) else [domain_val]
+    for value in domain_values:
+        if isinstance(value, str):
+            name = value.strip()
+            if name and name not in seen:
+                seen.add(name)
+                out.append(name)
+
+    # Then process domains values
+    if domains_val is not None:
+        domains_values = domains_val if isinstance(domains_val, list) else [domains_val]
+        for value in domains_values:
+            if isinstance(value, str):
+                name = value.strip()
+                if name and name not in seen:
+                    seen.add(name)
+                    out.append(name)
+
+    # If the list is empty, return untouched
+    if not out:
+        return metadata
+
+    # Otherwise set domains and delete domain
+    metadata["domains"] = out
+    del metadata["domain"]
+
+    return metadata
+
+
 async def save_artifact(content: str, metadata_json: str = "{}") -> dict:
     if isinstance(metadata_json, str):
         try:
@@ -718,6 +789,9 @@ async def save_artifact(content: str, metadata_json: str = "{}") -> dict:
     if not isinstance(metadata, dict):
         _append_log("memory_bridge", 2, "bad_metadata_type", {"got": type(metadata).__name__, "content_preview": content[:100]}, content)
         return {"status": "error", "message": f"Metadata must be a JSON object, got {type(metadata).__name__}"}
+
+    # Normalize domain and domains keys
+    metadata = _normalize_domains(metadata)
 
     # Fill project only when the caller left it empty. An untagged fact uses the consolidation
     # fallback, so it fragments away from its project's cluster and never reaches a summary.

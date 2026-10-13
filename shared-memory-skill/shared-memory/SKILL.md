@@ -104,10 +104,10 @@ Then rewrite the index line from `decision:2522` to the successor id.
 **B — Create.** Run from the project directory. The walk stops at `.git`, `CLAUDE.md`, `AGENTS.md`, or `GEMINI.md`, not `$HOME`. `SHARED_MEMORY_PROJECT=shared-memory-GitHub` overrides it.
 
 ```
-save "v0.9.109 shipped" '{"source":"grok","source_ref":"OPERATE.md","domain":"delivery"}'
+save "v0.9.109 shipped" '{"source":"grok","source_ref":"OPERATE.md"}' --domain delivery
 ```
 
-Omit `domain` and the record stores no section. It does not inherit one.
+Omit `--domain` and the record stores no section. It does not inherit one. A `"domain"` key inside the metadata JSON is still accepted and stored as `domains`.
 
 Operator confirmed a new project:
 
@@ -188,6 +188,7 @@ Refusals. Branch on `error`. One recovery; the second-submission essays are in `
 | `decision_not_visible` | The acknowledgement names a decision this caller cannot read. The viewer is the authenticated agent. Do not send that id. |
 | `domain_confusable` | Ask. If it is a different section, re-send `confirm_distinct_from` naming the near match. Otherwise use the existing name. |
 | `domain_not_allowed_on_judgement` | Do not send a domain. A retrospective does not store sections, and the decision's axes do not move onto it. |
+| `domain_shape_invalid` | A section is a string or a list of strings. Fix the value. |
 | `domain_spelling_variant` | It is that registered section. Save under that spelling. It cannot be confirmed as new. |
 | `domain_unknown` | Ask. Pick a proposal, or re-send `new_domain: true` after the operator confirms. Omitting the domain is valid. |
 | `domain_unnameable` | Name the section with at least one letter or digit. |
