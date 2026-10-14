@@ -6324,6 +6324,7 @@ class MemoryCoordinator:
             )
         # The internal outbox types (supersede, project_of, domain_of) are written by the gateway and operator scripts, never chosen by a client.
         raw_type = metadata.get("type") if isinstance(metadata, dict) else None
+        norm_type = raw_type.strip().lower() if isinstance(raw_type, str) else None
         if (isinstance(raw_type, str) and raw_type.strip()
                 and raw_type.strip().lower() not in REF_TYPES_DOCS):
             return web.json_response(
@@ -6340,6 +6341,37 @@ class MemoryCoordinator:
         if not isinstance(metadata, dict):
             return web.json_response(
                 {"status": "error", "message": "metadata must be a JSON object"}, status=400
+            )
+        # A retrospective saved here is a detached row: no target decision and no HAD_OUTCOME edge, and the project check can register an axis the verdict does not own.
+        if norm_type == "retrospective":
+            return web.json_response(
+                {
+                    "status": "error",
+                    "error": "use_retrospective_endpoint",
+                    "message": (
+                        "A retrospective cannot be saved via POST /memory/save; "
+                        "use POST /memory/retrospective (or the save_retrospective tool) "
+                        "against the target decision."
+                    ),
+                },
+                status=400,
+            )
+        # decision:1664: a fact and a decision are different records. A nested decision object on a fact is the second record hiding in the first, including an empty object.
+        if (norm_type != "decision"
+                and "decision" in metadata
+                and metadata["decision"] is not None):
+            return web.json_response(
+                {
+                    "status": "error",
+                    "error": "fact_cannot_carry_decision",
+                    "message": (
+                        "A fact cannot carry a 'decision' object in its metadata. "
+                        "Facts and decisions are distinct record types. To save a "
+                        "decision, set metadata.type = 'decision' and include required "
+                        "decision fields."
+                    ),
+                },
+                status=400,
             )
         if not metadata.get("source"):
             return web.json_response(
@@ -6416,7 +6448,7 @@ class MemoryCoordinator:
         # A decision's project is decision.project; copy it to the top-level key (blob wins over a cwd walk) before the registry gate (fact:1757).
         decision_project_rewrite = None
         _blob = metadata.get("decision")
-        if (metadata.get("type") in ("decision", "retrospective")
+        if (metadata.get("type") == "decision"
                 and isinstance(_blob, dict)):
             _asserted = _blob.get("project")
             if isinstance(_asserted, str) and _asserted.strip():

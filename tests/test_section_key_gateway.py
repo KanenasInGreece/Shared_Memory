@@ -194,7 +194,7 @@ async def test_g4_a_decision_blob_with_the_singular_key_keeps_the_blob_as_sent()
 async def test_g6_a_retrospective_in_another_spelling_with_a_section_is_refused(spelling):
     resp, _, conn = await _run({"type": spelling, "domain": "assembly"})
     assert resp.status == 400
-    assert json.loads(resp.text)["error"] == "domain_not_allowed_on_judgement"
+    assert json.loads(resp.text)["error"] == "use_retrospective_endpoint"
     conn.fetchrow.assert_not_awaited()
 
 
@@ -248,9 +248,11 @@ async def test_t1b_a_well_formed_decision_is_accepted(sent):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("sent", ["retrospective", "Retrospective", " RETROSPECTIVE "])
-async def test_t1b_a_well_formed_retrospective_is_accepted(sent):
-    resp, _, _ = await _run({"type": sent})
-    assert resp.status == 200
+async def test_t1b_a_well_formed_retrospective_is_rejected(sent):
+    resp, _, conn = await _run({"type": sent})
+    assert resp.status == 400
+    assert json.loads(resp.text)["error"] == "use_retrospective_endpoint"
+    conn.fetchrow.assert_not_awaited()
 
 
 def test_t1d_the_outbox_whitelist_still_admits_the_internal_row_types():
@@ -299,14 +301,15 @@ async def test_g9_a_wrong_shaped_section_in_a_decision_blob_is_refused(key, bad)
 async def test_g9_a_fact_whose_decision_blob_alone_carries_a_wrong_shaped_section_is_refused(key, bad):
     resp, _, conn = await _run({"decision": {key: bad}})
     assert resp.status == 400
-    assert json.loads(resp.text)["error"] == "domain_shape_invalid"
+    assert json.loads(resp.text)["error"] == "fact_cannot_carry_decision"
     conn.fetchrow.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_g9_the_shape_refusal_wins_over_the_judgement_refusal():
+async def test_g9_the_save_route_refuses_a_retrospective_before_the_section_shape():
     resp, _, _ = await _run({"type": "retrospective", "domain": {"a": 1}})
-    assert json.loads(resp.text)["error"] == "domain_shape_invalid"
+    assert resp.status == 400
+    assert json.loads(resp.text)["error"] == "use_retrospective_endpoint"
 
 
 @pytest.mark.asyncio
@@ -349,7 +352,9 @@ async def test_the_outbox_payload_carries_the_same_sections():
     assert _outbox_domains(conn)["domains"] == ["assembly"]
 
 
-# ── T2: a retrospective that names a project faces the project check ─────────
+# ── T2: a decision that names a project faces the project check ──────────────
+# Retrospectives no longer reach this check on handle_save. The same project
+# outcomes are pinned on a decision, which still owns its project.
 
 def _registry(c, registered=(), aliases=None):
     aliases = dict(aliases or {})
@@ -360,33 +365,47 @@ def _registry(c, registered=(), aliases=None):
     return c
 
 
+def _decision_on(project, spelling="decision"):
+    return {
+        "type": spelling,
+        "project": project,
+        "decision": {
+            "decided_by": "Operator",
+            "project": project,
+            "rationale": "a reason",
+        },
+    }
+
+
 @pytest.mark.asyncio
-@pytest.mark.parametrize("spelling", ["retrospective", "Retrospective"])
-async def test_t2a_a_retrospective_naming_an_unregistered_project_is_refused(spelling):
+@pytest.mark.parametrize("spelling", ["decision", "Decision"])
+async def test_t2a_a_decision_naming_an_unregistered_project_is_refused(spelling):
     c, conn = _coordinator()
     _registry(c, registered=("orbit-relay",))
-    resp, _, _ = await _run({"type": spelling, "project": "unlisted_thing"}, c, conn)
+    resp, _, _ = await _run(_decision_on("unlisted_thing", spelling), c, conn)
     assert resp.status == 400
     assert json.loads(resp.text)["error"] == "project_unknown"
     conn.fetchrow.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("spelling", ["retrospective", "Retrospective"])
-async def test_t2b_a_retrospective_naming_a_variant_or_alias_is_stored_under_the_registered_name(spelling):
+@pytest.mark.parametrize("spelling", ["decision", "Decision"])
+async def test_t2b_a_decision_naming_a_variant_or_alias_is_stored_under_the_registered_name(spelling):
     for sent in ("Orbit_Relay", "old_orbit"):
         c, conn = _coordinator()
         _registry(c, registered=("orbit-relay",), aliases={"old_orbit": "orbit-relay"})
-        resp, _, _ = await _run({"type": spelling, "project": sent}, c, conn)
+        resp, _, _ = await _run(_decision_on(sent, spelling), c, conn)
         assert resp.status == 200, resp.text
         assert _stored(conn)["project"] == "orbit-relay"
 
 
 @pytest.mark.asyncio
-async def test_t2_a_retrospective_that_names_no_project_is_still_accepted():
+async def test_t2_a_decision_naming_a_registered_project_is_accepted():
     c, conn = _coordinator()
     _registry(c, registered=("orbit-relay",))
-    body = {"content": "a verdict", "metadata": {"source": "claude-code", "type": "retrospective"}}
+    body = {"content": "a verdict", "metadata": {
+        "source": "claude-code", **_decision_on("orbit-relay"),
+    }}
     with patch.object(c, "_embed", new=AsyncMock(return_value=[0.1] * 1024)):
         resp = await c.handle_save(_request(body))
     assert resp.status == 200, resp.text
@@ -396,43 +415,51 @@ _MALFORMED_PROJECTS = [12345, ["unlisted_thing"], "   ", "", {"a": 1}, True]
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("spelling", ["retrospective", "Retrospective"])
+@pytest.mark.parametrize("spelling", ["decision", "Decision"])
 @pytest.mark.parametrize("bad", _MALFORMED_PROJECTS)
-async def test_t2e_a_retrospective_with_a_malformed_or_blank_project_is_refused(spelling, bad):
+async def test_t2e_a_decision_with_a_malformed_or_blank_project_is_refused(spelling, bad):
     c, conn = _coordinator()
     _registry(c, registered=("orbit-relay",))
-    body = {"content": "a verdict", "metadata": {"source": "claude-code", "type": spelling, "project": bad}}
+    body = {"content": "a verdict", "metadata": {
+        "source": "claude-code",
+        "type": spelling,
+        "project": bad,
+        "decision": {"decided_by": "Operator", "project": bad, "rationale": "a reason"},
+    }}
     with patch.object(c, "_embed", new=AsyncMock(return_value=[0.1] * 1024)):
         resp = await c.handle_save(_request(body))
     assert resp.status == 400
-    assert json.loads(resp.text)["error"] == "project_required"
+    assert "decision save missing" in json.loads(resp.text)["message"]
     conn.fetchrow.assert_not_awaited()
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("bad", _MALFORMED_PROJECTS)
-async def test_t2e_a_retrospective_with_a_malformed_project_in_its_decision_blob_is_refused(bad):
+async def test_t2e_a_decision_with_a_malformed_project_in_its_decision_blob_is_refused(bad):
     c, conn = _coordinator()
     _registry(c, registered=("orbit-relay",))
     body = {"content": "a verdict", "metadata": {
-        "source": "claude-code", "type": "retrospective", "decision": {"project": bad}}}
+        "source": "claude-code", "type": "decision", "project": "orbit-relay",
+        "decision": {"decided_by": "Operator", "project": bad, "rationale": "a reason"}}}
     with patch.object(c, "_embed", new=AsyncMock(return_value=[0.1] * 1024)):
         resp = await c.handle_save(_request(body))
     assert resp.status == 400
-    assert json.loads(resp.text)["error"] == "project_required"
+    assert "decision save missing" in json.loads(resp.text)["message"]
     conn.fetchrow.assert_not_awaited()
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("meta", [{"project": None}, {"decision": {"project": None}},
                                   {"project": None, "decision": {"note": "x"}}])
-async def test_t2e_a_retrospective_whose_project_is_null_or_absent_is_still_accepted(meta):
+async def test_t2e_a_decision_whose_project_is_null_or_absent_is_refused(meta):
     c, conn = _coordinator()
     _registry(c, registered=("orbit-relay",))
-    body = {"content": "a verdict", "metadata": {"source": "claude-code", "type": "retrospective", **meta}}
+    body = {"content": "a verdict", "metadata": {"source": "claude-code", "type": "decision", **meta}}
     with patch.object(c, "_embed", new=AsyncMock(return_value=[0.1] * 1024)):
         resp = await c.handle_save(_request(body))
-    assert resp.status == 200, resp.text
+    assert resp.status == 400
+    assert "decision save missing" in json.loads(resp.text)["message"]
+    conn.fetchrow.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -494,11 +521,18 @@ def _real_refusal_coordinator(registered=("orbit-relay", "alpha-service"), near=
 
 
 def _typed(spelling, **meta):
-    return {"type": spelling, **meta} if spelling != "fact" else dict(meta)
+    body = dict(meta) if spelling == "fact" else {"type": spelling, **meta}
+    if spelling == "decision":
+        body["decision"] = {
+            "decided_by": "Operator",
+            "project": meta["project"],
+            "rationale": "a reason",
+        }
+    return body
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("spelling", ["fact", "retrospective"])
+@pytest.mark.parametrize("spelling", ["fact", "decision"])
 async def test_t3b_a_key_identical_spelling_declared_new_is_refused_naming_the_registered_one(spelling):
     c, conn = _real_refusal_coordinator()
     resp, _, _ = await _run(_typed(spelling, project="Orbit_Relay", new_project=True), c, conn)
@@ -511,7 +545,7 @@ async def test_t3b_a_key_identical_spelling_declared_new_is_refused_naming_the_r
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("spelling", ["fact", "retrospective"])
+@pytest.mark.parametrize("spelling", ["fact", "decision"])
 async def test_t3c_a_confusable_name_declared_new_is_challenged(spelling):
     c, conn = _real_refusal_coordinator(near=("alpha-service",))
     resp, _, _ = await _run(_typed(spelling, project="alpha-servize", new_project=True), c, conn)
@@ -524,7 +558,7 @@ async def test_t3c_a_confusable_name_declared_new_is_challenged(spelling):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("spelling", ["fact", "retrospective"])
+@pytest.mark.parametrize("spelling", ["fact", "decision"])
 async def test_t3c_naming_the_neighbour_lets_a_confusable_name_register(spelling):
     c, conn = _real_refusal_coordinator(near=("alpha-service",))
     resp, _, _ = await _run(

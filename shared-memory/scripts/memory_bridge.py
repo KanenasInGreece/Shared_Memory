@@ -844,8 +844,8 @@ async def save_artifact(content: str, metadata_json: str = "{}") -> dict:
         _append_log("memory_bridge", 3, "save_success",
                     {"pg_id": pg_id, "source": metadata.get("source"), "entity_count": len(entities)},
                     content)
-        # no_entities is a coverage log only: entities never gate consolidation, and a judgement mints none (decision:1664: only a fact carries entities; a decision or retrospective takes its topics from grounded_in).
-        if metadata.get("type") in ("decision", "retrospective"):
+        # no_entities is a coverage log only: entities never gate consolidation, and a judgement mints none (decision:1664: only a fact carries entities; a decision takes its topics from grounded_in). A retrospective is not saved on this route.
+        if metadata.get("type") == "decision":
             if not metadata.get("grounded_in"):
                 _append_log("memory_bridge", 1, "no_grounding",
                             {"pg_id": pg_id, "source": metadata.get("source"),
