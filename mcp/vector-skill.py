@@ -1067,9 +1067,9 @@ async def save_artifact(content: str, metadata_json: str = "{}") -> str:
     # Normalize domain and domains keys
     m_data = _normalize_domains(m_data)
 
-    # Project is required on a fact here as on the CLI door, and there is no
-    # cwd to derive it from, because the host launches this server anywhere.
-    if m_data.get("type") not in ("decision", "retrospective") and not m_data.get("project"):
+    # Project is required on this door except for a decision, whose project is the blob. There is no
+    # cwd to derive it from, because the host launches this server anywhere. A retrospective is not a save.
+    if m_data.get("type") != "decision" and not m_data.get("project"):
         _append_log("vector_skill", 2, "missing_project", {"content_preview": content[:100]}, content)
         return _as_json(_error_obj(
             "metadata.project is required — the canonical value is the "

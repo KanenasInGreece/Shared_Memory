@@ -97,6 +97,10 @@ save "same words" '{"source":"grok"}' --domain other
 
 Same content, other axes: `axis_conflict`. Supersede instead. `registry_unavailable` (503): nothing was written. Retry.
 
+`use_retrospective_endpoint`: `POST /memory/save` was given type `retrospective`. Nothing was written. Send `save_retrospective` against that decision's pg id (`POST /memory/retrospective`). Do not retry the save.
+
+`fact_cannot_carry_decision`: a fact carried a `decision` object, including an empty one. Drop the object and save the fact, or set `metadata.type` to `decision` and include `decided_by`, `project`, and `rationale`.
+
 ## Search
 
 ```

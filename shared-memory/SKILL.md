@@ -201,6 +201,7 @@ Refusals. Branch on `error`. One recovery; the second-submission essays are in `
 | `entity_reserved` | Schema or axis vocabulary is not an entity. Also a registered project name, including this record's own project. Name the concept, or drop it. |
 | `entity_unknown` | Ask. Re-send `new_entities` listing exactly those names, each also in `entities`, or use the registered canonical. |
 | `fact_already_superseded` | The fact is already superseded. Re-read lineage. Nothing was written. |
+| `fact_cannot_carry_decision` | A fact cannot carry a `decision` object. Drop it, or set `metadata.type` to `decision` and include `decided_by`, `project`, and `rationale`. |
 | `filters_invalid` | The search `--domain` list is over the 16-entry cap. Narrow it. |
 | `graph_row_cap_exceeded` | Read-only Cypher returned more than `GRAPH_QUERY_ROW_CAP` rows (default 10000). Narrow the query. |
 | `new_entities_invalid` | A list of strings. Each name must also be in `entities`. A name that normalizes to nothing cannot be minted. |
@@ -211,6 +212,7 @@ Refusals. Branch on `error`. One recovery; the second-submission essays are in `
 | `refs_invalid` | `--ref` takes at most 16 refs by default (`type:id`). Fix the list. |
 | `unavailable` | A telemetry probe (`encoders` or `gateway`) failed. Read the sibling block. The rest of the snapshot may still be valid. |
 | `unknown_type` | On `save`, omit `type` or send `fact`. A decision uses its own command. Do not invent a type. |
+| `use_retrospective_endpoint` | A retrospective is not a save. Use `save_retrospective` (`POST /memory/retrospective`) against the target decision. Nothing was written. |
 
 Graph expansion on a judgement hit returns `belonging`: `{project, domains}`. The key is derived on read, never written. A fact has no such key; its belonging is the axes it stored. The domain set is the same-project union of sections asserted on the decision and sections reached through grounding. Another project's facts do not contribute sections.
 
