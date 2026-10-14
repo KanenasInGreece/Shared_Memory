@@ -7,7 +7,16 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
-## [1.0.15] - 2026-10-13
+## [1.0.16] - 2026-10-14
+
+Ingress hardening: general save rejects retrospectives and facts carrying decision objects. `API_VERSION` stays 4.
+
+### Fixed
+- Calling `POST /memory/save` with `metadata.type == "retrospective"` previously allowed storing a detached retrospective row without a target decision or `HAD_OUTCOME` graph edge, and permitted registering a new project axis. The save route now strictly rejects any retrospective with HTTP 400 `use_retrospective_endpoint`, directing the caller to `POST /memory/retrospective` (or `save_retrospective`).
+- Facts and decisions are distinct record types. A fact (`metadata.type != "decision"`) carrying a `decision` object in metadata previously stored ambiguous or conflicting project axes. The save route now rejects any non-decision record carrying a non-null `decision` object (both populated dictionaries and `{}`) with HTTP 400 `fact_cannot_carry_decision`.
+
+### Changed
+- Refusal codes `use_retrospective_endpoint` and `fact_cannot_carry_decision` added to client skill documentation and usage indexes.
 
 A fact's sections are stored in one place and found by the section filter; a save can no longer go around the project check through its record type; the MCP server gives the same outcome as the CLI skill. `API_VERSION` stays 4. Migration 044 runs on update. Update the gateway and the skills together.
 
