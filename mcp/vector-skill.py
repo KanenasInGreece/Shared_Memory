@@ -212,7 +212,7 @@ AGENT_ID = os.environ.get("AGENT_ID", "vector_skill")
 # v4 a fact save without a registered metadata.project is rejected 400 carrying
 # project_required or project_unknown plus near-match proposals.
 API_VERSION = 4
-VERSION = "1.0.16"
+VERSION = "1.0.17"
 CLIENT_VERSION_HEADER = "X-SM-Api-Version"
 # Framework build, separate from api_version, so two clients on the same wire contract can still be counted apart in clients.versions_seen.
 CLIENT_BUILD_HEADER = "X-Shared-Memory-Client"
@@ -1533,6 +1533,8 @@ async def check_memory_health() -> str:
     Read `status` (ok | degraded | down) and `dependencies` first: one enum per
     dependency — postgres, neo4j, embedder, reranker, llm_pool, rem_daemon,
     nrem_daemon, outbox, registry — each with a `reason` when it is not ok.
+    A consolidation stall alone shows in `dependencies.nrem_daemon` only and
+    does not by itself degrade the top `status`.
     `warnings` lists every limit that has been crossed, as
     {key, limit, observed, unit}; the NUMBER behind each one is on
     memory_telemetry.

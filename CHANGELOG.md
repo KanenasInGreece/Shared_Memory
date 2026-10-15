@@ -7,6 +7,17 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.0.17] - 2026-10-15
+
+A stalled insight or thematic-summary cycle no longer turns the top `/health` status to `degraded`. `API_VERSION` stays 4. Restart the gateway; update the skills for the version.
+
+### Changed
+- The top-level `status` on `GET /health` now answers whether facts, decisions and retrospectives can be saved and found. When the only thing wrong is a consolidation stall — `dependencies.nrem_daemon` degraded with reason exactly `stalled:insight`, `stalled:fact_consolidation` or both — `status` stays `ok` and the stall shows on `nrem_daemon` only, with its reason unchanged. A stall with the dream-slot reason appended, a stopped NREM daemon, any other degraded or down dependency and any warning still degrade `status` as before. The HTTP code and the anonymous `{status, version, api_version}` body are unchanged. On the reference install a failing insight fold had turned `status` degraded ten times in ten days while saves and search worked.
+- Telemetry contract: a `MEANING_CHANGES` entry for `health.status` (1.0.17). A monitor or script that alerted on a consolidation stall through `status` must read `dependencies.nrem_daemon.reason` instead.
+
+### Fixed
+- `CHANGELOG.md`: the `[1.0.15]` heading, lost when the 1.0.16 entry was added, is restored.
+
 ## [1.0.16] - 2026-10-14
 
 Ingress hardening: general save rejects retrospectives and facts carrying decision objects. `API_VERSION` stays 4.
@@ -17,6 +28,8 @@ Ingress hardening: general save rejects retrospectives and facts carrying decisi
 
 ### Changed
 - Refusal codes `use_retrospective_endpoint` and `fact_cannot_carry_decision` added to client skill documentation and usage indexes.
+
+## [1.0.15] - 2026-10-13
 
 A fact's sections are stored in one place and found by the section filter; a save can no longer go around the project check through its record type; the MCP server gives the same outcome as the CLI skill. `API_VERSION` stays 4. Migration 044 runs on update. Update the gateway and the skills together.
 

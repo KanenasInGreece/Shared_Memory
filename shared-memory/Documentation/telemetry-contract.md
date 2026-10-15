@@ -3,7 +3,7 @@
 
 # The Telemetry Contract
 
-Contract version **1.0.16**. Every key the gateway emits on `GET /health` and `GET /memory/telemetry`, what it means, what it is measured in, when it arrived, and where it is going.
+Contract version **1.0.17**. Every key the gateway emits on `GET /health` and `GET /memory/telemetry`, what it means, what it is measured in, when it arrived, and where it is going.
 
 ## The roles
 
@@ -53,6 +53,7 @@ A key whose **value** changed meaning while its **name** stayed. Enumerated beca
 | telemetry | `gateway.requests_total` | 0.9.88 | counted only AUTHENTICATED, handler-reached requests — the gateway's own 401/403/503 responses (load-shed, role denial, backup-quiesce) and all auth-off traffic never reached the single `_record_gateway_request` call site | counts every request entering the gateway, at every exit the middleware can take — exactly one `_record_gateway_request` per request | expect this counter to STEP UP on deploy — health polls and previously-invisible gateway-issued 401/403/503 now count. Magnitude is unmeasured; observe post-deploy rather than predicting |
 | telemetry | `gateway.by_status.*` | 0.9.88 | only the authenticated, handler-reached path's own status was ever counted — a gateway-issued 401/403/503 (load-shed, role denial, backup-quiesce) was invisible here | every exit the middleware can take is counted, so `by_status.401` now includes protected-path bearer failures, `by_status.403` includes role denials, and `by_status.503` now includes load-shed and backup-quiesce alongside pool-saturated — `shed_503_total` is therefore only `<= by_status.503` from now on, no longer equal-by-construction on the shed class alone | a consumer that treated `shed_503_total == by_status.503` as an invariant must drop that assumption; a 401 from a protected path now shows up here AND in the D1 rate window AND in `credentials.token_verify_failed` — same event, three surfaces. The v0.9.87 stale-token-monitor `/health` case is unaffected here: it serves 200, so it moves only the D1 window and `requests_total`/`by_status.2xx`, never `by_status.401` |
 | health | `llm / llm_backends.*` | 0.9.97 | the reasoning-LLM probe ran inline on the /health request path, so a backend read ok, timeout, down or http_<code> the moment /health answered | the probe runs in a background daemon (S7); before its first cycle lands a backend reads `unknown`, and the top-level `llm` reads `unknown` rather than `down` (the unknown-never-elevates contract) | a consumer reading `llm`/`llm_backends.*` must accept `unknown` as 'not yet probed', never a failure; it clears within one probe cycle (~3 s) of gateway start |
+| health | `status` | 1.0.17 | degraded whenever dependencies.nrem_daemon was degraded, including a consolidation stall alone | a consolidation stall alone (nrem_daemon degraded with reason exactly stalled:insight, stalled:fact_consolidation or both) no longer degrades it; the stall shows on nrem_daemon only | alert on a consolidation stall from dependencies.nrem_daemon.reason, not from status |
 
 ## Removed outright in 0.9.74
 
@@ -215,7 +216,7 @@ Paths are relative to the response object.
 | `auth_scheme` | str | — | <=0.9.73 | — | — | — | — |
 | `backup_in_progress` | bool | — | <=0.9.73 | — | — | — | — |
 | `role` | str | — | <=0.9.73 | — | — | — | read \| write \| admin. `admin` since 0.9.74 — an admin token is confined to /admin/* and cannot save either, so reporting it as `write` overstated it. |
-| `status` | str | — | <=0.9.73 | — | — | — | ok \| degraded \| down. down if any dependency is down; degraded if any dependency is degraded OR warnings is non-empty; else ok. ⛔ THE HTTP CODE IS A DIFFERENT QUESTION: 503 iff embedder or reranker is down (the save mandate) — every other verdict is served 200 with the enum. |
+| `status` | str | — | <=0.9.73 | — | — | — | ok \| degraded \| down. down if any dependency is down; degraded if any dependency is degraded OR warnings is non-empty, except `nrem_daemon` whose reason is exactly a consolidation stall (`stalled:insight`, `stalled:fact_consolidation` or both), which shows only on that dependency; else ok. ⛔ THE HTTP CODE IS A DIFFERENT QUESTION: 503 iff embedder or reranker is down (the save mandate) — every other verdict is served 200 with the enum. |
 
 ### dependencies
 

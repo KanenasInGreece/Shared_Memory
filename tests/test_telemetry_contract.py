@@ -1003,13 +1003,20 @@ def test_the_meaning_change_list_covers_every_re_pointed_key():
     assert ("health", "dependencies.rem_daemon.state") in paths
     assert ("health", "dependencies.nrem_daemon.state") in paths
 
+    # One key can change meaning more than once (`status` at 0.9.74 and 1.0.17), so collect every stamp per key.
+    stamps_by_path: dict = {}
+    for m in tc.MEANING_CHANGES:
+        stamps_by_path.setdefault((m["endpoint"], m["path"]), []).append(m["in_version"])
     by_path = {(m["endpoint"], m["path"]): m for m in tc.MEANING_CHANGES}
     # The four 0.9.74 entries (:910-913 above) remain MANDATORY at their own
     # frozen stamp — they never get bumped just because VERSION moved on.
     for key in (("telemetry", "breakdown.domains"), ("health", "role"),
                 ("health", "llm_backends.*"), ("health", "status")):
-        assert by_path[key]["in_version"] == tc.INTRODUCED_0_9_74, (
+        assert tc.INTRODUCED_0_9_74 in stamps_by_path[key], (
             f"{key} must stay pinned at INTRODUCED_0_9_74, never re-dated")
+    # fact:2996 ruling 3: a lone consolidation stall stopped degrading `status` in 1.0.17.
+    assert stamps_by_path[("health", "status")] == [tc.INTRODUCED_0_9_74, tc.INTRODUCED_1_0_17]
+    assert tc.INTRODUCED_1_0_17 == "1.0.17"
     # W2's three new entries are FROZEN at INTRODUCED_0_9_79 (handback H1),
     # NOT at the bare `tc.VERSION` constant — VERSION is the fifth version
     # pin and moves every release, so pinning a historical entry to it
