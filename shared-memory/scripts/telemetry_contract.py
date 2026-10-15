@@ -83,7 +83,7 @@ __all__ = [
 ]
 
 #: Not a free-running today: this is the fifth version pin, so a missed bump is visible (decision:1832).
-VERSION = "1.0.16"
+VERSION = "1.0.17"
 
 
 def _version_tuple(v: str) -> tuple:
@@ -166,6 +166,8 @@ INTRODUCED_0_9_114 = "0.9.114"
 INTRODUCED_1_0_2 = "1.0.2"
 #: compliance.label_distribution and top_paths, the monitor's graph-shape view (decision:2768).
 INTRODUCED_1_0_7 = "1.0.7"
+#: A lone consolidation stall stopped degrading the top /health status (fact:2996 ruling 3).
+INTRODUCED_1_0_17 = "1.0.17"
 #: Frozen release at which the v0.9.74 /health copies stop being served. A later drop gets its own stamp.
 DUAL_EMIT_DROP_TARGET = "0.9.90"
 #: Telemetry copies stay one release longer because the monitor still reads the old homes (fact:1989).
@@ -1589,6 +1591,19 @@ MEANING_CHANGES: tuple[dict, ...] = (
         "action": ("a consumer reading `llm`/`llm_backends.*` must accept "
                    "`unknown` as 'not yet probed', never a failure; it "
                    "clears within one probe cycle (~3 s) of gateway start"),
+        "shape_changed": False,
+    },
+    {
+        "endpoint": "health",
+        "path": "status",
+        "in_version": INTRODUCED_1_0_17,
+        "was": ("degraded whenever dependencies.nrem_daemon was degraded, "
+                "including a consolidation stall alone"),
+        "now": ("a consolidation stall alone (nrem_daemon degraded with reason "
+                "exactly stalled:insight, stalled:fact_consolidation or both) "
+                "no longer degrades it; the stall shows on nrem_daemon only"),
+        "action": ("alert on a consolidation stall from "
+                   "dependencies.nrem_daemon.reason, not from status"),
         "shape_changed": False,
     },
 )
