@@ -187,9 +187,12 @@ HEALTH: dict[str, dict] = {
     # ── liveness ────────────────────────────────────────────────────────────
     "status": _k("str", "liveness", note=(
         "ok | degraded | down. down if any dependency is down; degraded if any "
-        "dependency is degraded OR warnings is non-empty; else ok. ⛔ THE HTTP "
-        "CODE IS A DIFFERENT QUESTION: 503 iff embedder or reranker is down "
-        "(the save mandate) — every other verdict is served 200 with the enum.")),
+        "dependency is degraded OR warnings is non-empty, except `nrem_daemon` "
+        "whose reason is exactly a consolidation stall (`stalled:insight`, "
+        "`stalled:fact_consolidation` or both), which shows only on that "
+        "dependency; else ok. ⛔ THE HTTP CODE IS A DIFFERENT QUESTION: 503 iff "
+        "embedder or reranker is down (the save mandate) — every other verdict "
+        "is served 200 with the enum.")),
     "version": _k("str", "versions"),
     "api_version": _k("int", "versions"),
     "agent": _k("str", "liveness", note="authenticated callers only"),

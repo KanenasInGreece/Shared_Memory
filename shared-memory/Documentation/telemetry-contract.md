@@ -215,7 +215,7 @@ Paths are relative to the response object.
 | `auth_scheme` | str | — | <=0.9.73 | — | — | — | — |
 | `backup_in_progress` | bool | — | <=0.9.73 | — | — | — | — |
 | `role` | str | — | <=0.9.73 | — | — | — | read \| write \| admin. `admin` since 0.9.74 — an admin token is confined to /admin/* and cannot save either, so reporting it as `write` overstated it. |
-| `status` | str | — | <=0.9.73 | — | — | — | ok \| degraded \| down. down if any dependency is down; degraded if any dependency is degraded OR warnings is non-empty; else ok. ⛔ THE HTTP CODE IS A DIFFERENT QUESTION: 503 iff embedder or reranker is down (the save mandate) — every other verdict is served 200 with the enum. |
+| `status` | str | — | <=0.9.73 | — | — | — | ok \| degraded \| down. down if any dependency is down; degraded if any dependency is degraded OR warnings is non-empty, except `nrem_daemon` whose reason is exactly a consolidation stall (`stalled:insight`, `stalled:fact_consolidation` or both), which shows only on that dependency; else ok. ⛔ THE HTTP CODE IS A DIFFERENT QUESTION: 503 iff embedder or reranker is down (the save mandate) — every other verdict is served 200 with the enum. |
 
 ### dependencies
 

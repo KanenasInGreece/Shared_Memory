@@ -1533,6 +1533,8 @@ async def check_memory_health() -> str:
     Read `status` (ok | degraded | down) and `dependencies` first: one enum per
     dependency — postgres, neo4j, embedder, reranker, llm_pool, rem_daemon,
     nrem_daemon, outbox, registry — each with a `reason` when it is not ok.
+    A consolidation stall alone shows in `dependencies.nrem_daemon` only and
+    does not by itself degrade the top `status`.
     `warnings` lists every limit that has been crossed, as
     {key, limit, observed, unit}; the NUMBER behind each one is on
     memory_telemetry.

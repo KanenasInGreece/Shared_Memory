@@ -350,7 +350,7 @@ the network should learn.
 
 | Field | Meaning | Anonymous? |
 |---|---|---|
-| `status` | `ok` \| `degraded` \| `down`, derived from `dependencies` and `warnings` (decision:1785) — the HTTP code is a separate question: **503 iff the embedder or reranker is down**, every other verdict is served 200 with the enum | yes |
+| `status` | `ok` \| `degraded` \| `down`, derived from `dependencies` and `warnings` (decision:1785) — a consolidation stall alone (`nrem_daemon` reason exactly `stalled:insight`, `stalled:fact_consolidation` or both) shows on that dependency only and does not degrade `status`; the HTTP code is a separate question: **503 iff the embedder or reranker is down**, every other verdict is served 200 with the enum | yes |
 | `version` / `api_version` | build version / wire contract | yes |
 | `dependencies.{postgres,neo4j,embedder,reranker,llm_pool,rem_daemon,nrem_daemon,outbox,registry}` | one `{state, reason}` per dependency — see `Documentation/telemetry-contract.md` for the full enum vocabulary per key | authenticated only |
 | `embedder` / `reranker` / `llm` | upstream backend reachability | authenticated only |

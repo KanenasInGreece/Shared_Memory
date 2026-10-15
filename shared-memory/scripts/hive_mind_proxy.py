@@ -11,6 +11,7 @@ import signal
 import socket
 import sys
 import ipaddress
+import itertools
 import urllib.parse
 from datetime import datetime, timezone
 from pathlib import Path
@@ -51,6 +52,7 @@ load_split_env()
 from coordinator import (
     MemoryCoordinator,
     attach as attach_coordinator,
+    CONSOLIDATION_CYCLE_TYPES,
     auth_middleware,
     normalize_encoder_base,
     backup_quiesce_active,
@@ -3059,6 +3061,20 @@ def _rem_dependency(process_running: bool, dead_lettered: object) -> dict:
     return _dep(_STATE_OK)
 
 
+def _nrem_stall_reason(types) -> str:
+    """Return canonical NREM stall reason string for a collection of cycle types."""
+    return "stalled:" + ",".join(types) if types else "stalled"
+
+
+# Every non-empty subset of CONSOLIDATION_CYCLE_TYPES, in tuple order, rendered by the same helper as
+# _nrem_dependency. fact:2996 ruling 3: exactly these stall reasons stop degrading the top status.
+_NREM_STALL_REASONS_EXEMPT_FROM_ROLLUP = frozenset(
+    _nrem_stall_reason(combo)
+    for r in range(1, len(CONSOLIDATION_CYCLE_TYPES) + 1)
+    for combo in itertools.combinations(CONSOLIDATION_CYCLE_TYPES, r)
+)
+
+
 def _nrem_dependency(process_running: bool, consolidation: object,
                      attempt_floor: int) -> dict:
     """Return NREM daemon dependency state evaluating liveness, fold successes, and
@@ -3073,7 +3089,7 @@ def _nrem_dependency(process_running: bool, consolidation: object,
         return _dep(_STATE_UNKNOWN, "not yet probed")
     if consolidation.get("stalled"):
         types = consolidation.get("stalled_types") or []
-        reason = f"stalled:{','.join(types)}" if types else "stalled"
+        reason = _nrem_stall_reason(types)
         if slots_reason:
             reason = f"{reason}; {slots_reason}"
         return _dep(_STATE_DEGRADED, reason)
@@ -3165,8 +3181,17 @@ def _token_verify_failure_rate(now: float | None = None) -> float | None:
 def overall_status(dependencies: dict, warnings: list) -> str:
     """Compute overall status (down, degraded, ok).
 
+    fact:2996 ruling 3: exactly the two NREM consolidation stall reasons stop
+    turning the top status to degraded; nrem_daemon itself stays degraded.
+
     ⚠ unknown never elevates: unprobed dependencies do not report degraded."""
-    states = [d.get("state") for d in dependencies.values()]
+    states = [
+        dep.get("state") for name, dep in dependencies.items()
+        if not (name == "nrem_daemon"
+                and dep.get("state") == _STATE_DEGRADED
+                and isinstance(dep.get("reason"), str)
+                and dep.get("reason") in _NREM_STALL_REASONS_EXEMPT_FROM_ROLLUP)
+    ]
     if _STATE_DOWN in states:
         return _STATE_DOWN
     if _STATE_DEGRADED in states or warnings:
