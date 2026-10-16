@@ -47,3 +47,34 @@ def _capacity_log_path_never_touches_real_home(tmp_path, monkeypatch):
     tmp_path rather than reading/writing the operator's real log."""
     monkeypatch.setenv("CAPACITY_LOG_PATH", str(tmp_path / "capacity-derivations.jsonl"))
     yield
+
+
+@pytest.fixture(autouse=True)
+def _guard_live_postgres_connections(monkeypatch):
+    """Live-store guard: test harness enforces isolation from live postgres.
+
+    The autouse fixture RECORDS every asyncpg.connect / asyncpg.create_pool
+    attempt not overridden by the test and FAILS in teardown if any happened
+    (an assertion inside connect would be swallowed by the lock_connection_failed
+    path). Tests that need a connection override it with their own mocks.
+    """
+    import asyncpg
+    recorded_attempts = []
+
+    async def _fail_connect(*args, **kwargs):
+        recorded_attempts.append(("connect", args, kwargs))
+        raise RuntimeError("test attempted a live Postgres connection (connect)")
+
+    async def _fail_create_pool(*args, **kwargs):
+        recorded_attempts.append(("create_pool", args, kwargs))
+        raise RuntimeError("test attempted a live Postgres connection (create_pool)")
+
+    monkeypatch.setattr(asyncpg, "connect", _fail_connect)
+    monkeypatch.setattr(asyncpg, "create_pool", _fail_create_pool)
+
+    yield
+
+    if recorded_attempts:
+        raise AssertionError(
+            f"test attempted an unmocked live Postgres connection: {recorded_attempts}"
+        )

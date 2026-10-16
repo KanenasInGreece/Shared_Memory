@@ -49,6 +49,9 @@ def read_only_agents() -> "list[str]":
             names.append(extra)
     return names
 
+# Reserved maintenance admin identity.
+MAINTENANCE_ADMIN_AGENT = "maintenance-admin"
+
 # Roles the gateway understands. Roles only ever NARROW access; absence from the
 # map means full read/write, which is why an omission is the WIDEST outcome and
 # never a safe default.
@@ -62,13 +65,24 @@ def effective_role(name: str, declared: "str | None") -> str:
 
     A read-only identity resolves to "read" in every case — declared "full",
     declared "admin", declared nothing, or a file that has lost the line
-    entirely. Everyone else keeps what was declared, defaulting to "full", which
+    entirely.
+
+    MAINTENANCE_ADMIN_AGENT ("maintenance-admin") resolves to "admin" when its
+    declared role is missing, "full" or "write"; an explicit "read", or
+    membership of the read-only roster, stays "read" (fact:3099: maintenance-admin pin narrows only).
+
+    Everyone else keeps what was declared, defaulting to "full", which
     preserves the long-standing behaviour that an unlisted agent is unconfined.
 
     Pure, so the rule is testable without a gateway, a .env or a database.
     """
     if name in read_only_agents():
         return "read"
+    if name == MAINTENANCE_ADMIN_AGENT:
+        # (fact:3099: maintenance-admin pin narrows only)
+        if declared == "read":
+            return "read"
+        return "admin"
     # An operator-declared `name:read` is itself a read-only identity — the
     # roster cannot enumerate names this framework has never heard of, so a
     # declaration is the other way in. VALID_ROLES membership is checked so a
@@ -89,21 +103,53 @@ def role_for_mint(name: str, explicit: "str | None" = None,
     — even though the gateway would now override it anyway, because a .env that
     *claims* a monitor has full access is a lie an operator will act on.
 
+    MAINTENANCE_ADMIN_AGENT ("maintenance-admin") resolves to "admin" when its
+    declared role is missing, "full" or "write". An explicit "read" or roster
+    membership yields "read". An explicit request to widen it to "full" or "write"
+    raises ValueError (fact:3099: maintenance-admin pin narrows only).
+
     Raises ValueError on an unknown role, and on an attempt to widen a read-only
-    identity. Callers refuse BEFORE minting anything.
+    identity or alter MAINTENANCE_ADMIN_AGENT. Callers refuse BEFORE minting anything.
     """
     roster = read_only_agents()
-    if explicit is not None:
-        explicit = explicit.strip().lower()
-        if explicit not in VALID_ROLES:
-            raise ValueError(
-                f"unknown role {explicit!r} — expected one of {', '.join(VALID_ROLES)}")
-        if name in roster and explicit != "read":
+    if name in roster:
+        if explicit is not None and explicit.strip().lower() != "read":
             raise ValueError(
                 f"{name!r} is a read-only identity (roster) and always gets the "
                 f"'read' role — refusing --role {explicit}. If this agent genuinely "
                 f"needs write access it must be taken off the roster deliberately, "
                 f"in code or in {_ENV_ROSTER_VAR}, not widened at mint time.")
+        return "read"
+
+    if name == MAINTENANCE_ADMIN_AGENT:
+        if explicit is not None:
+            explicit_norm = explicit.strip().lower()
+            if explicit_norm == "read":
+                return "read"
+            if explicit_norm == "admin":
+                if declared == "read":
+                    raise ValueError(
+                        f"{name!r} is already declared read-only in AGENT_ROLES — refusing "
+                        f"--role {explicit}. Widening an existing read-only identity is a "
+                        f"privilege change, so it is made by editing that declaration "
+                        f"deliberately, never as a side effect of minting.")
+                return "admin"
+            if explicit_norm in ("full", "write"):
+                raise ValueError(
+                    f"{name!r} is the reserved maintenance admin identity and cannot be "
+                    f"widened to --role {explicit}. Only 'admin' or 'read' are permitted."
+                )
+            raise ValueError(
+                f"unknown role {explicit!r} — expected one of {', '.join(VALID_ROLES)}")
+        if declared == "read":
+            return "read"
+        return "admin"
+
+    if explicit is not None:
+        explicit = explicit.strip().lower()
+        if explicit not in VALID_ROLES:
+            raise ValueError(
+                f"unknown role {explicit!r} — expected one of {', '.join(VALID_ROLES)}")
         if declared == "read" and explicit != "read":
             raise ValueError(
                 f"{name!r} is already declared read-only in AGENT_ROLES — refusing "
@@ -121,7 +167,7 @@ def role_for_mint(name: str, explicit: "str | None" = None,
 
 
 def enforce_roster(roles: dict) -> dict:
-    """Return `roles` with every read-only identity pinned to "read".
+    """Return `roles` with read-only identities and maintenance admin pinned appropriately.
 
     Used on the WRITE side so a minted .env states the truth the gateway will
     enforce anyway — and so a roster that drifted (an agent registered before
@@ -132,6 +178,9 @@ def enforce_roster(roles: dict) -> dict:
     for name in read_only_agents():
         if name in fixed and fixed[name] != "read":
             fixed[name] = "read"
+    if MAINTENANCE_ADMIN_AGENT in fixed:
+        if fixed[MAINTENANCE_ADMIN_AGENT] != "read":
+            fixed[MAINTENANCE_ADMIN_AGENT] = "admin"
     # Nothing here ever turns a "read" entry into anything wider: an operator
     # declaration is a confinement, and this function only ever tightens.
     return fixed

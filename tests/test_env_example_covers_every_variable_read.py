@@ -656,9 +656,6 @@ def test_this_prs_templated_keys_carry_the_codes_real_default():
         "SEARCH_CANDIDATE_FLOOR": "20",
         "SEARCH_DOMAINS_FILTER_CAP": "16",
         "SEARCH_REFS_CAP": "16",
-        # _env_float, so the default is 45.0 -- the literal the code carries,
-        # not the integer it would round to.
-        "BACKUP_DAEMON_DRAIN_TIMEOUT": "45.0",
         "BACKUP_RETRY_AFTER": "30",
     }
     for name, default in round_4_defaults.items():
@@ -749,10 +746,65 @@ def test_templated_keys_stay_commented_not_live():
         "SEARCH_CANDIDATE_FLOOR",
         "SEARCH_DOMAINS_FILTER_CAP",
         "SEARCH_REFS_CAP",
-        "BACKUP_DAEMON_DRAIN_TIMEOUT",
         "BACKUP_RETRY_AFTER",
         "SHARED_MEMORY_READ_ONLY_AGENTS",
     ):
         assert not re.search(
             r"^" + re.escape(name) + r"=", framework_text, re.MULTILINE
         ), f"{name} is LIVE (uncommented) in shared-memory/.env.example — must stay commented"
+
+
+# An entry is added only when a variable is genuinely read only by compose files.
+_COMPOSE_ONLY_EXEMPTIONS: set[str] = set()
+
+
+def test_every_variable_in_env_example_is_read_somewhere():
+    """Reverse check: every variable templated in .env.example must be read by code or ops.
+
+    Ensures dead configuration variables deleted from code (like
+    BACKUP_DAEMON_DRAIN_TIMEOUT) cannot linger as phantom settings in
+    shared-memory/.env.example.
+    """
+    with open(_FRAMEWORK_TEMPLATE, encoding="utf-8") as f:
+        framework_text = f.read()
+
+    templated_vars = set(
+        re.findall(r"^(?:#\s*)?([A-Z0-9_]+)=(?![ \t])", framework_text, re.MULTILINE)
+    )
+
+    _, framework_python_names = _collect()
+
+    # Search non-python scripts and ops configuration files
+    scan_patterns = [
+        os.path.join(REPO_ROOT, "shared-memory", "scripts", "*"),
+        os.path.join(REPO_ROOT, "shared-memory", "ops", "*"),
+        os.path.join(REPO_ROOT, "ops", "*"),
+        os.path.join(REPO_ROOT, "shared-memory", "migrations", "*"),
+    ]
+    file_contents = []
+    for pattern in scan_patterns:
+        for path in glob.glob(pattern):
+            if os.path.basename(path).endswith((".env.example", ".env", ".swp", ".pyc")):
+                continue
+            if os.path.isfile(path):
+                try:
+                    with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                        file_contents.append((path, f.read()))
+                except Exception:
+                    pass
+
+    unread = []
+    for var in sorted(templated_vars):
+        if var in _COMPOSE_ONLY_EXEMPTIONS or var in framework_python_names:
+            continue
+        read_in_file = any(
+            re.search(r"\b" + re.escape(var) + r"\b", text) for _, text in file_contents
+        )
+        if not read_in_file:
+            unread.append(var)
+
+    assert not unread, (
+        f"Variable(s) templated in shared-memory/.env.example but not read "
+        f"anywhere in shared-memory/scripts/ or ops/ (and not in "
+        f"_COMPOSE_ONLY_EXEMPTIONS): {unread}"
+    )

@@ -411,12 +411,15 @@ def test_the_403_message_survives_postflight_a5s_200_character_slice():
 
 def _forbidden_from(mod, path, token, method="POST"):
     """Drive auth_middleware and return the HTTPException it raised."""
-    from unittest.mock import MagicMock
+    from unittest.mock import AsyncMock, MagicMock
     req = MagicMock()
     req.path, req.method = path, method
     req.headers = {"Authorization": f"Bearer {token}"} if token else {}
     req.get = MagicMock(return_value=None)
     req.__setitem__ = MagicMock()
+    req.match_info.route.resource.canonical = path.rstrip("/") or "/"
+    req.read = AsyncMock(return_value=b"{}")
+    req.transport = MagicMock()
 
     async def handler(request):
         from aiohttp import web

@@ -244,6 +244,9 @@ def _make_request(path: str, auth_header: str | None = None, method: str = "POST
     req.headers = headers
     req.get = MagicMock(return_value=None)
     req.__setitem__ = MagicMock()
+    req.match_info.route.resource.canonical = path.rstrip("/") or "/"
+    req.read = AsyncMock(return_value=b"{}")
+    req.transport = MagicMock()
     return req
 
 

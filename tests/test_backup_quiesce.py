@@ -11,7 +11,7 @@ Coverage:
   - MemoryCoordinator._begin_quiesce / _end_quiesce flag + advisory-lock lifecycle
     (asyncpg.connect mocked — no live DB), idempotent re-quiesce
   - TTL auto-resume clears the flag if no resume arrives
-  - handle_backup status routing (200 drained / 202 drain_timeout / 400 bad state)
+  - handle_backup status routing (200 drained / 202 lock_connection_failed / 400 bad state)
 
 All mocked — no live infrastructure.
 """
@@ -60,6 +60,9 @@ def _make_request(path: str, auth_header: str | None = None, method: str = "POST
     req.headers = headers
     req.get = MagicMock(return_value=None)
     req.__setitem__ = MagicMock()
+    req.match_info.route.resource.canonical = path.rstrip("/") or "/"
+    req.read = AsyncMock(return_value=b"{}")
+    req.transport = MagicMock()
     return req
 
 
@@ -213,8 +216,12 @@ async def test_admin_token_confined_cannot_save():
 
 def _mock_conn():
     conn = MagicMock()
+    conn.is_closed = MagicMock(return_value=False)
     conn.execute = AsyncMock()
+    conn.fetchval = AsyncMock(return_value=1)
     conn.close = AsyncMock()
+    conn.terminate = MagicMock()
+    conn.add_termination_listener = MagicMock()
     return conn
 
 
@@ -225,18 +232,19 @@ async def test_begin_quiesce_sets_flag_and_holds_lock(monkeypatch):
     monkeypatch.setattr(mod.asyncpg, "connect", AsyncMock(return_value=conn))
     coord = mod.MemoryCoordinator()
 
-    drained = await coord._begin_quiesce(max_seconds=30)
-    assert drained is True
+    res = await asyncio.wait_for(coord._begin_quiesce(max_seconds=30), 5.0)
+    assert res["drained"] is True
+    assert res["lock_held"] is True
     assert mod._backup_quiesce is True
     assert coord._quiesce_conn is conn
     # Exclusive advisory lock acquired on the dedicated connection.
     calls = [c.args[0] for c in conn.execute.await_args_list]
     assert any("pg_advisory_lock" in s for s in calls)
 
-    await coord._end_quiesce()
+    await asyncio.wait_for(coord._end_quiesce(), 5.0)
     assert mod._backup_quiesce is False
     assert coord._quiesce_conn is None
-    conn.close.assert_awaited()
+    conn.terminate.assert_called()
 
 
 @pytest.mark.asyncio
@@ -247,33 +255,37 @@ async def test_begin_quiesce_idempotent_single_connection(monkeypatch):
     monkeypatch.setattr(mod.asyncpg, "connect", connect)
     coord = mod.MemoryCoordinator()
 
-    assert await coord._begin_quiesce(30) is True
-    assert await coord._begin_quiesce(30) is True  # re-entrant — must NOT reconnect
+    res1 = await asyncio.wait_for(coord._begin_quiesce(30), 5.0)
+    assert res1["drained"] is True
+    res2 = await asyncio.wait_for(coord._begin_quiesce(30), 5.0)  # re-entrant — must NOT reconnect
+    assert res2["drained"] is True
     assert connect.await_count == 1
-    await coord._end_quiesce()
+    await asyncio.wait_for(coord._end_quiesce(), 5.0)
 
 
 @pytest.mark.asyncio
-async def test_begin_quiesce_drain_timeout_returns_false(monkeypatch):
-    """lock_timeout firing on the exclusive acquire → drain_timeout, no held conn."""
+async def test_begin_quiesce_lock_failure_returns_lock_connection_failed(monkeypatch):
+    """lock failure on the exclusive acquire → lock_connection_failed, no held conn."""
     mod = load_coordinator("claude:tok_abc")
     conn = _mock_conn()
 
     async def execute(sql, *args):
         if "pg_advisory_lock" in sql:
-            raise mod.asyncpg.PostgresError("canceling statement due to lock timeout")
+            raise mod.asyncpg.PostgresError("lock acquire failed")
         return "SET"
 
     conn.execute = AsyncMock(side_effect=execute)
     monkeypatch.setattr(mod.asyncpg, "connect", AsyncMock(return_value=conn))
     coord = mod.MemoryCoordinator()
 
-    drained = await coord._begin_quiesce(30)
-    assert drained is False
+    res = await asyncio.wait_for(coord._begin_quiesce(30), 5.0)
+    assert res["drained"] is False
+    assert res["lock_held"] is False
+    assert res["reason"] == "lock_connection_failed"
     assert mod._backup_quiesce is True          # client writes still shed
     assert coord._quiesce_conn is None          # no half-held lock
-    conn.close.assert_awaited()
-    await coord._end_quiesce()
+    conn.terminate.assert_called()
+    await asyncio.wait_for(coord._end_quiesce(), 5.0)
 
 
 @pytest.mark.asyncio
@@ -283,9 +295,9 @@ async def test_ttl_auto_resume_clears_flag(monkeypatch):
     monkeypatch.setattr(mod.asyncpg, "connect", AsyncMock(return_value=conn))
     coord = mod.MemoryCoordinator()
 
-    await coord._begin_quiesce(max_seconds=0.05)
+    await asyncio.wait_for(coord._begin_quiesce(max_seconds=0.5), 5.0)
     assert mod._backup_quiesce is True
-    await asyncio.sleep(0.15)                    # TTL expires → auto-resume
+    await asyncio.sleep(0.8)                    # TTL expires → auto-resume
     assert mod._backup_quiesce is False
     assert coord._quiesce_conn is None
 
@@ -295,6 +307,7 @@ async def test_ttl_auto_resume_clears_flag(monkeypatch):
 def _json_request(body: dict) -> MagicMock:
     req = MagicMock()
     req.json = AsyncMock(return_value=body)
+    req.transport = MagicMock()
     return req
 
 
@@ -302,18 +315,39 @@ def _json_request(body: dict) -> MagicMock:
 async def test_handle_backup_quiesce_drained_returns_200(monkeypatch):
     mod = load_coordinator("claude:tok_abc")
     coord = mod.MemoryCoordinator()
-    coord._begin_quiesce = AsyncMock(return_value=True)
-    resp = await coord.handle_backup(_json_request({"state": "quiesce"}))
+    coord._begin_quiesce = AsyncMock(return_value={
+        "lock_held": True, "writes_in_flight": 0, "worker_batches_in_flight": 0,
+        "oldest_write_age_s": None, "reason": None, "drained": True,
+    })
+    resp = await asyncio.wait_for(coord.handle_backup(_json_request({"state": "quiesce"})), 5.0)
     assert resp.status == 200
 
 
 @pytest.mark.asyncio
-async def test_handle_backup_quiesce_drain_timeout_returns_202(monkeypatch):
+async def test_handle_backup_quiesce_lock_failure_returns_202(monkeypatch):
+    import json
     mod = load_coordinator("claude:tok_abc")
+    conn = _mock_conn()
+
+    async def execute(sql, *args):
+        if "pg_advisory_lock" in sql:
+            raise mod.asyncpg.PostgresError("lock acquire failed")
+        return "SET"
+
+    conn.execute = AsyncMock(side_effect=execute)
+    monkeypatch.setattr(mod.asyncpg, "connect", AsyncMock(return_value=conn))
     coord = mod.MemoryCoordinator()
-    coord._begin_quiesce = AsyncMock(return_value=False)
-    resp = await coord.handle_backup(_json_request({"state": "quiesce"}))
+
+    resp = await asyncio.wait_for(coord.handle_backup(_json_request({"state": "quiesce"})), 5.0)
     assert resp.status == 202
+    data = json.loads(resp.body.decode())
+    assert data["reason"] == "lock_connection_failed"
+    assert data["lock_held"] is False
+    assert data["quiesced"] is True
+    assert mod._backup_quiesce is True
+    assert coord._quiesce_conn is None
+    conn.terminate.assert_called()
+    await asyncio.wait_for(coord._end_quiesce(), 5.0)
 
 
 @pytest.mark.asyncio
@@ -321,7 +355,7 @@ async def test_handle_backup_resume_returns_200():
     mod = load_coordinator("claude:tok_abc")
     coord = mod.MemoryCoordinator()
     coord._end_quiesce = AsyncMock()
-    resp = await coord.handle_backup(_json_request({"state": "resume"}))
+    resp = await asyncio.wait_for(coord.handle_backup(_json_request({"state": "resume"})), 5.0)
     assert resp.status == 200
     coord._end_quiesce.assert_awaited()
 
@@ -330,7 +364,7 @@ async def test_handle_backup_resume_returns_200():
 async def test_handle_backup_bad_state_returns_400():
     mod = load_coordinator("claude:tok_abc")
     coord = mod.MemoryCoordinator()
-    resp = await coord.handle_backup(_json_request({"state": "nope"}))
+    resp = await asyncio.wait_for(coord.handle_backup(_json_request({"state": "nope"})), 5.0)
     assert resp.status == 400
 
 

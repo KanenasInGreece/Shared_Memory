@@ -47,7 +47,7 @@ def load_coordinator(agent_tokens: str = "", gateway_inflight_max: str = ""):
 
 
 def _make_request(path: str, method: str = "GET"):
-    from unittest.mock import MagicMock
+    from unittest.mock import AsyncMock, MagicMock
     from yarl import URL
     req = MagicMock()
     req.path = path
@@ -62,6 +62,8 @@ def _make_request(path: str, method: str = "GET"):
     req.headers = {}
     req.get = MagicMock(return_value=None)
     req.__setitem__ = MagicMock()
+    req.match_info.route.resource.canonical = path.rstrip("/") or "/"
+    req.read = AsyncMock(return_value=b"{}")
     return req
 
 

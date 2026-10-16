@@ -19,7 +19,7 @@ import os
 import pwd
 import socket
 import sys
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -136,6 +136,8 @@ def _make_request(path, auth_header, method="POST"):
     req.get = MagicMock(return_value=None)
     req.__setitem__ = MagicMock()
     req.transport = None  # non-UDS → no kernel principal
+    req.match_info.route.resource.canonical = path.rstrip("/") or "/"
+    req.read = AsyncMock(return_value=b"{}")
     return req
 
 
