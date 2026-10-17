@@ -3,7 +3,7 @@
 
 # The Telemetry Contract
 
-Contract version **1.0.17**. Every key the gateway emits on `GET /health` and `GET /memory/telemetry`, what it means, what it is measured in, when it arrived, and where it is going.
+Contract version **1.0.18**. Every key the gateway emits on `GET /health` and `GET /memory/telemetry`, what it means, what it is measured in, when it arrived, and where it is going.
 
 ## The roles
 
@@ -54,6 +54,8 @@ A key whose **value** changed meaning while its **name** stayed. Enumerated beca
 | telemetry | `gateway.by_status.*` | 0.9.88 | only the authenticated, handler-reached path's own status was ever counted — a gateway-issued 401/403/503 (load-shed, role denial, backup-quiesce) was invisible here | every exit the middleware can take is counted, so `by_status.401` now includes protected-path bearer failures, `by_status.403` includes role denials, and `by_status.503` now includes load-shed and backup-quiesce alongside pool-saturated — `shed_503_total` is therefore only `<= by_status.503` from now on, no longer equal-by-construction on the shed class alone | a consumer that treated `shed_503_total == by_status.503` as an invariant must drop that assumption; a 401 from a protected path now shows up here AND in the D1 rate window AND in `credentials.token_verify_failed` — same event, three surfaces. The v0.9.87 stale-token-monitor `/health` case is unaffected here: it serves 200, so it moves only the D1 window and `requests_total`/`by_status.2xx`, never `by_status.401` |
 | health | `llm / llm_backends.*` | 0.9.97 | the reasoning-LLM probe ran inline on the /health request path, so a backend read ok, timeout, down or http_<code> the moment /health answered | the probe runs in a background daemon (S7); before its first cycle lands a backend reads `unknown`, and the top-level `llm` reads `unknown` rather than `down` (the unknown-never-elevates contract) | a consumer reading `llm`/`llm_backends.*` must accept `unknown` as 'not yet probed', never a failure; it clears within one probe cycle (~3 s) of gateway start |
 | health | `status` | 1.0.17 | degraded whenever dependencies.nrem_daemon was degraded, including a consolidation stall alone | a consolidation stall alone (nrem_daemon degraded with reason exactly stalled:insight, stalled:fact_consolidation or both) no longer degrades it; the stall shows on nrem_daemon only | alert on a consolidation stall from dependencies.nrem_daemon.reason, not from status |
+| telemetry | `gateway.by_status.503` | 1.0.18 | on an install without auth, the load-shed valve and pool saturation only; writes were never shed during a backup quiesce there | also every write refused during a quiesce on an install without auth (auth-on installs already counted them) | read gateway.shed_503_total for the load-shed valve alone; a quiesce 503 is the difference |
+| telemetry | `gateway.by_status.403` | 1.0.18 | role and principal refusals; a TCP write during a quiesce was a 503 | with GATEWAY_REQUIRE_PRINCIPAL set, a TCP write during a quiesce is refused by the principal check first and counts here as 403 | expect fewer 503 and more 403 during a quiesce on such installs |
 
 ## Removed outright in 0.9.74
 
