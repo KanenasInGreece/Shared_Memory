@@ -19,7 +19,7 @@ import sys
 
 import pytest
 from aiohttp import web
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 
 # ── Dynamic import (mirrors tests/test_auth.py) ─────────────────────────────────
@@ -58,6 +58,9 @@ def _make_request(path: str, auth_header: str | None = None, method: str = "POST
     req.get = lambda k, d=None: store.get(k, d)
     # MagicMock invokes dunders as bound methods, so __setitem__ receives self.
     req.__setitem__ = lambda self, k, v: store.__setitem__(k, v)
+    req.match_info.route.resource.canonical = path.rstrip("/") or "/"
+    req.read = AsyncMock(return_value=b"{}")
+    req.transport = MagicMock()
     return req
 
 

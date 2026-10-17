@@ -83,7 +83,7 @@ __all__ = [
 ]
 
 #: Not a free-running today: this is the fifth version pin, so a missed bump is visible (decision:1832).
-VERSION = "1.0.17"
+VERSION = "1.0.18"
 
 
 def _version_tuple(v: str) -> tuple:
@@ -168,6 +168,8 @@ INTRODUCED_1_0_2 = "1.0.2"
 INTRODUCED_1_0_7 = "1.0.7"
 #: A lone consolidation stall stopped degrading the top /health status (fact:2996 ruling 3).
 INTRODUCED_1_0_17 = "1.0.17"
+#: Quiesce sheds writes on auth-off installs and counts every write in flight (fact:2996 ruling 1: the container check).
+INTRODUCED_1_0_18 = "1.0.18"
 #: Frozen release at which the v0.9.74 /health copies stop being served. A later drop gets its own stamp.
 DUAL_EMIT_DROP_TARGET = "0.9.90"
 #: Telemetry copies stay one release longer because the monitor still reads the old homes (fact:1989).
@@ -1604,6 +1606,28 @@ MEANING_CHANGES: tuple[dict, ...] = (
                 "no longer degrades it; the stall shows on nrem_daemon only"),
         "action": ("alert on a consolidation stall from "
                    "dependencies.nrem_daemon.reason, not from status"),
+        "shape_changed": False,
+    },
+    {
+        "endpoint": "telemetry",
+        "path": "gateway.by_status.503",
+        "in_version": INTRODUCED_1_0_18,
+        "was": ("on an install without auth, the load-shed valve and pool saturation only; "
+                "writes were never shed during a backup quiesce there"),
+        "now": ("also every write refused during a quiesce on an install without auth "
+                "(auth-on installs already counted them)"),
+        "action": ("read gateway.shed_503_total for the load-shed valve alone; a quiesce "
+                   "503 is the difference"),
+        "shape_changed": False,
+    },
+    {
+        "endpoint": "telemetry",
+        "path": "gateway.by_status.403",
+        "in_version": INTRODUCED_1_0_18,
+        "was": "role and principal refusals; a TCP write during a quiesce was a 503",
+        "now": ("with GATEWAY_REQUIRE_PRINCIPAL set, a TCP write during a quiesce is refused "
+                "by the principal check first and counts here as 403"),
+        "action": "expect fewer 503 and more 403 during a quiesce on such installs",
         "shape_changed": False,
     },
 )

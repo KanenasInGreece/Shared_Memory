@@ -7,6 +7,23 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.0.18] - 2026-10-17
+
+The container check, gateway half: a backup or reconcile quiesce now sees every write, cannot strand its lock, imposes no fixed time limit, and also works on an install without auth. `API_VERSION` stays 4. Restart the gateway; update the skills for the version. `ops/backup.sh` is unchanged and keeps working; the scripts that use the new replies come in the next release.
+
+### Changed
+- `POST /admin/backup {"state":"quiesce"}` answers 200 only when no client write is between admission and completion, no outbox or alternative-vector batch is running, and REM and NREM are fenced by the exclusive advisory lock on a live connection. A write is counted from the moment its body has arrived; a write that arrives during a quiesce is refused with 503 before its body is read.
+- The quiesce waits as long as its caller stays connected and imposes no fixed limit. A resume, the caller leaving, or the caller-chosen dead-man timer (`max_seconds`) ends it. Resume terminates the lock connection instead of waiting on an unlock. The lock connection sets `client_connection_check_interval` so Postgres drops a queued lock request whose client is gone.
+- Replies: 202 now means `lock_connection_failed` (client writes drained to 0, daemons not fenced) — it no longer means a drain timeout. New 409 `resumed_during_wait` carries `ended_by` (`resume`, `timer` or `caller_gone`); 409 `caller_gone` carries `ended_by` only when that call ended the quiesce. New 400 `max_seconds_invalid`: `max_seconds` must be a finite number above 0 and is no longer silently replaced. `daemons` is now `fenced` / `not_fenced`; `ttl_seconds` is the time remaining. New keys `lock_held`, `writes_in_flight`, `oldest_write_age_s`, `worker_batches_in_flight`, `quiesced` on the quiesce replies and on `GET /admin/outbox`; the resume reply adds `lock_held`.
+- On an install without auth, writes are now refused while quiesced (they were not before). Admin routes there stay open to any local caller for this release; the next release restricts them to the gateway's own account over the unix socket. Until then a local process on an auth-off install can keep saves paused by quiescing repeatedly — accepted by the operator for one release.
+- During a quiesce the outbox worker keeps applying already-saved rows to Neo4j (its batches are counted); the alternative-vector worker pauses.
+- The agent name `maintenance-admin` is reserved: it always resolves to the `admin` role unless it is declared `read`, so a lost `AGENT_ROLES` entry cannot turn the maintenance credential into a full-access token. A pre-existing agent of that name gains `/admin/*` and loses saves.
+- Telemetry contract: `MEANING_CHANGES` entries for `gateway.by_status.503` (auth-off quiesce sheds) and `gateway.by_status.403` (principal refusals during a quiesce).
+
+### Removed
+- `BACKUP_DAEMON_DRAIN_TIMEOUT`: the quiesce no longer gives up on its own.
+- `INSIGHT_HUB_DEGREE_CAP` from `.env.example`: nothing has read it since the insight gate was rebuilt. A new test fails on any `.env.example` variable that nothing reads.
+
 ## [1.0.17] - 2026-10-15
 
 A stalled insight or thematic-summary cycle no longer turns the top `/health` status to `degraded`. `API_VERSION` stays 4. Restart the gateway; update the skills for the version.

@@ -54,6 +54,12 @@ def _client_flags() -> set:
     return set(re.findall(r'add_argument\(\s*"(--[a-z0-9-]+)"', _read(BRIDGE)))
 
 
+# Admin-route refusals agents never meet; operator documentation goes with the scripts release.
+_ADMIN_ROUTE_ERRORS = {
+    "max_seconds_invalid", "resumed_during_wait", "caller_gone", "lock_connection_failed",
+}
+
+
 def _ingress_errors() -> set:
     """Every machine-readable refusal code the gateway can answer a save with.
 
@@ -61,7 +67,8 @@ def _ingress_errors() -> set:
     refusal an agent meets with no idea what to do next — which is the specific
     failure the registry protocol exists to avoid.
     """
-    return set(re.findall(r'"error":\s*"([a-z_]+)"', _read(COORDINATOR)))
+    errors = set(re.findall(r'"error":\s*"([a-z_]+)"', _read(COORDINATOR)))
+    return errors - _ADMIN_ROUTE_ERRORS
 
 
 def test_every_capture_flag_is_explained_in_the_skill_document():

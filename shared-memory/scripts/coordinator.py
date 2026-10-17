@@ -9,6 +9,7 @@ import asyncio
 import copy
 import hashlib
 import hmac
+import itertools
 import json
 import logging
 import math
@@ -127,7 +128,7 @@ def _short(value: Any, cap: int = 200) -> str:
 
 
 # FRAMEWORK_VERSION is the build string and may drift. API_VERSION is the wire contract with memory_bridge.py; bump it only when shape, auth, or routes break older clients.
-FRAMEWORK_VERSION = "1.0.17"
+FRAMEWORK_VERSION = "1.0.18"
 # API v2: retrospective is a full record. v4: unregistered project is 400 (proposal / new_project / sentinel).
 API_VERSION = 4
 CLIENT_VERSION_HEADER = "X-SM-Api-Version"
@@ -1196,6 +1197,20 @@ def _record_client_version(request: web.Request) -> None:
 # Backup quiesce sheds client writes (503 Retry-After); reads flow. Daemons take the advisory lock SHARED and skip if the gateway holds it EXCLUSIVE.
 _backup_quiesce: bool = False
 
+# Clock seam for the backup quiesce lifecycle and write tracking.
+_now = time.monotonic
+
+# Quiesce generation, incremented at the start of every _end_quiesce.
+_quiesce_generation: int = 0
+
+# In-flight write tracking.
+_writes_in_flight: int = 0
+_write_started: dict[int, float] = {}
+_write_seq = itertools.count()
+
+# In-flight background worker batches (fact:3093: outbox keeps draining; alt-vector pauses).
+_worker_batches_in_flight: int = 0
+
 # Shared with REM and NREM; the key must match both daemons. A disconnect drops the session lock, so a crash cannot wedge the others.
 BACKUP_ADVISORY_LOCK_KEY    = _env_int("BACKUP_ADVISORY_LOCK_KEY", 8765309)
 # One transaction lock for every fact supersession, so the last-ground check and the UPDATE cannot race (decision:2802: refuse a supersession that removes a decision's last based-on fact until the operator answers).
@@ -1214,14 +1229,71 @@ def require_distinct_advisory_lock_keys() -> None:
 REM_MAX_ATTEMPTS            = _env_int("REM_MAX_ATTEMPTS", 5)
 # Mirror of rem_loop.REM_STARVED_THRESHOLD (decision 890). The gateway only reports how many pending rows are at the promotion point, so the default must match the daemon.
 REM_STARVED_THRESHOLD        = _env_int("REM_STARVED_THRESHOLD", 3)
-# Seconds the gateway waits for in-flight daemon cycles to release their shared lock
-# before reporting drain_timeout. Bounds the quiesce handshake.
-BACKUP_DAEMON_DRAIN_TIMEOUT = _env_float("BACKUP_DAEMON_DRAIN_TIMEOUT", 45.0)
-# TTL safety net: auto-resume if a backup script dies without calling resume, so a
-# crashed backup can never wedge writes. The script passes its own max_seconds.
+# Dead-man timer default (decision:334: gateway-coordinated quiesce; a crashed backup cannot wedge writes): auto-resume if a backup script dies without calling resume, so a
+# crashed backup can never wedge writes. The script passes its own max_seconds (decision:3101: no arbitrary timer or fixed limit without shown need; caller-chosen, unclamped).
 BACKUP_QUIESCE_MAX_SECONDS  = _env_float("BACKUP_QUIESCE_MAX_SECONDS", 900.0)
 # Retry-After (seconds) handed to a write shed while quiesced.
 BACKUP_RETRY_AFTER          = _env_int("BACKUP_RETRY_AFTER", 30)
+
+
+def _validate_max_seconds(raw: Any) -> float:
+    """Validate caller-supplied max_seconds for quiesce.
+
+    decision:3101 (no arbitrary timer without shown need).
+    Missing or None -> default BACKUP_QUIESCE_MAX_SECONDS.
+    Otherwise must be int or float (not bool), finite, > 0, convertible to float.
+    Raises ValueError on any invalid value. Returns valid unclamped float.
+    """
+    if raw is None:
+        return float(BACKUP_QUIESCE_MAX_SECONDS)
+    if isinstance(raw, bool) or isinstance(raw, str) or not isinstance(raw, (int, float)):
+        raise ValueError(f"max_seconds must be a number, got {raw!r}")
+    try:
+        val = float(raw)
+    except (ValueError, OverflowError):
+        raise ValueError(f"max_seconds cannot be converted to float: {raw!r}")
+    if not math.isfinite(val) or val <= 0:
+        raise ValueError(f"max_seconds must be finite and > 0, got {val!r}")
+    return val
+
+
+def _is_write_request(request: web.Request) -> bool:
+    """Identify a write request by the MATCHED route, not the raw path.
+
+    Matches (request.method, request.match_info.route.resource.canonical)
+    against _WRITE_ROUTES when route.resource is present. Falls back to raw
+    request.path for test doubles where canonical is not a str. Narrow
+    attribute extraction ensures unexpected errors fail closed (treated as a
+    write: counted and shed) rather than open.
+    """
+    try:
+        match_info = getattr(request, "match_info")
+        route = getattr(match_info, "route") if match_info is not None else None
+        resource = getattr(route, "resource") if route is not None else None
+    except Exception:
+        return True
+
+    try:
+        if resource is not None:
+            canonical = getattr(resource, "canonical", None)
+            if isinstance(canonical, str):
+                method = getattr(request, "method", "")
+                return (method, canonical) in _WRITE_ROUTES
+        path = getattr(request, "path", "")
+        if isinstance(path, str):
+            canonical = path.rstrip("/") or "/"
+            method = getattr(request, "method", "")
+            return (method, canonical) in _WRITE_ROUTES
+        return True
+    except Exception:
+        return True
+
+
+def _oldest_write_age_s() -> float | None:
+    """Age (seconds) of the oldest admitted write currently in flight, or None."""
+    if not _write_started:
+        return None
+    return float(_now() - min(_write_started.values()))
 
 
 def backup_quiesce_active() -> bool:
@@ -1828,7 +1900,7 @@ async def auth_middleware(request: web.Request, handler):
     asyncio.TimeoutError from a handler's _acquire(); it is mapped here to
     503 + Retry-After so the gateway sheds load instead of hanging a caller.
     """
-    global _inflight, _gateway_shed_503_total
+    global _inflight, _gateway_shed_503_total, _writes_in_flight
     _check_client_version(request)  # logs API skew to the gateway log; never raises
     _record_client_version(request)  # counts the caller's build; never raises
 
@@ -1853,9 +1925,39 @@ async def auth_middleware(request: web.Request, handler):
         if not AUTH_CONFIGURED_AT_STARTUP:
             _status = 500
             try:
-                resp = await handler(request)
-                _status = resp.status
-                return resp
+                is_write = _is_write_request(request)
+                if is_write:
+                    if _backup_quiesce:
+                        raise web.HTTPServiceUnavailable(
+                            reason="backup in progress — writes are briefly paused",
+                            headers={"Retry-After": str(BACKUP_RETRY_AFTER)},
+                            **_error_body("Backup in progress — writes are briefly paused so the "
+                                          "dump sees a quiet database. Reads are unaffected; "
+                                          "retry after the Retry-After interval."),
+                        )
+                    await request.read()
+                    if _backup_quiesce:
+                        raise web.HTTPServiceUnavailable(
+                            reason="backup in progress — writes are briefly paused",
+                            headers={"Retry-After": str(BACKUP_RETRY_AFTER)},
+                            **_error_body("Backup in progress — writes are briefly paused so the "
+                                          "dump sees a quiet database. Reads are unaffected; "
+                                          "retry after the Retry-After interval."),
+                        )
+                    _key = next(_write_seq)
+                    _write_started[_key] = _now()
+                    _writes_in_flight += 1
+                    try:
+                        resp = await handler(request)
+                        _status = resp.status
+                        return resp
+                    finally:
+                        _writes_in_flight -= 1
+                        _write_started.pop(_key, None)
+                else:
+                    resp = await handler(request)
+                    _status = resp.status
+                    return resp
             except web.HTTPException as exc:
                 _status = exc.status
                 raise
@@ -1925,16 +2027,6 @@ async def auth_middleware(request: web.Request, handler):
                                   "credential is VALID — use a write-capable agent token "
                                   "for this route."),
                 )
-            if _backup_quiesce and route in _WRITE_ROUTES:
-                # This 503 is quiesce, not the shed valve. by_status.503 counts both (MEANING_CHANGES).
-                _record_gateway_request(503, None)
-                raise web.HTTPServiceUnavailable(
-                    reason="backup in progress — writes are briefly paused",
-                    headers={"Retry-After": str(BACKUP_RETRY_AFTER)},
-                    **_error_body("Backup in progress — writes are briefly paused so the "
-                                  "dump sees a quiet database. Reads are unaffected; "
-                                  "retry after the Retry-After interval."),
-                )
             if GATEWAY_REQUIRE_PRINCIPAL and route in _WRITE_ROUTES and principal is None:
                 _record_gateway_request(403, None)
                 raise web.HTTPForbidden(
@@ -1945,16 +2037,49 @@ async def auth_middleware(request: web.Request, handler):
                                   "TCP. The credential is VALID; the TRANSPORT is what "
                                   "this route refuses."),
                 )
-
+        _refused_before_handler = False
         started    = asyncio.get_running_loop().time()
         request_id = uuid.uuid4().hex[:12]
         status     = 500
         # The proxy correlates credential-audit lines to this request (PR A3).
         request["request_id"] = request_id
+        is_write   = _is_write_request(request)
+        _write_key = None
         try:
-            resp = await handler(request)
-            status = resp.status
-            return resp
+            if is_write:
+                if _backup_quiesce:
+                    _refused_before_handler = True
+                    raise web.HTTPServiceUnavailable(
+                        reason="backup in progress — writes are briefly paused",
+                        headers={"Retry-After": str(BACKUP_RETRY_AFTER)},
+                        **_error_body("Backup in progress — writes are briefly paused so the "
+                                      "dump sees a quiet database. Reads are unaffected; "
+                                      "retry after the Retry-After interval."),
+                    )
+                await request.read()
+                if _backup_quiesce:
+                    _refused_before_handler = True
+                    raise web.HTTPServiceUnavailable(
+                        reason="backup in progress — writes are briefly paused",
+                        headers={"Retry-After": str(BACKUP_RETRY_AFTER)},
+                        **_error_body("Backup in progress — writes are briefly paused so the "
+                                      "dump sees a quiet database. Reads are unaffected; "
+                                      "retry after the Retry-After interval."),
+                    )
+                _write_key = next(_write_seq)
+                _write_started[_write_key] = _now()
+                _writes_in_flight += 1
+                try:
+                    resp = await handler(request)
+                    status = resp.status
+                    return resp
+                finally:
+                    _writes_in_flight -= 1
+                    _write_started.pop(_write_key, None)
+            else:
+                resp = await handler(request)
+                status = resp.status
+                return resp
         except asyncio.TimeoutError:
             # DB pool stayed saturated past POOL_ACQUIRE_TIMEOUT — shed, don't hang.
             status = 503
@@ -1974,7 +2099,7 @@ async def auth_middleware(request: web.Request, handler):
                    backend=request.get("backend"),
                    key_attached=bool(request.get("key_attached")))
             # After the durable audit line. This call cannot raise, so it cannot skip the write.
-            _record_gateway_request(status, latency_ms)
+            _record_gateway_request(status, None if _refused_before_handler else latency_ms)
     finally:
         _inflight -= 1
 
@@ -2922,9 +3047,13 @@ class MemoryCoordinator:
         # Observed-max rerank payload (monotonic this process) for the capacity signal, updated with the cumulative pair (fact:1441).
         self._rerank_payload_chars_max = 0
         # Backup quiesce: dedicated connection holding the EXCLUSIVE advisory lock
-        # (None = not held), plus the TTL auto-resume task.
+        # (None = not held), single-flight lock, and caller-chosen dead-man timer.
         self._quiesce_conn: Any = None
+        self._quiesce_pending_conn: Any = None
         self._quiesce_timer: asyncio.Task | None = None
+        self._quiesce_lock = asyncio.Lock()
+        self._quiesce_ended_by: str = "resume"
+        self._ttl_target: float | None = None
         # Cached consolidation snapshot so /health stays database-free; stalled is not asserted on no data. The telemetry lock is single-flight; see _telemetry_cached.
         self._telemetry_cache: dict = {"snap": None, "ts": 0.0}
         self._telemetry_lock = asyncio.Lock()
@@ -3362,10 +3491,15 @@ class MemoryCoordinator:
 
     async def _outbox_worker(self) -> None:
         """Background task: drain neo4j_outbox, applying pending rows to Neo4j."""
+        global _worker_batches_in_flight
         log.info("outbox worker started (poll every %.1f s)", OUTBOX_POLL_INTERVAL)
         while True:
             try:
-                await self._drain_outbox()
+                _worker_batches_in_flight += 1
+                try:
+                    await self._drain_outbox()
+                finally:
+                    _worker_batches_in_flight -= 1
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -3707,11 +3841,17 @@ class MemoryCoordinator:
 
     async def _alternative_vector_worker(self) -> None:
         """Background task: fill alternatives whose embedding is still NULL."""
+        global _worker_batches_in_flight
         log.info("alternative-vector worker started (poll every %.1f s)",
                  ALT_VECTOR_POLL_INTERVAL)
         while True:
             try:
-                await self._fill_pending_alternative_vectors()
+                if not _backup_quiesce:
+                    _worker_batches_in_flight += 1
+                    try:
+                        await self._fill_pending_alternative_vectors()
+                    finally:
+                        _worker_batches_in_flight -= 1
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -11202,18 +11342,31 @@ class MemoryCoordinator:
             "clean": total == 0,
         }
 
+    def _lock_held(self) -> bool:
+        """Predicate: live connection held for quiesce advisory lock."""
+        conn = self._quiesce_conn
+        if conn is None:
+            return False
+        try:
+            return not conn.is_closed()
+        except Exception:
+            return False
+
+    def _remaining_ttl_seconds(self) -> float | None:
+        """Remaining seconds on the dead-man timer, or None if not quiesced/set."""
+        if self._ttl_target is None or not _backup_quiesce:
+            return None
+        return round(max(0.0, self._ttl_target - _now()), 3)
+
     # ── POST /admin/backup (quiesce / resume) ─────────────────────────────────
 
     async def handle_backup(self, request: web.Request) -> web.Response:
         """Admin control for the backup quiesce. Body: {"state","max_seconds"}.
 
         state=quiesce → shed client writes immediately and acquire the EXCLUSIVE
-        backup advisory lock, which blocks only until in-flight daemon cycles
-        release their shared lock — so a 200 means "all writers drained, safe to
-        dump". A daemon cycle that outlasts BACKUP_DAEMON_DRAIN_TIMEOUT yields 202
-        (drain_timeout): client writes are still shed, but a daemon may write
-        during the dump, so the caller decides whether to proceed.
-        state=resume → release the lock, clear the flag, cancel the TTL.
+        backup advisory lock, waiting until in-flight daemon cycles and client
+        writes complete.
+        state=resume → release the lock, clear the flag, cancel the dead-man timer.
         """
         try:
             body = await request.json()
@@ -11222,22 +11375,74 @@ class MemoryCoordinator:
         state = (body.get("state") or "").strip().lower()
         if state == "quiesce":
             try:
-                max_s = float(body.get("max_seconds") or BACKUP_QUIESCE_MAX_SECONDS)
-            except (TypeError, ValueError):
-                max_s = BACKUP_QUIESCE_MAX_SECONDS
-            drained = await self._begin_quiesce(max_s)
-            return web.json_response(
-                {
-                    "status": "success",
-                    "quiesced": True,
-                    "daemons": "drained" if drained else "drain_timeout",
-                    "ttl_seconds": max_s,
-                },
-                status=200 if drained else 202,
-            )
+                max_s = _validate_max_seconds(body.get("max_seconds"))
+            except ValueError:
+                lock_held = self._lock_held()
+                return web.json_response(
+                    {
+                        "status": "error",
+                        "error": "max_seconds_invalid",
+                        "reason": "max_seconds_invalid",
+                        "quiesced": _backup_quiesce,
+                        "daemons": "fenced" if lock_held else "not_fenced",
+                        "lock_held": lock_held,
+                        "writes_in_flight": _writes_in_flight,
+                        "oldest_write_age_s": _oldest_write_age_s(),
+                        "worker_batches_in_flight": _worker_batches_in_flight,
+                        "ttl_seconds": self._remaining_ttl_seconds(),
+                    },
+                    status=400,
+                )
+
+            res = await self._begin_quiesce(max_s, request=request)
+
+            reason = res.get("reason")
+            lock_held = bool(res.get("lock_held"))
+            writes_in_flight = int(res.get("writes_in_flight", 0))
+            worker_batches_in_flight = int(res.get("worker_batches_in_flight", 0))
+            oldest_write_age_s = res.get("oldest_write_age_s")
+            quiesced = bool(res.get("quiesced", _backup_quiesce))
+            daemons = "fenced" if lock_held else "not_fenced"
+
+            payload = {
+                "status": "success" if reason is None and lock_held else "error",
+                "error": reason if (reason is not None or lock_held) else "lock_connection_failed",
+                "reason": reason if (reason is not None or lock_held) else "lock_connection_failed",
+                "quiesced": quiesced,
+                "daemons": daemons,
+                "lock_held": lock_held,
+                "writes_in_flight": writes_in_flight,
+                "oldest_write_age_s": oldest_write_age_s,
+                "worker_batches_in_flight": worker_batches_in_flight,
+                "ttl_seconds": self._remaining_ttl_seconds(),
+            }
+
+            if reason == "resumed_during_wait":
+                payload["ended_by"] = self._quiesce_ended_by
+                return web.json_response(payload, status=409)
+
+            if reason == "caller_gone":
+                if res.get("ended_here"):
+                    payload["ended_by"] = "caller_gone"
+                return web.json_response(payload, status=409)
+
+            if reason == "lock_connection_failed" or not lock_held:
+                if reason is None:
+                    payload["status"] = "error"
+                    payload["error"] = "lock_connection_failed"
+                    payload["reason"] = "lock_connection_failed"
+                return web.json_response(payload, status=202)
+
+            if reason is not None:
+                payload["ended_by"] = self._quiesce_ended_by
+                return web.json_response(payload, status=409)
+
+            return web.json_response(payload, status=200)
+
         if state == "resume":
-            await self._end_quiesce()
-            return web.json_response({"status": "success", "quiesced": False})
+            await self._end_quiesce(ended_by="resume")
+            return web.json_response({"status": "success", "quiesced": False, "lock_held": False})
+
         return web.json_response(
             {"status": "error", "message": "state must be 'quiesce' or 'resume'"},
             status=400,
@@ -11261,79 +11466,365 @@ class MemoryCoordinator:
             return web.json_response(
                 {"status": "error", "message": f"outbox census unavailable: {type(exc).__name__}"},
                 status=503)
-        return web.json_response({"status": "success", "outbox": _outbox_public_view(census)})
+        return web.json_response({
+            "status": "success",
+            "quiesced": _backup_quiesce,
+            "lock_held": self._lock_held(),
+            "writes_in_flight": _writes_in_flight,
+            "oldest_write_age_s": _oldest_write_age_s(),
+            "worker_batches_in_flight": _worker_batches_in_flight,
+            "outbox": _outbox_public_view(census),
+        })
 
-    async def _begin_quiesce(self, max_seconds: float) -> bool:
-        """Shed client writes now; acquire the exclusive backup advisory lock to
-        fence the REM/NREM daemons. Returns True once the lock is held (daemons
-        drained), False if an in-flight cycle outlasts the drain timeout. Idempotent:
-        a second call while quiesced only refreshes the TTL.
+    def _rearm_quiesce_timer(self, max_s: float) -> None:
+        """The dead-man timer (decision:334: gateway-coordinated quiesce; a crashed backup cannot wedge writes): caller-chosen auto-resume backstop.
+
+        A first quiesce arms it when it sets the flag; any 200 or 202 re-arms it to
+        _now() + max_s; an abandoned refresh leaves it as it was.
         """
-        global _backup_quiesce
-        _backup_quiesce = True
-        # (Re)arm the TTL auto-resume so a dead backup script can't wedge writes.
+        now = _now()
+        self._ttl_target = now + max_s
         if self._quiesce_timer and not self._quiesce_timer.done():
             self._quiesce_timer.cancel()
-        self._quiesce_timer = asyncio.create_task(self._quiesce_ttl(max_seconds))
-        # Already holding the exclusive lock → nothing more to do (TTL refreshed).
-        if self._quiesce_conn is not None:
-            return True
-        # Dedicated connection (outside the pool) so the lock auto-releases if this
-        # process dies — Postgres drops session advisory locks on disconnect.
+        self._quiesce_timer = asyncio.create_task(self._quiesce_ttl(max_s))
+
+    def _quiesce_result(
+        self,
+        reason: str | None,
+        lock_held: bool | None = None,
+        ended_here: bool = False,
+    ) -> dict:
+        """The one result dict: lock_held, drained, writes_in_flight, worker_batches_in_flight,
+        oldest_write_age_s, reason, quiesced, ended_here.
+        """
+        held = self._lock_held() if lock_held is None else bool(lock_held)
+        drained = bool(held and _writes_in_flight == 0 and _worker_batches_in_flight == 0)
+        return {
+            "lock_held": held,
+            "writes_in_flight": _writes_in_flight,
+            "worker_batches_in_flight": _worker_batches_in_flight,
+            "oldest_write_age_s": _oldest_write_age_s(),
+            "reason": reason,
+            "quiesced": _backup_quiesce,
+            "drained": drained,
+            "ended_here": ended_here,
+        }
+
+    def _quiesce_exit(self, request: "web.Request | None", gen: int) -> str | None:
+        """Check exit conditions without awaiting: generation bump precedes caller disconnect
+        because a caller that leaves after a resume must not end a newer quiesce.
+        """
+        if _quiesce_generation != gen:
+            return "resumed_during_wait"
+        if request is not None and getattr(request, "transport", None) is None:
+            return "caller_gone"
+        return None
+
+    async def _quiesce_watch(
+        self, task: asyncio.Task, request: "web.Request | None", gen: int
+    ) -> str | None:
+        """Wait for task, checking _quiesce_exit every 0.1 s.
+        Return the exit reason, or None once the task is done and a final _quiesce_exit is None.
+        """
+        while not task.done():
+            r = self._quiesce_exit(request, gen)
+            if r:
+                return r
+            await asyncio.wait({task}, timeout=0.1)
+        return self._quiesce_exit(request, gen)
+
+    async def _quiesce_abort(
+        self,
+        reason: str,
+        task: "asyncio.Task | None",
+        started_here: bool,
+        gen: int,
+    ) -> dict:
+        """Cancel task if not done; detach and terminate the PENDING connection only;
+        end quiesce if caller_gone and started_here and generation matches (fact:3102: an abandoned first quiesce is ended).
+        """
+        end = reason == "caller_gone" and started_here and _quiesce_generation == gen
+        ended_here = False
+
+        def _drop_pending():
+            pending, self._quiesce_pending_conn = self._quiesce_pending_conn, None
+            if pending is not None:
+                try:
+                    pending.terminate()
+                except Exception:
+                    pass
+
         try:
-            conn = await asyncpg.connect(PG_DSN)
-        except Exception as exc:
-            log.warning("backup quiesce: could not open advisory-lock connection: %s", exc)
-            return False
-        try:
-            await conn.execute(
-                "SET lock_timeout = '%dms'" % int(BACKUP_DAEMON_DRAIN_TIMEOUT * 1000)
-            )
-            await conn.execute("SELECT pg_advisory_lock($1)", BACKUP_ADVISORY_LOCK_KEY)
-        except Exception as exc:
-            # Daemons did not drain in time (lock_timeout). Leave client writes shed
-            # but report drain_timeout; drop the connection so no half-held lock lingers.
-            log.warning(
-                "backup quiesce: daemons did not drain within %.0fs (%s)",
-                BACKUP_DAEMON_DRAIN_TIMEOUT, exc,
-            )
+            if task is not None and not task.done():
+                task.cancel()
+                _drop_pending()                  # also makes the child fail fast
+                await asyncio.gather(task, return_exceptions=True)
+        finally:
+            _drop_pending()
+            if end and _quiesce_generation == gen:
+                await self._end_quiesce(ended_by="caller_gone")   # _end_quiesce has no internal await before its effects
+                ended_here = True
+        return self._quiesce_result(reason, ended_here=ended_here)
+
+    async def _quiesce_connect_and_lock(self, gen: int) -> None:
+        """Connect to Postgres and acquire advisory lock, storing into pending connection (fact:3102: a check interval is not a limit)."""
+        conn = await asyncpg.connect(PG_DSN, timeout=None)
+        self._quiesce_pending_conn = conn
+        if _quiesce_generation != gen:
             try:
-                await conn.close()
+                conn.terminate()
             except Exception:
                 pass
-            return False
-        self._quiesce_conn = conn
-        log.info(
-            "backup quiesce: client writes shed + daemons fenced "
-            "(exclusive advisory lock %d held)", BACKUP_ADVISORY_LOCK_KEY,
-        )
-        return True
+            return
+        try:
+            # A check interval that only detects a vanished client is not a limit (fact:3102, interpreting decision:3101: no arbitrary timer or fixed limit without shown need).
+            await conn.execute("SET client_connection_check_interval = '1s'")
+        except asyncpg.PostgresConnectionError:
+            raise
+        except asyncpg.PostgresError as exc:
+            log.info(
+                "Postgres does not support client_connection_check_interval (%s); "
+                "relying on gateway transport",
+                exc,
+            )
+        if _quiesce_generation != gen:
+            try:
+                conn.terminate()
+            except Exception:
+                pass
+            return
+        await conn.execute("SELECT pg_advisory_lock($1)", BACKUP_ADVISORY_LOCK_KEY)
 
-    async def _end_quiesce(self) -> None:
-        """Release the advisory lock, clear the flag, cancel the TTL. Safe to call
-        when not quiesced (idempotent).
+    async def _begin_quiesce(self, max_seconds: float, request: "web.Request | None" = None) -> dict:
+        """Shed client writes and acquire exclusive backup advisory lock.
+
+        Fences REM/NREM daemons while client writes and running batches drain.
+        Single-flight under self._quiesce_lock. The caller decides how long to wait;
+        the gateway enforces no arbitrary drain or connect timeouts (decision:3101: no arbitrary timer or fixed limit without shown need).
+        The caller-chosen dead-man timer (decision:334: gateway-coordinated quiesce; a crashed backup cannot wedge writes) is the only
+        time value in the quiesce path, ensuring a crashed caller cannot leave the
+        gateway quiesced indefinitely.
+
+        Ownership rules:
+        Before this call sets the flag, no exit changes anything.
+        Whether this call started the quiesce is decided just before setting the flag.
+        A connection this call opens stays pending until after the last wait, so an early
+        exit never touches the stored connection.
+        Status 200 is returned only with a live lock.
+        A closed or failing stored connection is dead and replaced.
+        A first quiesce arms the dead-man timer, any 200 or 202 re-arms it, and an abandoned
+        refresh leaves it as it was.
+        Cancellation (also while queued) runs the same cleanup.
+
+        Result keys:
+        - lock_held (bool): True when PostgreSQL advisory lock is held by this gateway
+        - writes_in_flight (int): number of admitted client writes currently in flight
+        - worker_batches_in_flight (int): number of daemon worker batches currently executing
+        - oldest_write_age_s (float | None): age in seconds of the oldest active write
+        - reason (str | None): exit reason, or None on success
+        - quiesced (bool): True if backup quiesce mode is active
+        - drained (bool): True when lock is held and writes and worker batches are 0
+        - ended_here (bool): True if this call ended the quiesce upon caller_gone
+
+        Reasons and HTTP codes:
+        - None → 200 (quiesced, lock acquired, writes drained)
+        - lock_connection_failed → 202 (writes drained, but lock connection failed so daemons not fenced)
+        - resumed_during_wait → 409 (quiesce was resumed while waiting)
+        - caller_gone → 409 (caller disconnected during wait)
+        - max_seconds_invalid → 400 (caller passed an invalid max_seconds value)
         """
         global _backup_quiesce
+        max_s = float(BACKUP_QUIESCE_MAX_SECONDS) if max_seconds is None else float(max_seconds)
+        entry_gen = _quiesce_generation
+        queue = asyncio.create_task(self._quiesce_lock.acquire())
+        try:
+            r = await self._quiesce_watch(queue, request, entry_gen)
+        except BaseException:
+            try:
+                if not queue.done():
+                    queue.cancel()
+                    await asyncio.gather(queue, return_exceptions=True)
+            finally:
+                if queue.done() and not queue.cancelled() and queue.exception() is None:
+                    self._quiesce_lock.release()
+            raise
+
+        if r:
+            try:
+                if not queue.done():
+                    queue.cancel()
+                    await asyncio.gather(queue, return_exceptions=True)
+            finally:
+                if queue.done() and not queue.cancelled() and queue.exception() is None:
+                    self._quiesce_lock.release()
+            return self._quiesce_result(r)
+
+        try:
+            r = self._quiesce_exit(request, entry_gen)
+            if r:
+                return self._quiesce_result(r)
+
+            gen = _quiesce_generation
+            started_here = not _backup_quiesce
+            _backup_quiesce = True
+            if started_here:
+                self._rearm_quiesce_timer(max_s)
+
+            task = None
+            try:
+                if self._quiesce_conn is not None and self._quiesce_conn.is_closed():
+                    stored, self._quiesce_conn = self._quiesce_conn, None
+                    if stored is not None:
+                        try:
+                            stored.terminate()
+                        except Exception:
+                            pass
+                    log.warning(
+                        "backup quiesce: stored lock connection was closed — "
+                        "detached and re-acquiring"
+                    )
+                elif self._quiesce_conn is not None:
+                    task = asyncio.create_task(self._quiesce_conn.fetchval("SELECT 1"))
+                    r = await self._quiesce_watch(task, request, gen)
+                    if r:
+                        return await self._quiesce_abort(r, task, started_here, gen)
+                    if task.cancelled() or task.exception() is not None or task.result() != 1:
+                        stored, self._quiesce_conn = self._quiesce_conn, None
+                        if stored is not None:
+                            try:
+                                stored.terminate()
+                            except Exception:
+                                pass
+                        log.warning(
+                            "backup quiesce: stored lock connection failed probe — "
+                            "detached and re-acquiring"
+                        )
+
+                if self._quiesce_conn is None:
+                    if self._quiesce_pending_conn is not None:
+                        pending, self._quiesce_pending_conn = self._quiesce_pending_conn, None
+                        if pending is not None:
+                            try:
+                                pending.terminate()
+                            except Exception:
+                                pass
+                        log.warning(
+                            "backup quiesce: stale pending connection detached before connect"
+                        )
+                    task = asyncio.create_task(self._quiesce_connect_and_lock(gen))
+                    r = await self._quiesce_watch(task, request, gen)
+                    if r:
+                        return await self._quiesce_abort(r, task, started_here, gen)
+                    if task.cancelled() or task.exception() is not None:
+                        pending, self._quiesce_pending_conn = self._quiesce_pending_conn, None
+                        if pending is not None:
+                            try:
+                                pending.terminate()
+                            except Exception:
+                                pass
+                        log.warning(
+                            "backup quiesce: failed to connect and acquire lock: %s",
+                            task.exception() if not task.cancelled() else "cancelled",
+                        )
+                        while _writes_in_flight or _worker_batches_in_flight:
+                            r = self._quiesce_exit(request, gen)
+                            if r:
+                                return await self._quiesce_abort(r, None, started_here, gen)
+                            await asyncio.sleep(0.1)
+
+                        r = self._quiesce_exit(request, gen)
+                        if r:
+                            return await self._quiesce_abort(r, None, started_here, gen)
+
+                        self._rearm_quiesce_timer(max_s)
+                        return self._quiesce_result("lock_connection_failed")
+
+                while _writes_in_flight or _worker_batches_in_flight:
+                    r = self._quiesce_exit(request, gen)
+                    if r:
+                        return await self._quiesce_abort(r, None, started_here, gen)
+                    await asyncio.sleep(0.1)
+
+                r = self._quiesce_exit(request, gen)
+                if r:
+                    return await self._quiesce_abort(r, None, started_here, gen)
+
+                if self._quiesce_pending_conn is not None:
+                    conn, self._quiesce_pending_conn = self._quiesce_pending_conn, None
+                    self._quiesce_conn = conn
+
+                    def _on_quiesce_conn_terminated(dead_conn=None):
+                        if self._quiesce_conn is conn:
+                            self._quiesce_conn = None
+                            if _backup_quiesce:
+                                log.warning(
+                                    "backup quiesce: backup lock connection lost while quiesced; "
+                                    "REM/NREM unfenced until the next quiesce call"
+                                )
+
+                    try:
+                        conn.add_termination_listener(_on_quiesce_conn_terminated)
+                    except Exception as exc:
+                        log.debug("could not add termination listener: %s", exc)
+
+                    if conn.is_closed():
+                        self._quiesce_conn = None
+                        if _backup_quiesce:
+                            log.warning(
+                                "backup quiesce: backup lock connection was closed at promotion"
+                            )
+
+                self._rearm_quiesce_timer(max_s)
+                if not self._lock_held():
+                    return self._quiesce_result("lock_connection_failed")
+                return self._quiesce_result(None)
+            except BaseException:
+                await self._quiesce_abort("caller_gone", task, started_here, gen)
+                raise
+        finally:
+            self._quiesce_lock.release()
+
+    async def _end_quiesce(self, ended_by: str = "resume") -> None:
+        """Release the backup advisory lock, clear the quiesce flag, bump generation.
+
+        Safe to call when not quiesced (idempotent).
+        Per decision:3101 (no arbitrary timer or fixed limit without shown need),
+        fact:3100 (no unlock wait: terminate() alone; Postgres drops the session lock): resume never waits. We detach
+        connections synchronously before any await and terminate them immediately;
+        Postgres automatically releases session advisory locks when the connection
+        terminates.
+        """
+        global _backup_quiesce, _quiesce_generation
+        _quiesce_generation += 1
         _backup_quiesce = False
-        if self._quiesce_timer and not self._quiesce_timer.done():
-            self._quiesce_timer.cancel()
+        self._quiesce_ended_by = ended_by
+        self._ttl_target = None
+
+        # Cancel dead-man timer unless called from the timer itself
+        timer = self._quiesce_timer
+        if timer is not None and timer is not asyncio.current_task():
+            timer.cancel()
         self._quiesce_timer = None
-        if self._quiesce_conn is not None:
+
+        # Detach connections before any await
+        conn, self._quiesce_conn = self._quiesce_conn, None
+        pending, self._quiesce_pending_conn = self._quiesce_pending_conn, None
+
+        if pending is not None:
             try:
-                await self._quiesce_conn.execute(
-                    "SELECT pg_advisory_unlock($1)", BACKUP_ADVISORY_LOCK_KEY
-                )
+                pending.terminate()
             except Exception:
                 pass
+        if conn is not None:
             try:
-                await self._quiesce_conn.close()
+                conn.terminate()
             except Exception:
                 pass
-            self._quiesce_conn = None
-            log.info("backup quiesce: released — writes and daemons resumed")
+        log.info("backup quiesce: released (ended_by=%s) — writes and daemons resumed", ended_by)
 
     async def _quiesce_ttl(self, max_seconds: float) -> None:
-        """Auto-resume backstop: if no resume arrives within max_seconds, release."""
+        """Auto-resume dead-man backstop (decision:334: gateway-coordinated quiesce; a crashed backup cannot wedge writes): if no refresh or resume arrives
+        within max_seconds, release the quiesce fence so writes and daemons can proceed."""
         try:
             await asyncio.sleep(max_seconds)
         except asyncio.CancelledError:
@@ -11342,9 +11833,7 @@ class MemoryCoordinator:
             "backup quiesce: TTL of %.0fs expired without resume — auto-resuming",
             max_seconds,
         )
-        # Detach self first so _end_quiesce won't cancel this running task mid-cleanup.
-        self._quiesce_timer = None
-        await self._end_quiesce()
+        await self._end_quiesce(ended_by="timer")
 
 
 # ── Registration ──────────────────────────────────────────────────────────────
