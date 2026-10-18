@@ -78,6 +78,30 @@ def test_count_domain_level_matches_partitioner():
     assert n == len(items) == 1
 
 
+def _one_section(pg_ids, stored, threshold=2):
+    """Partition `pg_ids` that all carry the one stored section string `stored`."""
+    contents = ["x", "y"][:len(pg_ids)] if len(set(pg_ids)) > 1 else ["x"] * len(pg_ids)
+    project_map = {i: "p" for i in pg_ids}
+    domains_map = {i: [stored] for i in pg_ids}
+    return eligible_domain_level_clusters(
+        contents, pg_ids, project_map, domains_map, threshold, {("p", stored)})
+
+
+def test_a_repeated_pg_id_does_not_count_twice_toward_the_threshold():
+    """A pg_id listed twice must not fill a bucket by itself."""
+    assert _one_section([1, 1], "a") == []
+
+
+def test_a_section_with_surrounding_spaces_forms_its_bucket_as_stored():
+    """The section is keyed exactly as stored; stripping it hid a registered name."""
+    assert _one_section([1, 2], " a ") == [(("p", " a "), ["x", "y"], [1, 2])]
+
+
+def test_a_whitespace_only_section_never_forms_a_bucket():
+    """A blank section name is skipped even when it is registered."""
+    assert _one_section([1, 2], "  ") == []
+
+
 # ── Decision 1080 ────────────────────────────────────────────────────────────
 
 def test_1080_fact_kind_from_own_source_ref():

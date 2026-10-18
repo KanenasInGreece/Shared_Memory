@@ -219,26 +219,22 @@ def test_i8_key_is_the_project_domain_tuple_not_project_alone():
 # structurally impossible" by sharing one function.
 
 def test_nrem_cycle_counts_reuses_the_folds_own_partitioner():
-    """MUTATION-CHECKED (see HANDOFF.md): temporarily replacing the
-    `from nrem_gate import count_domain_level_cycles` import (and its call)
-    with an inline reimplementation made this test fail. Reverted after.
+    """The gauge partitions with the fold's own `nrem_gate` functions.
 
-    Source-level proof that `_nrem_cycle_counts` cannot silently diverge from
-    the fold: it must import and call `count_domain_level_cycles` — the exact
-    count-only twin of `eligible_domain_level_clusters`, the SAME partitioner
-    `_consolidate_clusters` calls — never a second, hand-rolled threshold
-    check that could quietly stop matching it.
+    Source-level proof that `_nrem_cycle_counts` cannot diverge from the fold:
+    it imports `eligible_domain_level_clusters` (the partitioner
+    `_consolidate_clusters` calls) from `nrem_gate`, never a hand-rolled
+    threshold check.
 
-    ⛔ It must come from `nrem_gate`, NEVER from `consolidation_loop` — see
-    `test_nrem_gate_import_purity.py` for the defect class this guards (the
-    gateway service carries no psycopg2, and consolidation_loop imports it at
-    module level, so importing these pure functions from there raised
-    ModuleNotFoundError on every live call while every unit test, DB access
-    fully stubbed, stayed green)."""
+    ⛔ It must never import `consolidation_loop`: the gateway service carries no
+    psycopg2 and that module imports it at the top, so such an import raised
+    ModuleNotFoundError on every live call while the stubbed tests stayed green
+    (see `test_nrem_gate_import_purity.py`)."""
     source = inspect.getsource(co.MemoryCoordinator._nrem_cycle_counts)
-    assert "from nrem_gate import count_domain_level_cycles" in source
+    assert "from nrem_gate import" in source
+    assert "eligible_domain_level_clusters(" in source
     assert "from consolidation_loop import" not in source
-    assert "count_domain_level_cycles(" in source
+    assert "import consolidation_loop" not in source
     # No entity-hub language left in the fact-cycle half of this method at all
     # — that gate is gone, not just unused (the insight half below is a
     # DIFFERENT, still-live mechanism and legitimately keeps its own Cypher).

@@ -322,7 +322,8 @@ def test_nrem_fact_gate_is_grounded_non_superseded_not_rem_processed():
     discovery Cypher must still gate on GROUNDED_IN + non-superseded, and
     must NOT reintroduce a rem_processed precondition."""
     import inspect
-    source = inspect.getsource(ConsolidationDaemon._find_grounded_fact_groups)
+    from nrem_gate import grounded_fact_groups_cypher
+    source = grounded_fact_groups_cypher(with_content=True)
     assert "GROUNDED_IN" in source, "the v2 fact gate must require a GROUNDED_IN edge"
     assert "superseded" in source, "the v2 fact gate must exclude superseded facts"
     assert "rem_processed" not in source, (
