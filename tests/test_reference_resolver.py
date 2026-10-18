@@ -76,3 +76,42 @@ def test_references_in_known_relationships():
     from ontology import KNOWN_RELATIONSHIPS
     assert ONT.references in KNOWN_RELATIONSHIPS
     assert ONT.informed_by in KNOWN_RELATIONSHIPS
+
+
+# ── cue anchoring and whole numbers (clean-up 2026-10-18) ────────────────────
+
+def test_a_cue_inside_a_longer_word_is_not_a_cue():
+    """'artifact' contains 'fact' and 'indecision' contains 'decision'; neither cites a record."""
+    for text in ("The artifact 257 was measured.", "an indecision 381 moment",
+                 "prefact 381", "unrelated 214 results", "correlated 381 rows"):
+        assert _ids(text, 400) == [], text
+
+
+def test_a_cue_glued_to_its_number_is_not_a_reference():
+    assert _ids("decision381", 400) == []
+
+
+def test_a_longer_number_is_never_cut_to_a_valid_prefix():
+    valid = VALID | {3125, 10000}
+    ids = lambda text: [r[0] for r in rr.extract_references(text, 400, valid)]
+    assert ids("refines decision 31250") == []
+    assert ids("refines decision 10000") == [10000]
+    assert [r[0] for r in rr.extract_references("decision 381\u0662", 400, VALID)] == []
+
+
+def test_colon_and_hash_separators_still_resolve():
+    """A lock on the separators the new pattern keeps; it passes before and after."""
+    for text in ("decision:381", "decision #381", "decision: #381"):
+        assert _ids(text, 400) == [381], text
+
+
+def test_non_ascii_digits_are_not_an_id():
+    """ASCII-only by choice, the same rule record_ref.parse_ref applies to a ref."""
+    assert _ids("refines decision \u0663\u0668\u0661", 400) == []
+
+
+def test_a_one_digit_id_resolves_when_it_is_a_record():
+    """No digit floor: the valid-id check, not a length, decides (decision:3101)."""
+    valid = VALID | {7}
+    assert [r[0] for r in rr.extract_references("refines decision 7", 400, valid)] == [7]
+    assert _ids("decision 1 of 3", 400) == []
