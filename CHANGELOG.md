@@ -7,6 +7,17 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.0.19] - 2026-10-18
+
+Clean-up of `shared-memory/scripts/nrem_gate.py`, the first file of the backend clean-up campaign: comment, debugging, refactoring and simplification. `API_VERSION` stays 4. Restart the gateway; update the skills for the version.
+
+### Fixed
+- The NREM partitioner looks a section name up exactly as stored, so a registered name with surrounding spaces forms its group instead of never folding, and a fact listed twice in one group counts once toward the density threshold. Section names are stored trimmed, so no existing count moves.
+
+### Changed
+- The discovery query and the row-to-map fold that the consolidation daemon and the `/memory/telemetry` NREM gauge both used are now one copy each in `nrem_gate.py` (`grounded_fact_groups_cypher`, `project_domain_maps`), so the gauge cannot drift from the fold. The executed queries are unchanged byte for byte.
+- The gauge partitions once; `fact_cycles` is documented as the `(project, section)` groups at or above the density threshold, not cycles the daemon will certainly run. Telemetry shape and values are unchanged.
+
 ## [1.0.18] - 2026-10-17
 
 The container check, gateway half: a backup or reconcile quiesce now sees every write, cannot strand its lock, imposes no fixed time limit, and also works on an install without auth. `API_VERSION` stays 4. Restart the gateway; update the skills for the version. `ops/backup.sh` is unchanged and keeps working; the scripts that use the new replies come in the next release.
