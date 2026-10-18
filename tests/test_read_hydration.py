@@ -1468,3 +1468,27 @@ async def test_graph_row_value_whose_indexing_raises_still_returns_200():
 
     resp = await c.handle_graph(_graph_request())
     assert resp.status == 200
+
+
+# ── outbox-only ids: the status reply never invents a type ───────────────────
+
+_OUTBOX_ONLY = {"status": "applied", "retries": 1, "applied_at": None,
+                "rem_reviewed_at": None, "consolidated_at": None}
+
+
+@pytest.mark.asyncio
+async def test_status_of_an_outbox_only_id_does_not_call_a_decision_ref_a_fact():
+    """No technical_docs row, an outbox row present: fact:N and bare N answer the same;
+    decision:N is a 200 miss, not a 404 saying id N is a fact."""
+    bodies = {}
+    for ref in ("fact:31", "31", "decision:31"):
+        c, mock_conn, _ = _coord_with_mocks()
+        mock_conn.fetch = AsyncMock(return_value=[])
+        mock_conn.fetchrow = AsyncMock(side_effect=[None, dict(_OUTBOX_ONLY)])
+        resp = await c.handle_status(_status_request(ref))
+        assert resp.status == 200, ref
+        bodies[ref] = json.loads(resp.text)
+    assert bodies["fact:31"] == bodies["31"]
+    assert bodies["fact:31"]["exists"] is False
+    assert bodies["fact:31"]["neo4j"] == "applied"
+    assert bodies["decision:31"] == {"pg_id": 31, "exists": False, "neo4j": "unknown"}

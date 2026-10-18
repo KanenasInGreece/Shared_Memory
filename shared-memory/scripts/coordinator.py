@@ -128,7 +128,7 @@ def _short(value: Any, cap: int = 200) -> str:
 
 
 # FRAMEWORK_VERSION is the build string and may drift. API_VERSION is the wire contract with memory_bridge.py; bump it only when shape, auth, or routes break older clients.
-FRAMEWORK_VERSION = "1.0.19"
+FRAMEWORK_VERSION = "1.0.20"
 # API v2: retrospective is a full record. v4: unregistered project is 400 (proposal / new_project / sentinel).
 API_VERSION = 4
 CLIENT_VERSION_HEADER = "X-SM-Api-Version"
@@ -9472,6 +9472,10 @@ class MemoryCoordinator:
         if rec is None and ob is None:
             return web.json_response({"pg_id": pg_id, "exists": False, "neo4j": "unknown"})
 
+        # Only the outbox knows this id; a missing row cannot be called a decision or retrospective, so those refs are a miss.
+        if rec is None and record_type in ("decision", "retrospective"):
+            return web.json_response({"pg_id": pg_id, "exists": False, "neo4j": "unknown"})
+
         # The id resolved, but not to the type the caller named. Returning the row would be a confident wrong answer.
         actual_type = doc_record_type({"type": rec["type"]} if rec else None)
         if record_type and record_type != actual_type:
@@ -9496,7 +9500,7 @@ class MemoryCoordinator:
                 cycle_dur = round((s["cycle_finished"] - s["cycle_started"]).total_seconds(), 3)
             consolidated_into.append({
                 "summary_pg_id": s["id"],
-                "form": "insight" if s["kind"] == "insight" else "thematic_summary",
+                "form": "insight" if summary_record_type({"kind": s["kind"]}) == "insight" else "thematic_summary",
                 "entity": s["entity"],
                 "summary_created_at": _iso(s["created_at"]),
                 "fact_to_summary_seconds": latency,

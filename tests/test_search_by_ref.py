@@ -446,7 +446,7 @@ async def test_r11_a_body_without_refs_is_a_normal_search():
 
 @pytest.mark.asyncio
 async def test_r12_a_bare_integer_is_a_technical_docs_row():
-    """R12: A bare integer ref is looked up in community_summaries."""
+    """R12: A bare integer ref is a technical_docs row; community_summaries is never queried."""
     docs = {7: _doc(7, FACT_TEXT)}
     summaries = {7: _summary(7, SUMMARY_TEXT)}
     resp, _, conn = await _by_ref({"refs": ["7"]}, docs=docs, summaries=summaries)

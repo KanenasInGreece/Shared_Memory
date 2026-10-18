@@ -7,6 +7,18 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.0.20] - 2026-10-18
+
+Clean-up of `shared-memory/scripts/record_ref.py`, the second file of the backend clean-up campaign: comment, debugging, refactoring and simplification. `API_VERSION` stays 4. Restart the gateway; update the skills for the version.
+
+### Fixed
+- A record reference's id must be ASCII digits from 1 to 2^63-1. `search --ref fact:1_6` used to return record 16 and `fact:+5` record 5; those, `0`, negatives, oversize ids and non-ASCII digits are now refused with 400 on `GET /memory/status` and by `search --ref`.
+- `GET /memory/status/decision:N` (or `retrospective:N`) for an id known only to the outbox answers `exists: false` instead of a 404 claiming the id is a fact. `fact:N` and a bare `N` keep the outbox-only answer they gave before.
+- A stored record type or summary kind in another letter case or with spaces (for example `Decision`) now reads as that type everywhere — its ref, the decision lifecycle on a search hit, the insight tier, the status `form`, and REM enrichment — matching the graph label. Saves already store the type in lowercase.
+
+### Changed
+- REM enrichment and the status `form` use the shared record-type functions instead of their own copies.
+
 ## [1.0.19] - 2026-10-18
 
 Clean-up of `shared-memory/scripts/nrem_gate.py`, the first file of the backend clean-up campaign: comment, debugging, refactoring and simplification. `API_VERSION` stays 4. Restart the gateway; update the skills for the version.
