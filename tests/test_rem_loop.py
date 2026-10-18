@@ -1425,3 +1425,14 @@ async def test_llm_process_batch_envelope_list_content(monkeypatch):
     assert timing is None
     assert daemon._last_llm_failure == rem_mod.LLM_FAIL_TRANSPORT
 
+
+@pytest.mark.asyncio
+async def test_batch_fetch_content_reads_a_stored_type_in_another_case_as_its_type():
+    """The real fetch closure turns a row typed 'Decision' into kind 'decision', not 'fact'."""
+    daemon = REMDaemon.__new__(REMDaemon)
+    cur = MagicMock()
+    cur.fetchall.return_value = [(5, "body", "Decision", None)]
+    conn = MagicMock()
+    conn.cursor.return_value.__enter__.return_value = cur
+    out = await daemon._batch_fetch_content([5], conn, asyncio.get_running_loop())
+    assert out[5]["kind"] == "decision"

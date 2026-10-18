@@ -316,21 +316,10 @@ def fetch_fold_dead_letter_counts():
 
 
 def _fold_identity(record_type, ids):
-    """Content-derived dead-letter identity for a fold candidate (decision
-    882): its own member records, as sorted qualified refs
-    (record_ref.make_ref — decision 822's fact:N / decision:N form), joined
-    into one string. Unlike the display label (a lexicographic-min alias
-    name that is DELIBERATELY stable across cycles even as membership
-    changes — see the module docstring), this key changes whenever the
-    member set changes, so an alias merge or new content correctly produces
-    a fresh candidate instead of inheriting a smaller/different candidate's
-    failure history. Qualifying every ref by record_type also avoids the
-    cross-table pg_id collision decision 822 already diagnosed (technical_docs
-    and community_summaries run independent sequences) — relevant because a
-    caller could otherwise mix ids from both.
-    ``ids`` may contain duplicates/be unsorted; both are normalised here so
-    the same logical member set always produces the same string regardless
-    of caller ordering."""
+    """Dead-letter identity of a fold candidate (decision:882: key on the member records,
+    never on a display label): the sorted qualified refs of its members, so the key changes
+    whenever membership changes and a new candidate never inherits another's failure
+    history. Duplicates and order in ``ids`` are normalised."""
     return ",".join(sorted(make_ref(record_type, i) for i in {int(x) for x in ids}))
 
 

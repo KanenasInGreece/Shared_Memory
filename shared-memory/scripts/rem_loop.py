@@ -24,6 +24,7 @@ from neo4j import AsyncGraphDatabase
 
 sys.path.insert(0, os.path.dirname(__file__))
 from ontology import ONT
+from record_ref import doc_record_type
 from pool_status import pool_has_free_slot
 from log_hygiene import append_secure
 from dream_telemetry import (
@@ -586,8 +587,7 @@ class REMDaemon:
                 return {
                     row[0]: {
                         "content":        row[1],
-                        "kind":           row[2] if row[2] in (KIND_DECISION, KIND_RETRO)
-                                          else KIND_FACT,
+                        "kind":           doc_record_type({"type": row[2]}),
                         "created_at":     row[3],
                     }
                     for row in cur.fetchall()

@@ -107,3 +107,36 @@ def test_same_integer_yields_different_refs_in_each_namespace():
     is what stops those two being the same reference."""
     assert co.make_ref(co.doc_record_type({"type": "fact"}), 16) != \
            co.make_ref(co.summary_record_type({"kind": "thematic"}), 16)
+
+
+# ── strict ids and normalised types (clean-up 2026-10-18) ────────────────────
+
+@pytest.mark.parametrize("bad", [
+    "1_6", "+816", "-1", "0", "9223372036854775808", "fact:1_6", "fact:+5",
+    "fact:-5", "fact:0", "١٢",
+])
+def test_an_id_that_int_would_coerce_is_refused(bad):
+    """int() accepts underscores, signs and non-ASCII digits; each of these would
+    otherwise resolve to a real, different row."""
+    with pytest.raises(ValueError):
+        co.parse_ref(bad)
+
+
+def test_the_largest_bigint_id_and_spaces_around_the_number_still_parse():
+    """Guards the upper bound and the trimming the strict parser keeps (passes before and after; dies if
+    ID_MAX is off by one or the number is no longer stripped)."""
+    assert co.parse_ref("9223372036854775807") == (None, 9223372036854775807)
+    assert co.parse_ref("fact: 816") == ("fact", 816)
+
+
+@pytest.mark.parametrize("meta,expected", [
+    ({"type": "Decision"},         "decision"),
+    ({"type": " retrospective "}, "retrospective"),
+])
+def test_a_stored_type_in_another_case_keeps_its_type(meta, expected):
+    """The graph labels a 'Decision' row a Decision; its ref must say decision too."""
+    assert co.doc_record_type(meta) == expected
+
+
+def test_an_insight_kind_in_another_case_is_still_an_insight():
+    assert co.summary_record_type({"kind": "Insight"}) == "insight"
