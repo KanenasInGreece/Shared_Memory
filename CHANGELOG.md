@@ -7,6 +7,14 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.0.21] - 2026-10-18
+
+Clean-up of `shared-memory/scripts/reference_resolver.py`, the third file of the backend clean-up campaign: comment, debugging and simplification. `API_VERSION` stays 4. Restart the gateway; update the skills for the version. Only the operator-run `resolve_references.py` backfill uses this module; nothing changes until that is run with `--apply`.
+
+### Fixed
+- A textual citation needs a whole-word cue (`decision`, `fact`, `pg_id`, `refines` ...) followed by a space, `:` or `#`. "artifact 257", "indecision 381" and "decision381" are no longer read as citations.
+- The cited id is the whole number. The old pattern took two to four digits, so "decision 31250" was cut to 3125 — a different, existing record — and ids above 9999 or below 10 could never be cited. Whether a number is a record is now decided only by the existing-id check. Non-ASCII digits are not an id, as for record refs since 1.0.20.
+
 ## [1.0.20] - 2026-10-18
 
 Clean-up of `shared-memory/scripts/record_ref.py`, the second file of the backend clean-up campaign: comment, debugging, refactoring and simplification. `API_VERSION` stays 4. Restart the gateway; update the skills for the version.

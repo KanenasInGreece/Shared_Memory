@@ -1,24 +1,22 @@
-"""Reference resolution (Stage 1.2b) — turn textual record references into edges.
+"""Extract textual record references ("refines decision 381", "addendum to pg_id 257") and
+label them; resolve_references.py, the operator-run backfill, writes the edges (decision:474
+as refined by retrospective:1697: deterministic, no LLM judge, REM writes no edges).
 
-Agents routinely reference other records in free text ("refines decision 381",
-"addendum to pg_id 257"). These are real cross-references that previously leaked
-as noise entity nodes or stayed invisible in prose. This module extracts them
-deterministically (context-gated regex + id validation) and assigns a
-relationship type, materialising record→record edges.
-
-Relationship-type judgment is deterministic — there is no LLM judge. The rule:
-Decision→Decision = INFORMED_BY (activates the dormant "prior decision used as
-input" edge); any other record pairing = REFERENCES. Neither ever yields
-SUPERSEDES, which is explicit-only (`--supersedes`).
+A number counts only after a whole-word reference cue and a separator, and only when it is an
+existing technical_docs id. Decision→Decision is INFORMED_BY and every other pairing is
+REFERENCES; SUPERSEDES is never produced here, it is explicit-only (`--supersedes`).
 """
 import re
 
 from ontology import ONT
 
-# Context-gated: a bare number is ignored — it must follow a record-reference cue.
+# A whole-word cue, then whitespace, ':' or '#', then the whole number; the valid-id check in
+# extract_references decides whether it is a record. ASCII digits only, as record_ref.parse_ref,
+# and a number followed by any digit is never cut to a valid prefix.
 _REF_RE = re.compile(
-    r"(?:pg[_ ]?id|decision|fact|retrospective|supersed\w*|refines|"
-    r"follow-?up to|builds on|addendum to|companion to|related)\s*:?\s*#?\s*(\d{2,4})",
+    r"\b(?:pg[_ ]?id|decision|fact|retrospective|supersed\w*|refines|"
+    r"follow-?up to|builds on|addendum to|companion to|related)"
+    r"[\s:#]+([0-9]+)(?!\d)",
     re.I,
 )
 
