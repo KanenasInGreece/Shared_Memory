@@ -23,7 +23,8 @@ from insight_gate import (
     passes_insight_gate, order_components, classify_identity,
 )
 from project_axis import PROJECT_SQL, fold_eligible
-from nrem_gate import eligible_domain_level_clusters, count_domain_level_cycles  # noqa: F401 — re-exported from nrem_gate; importing this file pulls psycopg2, which telemetry does not ship
+from nrem_gate import eligible_domain_level_clusters, project_domain_maps, grounded_fact_groups_cypher
+from nrem_gate import count_domain_level_cycles  # noqa: F401 — re-exported from nrem_gate; importing this file pulls psycopg2, which telemetry does not ship
 from domain_axis import resolve_domains
 from pool_status import pool_has_free_slot
 from dream_telemetry import (record_llm_call, adaptive_ceiling, embed_ceiling,
@@ -2335,27 +2336,6 @@ def merge_logs(log_dir: str) -> None:
             pass
 
 
-def _project_domain_maps(rows):
-    """Shared (project, section) discovery fold over `_find_grounded_fact_groups`'s
-    flat rows: the per-pg_id project/domains maps and the registered
-    (project, section) set both fact and insight discovery partition on.
-    Iteration order is preserved (dict insertion order = row order), so
-    `list(project_map)` matches whichever key set a caller previously
-    derived `pg_ids_all` from. Pure. Returns
-    ``(project_map, domains_map, registered_sections, pg_ids_all)``."""
-    project_map: dict = {}
-    domains_map: dict = {}
-    registered_sections: set = set()
-    for r in rows:
-        pid = r["pg_id"]
-        project_map[pid] = r["project"]
-        doms = domains_map.setdefault(pid, [])
-        if r["domain"] not in doms:
-            doms.append(r["domain"])
-        registered_sections.add((r["project"], r["domain"]))
-    return project_map, domains_map, registered_sections, list(project_map)
-
-
 class ConsolidationDaemon:
     def __init__(self):
         self.pending_pg_ids = set()
@@ -2877,17 +2857,7 @@ class ConsolidationDaemon:
         """
         async with self.driver.session() as session:
             result = await session.run(
-                f"MATCH (j) WHERE j:{ONT.decision} OR j:{ONT.retrospective}"
-                f" MATCH (j)-[:{ONT.grounded_in}]->(f:{ONT.fact})"
-                f" WHERE coalesce(f.superseded, false) = false"
-                f" MATCH (f)-[:{ONT.domain_of}]->(dom:{ONT.domain})"
-                f"           -[:{ONT.project_of}]->(proj:{ONT.project})"
-                f" WITH DISTINCT f, proj.name AS project, dom.name AS domain"
-                # rem_summary when REM condensed a long fact; otherwise the curated text.
-                f" RETURN f.pg_id AS pg_id,"
-                f"        coalesce(f.rem_summary, f.content) AS content,"
-                f"        project, domain"
-            )
+                grounded_fact_groups_cypher(with_content=True))
             return await result.data()
 
     async def run_lineage_invalidation_pass(self, context="consolidation"):
@@ -3169,7 +3139,7 @@ class ConsolidationDaemon:
             # Axis membership comes from the graph walk already in these rows, not a second Postgres lookup. A DOMAIN_OF edge exists only for a registered section.
             content_by_pid: dict = {r["pg_id"]: r["content"] for r in rows}
             project_map, domains_map, registered_sections, pg_ids_all = \
-                _project_domain_maps(rows)
+                project_domain_maps(rows)
             contents_all = [content_by_pid[pid] for pid in pg_ids_all]
 
             # Only (project, section) folds. There is no entity level and no project-only level.
@@ -3684,7 +3654,7 @@ class ConsolidationDaemon:
             return []
 
         project_map, domains_map, registered_sections, pg_ids_all = \
-            _project_domain_maps(rows)
+            project_domain_maps(rows)
 
         # Same partitioner as the fact cycle, not a second derivation.
         groups = eligible_domain_level_clusters(

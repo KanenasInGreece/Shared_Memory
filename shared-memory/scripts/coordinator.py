@@ -10862,62 +10862,35 @@ class MemoryCoordinator:
                                as_of=datetime.now(timezone.utc).isoformat(), error=None)
 
     async def _nrem_cycle_counts(self) -> dict:
-        """Pending NREM consolidation cycles for facts and decisions.
+        """The `(project, section)` groups at or above the density threshold.
 
-        v2 (C1b/C2): reproduces consolidation_loop's v2 FACT GATE (Dreaming
-        Cycle Plan to v2, §2.1) exactly — there is no more entity-hub gate and
-        no more project-only gate to sum against it. Facts are the grounded,
-        non-superseded Facts of each registered (project, domain) group,
-        counted where a group meets ONT.density_threshold; `decision_cycles`
-        (C2) now counts GATING (project, domain) groups — G1 (the fact gate)
-        passed AND `insight_gate.passes_insight_gate` (G2 >=1 Retrospective,
-        G3 >=1 fresh judgement) true on the group's full walked reach — the
-        SAME predicate `consolidation_loop._find_fresh_insight_clusters`
-        folds on, via the SAME `insight_gate.walk_group_reached_set`/
-        `passes_insight_gate` this module imports at the top (never
-        `consolidation_loop` itself — that module imports psycopg2 at its own
-        top level and the shipped gateway service does not carry psycopg2;
-        see the v0.8.65 nrem-telemetry-gauge fix this pattern follows).
+        These are not cycles the daemon will certainly run: it also skips an
+        unchanged summary and a dead-lettered cluster, which need Postgres.
+        `decision_cycles` counts the groups that also pass
+        `insight_gate.passes_insight_gate` (a Retrospective and a fresh judgement
+        on the group's walked reach), the predicate
+        `consolidation_loop._find_fresh_insight_clusters` folds on. ⛔ Never import
+        `consolidation_loop` here: it imports psycopg2 at the top and the gateway
+        does not carry it.
         """
-        # The same walk the fold uses: GROUNDED_IN, then DOMAIN_OF, then PROJECT_OF, never MENTIONS. An edge exists only for a registered section, so presence already proves registration.
+        # NREM gauge uses nrem_gate (no DB driver); never import the daemon module (psycopg2 not in the gateway venv).
+        from nrem_gate import (eligible_domain_level_clusters,
+                               grounded_fact_groups_cypher, project_domain_maps)
         async with self._neo4j.session() as session:
-            fres = await session.run(
-                f"MATCH (j) WHERE j:{ONT.decision} OR j:{ONT.retrospective}"
-                f" MATCH (j)-[:{ONT.grounded_in}]->(f:{ONT.fact})"
-                f" WHERE coalesce(f.superseded, false) = false"
-                f" MATCH (f)-[:{ONT.domain_of}]->(dom:{ONT.domain})"
-                f"           -[:{ONT.project_of}]->(proj:{ONT.project})"
-                f" WITH DISTINCT f, proj.name AS project, dom.name AS domain"
-                f" RETURN f.pg_id AS pg_id, project, domain",
-            )
+            fres = await session.run(grounded_fact_groups_cypher(with_content=False))
             fact_rows = await fres.data()
 
-        # NREM gauge uses nrem_gate (no DB driver); never import the daemon module (psycopg2 not in the gateway venv).
-        from nrem_gate import count_domain_level_cycles
-        from nrem_gate import eligible_domain_level_clusters
-        project_map: dict[int, str] = {}
-        domains_map: dict[int, list] = {}
-        registered_sections: set = set()
-        for r in fact_rows:
-            pid = r["pg_id"]
-            project_map[pid] = r["project"]
-            doms = domains_map.setdefault(pid, [])
-            if r["domain"] not in doms:
-                doms.append(r["domain"])
-            registered_sections.add((r["project"], r["domain"]))
-        pg_ids_all = list(project_map)
+        project_map, domains_map, registered_sections, pg_ids_all = (
+            project_domain_maps(fact_rows))
 
         # This is the fact gate. A second always-equal domain_level_cycles field would look like a different number.
-        fact_cycles = count_domain_level_cycles(
-            pg_ids_all, project_map, domains_map,
-            ONT.density_threshold, registered_sections,
-        ) if pg_ids_all else 0
-
-        # Count gating groups, not decisions. Each candidate is one small walk on the refresh, not on the request.
         groups = eligible_domain_level_clusters(
             [""] * len(pg_ids_all), pg_ids_all, project_map, domains_map,
             ONT.density_threshold, registered_sections,
         ) if pg_ids_all else []
+        fact_cycles = len(groups)
+
+        # Count gating groups, not decisions. Each candidate is one small walk on the refresh, not on the request.
         decision_cycles = 0
         for _key, _contents, fact_ids in groups:
             labels, consolidated, _components = await walk_group_reached_set(
