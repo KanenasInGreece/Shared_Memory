@@ -18,14 +18,17 @@ each other would hang the save that triggered them, or loop until something
 gives. So the chain is collapsed at WRITE time instead: renaming a project
 re-points every alias already aimed at it and demotes the old canonical to an
 alias, all in one transaction, so every alias always points DIRECTLY at a
-canonical name. Reads stay a single indexed lookup, forever, and the chain is
-still legible in the superseded rows.
+canonical name. Reads stay a single indexed lookup, forever. The re-point
+overwrites the active row's target in place: nothing supersedes an alias row,
+though decision:1015 (A4: mappings superseded, never deleted) asks for it.
 
 SERVER-SIDE ONLY — never shipped in a skill. Clients send what their folder is
 called; deciding what that means is the gateway's job.
 """
 
-# `{p}` is the caller's placeholder, same as PROJECT_MATCH_SQL. The junction stores project_id (migration 027); the current name is read back, so a rename does not rewrite the alias row.
+# `{p}` is the caller's placeholder, same as PROJECT_MATCH_SQL. Exact match on the stored
+# spelling, at most one row (decision:1015 A2: one active mapping per alias). The name is
+# read through project_id (migration 027), so the row never holds a stale project name.
 ALIAS_RESOLVE_SQL = (
     "SELECT p.name"
     " FROM project_aliases pa"
@@ -51,44 +54,3 @@ ALIAS_UPSERT_SQL = (
     " ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name"
     " RETURNING id"
 )
-
-
-def alias_refusal(alias: str, canonical: str, registered: set) -> str | None:
-    """Why this alias must not be created — or ``None`` when it may.
-
-    A pure predicate over the three ways an alias can be wrong, so each one can
-    be asserted directly rather than inferred from a database error message. The
-    database enforces all three as well; this exists so the caller can refuse
-    early with something a human can read.
-    """
-    if not isinstance(alias, str) or not alias.strip():
-        return "alias is empty"
-    if not isinstance(canonical, str) or not canonical.strip():
-        return "canonical project is empty"
-    alias, canonical = alias.strip(), canonical.strip()
-    if alias == canonical:
-        return f"{alias!r} cannot be an alias of itself"
-    # A1 — the namespaces are disjoint. A string that is both a registered
-    # project and an alias for a DIFFERENT one has two correct answers.
-    if alias in registered:
-        return (
-            f"{alias!r} is a registered project; aliasing it would give one "
-            f"string two meanings. Merge the records first, then alias the name "
-            f"as part of retiring it"
-        )
-    if canonical not in registered:
-        return f"{canonical!r} is not a registered project"
-    return None
-
-
-def canonical_or_self(name, aliases: dict):
-    """The canonical name for ``name``, or ``name`` unchanged.
-
-    ``aliases`` maps alias → canonical, already one-hop by construction (A3).
-    Deliberately NOT recursive: if this ever needs to follow a second hop, the
-    write path has failed to collapse a chain and the right fix is there, not a
-    loop here that would paper over it and could cycle.
-    """
-    if not isinstance(name, str):
-        return name
-    return aliases.get(name.strip(), name)

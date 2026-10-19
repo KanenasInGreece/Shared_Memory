@@ -7,6 +7,16 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.0.23] - 2026-10-20
+
+Clean-up of `shared-memory/scripts/project_alias.py`, the module holding the SQL that resolves a retired project name to its current one, and the fifth file of the backend clean-up campaign: comment and simplification. No behaviour change. `API_VERSION` stays 4. Restart the gateway; update the skills for the version.
+
+### Removed
+- `alias_refusal` and `canonical_or_self`. Nothing called either. The database and `normalize_projects.py` already refuse a bad alias (and `alias_refusal` had drifted from them), and the gateway resolves names through `project_axis.resolve_axis_value`, of which `canonical_or_self` was a partial copy.
+
+### Fixed
+- Two comments that described behaviour the code does not have. A rename does re-point the alias row, and a collapsed chain is not kept in superseded rows: the re-point overwrites the active row, and nothing supersedes an alias row.
+
 ## [1.0.22] - 2026-10-19
 
 Clean-up of `shared-memory/scripts/resolve_references.py`, the operator-run backfill that writes a record's textual citations ("refines decision 381") as graph edges, and the fourth file of the backend clean-up campaign: comment, debugging, refactoring and simplification. `API_VERSION` stays 4. Restart the gateway; update the skills for the version. Nothing in the graph changes until the operator runs the backfill with `--apply`; run it without `--apply` first to see what it would write and re-type.
