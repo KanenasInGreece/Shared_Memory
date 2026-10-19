@@ -1,6 +1,6 @@
-"""Stage 1.2b reference resolution — pure extraction + deterministic classification.
+"""Reference extraction — pure, no I/O.
 
-Classification is deterministic — there is no judge and no I/O of any kind. Live
+There is no judge and no relation choice; the backfill writes every citation as REFERENCES. Live
 motivation: 145/146 context-gated numeric refs in the corpus resolved to real
 records (e.g. "refines decision 381").
 """
@@ -54,22 +54,6 @@ def test_snippet_and_cue_captured():
 def test_non_string_content():
     assert rr.extract_references(None, 1, VALID) == []
     assert rr.extract_references(42, 1, VALID) == []
-
-
-def test_deterministic_relation_decision_to_decision():
-    assert rr.deterministic_relation(ONT.decision, ONT.decision) == ONT.informed_by
-
-
-def test_deterministic_relation_other_pairings_reference():
-    assert rr.deterministic_relation(ONT.fact, ONT.decision) == ONT.references
-    assert rr.deterministic_relation(ONT.decision, ONT.fact) == ONT.references
-    assert rr.deterministic_relation(ONT.fact, ONT.fact) == ONT.references
-
-
-def test_classify_is_deterministic():
-    # No network call ever — returns the label-based rule.
-    assert rr.classify_relation(ONT.decision, ONT.decision, "addendum to 257") == ONT.informed_by
-    assert rr.classify_relation(ONT.fact, ONT.decision, "see 276") == ONT.references
 
 
 def test_references_in_known_relationships():

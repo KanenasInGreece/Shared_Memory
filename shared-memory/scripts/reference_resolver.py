@@ -3,12 +3,10 @@ label them; resolve_references.py, the operator-run backfill, writes the edges (
 as refined by retrospective:1697: deterministic, no LLM judge, REM writes no edges).
 
 A number counts only after a whole-word reference cue and a separator, and only when it is an
-existing technical_docs id. Decision→Decision is INFORMED_BY and every other pairing is
-REFERENCES; SUPERSEDES is never produced here, it is explicit-only (`--supersedes`).
+existing technical_docs id. The backfill writes every citation as REFERENCES (decision:3135:
+a citation is not grounding); SUPERSEDES is never produced here, it is explicit-only (`--supersedes`).
 """
 import re
-
-from ontology import ONT
 
 # A whole-word cue, then whitespace, ':' or '#', then the whole number; the valid-id check in
 # extract_references decides whether it is a record. ASCII digits only, as record_ref.parse_ref,
@@ -41,20 +39,3 @@ def extract_references(content, source_pg_id, valid_ids):
         snippet = content[max(0, s - 30):s + 25].replace("\n", " ").strip()
         out.append((ref, m.group(0).strip(), snippet))
     return out
-
-
-def deterministic_relation(src_label: str, tgt_label: str) -> str:
-    """Label-based default: Decision→Decision = INFORMED_BY, else REFERENCES."""
-    if src_label == ONT.decision and tgt_label == ONT.decision:
-        return ONT.informed_by
-    return ONT.references
-
-
-def classify_relation(src_label, tgt_label, snippet) -> str:
-    """Relationship type for a resolved reference — deterministic, no I/O.
-
-    `snippet` is accepted (and ignored) so call sites keep passing the evidence
-    they logged the edge with; the type follows from the two labels alone. It can
-    never widen the relation set or return SUPERSEDES.
-    """
-    return deterministic_relation(src_label, tgt_label)
