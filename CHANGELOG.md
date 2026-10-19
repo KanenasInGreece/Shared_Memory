@@ -7,6 +7,21 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.0.22] - 2026-10-19
+
+Clean-up of `shared-memory/scripts/resolve_references.py`, the operator-run backfill that writes a record's textual citations ("refines decision 381") as graph edges, and the fourth file of the backend clean-up campaign: comment, debugging, refactoring and simplification. `API_VERSION` stays 4. Restart the gateway; update the skills for the version. Nothing in the graph changes until the operator runs the backfill with `--apply`; run it without `--apply` first to see what it would write and re-type.
+
+### Changed
+- Every citation is written as `REFERENCES`, whatever the two record types. A decision citing another decision used to be written as `INFORMED_BY`, the edge the insight gate and the section walk count as grounding, so a passing mention became grounding. Grounding is now only what the operator declares (decision:3135, refining decision:474).
+- `--apply` re-types the `INFORMED_BY` edges earlier versions of the backfill wrote (stamped `resolved_from='content'`) to `REFERENCES`, keeping their cue and date and marking each `retyped_from='INFORMED_BY'`. An edge that also carries `asserted_by` is the operator's grounding and is left alone. Insight grouping can change at the next NREM run where it rested on those edges.
+- All writes happen in one transaction, so a failed run writes nothing; the report says how many edges were new, already present, or not written. The dry-run lists every planned edge (it stopped at 30) and how many edges `--apply` would re-type.
+- The script connects with `PG_HOST`, `PG_PORT`, `PG_USER`, `PG_DATABASE`, `NEO4J_URI` and `NEO4J_USER` like the other maintenance scripts (defaults unchanged); it ignored them before.
+- `reference_resolver.classify_relation` and `deterministic_relation` are removed: with one edge type there is nothing to choose.
+
+### Fixed
+- A citation with a retrospective at either end is counted and reported as skipped. It used to be listed as a Fact edge and then silently not written. A record whose type is stored as `Decision` in another letter case is now read as a decision.
+- The type of each record and its content are read in one statement, so they come from the same snapshot.
+
 ## [1.0.21] - 2026-10-18
 
 Clean-up of `shared-memory/scripts/reference_resolver.py`, the third file of the backend clean-up campaign: comment, debugging and simplification. `API_VERSION` stays 4. Restart the gateway; update the skills for the version. Only the operator-run `resolve_references.py` backfill uses this module; nothing changes until that is run with `--apply`.
