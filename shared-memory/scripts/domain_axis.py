@@ -3,11 +3,13 @@
 Lookups take a project id. A record may list several sections. A missing domain identity writes no graph edge (no name-keyed fallback). Server-side only.
 """
 
+import math
 import os
 
 from ontology import ONT
 
-# Both spellings are the same field. Accepting only one would refuse the careless caller and silently accept the careful one.
+# A caller may use either key. Reading only one would file the record with that
+# section silently dropped, with no refusal.
 DOMAIN_KEYS: tuple[str, ...] = ("domain", "domains")
 
 
@@ -98,28 +100,49 @@ DOMAIN_NAME_OR_KEY_SQL = (
 # Description match is the difference from projects. `crypto` will never trigram-match a section named `security`.
 DOMAIN_PROPOSALS_SQL = (
     "SELECT name FROM ("
-    "  SELECT name, similarity(name, $2) AS score"
-    "    FROM project_domains WHERE project_id = $1 AND similarity(name, $2) >= $3"
-    "  UNION"
-    "  SELECT name, similarity(coalesce(description, ''), $2) AS score"
-    "    FROM project_domains"
-    "   WHERE project_id = $1 AND similarity(coalesce(description, ''), $2) >= $3"
+    "  SELECT name, max(score) AS score FROM ("
+    "    SELECT name, similarity(name, $2) AS score"
+    "      FROM project_domains WHERE project_id = $1 AND similarity(name, $2) >= $3"
+    "    UNION ALL"
+    "    SELECT name, similarity(coalesce(description, ''), $2) AS score"
+    "      FROM project_domains"
+    "     WHERE project_id = $1 AND similarity(coalesce(description, ''), $2) >= $3"
+    "  ) u GROUP BY name"
     ") m ORDER BY score DESC, name LIMIT $4"
 )
 
 # Same floor as projects: a rejected save with no usable proposals is a dead end.
 DOMAIN_PROPOSAL_SIMILARITY = 0.25
+# Bounds the proposal list only.
 DOMAIN_PROPOSAL_LIMIT = 5
 
+
+def _similarity_from_env(name: str, raw: str | None, default: float) -> float:
+    """A trigram floor from the environment: a number above 0 and at most 1."""
+    if raw is None:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        value = float("nan")
+    if not (math.isfinite(value) and 0 < value <= 1):
+        raise ValueError(
+            f"{name}={raw!r} is not a number greater than 0 and at most 1")
+    return value
+
+
 # Own name so a deployment can move it without moving the project floor. Sections are named more loosely, so this is the one more likely to need moving.
-DOMAIN_CONFUSABLE_SIMILARITY = float(
-    os.environ.get("DOMAIN_CONFUSABLE_SIMILARITY", "0.6")
+DOMAIN_CONFUSABLE_SIMILARITY = _similarity_from_env(
+    "DOMAIN_CONFUSABLE_SIMILARITY",
+    os.environ.get("DOMAIN_CONFUSABLE_SIMILARITY"),
+    0.6,
 )
 
+# No row cap: `confirm_distinct_from` is checked only against what this returns.
 DOMAIN_CONFUSABLE_SQL = (
     "SELECT name FROM project_domains"
     " WHERE project_id = $1 AND similarity(name, $2) >= $3 AND name <> $2"
-    " ORDER BY similarity(name, $2) DESC, name LIMIT $4"
+    " ORDER BY similarity(name, $2) DESC, name"
 )
 
 # Joins on project_id. An alias string is not unique across projects.
@@ -142,8 +165,13 @@ DOMAIN_ALIASES_SQL = (
 DOMAIN_REGISTER_SQL = (
     "INSERT INTO project_domains (project_id, name, created_by)"
     " VALUES ($1, $2, $3)"
-    " ON CONFLICT (project_id, name) DO NOTHING"
+    " ON CONFLICT DO NOTHING"
     " RETURNING id"
+)
+
+DOMAIN_BY_KEY_SQL = (
+    "SELECT name FROM project_domains"
+    " WHERE project_id = $1 AND normalized_key = axis_normalize($2)"
 )
 
 

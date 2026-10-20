@@ -498,7 +498,7 @@ async def test_a_genuinely_new_project_still_registers_with_no_extra_step():
         "c", report) is None
     c._register_project.assert_not_awaited()
     assert report["pending_registrations"]["project"] == "unrelated-thing"
-    await c._commit_axis_registrations(report, "c")
+    await c._commit_axis_registrations(report, "c", {})
     c._register_project.assert_awaited_once()
 
 

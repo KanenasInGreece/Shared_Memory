@@ -1419,7 +1419,7 @@ async def test_the_domain_gate_never_asks_for_the_identity_of_a_pending_project(
     c._register_project = AsyncMock(
         side_effect=lambda n, a: order.append("register_project"))
     c._register_domain = AsyncMock(
-        side_effect=lambda pid, n, a: order.append("register_domain"))
+        side_effect=lambda pid, n, a: order.append("register_domain") or True)
     with patch.object(c, "_embed", new=AsyncMock(return_value=[0.1] * 1024)):
         req = _make_request({
             "content": "a fact declaring a new project and its first section",
@@ -1487,7 +1487,7 @@ async def test_new_project_with_new_domain_registers_both_after_gates():
     c._register_project = AsyncMock(
         side_effect=lambda n, a: order.append(("project", n)))
     c._register_domain = AsyncMock(
-        side_effect=lambda pid, n, a: order.append(("domain", n, pid)))
+        side_effect=lambda pid, n, a: order.append(("domain", n, pid)) or True)
 
     async def _embed(*_a, **_kw):
         order.append(("embed",))

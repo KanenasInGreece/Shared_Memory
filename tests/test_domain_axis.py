@@ -194,7 +194,7 @@ async def test_the_second_submission_registers_it():
     c._register_domain.assert_not_awaited()
     assert [d["name"] for d in report["pending_registrations"]["domains"]] \
         == ["telemetry"]
-    await c._commit_axis_registrations(report, "claude")
+    await c._commit_axis_registrations(report, "claude", {})
     c._register_domain.assert_awaited_once()
 
 
@@ -677,3 +677,183 @@ async def test_retrospective_apply_writes_no_domain_edge_of_its_own():
     # regression in what a retrospective materialises.
     assert any(f"MERGE (r:{ONT.retrospective}" in q for q, _ in captured)
     assert any(ONT.had_outcome in q for q, _ in captured)
+
+
+# ── Clean-up round: proposal rows, confusable cap, floor validation, race ────
+
+def test_proposals_sql_returns_one_row_per_section():
+    """Shape check only; the live run is the behaviour proof (da-3)."""
+    import re
+    assert not re.search(r"UNION(?!\s+ALL)", DOMAIN_PROPOSALS_SQL)
+    assert re.search(r"GROUP BY name\b(?!\s*,)", DOMAIN_PROPOSALS_SQL)
+    assert "max(" in DOMAIN_PROPOSALS_SQL
+
+
+@pytest.mark.asyncio
+async def test_the_confusable_query_has_no_cap_and_every_neighbour_must_be_named():
+    """da-5: `confirm_distinct_from` is checked only against what the query returns."""
+    from domain_axis import DOMAIN_CONFUSABLE_SQL
+    names = [f"neighbour{i}" for i in range(6)]
+    c = _coord(registered=set(), near=names)
+    conn = c._acquire.return_value.__aenter__.return_value
+    conn.fetch = AsyncMock(side_effect=lambda sql, *a: (
+        [] if "domain_aliases" in sql else [{"name": n} for n in names]))
+    err = await c._new_domain_refusal(
+        "zzz", "p", 6, {"confirm_distinct_from": names[:5]})
+    assert err["error"] == "domain_confusable"
+    assert names[5] in err["message"]
+    assert err["proposals"] == names
+    first = conn.fetch.await_args_list[0]
+    assert len(first.args) == 4        # sql, project_id, name, floor
+    assert "LIMIT" not in DOMAIN_CONFUSABLE_SQL
+    assert "FETCH" not in DOMAIN_CONFUSABLE_SQL
+
+
+@pytest.mark.parametrize("raw", [
+    "nan", "NaN", "inf", "-inf", "Infinity", "0", "-0.1", "1.01", "x", ""])
+def test_a_floor_that_disables_or_floods_the_gate_is_refused(raw):
+    from domain_axis import _similarity_from_env
+    with pytest.raises(ValueError, match="DOMAIN_CONFUSABLE_SIMILARITY"):
+        _similarity_from_env("DOMAIN_CONFUSABLE_SIMILARITY", raw, 0.6)
+
+
+def test_a_valid_floor_is_accepted_and_none_means_the_default():
+    from domain_axis import _similarity_from_env
+    name = "DOMAIN_CONFUSABLE_SIMILARITY"
+    assert _similarity_from_env(name, None, 0.6) == 0.6
+    assert _similarity_from_env(name, "1", 0.6) == 1.0
+    assert _similarity_from_env(name, "0.35", 0.6) == 0.35
+
+
+def _register_conn(register_result, by_key=None, raises=None):
+    """A bare coordinator whose conn records which method ran each statement."""
+    from coordinator import MemoryCoordinator
+    c = MemoryCoordinator()
+    ran = []
+
+    async def fetchval(sql, *a):
+        ran.append(("fetchval", sql))
+        if "ON CONFLICT" in sql:
+            if raises is not None:
+                raise raises
+            return register_result
+        return by_key
+
+    conn = MagicMock()
+    conn.fetchval = AsyncMock(side_effect=fetchval)
+    conn.execute = AsyncMock(side_effect=lambda sql, *a: ran.append(("execute", sql)))
+    acq = MagicMock()
+    acq.__aenter__ = AsyncMock(return_value=conn)
+    acq.__aexit__ = AsyncMock(return_value=False)
+    c._acquire = MagicMock(return_value=acq)
+    return c, ran
+
+
+@pytest.mark.asyncio
+async def test_registering_a_section_reports_whether_it_exists_under_that_name():
+    import asyncpg
+    from domain_axis import DOMAIN_REGISTER_SQL
+    assert "ON CONFLICT DO NOTHING" in DOMAIN_REGISTER_SQL
+    assert "RETURNING id" in DOMAIN_REGISTER_SQL
+    assert "ON CONFLICT (" not in DOMAIN_REGISTER_SQL
+
+    c, ran = _register_conn(register_result=7)
+    assert await c._register_domain(6, "ops", "a") is True
+    assert all(m != "execute" for m, _ in ran)
+    assert ("fetchval", DOMAIN_REGISTER_SQL) in ran
+
+    c, _ = _register_conn(register_result=None, by_key="ops")
+    assert await c._register_domain(6, "ops", "a") is True
+    c, _ = _register_conn(register_result=None, by_key="ops")
+    assert await c._register_domain(6, "Ops", "a") is False
+    c, _ = _register_conn(register_result=None, raises=asyncpg.RaiseError("alias"))
+    assert await c._register_domain(6, "ops", "a") is False
+
+
+def _pending(*names, project="p"):
+    return {"pending_registrations": {"domains": [
+        {"project": project, "project_id": 6, "name": n} for n in names]}}
+
+
+@pytest.mark.asyncio
+async def test_commit_refuses_same_save_variants_before_any_insert():
+    from coordinator import DomainRegistrationRefused
+    c = _coord()
+    with pytest.raises(DomainRegistrationRefused) as exc:
+        await c._commit_axis_registrations(_pending("ops", "Ops"), "a", {})
+    assert exc.value.body["error"] == "domain_spelling_variant"
+    c._register_domain.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_same_save_variant_on_a_new_project_writes_no_project_row():
+    """The pair check runs before the project insert, so a refused save leaves no project row."""
+    from coordinator import DomainRegistrationRefused
+    c = _coord()
+    c._register_project = AsyncMock()
+    report = _pending("ops", "Ops")
+    report["pending_registrations"]["project"] = "p"
+    with pytest.raises(DomainRegistrationRefused):
+        await c._commit_axis_registrations(report, "a", {})
+    c._register_project.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_commit_turns_a_lost_race_into_a_refusal_or_unavailable():
+    from coordinator import DomainRegistrationRefused, DomainRegistryUnavailable
+    body = {"status": "error", "error": "domain_spelling_variant"}
+    c = _coord()
+    c._register_domain = AsyncMock(return_value=False)
+    c._new_domain_refusal = AsyncMock(return_value=body)
+    with pytest.raises(DomainRegistrationRefused) as exc:
+        await c._commit_axis_registrations(_pending("Ops"), "a", {})
+    assert exc.value.body is body
+
+    c._new_domain_refusal = AsyncMock(return_value=None)
+    with pytest.raises(DomainRegistryUnavailable):
+        await c._commit_axis_registrations(_pending("Ops"), "a", {})
+
+
+async def _save_with_commit_raising(exc):
+    import json
+    from unittest.mock import patch
+    c = _coord()
+    conn = c._acquire.return_value.__aenter__.return_value
+    conn.fetchval = AsyncMock(side_effect=lambda sql, *a: (
+        None if "content_hash" in sql else 1))
+    conn.fetchrow = AsyncMock(return_value={"id": 99})
+    req = MagicMock()
+    req.json = AsyncMock(return_value={
+        "content": "a section race", "agent_id": "claude-code",
+        "metadata": {"source": "claude-code", "project": "p"}})
+    req.get = MagicMock(return_value=None)
+    req.headers = {}
+    with patch.object(c, "_embed", new=AsyncMock(return_value=[0.1] * 1024)), \
+         patch.object(c, "_commit_axis_registrations", new=AsyncMock(side_effect=exc)):
+        resp = await c.handle_save(req)
+    return c, resp, json.loads(resp.text)
+
+
+@pytest.mark.asyncio
+async def test_a_lost_section_race_answers_400_and_a_missing_one_answers_503():
+    from coordinator import DomainRegistrationRefused, DomainRegistryUnavailable
+    body = {"status": "error", "error": "domain_spelling_variant",
+            "message": "m", "proposals": ["ops"]}
+    c, resp, out = await _save_with_commit_raising(DomainRegistrationRefused(body))
+    assert resp.status == 400
+    assert out["error"] == "domain_spelling_variant"
+    assert c._registry_refusals.snapshot()["new_domain_refused"] == 1
+
+    _c, resp, out = await _save_with_commit_raising(DomainRegistryUnavailable("x"))
+    assert resp.status == 503
+    assert out["error"] == "registry_unavailable"
+
+
+@pytest.mark.asyncio
+async def test_the_race_body_and_the_pre_commit_body_are_the_same():
+    c = _coord(registered={(6, "ops")}, near=["ops"])
+    conn = c._acquire.return_value.__aenter__.return_value
+    conn.fetch = AsyncMock(side_effect=lambda sql, *a: (
+        [] if "domain_aliases" in sql else [{"name": "ops"}]))
+    got = await c._new_domain_refusal("Ops", "p", 6, {})
+    assert got == c._domain_spelling_refusal("Ops", "ops", "p", ["ops"])
