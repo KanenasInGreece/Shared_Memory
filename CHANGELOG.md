@@ -7,6 +7,17 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.0.24] - 2026-10-20
+
+Clean-up of `shared-memory/scripts/rerank_shim.py`, the optional path translator that lets the gateway use a reranker served by vLLM, and the sixth file of the backend clean-up campaign: comment and debugging. `API_VERSION` stays 4. Restart the gateway; update the skills for the version. ⚠ The shim is its own process: on a host that runs it, restart it too (for example `systemctl --user restart rerank-shim.service`), or it keeps the old code.
+
+### Fixed
+- The gateway's window probe could not see a vLLM reranker's context window through the shim: `GET /v1/models` was refused with 404, so `advertised_tokens` stayed null and a short window passed `/health` and postflight A9. The shim now forwards it unchanged.
+- The shim no longer has a 900-second default upstream deadline, which was shorter than the gateway's own wait for the largest rerank (about 921 s) and could cut it short into a vector-order fallback. The gateway's per-call wait now governs. A request the gateway abandons is released when it hangs up, and the shim then closes its connection to vLLM. `SHIM_TIMEOUT_S` remains an optional, caller-chosen deadline.
+- A bad `SHIM_TIMEOUT_S`, `SHIM_PORT` or `SHIM_VLLM_URL` (nan, inf, zero, negative, not a number, not `http://`) is refused at startup with exit status 2, naming the variable, instead of answering 502 to every call.
+- Upstream redirects are no longer followed and `http_proxy` is no longer consulted, matching how the gateway talks to a reranker directly.
+- A POST without a usable `Content-Length` is refused (411 when missing or chunked, 400 when invalid), and an error response closes the connection so unread body bytes are never read as a next request.
+
 ## [1.0.23] - 2026-10-20
 
 Clean-up of `shared-memory/scripts/project_alias.py`, the module holding the SQL that resolves a retired project name to its current one, and the fifth file of the backend clean-up campaign: comment and simplification. No behaviour change. `API_VERSION` stays 4. Restart the gateway; update the skills for the version.
