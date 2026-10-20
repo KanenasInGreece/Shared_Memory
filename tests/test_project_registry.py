@@ -137,7 +137,7 @@ async def test_a_decision_may_declare_a_new_project_with_the_operator_s_confirma
          "decision": {"project": "brand-new"}}, "c", report) is None
     coord._register_project.assert_not_awaited()
     assert report["pending_registrations"]["project"] == "brand-new"
-    await coord._commit_axis_registrations(report, "c")
+    await coord._commit_axis_registrations(report, "c", {})
     coord._register_project.assert_awaited_once_with("brand-new", "c")
 
 
@@ -159,7 +159,7 @@ async def test_a_decision_declared_once_needs_no_flag_on_the_records_that_follow
     report = {}
     first = await coord._project_ingress_error(
         {"source": "c", "project": "brand-new", "new_project": True}, "c", report)
-    await coord._commit_axis_registrations(report, "c")
+    await coord._commit_axis_registrations(report, "c", {})
     second = await coord._project_ingress_error(
         {"type": "decision", "decision": {"project": "brand-new"}}, "c", {})
     assert first is None and second is None
@@ -309,7 +309,7 @@ async def test_naming_the_neighbour_lets_a_genuinely_separate_project_through():
     assert err is None
     # v0.9.72 (P4′): accepted here, written by the commit step.
     assert report["pending_registrations"]["project"] == "alpha-servize"
-    await coord._commit_axis_registrations(report, "c")
+    await coord._commit_axis_registrations(report, "c", {})
     coord._register_project.assert_awaited_once()
 
 
@@ -335,7 +335,7 @@ async def test_an_unmistakable_new_project_registers_with_no_extra_step():
     assert await coord._project_ingress_error(
         {"source": "c", "project": "unrelated-thing", "new_project": True},
         "c", report) is None
-    await coord._commit_axis_registrations(report, "c")
+    await coord._commit_axis_registrations(report, "c", {})
     coord._register_project.assert_awaited_once()
 
 

@@ -57,6 +57,7 @@ from domain_axis import (
     DOMAIN_PROPOSAL_LIMIT, DOMAIN_CONFUSABLE_SQL, DOMAIN_CONFUSABLE_SIMILARITY,
     DOMAIN_ALIAS_RESOLVE_SQL, DOMAIN_REGISTER_SQL, DOMAIN_KEYS,
     DOMAIN_NAMES_SQL, DOMAIN_ALIASES_SQL, DOMAIN_NAME_OR_KEY_SQL,
+    DOMAIN_BY_KEY_SQL,
     domain_merge_cypher, names_a_domain, resolve_domains,
 )
 from insight_gate import walk_group_reached_set, passes_insight_gate
@@ -128,7 +129,7 @@ def _short(value: Any, cap: int = 200) -> str:
 
 
 # FRAMEWORK_VERSION is the build string and may drift. API_VERSION is the wire contract with memory_bridge.py; bump it only when shape, auth, or routes break older clients.
-FRAMEWORK_VERSION = "1.0.24"
+FRAMEWORK_VERSION = "1.0.25"
 # API v2: retrospective is a full record. v4: unregistered project is 400 (proposal / new_project / sentinel).
 API_VERSION = 4
 CLIENT_VERSION_HEADER = "X-SM-Api-Version"
@@ -863,6 +864,18 @@ def is_judgement_type(record_type: object) -> bool:
 
 class ProjectIdentityUnavailable(RuntimeError):
     """Registry lookup failed for a name that should have an id: outbox retries, save is 503, readers degrade."""
+
+
+class DomainRegistrationRefused(RuntimeError):
+    """A section the gates accepted lost a spelling race at commit; `body` is the 400 answer."""
+
+    def __init__(self, body: dict):
+        super().__init__(body.get("message") or body.get("error") or "domain refused")
+        self.body = body
+
+
+class DomainRegistryUnavailable(RuntimeError):
+    """A section was not registered and nothing visible explains why: save is 503."""
 
 
 class DomainIdentityUnavailable(RuntimeError):
@@ -4613,7 +4626,7 @@ class MemoryCoordinator:
                  "has passed", name, project, agent_id)
 
     async def _commit_axis_registrations(self, report: dict | None,
-                                         agent_id: str) -> None:
+                                         agent_id: str, metadata: dict) -> None:
         """Write the registry rows this save's gates accepted (P4′).
 
         Called from `handle_save` ONLY, immediately before
@@ -4628,7 +4641,7 @@ class MemoryCoordinator:
         ⚠ WHAT STILL EXITS AFTER THIS POINT — stated in full, because the
         first version of this docstring claimed "no registry row is written by
         a save refused with 4xx or 503" and that was OVERSTATED (review R1).
-        Three exits remain downstream of this commit, and they are here by
+        These exits remain downstream of this commit, and they are here by
         CONSTRUCTION rather than by oversight:
 
           * the **hard-mandate embedding 503** — it needs the final content,
@@ -4641,6 +4654,11 @@ class MemoryCoordinator:
             before this commit for every non-racing case.
           * this method's **own 503**, when the project row is written and its
             id cannot be read back for the sections that follow.
+          * a `new_project` row, and any EARLIER section row of the same save,
+            written before a later section is refused or found unavailable,
+            stays.
+          * a project-key race in `_register_project` is still a 500 (finding
+            da-9, not this change).
 
         Closing any of them needs one transaction spanning the registry writes
         and the record insert, which no axis has today. What WAS fixed is the
@@ -4653,6 +4671,14 @@ class MemoryCoordinator:
         pending = (report or {}).pop(self._PENDING_KEY, None)
         if not pending:
             return
+        earlier_by_project: dict[str, list[str]] = {}
+        for intent in pending.get("domains") or []:
+            earlier = earlier_by_project.setdefault(intent["project"], [])
+            variant = spelling_variant_of(intent["name"], earlier)
+            if variant is not None:
+                raise DomainRegistrationRefused(self._domain_spelling_refusal(
+                    intent["name"], variant, intent["project"], [variant]))
+            earlier.append(intent["name"])
         project = pending.get("project")
         if project:
             await self._register_project(project, agent_id)
@@ -4662,7 +4688,15 @@ class MemoryCoordinator:
             project_id = intent.get("project_id")
             if project_id is None:
                 project_id = await self._project_identity(intent["project"])
-            await self._register_domain(project_id, intent["name"], agent_id)
+            if not await self._register_domain(project_id, intent["name"], agent_id):
+                body = await self._new_domain_refusal(
+                    intent["name"], intent["project"], project_id, metadata)
+                if body is not None:
+                    raise DomainRegistrationRefused(body)
+                raise DomainRegistryUnavailable(
+                    f"section {_short(intent['name'])} of project "
+                    f"{_short(intent['project'])} was not registered and no "
+                    "spelling in the registry explains why")
             log.info("domain registry: %r REGISTERED under project %r by %s — "
                      "every gate passed", intent["name"], intent["project"],
                      agent_id)
@@ -5047,6 +5081,20 @@ class MemoryCoordinator:
             {"supplied": supplied, "canonical": canonical, "via": via}
         )
 
+    def _domain_spelling_refusal(self, name: str, variant: str, project: str,
+                                 proposals: list[str]) -> dict:
+        """The 400 body for a new section that only respells `variant`."""
+        return {
+            "status": "error",
+            "error": "domain_spelling_variant",
+            "message": (
+                f"domain {_short(name)} differs from {_short(variant)}, already a section of "
+                f"{_short(project)}, only in separators or capitalisation — so it is a "
+                f"SPELLING of it and not a new section. Save under {_short(variant)}."
+            ),
+            "proposals": proposals,
+        }
+
     async def _new_domain_refusal(
         self, name: str, project: str, project_id: int, metadata: dict,
     ) -> dict | None:
@@ -5068,8 +5116,7 @@ class MemoryCoordinator:
             return unnameable
         async with self._acquire() as conn:
             rows = await conn.fetch(DOMAIN_CONFUSABLE_SQL, project_id, name,
-                                    DOMAIN_CONFUSABLE_SIMILARITY,
-                                    DOMAIN_PROPOSAL_LIMIT)
+                                    DOMAIN_CONFUSABLE_SIMILARITY)
             # Every section of THIS project, not just the trigram neighbours —
             # see the identical note on the project axis above.
             all_names = [r["name"]
@@ -5087,16 +5134,7 @@ class MemoryCoordinator:
         if variant is not None:
             log.info("domain registry: refused %r — a spelling of %r in project %r",
                      name, variant, project)
-            return {
-                "status": "error",
-                "error": "domain_spelling_variant",
-                "message": (
-                    f"domain {_short(name)} differs from {_short(variant)}, already a section of "
-                    f"{_short(project)}, only in separators or capitalisation — so it is a "
-                    f"SPELLING of it and not a new section. Save under {_short(variant)}."
-                ),
-                "proposals": near,
-            }
+            return self._domain_spelling_refusal(name, variant, project, near)
 
         unconfirmed = unconfirmed_confusables(
             near, metadata.get("confirm_distinct_from"))
@@ -5255,7 +5293,7 @@ class MemoryCoordinator:
                         name, exc)
             return None
 
-    async def _register_domain(self, project_id: int, name: str, agent_id: str) -> None:
+    async def _register_domain(self, project_id: int, name: str, agent_id: str) -> bool:
         """Register a section the caller declared new.
 
         No description, for the same reason a new project gets none: it is owed
@@ -5263,10 +5301,19 @@ class MemoryCoordinator:
         this axis that costs more than on the project axis — descriptions are
         half of how domain proposals work — so an undescribed section is a real,
         visible gap rather than a cosmetic one.
+
+        Returns True when the section exists under this exact name afterwards.
         """
         async with self._acquire() as conn:
-            await conn.execute(DOMAIN_REGISTER_SQL, project_id, name,
-                               agent_id or "unknown")
+            try:
+                new_id = await conn.fetchval(
+                    DOMAIN_REGISTER_SQL, project_id, name, agent_id or "unknown")
+                if new_id is not None:
+                    return True
+                return await conn.fetchval(
+                    DOMAIN_BY_KEY_SQL, project_id, name) == name
+            except asyncpg.RaiseError:
+                return False
 
     async def _domain_proposals(self, project_id: int | None, name: str) -> list[str]:
         """Sections of THIS project near a value that missed — by name or by
@@ -6775,16 +6822,20 @@ class MemoryCoordinator:
 
         # decision:1413: registry rows are written after every 400 and the 409, and before the mint. A refused save must not leave a project or domain row.
         try:
-            await self._commit_axis_registrations(axis_report, agent_id)
-        except ProjectIdentityUnavailable as exc:
-            # The project row's id could not be read back, so its sections cannot be filed. A record that cannot be filed is not saved.
+            await self._commit_axis_registrations(axis_report, agent_id, metadata)
+        except DomainRegistrationRefused as exc:
+            self._count_refusal(exc.body)
+            return web.json_response(exc.body, status=400)
+        except (ProjectIdentityUnavailable, DomainRegistryUnavailable) as exc:
+            # A project id could not be read back, or a section was not registered and
+            # nothing explains why. A record that cannot be filed is not saved.
             log.error("save refused while committing axis registrations: %s", exc)
             return web.json_response(
                 {
                     "status": "error",
                     "error": "registry_unavailable",
                     "message": (
-                        "the project registry could not be read back while "
+                        "the registry could not be read back while "
                         "registering this record's axes, so it would be saved "
                         "unfiled. No record was written. Retry; if it "
                         "persists, the gateway's database is the thing to "

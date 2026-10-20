@@ -7,6 +7,17 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.0.25] - 2026-10-20
+
+Clean-up of `shared-memory/scripts/domain_axis.py`, the rules and SQL for a record's section (domain) within its project, and the seventh file of the backend clean-up campaign: comment and debugging. `API_VERSION` stays 4. Restart the gateway; update the skills for the version.
+
+### Fixed
+- Section proposals return one row per section, at its best score. A section matched by both its name and its description used to fill two of the five proposal slots and push another section out.
+- The confusable check for a new section now reads every existing section at or above `DOMAIN_CONFUSABLE_SIMILARITY`. It used to read only the closest five, so a save naming those five in `confirm_distinct_from` registered the new section without being asked about a sixth.
+- `DOMAIN_CONFUSABLE_SIMILARITY` must be a number greater than 0 and at most 1, or the gateway stops at startup with a message naming it. `nan`, `inf` or a value above 1 used to switch the confusable check off silently, `0` held every section as confusable, and a non-number stopped the import without naming the variable.
+- Two saves registering spellings of the same new section at the same moment (`ops` and `Ops`), or one save naming both, no longer fail with a 500. The losing save gets `domain_spelling_variant`, the same answer it would get a moment later, and a save naming both spellings registers neither. A section that cannot be registered for any other visible reason answers `registry_unavailable` (503).
+- The `.env.example` entry for `DOMAIN_CONFUSABLE_SIMILARITY` described a cosine reconciliation threshold; it is the trigram floor checked when a save declares a new section.
+
 ## [1.0.24] - 2026-10-20
 
 Clean-up of `shared-memory/scripts/rerank_shim.py`, the optional path translator that lets the gateway use a reranker served by vLLM, and the sixth file of the backend clean-up campaign: comment and debugging. `API_VERSION` stays 4. Restart the gateway; update the skills for the version. ⚠ The shim is its own process: on a host that runs it, restart it too (for example `systemctl --user restart rerank-shim.service`), or it keeps the old code.
