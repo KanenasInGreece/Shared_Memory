@@ -20,7 +20,7 @@ from neo4j import AsyncGraphDatabase
 from ontology import ONT, fact_kind_from_source_ref, origin_location
 from insight_gate import (
     INSIGHT_AGE_CENSUS_K, CLOSED_RELATION_TYPES, walk_group_reached_set,
-    passes_insight_gate, order_components, classify_identity,
+    passes_insight_gate, order_components, match_existing_insight,
 )
 from project_axis import PROJECT_SQL, fold_eligible
 from nrem_gate import eligible_domain_level_clusters, project_domain_maps, grounded_fact_groups_cypher
@@ -384,9 +384,10 @@ def _fetch_outbox_created_at(pg_ids):
 def _kth_oldest_age_seconds(cluster_id_lists, ts_map, k):
     """Coverage-debt gauge (ADR-018 open-Q1, K-th anchor): max over clusters of
     (now − the K-th-oldest member's outbox write-time) = the eligibility-onset
-    age of the most-neglected actionable cluster. The K-th member is the one
-    that tipped the cluster over the threshold, so this is 'how long has an
-    actionable cluster gone unfolded' — fairer than min(member). NULL-safe: a
+    age of the most-neglected actionable cluster. K is a rank set by
+    `consolidation.insight_threshold`, not an eligibility count (the insight gate
+    is at-least-one), and the K-th oldest member's write time is taken as the
+    cluster's onset — fairer than min(member). NULL-safe: a
     cluster with <k timestamped members degrades to its oldest available; None
     if no cluster yields any timestamp."""
     from datetime import timezone
@@ -3787,12 +3788,7 @@ class ConsolidationDaemon:
                     None, lambda: fetch_active_insight_rows(conn))
                 surviving = []
                 for c in clusters:
-                    matched = None
-                    for iid, iset, imeta in existing_insights:
-                        rel = classify_identity(c["judgement_ids"], iset)
-                        if rel in ("same", "covered"):
-                            matched = (rel, iid, imeta)
-                            break
+                    matched = match_existing_insight(c["judgement_ids"], existing_insights)
                     if matched is None:
                         surviving.append(c)
                         continue

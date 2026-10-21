@@ -16,4 +16,5 @@ labels:
 consolidation:
   # Minimum grounded, non-superseded facts in one (project, domain) group before a thematic synthesis. Lowered from 5 to 3 because that axis is sparser than the old entity hubs.
   density_threshold: 3
-  insight_threshold: 2           # min unconsolidated judgements the G3 walk must reach (not an entity-hub count)
+  # Census rank K of the insight coverage-debt gauge, not a gate; a whole number >= 1.
+  insight_threshold: 2
