@@ -1193,3 +1193,49 @@ def test_insight_cypher_query_is_self_contained_and_deterministic():
     assert "245" in q1 and "267" in q1
     assert "Decision" in q1 and "Retrospective" in q1
     assert "CONSIDERED" in q1 and "REJECTED" in q1 and "UNDER_CONDITIONS" in q1
+
+
+@pytest.mark.asyncio
+async def test_run_insight_cycle_same_wins_over_earlier_covering_row(monkeypatch):
+    """An equal insight (id 70) gains the reference even when a covering insight
+    (id 10) is listed first: the match does not depend on row order."""
+
+    class _Conn(StubConn):
+        def close(self):
+            pass
+
+    conn = _Conn(script=[
+        {"rowcount": 1, "rows": [({"summary_ids": [], "domains": ["architecture"]},)]},
+        {"rowcount": 1, "rows": []},   # UPDATE metadata
+    ])
+    first_connect = {"done": False}
+    def _connect(*a, **k):
+        if not first_connect["done"]:
+            first_connect["done"] = True
+            return conn
+        return _Conn()
+    monkeypatch.setattr(cl.psycopg2, "connect", _connect)
+    monkeypatch.setattr(cl, "fetch_unreconciled_insights", lambda c: [])
+    monkeypatch.setattr(cl, "fetch_open_retro_record_ids", lambda c: [])
+    monkeypatch.setattr(cl, "fetch_refold_insights", lambda c, ids: [])
+    monkeypatch.setattr(cl, "fetch_active_insight_rows", lambda c: [
+        (10, {245, 267, 300}, {"summary_ids": [], "domains": []}),
+        (70, {245, 267}, {"summary_ids": [], "domains": []}),
+    ])
+    monkeypatch.setattr(cl, "fetch_active_thematic_summary_id", lambda c, p, d: 44)
+
+    daemon, _ = daemon_with_fake_graph()
+    daemon._find_fresh_insight_clusters = AsyncMock(return_value=[
+        {"entity": "OutboxPattern", "decision_ids": [245, 267],
+         "judgement_ids": [245, 267], "judgement_types": {245: "Decision", 267: "Decision"},
+         "projects": ["shared-memory-GitHub"], "domain": "infrastructure"},
+    ])
+    daemon._fold_insight = AsyncMock(return_value=True)
+
+    await daemon.run_insight_cycle()
+
+    daemon._fold_insight.assert_not_awaited()
+    update_sql, params = next(
+        (s, p) for s, p in conn.executed
+        if s.startswith("UPDATE community_summaries SET metadata"))
+    assert params[-1] == 70

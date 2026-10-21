@@ -405,3 +405,48 @@ def test_insight_age_census_k_is_a_plain_int_not_a_gate_parameter():
     assert INSIGHT_AGE_CENSUS_K >= 1
     import inspect
     assert "INSIGHT_THRESHOLD" not in dir(sys.modules["insight_gate"])
+
+
+# --- match_existing_insight (order-independent identity match) and _census_rank ---
+
+from insight_gate import match_existing_insight, _census_rank  # noqa: E402
+
+
+def _m(tag):
+    return {"tag": tag}
+
+
+def test_match_same_beats_covering_row_with_smaller_id_in_both_orders():
+    rows = [(10, {1, 2, 3}, _m(10)), (70, {1, 2}, _m(70))]
+    assert match_existing_insight({1, 2}, rows) == ("same", 70, _m(70))
+    assert match_existing_insight({1, 2}, list(reversed(rows))) == ("same", 70, _m(70))
+
+
+def test_match_smallest_id_among_several_same_or_several_covered():
+    same = [(30, {1, 2}, _m(30)), (20, {1, 2}, _m(20)), (40, {1, 2}, _m(40))]
+    assert match_existing_insight({1, 2}, same)[1] == 20
+    assert match_existing_insight({1, 2}, same[::-1])[1] == 20
+    cov = [(50, {1, 2, 3}, _m(50)), (15, {1, 2, 4}, _m(15)), (60, {1, 2, 5}, _m(60))]
+    assert match_existing_insight({1, 2}, cov) == ("covered", 15, _m(15))
+    assert match_existing_insight({1, 2}, cov[::-1]) == ("covered", 15, _m(15))
+
+
+def test_match_none_when_no_same_or_covered_row():
+    rows = [(1, {1}, _m(1)), (2, {1, 9}, _m(2)), (3, {7, 8}, _m(3))]
+    assert match_existing_insight({1, 2}, rows) is None
+    assert match_existing_insight({1, 2}, []) is None
+
+
+def test_census_rank_refuses_non_positive_and_names_the_key():
+    for bad in (0, -1):
+        with pytest.raises(ValueError, match="insight_threshold"):
+            _census_rank(bad)
+    assert _census_rank(1) == 1
+    assert _census_rank(2) == 2
+
+
+def test_census_k_is_bound_through_census_rank_and_default_is_two():
+    import insight_gate
+    src = open(insight_gate.__file__).read()
+    assert "INSIGHT_AGE_CENSUS_K: int = _census_rank(" in src
+    assert INSIGHT_AGE_CENSUS_K == 2

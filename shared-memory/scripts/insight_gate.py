@@ -1,4 +1,6 @@
-"""Insight gate: from a fact-group seed, require a retrospective (G2) and a fresh judgement (G3), then componentise the reached set.
+"""Insight gate: from a fact-group seed, require a retrospective (G2) and a fresh
+judgement (G3), then componentise the reached set, as `fact:1157` specifies (the v0.8.66
+record of G2/G3, the unbounded walk and the reversed-decision exclusion).
 
 Imports only ontology and stdlib; the walk takes an already-built Neo4j driver as a parameter. Server-side only.
 """
@@ -12,21 +14,35 @@ CLOSED_RELATION_TYPES: tuple[str, ...] = (
 
 _JUDGEMENT_LABELS = (ONT.decision, ONT.retrospective)
 
-# Age-census K only, not a gate. The old name stayed so the metric would not silently change meaning.
-INSIGHT_AGE_CENSUS_K: int = ONT.insight_threshold
+
+def _census_rank(k: int) -> int:
+    """Return ``k`` if it is a valid 1-based census rank (>= 1), else raise.
+
+    The gauge indexes ``ts[k - 1]``: 0 would read the newest member and a negative
+    value an end-relative one, so a non-positive rank is refused at import."""
+    if k < 1:
+        raise ValueError(
+            f"consolidation.insight_threshold in ontology.yaml must be a whole "
+            f"number >= 1 (the census rank K), got {k!r}")
+    return k
+
+
+# K is the rank of the coverage-debt gauge only, not a gate (G2/G3 are at-least-one
+# checks). Its value comes from `consolidation.insight_threshold` in ontology.yaml.
+INSIGHT_AGE_CENSUS_K: int = _census_rank(ONT.insight_threshold)
 
 
 def _walk_step_cypher() -> str:
-    """One BFS layer (I3) over the closed relation set, undirected, from the
+    """One BFS layer over the closed relation set, undirected, from the
     current frontier (``$ids``) to its unvisited neighbours.
 
     Matches only {Fact, Decision, Retrospective} on both ends — a bare
     ``{pg_id: $pid}`` property match would also hit CommunitySummary nodes,
     whose pg_id sequence (``community_summaries.id``) is independent of
     ``technical_docs.id`` and can coincide by coincidence (the same collision
-    risk §3.2 names for source_pg_ids vs summary_ids).
+    risk as between source_pg_ids and summary_ids).
 
-    I10: a reversed Decision (``superseded = true``) is excluded on BOTH
+    A reversed Decision (``superseded = true``) is excluded on BOTH
     ends — as ``m`` so it is never discovered/added to the frontier, and as
     ``n`` (belt-and-braces: by construction a reversed decision can never
     already be in the frontier, since it would have failed the ``m`` check
@@ -34,13 +50,13 @@ def _walk_step_cypher() -> str:
     that invariant holding for a reason it cannot see).
 
     Facts carry no such exclusion here — only DECISION supersession removes a
-    node from the walk (I10 is decision-specific); a superseded Fact is still
-    a valid pass-through connectivity node (measured live, plan §5.3/§8: two
+    node from the walk (the exclusion is decision-specific); a superseded Fact
+    is still a valid pass-through connectivity node (measured live, `fact:1157`: two
     judgements sharing a since-superseded fact remain one component).
 
     Returns ``{src, dst, dst_label, dst_consolidated}`` rows — ``dst_label``
     is one of 'Fact' / 'Decision' / 'Retrospective'; ``dst_consolidated`` is
-    only meaningful for judgement rows (I4: freshness is tested on
+    only meaningful for judgement rows (freshness is tested on
     judgements, never on facts) and is read regardless so the caller need not
     special-case it.
     """
@@ -65,7 +81,7 @@ WALK_STEP_CYPHER: str = _walk_step_cypher()
 
 
 class _UnionFind:
-    """Disjoint-set over pg_ids — connectivity backbone for §2.4 components.
+    """Disjoint-set over pg_ids — connectivity backbone for the components.
     Path-halving find, union by attach-to-other-root (no rank tracking
     needed at this corpus size). Pure, no I/O."""
 
@@ -86,7 +102,7 @@ class _UnionFind:
 
 
 async def walk_reached_graph(seed_fact_ids, fetch_neighbors):
-    """THE WALK (plan §2.3) — undirected, unbounded fixpoint (I3) over the
+    """THE WALK — undirected, unbounded fixpoint over the
     closed relation set, starting from a gating group's grounded,
     non-superseded fact pg_ids.
 
@@ -100,21 +116,21 @@ async def walk_reached_graph(seed_fact_ids, fetch_neighbors):
     nodes newly discovered this layer (``frontier``), and a node is queried
     at most once (``seen`` guards re-entry) — the loop ends when a layer
     discovers nothing new, which is guaranteed to happen because the graph is
-    finite. No hop cap, no edge cap, no hub cap (I3) — nothing here bounds
+    finite. No hop cap, no edge cap, no hub cap — nothing here bounds
     how many layers run.
 
-    Facts are traversed (so two judgements sharing a fact connect, per §0 and
-    I5) but never themselves returned as members of the reached set — the
+    Facts are traversed (so two judgements sharing a fact connect) but never
+    themselves returned as members of the reached set — the
     ``labels``/``consolidated`` dicts below only ever gain a Decision or
-    Retrospective key. I10 is enforced by ``_walk_step_cypher`` itself: a
-    reversed Decision is never yielded as ``dst``, so it can never enter
-    ``seen``/``labels``/a component.
+    Retrospective key. The reversed-decision exclusion is enforced by
+    ``_walk_step_cypher`` itself: a reversed Decision is never yielded as
+    ``dst``, so it can never enter ``seen``/``labels``/a component.
 
     Returns ``(labels, consolidated, components)``:
       ``labels``       -- {judgement_pg_id: 'Decision' | 'Retrospective'}
       ``consolidated``  -- {judgement_pg_id: bool}
       ``components``   -- list[list[int]], each an UNORDERED judgement-id
-                           component (§2.4) — pass to ``order_components``
+                           component — pass to ``order_components``
                            for the deterministic fold order.
     """
     uf = _UnionFind()
@@ -160,16 +176,20 @@ async def walk_group_reached_set(driver, seed_fact_ids):
 
 
 def passes_insight_gate(labels, consolidated) -> bool:
-    """G2 + G3 (plan §2.2) — evaluated once per gating group's FULL reached
-    set, never per component (§2.4: components structure the payload, they
-    do not gate; every component in a passing group folds).
+    """G2 + G3 — evaluated once per gating group's FULL reached set, never per
+    component (components structure the payload, they do not gate).
+
+    Two later drops are separate from this gate: `_find_fresh_insight_clusters`
+    skips a component with no Decision, and a one-judgement component still
+    resolves identity (and can append on 'same'), but only an unmatched one is
+    left out of the fold.
 
     G1 (fact gate) is the caller's job — this is only ever invoked on a group
     that has already cleared it (nrem_gate.eligible_domain_level_clusters).
 
     G2 — at least one Retrospective anywhere in the reached set.
     G3 — at least one judgement (Decision OR Retrospective) with
-         ``consolidated = false`` anywhere in the reached set. I4: this reads
+         ``consolidated = false`` anywhere in the reached set. This reads
          ONLY ``consolidated`` (judgements) — never a fact's own flag, which
          plays no part here or anywhere in this module.
     """
@@ -179,7 +199,7 @@ def passes_insight_gate(labels, consolidated) -> bool:
 
 
 def order_components(components, labels):
-    """§2.4 deterministic component ordering — stable across re-folds so the
+    """Deterministic component ordering — stable across re-folds so the
     upserted insight's content-comparison is meaningful cycle over cycle.
 
     1. Components containing >=1 Retrospective come first, ordered by their
@@ -204,7 +224,7 @@ def order_components(components, labels):
 
 
 def classify_identity(new_ids, existing_ids) -> str:
-    """§2.5 — LOCKED. An insight's identity is the SET of judgement pg_ids it
+    """An insight's identity is the SET of judgement pg_ids it
     covers. Pure set comparison between a freshly-walked component's judgement
     ids and one existing active insight's judgement-id set.
 
@@ -217,11 +237,10 @@ def classify_identity(new_ids, existing_ids) -> str:
       'covered'    -- ``existing_ids`` is a strict superset of ``new_ids``
                        (the reverse of 'supersedes') — the existing insight
                        already covers this reach in full; nothing new to add.
-                       Not named in the plan's LOCKED table (the walk only
-                       grows in the documented scenario), but the same set
-                       logic settles it: no new insight is warranted.
+                       Rare, since a walk normally only grows, but the same
+                       set logic settles it: no new insight is warranted.
       'overlap'    -- partial intersection, neither a subset of the other.
-                       Both coexist (accepted early duplication, §2.5).
+                       Both coexist (accepted early duplication).
       'disjoint'   -- no shared members — unrelated insights.
     """
     new_ids, existing_ids = set(new_ids), set(existing_ids)
@@ -234,3 +253,19 @@ def classify_identity(new_ids, existing_ids) -> str:
     if new_ids & existing_ids:
         return "overlap"
     return "disjoint"
+
+
+def match_existing_insight(new_ids, existing):
+    """Pick the active insight a walked component matches, independent of row order.
+
+    ``existing`` is ``fetch_active_insight_rows``' list of ``(id, judgement_id_set,
+    metadata)``. Returns ``("same", id, metadata)`` for the smallest-id 'same' row if
+    any, else ``("covered", id, metadata)`` for the smallest-id 'covered' row, else
+    ``None``. 'same' wins so an equal insight always gains the reference even when
+    another insight also covers the set."""
+    best = {}
+    for iid, iset, imeta in existing:
+        rel = classify_identity(new_ids, iset)
+        if rel in ("same", "covered") and (rel not in best or iid < best[rel][1]):
+            best[rel] = (rel, iid, imeta)
+    return best.get("same") or best.get("covered")

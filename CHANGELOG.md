@@ -7,6 +7,15 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.0.26] - 2026-10-21
+
+Clean-up of `shared-memory/scripts/insight_gate.py`, the walk and checks that decide whether a section's decisions and retrospectives are folded into an insight, and the eighth file of the backend clean-up campaign: comment and debugging. `API_VERSION` stays 4. Restart the gateway; update the skills for the version.
+
+### Fixed
+- When the insight cycle matches a walked set of judgements against the active insights, the result no longer depends on the order Postgres returns them. An insight with exactly the same judgements is preferred over one that covers more of them, so the triggering section is always added to the equal insight as a reference. Before, a covering insight from another project returned first meant nothing was added. Among several equal or several covering insights, the smallest id is chosen.
+- `consolidation.insight_threshold` in `ontology.yaml`, the rank used by the insight coverage-debt gauge, must be a whole number of at least 1, or the gateway and the consolidation daemon stop at startup with a message naming it. `0` used to make the gauge report the newest judgement's age, and a negative value gave a wrong age or skipped every fresh insight fold in a pass.
+- The `ontology.yaml` comment on `insight_threshold` described it as the number of unconsolidated judgements the gate requires. The gate needs only one; the value is the gauge's rank.
+
 ## [1.0.25] - 2026-10-20
 
 Clean-up of `shared-memory/scripts/domain_axis.py`, the rules and SQL for a record's section (domain) within its project, and the seventh file of the backend clean-up campaign: comment and debugging. `API_VERSION` stays 4. Restart the gateway; update the skills for the version.
