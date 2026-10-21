@@ -26,10 +26,12 @@ from dream_telemetry import (
     prefix_rerank_query,
     rerank_ceiling,
 )
+from framework_defaults import FRAMEWORK_DEFAULTS
 
 log = logging.getLogger("EncoderWindow")
 
-OVERFLOW_TOKEN_SLACK = int(os.environ.get("OVERFLOW_TOKEN_SLACK", "16"))
+OVERFLOW_TOKEN_SLACK = int(os.environ.get(
+    "OVERFLOW_TOKEN_SLACK", str(FRAMEWORK_DEFAULTS["OVERFLOW_TOKEN_SLACK"]["default"])))
 
 
 def reserved_clamp_chars() -> int:
