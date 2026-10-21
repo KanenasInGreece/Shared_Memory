@@ -7,6 +7,17 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.0.28] - 2026-10-21
+
+Clean-up of `shared-memory/scripts/framework_defaults.py`, the table of built-in defaults that `check_config.py` reports from, and the tenth file of the backend clean-up campaign: comment, refactoring. `API_VERSION` stays 4. No behaviour change. Restart the gateway; update the skills for the version.
+
+### Changed
+- `dream_telemetry.py` and `encoder_window.py` take the fallback values of `EMBED_MAX_CONTEXT_TOKENS`, `EMBED_CHARS_PER_TOKEN`, `EMBED_SPECIAL_TOKEN_RESERVE` and `OVERFLOW_TOKEN_SLACK` from the defaults table instead of their own copies, so the value `check_config.py` reports and the value the gateway uses cannot drift apart. The values are unchanged (8192, 3.0, 2, 16).
+- The defaults table's notes now say what each setting really does: which processes read `NEO4J_URI` (the gateway and both daemons do not), when the single-backend `LLM_DEFAULT_TARGET` fallback is used, how `PROXY_BIND` keeps an empty value on loopback, and what the `or` and `get` idioms mean.
+
+### Fixed
+- `.env.example`: `LLM_DEFAULT_TARGET` is used only when `LLM_BACKENDS_JSON` gives no usable fleet and the `LLM_BACKENDS` list yields no URL (it said "only when LLM_BACKENDS is unset"); the embedder's refusal of an oversized input is handled as HTTP 400/413 (it said 500); and an overshoot beyond `OVERFLOW_TOKEN_SLACK` fails the attempt on the save and search path, while consolidation still shortens and retries.
+
 ## [1.0.27] - 2026-10-21
 
 Clean-up of `shared-memory/scripts/agent_roles.py`, the read-only roster and role rules shared by the token minter and the gateway, and the ninth file of the backend clean-up campaign: comment, debugging, simplification. `API_VERSION` stays 4. Restart the gateway; update the skills for the version.

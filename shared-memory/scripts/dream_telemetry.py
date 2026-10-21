@@ -13,6 +13,7 @@ import math
 import os
 import time
 
+from framework_defaults import FRAMEWORK_DEFAULTS
 from log_hygiene import append_secure
 
 logger = logging.getLogger("DreamTelemetry")
@@ -33,20 +34,24 @@ LLM_MIN_TOK_S = float(os.environ.get("LLM_MIN_TOK_S", "10"))
 # Throughput falls as the input grows, so a constant timeout kills the large calls and looks fine on small ones. Anchor this floor on the slowest observation, not the mean.
 EMBED_MIN_TOK_S = float(os.environ.get("EMBED_MIN_TOK_S", "100"))
 # BGE-M3 refuses past its window instead of truncating, so the longest call is a known size. Tunable only because another embedder may differ.
-EMBED_MAX_CONTEXT_TOKENS = int(os.environ.get("EMBED_MAX_CONTEXT_TOKENS", "8192"))
+EMBED_MAX_CONTEXT_TOKENS = int(os.environ.get(
+    "EMBED_MAX_CONTEXT_TOKENS", str(FRAMEWORK_DEFAULTS["EMBED_MAX_CONTEXT_TOKENS"]["default"])))
 # Below measured English prose so denser text truncates early and the timeout is over-estimated. Both mistakes stay on the safe side.
-EMBED_CHARS_PER_TOKEN = float(os.environ.get("EMBED_CHARS_PER_TOKEN", "3.0"))
+EMBED_CHARS_PER_TOKEN = float(os.environ.get(
+    "EMBED_CHARS_PER_TOKEN", str(FRAMEWORK_DEFAULTS["EMBED_CHARS_PER_TOKEN"]["default"])))
 # Special-token reserve (BOS/EOS/CLS/SEP) so raw text sent to the tokenizer
 # never pushes the final sequence over the model window. Valid range: [0, EMBED_MAX_CONTEXT_TOKENS).
 def _parse_special_token_reserve(max_ctx: int) -> int:
-    raw = os.environ.get("EMBED_SPECIAL_TOKEN_RESERVE", "2")
+    raw = os.environ.get(
+        "EMBED_SPECIAL_TOKEN_RESERVE",
+        str(FRAMEWORK_DEFAULTS["EMBED_SPECIAL_TOKEN_RESERVE"]["default"]))
     try:
         val = int(raw)
         if 0 <= val < max_ctx:
             return val
     except (ValueError, TypeError):
         pass
-    return 2
+    return FRAMEWORK_DEFAULTS["EMBED_SPECIAL_TOKEN_RESERVE"]["default"]
 
 
 EMBED_SPECIAL_TOKEN_RESERVE = _parse_special_token_reserve(EMBED_MAX_CONTEXT_TOKENS)

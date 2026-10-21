@@ -1,14 +1,8 @@
-"""FRAMEWORK_DEFAULTS (W1, D1) — ONE authority for the framework's literal
-built-in defaults, and the two edited consumer sites (coordinator.py's
-EMBED_URL/RERANK_URL, hive_mind_proxy.py's EMBEDDER_URL/RERANKER_URL/
-DEFAULT_TARGET/LLM_BACKENDS) that now read it instead of re-typing the
-value.
+"""FRAMEWORK_DEFAULTS: the framework's ONE authority for literal built-in defaults.
 
-⛔ Does NOT DRY tests/test_coordinator_encoder_urls.py:31-32/:44/:71-72 — those
-stay byte-identical, independent pins of the exact same literals; this file
-is deliberately a SECOND, separate set of assertions, not a refactor of the
-first (an independent pin that references the table it is meant to check
-against becomes a tautology).
+⛔ Does NOT DRY tests/test_coordinator_encoder_urls.py — those stay independent pins of
+the same literals; this file is a second, separate set of assertions (a pin that
+references the table it checks becomes a tautology).
 """
 import ast
 import importlib
@@ -104,15 +98,10 @@ def test_proxy_bind_documented_default_value():
 
 
 def test_proxy_bind_carries_an_idiom_despite_being_documented_only():
-    """Fold round item 4 (PR #347, QA Q1): PROXY_BIND's idiom now lives here
-    — the ONE authority — even though its 'kind' stays documented-only (no
-    W1 code change at that site); check_config.py used to duplicate this as
-    a hand-written special case, deleted in the fold round.
-
-    SEC H (R-3, RULED 2026-09-02): idiom flipped "get" -> "or" — measured
-    on glxvm, TCPSite(runner, "", port) binds ALL interfaces, so a
-    present-but-empty PROXY_BIND must fall back to the default exactly
-    like an absent one, matching the gateway's actual (fixed) behaviour."""
+    """PROXY_BIND keeps its idiom here although its kind is documented-only:
+    TCPSite(runner, "", port) binds ALL interfaces, so a present-but-empty value
+    must fall back to the default like an absent one, and check_config reads the
+    idiom from this table to render that verdict."""
     row = framework_defaults.FRAMEWORK_DEFAULTS["PROXY_BIND"]
     assert row["kind"] == "documented-only"
     assert row["idiom"] == "or"
@@ -215,9 +204,8 @@ def test_proxy_llm_backends_falls_back_to_default_target_when_llm_backends_unset
 
 def test_llm_default_target_empty_value_is_honoured_as_empty_not_the_default(monkeypatch):
     """'get' idiom: LLM_DEFAULT_TARGET= (present but EMPTY) resolves to the
-    empty string, NOT the table default — pinned as today's exact, if
-    latent, behaviour (see framework_defaults.py's own row note); W1 never
-    normalises idiom on an existing site."""
+    empty string, NOT the table default — pinned as the exact current behaviour
+    (see framework_defaults.py's own row note)."""
     mod = _reload_proxy(monkeypatch, LLM_DEFAULT_TARGET="")
     assert mod.DEFAULT_TARGET == ""
 
@@ -288,3 +276,94 @@ def test_proxy_llm_backends_is_bound_once_at_module_level_via_tuple_unpack():
     import hive_mind_proxy
     src = inspect.getsource(hive_mind_proxy)
     assert _assigned_at_module_level(src, "LLM_BACKENDS")
+
+
+# ── One source for the embed/slack fallbacks ────────────────────────────────
+
+_SCRIPTS = os.path.join(os.path.dirname(__file__), "..", "shared-memory", "scripts")
+_FALLBACK_NAMES = (
+    "EMBED_MAX_CONTEXT_TOKENS", "EMBED_CHARS_PER_TOKEN",
+    "EMBED_SPECIAL_TOKEN_RESERVE", "OVERFLOW_TOKEN_SLACK",
+)
+
+
+def _environ_get_fallbacks(filename):
+    """name -> second argument node of every os.environ.get(name, fallback) call."""
+    with open(os.path.join(_SCRIPTS, filename)) as f:
+        tree = ast.parse(f.read())
+    found = {}
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "get" and len(node.args) == 2
+                and isinstance(node.args[0], ast.Constant)
+                and node.args[0].value in _FALLBACK_NAMES):
+            found[node.args[0].value] = node.args[1]
+    return found
+
+
+def test_embed_and_slack_fallbacks_are_not_retyped_literals():
+    """Drift guard: the fallbacks come from the table, never a string literal."""
+    found = {}
+    for fname in ("dream_telemetry.py", "encoder_window.py"):
+        found.update(_environ_get_fallbacks(fname))
+    assert set(found) == set(_FALLBACK_NAMES)
+    for name, node in found.items():
+        assert not isinstance(node, ast.Constant), f"{name} fallback is a literal"
+    with open(os.path.join(_SCRIPTS, "dream_telemetry.py")) as f:
+        tree = ast.parse(f.read())
+    fn = next(n for n in ast.walk(tree)
+              if isinstance(n, ast.FunctionDef) and n.name == "_parse_special_token_reserve")
+    for node in ast.walk(fn):
+        if isinstance(node, ast.Return):
+            assert not isinstance(node.value, ast.Constant), "bare literal return"
+
+
+@pytest.fixture
+def _restore_embed_modules(request, monkeypatch):
+    """Undo the env patches FIRST, then reload the embed modules against the real env."""
+    def _restore():
+        monkeypatch.undo()
+        for name in ("dream_telemetry", "encoder_window", "coordinator", "hive_mind_proxy"):
+            if name in sys.modules:
+                importlib.reload(sys.modules[name])
+    request.addfinalizer(_restore)
+
+
+def test_unset_embed_variables_resolve_to_the_shipped_values(_restore_embed_modules, monkeypatch):
+    for k in _FALLBACK_NAMES + ("EMBED_MAX_CHARS",):
+        monkeypatch.delenv(k, raising=False)
+    dt = importlib.reload(importlib.import_module("dream_telemetry"))
+    ew = importlib.reload(importlib.import_module("encoder_window"))
+    assert dt.EMBED_MAX_CONTEXT_TOKENS == 8192 and isinstance(dt.EMBED_MAX_CONTEXT_TOKENS, int)
+    assert dt.EMBED_CHARS_PER_TOKEN == 3.0 and isinstance(dt.EMBED_CHARS_PER_TOKEN, float)
+    assert dt.EMBED_SPECIAL_TOKEN_RESERVE == 2 and isinstance(dt.EMBED_SPECIAL_TOKEN_RESERVE, int)
+    assert dt.EMBED_MAX_CHARS == 24570 and isinstance(dt.EMBED_MAX_CHARS, int)
+    assert ew.OVERFLOW_TOKEN_SLACK == 16 and isinstance(ew.OVERFLOW_TOKEN_SLACK, int)
+
+
+def test_invalid_special_token_reserve_falls_back_to_the_table_default(monkeypatch):
+    monkeypatch.setenv("EMBED_SPECIAL_TOKEN_RESERVE", "abc")
+    dt = importlib.import_module("dream_telemetry")
+    default = framework_defaults.FRAMEWORK_DEFAULTS["EMBED_SPECIAL_TOKEN_RESERVE"]["default"]
+    assert dt._parse_special_token_reserve(8192) == default == 2
+
+
+def test_module_docstring_defines_both_idioms():
+    doc = framework_defaults.__doc__
+    assert "present-but-empty" in doc and "ENV_ROW_ORDER" in doc
+    assert '"or"' in doc and '"get"' in doc
+
+
+def test_consumers_carry_no_line_numbers():
+    import re
+    for name, row in framework_defaults.FRAMEWORK_DEFAULTS.items():
+        for c in row["consumers"]:
+            assert not re.search(r"\.py:\d", c), f"{name}: {c}"
+
+
+def test_zz_embed_modules_reflect_the_process_env_after_earlier_tests():
+    """Guard for the restore above: runs last, sees no leftover shipped-default rebind."""
+    dt = importlib.import_module("dream_telemetry")
+    ew = importlib.import_module("encoder_window")
+    assert dt.EMBED_MAX_CONTEXT_TOKENS == int(os.environ.get("EMBED_MAX_CONTEXT_TOKENS", "8192"))
+    assert ew.OVERFLOW_TOKEN_SLACK == int(os.environ.get("OVERFLOW_TOKEN_SLACK", "16"))
