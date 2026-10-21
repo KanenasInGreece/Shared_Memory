@@ -7,6 +7,15 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.0.27] - 2026-10-21
+
+Clean-up of `shared-memory/scripts/agent_roles.py`, the read-only roster and role rules shared by the token minter and the gateway, and the ninth file of the backend clean-up campaign: comment, debugging, simplification. `API_VERSION` stays 4. Restart the gateway; update the skills for the version.
+
+### Fixed
+- The bulk token mint (`generate_tokens.py`, run by `bootstrap_tokens.sh`) refuses before minting or writing anything when a read-only roster name, built in or from `SHARED_MEMORY_READ_ONLY_AGENTS`, still contains `:`, a newline or a carriage return after trimming. It used to print such a name into the `AGENT_ROLES=` line, so `evil\nINJECTED=1` forged a second `.env` assignment and `backup:admin` became `backup:admin:read`. It now exits 1 with a message naming the variable and the character. The gateway's confinement is unchanged: every roster name it is given is still read-only.
+- The gateway's warning for an `AGENT_ROLES` entry with an unknown role no longer says the agent keeps full access. It says the pair is not stored, and, when no valid pair for that name remains, names the role the agent really gets: `read` for a roster name, `admin` for `maintenance-admin`, `full` otherwise.
+- The `--role` help of `generate_tokens.py`, and the `AGENT_ROLES` entry of `.env.example`, now describe how an omitted role is decided, including `admin` and `maintenance-admin`. The `SHARED_MEMORY_READ_ONLY_AGENTS` entry moved next to `AGENT_ROLES`.
+
 ## [1.0.26] - 2026-10-21
 
 Clean-up of `shared-memory/scripts/insight_gate.py`, the walk and checks that decide whether a section's decisions and retrospectives are folded into an insight, and the eighth file of the backend clean-up campaign: comment and debugging. `API_VERSION` stays 4. Restart the gateway; update the skills for the version.
