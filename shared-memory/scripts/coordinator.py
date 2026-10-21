@@ -34,7 +34,7 @@ from neo4j.exceptions import ClientError
 from neo4j.graph import Node
 
 from log_hygiene import AsyncLineWriter, scrub_url_credentials
-from agent_roles import effective_role, read_only_agents
+from agent_roles import VALID_ROLES, effective_role, read_only_agents
 from ontology import (
     ONT, sanitize_entity_names, sanitize_entity_name,
     reserved_entity_name_reason,
@@ -379,13 +379,16 @@ def _load_agent_roles() -> dict[str, str]:
     Format: AGENT_ROLES=monitor:read,dashboard:read
     Roles only ever NARROW access — they never grant it (a token must still be a
     valid AGENT_TOKENS entry). The value "read" restricts an agent to
-    _READ_ROLE_ROUTES; "full" (or absence from the map) keeps full read/write.
-    Unset AGENT_ROLES → every token is full-access (backward compatible).
+    _READ_ROLE_ROUTES; "full" keeps full read/write. Absence from the map is full
+    for an ordinary name; a roster name is always read, and maintenance-admin is
+    admin unless declared read or on the roster (via effective_role). Unset AGENT_ROLES → ordinary tokens
+    are full-access (backward compatible).
     """
     raw = os.environ.get("AGENT_ROLES", "").strip()
     if not raw:
         return {}
     result: dict[str, str] = {}
+    rejected: list[str] = []
     for pair in raw.split(","):
         pair = pair.strip()
         if not pair:
@@ -394,13 +397,18 @@ def _load_agent_roles() -> dict[str, str]:
             log.warning("AGENT_ROLES: malformed entry %r (expected name:role)", pair)
             continue
         name, role = (p.strip() for p in pair.split(":", 1))
-        if role not in ("read", "full", "admin"):
+        if role not in VALID_ROLES:
             log.warning(
                 "AGENT_ROLES: unknown role %r for %r — expected 'read', 'full', or "
-                "'admin'; ignoring (agent keeps full access)", role, name,
+                "'admin'; this pair is not stored", role, name,
             )
+            rejected.append(name)
             continue
         result[name] = role
+    for name in dict.fromkeys(rejected):
+        if name not in result:
+            log.warning("AGENT_ROLES: %r has no valid role entry — it gets %r",
+                        name, effective_role(name, None))
     return result
 
 

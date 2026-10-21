@@ -1704,3 +1704,63 @@ def test_the_undeliverable_block_pastes_into_an_env(tmp_path):
 
     assert "REGISTERED BUT UNDELIVERABLE" in out, "the block must have printed"
     _assert_every_line_pastes(out)
+
+
+# ── bulk mint refuses an injectable read-only roster name ────────────────────
+
+@pytest.mark.parametrize("bad,shown", [
+    ("dash,evil\nINJECTED=1", "'evil\\nINJECTED=1'"),
+    ("backup:admin", "'backup:admin'"),
+])
+def test_mint_refuses_an_injectable_roster_name_before_writing(
+        tmp_path, monkeypatch, bad, shown):
+    gt = load_generate_tokens()
+    skill = tmp_path / "claude_skill"
+    skill.mkdir()
+    gt.LOCAL_SKILL_ENV_PATHS = {"claude": str(skill / ".env")}
+    monkeypatch.setenv("SHARED_MEMORY_READ_ONLY_AGENTS", bad)
+    with pytest.raises(ValueError) as ei:
+        _capture(gt.mint, roster=["claude"])
+    assert "SHARED_MEMORY_READ_ONLY_AGENTS" in str(ei.value)
+    assert shown in str(ei.value)
+    assert not (skill / ".env").exists()
+
+
+def test_mint_with_a_clean_extra_roster_name_still_works(tmp_path, monkeypatch):
+    gt = load_generate_tokens()
+    skill = tmp_path / "claude_skill"
+    skill.mkdir()
+    gt.LOCAL_SKILL_ENV_PATHS = {"claude": str(skill / ".env")}
+    monkeypatch.setenv("SHARED_MEMORY_READ_ONLY_AGENTS", "dash")
+    (_tokens, _digests, failures), out = _capture(gt.mint, roster=["claude"])
+    assert not failures
+    role_lines = [ln for ln in out.splitlines() if ln.startswith("AGENT_ROLES=")]
+    assert len(role_lines) == 1
+    entries = role_lines[0][len("AGENT_ROLES="):].split(",")
+    assert "dash:read" in entries and "monitor:read" in entries
+    assert (skill / ".env").exists()
+
+
+def test_main_refuses_an_injectable_roster_without_minting(monkeypatch, capsys):
+    gt = load_generate_tokens()
+    called = []
+    monkeypatch.setenv("SHARED_MEMORY_READ_ONLY_AGENTS", "evil\nINJECTED=1")
+    monkeypatch.setattr(gt, "_resolve_roster", lambda _p: [])
+    monkeypatch.setattr(gt, "mint", lambda **_kw: called.append(1))
+    assert gt.main([]) == 1
+    err = capsys.readouterr().err
+    assert "✗" in err and "SHARED_MEMORY_READ_ONLY_AGENTS" in err
+    assert not called
+
+
+def test_main_lets_an_unrelated_mint_valueerror_propagate(monkeypatch):
+    gt = load_generate_tokens()
+
+    def _boom(**_kw):
+        raise ValueError("boom")
+
+    monkeypatch.delenv("SHARED_MEMORY_READ_ONLY_AGENTS", raising=False)
+    monkeypatch.setattr(gt, "_resolve_roster", lambda _p: [])
+    monkeypatch.setattr(gt, "mint", _boom)
+    with pytest.raises(ValueError, match="boom"):
+        gt.main([])

@@ -120,7 +120,7 @@ AGENTS = ["claude", "gemini", "grok", "codex", "lm_studio", "antigravity"]
 
 # The read-only roster lives in agent_roles.py, and the gateway enforces that same list. A mint-only list let an old AGENT_ROLES line keep full access.
 from agent_roles import (                                    # noqa: E402
-    READ_ONLY_AGENTS, VALID_ROLES, read_only_agents,
+    READ_ONLY_AGENTS, VALID_ROLES, ENV_ROSTER_VAR, read_only_agents,
     role_for_mint, enforce_roster,
 )
 
@@ -640,6 +640,17 @@ def _write_agent_token_file(path: str, token: str) -> bool:
         os.close(dir_fd)
 
 
+def _refuse_injectable_roster() -> None:
+    """Raise ValueError if a read-only roster name could forge a .env line.
+
+    The roles line is printed from this list and token files are written before it,
+    so mint() refuses first, and main() calls this to catch only this refusal.
+    """
+    for name in read_only_agents():
+        _validate_registry_field(
+            name, f"read-only roster name (from {ENV_ROSTER_VAR} or the built-in roster)")
+
+
 def mint(
     env_path: "str | None" = None, roster: "list[str] | None" = None,
     revealing: "list[str] | None" = None,   # ⛔ see the note below: no TTY guard here
@@ -701,6 +712,7 @@ def mint(
             nothing to carry forward, matches D19's original intent (never
             register a digest nobody holds the matching plaintext for).
     """
+    _refuse_injectable_roster()
     if env_path is None:
         env_path = _DEFAULT_GATEWAY_ENV
     roster = _resolve_roster(env_path) if roster is None else roster
@@ -1204,8 +1216,11 @@ def main(argv=None) -> int:
         "--role", metavar="ROLE", choices=list(VALID_ROLES) + ["write"],
         help="Role for the agent being added with --add: read | full | admin. "
              "Roles only ever NARROW access. Omit it and the role is derived: "
-             "a name in READ_ONLY_AGENTS always gets 'read', anything else "
-             "gets full access (no AGENT_ROLES entry). ⛔ A read-only identity "
+             "a read-only roster name (built-in, or from "
+             "SHARED_MEMORY_READ_ONLY_AGENTS) or a name already declared "
+             "name:read gets 'read', maintenance-admin included; otherwise "
+             "maintenance-admin gets 'admin'; any other name gets full access "
+             "(no AGENT_ROLES entry). ⛔ A read-only identity "
              "cannot be widened here — --role full on one is REFUSED before "
              "anything is minted.",
     )
@@ -1367,6 +1382,11 @@ def main(argv=None) -> int:
               f"(known: {', '.join(roster)})", file=sys.stderr)
         return 1
 
+    try:
+        _refuse_injectable_roster()
+    except ValueError as exc:
+        print(f"✗ {exc}", file=sys.stderr)
+        return 1
     tokens, _digests, failures = mint(env_path=_DEFAULT_GATEWAY_ENV, roster=roster,
                                       revealing=args.reveal)
 

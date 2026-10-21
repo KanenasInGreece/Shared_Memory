@@ -3,14 +3,14 @@
 WHY THIS FILE EXISTS. `READ_ONLY_AGENTS` used to live only in generate_tokens.py,
 which meant the guarantee was a *minting convention*: whoever minted a token was
 trusted to write `name:read` into AGENT_ROLES, and the gateway simply believed
-whatever the file said. That has two holes, and both were found by review:
+whatever the file said. That left two holes, both found by review and both now
+closed by gateway enforcement:
 
-  * An agent registered BEFORE the roster was honoured on a given path keeps full
-    access forever — nothing ever revisits it.
-  * Absence from AGENT_ROLES means FULL read/write in the gateway, so any edit,
-    partial write, or older tool that rewrites that line silently WIDENS a
-    read-only identity. A guarantee that a file edit can switch off is not a
-    guarantee.
+  * An agent registered before the roster was honoured on a given path kept full
+    access forever — nothing revisited it.
+  * Absence from AGENT_ROLES meant FULL read/write, so any edit, partial write,
+    or older tool that rewrote that line silently WIDENED a read-only identity. A guarantee that a file edit can
+    switch off is not a guarantee.
 
 ⛔ THE ROSTER IS ENFORCED AT THE GATEWAY, NOT PROMISED AT MINT TIME (operator
 ruling, 2026-08-23: "always read only, enforced"). The gateway applies
@@ -23,14 +23,20 @@ Deliberately dependency-free: generate_tokens.py runs during install, long befor
 the gateway's asyncpg/aiohttp stack exists, so this module must import cleanly
 with nothing but the standard library.
 """
+import os
 
-# Built-in read-only roster. A deployment can add names via SHARED_MEMORY_READ_ONLY_AGENTS, and an existing AGENT_ROLES `name:read` must not be widened by a later mint: the roster cannot know names it has never heard of.
+# Built-in read-only roster. A deployment can add names via
+# SHARED_MEMORY_READ_ONLY_AGENTS.
+# A declared AGENT_ROLES `name:read` is never widened by a later mint, because the
+# roster cannot know names it has never heard of.
 _READ_ONLY_AGENTS_BUILTIN = ["monitor"]
 
 # Imported by callers. read_only_agents() is the accessor that also honours the environment.
 READ_ONLY_AGENTS = list(_READ_ONLY_AGENTS_BUILTIN)
 
 _ENV_ROSTER_VAR = "SHARED_MEMORY_READ_ONLY_AGENTS"
+# Public alias so callers (generate_tokens) can name the variable in messages.
+ENV_ROSTER_VAR = _ENV_ROSTER_VAR
 
 
 def read_only_agents() -> "list[str]":
@@ -40,7 +46,6 @@ def read_only_agents() -> "list[str]":
     separate processes with separate lifetimes, and a roster captured at import
     would ignore an identity confined after the process started.
     """
-    import os
     names = list(READ_ONLY_AGENTS)
     raw = os.environ.get(_ENV_ROSTER_VAR, "")
     for extra in raw.split(","):
@@ -52,9 +57,10 @@ def read_only_agents() -> "list[str]":
 # Reserved maintenance admin identity.
 MAINTENANCE_ADMIN_AGENT = "maintenance-admin"
 
-# Roles the gateway understands. Roles only ever NARROW access; absence from the
-# map means full read/write, which is why an omission is the WIDEST outcome and
-# never a safe default.
+# Roles the gateway understands. Roles only ever NARROW access. Absence from the
+# map is full read/write for an ordinary name — the widest outcome, so never a safe
+# default. A roster name is always read; maintenance-admin is admin unless declared
+# read or on the roster (effective_role()).
 VALID_ROLES = ("read", "full", "admin")
 
 
@@ -69,12 +75,13 @@ def effective_role(name: str, declared: "str | None") -> str:
 
     MAINTENANCE_ADMIN_AGENT ("maintenance-admin") resolves to "admin" when its
     declared role is missing, "full" or "write"; an explicit "read", or
-    membership of the read-only roster, stays "read" (fact:3099: maintenance-admin pin narrows only).
+    membership of the read-only roster, stays "read" (fact:3099: the
+    maintenance-admin pin narrows only).
 
     Everyone else keeps what was declared, defaulting to "full", which
     preserves the long-standing behaviour that an unlisted agent is unconfined.
 
-    Pure, so the rule is testable without a gateway, a .env or a database.
+    Needs no gateway or database; it reads the roster env var at call time.
     """
     if name in read_only_agents():
         return "read"
@@ -103,13 +110,13 @@ def role_for_mint(name: str, explicit: "str | None" = None,
     — even though the gateway would now override it anyway, because a .env that
     *claims* a monitor has full access is a lie an operator will act on.
 
-    MAINTENANCE_ADMIN_AGENT ("maintenance-admin") resolves to "admin" when its
-    declared role is missing, "full" or "write". An explicit "read" or roster
-    membership yields "read". An explicit request to widen it to "full" or "write"
-    raises ValueError (fact:3099: maintenance-admin pin narrows only).
+    MAINTENANCE_ADMIN_AGENT gets "admin" when omitted or requested "admin", "read"
+    when declared or requested "read"; "full"/"write" are refused (fact:3099: the
+    maintenance-admin pin narrows only).
 
-    Raises ValueError on an unknown role, and on an attempt to widen a read-only
-    identity or alter MAINTENANCE_ADMIN_AGENT. Callers refuse BEFORE minting anything.
+    Raises ValueError on: an unknown role; widening a roster or declared-read
+    identity; "full"/"write" on maintenance-admin; "admin" on a maintenance-admin
+    already declared read. Callers refuse BEFORE minting anything.
     """
     roster = read_only_agents()
     if name in roster:
@@ -157,8 +164,6 @@ def role_for_mint(name: str, explicit: "str | None" = None,
                 f"privilege change, so it is made by editing that declaration "
                 f"deliberately, never as a side effect of minting.")
         return explicit
-    if name in roster:
-        return "read"
     # Already confined by an operator declaration: preserve it rather than
     # returning None, which would drop the entry and mean FULL access.
     if declared == "read":
@@ -170,9 +175,9 @@ def enforce_roster(roles: dict) -> dict:
     """Return `roles` with read-only identities and maintenance admin pinned appropriately.
 
     Used on the WRITE side so a minted .env states the truth the gateway will
-    enforce anyway — and so a roster that drifted (an agent registered before
-    this rule, or a line rewritten by an older tool) is repaired the next time
-    anything mints, rather than staying wrong until someone notices.
+    enforce anyway. A drifted line (an agent registered before this rule, or a line
+    rewritten by an older tool) is repaired when a mint calls this: the bulk mint,
+    and an --add/--remint that writes a roles line.
     """
     fixed = dict(roles)
     for name in read_only_agents():
