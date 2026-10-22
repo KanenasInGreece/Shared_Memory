@@ -4,9 +4,12 @@
 Phase A is stdlib-only (survives a coordinator import crash). Phase B needs daemon deps. Exit 0 = readable and would boot, 1 = readable but boot would refuse, 2 = could not render. Not wired into preflight.sh (different 0/1 contract; needs shared-memory/.env).
 """
 import argparse
+import importlib.util
 import json
+import math
 import os
 import sys
+import urllib.parse
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -64,12 +67,75 @@ def _idiom_for(key: str) -> str:
     return FRAMEWORK_DEFAULTS[key]["idiom"]
 
 
-def _verdict(key: str) -> dict:
+# Module-level float()/int() env reads of dream_telemetry.py, in module order. A parse failure
+# in any of them stops the gateway at import, so _gateway_embed_values names the first to raise.
+# A non-finite EMBED_CHARS_PER_TOKEN (nan, inf, 1e309) counts too: it is the only float fed to
+# the derived int((ctx - reserve) * ratio) and int(reserve * ratio), which raise on it.
+_DREAM_TELEMETRY_PARSES = (
+    ("LLM_CEILING_FLOOR", float), ("LLM_MIN_TOK_S", float), ("EMBED_MIN_TOK_S", float),
+    ("EMBED_MAX_CONTEXT_TOKENS", int), ("EMBED_CHARS_PER_TOKEN", float),
+    ("EMBED_MAX_CHARS", int), ("EMBED_SAFETY_FACTOR", float),
+    ("EMBED_TIMEOUT_FLOOR_S", float), ("RERANK_MIN_CHARS_S", float),
+    ("RERANK_MAX_DOC_CHARS", int), ("RERANK_SAFETY_FACTOR", float),
+    ("RERANK_TIMEOUT_FLOOR_S", float),
+)
+_EMBED_KEYS = ("EMBED_MAX_CONTEXT_TOKENS", "EMBED_CHARS_PER_TOKEN",
+               "EMBED_SPECIAL_TOKEN_RESERVE", "EMBED_MAX_CHARS")
+_GATEWAY_BIND_DEFAULT = "127.0.0.1"
+
+
+def _gateway_embed_values() -> "tuple[dict | None, str | None]":
+    """What the gateway's own dream_telemetry resolves for the four embed values, as
+    (values, None); or (None, name) when importing it fails, name being the env variable
+    whose parse raised (None if unknown). Loads a PRIVATE copy never put in sys.modules, so
+    the shared module that Phase B, coordinator and encoder_window read is never reloaded
+    or half-updated. Call after load_split_env(): the module reads os.environ at import."""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dream_telemetry.py")
+    try:
+        spec = importlib.util.spec_from_file_location("_check_config_dream_telemetry", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return {k: getattr(module, k) for k in _EMBED_KEYS}, None
+    except Exception:
+        # Never surface the exception message (it can carry a raw .env line); name the variable.
+        for name, conv in _DREAM_TELEMETRY_PARSES:
+            raw = os.environ.get(name)
+            if raw is None:
+                continue
+            try:
+                parsed = conv(raw)
+            except (ValueError, OverflowError):
+                return None, name
+            if name == "EMBED_CHARS_PER_TOKEN" and not math.isfinite(parsed):
+                return None, name
+        return None, None
+
+
+def _encoder_base_problem(base: str) -> str:
+    """Why coordinator._encoder_url would refuse the already-stripped `base` at import ('' if
+    it would not): a query or fragment (normalize_encoder_base), or a scheme other than
+    http/https."""
+    try:
+        parsed = urllib.parse.urlsplit(base)
+    except ValueError:
+        return "not an http(s) URL — the gateway would not start"
+    if parsed.query or parsed.fragment:
+        return "carries a query string or fragment — the gateway would not start"
+    if parsed.scheme not in ("http", "https"):
+        return "not an http(s) URL — the gateway would not start"
+    return ""
+
+
+def _verdict(key: str, gateway: "tuple[dict | None, str | None] | None" = None) -> dict:
     """The three-valued state for `key`, plus the value THIS process would
     actually resolve — mirroring the real consumer site's own idiom exactly
     (never normalised; see framework_defaults.py's LLM_DEFAULT_TARGET row
     for why an 'or' vs 'get' difference here is documented, not a bug to
-    silently fix)."""
+    silently fix). Rows whose consumer does more than get/or (the embed
+    values, PROXY_BIND, the encoder URLs, OVERFLOW_TOKEN_SLACK) take the
+    consumer's own result, or name why the gateway would not start, in `note`
+    ('' when there is nothing to add). `gateway` is _gateway_embed_values()'s
+    result; omitted, it is computed here."""
     default = FRAMEWORK_DEFAULTS[key]["default"]
     idiom = _idiom_for(key)
     raw = os.environ.get(key)
@@ -80,9 +146,42 @@ def _verdict(key: str) -> dict:
         effective = (raw or default) if idiom == "or" else raw
     else:
         state, effective = "declared", raw
+    note = ""
     if key in ("EMBEDDER_URL", "RERANKER_URL"):
         effective = (effective or "").strip().rstrip("/")
-    return {"key": key, "state": state, "idiom": idiom, "effective": effective}
+        # coordinator._encoder_url refuses a non-http(s) base at import.
+        note = _encoder_base_problem(effective)
+    elif key == "PROXY_BIND" and raw is not None:
+        # hive_mind_proxy._resolve_proxy_bind_host: strip, empty falls back to loopback.
+        effective = raw.strip() or _GATEWAY_BIND_DEFAULT
+    elif key == "OVERFLOW_TOKEN_SLACK" and raw is not None:
+        # encoder_window does int(os.environ.get(...)): a raw int() rejects stops the gateway;
+        # an accepted spelling keeps its raw text.
+        try:
+            int(raw)
+        except ValueError:
+            note = "not a whole number — the gateway would not start"
+    elif key in _EMBED_KEYS:
+        values, failed = gateway if gateway is not None else _gateway_embed_values()
+        if values is None:
+            if failed == key:
+                note = "not a number — the gateway would not start"
+        elif key == "EMBED_SPECIAL_TOKEN_RESERVE" and raw is not None:
+            # dream_telemetry._parse_special_token_reserve: only an int in
+            # [0, EMBED_MAX_CONTEXT_TOKENS) is used, anything else falls back.
+            try:
+                accepted = 0 <= int(raw) < values["EMBED_MAX_CONTEXT_TOKENS"]
+            except ValueError:
+                accepted = False
+            if not accepted:
+                effective = values[key]
+                note = f"invalid — the gateway uses {effective}"
+        elif key == "EMBED_MAX_CHARS" and raw is None:
+            # dream_telemetry derives it from the context, reserve and chars-per-token.
+            state, effective = "derived", values[key]
+            note = ("from (EMBED_MAX_CONTEXT_TOKENS - EMBED_SPECIAL_TOKEN_RESERVE) "
+                    "* EMBED_CHARS_PER_TOKEN")
+    return {"key": key, "state": state, "idiom": idiom, "effective": effective, "note": note}
 
 
 def _secret_names() -> "list[str]":
@@ -120,10 +219,17 @@ def phase_a_render() -> "tuple[list[str], bool]":
 
     lines.append("")
     lines.append("Effective configuration:")
+    gateway = _gateway_embed_values()
     for key in ENV_ROW_ORDER:
-        v = _verdict(key)
+        v = _verdict(key, gateway)
         effective = scrub_url_credentials(str(v["effective"]))
-        lines.append(f"  {key:<28} {v['state']:<20} -> {effective!r}  [idiom={v['idiom']}]")
+        suffix = f"  ({v['note']})" if v["note"] else ""
+        lines.append(f"  {key:<28} {v['state']:<20} -> {effective!r}  [idiom={v['idiom']}]{suffix}")
+    if gateway[0] is None and gateway[1] is None:
+        # The import failed but no variable could be named; say so without exception text.
+        lines.append("  dream_telemetry: a value could not be used — the gateway would not start")
+    elif gateway[0] is None and gateway[1] not in ENV_ROW_ORDER:
+        lines.append(f"  {gateway[1]}: not a number — the gateway would not start")
 
     lines.append("")
     lines.append("Credentials (boolean only — the value is never rendered):")
