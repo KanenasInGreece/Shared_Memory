@@ -737,12 +737,28 @@ def _normalize_ack(raw: dict) -> dict[int, str]:
     return out
 
 
-def _valid_ref(ref: str) -> bool:
-    """A bare id, or a qualified `type:id` reference (decision 822)."""
-    head, _, tail = str(ref).partition(":")
-    if tail:
-        return tail.lstrip("-").isdigit() and head.lower() in RECORD_TYPES
-    return str(ref).lstrip("-").isdigit()
+def _canonical_ref(ref) -> str | None:
+    """The canonical `type:id` (or bare id) the gateway would accept for ``ref``, else None."""
+    # Mirrors record_ref.parse_ref (not imported: the clients ship alone, ADR-014); the
+    # parity test in tests/test_fix_batch_e.py pins the two together.
+    text = str(ref).strip()
+    rtype, sep, num = text.partition(":")
+    if sep:
+        rtype = rtype.strip().lower()
+        if rtype not in RECORD_TYPES:
+            return None
+    else:
+        rtype, num = None, text
+    num = num.strip()
+    if not (num.isascii() and num.isdigit()):
+        return None
+    try:
+        pid = int(num)
+    except ValueError:  # past the interpreter's int-string digit limit; the gateway refuses it too
+        return None
+    if not 0 < pid <= 2**63 - 1:
+        return None
+    return str(pid) if rtype is None else f"{rtype}:{pid}"
 
 
 # ── Retrieval ────────────────────────────────────────────────────────────────
@@ -1622,7 +1638,8 @@ async def record_lineage(ref: str) -> str:
     resolves against the facts table and returns a confident, unrelated record.
     """
     ref = str(ref).strip()
-    if not _valid_ref(ref):
+    ref = _canonical_ref(ref)
+    if ref is None:
         return _as_json({"error": (
             "ref must be a bare id or type:id, where type is one of "
             + ", ".join(RECORD_TYPES))})
