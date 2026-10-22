@@ -1084,7 +1084,7 @@ def _may_steer_llm(request) -> bool:
     agent_name = _safe_agent_name(request)
     if agent_name in DAEMON_AGENT_NAMES:
         return True
-    return _AGENT_ROLES.get(agent_name, "full") == "admin"
+    return effective_role(agent_name, _AGENT_ROLES.get(agent_name)) == "admin"
 
 
 def _strip_llm_steering_headers(headers) -> "CIMultiDict[str]":

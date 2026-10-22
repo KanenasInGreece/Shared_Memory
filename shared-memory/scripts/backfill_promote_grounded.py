@@ -64,10 +64,12 @@ from project_promotion import (  # noqa: E402
     promote_record, sole_project, METHOD_GROUNDING,
 )
 
-DSN = (
-    f"postgresql://{os.environ.get('PG_USER', 'postgres')}:"
-    f"{secure_env.get_secret('PG_PASSWORD', '')}@{os.environ.get('PG_HOST', 'localhost')}:"
-    f"{os.environ.get('PG_PORT', '5432')}/{os.environ.get('PG_DATABASE', 'agent_data')}"
+DSN = secure_env.pg_dsn(
+    secure_env.get_secret('PG_PASSWORD', ''),
+    user=os.environ.get('PG_USER', 'postgres'),
+    host=os.environ.get('PG_HOST', 'localhost'),
+    port=os.environ.get('PG_PORT', '5432'),
+    dbname=os.environ.get('PG_DATABASE', 'agent_data'),
 )
 
 # Parked facts, with the distinct projects of every judgement citing them.

@@ -1,7 +1,7 @@
-"""Tests for DSN construction and password quote_plus encoding (A5).
+"""Tests for DSN construction and password percent-encoding (A5).
 
 A PG_PASSWORD containing characters like '@', ':', or '/' (e.g. 'a@b:c/d')
-must be percent-encoded with urllib.parse.quote_plus when constructing DSNs,
+must be percent-encoded with urllib.parse.quote(safe="") when constructing DSNs,
 so urlparse properly recovers the credentials and host/database components.
 If PG_CONN is supplied whole, it is left untouched.
 """

@@ -57,7 +57,7 @@ from domain_axis import (
     DOMAIN_PROPOSAL_LIMIT, DOMAIN_CONFUSABLE_SQL, DOMAIN_CONFUSABLE_SIMILARITY,
     DOMAIN_ALIAS_RESOLVE_SQL, DOMAIN_REGISTER_SQL, DOMAIN_KEYS,
     DOMAIN_NAMES_SQL, DOMAIN_ALIASES_SQL, DOMAIN_NAME_OR_KEY_SQL,
-    DOMAIN_BY_KEY_SQL,
+    DOMAIN_BY_KEY_SQL, _similarity_from_env,
     domain_merge_cypher, names_a_domain, resolve_domains,
 )
 from insight_gate import walk_group_reached_set, passes_insight_gate
@@ -65,7 +65,7 @@ from project_promotion import (
     promote_record, sole_project, METHOD_GROUNDING,
 )
 from project_alias import ALIAS_RESOLVE_SQL, ACTIVE_ALIASES_SQL
-from secure_env import get_secret
+from secure_env import get_secret, pg_dsn
 from framework_defaults import FRAMEWORK_DEFAULTS
 from telemetry_instruments import LatencyRing, Counter, safe
 # A key whose removed_in this release has reached is stripped in handle_telemetry. Leaf module: its only import is annotations, so it cannot cycle back here.
@@ -129,7 +129,7 @@ def _short(value: Any, cap: int = 200) -> str:
 
 
 # FRAMEWORK_VERSION is the build string and may drift. API_VERSION is the wire contract with memory_bridge.py; bump it only when shape, auth, or routes break older clients.
-FRAMEWORK_VERSION = "1.0.28"
+FRAMEWORK_VERSION = "1.0.29"
 # API v2: retrospective is a full record. v4: unregistered project is 400 (proposal / new_project / sentinel).
 API_VERSION = 4
 CLIENT_VERSION_HEADER = "X-SM-Api-Version"
@@ -870,12 +870,24 @@ def is_judgement_type(record_type: object) -> bool:
     return record_label_for_type(record_type) in JUDGEMENT_LABELS
 
 
+# No conflict target, so every unique index (`name` and `normalized_key`) is absorbed and a lost spelling race returns no row instead of raising. The alias-disjoint trigger still raises; `_register_project` catches it.
+PROJECT_REGISTER_SQL = (
+    "INSERT INTO projects (name, created_by) VALUES ($1, $2)"
+    " ON CONFLICT DO NOTHING"
+    " RETURNING id"
+)
+
+PROJECT_BY_KEY_SQL = (
+    "SELECT name FROM projects WHERE normalized_key = axis_normalize($1)"
+)
+
+
 class ProjectIdentityUnavailable(RuntimeError):
     """Registry lookup failed for a name that should have an id: outbox retries, save is 503, readers degrade."""
 
 
 class DomainRegistrationRefused(RuntimeError):
-    """A section the gates accepted lost a spelling race at commit; `body` is the 400 answer."""
+    """A project or section the gates accepted lost a spelling race at commit; `body` is the 400 answer."""
 
     def __init__(self, body: dict):
         super().__init__(body.get("message") or body.get("error") or "domain refused")
@@ -883,7 +895,7 @@ class DomainRegistrationRefused(RuntimeError):
 
 
 class DomainRegistryUnavailable(RuntimeError):
-    """A section was not registered and nothing visible explains why: save is 503."""
+    """A project or section was not registered and nothing visible explains why: save is 503."""
 
 
 class DomainIdentityUnavailable(RuntimeError):
@@ -980,8 +992,10 @@ ENTITY_CONFUSABLE_SQL = """
 """
 
 # Floor inherited from projects; not re-measured on this vocabulary (fact:1338).
-ENTITY_CONFUSABLE_SIMILARITY = float(
-    os.environ.get("ENTITY_CONFUSABLE_SIMILARITY", "0.6")
+ENTITY_CONFUSABLE_SIMILARITY = _similarity_from_env(
+    "ENTITY_CONFUSABLE_SIMILARITY",
+    os.environ.get("ENTITY_CONFUSABLE_SIMILARITY"),
+    0.6,
 )
 ENTITY_PROPOSAL_LIMIT = _env_int("ENTITY_PROPOSAL_LIMIT", 5)
 
@@ -2128,7 +2142,7 @@ async def auth_middleware(request: web.Request, handler):
 
 _pg_pass = get_secret("PG_PASSWORD", "")
 PG_DSN   = get_secret(
-    "PG_CONN", f"postgresql://postgres:{_pg_pass}@localhost:5432/agent_data"
+    "PG_CONN", pg_dsn(_pg_pass)
 )
 NEO4J_URI  = "bolt://localhost:7687"
 NEO4J_AUTH = ("neo4j", get_secret("NEO4J_PASSWORD", ""))
@@ -4665,8 +4679,6 @@ class MemoryCoordinator:
           * a `new_project` row, and any EARLIER section row of the same save,
             written before a later section is refused or found unavailable,
             stays.
-          * a project-key race in `_register_project` is still a 500 (finding
-            da-9, not this change).
 
         Closing any of them needs one transaction spanning the registry writes
         and the record insert, which no axis has today. What WAS fixed is the
@@ -4689,7 +4701,13 @@ class MemoryCoordinator:
             earlier.append(intent["name"])
         project = pending.get("project")
         if project:
-            await self._register_project(project, agent_id)
+            if await self._register_project(project, agent_id) is False:
+                body = await self._new_project_refusal(project, metadata)
+                if body is not None:
+                    raise DomainRegistrationRefused(body)
+                raise DomainRegistryUnavailable(
+                    f"project {_short(project)} was not registered and no "
+                    "spelling in the registry explains why")
             log.info("project registry: %r REGISTERED by %s — every gate passed",
                      project, agent_id)
         for intent in pending.get("domains") or []:
@@ -6410,20 +6428,27 @@ class MemoryCoordinator:
         except Exception as exc:
             return [], {}, self._note_registry_read_failure("domain", exc)
 
-    async def _register_project(self, name: str, agent_id: str) -> None:
+    async def _register_project(self, name: str, agent_id: str) -> bool:
         """Register a project the caller declared new (P9's second form).
 
         No description: it is owed from the operator, and a placeholder would
         claim one was supplied. The sentinel can never arrive here — it short
         circuits above — and the schema's CHECK constraint keeps that true even
         if a future caller reaches this by another path.
+
+        Returns True when the project exists under this exact name afterwards, and
+        False when another spelling holds its key or the alias-disjoint trigger
+        refused it.
         """
         async with self._acquire() as conn:
-            await conn.execute(
-                "INSERT INTO projects (name, created_by) VALUES ($1, $2)"
-                " ON CONFLICT (name) DO NOTHING",
-                name, agent_id or "unknown",
-            )
+            try:
+                new_id = await conn.fetchval(
+                    PROJECT_REGISTER_SQL, name, agent_id or "unknown")
+                if new_id is not None:
+                    return True
+                return await conn.fetchval(PROJECT_BY_KEY_SQL, name) == name
+            except asyncpg.RaiseError:
+                return False
 
     async def _project_proposals(self, name: str | None) -> list[str]:
         """Registry neighbours of a value that missed.
@@ -6835,8 +6860,8 @@ class MemoryCoordinator:
             self._count_refusal(exc.body)
             return web.json_response(exc.body, status=400)
         except (ProjectIdentityUnavailable, DomainRegistryUnavailable) as exc:
-            # A project id could not be read back, or a section was not registered and
-            # nothing explains why. A record that cannot be filed is not saved.
+            # A project id could not be read back, or a project or section was not registered
+            # and nothing explains why. A record that cannot be filed is not saved.
             log.error("save refused while committing axis registrations: %s", exc)
             return web.json_response(
                 {

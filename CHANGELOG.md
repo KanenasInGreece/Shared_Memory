@@ -7,6 +7,16 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.0.29] - 2026-10-22
+
+Fix round, batch A: four defects from the clean-up campaign's fix register. `API_VERSION` stays 4. Restart the gateway; update the skills for the version.
+
+### Fixed
+- When `PG_CONN` is unset, every built-in Postgres connection string now percent-encodes `PG_PASSWORD` correctly (`secure_env.pg_dsn`, used by the gateway, both daemons and eight maintenance scripts; the three migration tools do the same inline). The gateway, NREM and the maintenance scripts inserted the password raw, so a password containing `@ / % # ? [ ]` or a tab could not connect; REM and the migration tools used `quote_plus`, which turned a space into a literal `+`. A password made only of letters, digits and `_ . ~ -` produces the same string as before, and an explicit `PG_CONN` is unchanged.
+- Two saves registering spellings of the same new project at the same moment (`MyProj` and `myproj`) no longer fail with a 500. The losing save gets `project_spelling_variant`, the answer it would get a moment later, or `registry_unavailable` (503) when nothing visible explains the miss, as sections already do.
+- `ENTITY_CONFUSABLE_SIMILARITY` must be a number greater than 0 and at most 1, or the gateway stops at startup with a message naming it. `nan`, `inf` or a value above 1 used to switch the entity confusable check off silently, `0` held every entity as confusable, and a non-number stopped the import without naming the variable.
+- The check that decides whether a caller may send `X-SM-LLM-*` steering headers now uses the same effective role as the rest of the gateway (a read-only roster name is never admin; `maintenance-admin` is). No caller could reach the disagreement before, because admin tokens are confined to `/admin/*` and read tokens never reach the LLM route.
+
 ## [1.0.28] - 2026-10-21
 
 Clean-up of `shared-memory/scripts/framework_defaults.py`, the table of built-in defaults that `check_config.py` reports from, and the tenth file of the backend clean-up campaign: comment, refactoring. `API_VERSION` stays 4. No behaviour change. Restart the gateway; update the skills for the version.

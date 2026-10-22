@@ -72,6 +72,7 @@ import os
 import re
 import stat
 import sys
+import urllib.parse
 from pathlib import Path
 
 # PG_CONN embeds the Postgres password, so treating it as config would export it. AGENT_TOKEN is already secret by suffix; it is listed so the advisory can see a key that is never written to shared-memory/.env.
@@ -1029,3 +1030,14 @@ def require_db_credentials(*, pg_password: str, pg_conn: str, neo4j_password: st
             "NEO4J_PASSWORD is empty. Supply it via shared-memory/.env, or "
             "the A4 file-based credential path once it ships."
         )
+
+
+def pg_dsn(password: str, *, user: str = "postgres", host: str = "localhost",
+           port: str | int = 5432, dbname: str = "agent_data") -> str:
+    """Build the default Postgres URL with the password percent-encoded.
+
+    `quote(safe="")` is used because both drivers percent-decode the userinfo, and
+    `quote_plus` would turn a space into a literal `+`. A supplied PG_CONN is used
+    verbatim instead of passing through here.
+    """
+    return f"postgresql://{user}:{urllib.parse.quote(password, safe='')}@{host}:{port}/{dbname}"

@@ -82,12 +82,12 @@ def _load_env() -> None:
 
 
 def _pg_dsn() -> str:
-    return (
-        f"postgresql://{os.environ.get('PG_USER', 'postgres')}:"
-        f"{secure_env.get_secret('PG_PASSWORD', '')}@"
-        f"{os.environ.get('PG_HOST', 'localhost')}:"
-        f"{os.environ.get('PG_PORT', '5432')}/"
-        f"{os.environ.get('PG_DATABASE', 'agent_data')}"
+    return secure_env.pg_dsn(
+        secure_env.get_secret('PG_PASSWORD', ''),
+        user=os.environ.get('PG_USER', 'postgres'),
+        host=os.environ.get('PG_HOST', 'localhost'),
+        port=os.environ.get('PG_PORT', '5432'),
+        dbname=os.environ.get('PG_DATABASE', 'agent_data'),
     )
 
 

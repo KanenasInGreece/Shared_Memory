@@ -683,8 +683,7 @@ def test_this_prs_templated_keys_carry_the_codes_real_default():
     assert _template_covers("EMBED_URL", _FRAMEWORK_TEMPLATE)
 
     # PG_CONN is DELIBERATELY EXEMPT from the default-value assertion. Its
-    # code default (coordinator.py:2388-2389) is
-    # f"postgresql://postgres:{_pg_pass}@localhost:5432/agent_data" -- it
+    # code default (the `PG_DSN` line in coordinator.py) is pg_dsn(_pg_pass) -- it
     # INTERPOLATES A LIVE PASSWORD. This repository is a public mirror and
     # ships placeholder values only, so asserting the real default here would
     # mean asserting a line that must never exist in this file. Presence is

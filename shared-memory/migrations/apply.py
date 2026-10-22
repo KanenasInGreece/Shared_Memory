@@ -115,7 +115,7 @@ def _pg_conn() -> str:
     pg_pass = os.environ.get("PG_PASSWORD", "")
     return os.environ.get(
         "PG_CONN",
-        f"postgresql://postgres:{urllib.parse.quote_plus(pg_pass)}@localhost:5432/agent_data",
+        f"postgresql://postgres:{urllib.parse.quote(pg_pass, safe='')}@localhost:5432/agent_data",
     )
 
 
