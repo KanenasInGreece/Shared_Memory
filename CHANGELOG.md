@@ -7,6 +7,13 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.0.33] - 2026-10-22
+
+Fix round, batch E: the two client front doors. `API_VERSION` stays 4. Update the skills (and restart MCP hosts) for the version.
+
+### Fixed
+- `memory_bridge.py lineage` and the MCP `record_lineage` tool check a record reference with exactly the gateway's rules and send it in its canonical form. A negative, zero, non-ASCII or oversized id (`-5`, `fact:0`, `fact:٣`) used to pass the client and be refused by the gateway; one with spaces around its parts (`fact : 12`) was refused by the client although the gateway accepts it; and a ref with leading zeros was sent as typed. A digit string too long for Python to convert now gets the usual refusal instead of a traceback. Refusal messages are unchanged.
+
 ## [1.0.32] - 2026-10-22
 
 Fix round, batch D: operator tooling. `API_VERSION` stays 4. Restart the gateway; update the skills for the version.
