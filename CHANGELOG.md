@@ -7,6 +7,17 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.0.32] - 2026-10-22
+
+Fix round, batch D: operator tooling. `API_VERSION` stays 4. Restart the gateway; update the skills for the version.
+
+### Fixed
+- `sync_project_registry.py` no longer lists as NEW a folder that is only a spelling of a name already settled: a spelling of a registered project (`Foo_Bar` against `foo-bar`), a retired spelling (an active alias), or a second folder in the same run that the registry would treat as the same project (`foo.bar` and `foobar`). It asks the database's own normalisation and lists those folders with the name to rename them to. `--apply` registers each new name separately, so one name the registry refuses no longer aborts the whole run with a traceback and nothing registered.
+- `update_framework.sh` restarts the optional rerank shim after the gateway when it runs as the `rerank-shim.service` user unit; a failure there warns and the update continues. When the shim runs as the `b580-rerank-shim` container it prints the `docker restart` command instead, because an update never restarts containers.
+
+### Removed
+- `shared-memory/scripts/diagnostic_proxy.py`, an unreferenced debugging relay. It listened on port 8888 on every network interface and forwarded requests to the embedder and the LLM without authentication.
+
 ## [1.0.31] - 2026-10-22
 
 Fix round, batch C. `API_VERSION` stays 4. Restart the gateway; update the skills for the version. ⚠ The gateway lock gains one package (PyYAML), so the first start after the update resolves it.
