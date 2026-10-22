@@ -37,7 +37,7 @@ from typing import Any
 
 import httpx
 
-VERSION = "1.0.32"
+VERSION = "1.0.33"
 # Must match GET /health api_version; v4 refuses unregistered project on fact save.
 API_VERSION = 4
 
@@ -732,6 +732,30 @@ async def _warn_on_skew(result: dict) -> dict:
         print(f"[WARN] shared-memory: {diag['warning']}", file=sys.stderr)
         result["version_warning"] = diag["warning"]
     return result
+
+
+def _canonical_ref(ref) -> str | None:
+    """The canonical `type:id` (or bare id) the gateway would accept for ``ref``, else None."""
+    # Mirrors record_ref.parse_ref (not imported: the clients ship alone, ADR-014); the
+    # parity test in tests/test_fix_batch_e.py pins the two together.
+    text = str(ref).strip()
+    rtype, sep, num = text.partition(":")
+    if sep:
+        rtype = rtype.strip().lower()
+        if rtype not in ("fact", "decision", "retrospective", "summary", "insight"):
+            return None
+    else:
+        rtype, num = None, text
+    num = num.strip()
+    if not (num.isascii() and num.isdigit()):
+        return None
+    try:
+        pid = int(num)
+    except ValueError:  # past the interpreter's int-string digit limit; the gateway refuses it too
+        return None
+    if not 0 < pid <= 2**63 - 1:
+        return None
+    return str(pid) if rtype is None else f"{rtype}:{pid}"
 
 
 def _normalize_domains(metadata: dict) -> dict:
@@ -1668,17 +1692,12 @@ async def main() -> None:
             print(json.dumps({"error": "Usage: memory_bridge.py lineage <pg_id|type:id>"}))
             sys.exit(1)
         ref = sys.argv[2].strip()
-        head, _, tail = ref.partition(":")
-        valid = (tail.lstrip("-").isdigit()
-                 and head.lower() in ("fact", "decision", "retrospective",
-                                      "summary", "insight")) if tail else \
-                ref.lstrip("-").isdigit()
-        if not valid:
+        pid = _canonical_ref(ref)
+        if pid is None:
             print(json.dumps({"error": (
                 "Usage: memory_bridge.py lineage <pg_id|type:id> — type is one of "
                 "fact, decision, retrospective, summary, insight")}))
             sys.exit(1)
-        pid = ref
         try:
             async with _async_client(30.0) as client:
                 r = await client.get(
