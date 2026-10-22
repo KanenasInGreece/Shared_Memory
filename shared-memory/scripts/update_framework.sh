@@ -5,7 +5,7 @@
 #   bash shared-memory/scripts/update_framework.sh              # upgrade in place
 #   bash shared-memory/scripts/update_framework.sh --from-restore
 #   bash shared-memory/scripts/update_framework.sh --dry-run    # print, run nothing
-#   bash shared-memory/scripts/update_framework.sh --domain-backfill  # also run step 8 (opt-in)
+#   bash shared-memory/scripts/update_framework.sh --domain-backfill  # also run the domain backfill (opt-in)
 #   bash shared-memory/scripts/update_framework.sh --skip-env-migration  # see below
 #   bash shared-memory/scripts/update_framework.sh --skip-backup  # see below
 #
@@ -16,6 +16,8 @@
 # --skip-env-migration skips the pre-pull capture and the migrate_env.py --apply step, so a capture bug cannot block a security update. Run migrate_env.py by hand for this upgrade.
 #
 # Env overrides: GATEWAY_URL, GATEWAY_UNIT, GATEWAY_RESTART_CMD.
+#
+# After the gateway's version gate it also restarts an active rerank-shim.service user unit; a running b580-rerank-shim container only gets a warning with the docker restart command.
 #
 # --from-restore is the same procedure as an upgrade, minus fetching code, because restore.sh has just supplied the data. Every guard below applies to both.
 #
@@ -445,6 +447,29 @@ if [[ "$DRY_RUN" == "0" ]]; then
           journalctl --user -u $GATEWAY_UNIT -n 50"
     fi
     grn "   ✓ gateway restarted and running $_running (matches this checkout)"
+fi
+
+# The optional rerank shim keeps running its old code after an update until it is restarted. The check stays outside run() so an absent unit, systemctl or docker is not fatal, and it sits after the version gate so a shim problem can never skip the gate.
+# rerank-shim.service is the unit name the README and records use; the workstation's local PartOf/Wants drop-ins already restart it with the gateway, so this restarts it a second time, harmlessly. A container is never restarted here (decision:1586/1589: containers move only via reconcile_stack.sh, run by the operator), so that shape only gets a warning.
+echo
+ylw "── Rerank shim (optional): restart it if this host runs it ──"
+if [[ "$DRY_RUN" == "1" ]]; then
+    echo "   (dry run — would check systemctl --user is-active rerank-shim.service,"
+    echo "    restart it if active, else warn if container b580-rerank-shim runs; nothing called)"
+elif command -v systemctl >/dev/null 2>&1 \
+     && systemctl --user is-active --quiet rerank-shim.service; then
+    run_soft "restart the rerank shim" systemctl --user restart rerank-shim.service
+    if [[ $? -ne 0 ]]; then
+        ylw "   ! restarting rerank-shim.service failed — the shim is optional, continuing."
+        ylw "     It may still be running the OLD rerank_shim.py; restart it by hand."
+    fi
+elif command -v docker >/dev/null 2>&1 \
+     && [[ -n "$(docker ps --filter 'name=^b580-rerank-shim$' --format '{{.Names}}' 2>/dev/null)" ]]; then
+    ylw "   ! the rerank shim container b580-rerank-shim keeps running the OLD"
+    ylw "     rerank_shim.py until you restart it. This update never touches containers."
+    ylw "     Run:  docker restart b580-rerank-shim"
+else
+    echo "   no rerank shim is running, so there is nothing to restart."
 fi
 
 # Report the config the restarted gateway is running (decision:1832). Before the restart it would describe the old process. Use the unit's locked uv invocation, and do not sit this between a run_soft and its rc capture.

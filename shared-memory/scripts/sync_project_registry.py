@@ -160,6 +160,100 @@ def collisions(folders: set[str]) -> dict[str, list[str]]:
     return {k: v for k, v in seen.items() if len(v) > 1}
 
 
+# The database, never a Python copy of the rule, says which spellings are one project:
+# axis_normalize strips every non-alphanumeric (migration 035), which normalise_key above
+# does not, and projects.normalized_key is UNIQUE on its result.
+SPELLING_OF_REGISTERED_SQL = "SELECT name FROM projects WHERE normalized_key = axis_normalize(%s)"
+RETIRED_SPELLING_SQL = ACTIVE_ALIASES_SQL + " AND axis_normalize(a.name) = axis_normalize(%s)"
+FOLDER_KEYS_SQL = "SELECT n, axis_normalize(n) FROM unnest(%s::text[]) AS n"
+INSERT_PROJECT_SQL = (
+    "INSERT INTO projects (name, created_by) VALUES (%s, 'workspace_scan')"
+    " ON CONFLICT DO NOTHING RETURNING id"
+)
+
+# undefined_table, undefined_column: the alias tables are absent or older than this tool.
+_MISSING_ALIAS_SCHEMA = {"42P01", "42703"}
+
+
+def _alias_schema_missing(exc: Exception) -> bool:
+    return getattr(exc, "pgcode", None) in _MISSING_ALIAS_SCHEMA
+
+
+def classify_new(cur, candidates: list[str]):
+    """Split folders absent from the registry by exact name into (new, spellings,
+    alias_skipped). `spellings` maps folder -> (kind, resolves-to) for a folder that
+    is already settled; `new` keeps ONE folder per database key, the first in sorted
+    order. Read-only. A missing alias schema skips only the alias check and sets
+    `alias_skipped`; any other error propagates."""
+    spellings: dict[str, tuple[str, str]] = {}
+    alias_skipped = False
+    pending: list[str] = []
+    for folder in candidates:
+        cur.execute(SPELLING_OF_REGISTERED_SQL, (folder,))
+        row = cur.fetchone()
+        if row:
+            spellings[folder] = ("registered", row[0])
+            continue
+        if not alias_skipped:
+            # A SAVEPOINT keeps a failed alias lookup from poisoning the transaction.
+            cur.execute("SAVEPOINT alias_check")
+            try:
+                cur.execute(RETIRED_SPELLING_SQL, (folder,))
+                row = cur.fetchone()
+                cur.execute("RELEASE SAVEPOINT alias_check")
+            except psycopg2.Error as exc:
+                if not _alias_schema_missing(exc):
+                    raise
+                cur.execute("ROLLBACK TO SAVEPOINT alias_check")
+                alias_skipped = True
+                row = None
+            if row:
+                spellings[folder] = ("retired", row[1])
+                continue
+        pending.append(folder)
+    new: list[str] = []
+    if pending:
+        cur.execute(FOLDER_KEYS_SQL, (pending,))
+        key_of = {n: k for n, k in cur.fetchall()}
+        winner: dict[str, str] = {}
+        for folder in pending:  # sorted, so the first spelling of a key wins
+            key = key_of.get(folder, folder)
+            if key in winner:
+                spellings[folder] = ("same-run", winner[key])
+            else:
+                winner[key] = folder
+                new.append(folder)
+    return new, spellings, alias_skipped
+
+
+def register_projects(conn, names: list[str]):
+    """Insert each name under its own SAVEPOINT so one refusal skips that name only.
+    Returns (registered, skipped) where skipped is [(folder, reason)]. Never calls
+    conn.rollback(): that would drop the rows already inserted. The caller commits."""
+    registered: list[str] = []
+    skipped: list[tuple[str, str]] = []
+    with conn.cursor() as cur:
+        for name in names:
+            cur.execute("SAVEPOINT sync_project")
+            try:
+                # Descriptions stay NULL: they are owed from the operator, and a
+                # generated sentence would claim one was supplied.
+                cur.execute(INSERT_PROJECT_SQL, (name,))
+                inserted = cur.fetchone()
+                if inserted:
+                    registered.append(name)
+                else:
+                    # A unique index (name or normalized_key) filled between read and write.
+                    cur.execute(SPELLING_OF_REGISTERED_SQL, (name,))
+                    row = cur.fetchone()
+                    skipped.append((name, f"registered meanwhile as {row[0] if row else '?'}"))
+                cur.execute("RELEASE SAVEPOINT sync_project")
+            except psycopg2.Error as exc:
+                cur.execute("ROLLBACK TO SAVEPOINT sync_project")
+                skipped.append((name, f"refused by the registry ({getattr(exc, 'pgcode', None)})"))
+    return registered, skipped
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -187,14 +281,18 @@ def main() -> int:
             # A decision made once must never return to the queue: a name with
             # an ACTIVE alias has already been adjudicated and resolves at
             # ingress, so surfacing it again is asking the operator to redo work.
+            cur.execute("SAVEPOINT alias_list")
             try:
                 cur.execute(ACTIVE_ALIASES_SQL)
                 aliased = {r[0]: r[1] for r in cur.fetchall()}
-            except Exception:
-                # The alias tables predate no deployment this ships to, but a
-                # reporting tool must not die because an optional table is
-                # missing — it would take the whole registry report with it.
-                conn.rollback()
+                cur.execute("RELEASE SAVEPOINT alias_list")
+            except psycopg2.Error as exc:
+                # A reporting tool must not die because an optional table is missing,
+                # but only a missing table or column is excused: any other error
+                # would silently put retired spellings back in the queue.
+                if not _alias_schema_missing(exc):
+                    raise
+                cur.execute("ROLLBACK TO SAVEPOINT alias_list")
                 aliased = {}
             cur.execute(
                 f"SELECT {PROJECT_SQL} AS p, count(*) FROM technical_docs"
@@ -204,7 +302,9 @@ def main() -> int:
 
         # The sentinel is reserved and can never be a project, folder or not.
         folders.discard(SENTINEL)
-        to_add = sorted(folders - registered)
+        with conn.cursor() as cur:
+            to_add, spellings, alias_skipped = classify_new(
+                cur, sorted(folders - registered))
 
         dupes = collisions(folders)
         if dupes:
@@ -217,6 +317,19 @@ def main() -> int:
         print(f"NEW — would be registered  : {len(to_add)}")
         for name in to_add:
             print(f"      + {name}")
+        if spellings:
+            print("\n── folders that are only a SPELLING of a name already settled"
+                  " — this tool changes nothing about them ──")
+            for folder, (kind, target) in sorted(spellings.items()):
+                if kind == "registered":
+                    what = f"spelling of registered project {target!r}"
+                elif kind == "retired":
+                    what = f"retired spelling of project {target!r}"
+                else:
+                    what = f"spelling of folder {target!r} — the registry keeps one"
+                print(f"      {folder!r}: {what}; rename the folder to {target!r}")
+        if alias_skipped:
+            print("  ⚠ alias tables missing — retired spellings were not checked.")
 
         print("\n── stored names that do NOT match a folder — YOUR adjudication surface ──")
         surface = 0
@@ -246,16 +359,11 @@ def main() -> int:
             print("\nNothing to register.")
             return 0
 
-        with conn.cursor() as cur:
-            # Descriptions stay NULL: they are owed from the operator, and a
-            # generated sentence would claim one was supplied.
-            cur.executemany(
-                "INSERT INTO projects (name, created_by) VALUES (%s, 'workspace_scan')"
-                " ON CONFLICT (name) DO NOTHING",
-                [(n,) for n in to_add],
-            )
+        registered_now, skipped = register_projects(conn, to_add)
         conn.commit()
-        print(f"\nRegistered {len(to_add)} project(s) from the workspace. "
+        for folder, reason in skipped:
+            print(f"   skipped: {folder} — {reason}")
+        print(f"\nRegistered {len(registered_now)} project(s) from the workspace. "
               f"Descriptions are still owed from the operator.")
         return 0
     finally:
