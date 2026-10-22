@@ -12,3 +12,4 @@ asyncpg
 neo4j
 httpx
 json-repair
+pyyaml==6.0.3
