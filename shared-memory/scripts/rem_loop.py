@@ -15,7 +15,6 @@ import sys
 import time
 from collections import Counter
 from datetime import datetime, timezone
-import urllib.parse
 
 import httpx
 import psycopg2
@@ -32,7 +31,7 @@ from dream_telemetry import (
 )
 from secure_env import (
     load_split_env, get_secret, require_db_credentials, read_daemon_token_from_fd,
-    require_llm_backends_json_parses,
+    require_llm_backends_json_parses, pg_dsn,
 )
 
 
@@ -50,7 +49,7 @@ NEO4J_ACQUIRE_TIMEOUT = float(os.environ.get("NEO4J_ACQUIRE_TIMEOUT", "30"))
 _pg_pass     = get_secret("PG_PASSWORD", "")
 # PG_CONN embeds the password, so it is read via get_secret(); the raw value stays empty when unset so a constructed default is not mistaken for an operator DSN.
 _pg_conn_explicit = get_secret("PG_CONN", "")
-PG_CONN      = _pg_conn_explicit or f"postgresql://postgres:{urllib.parse.quote_plus(_pg_pass)}@localhost:5432/agent_data"
+PG_CONN      = _pg_conn_explicit or pg_dsn(_pg_pass)
 # Fixed at the gateway, not an env knob: a direct backend would skip pooling, affinity, wedge detection, and telemetry.
 REASONER_URL   = "http://localhost:8888/v1/chat/completions"
 # "local-model" is only safe where the server ignores the field; a backend that validates model ids needs the real one.

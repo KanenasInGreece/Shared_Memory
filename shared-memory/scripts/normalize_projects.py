@@ -104,7 +104,7 @@ _load_env()
 
 _pg_pass = secure_env.get_secret("PG_PASSWORD", "")
 PG_CONN = secure_env.get_secret(
-    "PG_CONN", f"postgresql://postgres:{_pg_pass}@localhost:5432/agent_data"
+    "PG_CONN", secure_env.pg_dsn(_pg_pass)
 )
 # Env-overridable, never a baked-in literal: our bolt port is one valid
 # configuration, not the configuration. Matches backfill_project_of.py.

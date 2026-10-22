@@ -69,10 +69,12 @@ _load_env()
 from project_axis import PROJECT_SQL, SENTINEL  # noqa: E402
 from project_alias import ACTIVE_ALIASES_SQL  # noqa: E402
 
-PG_CONN = (
-    f"postgresql://{os.environ.get('PG_USER', 'postgres')}:"
-    f"{secure_env.get_secret('PG_PASSWORD', '')}@{os.environ.get('PG_HOST', 'localhost')}:"
-    f"{os.environ.get('PG_PORT', '5432')}/{os.environ.get('PG_DATABASE', 'agent_data')}"
+PG_CONN = secure_env.pg_dsn(
+    secure_env.get_secret('PG_PASSWORD', ''),
+    user=os.environ.get('PG_USER', 'postgres'),
+    host=os.environ.get('PG_HOST', 'localhost'),
+    port=os.environ.get('PG_PORT', '5432'),
+    dbname=os.environ.get('PG_DATABASE', 'agent_data'),
 )
 
 

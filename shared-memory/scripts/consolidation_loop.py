@@ -32,7 +32,7 @@ from dream_telemetry import (record_llm_call, adaptive_ceiling, embed_ceiling,
 from record_ref import make_ref
 from secure_env import (
     load_split_env, get_secret, require_db_credentials, read_daemon_token_from_fd,
-    require_llm_backends_json_parses,
+    require_llm_backends_json_parses, pg_dsn,
 )
 
 # The gateway no longer copies os.environ into this daemon, so credentials load from the framework .env here.
@@ -47,7 +47,7 @@ NEO4J_ACQUIRE_TIMEOUT = float(os.environ.get("NEO4J_ACQUIRE_TIMEOUT", "30"))
 _pg_pass = get_secret("PG_PASSWORD", "")
 # PG_CONN embeds the password, so read it via get_secret. The raw value tells a supplied DSN apart from the constructed default.
 _pg_conn_explicit = get_secret("PG_CONN", "")
-PG_CONN = _pg_conn_explicit or f"postgresql://postgres:{_pg_pass}@localhost:5432/agent_data"
+PG_CONN = _pg_conn_explicit or pg_dsn(_pg_pass)
 RETRIEVER_URL = "http://localhost:8888/v1/embeddings"
 # Daemons reach the LLM only through the gateway. An env knob here would bypass pooling, affinity, wedge detection, and telemetry.
 REASONER_URL = "http://localhost:8888/v1/chat/completions"

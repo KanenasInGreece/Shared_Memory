@@ -79,10 +79,12 @@ from project_promotion import is_parked  # noqa: E402
 NEO4J_URI = os.environ.get("NEO4J_URI", "bolt://localhost:7687")
 NEO4J_AUTH = (os.environ.get("NEO4J_USER", "neo4j"),
               secure_env.get_secret("NEO4J_PASSWORD", ""))
-PG_CONN = (
-    f"postgresql://{os.environ.get('PG_USER', 'postgres')}:"
-    f"{secure_env.get_secret('PG_PASSWORD', '')}@{os.environ.get('PG_HOST', 'localhost')}:"
-    f"{os.environ.get('PG_PORT', '5432')}/{os.environ.get('PG_DATABASE', 'agent_data')}"
+PG_CONN = secure_env.pg_dsn(
+    secure_env.get_secret('PG_PASSWORD', ''),
+    user=os.environ.get('PG_USER', 'postgres'),
+    host=os.environ.get('PG_HOST', 'localhost'),
+    port=os.environ.get('PG_PORT', '5432'),
+    dbname=os.environ.get('PG_DATABASE', 'agent_data'),
 )
 
 

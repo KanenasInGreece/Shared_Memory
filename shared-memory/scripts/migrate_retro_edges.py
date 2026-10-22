@@ -66,7 +66,7 @@ NEO4J_USER = os.environ.get("NEO4J_USER", "neo4j")
 NEO4J_PASS = secure_env.get_secret("NEO4J_PASSWORD", "")
 _pg_pass   = secure_env.get_secret("PG_PASSWORD", "")
 PG_CONN    = secure_env.get_secret(
-    "PG_CONN", f"postgresql://postgres:{_pg_pass}@localhost:5432/agent_data"
+    "PG_CONN", secure_env.pg_dsn(_pg_pass)
 )
 # GATEWAY_URL is the documented knob. EMBED_URL remains a one-release override: dropping a hand-set line would write vectors against a different model.
 GATEWAY_URL = os.environ.get("GATEWAY_URL", "http://localhost:8888")

@@ -128,7 +128,7 @@ def _dsn(dbname: str) -> str:
     host = os.environ.get("PG_HOST", "localhost")
     port = os.environ.get("PG_PORT", "5432")
     pw = os.environ.get("PG_PASSWORD", "")
-    return f"postgresql://{user}:{urllib.parse.quote_plus(pw)}@{host}:{port}/{dbname}"
+    return f"postgresql://{user}:{urllib.parse.quote(pw, safe='')}@{host}:{port}/{dbname}"
 
 
 def _norm(text: str) -> str:
