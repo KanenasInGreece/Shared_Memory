@@ -7,6 +7,17 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.0.30] - 2026-10-22
+
+Fix round, batch B: `check_config.py`'s Phase A report now shows what the gateway really resolves. `API_VERSION` stays 4. No change to the gateway's own behaviour or to check_config's exit codes. Restart the gateway; update the skills for the version.
+
+### Fixed
+- `EMBED_MAX_CHARS`, when unset, is shown as the value the gateway derives from `EMBED_MAX_CONTEXT_TOKENS`, `EMBED_SPECIAL_TOKEN_RESERVE` and `EMBED_CHARS_PER_TOKEN` (state `derived`). It always showed 24570, even when `EMBED_MAX_CONTEXT_TOKENS=16384` made the gateway use 49146.
+- An invalid `EMBED_SPECIAL_TOKEN_RESERVE` is shown with the value the gateway falls back to (2) and a note. It used to be printed as if it were used.
+- A value the gateway cannot parse (`EMBED_MAX_CONTEXT_TOKENS=abc`, `EMBED_CHARS_PER_TOKEN=nan`, `OVERFLOW_TOKEN_SLACK=x`, or any other number the embed sizing reads) is flagged "the gateway would not start". It used to be printed as an ordinary value.
+- A whitespace-only `PROXY_BIND` is shown as `127.0.0.1`, the address the gateway binds, and a surrounding space is trimmed as the gateway trims it. An `EMBEDDER_URL` or `RERANKER_URL` the gateway would refuse (empty, no `http(s)://` scheme, a query string or fragment) is flagged.
+- check_config reads the embed sizing from a private copy of the gateway's own `dream_telemetry.py`, so its report cannot drift from the gateway again, and the copy the running modules share is never reloaded.
+
 ## [1.0.29] - 2026-10-22
 
 Fix round, batch A: four defects from the clean-up campaign's fix register. `API_VERSION` stays 4. Restart the gateway; update the skills for the version.
