@@ -129,7 +129,7 @@ def _short(value: Any, cap: int = 200) -> str:
 
 
 # FRAMEWORK_VERSION is the build string and may drift. API_VERSION is the wire contract with memory_bridge.py; bump it only when shape, auth, or routes break older clients.
-FRAMEWORK_VERSION = "1.0.30"
+FRAMEWORK_VERSION = "1.0.31"
 # API v2: retrospective is a full record. v4: unregistered project is 400 (proposal / new_project / sentinel).
 API_VERSION = 4
 CLIENT_VERSION_HEADER = "X-SM-Api-Version"
@@ -10956,8 +10956,17 @@ class MemoryCoordinator:
         unchanged summary and a dead-lettered cluster, which need Postgres.
         `decision_cycles` counts the groups that also pass
         `insight_gate.passes_insight_gate` (a Retrospective and a fresh judgement
-        on the group's walked reach), the predicate
-        `consolidation_loop._find_fresh_insight_clusters` folds on. ⛔ Never import
+        on the group's walked reach) AND have at least one component with a
+        Decision and two or more judgements. That mirrors
+        `consolidation_loop._find_fresh_insight_clusters`, which drops a component
+        with no Decision, and `run_insight_cycle`, which partitions out a
+        one-judgement component (decision:1121). Work it cannot see without
+        Postgres, in both directions: a foldable component that identity
+        resolution then marks 'same' or 'covered', or that is unchanged or
+        dead-lettered, still counts (overcount); a one-judgement component that
+        matches an existing insight exactly ('same') still does an identity append
+        in `run_insight_cycle` but is not counted (undercount; a legacy case,
+        since `_fold_insight` never creates a one-member insight). ⛔ Never import
         `consolidation_loop` here: it imports psycopg2 at the top and the gateway
         does not carry it.
         """
@@ -10981,9 +10990,14 @@ class MemoryCoordinator:
         # Count gating groups, not decisions. Each candidate is one small walk on the refresh, not on the request.
         decision_cycles = 0
         for _key, _contents, fact_ids in groups:
-            labels, consolidated, _components = await walk_group_reached_set(
+            labels, consolidated, components = await walk_group_reached_set(
                 self._neo4j, fact_ids)
-            if passes_insight_gate(labels, consolidated):
+            # Only a component with a Decision and 2+ members folds; see the docstring.
+            if passes_insight_gate(labels, consolidated) and any(
+                len(comp) >= 2
+                and any(labels.get(i) == ONT.decision for i in comp)
+                for comp in components
+            ):
                 decision_cycles += 1
 
         # No decision_threshold: G2/G3 are at-least-one conditions, not a lowered count.

@@ -117,9 +117,21 @@ def _load() -> OntologyConfig:
     cfg.concept = labels.get("concept", cfg.concept)
     cfg.document = labels.get("document", cfg.document)
     # Framework consolidation tuning (operator-tunable mechanism params, NOT domain vocab)
-    cfg.density_threshold = int(cons.get("density_threshold", cfg.density_threshold))
-    cfg.insight_threshold = int(cons.get("insight_threshold", cfg.insight_threshold))
+    cfg.density_threshold = _positive_int(
+        "density_threshold", cons.get("density_threshold", cfg.density_threshold))
+    cfg.insight_threshold = _positive_int(
+        "insight_threshold", cons.get("insight_threshold", cfg.insight_threshold))
     return cfg
+
+
+def _positive_int(key: str, value) -> int:
+    """A consolidation threshold must be a YAML integer of at least 1; a float
+    would be truncated, a bool is not a count, and the message names the key."""
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(
+            f"consolidation.{key} must be a whole number of at least 1, got {value!r}"
+        )
+    return value
 
 
 def _validate(cfg: OntologyConfig) -> OntologyConfig:

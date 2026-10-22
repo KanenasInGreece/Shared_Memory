@@ -97,7 +97,7 @@ deferred to the graph walk via `metadata.cypher_query` below.
   "entities": ["<union of the constituent judgements' own human-asserted entities>"],
   "source_pg_ids": [<technical_docs.id of every JUDGEMENT the fold covers — decisions AND retrospectives, never a fact id — I9>],
   "summary_ids": [<community_summaries.id of the thematic summar(ies) this insight rests on — a SEPARATE field from source_pg_ids; the two id sequences overlap, so mixing them resolves a summary id against a technical_docs row silently>],
-  "cypher_query": "<self-contained Cypher re-deriving the §2.3 walk from these judgement ids>",
+  "cypher_query": "<self-contained Cypher returning each of these judgements with its direct neighbours over the closed relation types>",
   "timestamp": "<ISO-8601 datetime of this consolidation run>"
 }
 ```

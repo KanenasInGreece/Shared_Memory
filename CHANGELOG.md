@@ -7,6 +7,18 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.0.31] - 2026-10-22
+
+Fix round, batch C. `API_VERSION` stays 4. Restart the gateway; update the skills for the version. ⚠ The gateway lock gains one package (PyYAML), so the first start after the update resolves it.
+
+### Changed
+- PyYAML 6.0.3 is now a declared gateway dependency, so `shared-memory/ontology.yaml` is read on every install. The loader silently fell back to built-in defaults when PyYAML could not be imported, and nothing declared it: an install whose operating system ships PyYAML read the file, and one that does not (for example Debian without `python3-yaml`) ignored it without a word. The shipped file equals the defaults, so nothing changes until it is edited.
+- `nrem.decision_cycles` (and so `nrem.total_cycles`) counts a section's insight work only when the walk reaches at least one group of two or more related judgements that includes a decision — the only work the consolidation daemon can fold. It used to count every section that passed the insight gate, including ones whose judgements were all retrospectives or all unconnected singles, which the daemon skips every time, so the pending figure on `/health`, `/memory/telemetry`, the status command and the monitor stayed high for work that would never run.
+
+### Fixed
+- `consolidation.density_threshold` and `consolidation.insight_threshold` in `ontology.yaml` must be whole numbers of at least 1, or the gateway and the daemons stop at startup with a message naming the key. A float was silently truncated (`3.5` became 3), `true` became 1, and `0` or a negative value was accepted.
+- The description of an insight's `cypher_query` (docstring and `schema.md`) says what it is: one hop from each member over the closed relation set, not a re-run of the walk.
+
 ## [1.0.30] - 2026-10-22
 
 Fix round, batch B: `check_config.py`'s Phase A report now shows what the gateway really resolves. `API_VERSION` stays 4. No change to the gateway's own behaviour or to check_config's exit codes. Restart the gateway; update the skills for the version.

@@ -25,6 +25,7 @@ metadata at that date, not recalled.
 | `httpx` | resolved by `uv` | BSD-3-Clause | imported libraries |
 | `numpy` | resolved by `uv` | BSD-3-Clause AND 0BSD AND MIT AND Zlib AND CC0-1.0 | imported library |
 | `json-repair` | resolved by `uv` | MIT | imported library |
+| `PyYAML` | 6.0.3 (exact pin in `requirements-gateway.txt`) | MIT | imported library; reads `shared-memory/ontology.yaml` (`yaml.safe_load` only) |
 | `psycopg2-binary` | resolved by `uv` | LGPL with exceptions (PyPI metadata) | imported library, used unmodified and dynamically, within its linking exception |
 
 ## The copyleft components, stated plainly

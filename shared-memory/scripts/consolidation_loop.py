@@ -715,11 +715,12 @@ def thematic_fold_is_current(active_row, summary, pg_ids, entities):
 
 
 def insight_cypher_query(judgement_ids) -> str:
-    """§3.2 `cypher_query` — re-derives §2.3's WALK from this insight's own
-    judgement members, so a reader can re-run the exact provenance
-    traversal the fold used. This is precisely where CONSIDERED / REJECTED
-    / UNDER_CONDITIONS are deferred TO (§3.2: excluded from the embedded
-    TEXT, reachable here). Self-contained, no bind parameters. Pure."""
+    """The insight's `cypher_query`: one undirected hop over the closed relation
+    types from this insight's own judgement members, with no label filter on the
+    neighbour and no superseded or reversed exclusion. It is not the unbounded
+    provenance walk. A reader sees each member's direct neighbours, including
+    CONSIDERED / REJECTED / UNDER_CONDITIONS, which are excluded from the embedded
+    text. Self-contained, no bind parameters. Pure."""
     ids = _cypher_id_list(judgement_ids)
     rels = "|".join(CLOSED_RELATION_TYPES)
     return (
@@ -3582,9 +3583,9 @@ class ConsolidationDaemon:
         identical to ``_consolidate_clusters``'s own use of it just above).
         For every gating (project, domain) group this walks (§2.3, I3) from
         its grounded, non-superseded fact pg_ids over the closed relation
-        set, checks G2+G3 (``insight_gate.passes_insight_gate`` — the exact
-        predicate ``coordinator._nrem_cycle_counts`` counts for its telemetry
-        gauge, one definition for both), and — only for a passing group —
+        set, checks G2+G3 (``insight_gate.passes_insight_gate`` — the gate
+        ``coordinator._nrem_cycle_counts`` also applies, which then counts only
+        groups with a foldable component), and — only for a passing group —
         partitions the reached judgements into components and orders them
         (§2.4, ``insight_gate.order_components``).
 
