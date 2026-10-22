@@ -162,8 +162,8 @@ def test_the_migration_tool_matches_both_fields_not_the_resolution():
 #    (see test_project_identity.py's retired-P22 note). `_nrem_cycle_counts`
 #    now walks each fact-gating (project, domain) group via
 #    `insight_gate.walk_group_reached_set` and checks
-#    `insight_gate.passes_insight_gate` (G2 + G3) — the SAME predicate
-#    `consolidation_loop._find_fresh_insight_clusters` folds on. ─────────────
+#    `insight_gate.passes_insight_gate` (G2 + G3), then counts the group only
+#    when a component has a Decision and 2+ members, as the daemon folds. ───
 
 _FACT_ROWS_MARKER = "RETURN f.pg_id AS pg_id, project, domain"
 _THREE_FACT_ROWS = [
@@ -210,10 +210,10 @@ async def test_decision_cycles_reflects_the_walk_not_a_partition():
 
 
 @pytest.mark.asyncio
-async def test_decision_cycles_counts_a_group_whose_walk_reaches_a_retrospective():
-    """The counterpart: the gating group's walk reaches one fresh Decision and
-    one fresh Retrospective (G2 + G3 both satisfied) — one gating group, one
-    cycle."""
+async def test_decision_cycles_skips_a_group_with_only_single_judgement_components():
+    """The gating group's walk reaches one fresh Decision and one fresh
+    Retrospective (G2 + G3 satisfied), but they sit in separate one-member
+    components, which the daemon never folds — so the group counts 0."""
     from coordinator import MemoryCoordinator
 
     coord = MemoryCoordinator()
@@ -243,8 +243,8 @@ async def test_decision_cycles_counts_a_group_whose_walk_reaches_a_retrospective
     coord._neo4j.session = MagicMock(return_value=session)
 
     counts = await coord._nrem_cycle_counts()
-    assert counts["decision_cycles"] == 1
-    assert counts["total_cycles"] == counts["fact_cycles"] + 1
+    assert counts["decision_cycles"] == 0
+    assert counts["total_cycles"] == counts["fact_cycles"]
 
 
 def test_decision_threshold_no_longer_a_duplicate_tunable():
