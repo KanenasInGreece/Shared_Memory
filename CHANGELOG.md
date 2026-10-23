@@ -7,6 +7,13 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.0.34] - 2026-10-23
+
+Fix round, batch F: record ids in both clients. `API_VERSION` stays 4. Update the skills, and restart every MCP host (LM Studio, opencode's MCP server) so it loads the new connector.
+
+### Fixed
+- Every record id a client takes — `grounded_in` tokens, `acknowledge_standing` keys, the CLI's `--supersedes`, `supersede --pg-id/--by`, `review-hold --summary-id/--pg-id` and `save_retrospective --pg-id`, and the MCP tools `supersede`, `save_retrospective` and `review_hold` — now follows the gateway's rule: whole ASCII digits from 1 to 2**63-1. Before, values such as `1_6`, `+5`, `-5`, `0`, `٣` (an Arabic digit) or `１２` could be turned into a different, real record id: an MCP tool call with the string `"1_6"` superseded record 16, and a grounded-in token `٣` grounded the record on record 3. Such values are now refused (a CLI flag exits with "invalid record id value"; an MCP tool raises before it runs), and an invalid grounded-in token is skipped as non-numeric tokens already were. Valid ids, including space- or zero-padded ones, behave as before, and the MCP `supersede` tool's `by=0` still means "no successor".
+
 ## [1.0.33] - 2026-10-22
 
 Fix round, batch E: the two client front doors. `API_VERSION` stays 4. Update the skills (and restart MCP hosts) for the version.
