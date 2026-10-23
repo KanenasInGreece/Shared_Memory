@@ -7,6 +7,22 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.0.35] - 2026-10-23
+
+Security release: the eMudhra / emSign certificate-authority compromise. `API_VERSION` stays 4. Update every install now (framework and skills), and on each host also update the packaging tools and the system trust store — see *Operator actions* below.
+
+### Security
+- **certifi raised from 2026.7.22 to 2026.10.23 in all three locks** (`requirements.lock`, `requirements-gateway.lock`, `requirements-mcp.lock`), a floor `certifi>=2026.10.19` added to `requirements.txt`, `requirements-gateway.txt` and `requirements-mcp.txt` (all three pinned by `tests/test_requirements_floors.py`), and `certifi==2026.10.23` added to the MCP connector's own inline dependency block in `mcp/vector-skill.py`, which is what its spawn line actually installs (pinned by `tests/test_mcp_spawn_lines_pinned.py`). On 2026-10-20 eMudhra disclosed that eight intermediate CAs under its `emSign ECC Root CA - G3` root had private keys generated with too little randomness; whoever recovers one can issue a certificate for any hostname. certifi before 2026.10.18 trusts that root, so an attacker who can also intercept the connection could impersonate any HTTPS endpoint reached through `httpx` — both clients, the coordinator's embed calls and the REM/NREM daemons all build `httpx` clients that trust certifi's bundle (advisory GHSA-6q48-6c7w-9gw2, critical, CVSS 9.1). The gateway's proxy to an online LLM backend uses aiohttp, which trusts the HOST store instead: for that path the trust-store step below is the fix, not this pin. certifi 2026.10.18 removed every emSign root and 2026.10.19, the patched release, restored the unaffected ones; 2026.10.23 is the current release and keeps the fix. The gateway process and the daemons pick the new bundle up for their `httpx` calls on their next start, because their lock changed. The skill client (`uv run --with httpx`) resolves certifi freshly only once uv's cached environment is gone — see the cache step below. Both clients build httpx with `trust_env=False`, so they trust certifi's bundle, not the host store; this matters for an `https://` gateway, not a loopback `http://` one. No request-handling logic changed — only the build strings (1.0.35) and the connector's inline pin. Hashes were checked against both PyPI's JSON API and an uncached `uv pip compile` run with uv 0.13.4.
+- The same day, `litellm==1.107.0` on PyPI shipped a credential stealer (2026-10-21). The framework does not depend on litellm, and no lock in this repository names it.
+
+### Operator actions (not done by this release)
+- **pip ≥ 26.2.2** in every Python and every virtual environment that has its own pip (pip always loads its vendored certifi in addition to the system store). Distribution-packaged pip that is patched to use the system store is fixed by the trust-store step below instead.
+- **uv ≥ 0.13.4** (uv's default bundled roots trusted the root). With an older uv, `UV_SYSTEM_CERTS=true` makes it use the host store, which is only safe once that store is fixed.
+- **The system trust store**: update `ca-certificates` (Fedora's `2026.2.92_v9.0.319-1` removes `emSign ECC Root CA - G3` from TLS trust; the `-2` rebuild of 2026-10-22 also drops the code-signing `emSign Root CS CA - G3`). Check with `grep -c "emSign ECC Root CA - G3"` on the extracted bundle (`/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem` on Fedora, `/etc/ssl/certs/ca-certificates.crt` on Debian/Ubuntu) — expect 0. Where the update has not landed, distrust it locally with the certificate's PEM: on Fedora copy it into `/etc/pki/ca-trust/source/blocklist/` and run `update-ca-trust`; on Debian/Ubuntu put `!` before its line in `/etc/ca-certificates.conf` and run `update-ca-certificates --fresh`.
+- **Clear uv's cache** (`uv cache clean`, the whole cache, as the user who runs the gateway and the agents) so every cached `uv run --with …` environment rebuilds with the new bundle; `uv cache clean certifi` alone removes the downloaded package, not the environments built from it. Re-sync any persistent venv (`uv pip sync`). Updating `ca-certificates` does not refresh these environments.
+- CPython 3.15.1, 3.14.9 and 3.13.17 bundle pip 26.2.2 for `ensurepip`; existing installs and venvs still need the pip step above.
+
+
 ## [1.0.34] - 2026-10-23
 
 Fix round, batch F: record ids in both clients. `API_VERSION` stays 4. Update the skills, and restart every MCP host (LM Studio, opencode's MCP server) so it loads the new connector.
