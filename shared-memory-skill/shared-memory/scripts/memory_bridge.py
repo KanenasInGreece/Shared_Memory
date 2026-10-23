@@ -557,6 +557,40 @@ def _is_placeholder_words(text: str) -> bool:
     return _ACK_ANGLE.match(folded) is not None
 
 
+_MAX_RECORD_ID = 2**63 - 1
+
+
+def _parse_record_id(value) -> int | None:
+    """The record id ``value`` stands for under the gateway's rule, else None."""
+    # Mirrors record_ref._parse_id (not imported: the clients ship alone, ADR-014): an int
+    # that is not a bool, or ASCII digits after stripping, within 1..2**63-1. Bare int()
+    # would also take "+5", "1_6" and non-ASCII digits and resolve them to a wrong row.
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, str):
+        text = value.strip()
+        if not (text.isascii() and text.isdigit()):
+            return None
+        try:
+            value = int(text)
+        except ValueError:  # past the interpreter's int-string digit limit
+            return None
+    if not isinstance(value, int):
+        return None
+    return value if 0 < value <= _MAX_RECORD_ID else None
+
+
+def _record_id_arg(text: str) -> int:
+    """argparse `type=` for a record-id flag; the name shows in `invalid record id value`."""
+    pid = _parse_record_id(text)
+    if pid is None:
+        raise ValueError(text)
+    return pid
+
+
+_record_id_arg.__name__ = "record id"
+
+
 def _normalize_cli_ack(raw: Any) -> dict[int, str] | None:
     """Turn repeatable `--acknowledge-standing ID "words"` into {id: words}, and refuse every other shape.
     A bare id, an empty string, a placeholder, or an `id:answer` token is a ValueError: this CLI has no colon syntax and must not invent the words (fact:2809: the operator's words are carried per decision)."""
@@ -566,13 +600,12 @@ def _normalize_cli_ack(raw: Any) -> dict[int, str] | None:
     def _one(did_part: object, words: str) -> tuple[int, str]:
         if isinstance(did_part, bool):
             raise ValueError("acknowledge_standing requires an integer decision id and the operator's words")
-        try:
-            d_id = int(did_part)
-        except (ValueError, TypeError):
+        d_id = _parse_record_id(did_part)
+        if d_id is None:
             raise ValueError(
                 "acknowledge_standing form is --acknowledge-standing ID \"operator's words\". "
                 f"Got {did_part!r}. There is no id:answer syntax."
-            ) from None
+            )
         if not words or _is_placeholder_words(words):
             raise ValueError(
                 f"acknowledge_standing[{d_id}] requires the operator's non-empty words "
@@ -746,14 +779,8 @@ def _canonical_ref(ref) -> str | None:
             return None
     else:
         rtype, num = None, text
-    num = num.strip()
-    if not (num.isascii() and num.isdigit()):
-        return None
-    try:
-        pid = int(num)
-    except ValueError:  # past the interpreter's int-string digit limit; the gateway refuses it too
-        return None
-    if not 0 < pid <= 2**63 - 1:
+    pid = _parse_record_id(num)
+    if pid is None:
         return None
     return str(pid) if rtype is None else f"{rtype}:{pid}"
 
@@ -1091,7 +1118,7 @@ def _save_argparser() -> "argparse.ArgumentParser":
     )
     p.add_argument("content", help="Fact content")
     p.add_argument("metadata", nargs="?", default="{}", help="Metadata JSON (optional)")
-    p.add_argument("--supersedes", type=int, default=None,
+    p.add_argument("--supersedes", type=_record_id_arg, default=None,
                    help="pg_id of an existing fact this save supersedes "
                         "(soft-retire: old fact kept, flagged, hidden from search)")
     # Repeatable and never comma-split. A separator that can occur inside a section name is not
@@ -1461,9 +1488,9 @@ def build_decision_metadata(
             continue
         pid_str, _, role = tok.partition(":")
         pid_str = pid_str.strip()
-        if not pid_str.isdigit():
+        pid = _parse_record_id(pid_str)
+        if pid is None:
             continue
-        pid = int(pid_str)
         gi.append(pid)
         if role.strip():
             grounded_roles[str(pid)] = role.strip().lower()
@@ -1519,9 +1546,9 @@ def build_retrospective_payload(
             continue
         pid_str, _, role = tok.partition(":")
         pid_str = pid_str.strip()
-        if not pid_str.isdigit():
+        pid = _parse_record_id(pid_str)
+        if pid is None:
             continue
-        pid = int(pid_str)
         gi.append(pid)
         if role.strip():
             grounded_roles[str(pid)] = role.strip().lower()
@@ -1788,9 +1815,9 @@ async def main() -> None:
             description="Retract an existing fact (no replacement). Soft: kept, "
                         "flagged, hidden from search.",
         )
-        p.add_argument("--pg-id", type=int, required=True,
+        p.add_argument("--pg-id", type=_record_id_arg, required=True,
                        help="pg_id of the fact to retract")
-        p.add_argument("--by", type=int, default=None,
+        p.add_argument("--by", type=_record_id_arg, default=None,
                        help="pg_id of an existing successor fact (optional)")
         p.add_argument("--acknowledge-standing", action="append", nargs="+", metavar="ID_AND_WORDS",
                        help="decision id and the operator's words, repeated per decision: "
@@ -1808,9 +1835,9 @@ async def main() -> None:
             description="Mark a summary's flagged stale source as reviewed-and-held "
                         "(stops re-surfacing it).",
         )
-        p.add_argument("--summary-id", type=int, required=True,
+        p.add_argument("--summary-id", type=_record_id_arg, required=True,
                        help="community_summaries.id of the flagged summary")
-        p.add_argument("--pg-id", type=int, required=True,
+        p.add_argument("--pg-id", type=_record_id_arg, required=True,
                        help="pg_id of the superseded source fact to acknowledge")
         sargs = p.parse_args(sys.argv[2:])
         print(json.dumps(await review_hold(sargs.summary_id, sargs.pg_id), indent=2))
@@ -1928,7 +1955,7 @@ async def main() -> None:
                         "record (Retrospective node behind the decision's HAD_OUTCOME "
                         "trigger edge).",
         )
-        p.add_argument("--pg-id",  required=True, type=int,
+        p.add_argument("--pg-id",  required=True, type=_record_id_arg,
                        help="pg_id of the target Decision")
         p.add_argument("--rating", required=True,
                        help=f"The outcome STATE, not a sentiment: {list(RETRO_RATINGS)}. "

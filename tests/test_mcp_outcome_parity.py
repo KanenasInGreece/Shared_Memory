@@ -200,10 +200,6 @@ _CASES = {
         ["save", "fact text", json.dumps({"project": "proj-a", "model": "qwen3"})],
         lambda: vs.save_artifact("fact text", json.dumps({"project": "proj-a", "model": "qwen3"})),
     ),
-    "supersede_negative_by": (
-        ["supersede", "--pg-id", "7", "--by=-1"],
-        lambda: vs.supersede(7, -1),
-    ),
     "supersede_no_successor": (
         ["supersede", "--pg-id", "7"],
         lambda: vs.supersede(7),

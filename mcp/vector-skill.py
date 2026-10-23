@@ -49,9 +49,11 @@ import re
 import stat
 import sys
 from datetime import datetime
+from typing import Annotated
 
 import httpx
 from fastmcp import FastMCP
+from pydantic import BeforeValidator
 
 # ── Client-scoped credentials ────────────────────────────────────────────────
 # This client may hold only its own AGENT_TOKEN and the gateway URL, so a .env
@@ -704,6 +706,49 @@ def _is_placeholder_words(text: str) -> bool:
     return _ACK_ANGLE.match(folded) is not None
 
 
+_MAX_RECORD_ID = 2**63 - 1
+
+
+def _parse_record_id(value) -> int | None:
+    """The record id ``value`` stands for under the gateway's rule, else None."""
+    # Mirrors record_ref._parse_id (not imported: the clients ship alone, ADR-014): an int
+    # that is not a bool, or ASCII digits after stripping, within 1..2**63-1. Bare int()
+    # would also take "+5", "1_6" and non-ASCII digits and resolve them to a wrong row.
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, str):
+        text = value.strip()
+        if not (text.isascii() and text.isdigit()):
+            return None
+        try:
+            value = int(text)
+        except ValueError:  # past the interpreter's int-string digit limit
+            return None
+    if not isinstance(value, int):
+        return None
+    return value if 0 < value <= _MAX_RECORD_ID else None
+
+
+def _strict_record_id(value):
+    """BeforeValidator for a record-id tool parameter: only a real JSON integer in range."""
+    # FastMCP validates in pydantic lax mode (strict=False overrides a field-level Strict()),
+    # which turns "1_6" into 16; this runs first and refuses every non-int shape.
+    if isinstance(value, bool) or not isinstance(value, int) or _parse_record_id(value) is None:
+        raise ValueError(f"record id must be an integer from 1 to {_MAX_RECORD_ID}, got {value!r}")
+    return value
+
+
+def _strict_record_id_or_zero(value):
+    """Like _strict_record_id, but integer 0 passes: supersede's `by` omit sentinel."""
+    if isinstance(value, int) and not isinstance(value, bool) and value == 0:
+        return value
+    return _strict_record_id(value)
+
+
+RecordId = Annotated[int, BeforeValidator(_strict_record_id)]
+RecordIdOrZero = Annotated[int, BeforeValidator(_strict_record_id_or_zero)]
+
+
 def _normalize_ack(raw: dict) -> dict[int, str]:
     """Turn the tool's {decision_id: operator's words} map into the {int: words} map the CLI sends, refusing what the CLI refuses as ValueError text worded for this tool's argument.
     A key that is not a decision id, an empty string, or a placeholder is refused: this client must not invent the operator's words (fact:2809: the operator's words are carried per decision)."""
@@ -718,13 +763,12 @@ def _normalize_ack(raw: dict) -> dict[int, str]:
             raise ValueError(f"acknowledge_standing[{k!r}] must be the operator's words")
         if isinstance(k, bool):
             raise ValueError("acknowledge_standing keys must be decision ids")
-        try:
-            d_id = int(k)
-        except (ValueError, TypeError):
+        d_id = _parse_record_id(k)
+        if d_id is None:
             raise ValueError(
                 f"acknowledge_standing key {k!r} is not a decision id; the form is "
                 "{decision_id: the operator's words}."
-            ) from None
+            )
         if not v or _is_placeholder_words(v):
             raise ValueError(
                 f"acknowledge_standing[{d_id}] requires the operator's non-empty words "
@@ -749,14 +793,8 @@ def _canonical_ref(ref) -> str | None:
             return None
     else:
         rtype, num = None, text
-    num = num.strip()
-    if not (num.isascii() and num.isdigit()):
-        return None
-    try:
-        pid = int(num)
-    except ValueError:  # past the interpreter's int-string digit limit; the gateway refuses it too
-        return None
-    if not 0 < pid <= 2**63 - 1:
+    pid = _parse_record_id(num)
+    if pid is None:
         return None
     return str(pid) if rtype is None else f"{rtype}:{pid}"
 
@@ -1284,9 +1322,9 @@ async def save_decision(
             continue
         pid_str, _, role = tok.partition(":")
         pid_str = pid_str.strip()
-        if not pid_str.isdigit():
+        pid = _parse_record_id(pid_str)
+        if pid is None:
             continue
-        pid = int(pid_str)
         gi.append(pid)
         if role.strip():
             grounded_roles[str(pid)] = role.strip().lower()
@@ -1306,7 +1344,7 @@ async def save_decision(
 
 @mcp.tool()
 async def save_retrospective(
-    pg_id: int,
+    pg_id: RecordId,
     rating: str,
     notes: str,
     source: str,
@@ -1363,9 +1401,9 @@ async def save_retrospective(
             continue
         pid_str, _, role = tok.partition(":")
         pid_str = pid_str.strip()
-        if not pid_str.isdigit():
+        pid = _parse_record_id(pid_str)
+        if pid is None:
             continue
-        pid = int(pid_str)
         gi.append(pid)
         if role.strip():
             grounded_roles[str(pid)] = role.strip().lower()
@@ -1392,8 +1430,8 @@ async def save_retrospective(
 
 @mcp.tool()
 async def supersede(
-    pg_id: int,
-    by: int = 0,
+    pg_id: RecordId,
+    by: RecordIdOrZero = 0,
     acknowledge_standing: dict[str, str] | None = None,
 ) -> str:
     """Retract or supersede an existing FACT (decision 381/384).
@@ -1470,7 +1508,7 @@ async def supersede(
 
 
 @mcp.tool()
-async def review_hold(summary_id: int, pg_id: int) -> str:
+async def review_hold(summary_id: RecordId, pg_id: RecordId) -> str:
     """Mark a summary's flagged stale source as reviewed-and-held (decision 384).
 
     Returns, as JSON text, the object the CLI prints for its twin: the
