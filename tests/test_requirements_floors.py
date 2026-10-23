@@ -9,3 +9,4 @@ def test_requirements_floors():
     assert "aiohttp>=3.14.3" in req
     assert "fastmcp>=3.4.7" in req
     assert "starlette>=1.6.0" in req
+    assert "certifi>=2026.10.19" in req
