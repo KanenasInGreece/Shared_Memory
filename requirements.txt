@@ -10,4 +10,5 @@ psycopg2-binary>=2.9.12 # Postgres driver — consolidation_loop.py, migrations
 neo4j>=6.2.0           # Neo4j driver — coordinator.py, consolidation_loop.py
 fastmcp>=3.4.7         # MCP server — vector-skill.py (LM Studio only)
 starlette>=1.6.0       # Transitive via fastmcp; floor enforces BadHost fix (CVE-2026-48710)
+certifi>=2026.10.19    # Transitive via httpx; floor drops the compromised emSign ECC Root CA - G3 (GHSA-6q48-6c7w-9gw2)
 json-repair>=0.63.2    # Salvage LLM JSON slips — rem_loop.py

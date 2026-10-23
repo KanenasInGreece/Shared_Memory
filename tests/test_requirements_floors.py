@@ -9,3 +9,8 @@ def test_requirements_floors():
     assert "aiohttp>=3.14.3" in req
     assert "fastmcp>=3.4.7" in req
     assert "starlette>=1.6.0" in req
+    # The compromised emSign ECC Root CA - G3 (GHSA-6q48-6c7w-9gw2) is gone from
+    # certifi 2026.10.19 on; every install surface carries the floor.
+    for name in ("requirements.txt", "requirements-gateway.txt", "requirements-mcp.txt"):
+        text = (REPO_ROOT / name).read_text(encoding="utf-8")
+        assert "certifi>=2026.10.19" in text, name

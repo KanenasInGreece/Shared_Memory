@@ -7,12 +7,13 @@
 # ⚠ THIS PAIR IS NOT ON THE SPAWN PATH — it is the HASHED AUDIT ARTEFACT and
 # the SOURCE OF TRUTH the connector's own pins are checked against. The
 # documented spawn line is `uv run --no-project mcp/vector-skill.py`: the
-# connector carries PEP 723 inline metadata naming fastmcp and httpx by exact
+# connector carries PEP 723 inline metadata naming fastmcp and httpx (and
+# httpx's CA bundle, certifi) by exact
 # version, because `--with-requirements` resolves this file relative to
 # whatever directory the MCP host happens to spawn from (measured: `error:
 # File not found`, and a hijack surface for anyone who can plant a file of
 # that name there). `tests/test_mcp_spawn_lines_pinned.py` asserts that the
-# two inline versions equal the versions pinned in requirements-mcp.lock, so
+# three inline versions equal the versions pinned in requirements-mcp.lock, so
 # editing one without the other turns the suite red.
 #
 # Regenerate the pinned lock after editing (same form as requirements-gateway.lock):
@@ -22,3 +23,5 @@
 
 fastmcp
 httpx
+# Transitive via httpx; floor drops the compromised emSign ECC Root CA - G3 (GHSA-6q48-6c7w-9gw2).
+certifi>=2026.10.19

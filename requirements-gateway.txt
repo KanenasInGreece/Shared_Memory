@@ -11,5 +11,7 @@ aiohttp
 asyncpg
 neo4j
 httpx
+# Transitive via httpx; floor drops the compromised emSign ECC Root CA - G3 (GHSA-6q48-6c7w-9gw2).
+certifi>=2026.10.19
 json-repair
 pyyaml==6.0.3
