@@ -1,11 +1,14 @@
 # /// script
 # requires-python = ">=3.10"
-# dependencies = ["fastmcp==4.0.3", "httpx==0.28.1"]
+# dependencies = ["fastmcp==4.0.3", "httpx==0.28.1", "certifi==2026.10.23"]
 # ///
 #
 # PEP 723 inline metadata: the connector declares its own dependencies, so the
 # spawn line is `uv run --no-project <this file>`. The versions above are the
 # ones `requirements-mcp.lock` pins, checked by tests/test_mcp_spawn_lines_pinned.py.
+# certifi is not imported here: it is httpx's CA bundle, pinned so a cached
+# environment cannot keep a bundle that trusts the compromised emSign ECC
+# Root CA - G3 (GHSA-6q48-6c7w-9gw2).
 #
 # `--with-requirements requirements-mcp.lock` resolves the lock relative to the
 # spawning process's working directory, and an MCP host spawns stdio servers
@@ -214,7 +217,7 @@ AGENT_ID = os.environ.get("AGENT_ID", "vector_skill")
 # v4 a fact save without a registered metadata.project is rejected 400 carrying
 # project_required or project_unknown plus near-match proposals.
 API_VERSION = 4
-VERSION = "1.0.34"
+VERSION = "1.0.35"
 CLIENT_VERSION_HEADER = "X-SM-Api-Version"
 # Framework build, separate from api_version, so two clients on the same wire contract can still be counted apart in clients.versions_seen.
 CLIENT_BUILD_HEADER = "X-Shared-Memory-Client"

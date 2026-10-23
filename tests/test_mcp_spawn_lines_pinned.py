@@ -322,9 +322,10 @@ def test_inline_pins_equal_the_lock_pins():
     what actually installs. If they can drift apart silently, the lock is
     decoration."""
     deps = _inline_dependencies()
-    assert {d.split("==")[0] for d in deps} == {"fastmcp", "httpx"}, (
+    assert {d.split("==")[0] for d in deps} == {"fastmcp", "httpx", "certifi"}, (
         f"the inline block must pin exactly fastmcp and httpx — "
-        f"vector-skill.py's only third-party imports — found {deps!r}"
+        f"vector-skill.py's only third-party imports — and certifi, httpx's "
+        f"CA bundle (GHSA-6q48-6c7w-9gw2), found {deps!r}"
     )
     for dep in deps:
         assert "==" in dep, (
