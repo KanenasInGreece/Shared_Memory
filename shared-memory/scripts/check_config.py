@@ -28,7 +28,6 @@ ENV_ROW_ORDER = (
     "EMBED_CHARS_PER_TOKEN",
     "EMBED_SPECIAL_TOKEN_RESERVE",
     "EMBED_MAX_CHARS",
-    "OVERFLOW_TOKEN_SLACK",
 )
 
 # ── Exception rendering (SEC-HIGH, fold round) — see the module docstring's
@@ -132,7 +131,7 @@ def _verdict(key: str, gateway: "tuple[dict | None, str | None] | None" = None) 
     (never normalised; see framework_defaults.py's LLM_DEFAULT_TARGET row
     for why an 'or' vs 'get' difference here is documented, not a bug to
     silently fix). Rows whose consumer does more than get/or (the embed
-    values, PROXY_BIND, the encoder URLs, OVERFLOW_TOKEN_SLACK) take the
+    values, PROXY_BIND, the encoder URLs) take the
     consumer's own result, or name why the gateway would not start, in `note`
     ('' when there is nothing to add). `gateway` is _gateway_embed_values()'s
     result; omitted, it is computed here."""
@@ -154,13 +153,6 @@ def _verdict(key: str, gateway: "tuple[dict | None, str | None] | None" = None) 
     elif key == "PROXY_BIND" and raw is not None:
         # hive_mind_proxy._resolve_proxy_bind_host: strip, empty falls back to loopback.
         effective = raw.strip() or _GATEWAY_BIND_DEFAULT
-    elif key == "OVERFLOW_TOKEN_SLACK" and raw is not None:
-        # encoder_window does int(os.environ.get(...)): a raw int() rejects stops the gateway;
-        # an accepted spelling keeps its raw text.
-        try:
-            int(raw)
-        except ValueError:
-            note = "not a whole number — the gateway would not start"
     elif key in _EMBED_KEYS:
         values, failed = gateway if gateway is not None else _gateway_embed_values()
         if values is None:

@@ -104,8 +104,8 @@ def test_classify_overflow_mismatch_short_window():
     assert res.requested == 600
 
 
-def test_classify_overflow_larger_than_slack():
-    # Gap > OVERFLOW_TOKEN_SLACK (16) with advertised >= required
+def test_classify_overflow_any_overshoot_of_a_sufficient_window_is_overrun():
+    # No slack band: a 58-token overshoot is an overrun like a 1-token one.
     body = {
         "message": (
             "This model's maximum context length is 8192 tokens. "
@@ -113,7 +113,7 @@ def test_classify_overflow_larger_than_slack():
         )
     }
     res = encoder_window.classify_overflow(400, body, required_tokens=8192)
-    assert res.kind == "other"
+    assert res.kind == "overrun"
     assert res.advertised == 8192
     assert res.requested == 8250
 

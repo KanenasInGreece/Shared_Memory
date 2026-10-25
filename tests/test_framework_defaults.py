@@ -278,12 +278,12 @@ def test_proxy_llm_backends_is_bound_once_at_module_level_via_tuple_unpack():
     assert _assigned_at_module_level(src, "LLM_BACKENDS")
 
 
-# ── One source for the embed/slack fallbacks ────────────────────────────────
+# ── One source for the embed fallbacks ────────────────────────────────
 
 _SCRIPTS = os.path.join(os.path.dirname(__file__), "..", "shared-memory", "scripts")
 _FALLBACK_NAMES = (
     "EMBED_MAX_CONTEXT_TOKENS", "EMBED_CHARS_PER_TOKEN",
-    "EMBED_SPECIAL_TOKEN_RESERVE", "OVERFLOW_TOKEN_SLACK",
+    "EMBED_SPECIAL_TOKEN_RESERVE",
 )
 
 
@@ -301,10 +301,10 @@ def _environ_get_fallbacks(filename):
     return found
 
 
-def test_embed_and_slack_fallbacks_are_not_retyped_literals():
+def test_embed_fallbacks_are_not_retyped_literals():
     """Drift guard: the fallbacks come from the table, never a string literal."""
     found = {}
-    for fname in ("dream_telemetry.py", "encoder_window.py"):
+    for fname in ("dream_telemetry.py",):
         found.update(_environ_get_fallbacks(fname))
     assert set(found) == set(_FALLBACK_NAMES)
     for name, node in found.items():
@@ -333,12 +333,10 @@ def test_unset_embed_variables_resolve_to_the_shipped_values(_restore_embed_modu
     for k in _FALLBACK_NAMES + ("EMBED_MAX_CHARS",):
         monkeypatch.delenv(k, raising=False)
     dt = importlib.reload(importlib.import_module("dream_telemetry"))
-    ew = importlib.reload(importlib.import_module("encoder_window"))
     assert dt.EMBED_MAX_CONTEXT_TOKENS == 8192 and isinstance(dt.EMBED_MAX_CONTEXT_TOKENS, int)
     assert dt.EMBED_CHARS_PER_TOKEN == 3.0 and isinstance(dt.EMBED_CHARS_PER_TOKEN, float)
     assert dt.EMBED_SPECIAL_TOKEN_RESERVE == 2 and isinstance(dt.EMBED_SPECIAL_TOKEN_RESERVE, int)
     assert dt.EMBED_MAX_CHARS == 24570 and isinstance(dt.EMBED_MAX_CHARS, int)
-    assert ew.OVERFLOW_TOKEN_SLACK == 16 and isinstance(ew.OVERFLOW_TOKEN_SLACK, int)
 
 
 def test_invalid_special_token_reserve_falls_back_to_the_table_default(monkeypatch):
@@ -364,6 +362,4 @@ def test_consumers_carry_no_line_numbers():
 def test_zz_embed_modules_reflect_the_process_env_after_earlier_tests():
     """Guard for the restore above: runs last, sees no leftover shipped-default rebind."""
     dt = importlib.import_module("dream_telemetry")
-    ew = importlib.import_module("encoder_window")
     assert dt.EMBED_MAX_CONTEXT_TOKENS == int(os.environ.get("EMBED_MAX_CONTEXT_TOKENS", "8192"))
-    assert ew.OVERFLOW_TOKEN_SLACK == int(os.environ.get("OVERFLOW_TOKEN_SLACK", "16"))

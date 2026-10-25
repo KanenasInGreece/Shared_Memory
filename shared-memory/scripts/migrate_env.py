@@ -107,11 +107,15 @@ class UnitQuery:
     is authoritative), 'query_failed' (ALL writes must decline)."""
 
     def __init__(self, status: str, owned_keys: "set[str]" = frozenset(),
-                 environment: "dict[str, str]" = None, error: str = None):
+                 environment: "dict[str, str]" = None, error: str = None,
+                 load_credentials: bool = False):
         self.status = status
         self.owned_keys = owned_keys
         self.environment = environment or {}
         self.error = error
+        # True when the unit declares LoadCredential= / LoadCredentialEncrypted=
+        # (never the ids, paths or values).
+        self.load_credentials = load_credentials
 
 
 class _EnvironmentParseError(Exception):
@@ -194,6 +198,16 @@ def _read_env_file_key_names(path: str) -> "set[str]":
     return names
 
 
+def _unit_declares_load_credential(raw: str) -> bool:
+    """True only when a LoadCredential= / LoadCredentialEncrypted= line carries a
+    value: systemctl prints the property name even when it is empty."""
+    for line in raw.splitlines():
+        for prefix in ("LoadCredential=", "LoadCredentialEncrypted="):
+            if line.startswith(prefix) and line[len(prefix):].strip():
+                return True
+    return False
+
+
 def query_gateway_unit(gateway_unit: str) -> UnitQuery:
     systemctl = shutil.which("systemctl")
     if systemctl is None:
@@ -201,7 +215,8 @@ def query_gateway_unit(gateway_unit: str) -> UnitQuery:
     try:
         proc = subprocess.run(
             [systemctl, "--user", "show", gateway_unit, "-p", "Environment",
-             "-p", "EnvironmentFiles"],
+             "-p", "EnvironmentFiles", "-p", "LoadCredential",
+             "-p", "LoadCredentialEncrypted"],
             capture_output=True, text=True, timeout=10,
         )
     except Exception as exc:
@@ -221,11 +236,38 @@ def query_gateway_unit(gateway_unit: str) -> UnitQuery:
             return UnitQuery(
                 "query_failed",
                 error=f"EnvironmentFile {path!r} unreadable ({type(exc).__name__})")
-    return UnitQuery("ok", owned_keys=owned, environment=environment)
+    return UnitQuery("ok", owned_keys=owned, environment=environment,
+                     load_credentials=_unit_declares_load_credential(proc.stdout))
+
+
+def hidden_credentials(unit_query: UnitQuery) -> bool:
+    """True when the unit supplies a credential this check's child cannot see:
+    a non-empty LoadCredential=, or a secret Environment= key that
+    build_faithful_env withheld."""
+    if unit_query.status != "ok":
+        return False
+    return unit_query.load_credentials or any(
+        secure_env.is_secret_key(k) for k in unit_query.environment)
+
+
+# One plain sentence in this script's words, used instead of the loader's
+# fallback_reason when a hidden credential is the likely cause. A PARTIAL
+# exclusion (one credentialed backend dropped from a larger fleet) sets neither
+# fallback_reason nor has_token=False, so this image cannot show it.
+HIDDEN_CREDENTIAL_NOTE = (
+    "a credential supplied through LoadCredential= or a secret Environment= value "
+    "is not visible to this check, so it sees the provider backend as uncredentialed; "
+    "the running gateway is unaffected and nothing was changed.")
+
+
+def _hidden_credential_line(unit_query: UnitQuery, image: "dict | None") -> "str | None":
+    if image and image.get("fallback_reason") and hidden_credentials(unit_query):
+        return HIDDEN_CREDENTIAL_NOTE
+    return None
 
 
 # PATH, HOME, and the unit's own declarations only. The operator shell is excluded so the image matches systemd.
-# A secret on a unit Environment= line is not copied into the child, and LoadCredential= is invisible to systemctl show, so both can look like a missing token. Writes still decline.
+# A secret on a unit Environment= line is not copied into the child, and a LoadCredential= file is not readable by it, so both can look like a missing token. Writes still decline.
 
 def build_faithful_env(unit_query: UnitQuery) -> "dict[str, str]":
     faithful: "dict[str, str]" = {
@@ -246,8 +288,18 @@ def build_faithful_env(unit_query: UnitQuery) -> "dict[str, str]":
 # Fresh subprocess per image. The gateway loader runs once at import and writes module globals, so it cannot run in-process.
 
 _LOADER_SNIPPET = """
-import json, sys
+import json, logging, sys
 sys.path.insert(0, {here!r})
+
+
+class _DropNoBackendError(logging.Filter):
+    # Only the gateway's own "no usable backend" ERROR is dropped (this child cannot see
+    # a unit-supplied credential); every other import-time record stays on stderr.
+    def filter(self, record):
+        return not record.getMessage().startswith("LLM_BACKENDS_JSON produced no usable backend")
+
+
+logging.getLogger("hive-proxy").addFilter(_DropNoBackendError())
 try:
     import secure_env
     secure_env.load_split_env()
@@ -901,6 +953,9 @@ def do_capture(out_path: str, gateway_unit: str) -> int:
     _report(lines, f"captured pre-image: {len(image.get('urls', []))} backend(s), "
                     f"config_empty={image.get('config_empty')}, "
                     f"fallback={'yes' if image.get('fallback_reason') else 'no'} -> {out_path}")
+    hidden = _hidden_credential_line(unit_query, image)
+    if hidden:
+        _report(lines, f"note: {hidden}")
     print("\n".join(lines))
     return EXIT_OK
 
@@ -1035,9 +1090,14 @@ def do_apply_or_dryrun(preimage_path: "str | None", apply: bool, gateway_unit: s
                         "faces the same 'no backend declared' outcome W4 will apply — "
                         "see GET /health.")
     elif case == CASE_JSON_UNUSABLE:
-        _report(lines, f"LLM_BACKENDS_JSON is present but unusable — "
-                        f"{_scrub(pre_image.get('fallback_reason') or '')}. Touching "
-                        f"nothing (JSON key, CSV key, and the pool half all left as-is).")
+        hidden = _hidden_credential_line(unit_query, pre_image)
+        if hidden:
+            _report(lines, f"LLM_BACKENDS_JSON could not be fully checked — {hidden} Touching "
+                            f"nothing (JSON key, CSV key, and the pool half all left as-is).")
+        else:
+            _report(lines, f"LLM_BACKENDS_JSON is present but unusable — "
+                            f"{_scrub(pre_image.get('fallback_reason') or '')}. Touching "
+                            f"nothing (JSON key, CSV key, and the pool half all left as-is).")
     elif case == CASE_JSON_USABLE:
         if not boundary_open:
             _report(lines, "LLM_BACKENDS_JSON already reflects the CURRENT loader "

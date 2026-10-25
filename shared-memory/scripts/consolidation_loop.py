@@ -2503,8 +2503,8 @@ class ConsolidationDaemon:
            window and killed large summaries deterministically.
         3. Overflow (decision:2569 remainder): HTTP 400 or 413. Mismatch
            (advertised < required) returns None — do not silent-prefix a
-           short server. Overrun *and* other (dense text, requested ≫
-           advertised+slack) shrink the *vector prefix* only; the full
+           short server. Overrun (any overshoot of a sufficient window)
+           and other shrink the *vector prefix* only; the full
            summary stays stored. First snap is the imported reserved clamp
            when the body is still longer; then at most ~8 HTTP attempts
            using advertised/requested ratio when known, else halve. A

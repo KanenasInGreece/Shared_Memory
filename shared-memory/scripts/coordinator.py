@@ -3319,7 +3319,6 @@ class MemoryCoordinator:
                     from encoder_window import (
                         classify_overflow,
                         record_embed_window_overrun,
-                        OVERFLOW_TOKEN_SLACK,
                     )
                     resp_text = getattr(r, "text", "")
                     classification = classify_overflow(400, resp_text, EMBED_MAX_CONTEXT_TOKENS)
@@ -3336,31 +3335,24 @@ class MemoryCoordinator:
                         safe(lambda: setattr(self, "_embed_window_overruns_last_ts", time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())))
                         log.error(
                             "embed input %d chars caused %d-token overflow on %d-token model — "
-                            "snapping to reserved clamp (reserved=%d, EMBED_MAX_CHARS=%d)",
+                            "shrinking in proportion (reserved clamp=%d, EMBED_MAX_CHARS=%d)",
                             len(text), classification.requested, classification.advertised, reserved_snap, EMBED_MAX_CHARS,
                         )
-                        new_len = min(reserved_snap, len(text) - 1)
+                        # Shrink in proportion to the overshoot, never past the reserved clamp.
+                        new_len = min(reserved_snap, (len(text) * classification.advertised) // classification.requested)
+                        if new_len >= len(text):
+                            new_len = len(text) - 1
                         if attempt == EMBED_RETRIES or new_len < 1:
                             raise RuntimeError(
                                 f"Embedding context overrun after {attempt} attempts: server reported {classification.requested} "
                                 f"tokens on {classification.advertised}-token window (last input {len(text)} chars). "
                                 f"Check for leftover or oversize EMBED_MAX_CHARS (currently {EMBED_MAX_CHARS}) in .env; "
-                                f"unset or lower to {reserved_snap}."
+                                f"unset or lower to {reserved_snap}, or lower EMBED_CHARS_PER_TOKEN "
+                                f"(currently {EMBED_CHARS_PER_TOKEN})."
                             )
                         text = text[:new_len]
                         ceiling = embed_ceiling(len(text))
                         continue
-                    elif (
-                        classification.advertised is not None
-                        and classification.requested is not None
-                        and classification.advertised >= EMBED_MAX_CONTEXT_TOKENS
-                    ):
-                        raise RuntimeError(
-                            f"Embedding input requested {classification.requested} tokens on "
-                            f"{classification.advertised}-token window (exceeds slack {OVERFLOW_TOKEN_SLACK}). "
-                            f"Lower EMBED_CHARS_PER_TOKEN (currently {EMBED_CHARS_PER_TOKEN}) or "
-                            f"EMBED_MAX_CHARS (currently {EMBED_MAX_CHARS}) in .env."
-                        )
                 r.raise_for_status()
                 vec = r.json()["data"][0]["embedding"]
                 # safe() so a stubbed owner cannot AttributeError the embed path.
@@ -3370,7 +3362,6 @@ class MemoryCoordinator:
             except Exception as exc:
                 if isinstance(exc, RuntimeError) and (
                     "Embedding context mismatch:" in str(exc)
-                    or "exceeds slack" in str(exc)
                     or "Embedding context overrun" in str(exc)
                 ):
                     raise
@@ -3428,7 +3419,6 @@ class MemoryCoordinator:
                     from encoder_window import (
                         classify_overflow,
                         record_embed_window_overrun,
-                        OVERFLOW_TOKEN_SLACK,
                     )
                     resp_text = getattr(r, "text", "")
                     classification = classify_overflow(400, resp_text, EMBED_MAX_CONTEXT_TOKENS)
@@ -3445,41 +3435,37 @@ class MemoryCoordinator:
                         safe(lambda: setattr(self, "_embed_window_overruns_last_ts", time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())))
                         log.error(
                             "batch embed caused %d-token overflow on %d-token model — "
-                            "snapping items to reserved clamp (reserved=%d, EMBED_MAX_CHARS=%d)",
+                            "shrinking items in proportion (reserved clamp=%d, EMBED_MAX_CHARS=%d)",
                             classification.requested, classification.advertised, reserved_snap, EMBED_MAX_CHARS,
                         )
                         max_len = max(len(t) for t in clamped)
-                        if attempt == EMBED_RETRIES or max_len < 1:
+                        # Shrink in proportion to the overshoot; only the longest item (or one
+                        # already at the reserved clamp) shrinks, shorter siblings stay whole.
+                        new_max = min(reserved_snap, (max_len * classification.advertised) // classification.requested)
+                        if new_max >= max_len:
+                            new_max = max_len - 1
+                        # A selected item whose own proportion is below 1 would be posted at a
+                        # coerced length of 1; it raises the same overrun error instead.
+                        selected_zero = any(
+                            (len(t) * classification.advertised) // classification.requested < 1
+                            for t in clamped if (len(t) == max_len or len(t) >= reserved_snap)
+                        )
+                        if attempt == EMBED_RETRIES or new_max < 1 or selected_zero:
                             raise RuntimeError(
                                 f"Batch embedding context overrun after {attempt} attempts: server reported {classification.requested} "
                                 f"tokens on {classification.advertised}-token window. "
                                 f"Check for leftover or oversize EMBED_MAX_CHARS (currently {EMBED_MAX_CHARS}) in .env; "
-                                f"unset or lower to {reserved_snap}."
+                                f"unset or lower to {reserved_snap}, or lower EMBED_CHARS_PER_TOKEN "
+                                f"(currently {EMBED_CHARS_PER_TOKEN})."
                             )
-                        if max_len >= reserved_snap:
-                            clamped = [
-                                t[:min(reserved_snap, len(t) - 1)] if len(t) >= reserved_snap else t
-                                for t in clamped
-                            ]
-                        else:
-                            clamped = [
-                                t[:len(t) - 1] if len(t) == max_len else t
-                                for t in clamped
-                            ]
+                        clamped = [
+                            t[:min(reserved_snap, (len(t) * classification.advertised) // classification.requested, len(t) - 1)]
+                            if (len(t) == max_len or len(t) >= reserved_snap) else t
+                            for t in clamped
+                        ]
                         total_chars = sum(len(t) for t in clamped)
                         ceiling = embed_ceiling(total_chars)
                         continue
-                    elif (
-                        classification.advertised is not None
-                        and classification.requested is not None
-                        and classification.advertised >= EMBED_MAX_CONTEXT_TOKENS
-                    ):
-                        raise RuntimeError(
-                            f"Batch embedding requested {classification.requested} tokens on "
-                            f"{classification.advertised}-token window (exceeds slack {OVERFLOW_TOKEN_SLACK}). "
-                            f"Lower EMBED_CHARS_PER_TOKEN (currently {EMBED_CHARS_PER_TOKEN}) or "
-                            f"EMBED_MAX_CHARS (currently {EMBED_MAX_CHARS}) in .env."
-                        )
                 r.raise_for_status()
                 data = r.json()["data"]
                 if len(data) != len(clamped):
@@ -3496,7 +3482,6 @@ class MemoryCoordinator:
             except Exception as exc:
                 if isinstance(exc, RuntimeError) and (
                     "Embedding context mismatch:" in str(exc)
-                    or "exceeds slack" in str(exc)
                     or "Batch embedding context overrun" in str(exc)
                 ):
                     raise
