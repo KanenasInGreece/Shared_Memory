@@ -3,7 +3,7 @@
 # Install into a clean venv: pip install -r requirements.txt
 # Reproducible install (exact tested versions): uv venv && uv pip sync requirements.lock
 
-aiohttp>=3.14.3        # Hive-Mind Gateway (hive_mind_proxy.py)
+aiohttp>=3.14.4        # Hive-Mind Gateway (hive_mind_proxy.py); 3.14.4 fixes the server advisories of 2026-10 (GHSA-5wr8-gcqf-gqf3, GHSA-pqxq-w44r-73xw, GHSA-9xw5-w5jj-pvcg)
 asyncpg>=0.31.0        # Async Postgres pool — coordinator.py
 httpx>=0.28.1          # HTTP client — memory_bridge.py, vector-skill.py
 psycopg2-binary>=2.9.12 # Postgres driver — consolidation_loop.py, migrations

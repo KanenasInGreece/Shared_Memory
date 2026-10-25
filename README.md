@@ -375,14 +375,14 @@ online provider — the embedder and reranker run as Docker containers from the 
 least one consumer: a CLI agent through the skill (Claude Code, Antigravity CLI, Grok, Codex CLI,
 OpenClaw) and/or an MCP host through the connector (LM Studio, opencode — [§21](#21-the-mcp-install-any-mcp-host-one-connector)).
 
-**Runtime components — the shipped, pinned baseline (pins rechecked 2026-09-23, not a postflight of 5.26.31).** The compose file names
+**Runtime components — the shipped, pinned baseline (pins rechecked 2026-10-25, not a postflight of 5.26.32).** The compose file names
 exact image tags, never floating ones, and these are requirements in their own right:
 
 | Component | Shipped pin | Floor, and why |
 |---|---|---|
-| PostgreSQL | **17.11** via `pgvector/pgvector:0.8.6-pg17` | 17.x; 17.11 carries the 2026-08-13 security release (`pg_dump` CVE-2026-19385, `psql \unrestrict` CVE-2026-18408 — paths the backup and restore scripts exercise) |
-| pgvector | **0.8.6** (same image) | **≥ 0.8** — `hnsw.iterative_scan` is what keeps a selective `--project`/`--domain` filter from returning nothing at scale ([§16](#16-databases-initialise-verify-upgrade)); ≥ 0.8.4 for the HNSW-vacuum corruption fixes. The gateway reads the installed version at startup and reports it on authenticated `/health` |
-| Neo4j | **5.26.31** Community, `neo4j:5.26.31-community` | the 5.26 **LTS** line (supported to 2028-06); APOC and Graph Data Science load at container start |
+| PostgreSQL | **17.11** via `pgvector/pgvector:0.8.7-pg17` | 17.x; 17.11 carries the 2026-08-13 security release (`pg_dump` CVE-2026-19385, `psql \unrestrict` CVE-2026-18408 — paths the backup and restore scripts exercise) |
+| pgvector | **0.8.7** (same image) | **≥ 0.8** — `hnsw.iterative_scan` is what keeps a selective `--project`/`--domain` filter from returning nothing at scale ([§16](#16-databases-initialise-verify-upgrade)); ≥ 0.8.4 for the HNSW-vacuum corruption fixes; 0.8.7 fixes the IVFFlat index-build overflow (CVE-2026-103484). The gateway reads the installed version at startup and reports it on authenticated `/health` |
+| Neo4j | **5.26.32** Community, `neo4j:5.26.32-community` | the 5.26 **LTS** line (supported to 2028-06); APOC and Graph Data Science load at container start |
 | llama.cpp server images | `ghcr.io/ggml-org/llama.cpp:server` / `:server-vulkan` | still floating — pinned after an encoder-host test |
 
 A pin moves only deliberately, and every move is recorded in the `CHANGELOG` with its reason; a
@@ -830,7 +830,7 @@ verifies it; by hand it is
 ## 15. The stack: Docker Compose
 
 `shared-memory/ops/postgres_neo4j_limits.yaml` defines six services, four of them on by default: **postgres** (pgvector, pinned
-`0.8.6-pg17`), **neo4j** (pinned `5.26.31-community`, with APOC + the required GDS plugin), and the two
+`0.8.7-pg17`), **neo4j** (pinned `5.26.32-community`, with APOC + the required GDS plugin), and the two
 llama.cpp inference containers —
 **retriever-api** (BGE-M3 embedder, `:8070`) and **reranker-api** (BGE-Reranker-v2-m3, `:8071`).
 The file is `${VAR}`-parametrized: host paths and passwords come from `shared-memory/.env`
@@ -892,8 +892,8 @@ bash shared-memory/scripts/update_framework.sh --from-restore
 You are not stuck on the version you installed, and you are not stuck with the installation.
 Both directions are scripts the framework ships and runs on its own test hosts at every release — the
 released pin move to PostgreSQL 17.11, pgvector 0.8.6 and Neo4j 5.26.30 ended with postflight
-passing on the test hosts and the Main workstation ([§23](#23-testing)). Neo4j `5.26.31-community`
-is the image running now. That move is not a release, and postflight has not been run for it.
+passing on the test hosts and the Main workstation ([§23](#23-testing)). The later moves to Neo4j
+`5.26.31-community` and then `5.26.32-community` with pgvector `0.8.7-pg17` (v1.0.36) have not had a postflight run yet.
 
 - **Update** (`update_framework.sh`) takes a backup first (quiesced when an admin token is set,
   online otherwise — it says which), pulls the released code, applies the Postgres migrations and
@@ -943,7 +943,7 @@ same reasoning, unmeasured). The gateway sets `hnsw.iterative_scan = relaxed_ord
 connection whenever the installed pgvector is >= 0.8 — with it, the minority filter above returned
 22 rows in 217 ms at 296,800 rows instead of 0 — and reports the installed pgvector version and
 whether iterative scan is active on authenticated `/health`. The bundled compose image is pinned
-to `pgvector/pgvector:0.8.6-pg17` for that floor. CPU-host latencies are unmeasured — the numbers
+to `pgvector/pgvector:0.8.7-pg17` for that floor. CPU-host latencies are unmeasured — the numbers
 above are from the 12-core Main workstation (Postgres itself uses no GPU).
 
 ## 17. Inference: the encoders and the reasoning LLM

@@ -71,7 +71,11 @@ A crafted `Host` header containing `/`, `?`, or `#` causes Starlette to misparse
 
 ### PostgreSQL, pgvector, and the Python locks (2026-09-23)
 
-PostgreSQL stays at 17.11 inside `pgvector/pgvector:0.8.6-pg17` and pgvector stays at 0.8.6, both still the current releases, and `pip-audit` reports no advisory on `requirements.lock`, `requirements-gateway.lock`, or `requirements-mcp.lock`, whose floors already match those pins.
+PostgreSQL stays at 17.11 inside `pgvector/pgvector:0.8.6-pg17` and pgvector stays at 0.8.6, both still the current releases, and `pip-audit` reports no advisory on `requirements.lock`, `requirements-gateway.lock`, or `requirements-mcp.lock`, whose floors already match those pins. That held on 2026-09-23. The 2026-10-25 sweep below moves both images and the locks.
+
+### Dependency sweep (2026-10-25, v1.0.36)
+
+Every pinned Python package (three locks plus the connector's inline block, 101 pairs) was checked against OSV and PyPI's advisory database, and every compose image against vendor advisories. aiohttp moves to 3.14.5 (the gateway is an aiohttp server; eight 2026-10 advisories), with multidict 6.9.1 and yarl 1.25.1. pyjwt 2.15.1, opentelemetry-api 1.45.1 and mcp 1.30.0 move in the locks; they are fastmcp transitives the stdio connector never reaches. Neo4j moves to 5.26.32 (Jackson, Parquet, Netty CVEs) and pgvector to 0.8.7-pg17 (IVFFlat build overflow, CVE-2026-103484); PostgreSQL stays at 17.11, the current 17.x minor. Open: fastmcp's two advisories (fixes from 2026-10-20 wait for the 14-day age floor; the connector uses neither affected feature) and `intel/vllm:0.21.0-xpu` (no newer Intel XPU image; loopback-only encoders with no API key). The CHANGELOG entry for 1.0.36 has the advisory ids.
 
 ---
 
