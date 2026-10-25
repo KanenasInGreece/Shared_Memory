@@ -1,6 +1,6 @@
 """Prove-It for consolidation_loop.get_embedding overflow snap (decision:2569).
 
-A slack-bounded HTTP 400/413 retries at the reserved clamp and returns a
+An HTTP 400/413 overrun retries at the reserved clamp and returns a
 1024-dim vector. A mismatch does not silent-prefix. Floor without 200
 returns None — no 1-char garbage, no per-char HTTP spam. Vector only;
 the caller's summary text is not rewritten.
@@ -38,7 +38,7 @@ MISMATCH_BODY = (
     '{"message": "This model\'s maximum context length is 512 tokens. '
     'However, you requested 600 tokens in the messages."}'
 )
-# Dense Zettelkasten: requested ≫ advertised+slack → classify kind "other".
+# Dense Zettelkasten: requested 9000 on an 8192 window → classify kind "overrun".
 DENSE_OTHER_BODY = (
     '{"message": "This model\'s maximum context length is 8192 tokens. '
     'However, you requested 9000 tokens in the messages, '
@@ -152,7 +152,7 @@ def test_get_embedding_mismatch_does_not_truncate(monkeypatch, caplog):
 
 
 def test_get_embedding_other_9000_vs_8192_shrinks_to_1024(monkeypatch):
-    """Live stall: 24570-char dense text, requested=9000 advertised=8192 (kind other).
+    """Live stall: 24570-char dense text, requested=9000 advertised=8192 (kind overrun).
 
     Must shrink the vector prefix (ratio) and return 1024-dim. Caller text
     stays full length. Fails on a7468a9: other → None on the first 400.

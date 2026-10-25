@@ -2305,12 +2305,12 @@ def test_embed_overrun_snaps_to_clamp_and_retries_to_200():
     assert vec == [0.3, 0.4]
     assert len(posts) == 2
     # First attempt clamped at EMBED_MAX_CHARS (24570)
-    # Second attempt snapped to min(EMBED_MAX_CHARS, len-1) = 24569
+    # Second attempt shrinks in proportion to the overshoot (8193 tokens on an 8192 window)
     assert len(posts[0]["input"]) == coord.EMBED_MAX_CHARS
-    assert len(posts[1]["input"]) == coord.EMBED_MAX_CHARS - 1
+    assert len(posts[1]["input"]) == coord.EMBED_MAX_CHARS * 8192 // 8193
 
 
-def test_embed_larger_than_slack_fails_with_named_error():
+def test_embed_larger_overshoot_retries_then_fails_with_named_error():
     import asyncio
     coord = load_coordinator()
     posts = []
@@ -2331,9 +2331,12 @@ def test_embed_larger_than_slack_fails_with_named_error():
     with pytest.raises(RuntimeError) as exc_info:
         asyncio.run(coord.MemoryCoordinator._embed(None, "x" * 24570, FakeClient()))
 
-    assert len(posts) == 1
+    # No slack band any more: every overshoot of a sufficient window is retried, bounded
+    # by EMBED_RETRIES, and the final error is the overrun error.
+    assert len(posts) == coord.EMBED_RETRIES
     err_msg = str(exc_info.value)
-    assert "Lower EMBED_CHARS_PER_TOKEN" in err_msg or "EMBED_MAX_CHARS" in err_msg
+    assert "Embedding context overrun after" in err_msg
+    assert "EMBED_CHARS_PER_TOKEN" in err_msg and "EMBED_MAX_CHARS" in err_msg
 
 
 def test_embed_leftover_env_24576_snaps_to_reserved_and_raises_named_error(monkeypatch):
@@ -2404,6 +2407,6 @@ def test_embed_many_preserves_short_siblings_on_overrun():
     assert len(posts) == 2
     retry_input = posts[1]["input"]
     assert retry_input[0] == "short", f"Short sibling mutated to {retry_input[0]!r}"
-    assert len(retry_input[1]) == 24569
+    assert len(retry_input[1]) == 24570 * 8192 // 8193
 
 

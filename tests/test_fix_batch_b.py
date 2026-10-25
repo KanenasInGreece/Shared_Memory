@@ -1,7 +1,7 @@
 """check_config Phase A reports what the gateway really resolves (fix round, batch B).
 
 Each case sets only the env a scenario needs; every test first clears every key the
-embed, slack and bind rows read, so the developer's own environment cannot leak in.
+embed and bind rows read, so the developer's own environment cannot leak in.
 """
 import os
 import sys
@@ -15,7 +15,7 @@ from framework_defaults import FRAMEWORK_DEFAULTS  # noqa: E402
 
 _CLEARED = (
     "EMBED_MAX_CONTEXT_TOKENS", "EMBED_CHARS_PER_TOKEN", "EMBED_SPECIAL_TOKEN_RESERVE",
-    "EMBED_MAX_CHARS", "OVERFLOW_TOKEN_SLACK", "EMBED_SAFETY_FACTOR",
+    "EMBED_MAX_CHARS", "EMBED_SAFETY_FACTOR",
     "PROXY_BIND", "EMBEDDER_URL", "RERANKER_URL",
 )
 
@@ -117,22 +117,14 @@ def test_unlisted_bad_variable_gets_an_extra_line(env):
     assert "derived" not in _row(lines, "EMBED_MAX_CHARS")
 
 
-@pytest.mark.parametrize("raw", ["x", ""])
-def test_bad_overflow_slack_is_noted(env, raw):
-    env.setenv("OVERFLOW_TOKEN_SLACK", raw)
-    assert "would not start" in check_config._verdict("OVERFLOW_TOKEN_SLACK")["note"]
-
-
 # 5. Accepted spellings keep their raw text; a default environment renders as before.
 
 def test_accepted_spellings_keep_raw_text(env):
     env.setenv("EMBED_CHARS_PER_TOKEN", "3")
     env.setenv("EMBED_MAX_CONTEXT_TOKENS", "  8192")
-    env.setenv("OVERFLOW_TOKEN_SLACK", " 5 ")
     lines, _ = check_config.phase_a_render()
     assert "-> '3'" in _row(lines, "EMBED_CHARS_PER_TOKEN")
     assert "-> '  8192'" in _row(lines, "EMBED_MAX_CONTEXT_TOKENS")
-    assert "-> ' 5 '" in _row(lines, "OVERFLOW_TOKEN_SLACK")
 
 
 def test_default_environment_rows_match_the_old_renderer(env):

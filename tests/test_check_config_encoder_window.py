@@ -6,7 +6,6 @@ Verifies:
    - EMBED_CHARS_PER_TOKEN
    - EMBED_SPECIAL_TOKEN_RESERVE
    - EMBED_MAX_CHARS
-   - OVERFLOW_TOKEN_SLACK
 2. Phase B renders encoder context window information as a note, never a boot refusal.
    Even if the advertised window is short, exit code remains 0.
 """
@@ -32,7 +31,7 @@ def clean_encoder_window_cache():
 
 
 
-def test_phase_a_renders_all_five_encoder_window_rows(monkeypatch):
+def test_phase_a_renders_all_four_encoder_window_rows(monkeypatch):
     monkeypatch.setenv("SECURE_ENV_FILE", "")
     lines, ok = check_config.phase_a_render()
     assert ok, f"phase_a_render failed: {lines}"
@@ -43,7 +42,6 @@ def test_phase_a_renders_all_five_encoder_window_rows(monkeypatch):
         "EMBED_CHARS_PER_TOKEN",
         "EMBED_SPECIAL_TOKEN_RESERVE",
         "EMBED_MAX_CHARS",
-        "OVERFLOW_TOKEN_SLACK",
     ]
     for key in required_keys:
         assert key in body, f"{key} missing from Phase A output"
@@ -80,21 +78,3 @@ def test_phase_b_renders_encoder_window_note_never_refusal(monkeypatch):
         encoder_window._window_cache.clear()
 
 
-def test_overflow_token_slack_default_is_16_across_contract():
-    from pathlib import Path
-    import encoder_window
-    import framework_defaults
-
-    # 1. encoder_window runtime default is 16
-    assert encoder_window.OVERFLOW_TOKEN_SLACK == 16
-
-    # 2. framework_defaults.py default is 16
-    row = framework_defaults.FRAMEWORK_DEFAULTS["OVERFLOW_TOKEN_SLACK"]
-    assert row["default"] == 16, f"framework_defaults OVERFLOW_TOKEN_SLACK default is {row['default']}, expected 16"
-    assert "snap" in row["note"].lower()
-
-    # 3. .env.example documents OVERFLOW_TOKEN_SLACK=16
-    env_example = (Path(__file__).parent.parent / "shared-memory" / ".env.example").read_text()
-    assert "# OVERFLOW_TOKEN_SLACK=16" in env_example
-    assert "Default: 16 tokens" in env_example
-    assert "slack * chars_per_token" not in env_example

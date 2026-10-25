@@ -83,7 +83,7 @@ __all__ = [
 ]
 
 #: Not a free-running today: this is the fifth version pin, so a missed bump is visible (decision:1832).
-VERSION = "1.0.36"
+VERSION = "1.0.37"
 
 
 def _version_tuple(v: str) -> tuple:
@@ -723,7 +723,7 @@ TELEMETRY: dict[str, dict] = {
         "env (QA fix round, finding 3: this note previously named the p95s).")),
     "encoders.embed_window_overruns_total": _k("int", "encoders", unit="_total",
                                                since=INTRODUCED_0_9_104,
-                                               note="slack-bounded retries only"),
+                                               note="every overshoot the gateway snapped and retried"),
     "encoders.embed_window_overruns_last_ts": _k("str|null", "encoders",
                                                  since=INTRODUCED_0_9_104),
 

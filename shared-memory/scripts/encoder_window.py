@@ -1,7 +1,7 @@
-"""Classify embed/rerank 400/413 as window mismatch vs slack-bounded overrun, and clamp embedding inputs per string (decision:2540).
+"""Classify embed/rerank 400/413 as window mismatch vs overrun, and clamp embedding inputs per string (decision:2540).
 
 Defines:
-- classify_overflow(): detects window mismatch vs slack-bounded overrun on HTTP 400/413.
+- classify_overflow(): detects window mismatch vs overrun on HTTP 400/413.
 - clamp_encoder_payload(): clamps OpenAI-style embedding inputs per string element.
 - OverflowResult: classification result with unpacked tuple compatibility.
 """
@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import re
 from typing import Any
 
@@ -26,12 +25,8 @@ from dream_telemetry import (
     prefix_rerank_query,
     rerank_ceiling,
 )
-from framework_defaults import FRAMEWORK_DEFAULTS
 
 log = logging.getLogger("EncoderWindow")
-
-OVERFLOW_TOKEN_SLACK = int(os.environ.get(
-    "OVERFLOW_TOKEN_SLACK", str(FRAMEWORK_DEFAULTS["OVERFLOW_TOKEN_SLACK"]["default"])))
 
 
 def reserved_clamp_chars() -> int:
@@ -217,7 +212,7 @@ _embed_window_overruns_last_ts: str | None = None
 
 
 def record_embed_window_overrun() -> None:
-    """Record a slack-bounded overrun event and timestamp."""
+    """Record an embed window overrun event and timestamp."""
     global _embed_window_overruns_total, _embed_window_overruns_last_ts
     import datetime
     _embed_window_overruns_total += 1
@@ -225,7 +220,7 @@ def record_embed_window_overrun() -> None:
 
 
 def get_embed_window_overruns() -> tuple[int, str | None]:
-    """Return (count, last_ts) for slack-bounded embed window overruns."""
+    """Return (count, last_ts) for embed window overruns."""
     return _embed_window_overruns_total, _embed_window_overruns_last_ts
 
 
@@ -350,8 +345,9 @@ def classify_overflow(
 
     - status not in (400, 413) -> 'other' (proxy/backend may 413 on window overrun)
     - advertised < required_tokens -> 'mismatch'
-    - advertised >= required_tokens and requested <= advertised + OVERFLOW_TOKEN_SLACK -> 'overrun'
-    - larger-than-slack or unparseable -> 'other' with (advertised, requested) when parsed
+    - advertised >= required_tokens and requested > advertised -> 'overrun'
+    - requested <= advertised (not an overshoot) or unparseable -> 'other' with
+      (advertised, requested) when parsed
     """
     if status not in (400, 413):
         return OverflowResult("other", None, None)
@@ -401,10 +397,10 @@ def classify_overflow(
     if advertised < required_tokens:
         return OverflowResult("mismatch", advertised, requested)
 
-    if requested <= advertised + OVERFLOW_TOKEN_SLACK:
+    if requested > advertised:
         return OverflowResult("overrun", advertised, requested)
 
-    # Larger than slack with advertised >= required
+    # Parsed, but not an overshoot of a sufficient window
     return OverflowResult("other", advertised, requested)
 
 

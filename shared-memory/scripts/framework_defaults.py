@@ -16,7 +16,7 @@ from types import MappingProxyType
 FRAMEWORK_DEFAULTS = MappingProxyType({
 
     # ── env-default rows — EMBEDDER_URL, RERANKER_URL, LLM_DEFAULT_TARGET,
-    # LLM_BACKENDS and the embed/slack knobs take their fallback from this table;
+    # LLM_BACKENDS and the embed knobs take their fallback from this table;
     # EMBED_MAX_CHARS is derived instead (see its note) ──────────────────────
 
     "EMBEDDER_URL": MappingProxyType({
@@ -105,13 +105,6 @@ FRAMEWORK_DEFAULTS = MappingProxyType({
             "EMBED_CHARS_PER_TOKEN; 24570 is that formula at the shipped defaults. "
             "The module never reads this table entry."
         ),
-    }),
-    "OVERFLOW_TOKEN_SLACK": MappingProxyType({
-        "default": 16,
-        "kind": "env-default",
-        "idiom": "get",
-        "consumers": ("encoder_window.py (OVERFLOW_TOKEN_SLACK)",),
-        "note": "Token slack allowed above context window during overflow snap loop.",
     }),
 
 
