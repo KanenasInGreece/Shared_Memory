@@ -4,8 +4,8 @@ name: shared-memory
 services:
 #---------- STORAGE LAYER ---------
   neo4j:
-    # Pinned exact. 5.26.31 escapes query-log unicode (CVE-2026-1337); Cypher and the store format do not change. Never float back to `neo4j:5-community`.
-    image: neo4j:5.26.31-community
+    # Pinned exact. 5.26.32 carries Jackson 2.22.3 (CVE-2026-89407, CVE-2026-89425, CVE-2026-91776, CVE-2026-91777) and Netty 4.1.138; Cypher and the store format do not change. Never float back to `neo4j:5-community`.
+    image: neo4j:5.26.32-community
     container_name: neo4j-memory
     # Loopback by default. A bare "7474:7474" publishes the corpus on every interface behind only its password. Widen DB_BIND only for a gateway on another host you trust.
     ports:
@@ -47,8 +47,8 @@ services:
       - SYS_CHROOT
 
   postgres:
-    # Pinned exact. pgvector >= 0.8.4 is the HNSW-vacuum floor, and this tag carries the 2026-08-13 PostgreSQL fixes. Never float it back to `pg17`.
-    image: pgvector/pgvector:0.8.6-pg17
+    # Pinned exact. pgvector >= 0.8.4 is the HNSW-vacuum floor, and 0.8.7 fixes the IVFFlat index-build buffer overflow (CVE-2026-103484); this tag carries PostgreSQL 17.11 with the 2026-08-13 fixes. Never float it back to `pg17`.
+    image: pgvector/pgvector:0.8.7-pg17
     container_name: postgres-vector
     ports:
       - "${DB_BIND:-127.0.0.1}:5432:5432"
