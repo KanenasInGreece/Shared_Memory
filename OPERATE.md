@@ -233,22 +233,24 @@ Do not run `shared-memory/scripts/backfill_domain_of.py` before the restarted ga
 
 Stack reconcile is separate and recreates database containers. Ask first. Show `bash shared-memory/scripts/reconcile_stack.sh --dry-run`. Run `bash shared-memory/scripts/reconcile_stack.sh` only on the operator's word.
 
-After a reconcile, restart the gateway. It reconnects on its own, but a registry census that failed while Postgres restarted keeps `/health` at `degraded` until a restart. Expect `ok`, or the `degraded` reason the host already had (a CPU reranker).
+After a reconcile, restart the gateway, although the script says it reconnects on its own. A registry census that failed while Postgres restarted keeps `/health` at `degraded` until a restart; `census recovered` in the log does not clear it.
 
 ```bash
 systemctl --user restart hive-mind-gateway.service
-curl -s http://localhost:8888/health
+curl -s -H "Authorization: Bearer $AGENT_TOKEN" http://localhost:8888/health
 ```
 
-Then, on the operator's word, remove superseded images by explicit tag. The pull also fetches the llama.cpp images of encoders this host does not run. Remove an older `neo4j:*-community` or `pgvector/pgvector:*-pg17` tag, or such a llama.cpp image, only when no container uses it and no other compose file on the host names it.
+Expect `status` `ok`. On `degraded`, read each `dependencies.*.reason`. A `registry` reason `census_failures:N` means Postgres was not ready yet; restart again.
+
+Then, on the operator's word, free disk by explicit tag. Keep every image `docker ps -a` lists, the pins in `shared-memory/ops/postgres_neo4j_limits.yaml`, and any image another project on the host uses. Remove the older `neo4j` and `pgvector/pgvector` tags. A llama.cpp tag whose encoders all run at 0 replicas here may go too; a reconcile that finds drift pulls it again. When a pull moves a floating llama.cpp tag this host runs, the previous image is left untagged and the `docker images` lines below do not show it. `docker images -f dangling=true` lists it; remove it by id. `docker rmi` refuses an image a container still uses.
 
 ```bash
 docker ps -a --format '{{.Image}}' | sort -u
 docker images neo4j; docker images pgvector/pgvector; docker images ghcr.io/ggml-org/llama.cpp
-docker rmi <superseded-tag> ...
+docker rmi <tag> ...
 ```
 
-Do not run `docker system prune`, `docker image prune -a`, or `docker builder prune`. They delete images another project on the host needs but has no container for right now.
+Do not run `docker image prune -a` or `docker system prune -a`: they delete images another project needs but has no container for right now. Do not run `docker system prune`: it deletes every stopped container on the host.
 
 If a constitution snippet's version marker moved after sync, propose the new block. Do not overwrite it silently.
 

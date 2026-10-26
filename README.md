@@ -904,7 +904,8 @@ passing on the test hosts and the Main workstation ([§23](#23-testing)). The la
   instructions, and the defects that surfaced were fixed in the versions that followed.
   The update path does not move the containers by design: when a release moves an image pin,
   `reconcile_stack.sh` shows the drift and, on your say-so, pulls the pinned images, recreates the
-  containers and updates the pgvector extension.
+  containers and updates the pgvector extension. Then restart the gateway and remove the superseded
+  images, as `OPERATE.md` describes.
 - **Uninstall** (`uninstall_framework.sh --level service|data|all`) is tiered, and `--level` is
   required because the safe default for an irreversible operation is to say what you mean.
   `service` stops the gateway and removes the agents' skill directories, touching no data — and is
