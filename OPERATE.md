@@ -233,6 +233,23 @@ Do not run `shared-memory/scripts/backfill_domain_of.py` before the restarted ga
 
 Stack reconcile is separate and recreates database containers. Ask first. Show `bash shared-memory/scripts/reconcile_stack.sh --dry-run`. Run `bash shared-memory/scripts/reconcile_stack.sh` only on the operator's word.
 
+After a reconcile, restart the gateway. It reconnects on its own, but a registry census that failed while Postgres restarted keeps `/health` at `degraded` until a restart. Expect `ok`, or the `degraded` reason the host already had (a CPU reranker).
+
+```bash
+systemctl --user restart hive-mind-gateway.service
+curl -s http://localhost:8888/health
+```
+
+Then, on the operator's word, remove superseded images by explicit tag. The pull also fetches the llama.cpp images of encoders this host does not run. Remove an older `neo4j:*-community` or `pgvector/pgvector:*-pg17` tag, or such a llama.cpp image, only when no container uses it and no other compose file on the host names it.
+
+```bash
+docker ps -a --format '{{.Image}}' | sort -u
+docker images neo4j; docker images pgvector/pgvector; docker images ghcr.io/ggml-org/llama.cpp
+docker rmi <superseded-tag> ...
+```
+
+Do not run `docker system prune`, `docker image prune -a`, or `docker builder prune`. They delete images another project on the host needs but has no container for right now.
+
 If a constitution snippet's version marker moved after sync, propose the new block. Do not overwrite it silently.
 
 ## Start, stop, backup

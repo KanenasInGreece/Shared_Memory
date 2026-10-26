@@ -298,8 +298,8 @@ converting them.
 
 Neither path above recreates the store containers when a release moves a compose image pin
 (pgvector, neo4j). `bash shared-memory/scripts/reconcile_stack.sh --dry-run` shows the drift, and
-`bash shared-memory/scripts/reconcile_stack.sh` closes it, only once you confirm — see AGENTS.md's
-*Reconcile the stack to the shipped pins* runbook.
+`bash shared-memory/scripts/reconcile_stack.sh` closes it, only once you confirm. Then restart
+the gateway and remove the superseded images, as `OPERATE.md` *Upgrade (gateway host)* describes.
 
 ---
 
