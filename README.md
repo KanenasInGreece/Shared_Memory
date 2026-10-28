@@ -246,16 +246,19 @@ torch 2.11 with native XPU support, no IPEX). Pass **`--device /dev/dri` *and*
 pass that directory and without it oneCCL cannot enumerate the GPU and the engine never starts; add
 `-e CCL_ZE_IPC_EXCHANGE=sockets` alongside it. Note also that `--gpu-memory-utilization` behaves as a
 **ceiling, not a reservation**, for a pooling model — there is no KV cache to fill, so 0.3 and 0.6
-produced an identical footprint. **It is still checked at start:** vLLM refuses to start an engine
-unless that fraction of the whole card is free at that moment, so on the 12 GB B580 the reranker at
-0.6 needed 7.2 GB free and at 0.3 needs 3.6 GB. Both encoders now run at 0.3. Measured: the reranker
-at 0.3 served the maximum-size rerank in the same time as at 0.6, and restarted cleanly beside the
-desktop and a 3.6 GB speech-to-text model sharing the card, which at 0.6 it could not have done. Set
-it low if the card is shared. With **more than one Intel card** in the host, each engine also opens
-the others — measured, about 2 GB of host RAM pinned per engine through the second card. Set
-`ZE_ENABLE_PCI_ID_DEVICE_ORDER=1` and `ZE_AFFINITY_MASK` to the B580's index in PCI bus order to keep
-each engine on the one card; passing only that card's `/dev/dri` nodes does not work, because oneCCL
-needs every device listed under `/dev/dri/by-path`.
+produced a footprint within the same 2.05–2.45 GiB band. **It is still checked at start:** vLLM
+refuses to start an engine unless the card's total memory times that value is free at that moment.
+On the B580 (11.93 GiB) that is 7.16 GiB at 0.6 and 3.58 GiB at 0.3, so both encoders ship at 0.3.
+Measured at 0.3: the maximum-size rerank took 3.17–3.19 s median against 3.21 s at 0.6 in the same
+session (the 2.5 s in the table above is an earlier run), VRAM stayed flat across 40 of them with
+nothing moving to host memory, and the reranker restarted with a 3.6 GB speech-to-text model resident
+on the card — 6.3 GiB free, enough for 0.3 and short of the 7.16 GiB that 0.6 requires. Set it low if
+the card is shared. **Two Intel GPUs in one host:** unmasked, each engine also held 191 MiB of device
+memory and 1.8–2.1 GiB of GTT (host memory mapped for the GPU) on the other card. Keep the whole
+`/dev/dri` and `by-path` mounts, set `ZE_ENABLE_PCI_ID_DEVICE_ORDER=1` and `ZE_AFFINITY_MASK` to the
+B580's index among the Intel GPUs in PCI bus order, and recreate both services; that left the other
+card empty. Passing only the B580's `/dev/dri` nodes instead failed in oneCCL
+(`ze_fd_manager fill_device_fds`). A one-card host sets neither variable.
 
 ⚠ **Per-card, not per-vendor.** Measured on the Arc B580 (12 GB), the card that serves both
 encoders on the Main workstation. This is not a general "Arc" answer, and it does nothing for an
