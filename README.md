@@ -246,7 +246,16 @@ torch 2.11 with native XPU support, no IPEX). Pass **`--device /dev/dri` *and*
 pass that directory and without it oneCCL cannot enumerate the GPU and the engine never starts; add
 `-e CCL_ZE_IPC_EXCHANGE=sockets` alongside it. Note also that `--gpu-memory-utilization` behaves as a
 **ceiling, not a reservation**, for a pooling model — there is no KV cache to fill, so 0.3 and 0.6
-produced an identical footprint. Set it low if the card is shared; it will not be claimed.
+produced an identical footprint. **It is still checked at start:** vLLM refuses to start an engine
+unless that fraction of the whole card is free at that moment, so on the 12 GB B580 the reranker at
+0.6 needed 7.2 GB free and at 0.3 needs 3.6 GB. Both encoders now run at 0.3. Measured: the reranker
+at 0.3 served the maximum-size rerank in the same time as at 0.6, and restarted cleanly beside the
+desktop and a 3.6 GB speech-to-text model sharing the card, which at 0.6 it could not have done. Set
+it low if the card is shared. With **more than one Intel card** in the host, each engine also opens
+the others — measured, about 2 GB of host RAM pinned per engine through the second card. Set
+`ZE_ENABLE_PCI_ID_DEVICE_ORDER=1` and `ZE_AFFINITY_MASK` to the B580's index in PCI bus order to keep
+each engine on the one card; passing only that card's `/dev/dri` nodes does not work, because oneCCL
+needs every device listed under `/dev/dri/by-path`.
 
 ⚠ **Per-card, not per-vendor.** Measured on the Arc B580 (12 GB), the card that serves both
 encoders on the Main workstation. This is not a general "Arc" answer, and it does nothing for an

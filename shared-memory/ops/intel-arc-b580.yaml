@@ -5,6 +5,9 @@
 #   GPU_VIDEO_GID=$(stat -c %g /dev/dri/card0)
 #   B580_EMBED_MODEL_DIR=/path/to/bge-m3
 #   B580_RERANK_MODEL_DIR=/path/to/bge-reranker-v2-m3
+# More than one Intel card in the host: each engine also opens the others (measured: ~2 GB of host RAM pinned per engine
+# through the second card). Add ZE_ENABLE_PCI_ID_DEVICE_ORDER: "1" and ZE_AFFINITY_MASK: "<the B580's index in PCI bus order>"
+# to both services' environment.
 
 name: shared-memory-b580
 
@@ -75,9 +78,10 @@ services:
       - bge-reranker-v2-m3
       - --runner
       - pooling
-      # Ceiling, not a reservation. A pooling model has no KV cache to fill.
+      # Ceiling, not a reservation: a pooling model has no KV cache to fill. vLLM still refuses to start unless this
+      # fraction of the card is free at that moment, so 0.3 needs 3.6 GB free on a 12 GB card where 0.6 needed 7.2 GB.
       - --gpu-memory-utilization
-      - "0.6"
+      - "0.3"
       - --max-model-len
       - "8192"
       - --host
