@@ -64,3 +64,8 @@ def test_b580_file_is_vllm_with_the_shim_and_the_default_is_not(tmp_path):
         assert got[0]["host_ip"] == "127.0.0.1"
         assert got[0]["published"] == published
         assert got[0]["target"] == target
+    # vLLM refuses to start an engine unless total x this value is free; at 0.6 the reranker cannot
+    # restart once another tenant holds about half the card, so both encoders ship at 0.3.
+    for name in ("b580-embed", "b580-rerank"):
+        cmd = doc["services"][name]["command"]
+        assert cmd[cmd.index("--gpu-memory-utilization") + 1] == "0.3"

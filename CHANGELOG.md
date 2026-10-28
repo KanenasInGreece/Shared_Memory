@@ -7,6 +7,8 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+- **Arc B580 encoders: the reranker ships at `--gpu-memory-utilization 0.3`** (was 0.6; the embedder was already 0.3) in `shared-memory/ops/intel-arc-b580.yaml`. For a pooling model the flag does not set how much VRAM the engine holds; it sets vLLM's start-up check that the card's total times this value is free. On the B580 (11.93 GiB) that is 7.16 GiB at 0.6 and 3.58 GiB at 0.3. Measured: the maximum-size rerank took 3.17–3.19 s median at 0.3 against 3.21 s at 0.6, VRAM stayed flat across 40 of them with nothing moving to host memory, and the reranker restarted with a 3.6 GB speech-to-text model resident (6.3 GiB free: enough for 0.3, short of 0.6). README and the compose file now say this, and what to set with two Intel GPUs in one host, where each unmasked engine also held 191 MiB of device memory and 1.8–2.1 GiB of GTT on the other card. A test now pins 0.3 on both encoders. To apply: `docker compose -f shared-memory/ops/intel-arc-b580.yaml up -d --no-deps b580-rerank` (a plain restart keeps the old command).
+
 ## [1.0.37] - 2026-10-25
 
 Fix round, batch G: the embed overflow band and the update's credential report. `API_VERSION` stays 4. Restart the gateway. Update the skills for the version.
