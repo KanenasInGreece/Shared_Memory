@@ -33,6 +33,7 @@ from secure_env import (
     load_split_env, get_secret, require_db_credentials, read_daemon_token_from_fd,
     require_llm_backends_json_parses, pg_dsn,
 )
+import request_sizing
 
 
 # ── Environment ───────────────────────────────────────────────────────────────
@@ -164,13 +165,8 @@ def _nrem_is_queuing(conn) -> bool:
 # 0.6 because Gemma degrades when colder; set REM_TEMPERATURE=0.1 for Qwen. DREAM_TEMPERATURE sets both daemons, and the request overrides the LM Studio preset.
 REM_TEMPERATURE = float(os.environ.get("REM_TEMPERATURE", os.environ.get("DREAM_TEMPERATURE", "0.6")))
 
-# finish_reason='length' fails the unit: a truncated summary is never repaired, stored, or passed downstream.
-REM_MAX_TOKENS_SOLO        = int(os.environ.get("REM_MAX_TOKENS_SOLO", "1500"))
-REM_MAX_TOKENS_PER_FACT    = int(os.environ.get("REM_MAX_TOKENS_PER_FACT", "400"))
-REM_MAX_TOKENS_PER_SUMMARY = int(os.environ.get("REM_MAX_TOKENS_PER_SUMMARY", "250"))
-
-# Honest truncation: widen max_tokens once and retry; a repetition loop retries at the same bound (fact:1329).
-REM_TRUNCATION_RETRY_FACTOR = float(os.environ.get("REM_TRUNCATION_RETRY_FACTOR", "2.0"))
+# finish_reason='length' fails the unit: a truncated summary is never repaired, stored, or passed downstream. Its bounds live in request_sizing.
+request_sizing.validate_rem()
 
 # Truncated body excerpt for logs only; never persisted.
 REM_TRUNCATION_SPECIMEN_CHARS = int(os.environ.get("REM_TRUNCATION_SPECIMEN_CHARS", "500"))
@@ -877,25 +873,25 @@ class REMDaemon:
                             prompt_chars=len(prompt))
             return resp_json, model, None, False
 
-        resp_json, model, failure, degenerate = await _attempt(REM_MAX_TOKENS_SOLO)
+        first_bound = request_sizing.rem_solo_max_tokens()
+        resp_json, model, failure, degenerate = await _attempt(first_bound)
 
         # An honest truncation widens the bound once; a repetition loop retries at the same bound, because a larger budget only feeds the loop (fact:1329/1330).
         # Either way a second truncation fails the unit.
         if failure == LLM_FAIL_TRUNCATED:
+            retry_bound = request_sizing.rem_retry_bound(first_bound, degenerate=degenerate)
             if degenerate:
-                retry_bound = REM_MAX_TOKENS_SOLO
                 logger.warning(
                     "REM: pg_id=%s solo enrichment TRUNCATED (degenerate) at "
                     "max_tokens=%d — retrying ONCE at the SAME bound before "
                     "failing the unit",
-                    pg_id, REM_MAX_TOKENS_SOLO,
+                    pg_id, first_bound,
                 )
             else:
-                retry_bound = int(REM_MAX_TOKENS_SOLO * REM_TRUNCATION_RETRY_FACTOR)
                 logger.warning(
                     "REM: pg_id=%s solo enrichment TRUNCATED at max_tokens=%d — "
                     "retrying ONCE at %d before failing the unit",
-                    pg_id, REM_MAX_TOKENS_SOLO, retry_bound,
+                    pg_id, first_bound, retry_bound,
                 )
             resp_json, model, failure, degenerate = await _attempt(retry_bound)
             if failure == LLM_FAIL_TRUNCATED:
@@ -985,8 +981,7 @@ class REMDaemon:
         require_summary = set(idx_to_pg)
         prompt = self._build_batch_prompt(sent)
         # Budget scales with count: one JSONL line plus summary allowance per fact sent.
-        _max_tokens = (REM_MAX_TOKENS_PER_FACT * len(sent)
-                       + REM_MAX_TOKENS_PER_SUMMARY * len(sent))
+        _max_tokens = request_sizing.rem_batch_max_tokens(len(sent))
         _ceiling = adaptive_ceiling(len(prompt), units=len(sent))
         _start = time.monotonic()
         model = "local-model"

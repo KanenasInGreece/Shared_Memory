@@ -372,8 +372,8 @@ def hidden_credentials(unit_query: UnitQuery, token_env_names: "list[str] | set[
 HIDDEN_CREDENTIAL_NOTE = (
     "note: {names} {verb} supplied by the gateway's systemd unit (a credential directive or a secret "
     "Environment= value), which this check cannot see, so the backend that needs it looks uncredentialed here. "
-    "The running gateway reads it from the unit; the full /health (with a bearer token where auth is on) "
-    "shows the fleet it serves under dependencies.llm_pool."
+    "The running gateway reads it from the unit; the authenticated /memory/telemetry "
+    "shows the gateway's own roster, with has_credential per backend, under config.llm_backends."
 )
 
 

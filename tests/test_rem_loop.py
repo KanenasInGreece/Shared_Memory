@@ -619,9 +619,10 @@ async def test_llm_process_solo_truncated_fails_unit_no_repair(monkeypatch):
 
     assert result is None
     parse.assert_not_called()
-    from rem_loop import REM_MAX_TOKENS_SOLO, REM_TRUNCATION_RETRY_FACTOR
-    assert bounds == [REM_MAX_TOKENS_SOLO,
-                      int(REM_MAX_TOKENS_SOLO * REM_TRUNCATION_RETRY_FACTOR)]
+    import request_sizing
+    first = request_sizing.rem_solo_max_tokens()
+    assert bounds == [first,
+                      request_sizing.rem_retry_bound(first, degenerate=False)]
     assert daemon._last_llm_failure == rem_mod.LLM_FAIL_TRUNCATED
 
 
@@ -791,8 +792,8 @@ async def test_llm_process_batch_max_tokens_scales_per_fact_and_summary(monkeypa
     """Batch bound = (REM_MAX_TOKENS_PER_FACT + REM_MAX_TOKENS_PER_SUMMARY) × the
     facts actually SENT — a fact under the threshold is asked for nothing and
     never sent, so it buys no budget."""
-    from rem_loop import (REM_MAX_TOKENS_PER_FACT, REM_MAX_TOKENS_PER_SUMMARY,
-                          REM_SUMMARY_THRESHOLD)
+    from rem_loop import REM_SUMMARY_THRESHOLD
+    import request_sizing
     daemon, _ = _make_daemon()
     monkeypatch.delenv("MOCK_LLM", raising=False)
     items = [{"pg_id": 1, "content": "short"},
@@ -810,7 +811,7 @@ async def test_llm_process_batch_max_tokens_scales_per_fact_and_summary(monkeypa
     monkeypatch.setattr("httpx.AsyncClient.post", _fake_post)
 
     await daemon._llm_process_batch(items)
-    assert captured["max_tokens"] == REM_MAX_TOKENS_PER_FACT * 1 + REM_MAX_TOKENS_PER_SUMMARY * 1
+    assert captured["max_tokens"] == request_sizing.rem_batch_max_tokens(1)
 
 
 def test_parse_jsonl_batch_truncated_drops_final_line_and_is_strict_only():
