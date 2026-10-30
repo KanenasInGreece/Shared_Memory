@@ -7,6 +7,22 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.0.39] - 2026-10-30
+
+Fix round, batch H: one module, `request_sizing.py`, now decides how large every reasoning request is. No behaviour change. `API_VERSION` stays 4. Restart the gateway. Update the skills for the version.
+
+### Changed
+- **`shared-memory/scripts/request_sizing.py` is the one place that sizes a reasoning request** (the operator's 2026-10-23 instruction; the next step, backend-aware sizing, is fact:2983). It owns the REM solo bound, its retry rule (an honest truncation widens once by `REM_TRUNCATION_RETRY_FACTOR`; a repetition loop retries at the same bound), the REM batch budget, the NREM insight bounds and the cut on each judgement body before the insight prompt, and the gateway's fit estimate (request bytes ÷ `LLM_CHARS_PER_TOKEN_RATIO`, the caller's `max_tokens` or `FIT_DEFAULT_OUTPUT_TOKENS`, `n_ctx × (1 − FIT_MARGIN)`). `rem_loop.py`, `consolidation_loop.py` and `hive_mind_proxy.py` call it instead of keeping their own copies. Every variable keeps its name, default and parse, and every value is the same. Each process still refuses to start on a malformed value it reads, and only on those (the gateway on the fit values, REM on its bounds, NREM on its own). Prompt text that is still sent whole (full record text, decision titles, the previous insight, reversal lines) is listed in the module as the next thing to bring there.
+- **Monitor:** none. No telemetry key, type or `/health` field changed, and log lines keep their wording.
+
+### Removed
+- `NREM_MAX_TOKENS_SUMMARY`. It was never read (the thematic fold makes no LLM call), so an install that set it is unaffected. Removed from `consolidation_loop.py` and `.env.example`.
+
+### Fixed
+- The hidden-credential note (v1.0.38) pointed at `/health` `dependencies.llm_pool` for the fleet the gateway serves; that field is only a state and a reason. It now points at the authenticated `/memory/telemetry` `config.llm_backends`, where `has_credential` per backend lives since 0.9.90.
+- Docs for the v1.0.38 change (register fact:3324): `.env.example` says `update_framework.sh` reads `GATEWAY_UNIT`, `GATEWAY_URL` and `GATEWAY_RESTART_CMD` from the shell, not from that file; `shared-memory/ops/README.md` says when the note appears, that `migrate_env.py` prints it too, and how Phase B sees a backend whose token comes through `LoadCredential=`.
+- The [1.0.38] entry said that if busctl is missing or fails, the note never appears. Not quite: a secret `Environment=` value on the unit can still produce it, and a property older systemd lacks counts as empty rather than failing the query.
+
 ## [1.0.38] - 2026-10-30
 
 Fix round, batch G2: the update checks now ask systemd which credentials the gateway's unit holds, and they name a hidden credential as the cause only when it is the one the fleet needs. This release also carries the 2026-10-30 dependency sweep and the B580 reranker setting. `API_VERSION` stays 4. Restart the gateway. Update the skills for the version.

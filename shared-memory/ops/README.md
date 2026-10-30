@@ -405,7 +405,17 @@ without ever booting it. Two phases:
   printed, Phase B unavailable, exit 2" rather than a raw traceback. On success, renders one line
   per configured LLM backend (url — credential-scrubbed, weight, model, roles, `n_ctx`,
   `has_credential`, `private_ok` effective + explicit) and then calls the gateway's OWN startup
-  guard functions (never re-implementing their predicates) to say whether it would actually boot.
+  guard functions (never re-implementing their predicates) to say whether
+  it would actually boot. A `token_env` delivered through `LoadCredential=`
+  cannot be resolved in this process, so a backend that needs it is excluded
+  from the Phase B roster here; when that empties the fleet, the rows shown
+  are the legacy fallback. Trust the authenticated `/memory/telemetry`
+  (`config.llm_backends[].has_credential`) for what the gateway process
+  resolved. The note covers only a whole-fleet fallback, not one credentialed
+  backend dropped from a larger fleet. On that fallback Phase B asks
+  `systemctl --user`, and `busctl --user` when present: no note when the
+  `systemctl` query fails; without `busctl`, credential-directive ids are not
+  seen, but a secret `Environment=` value still produces the note.
 
 ```bash
 # Phase A only — plain python3, no third-party packages needed at all:
@@ -432,7 +442,7 @@ exit **0** (the gateway genuinely does boot, just not on the fleet you declared)
 meaning for exit 1. Exit 2 is reserved for a shape the loader's own try/except does not catch (e.g.
 a JSON array of bare strings instead of objects).
 
-When every entry is excluded and the gateway's unit supplies a backend's `token_env`, a note naming that variable follows the line.
+When every entry is excluded, and a `token_env` this check cannot resolve is one the gateway's unit supplies (a credential directive or a secret `Environment=` value), a note naming that variable follows the line. `migrate_env.py` prints the same note during an update. The gateway's own roster, with `has_credential` per backend, is on the authenticated `/memory/telemetry` under `config.llm_backends`.
 
 ⛔ **Not wired into `preflight.sh`.** preflight's exit contract is 0/1 (hard requirements only) and
 it deliberately runs before `shared-memory/.env` is expected to exist — this script's 0/1/2

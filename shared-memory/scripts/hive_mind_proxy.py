@@ -48,6 +48,7 @@ except ImportError:  # pragma: no cover -- defensive against a log_hygiene refac
         pass
 
 load_split_env()
+import request_sizing
 
 from coordinator import (
     MemoryCoordinator,
@@ -535,6 +536,7 @@ def _apply_backend_body_overrides(body: bytes, model: "str | None",
         if not isinstance(payload, dict):
             return body
     if extra:
+        # A backend's extra_body may still override max_tokens after the fit check (see request_sizing).
         payload.update(extra)
     if model and "model" in payload:
         payload["model"] = model
@@ -548,13 +550,8 @@ LLM_HTTP_FAIL_THRESHOLD = max(1, int(os.environ.get("LLM_HTTP_FAIL_THRESHOLD", "
 LLM_FAIL_WINDOW = float(os.environ.get("LLM_FAIL_WINDOW", "60"))
 LLM_COOLDOWN = float(os.environ.get("LLM_COOLDOWN", "300"))
 
-# Fit uses chars/CHARS_PER_TOKEN_RATIO (measured floor 1.2) plus FIT_MARGIN; never under-count prompt tokens.
-CHARS_PER_TOKEN_RATIO = float(os.environ.get("LLM_CHARS_PER_TOKEN_RATIO", "1.2"))
-# Eligible iff est_prompt_tokens + effective_max_tokens <= n_ctx * (1 - FIT_MARGIN).
-FIT_MARGIN = float(os.environ.get("FIT_MARGIN", "0.10"))
-# fact:1338: unmeasured output budget when the caller sends no max_tokens, not a live measurement.
-# decision:1330: REM_MAX_TOKENS_* is the measured ceiling for dream traffic; this is only the estimator fallback.
-FIT_DEFAULT_OUTPUT_TOKENS = int(os.environ.get("FIT_DEFAULT_OUTPUT_TOKENS", "2048"))
+# Sizing and fit validation: request_sizing decides request size before routing.
+request_sizing.validate_fit()
 # At max_inflight the backend counts as busy. Wait for an eligible one instead of widening eligibility or picking over cap, and bound the wait so a saturated backend still fails.
 LLM_MAX_INFLIGHT_WAIT_S = float(os.environ.get("LLM_MAX_INFLIGHT_WAIT_S", "120"))
 # decision:1357: floor of 0.05s. A configured 0 would busy-spin the event loop for the whole wait.
@@ -712,16 +709,6 @@ def _affinity_key(body: bytes) -> str | None:
     return _affinity_key_from_obj(_parse_json_body(body))
 
 
-def _extract_effective_max_tokens(body_obj: "dict | None") -> float:
-    """Return positive max_tokens from `body_obj`, or FIT_DEFAULT_OUTPUT_TOKENS.
-    Used as read-only headroom for fit checks and never written back."""
-    if isinstance(body_obj, dict):
-        mt = body_obj.get("max_tokens")
-        if isinstance(mt, (int, float)) and mt > 0:
-            return float(mt)
-    return float(FIT_DEFAULT_OUTPUT_TOKENS)
-
-
 def _serves_all(url: str) -> bool:
     """Return True if backend has no explicit roles and has private_ok enabled."""
     return LLM_BACKEND_ROLES.get(url) is None and LLM_BACKEND_PRIVATE_OK.get(url, False)
@@ -741,9 +728,7 @@ def _fits(url: str, est_prompt_tokens: float, effective_max_tokens: float) -> bo
     """Return True if total tokens fit within backend n_ctx with FIT_MARGIN headroom.
     Undeclared n_ctx always fits."""
     n_ctx = LLM_BACKEND_NCTX.get(url)
-    if not n_ctx:
-        return True
-    return (est_prompt_tokens + effective_max_tokens) <= n_ctx * (1 - FIT_MARGIN)
+    return request_sizing.fits(n_ctx, est_prompt_tokens, effective_max_tokens)
 
 
 def _eligible_backends(role: str, est_prompt_tokens: float = 0.0,
@@ -1301,9 +1286,8 @@ class AsyncHiveMindProxy:
         body_obj = _parse_json_body(llm_body)
         role = steer_headers.get("X-SM-LLM-Role", "").strip().lower()
         affinity_key = _affinity_key_from_obj(body_obj)
-        est_prompt_tokens = (len(llm_body) / CHARS_PER_TOKEN_RATIO
-                             if CHARS_PER_TOKEN_RATIO > 0 else 0.0)
-        effective_max_tokens = _extract_effective_max_tokens(body_obj)
+        est_prompt_tokens = request_sizing.estimate_prompt_tokens(len(llm_body))
+        effective_max_tokens = request_sizing.effective_max_tokens(body_obj)
 
         # Eligibility is a hard pre-filter, before affinity, health, cooldown, reservation, or cap. Empty is a 422 with no inflight slot taken, and it must not widen.
         if role and role not in ROUTING_ROLE_NAMES:

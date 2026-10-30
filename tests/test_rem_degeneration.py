@@ -31,11 +31,10 @@ sys.path.insert(0, os.path.dirname(__file__))   # tests/ itself, for test_rem_lo
 # over — patch.object(rem_mod, ...) here would then silently patch the wrong
 # instance and never take effect.
 from test_rem_loop import rem_mod, _make_daemon, _length_resp, _ok_resp
+import request_sizing
 
 truncation_is_degenerate = rem_mod.truncation_is_degenerate
 _truncation_specimen = rem_mod._truncation_specimen
-REM_MAX_TOKENS_SOLO = rem_mod.REM_MAX_TOKENS_SOLO
-REM_TRUNCATION_RETRY_FACTOR = rem_mod.REM_TRUNCATION_RETRY_FACTOR
 REM_TRUNCATION_SPECIMEN_CHARS = rem_mod.REM_TRUNCATION_SPECIMEN_CHARS
 
 # Only a record OVER the summary threshold reaches an LLM call at all
@@ -148,7 +147,8 @@ async def test_degenerate_truncation_retries_at_the_same_bound(monkeypatch):
         result, _model = await daemon._llm_process(
             _LONG, rem_mod.KIND_FACT, pg_id=1)
 
-    assert bounds == [REM_MAX_TOKENS_SOLO, REM_MAX_TOKENS_SOLO]
+    expected_first = request_sizing.rem_solo_max_tokens()
+    assert bounds == [expected_first, expected_first]
     assert result == {"summary": "complete", "relationships": []}
     # N3: only the final SUCCESSFUL body reaches the parser — the truncated,
     # degenerate first attempt's body never does.
@@ -174,8 +174,9 @@ async def test_honest_truncation_still_gets_the_widened_retry(monkeypatch):
     result, _model = await daemon._llm_process(
         _LONG, rem_mod.KIND_FACT, pg_id=1)
 
-    assert bounds == [REM_MAX_TOKENS_SOLO,
-                      int(REM_MAX_TOKENS_SOLO * REM_TRUNCATION_RETRY_FACTOR)]
+    expected_first = request_sizing.rem_solo_max_tokens()
+    expected_retry = request_sizing.rem_retry_bound(expected_first, degenerate=False)
+    assert bounds == [expected_first, expected_retry]
     assert result == {"summary": "complete", "relationships": []}
 
 

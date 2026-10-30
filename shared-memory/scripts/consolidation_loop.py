@@ -34,6 +34,7 @@ from secure_env import (
     load_split_env, get_secret, require_db_credentials, read_daemon_token_from_fd,
     require_llm_backends_json_parses, pg_dsn,
 )
+import request_sizing
 
 # The gateway no longer copies os.environ into this daemon, so credentials load from the framework .env here.
 load_split_env()
@@ -68,22 +69,14 @@ NREM_ELIGIBILITY_RECHECK_SEC = int(os.environ.get("NREM_ELIGIBILITY_RECHECK_SEC"
 # Probe the LLM pool this often. The idle clock must see REM holding the slot, or quiet-time is measured while the pool is busy.
 NREM_POOL_PROBE_SEC = int(os.environ.get("NREM_POOL_PROBE_SEC", "15"))
 
-# A truncated draft is never stored. 8192 stays above the growing previous-insight floor after 2048 stalled the busiest cluster (decision:1205); NREM_MAX_TOKENS_SUMMARY is unread because the thematic fold makes no LLM call.
-NREM_MAX_TOKENS_SUMMARY = int(os.environ.get("NREM_MAX_TOKENS_SUMMARY", "8192"))
-NREM_MAX_TOKENS_INSIGHT = int(os.environ.get("NREM_MAX_TOKENS_INSIGHT", "8192"))
-
-# Widen a truncated bound once before failing the fold, so a longer narrative is not dead-lettered by the default.
-NREM_TRUNCATION_RETRY_FACTOR = float(
-    os.environ.get("NREM_TRUNCATION_RETRY_FACTOR", "2.0"))
+# A truncated insight draft is never stored; its output bounds and their reasons live in request_sizing.nrem_insight_bounds (decision:1205). The thematic fold makes no LLM call.
+request_sizing.validate_nrem()
 
 # After one SLOT/PRINCIPLE call, a still-empty slot gets one hardcoded retry for only the missing slots (decision:1205).
 
 # Skip a cluster after this many truncation, slot, or embed failures in the window.
 NREM_FOLD_FAIL_WINDOW = int(os.environ.get("NREM_FOLD_FAIL_WINDOW", "7"))   # days
 NREM_FOLD_FAIL_CAP    = int(os.environ.get("NREM_FOLD_FAIL_CAP", "3"))
-# Cap each judgement body (decision text after the title line, or the full retrospective) before the insight prompt (decision:1205).
-NREM_INSIGHT_SLOT_INPUT_CHARS = int(
-    os.environ.get("NREM_INSIGHT_SLOT_INPUT_CHARS", "2000"))
 
 # Wait this long for a free LLM slot. 1800s outlasts a ~1000s REM unit; a 300s queue expired mid-generation and NREM deferred forever.
 NREM_FORCED_SLOT_WAIT = float(os.environ.get("NREM_FORCED_SLOT_WAIT", "1800"))
@@ -759,16 +752,17 @@ def _neutralize_marker_lines(text):
     )
 
 
-def _insight_slot_items(rows):
+def _insight_slot_items(rows, max_chars):
     """Pure — the per-judgement (pg_id, type, title, body) input to the
     insight-slot LLM call (decision:1205). ``rows`` is `_fold_insight`'s own
-    fetch shape: (pg_id, content, project, rtype, meta). A decision's
+    fetch shape: (pg_id, content, project, rtype, meta). ``max_chars`` is the
+    character bound for each judgement body. A decision's
     ``title`` is its content's first line, VERBATIM — this is what
     `_assemble_insight_content` renders (never capped, never dependent on
     the LLM); the BODY fed to the LLM (decision: content minus that title
     line; retrospective: the full notes — retrospectives have no title) is
     marker-neutralized (`_neutralize_marker_lines`, CQR-01) THEN capped to
-    NREM_INSIGHT_SLOT_INPUT_CHARS (head of the text) so one oversized
+    max_chars (head of the text) so one oversized
     judgement cannot blow out the prompt on its own."""
     items = []
     for pg_id, content, _project, rtype, _meta in rows:
@@ -784,7 +778,7 @@ def _insight_slot_items(rows):
             "pg_id": int(pg_id),
             "type": rtype,
             "title": title,
-            "body": _neutralize_marker_lines(body)[:NREM_INSIGHT_SLOT_INPUT_CHARS],
+            "body": _neutralize_marker_lines(body)[:max_chars],
         })
     return items
 
@@ -2610,7 +2604,7 @@ class ConsolidationDaemon:
             return None
         return None
 
-    # The thematic fold no longer calls an LLM, so NREM_MAX_TOKENS_SUMMARY is defined but unread. decision:1205: insight text is assembled from bounded distillates, not written whole by the LLM.
+    # The thematic fold makes no LLM call. decision:1205: insight text is assembled from bounded distillates, not written whole by the LLM.
 
     async def _call_insight_llm(self, prompt, entity, units, items=None,
                                 only_ids=None, need_principle=True):
@@ -2643,8 +2637,7 @@ class ConsolidationDaemon:
                 lines.append(f"PRINCIPLE: Mocked principle for {entity} "
                              f"over {len(selected)} judgement(s).")
             return "\n".join(lines)
-        bounds = [NREM_MAX_TOKENS_INSIGHT,
-                  int(NREM_MAX_TOKENS_INSIGHT * NREM_TRUNCATION_RETRY_FACTOR)]
+        bounds = request_sizing.nrem_insight_bounds()
         _ceiling = adaptive_ceiling(len(prompt), units=units, max_tokens=bounds[-1])
         try:
             async with httpx.AsyncClient(timeout=_ceiling, trust_env=False) as client:
@@ -2713,7 +2706,7 @@ class ConsolidationDaemon:
         meta), ascending pg_id."""
         self._last_llm_truncated = False
         self._last_llm_missing_slots = False
-        items = _insight_slot_items(rows)
+        items = _insight_slot_items(rows, request_sizing.nrem_insight_item_chars())
         expected_ids = {it["pg_id"] for it in items}
 
         # MOCK_LLM is handled only inside _call_insight_llm, so a mocked cycle still runs this parser and the one retry.

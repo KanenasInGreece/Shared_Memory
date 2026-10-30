@@ -22,6 +22,7 @@ import pytest
 from yarl import URL
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "shared-memory", "scripts"))
+import request_sizing
 
 
 def _fresh(monkeypatch):
@@ -324,7 +325,7 @@ def test_r5_fit_422_names_the_estimate(monkeypatch):
     # concrete VALUES, not mere presence: est = body_chars / 1.2, and the
     # caller's own max_tokens
     assert body["effective_max_tokens"] == 64
-    assert body["est_prompt_tokens"] == int(len(huge) / g.CHARS_PER_TOKEN_RATIO)
+    assert body["est_prompt_tokens"] == int(request_sizing.estimate_prompt_tokens(len(huge)))
     assert body["est_prompt_tokens"] > 100   # sanity: bigger than n_ctx
 
 

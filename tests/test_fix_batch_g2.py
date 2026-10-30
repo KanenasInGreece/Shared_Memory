@@ -420,16 +420,16 @@ def test_t9_hidden_credential_note_exact_wording():
     expected = (
         "note: A is supplied by the gateway's systemd unit (a credential directive or a secret "
         "Environment= value), which this check cannot see, so the backend that needs it looks "
-        "uncredentialed here. The running gateway reads it from the unit; the full /health "
-        "(with a bearer token where auth is on) shows the fleet it serves under dependencies.llm_pool."
+        "uncredentialed here. The running gateway reads it from the unit; the authenticated /memory/telemetry "
+        "shows the gateway's own roster, with has_credential per backend, under config.llm_backends."
     )
     assert m.HIDDEN_CREDENTIAL_NOTE.format(names="A", verb="is") == expected
     assert m.format_hidden_credential_note(["A"]) == expected
     expected_multi = (
         "note: A, B are supplied by the gateway's systemd unit (a credential directive or a secret "
         "Environment= value), which this check cannot see, so the backend that needs it looks "
-        "uncredentialed here. The running gateway reads it from the unit; the full /health "
-        "(with a bearer token where auth is on) shows the fleet it serves under dependencies.llm_pool."
+        "uncredentialed here. The running gateway reads it from the unit; the authenticated /memory/telemetry "
+        "shows the gateway's own roster, with has_credential per backend, under config.llm_backends."
     )
     assert m.format_hidden_credential_note(["A", "B"]) == expected_multi
     assert m.extract_token_env_names(json.dumps([{"token_env": "A"}, {"token_env": "B"}])) == ["A", "B"]
