@@ -31,6 +31,7 @@ SCRIPT_PATH = os.path.join(
 def _run(args=(), env_overrides=None, tmp_path=None, python_flags=(), timeout=30):
     env = dict(os.environ)
     env.setdefault("SECURE_ENV_FILE", "")
+    env["GATEWAY_UNIT"] = "sm-test-nonexistent-gateway.service"
     if tmp_path is not None:
         env["CREDENTIAL_AUDIT_LOG_PATH"] = str(tmp_path / "credential-audit.jsonl")
         env["CAPACITY_LOG_PATH"] = str(tmp_path / "capacity-derivations.jsonl")

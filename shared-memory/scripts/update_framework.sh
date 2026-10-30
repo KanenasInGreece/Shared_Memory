@@ -34,6 +34,8 @@ ENV_FILE="$REPO_ROOT/shared-memory/.env"
 
 GATEWAY_URL="${GATEWAY_URL:-http://localhost:8888}"
 GATEWAY_UNIT="${GATEWAY_UNIT:-hive-mind-gateway.service}"
+# Exported so migrate_env.py and check_config.py query the same unit as the restart.
+export GATEWAY_UNIT
 # systemd --user is the default because that is what install_service.sh sets up. Override this instead of editing the script when the gateway is supervised some other way.
 GATEWAY_RESTART_CMD="${GATEWAY_RESTART_CMD:-systemctl --user restart $GATEWAY_UNIT}"
 
