@@ -6,6 +6,7 @@ Phase A is stdlib-only (survives a coordinator import crash). Phase B needs daem
 import argparse
 import importlib.util
 import json
+import logging
 import math
 import os
 import sys
@@ -347,6 +348,13 @@ def _w4_census_lines(proxy) -> "list[str]":
     return lines
 
 
+class _DropNoBackendError(logging.Filter):
+    # Only the gateway's own "no usable backend" ERROR is dropped; the reason
+    # is printed in check_config's own line. Keep per-backend token_env warnings.
+    def filter(self, record):
+        return not record.getMessage().startswith("LLM_BACKENDS_JSON produced no usable backend")
+
+
 def phase_b_render() -> "tuple[list[str], int]":
     """Returns (lines, exit_code). Never raises: a daemon-side import
     failure (bad encoder URL, a malformed LLM_BACKENDS_JSON entry shape, or
@@ -355,6 +363,9 @@ def phase_b_render() -> "tuple[list[str], int]":
     never the raw exception message unless its type is on the safe
     allowlist."""
     lines: list[str] = []
+    proxy_filter = _DropNoBackendError()
+    proxy_logger = logging.getLogger("hive-proxy")
+    proxy_logger.addFilter(proxy_filter)
     try:
         import hive_mind_proxy as proxy  # noqa: PLC0415
     except Exception as exc:
@@ -362,6 +373,8 @@ def phase_b_render() -> "tuple[list[str], int]":
         lines.append("== Phase B — backends ==")
         lines.append("UNAVAILABLE — import failed: " + _render_exception(exc, _PHASE_B_EXCEPTION_HINT))
         return lines, 2
+    finally:
+        proxy_logger.removeFilter(proxy_filter)
 
     lines.append("")
     lines.append("== Phase B — backends ==")
@@ -371,6 +384,17 @@ def phase_b_render() -> "tuple[list[str], int]":
     if fallback_reason:
         lines.append("⚠ DECLARED FLEET NOT USABLE — the gateway would boot on the "
                      "legacy fallback: " + scrub_url_credentials(str(fallback_reason)))
+        try:
+            import migrate_env  # noqa: PLC0415
+            token_env_names = migrate_env.extract_token_env_names(os.environ.get("LLM_BACKENDS_JSON"))
+            unseen = [name for name in token_env_names if not secure_env.get_secret(name)]
+            unit_name = os.environ.get("GATEWAY_UNIT") or migrate_env.DEFAULT_GATEWAY_UNIT
+            unit_q = migrate_env.query_gateway_unit(unit_name)
+            hidden = migrate_env.hidden_credentials(unit_q, unseen)
+            if hidden:
+                lines.append("  " + migrate_env.format_hidden_credential_note(hidden))
+        except Exception:
+            pass
         lines.append("")
 
     # Nothing was declared, as opposed to a declared fleet that was excluded above. The two warnings are mutually exclusive.

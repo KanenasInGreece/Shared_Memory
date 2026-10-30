@@ -51,6 +51,7 @@ def test_phase_a_renders_all_four_encoder_window_rows(monkeypatch):
 
 def test_phase_b_renders_encoder_window_note_never_refusal(monkeypatch):
     monkeypatch.setenv("SECURE_ENV_FILE", "")
+    monkeypatch.setenv("GATEWAY_UNIT", "sm-test-nonexistent-gateway.service")
     # Emulate short advertised window in encoder_window cache
     import encoder_window
     encoder_window._window_cache["embedder"] = {

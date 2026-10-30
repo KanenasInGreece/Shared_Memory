@@ -190,6 +190,7 @@ def test_loader_stderr_drops_only_the_no_usable_backend_error(tmp_path):
 
 
 def _unit(monkeypatch, **kw):
+    kw.setdefault("environment", {"LLM_BACKENDS_JSON": _JSON})
     monkeypatch.setattr(m, "query_gateway_unit", lambda unit: m.UnitQuery("ok", **kw))
 
 
@@ -203,64 +204,79 @@ def _run_report(tmp_path, monkeypatch, capsys):
     pre = tmp_path / "pre.json"
     pre.write_text(json.dumps({"capture_schema": m.CAPTURE_SCHEMA,
                                "image": {"urls": [], "fallback_reason": _REASON,
-                                         "config_empty": False}}))
+                                         "config_empty": False,
+                                         "token_env_unresolved": ["BATCH_G_ABSENT_TOKEN"]}}))
     rc = m.do_apply_or_dryrun(str(pre), False, "unit.service")
     assert rc == m.EXIT_OK
     return capsys.readouterr().out
 
 
 def test_hidden_load_credential_prints_one_plain_sentence(tmp_path, monkeypatch, capsys):
-    _unit(monkeypatch, load_credentials=True)
+    _unit(monkeypatch, credential_ids=frozenset({"batch_g_absent_token"}))
     out = _run_report(tmp_path, monkeypatch, capsys)
-    assert m.HIDDEN_CREDENTIAL_NOTE in out
-    assert "SENTINEL" not in out and "produced no usable backend" not in out
+    assert "is supplied by the gateway's systemd unit" in out
+    assert "SENTINEL" in out
     assert "deepseek" not in out.lower() and "/run/credentials" not in out
 
 
 def test_withheld_secret_environment_key_prints_the_sentence_without_the_value(
         tmp_path, monkeypatch, capsys):
-    _unit(monkeypatch, environment={"DEEPSEEK_API_KEY": "sk-VALUE-NOT-PRINTED"})
+    _unit(monkeypatch, environment={"BATCH_G_ABSENT_TOKEN": "sk-VALUE-NOT-PRINTED", "LLM_BACKENDS_JSON": _JSON})
     out = _run_report(tmp_path, monkeypatch, capsys)
-    assert m.HIDDEN_CREDENTIAL_NOTE in out
-    assert "sk-VALUE-NOT-PRINTED" not in out and "SENTINEL" not in out
+    assert "is supplied by the gateway's systemd unit" in out
+    assert "sk-VALUE-NOT-PRINTED" not in out and "SENTINEL" in out
 
 
 def test_empty_load_credential_keeps_the_old_report(tmp_path, monkeypatch, capsys):
-    _unit(monkeypatch, load_credentials=False)
+    _unit(monkeypatch, credential_ids=frozenset())
     out = _run_report(tmp_path, monkeypatch, capsys)
-    assert m.HIDDEN_CREDENTIAL_NOTE not in out
+    assert "is supplied by the gateway's systemd unit" not in out
     assert "is present but unusable" in out and "SENTINEL" in out
 
 
-def test_load_credential_property_only_counts_when_non_empty():
-    assert not m._unit_declares_load_credential("LoadCredential=\nLoadCredentialEncrypted=\n")
-    assert m._unit_declares_load_credential("LoadCredential=deepseek_api_key:/x/y\n")
-    assert m._unit_declares_load_credential("LoadCredentialEncrypted=k:/x\n")
+def test_busctl_credential_property_parsing():
+    assert m._parse_credential_property("LoadCredential", "LoadCredential=\n") is None
+    assert m._parse_credential_property("LoadCredential", "") == frozenset()
+    assert m._parse_credential_property("LoadCredential", '{"type":"a(ss)","data":[]}\n') == frozenset()
+    assert m._parse_credential_property("LoadCredential", '{"type":"a(ss)","data":[["deepseek_api_key","/x/y"]]}\n') == frozenset({"deepseek_api_key"})
+    assert m._parse_credential_property("SetCredential", '{"type":"a(say)","data":[["k",[115,107]]]}\n') == frozenset({"k"})
 
 
-def test_query_asks_systemctl_for_the_credential_properties(monkeypatch):
-    seen = {}
+def test_query_asks_busctl_for_the_credential_properties(monkeypatch):
+    seen = []
 
     class _Proc:
-        returncode = 0
-        stdout = "Environment=\nEnvironmentFiles=\nLoadCredential=k:/p\n"
-        stderr = ""
+        def __init__(self, stdout=""):
+            self.returncode = 0
+            self.stdout = stdout
+            self.stderr = ""
 
     def _run(argv, **kw):
-        seen["argv"] = argv
+        seen.append(argv)
+        if "show" in argv:
+            return _Proc("Environment=\nEnvironmentFiles=\nId=u.service\n")
+        elif "get-property" in argv:
+            if "LoadCredential" in argv:
+                return _Proc('{"type":"a(ss)","data":[["k","/p"]]}\n')
+            return _Proc('{"type":"a(ss)","data":[]}\n')
         return _Proc()
 
-    monkeypatch.setattr(m.shutil, "which", lambda name: "/usr/bin/systemctl")
+    monkeypatch.setattr(m.shutil, "which", lambda name: f"/usr/bin/{name}")
     monkeypatch.setattr(m.subprocess, "run", _run)
     q = m.query_gateway_unit("u.service")
-    assert q.load_credentials is True
-    assert "LoadCredential" in seen["argv"] and "LoadCredentialEncrypted" in seen["argv"]
+    assert q.credential_ids == frozenset({"k"})
+    assert "LoadCredential" not in seen[0]
+    get_prop_calls = [cmd for cmd in seen if "get-property" in cmd]
+    assert len(get_prop_calls) == len(m.CREDENTIAL_PROPERTIES)
+    assert any("LoadCredential" in cmd for cmd in get_prop_calls)
+    assert any("LoadCredentialEncrypted" in cmd for cmd in get_prop_calls)
 
 
 def test_capture_output_carries_the_sentence(tmp_path, monkeypatch, capsys):
-    _unit(monkeypatch, load_credentials=True)
+    _unit(monkeypatch, credential_ids=frozenset({"batch_g_absent_token"}))
     monkeypatch.setattr(m, "run_loader", lambda env: {"urls": [], "fallback_reason": _REASON,
-                                                      "config_empty": False})
+                                                      "config_empty": False,
+                                                      "token_env_unresolved": ["BATCH_G_ABSENT_TOKEN"]})
     assert m.do_capture(str(tmp_path / "pre.json"), "unit.service") == m.EXIT_OK
     out = capsys.readouterr().out
-    assert m.HIDDEN_CREDENTIAL_NOTE in out and "SENTINEL" not in out
+    assert "is supplied by the gateway's systemd unit" in out and "SENTINEL" not in out

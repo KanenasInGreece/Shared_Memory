@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """One-time migration of implicit LLM routing (CSV / default target) to explicit LLM_BACKENDS_JSON without changing what serves today (decision:1846).
 
-Standalone: no other module in this repo imports this one. Two top-level
+check_config.py's phase_b_render imports it for the unit credential query. Two top-level
 modes:
 
     migrate_env.py --capture-preimage <out.json>      # capture only
@@ -40,6 +40,7 @@ persists: every URL rendered anywhere routes through
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import ipaddress
 import json
 import os
@@ -108,14 +109,13 @@ class UnitQuery:
 
     def __init__(self, status: str, owned_keys: "set[str]" = frozenset(),
                  environment: "dict[str, str]" = None, error: str = None,
-                 load_credentials: bool = False):
+                 credential_ids: "frozenset[str]" = frozenset()):
         self.status = status
         self.owned_keys = owned_keys
         self.environment = environment or {}
         self.error = error
-        # True when the unit declares LoadCredential= / LoadCredentialEncrypted=
-        # (never the ids, paths or values).
-        self.load_credentials = load_credentials
+        # Credential ids and globs declared by the unit (never values or paths).
+        self.credential_ids = credential_ids
 
 
 class _EnvironmentParseError(Exception):
@@ -198,14 +198,78 @@ def _read_env_file_key_names(path: str) -> "set[str]":
     return names
 
 
-def _unit_declares_load_credential(raw: str) -> bool:
-    """True only when a LoadCredential= / LoadCredentialEncrypted= line carries a
-    value: systemctl prints the property name even when it is empty."""
-    for line in raw.splitlines():
-        for prefix in ("LoadCredential=", "LoadCredentialEncrypted="):
-            if line.startswith(prefix) and line[len(prefix):].strip():
-                return True
-    return False
+CREDENTIAL_PROPERTIES = (
+    "LoadCredential",
+    "LoadCredentialEncrypted",
+    "SetCredential",
+    "SetCredentialEncrypted",
+    "ImportCredential",
+    "ImportCredentialEx",
+)
+
+
+def _unit_object_path(unit: str) -> str:
+    """systemd bus-label escape for unit name under /org/freedesktop/systemd1/unit/."""
+    raw_bytes = unit.encode("utf-8")
+    out = ["/org/freedesktop/systemd1/unit/"]
+    for i, b in enumerate(raw_bytes):
+        is_alpha = (ord(b"a") <= b <= ord(b"z")) or (ord(b"A") <= b <= ord(b"Z"))
+        is_digit = ord(b"0") <= b <= ord(b"9")
+        if is_alpha or (is_digit and i > 0):
+            out.append(chr(b))
+        else:
+            out.append(f"_{b:02x}")
+    return "".join(out)
+
+
+def _parse_credential_property(prop: str, stdout: str) -> "frozenset[str] | None":
+    """Parses credential ids and globs from one busctl get-property JSON line.
+    Returns frozenset of ids/globs, or None if unparseable/unexpected shape."""
+    line = stdout.strip()
+    if not line:
+        return frozenset()
+    ids = set()
+    try:
+        obj = json.loads(line)
+        if not isinstance(obj, dict) or "type" not in obj or "data" not in obj:
+            return None
+        t = obj["type"]
+        data = obj["data"]
+        if not isinstance(t, str) or not isinstance(data, list):
+            return None
+        if t == "a(ss)":
+            for item in data:
+                if not isinstance(item, (list, tuple)) or len(item) < 2:
+                    return None
+                if not isinstance(item[0], str) or not isinstance(item[1], str):
+                    return None
+                if prop == "ImportCredentialEx":
+                    # ImportCredentialEx: when item[1] is non-empty, rename replaces prefix.
+                    # Add rename + "*" if glob ends with "*", else rename. When item[1] is empty, add item[0].
+                    if item[1]:
+                        ids.add(item[1] + "*" if item[0].endswith("*") else item[1])
+                    else:
+                        ids.add(item[0])
+                else:
+                    ids.add(item[0])
+        elif t == "a(say)":
+            for item in data:
+                if not isinstance(item, (list, tuple)) or len(item) < 2:
+                    return None
+                if not isinstance(item[0], str):
+                    return None
+                # the payload bytes (item[1]) are never copied or printed
+                ids.add(item[0])
+        elif t == "as":
+            for item in data:
+                if not isinstance(item, str):
+                    return None
+                ids.add(item)
+        else:
+            return None
+    except Exception:
+        return None
+    return frozenset(ids)
 
 
 def query_gateway_unit(gateway_unit: str) -> UnitQuery:
@@ -215,8 +279,7 @@ def query_gateway_unit(gateway_unit: str) -> UnitQuery:
     try:
         proc = subprocess.run(
             [systemctl, "--user", "show", gateway_unit, "-p", "Environment",
-             "-p", "EnvironmentFiles", "-p", "LoadCredential",
-             "-p", "LoadCredentialEncrypted"],
+             "-p", "EnvironmentFiles", "-p", "Id"],
             capture_output=True, text=True, timeout=10,
         )
     except Exception as exc:
@@ -236,34 +299,114 @@ def query_gateway_unit(gateway_unit: str) -> UnitQuery:
             return UnitQuery(
                 "query_failed",
                 error=f"EnvironmentFile {path!r} unreadable ({type(exc).__name__})")
+
+    unit_id = None
+    for line in proc.stdout.splitlines():
+        line = line.strip()
+        if line.startswith("Id="):
+            val = line[3:].strip()
+            if val:
+                unit_id = val
+            break
+
+    credential_ids: frozenset[str] = frozenset()
+    busctl = shutil.which("busctl")
+    if busctl is not None and unit_id:
+        # An unknown answer gives the old report, never the note.
+        collected_ids: set[str] = set()
+        query_ok = True
+        unit_path = _unit_object_path(unit_id)
+        for prop in CREDENTIAL_PROPERTIES:
+            try:
+                b_proc = subprocess.run(
+                    [busctl, "--user", "--json=short", "get-property",
+                     "org.freedesktop.systemd1", unit_path,
+                     "org.freedesktop.systemd1.Service", prop],
+                    capture_output=True, text=True, timeout=10,
+                )
+                if b_proc.returncode == 0:
+                    parsed = _parse_credential_property(prop, b_proc.stdout)
+                    if parsed is None:
+                        query_ok = False
+                        break
+                    collected_ids |= parsed
+                elif "Unknown" in (b_proc.stderr or ""):
+                    # Directive unsupported on older systemd (<257); treat as empty and continue.
+                    continue
+                else:
+                    query_ok = False
+                    break
+            except Exception:
+                query_ok = False
+                break
+        if query_ok:
+            credential_ids = frozenset(collected_ids)
     return UnitQuery("ok", owned_keys=owned, environment=environment,
-                     load_credentials=_unit_declares_load_credential(proc.stdout))
+                     credential_ids=credential_ids)
 
 
-def hidden_credentials(unit_query: UnitQuery) -> bool:
-    """True when the unit supplies a credential this check's child cannot see:
-    a non-empty LoadCredential=, or a secret Environment= key that
-    build_faithful_env withheld."""
+def _unit_supplies_token(name: str, unit_query: UnitQuery) -> bool:
+    """Matches the lowercased name, as secure_env._credentials_directory_secret reads $CREDENTIALS_DIRECTORY, against credential ids/globs or secret unit Environment keys."""
+    name_lower = name.lower()
+    for cid in unit_query.credential_ids:
+        if name_lower == cid or fnmatch.fnmatchcase(name_lower, cid):
+            return True
+    if name in unit_query.environment and secure_env.is_secret_key(name):
+        return True
+    return False
+
+
+def hidden_credentials(unit_query: UnitQuery, token_env_names: "list[str] | set[str]") -> list[str]:
+    """Returns, sorted, the token_env names among unresolved token_env_names that
+    the unit supplies. Status not 'ok' -> []."""
     if unit_query.status != "ok":
-        return False
-    return unit_query.load_credentials or any(
-        secure_env.is_secret_key(k) for k in unit_query.environment)
+        return []
+    hidden = [name for name in set(token_env_names) if _unit_supplies_token(name, unit_query)]
+    return sorted(hidden)
 
 
-# One plain sentence in this script's words, used instead of the loader's
-# fallback_reason when a hidden credential is the likely cause. A PARTIAL
-# exclusion (one credentialed backend dropped from a larger fleet) sets neither
+# One plain sentence in this script's words, printed after the fallback
+# report when a hidden credential is the likely cause. A PARTIAL exclusion
+# (one credentialed backend dropped from a larger fleet) sets neither
 # fallback_reason nor has_token=False, so this image cannot show it.
 HIDDEN_CREDENTIAL_NOTE = (
-    "a credential supplied through LoadCredential= or a secret Environment= value "
-    "is not visible to this check, so it sees the provider backend as uncredentialed; "
-    "the running gateway is unaffected and nothing was changed.")
+    "note: {names} {verb} supplied by the gateway's systemd unit (a credential directive or a secret "
+    "Environment= value), which this check cannot see, so the backend that needs it looks uncredentialed here. "
+    "The running gateway reads it from the unit; the full /health (with a bearer token where auth is on) "
+    "shows the fleet it serves under dependencies.llm_pool."
+)
 
 
-def _hidden_credential_line(unit_query: UnitQuery, image: "dict | None") -> "str | None":
-    if image and image.get("fallback_reason") and hidden_credentials(unit_query):
-        return HIDDEN_CREDENTIAL_NOTE
-    return None
+def extract_token_env_names(raw_json_text: "str | None") -> list[str]:
+    """Extracts non-empty token_env strings from raw LLM_BACKENDS_JSON text."""
+    if not raw_json_text:
+        return []
+    entries = _load_raw_backend_entries(raw_json_text)
+    if entries is None:
+        return []
+    names = []
+    for e in entries:
+        token_env = e.get("token_env")
+        if isinstance(token_env, str) and token_env.strip():
+            names.append(token_env.strip())
+    return names
+
+
+def format_hidden_credential_note(hidden: list[str]) -> str:
+    """Formats the note explaining that hidden credentials are supplied by the gateway's systemd unit."""
+    names_str = ", ".join(hidden)
+    verb = "is" if len(hidden) == 1 else "are"
+    return HIDDEN_CREDENTIAL_NOTE.format(names=names_str, verb=verb)
+
+
+def _hidden_credential_line(unit_query: UnitQuery, image: "dict | None",
+                            token_env_names: "list[str] | set[str]") -> "str | None":
+    if not image or not image.get("fallback_reason"):
+        return None
+    hidden = hidden_credentials(unit_query, token_env_names)
+    if not hidden:
+        return None
+    return format_hidden_credential_note(hidden)
 
 
 # PATH, HOME, and the unit's own declarations only. The operator shell is excluded so the image matches systemd.
@@ -288,7 +431,7 @@ def build_faithful_env(unit_query: UnitQuery) -> "dict[str, str]":
 # Fresh subprocess per image. The gateway loader runs once at import and writes module globals, so it cannot run in-process.
 
 _LOADER_SNIPPET = """
-import json, logging, sys
+import json, logging, os, sys
 sys.path.insert(0, {here!r})
 
 
@@ -315,6 +458,23 @@ def _guard(fn):
     except SystemExit as e:
         return {{"raised": True, "message": str(e)}}
 
+unresolved = []
+try:
+    raw_backends = os.environ.get("LLM_BACKENDS_JSON")
+    if raw_backends:
+        parsed_backends = json.loads(raw_backends)
+        if isinstance(parsed_backends, list):
+            for entry in parsed_backends:
+                if isinstance(entry, dict):
+                    t_env = entry.get("token_env")
+                    if isinstance(t_env, str) and t_env.strip():
+                        t_name = t_env.strip()
+                        if not secure_env.get_secret(t_name):
+                            unresolved.append(t_name)
+    unresolved = sorted(set(unresolved))
+except Exception:
+    unresolved = []
+
 env_path = secure_env._select_env_file()
 image = {{
     "urls": list(proxy.LLM_BACKENDS),
@@ -330,6 +490,7 @@ image = {{
     "fallback_reason": proxy.LLM_POOL_FALLBACK_REASON,
     "config_empty": proxy.LLM_POOL_CONFIG_EMPTY,
     "default_target": proxy.DEFAULT_TARGET,
+    "token_env_unresolved": unresolved,
     "env_file": (str(env_path) if env_path else None),
     "guard_routing": _guard(proxy.require_valid_llm_routing_config),
     "guard_auth": _guard(proxy.require_auth_when_provider_keys_configured),
@@ -953,9 +1114,10 @@ def do_capture(out_path: str, gateway_unit: str) -> int:
     _report(lines, f"captured pre-image: {len(image.get('urls', []))} backend(s), "
                     f"config_empty={image.get('config_empty')}, "
                     f"fallback={'yes' if image.get('fallback_reason') else 'no'} -> {out_path}")
-    hidden = _hidden_credential_line(unit_query, image)
+    unresolved = image.get("token_env_unresolved") or []
+    hidden = _hidden_credential_line(unit_query, image, unresolved)
     if hidden:
-        _report(lines, f"note: {hidden}")
+        _report(lines, hidden)
     print("\n".join(lines))
     return EXIT_OK
 
@@ -1090,14 +1252,14 @@ def do_apply_or_dryrun(preimage_path: "str | None", apply: bool, gateway_unit: s
                         "faces the same 'no backend declared' outcome W4 will apply — "
                         "see GET /health.")
     elif case == CASE_JSON_UNUSABLE:
-        hidden = _hidden_credential_line(unit_query, pre_image)
+        _report(lines, f"LLM_BACKENDS_JSON is present but unusable — "
+                        f"{_scrub(pre_image.get('fallback_reason') or '')}. Touching "
+                        f"nothing (JSON key, CSV key, and the pool half all left as-is).")
+        # An older pre-image lacking token_env_unresolved yields [] and no note (safe direction).
+        unresolved = (pre_image.get("token_env_unresolved") or []) if pre_image else []
+        hidden = _hidden_credential_line(unit_query, pre_image, unresolved)
         if hidden:
-            _report(lines, f"LLM_BACKENDS_JSON could not be fully checked — {hidden} Touching "
-                            f"nothing (JSON key, CSV key, and the pool half all left as-is).")
-        else:
-            _report(lines, f"LLM_BACKENDS_JSON is present but unusable — "
-                            f"{_scrub(pre_image.get('fallback_reason') or '')}. Touching "
-                            f"nothing (JSON key, CSV key, and the pool half all left as-is).")
+            _report(lines, hidden)
     elif case == CASE_JSON_USABLE:
         if not boundary_open:
             _report(lines, "LLM_BACKENDS_JSON already reflects the CURRENT loader "

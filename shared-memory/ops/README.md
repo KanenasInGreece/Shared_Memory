@@ -432,6 +432,8 @@ exit **0** (the gateway genuinely does boot, just not on the fleet you declared)
 meaning for exit 1. Exit 2 is reserved for a shape the loader's own try/except does not catch (e.g.
 a JSON array of bare strings instead of objects).
 
+When every entry is excluded and the gateway's unit supplies a backend's `token_env`, a note naming that variable follows the line.
+
 ⛔ **Not wired into `preflight.sh`.** preflight's exit contract is 0/1 (hard requirements only) and
 it deliberately runs before `shared-memory/.env` is expected to exist — this script's 0/1/2
 contract is different on purpose, and it has nothing useful to say that early. Run it any time after
