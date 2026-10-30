@@ -713,17 +713,25 @@ def test_s_isreg_guard_isolated_via_mocked_fstat(monkeypatch, tmp_path):
     return None via a DIFFERENT branch even without the type check). A REAL
     regular file, well under the cap, WOULD read fine and return its content
     if S_ISREG were removed — mock os.fstat to report a non-regular mode on
-    the same fd so only that one guard is exercised."""
+    the same fd so only that one guard is exercised. The fake is a full
+    os.stat_result with only st_mode changed, so any other caller of the
+    patched os.fstat still gets every field."""
     f = tmp_path / "small_secret_but_wrong_type"
     f.write_text("should-never-surface")
 
-    import types
+    _EXTRA = (
+        "st_atime", "st_mtime", "st_ctime",
+        "st_atime_ns", "st_mtime_ns", "st_ctime_ns",
+        "st_blksize", "st_blocks", "st_rdev",
+        "st_flags", "st_gen", "st_birthtime",
+    )
     real_fstat = os.fstat
 
     def _fake_fstat(fd):
         st = real_fstat(fd)
         fake_mode = stat.S_IFCHR | stat.S_IMODE(st.st_mode)
-        return types.SimpleNamespace(st_mode=fake_mode)
+        extra = {name: getattr(st, name) for name in _EXTRA if hasattr(st, name)}
+        return os.stat_result((fake_mode,) + tuple(st)[1:], extra)
 
     monkeypatch.setattr(os, "fstat", _fake_fstat)
 
