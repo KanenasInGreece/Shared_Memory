@@ -4,9 +4,8 @@ DESIGN section; Local_Documentation/ROUTING_UNIT2_BUILDER_BRIEF.md).
 
 Covers the three things Unit 2 adds on top of Unit 1's gateway:
 
-1. Every dream LLM call site sends the ONE new header, `X-SM-LLM-Role`, with
-   the role the plan's taxonomy assigns it (R-1: {extract, judge} —
-   `summarize` is RESERVED and never sent).
+1. No dream LLM call sends `X-SM-LLM-Role`. The gateway strips that header
+   if a client still sends one (`tests/test_llm_steering_headers.py`).
 2. Each daemon RECOGNIZES the gateway's two structured routing refusals (422
    `no_eligible_backend` / 503 `backend_at_capacity`, both stamped
    `X-SM-Fault-Origin: gateway`) and skips the unit WITHOUT charging any
@@ -98,7 +97,8 @@ _ROUTING_MODULES = [rem_mod, cl]
 @pytest.mark.parametrize("mod", _ROUTING_MODULES, ids=["rem_loop", "consolidation_loop"])
 def test_routing_refusal_recognizes_no_eligible_backend(mod):
     refusal = mod._routing_refusal(_RefusalResp())
-    assert refusal == {"error": "no_eligible_backend", "constraint": "role", "role": "extract"}
+    assert refusal == {"error": "no_eligible_backend", "constraint": "role"}
+    assert "role" not in refusal
 
 
 class _RefusalRespWithDeclaration(_RefusalResp):
@@ -113,16 +113,13 @@ class _RefusalRespWithDeclaration(_RefusalResp):
 @pytest.mark.parametrize("mod", _ROUTING_MODULES, ids=["rem_loop", "consolidation_loop"])
 @pytest.mark.parametrize("declaration", ["none", "no_role_less_opt_in"])
 def test_routing_refusal_ignores_the_additive_declaration_key(mod, declaration):
-    """§5 (Ruling C(α)/E(α2)): both daemons' _routing_refusal() build their
-    return value from an explicit three-key dict literal
-    (`{"error": ..., "constraint": ..., "role": ...}`) — an ADDITIVE
-    `declaration` key on the gateway's 422 body must never surface in the
-    daemon's own parsed refusal, by construction. MUTATION TARGET: were
-    either daemon to instead do `dict(body)` or otherwise pass the raw
-    body through, this test would start seeing a 4th key."""
+    """The parsed refusal is exactly error and constraint. An additive
+    `declaration` key, and the old `role` key, stay out. A raw `dict(body)`
+    would surface both."""
     refusal = mod._routing_refusal(_RefusalRespWithDeclaration(declaration=declaration))
-    assert refusal == {"error": "no_eligible_backend", "constraint": "role", "role": "extract"}
+    assert refusal == {"error": "no_eligible_backend", "constraint": "role"}
     assert "declaration" not in refusal
+    assert "role" not in refusal
 
 
 @pytest.mark.parametrize("mod", _ROUTING_MODULES, ids=["rem_loop", "consolidation_loop"])
@@ -184,7 +181,7 @@ def test_routing_refusal_ignores_unrecognized_gateway_error(mod):
 _REM_LONG = "x" * (rem_mod.REM_SUMMARY_THRESHOLD + 1)
 
 @pytest.mark.asyncio
-async def test_rem_solo_call_sends_extract_role_header(monkeypatch):
+async def test_rem_solo_call_sends_no_role_header(monkeypatch):
     daemon, _ = _make_daemon()
     monkeypatch.delenv("MOCK_LLM", raising=False)
     captured = {}
@@ -193,11 +190,12 @@ async def test_rem_solo_call_sends_extract_role_header(monkeypatch):
         return _ok_resp('{"summary":"s","relationships":[]}')
     monkeypatch.setattr("httpx.AsyncClient.post", _fake_post)
     await daemon._llm_process(_REM_LONG, rem_mod.KIND_FACT, pg_id=1)
-    assert captured["headers"].get("X-SM-LLM-Role") == "extract"
+    assert "headers" in captured
+    assert "X-SM-LLM-Role" not in captured["headers"]
 
 
 @pytest.mark.asyncio
-async def test_rem_batch_call_sends_extract_role_header(monkeypatch):
+async def test_rem_batch_call_sends_no_role_header(monkeypatch):
     daemon, _ = _make_daemon()
     monkeypatch.delenv("MOCK_LLM", raising=False)
     captured = {}
@@ -207,7 +205,8 @@ async def test_rem_batch_call_sends_extract_role_header(monkeypatch):
     monkeypatch.setattr("httpx.AsyncClient.post", _fake_post)
     items = [{"pg_id": 1, "content": _REM_LONG}]
     await daemon._llm_process_batch(items)
-    assert captured["headers"].get("X-SM-LLM-Role") == "extract"
+    assert "headers" in captured
+    assert "X-SM-LLM-Role" not in captured["headers"]
 
 
 # ── 3. rem_loop.py — U2-I1: routing refusal never charges rem_attempts ───────
@@ -328,7 +327,7 @@ async def test_rem_batch_call_wires_prompt_chars(monkeypatch):
 # ── 5. consolidation_loop.py — role header, refusal, no-retry, prompt_chars ──
 
 @pytest.mark.asyncio
-async def test_nrem_insight_call_sends_judge_role_header(monkeypatch):
+async def test_nrem_insight_call_sends_no_role_header(monkeypatch):
     monkeypatch.delenv("MOCK_LLM", raising=False)
     daemon, _ = daemon_with_fake_graph()
     captured = {}
@@ -338,8 +337,9 @@ async def test_nrem_insight_call_sends_judge_role_header(monkeypatch):
     monkeypatch.setattr("httpx.AsyncClient.post", _fake_post)
     rows = [(1, "Decision A\n\nra", "p", "decision", {})]
     slots = await daemon.generate_insight_slots("E", rows)
-    assert captured["headers"].get("X-SM-LLM-Role") == "judge"
     assert slots is not None
+    assert "headers" in captured
+    assert "X-SM-LLM-Role" not in captured["headers"]
 
 
 @pytest.mark.asyncio
@@ -365,10 +365,8 @@ async def test_nrem_insight_routing_refusal_no_retry_no_poison(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_nrem_insight_routing_refusal_logs_constraint_and_role(monkeypatch, caplog):
-    """The distinguishing behaviour a mutation removing the refusal branch
-    would break: the loud, entity-scoped log naming constraint + role. The
-    generic non-200 fallback names only the HTTP status, never these."""
+async def test_nrem_insight_routing_refusal_logs_constraint(monkeypatch, caplog):
+    """The refusal log names the constraint. It does not name a role."""
     monkeypatch.delenv("MOCK_LLM", raising=False)
     daemon, _ = daemon_with_fake_graph()
     async def _fake_post(self, url, **kwargs):
@@ -378,9 +376,11 @@ async def test_nrem_insight_routing_refusal_logs_constraint_and_role(monkeypatch
     with caplog.at_level(logging.WARNING, logger="ConsolidationDaemon"):
         slots = await daemon.generate_insight_slots("E", rows)
     assert slots is None
-    assert any("REFUSED by gateway routing" in r.message and "constraint=fit" in r.message
-              and "role=judge" in r.message
-              for r in caplog.records)
+    assert any(
+        "REFUSED by gateway routing" in r.message and "constraint=fit" in r.message
+        and "role=" not in r.message
+        for r in caplog.records
+    )
 
 
 @pytest.mark.asyncio

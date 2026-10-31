@@ -251,7 +251,7 @@ def _load_gateway_auth_off(monkeypatch):
     registry. Mirrors test_health_anonymous_slimming.py's proven reload
     order — coordinator first, then hive_mind_proxy."""
     monkeypatch.delenv("LLM_BACKENDS_JSON", raising=False)
-    monkeypatch.setenv("LLM_BACKENDS", "http://a:5000")
+    monkeypatch.setenv("LLM_BACKENDS_JSON", "[{\"url\": \"http://a:5000\", \"n_ctx\": 8192, \"max_output_tokens\": 2048}]")
     import secure_env
     secure_env._secrets.pop("AGENT_TOKENS", None)
     monkeypatch.delenv("AGENT_TOKENS", raising=False)

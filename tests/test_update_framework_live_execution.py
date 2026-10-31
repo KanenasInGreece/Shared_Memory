@@ -239,6 +239,10 @@ def _stub_path_env(tmp_path: Path, log_path: Path) -> dict:
     for _leaky in ("GATEWAY_URL", "GATEWAY_UNIT", "GATEWAY_RESTART_CMD"):
         env.pop(_leaky, None)
     env["PATH"] = f"{stub_dir}{os.pathsep}{env.get('PATH', '')}"
+    # install_restart_prevent_dropin writes a real unit drop-in under
+    # XDG_CONFIG_HOME (else ~/.config). These runs execute the live script,
+    # so an unset value lands in the operator's systemd user directory.
+    env["XDG_CONFIG_HOME"] = str(tmp_path / "xdg-config")
     # check_linger()'s PRIMARY instrument is /var/lib/systemd/linger/<user> --
     # a real filesystem path, not something PATH-stubbing can intercept.
     # RULING 3 (this branch) removed the $LINGER_DIR environment seam that

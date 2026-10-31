@@ -19,6 +19,7 @@ import sys
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+pytestmark = pytest.mark.usefixtures("chat_caller_is_consolidation")
 from yarl import URL
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "shared-memory", "scripts"))
@@ -536,7 +537,7 @@ async def test_4_wiring_gateway_fit_greek(monkeypatch):
     secure_env._secrets.pop("AGENT_TOKENS", None)
 
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
-        {"url": "http://a:5000", "n_ctx": 4096, "private_ok": True},
+        {"url": "http://a:5000", "n_ctx": 4096, "private_ok": True, "max_output_tokens": 2048},
     ]))
 
     import coordinator

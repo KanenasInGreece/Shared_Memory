@@ -210,10 +210,10 @@ _ALLOWLIST: list[tuple[str, str]] = [
         "stub their LLM calls.",
     ),
     (
-        "SM_PRE_UPDATE_VERSION",
-        "internal parent-to-child handoff set by update_framework.sh itself "
-        "between its own steps (round 2 ruling) — not operator configuration; "
-        "an operator-set value would be overwritten by the very next update run.",
+        "LLM_STEER_EXTRA_AGENT_NAMES",
+        "the pre-rename steering list. The gateway still reads it for one "
+        "release and warns; a template line would tell an operator to set a "
+        "name that is no longer how framework callers are declared.",
     ),
 ]
 _ALLOWLIST_NAMES = {name for name, _ in _ALLOWLIST}

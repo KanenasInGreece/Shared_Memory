@@ -320,9 +320,8 @@ fi
 if [[ "${llm_yn:-$_llm_yn_default}" =~ ^[Yy]$ ]]; then
   bash "$FRAMEWORK_DIR/ops/install_llm_backends.sh"
 else
-  echo "  Skipped. Until you configure backends, the gateway falls back to"
-  echo "  http://localhost:5000 (LLM_DEFAULT_TARGET). This implicit fallback is"
-  echo "  being retired — configure explicitly with:"
+  echo "  Skipped. The gateway runs with no reasoning until a backend is declared."
+  echo "  Saves and search keep working. Declare one with:"
   echo "    bash shared-memory/ops/install_llm_backends.sh"
 fi
 

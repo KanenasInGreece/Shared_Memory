@@ -359,17 +359,7 @@ the network should learn.
 | `auth_required` | whether `AGENT_TOKENS` is set | authenticated only |
 | `config` | resolved LLM backend roster, pool tuning, affinity config | authenticated only |
 
-⚠ **A fresh, undeclared install now reads `degraded` on `llm_pool`, not `ok`**
-(W2, decision:1832). Before this, a zero-config gateway with something merely
-*serving* the implicit fallback (`LLM_DEFAULT_TARGET`) read
-`ok` — indistinguishable from a deliberately configured fleet. It now reads
-`degraded` with a reason naming exactly that: nothing was declared, and the
-built-in fallback is what answered. This is a deliberate visibility change
-ahead of the fallback's eventual retirement — declare backends explicitly
-(`bash shared-memory/ops/install_llm_backends.sh`) to clear it. The same
-principle applies to `rem_daemon`/`nrem_daemon`: a fleet where no backend
-counts toward a dream slot now reads `degraded` there instead of silently
-never running REM/NREM while both read `ok`.
+A fresh install with no `LLM_BACKENDS_JSON` reads `degraded` on `llm_pool`, reason `no_backend_declared` (decision:1832: `/health` shows that the fleet has no backend). Memory, including Tier 3, keeps working. Declare a backend with `bash shared-memory/ops/install_llm_backends.sh` to clear it. A defined backend with no `n_ctx` or no `max_output_tokens` stops the gateway. `max_output_tokens` is the provider's published limit, or a self-hosted server's context size. Query the URL; if it does not say, ask the operator. Never guess.
 
 The gateway auto-restarts a crashed daemon with exponential backoff; a circuit
 breaker stops after 5 crashes in 10 minutes (restart the gateway to reset). Set

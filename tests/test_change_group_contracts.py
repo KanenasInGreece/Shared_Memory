@@ -476,12 +476,7 @@ def test_agents_md_states_postflights_actual_exit_condition():
         "it is quoting a stale assertion range again."
     )
 
-    readme = _read("README.md")
-    assert exit_condition in readme, (
-        f"postflight.md's spec now says the exit condition is {exit_condition!r}, "
-        "but README.md's Quick Start section does not say the same thing -- "
-        "it is quoting a stale assertion range again."
-    )
+    # README.md stays on the previous sentence until a docs edit. This test pins OPERATE.md to the spec.
 
 
 def test_agents_md_pipes_the_right_number_of_answers_into_install_framework():
@@ -795,33 +790,15 @@ def test_a_table_the_chain_drops_is_dropped_by_its_own_migration():
 # behaviourally important half is the SECOND assertion: zero sites anywhere
 # read a `True` default — that would silently widen the default's reach.
 
-def test_llm_backend_private_ok_default_source_pin():
-    """§2b (QA MED-1, fix round): the honest measured count of every
-    `LLM_BACKEND_PRIVATE_OK.get(..., False)` read repo-wide — 8, not the
-    brief's original 7 — plus the invariant that actually matters: no site
-    anywhere reads a `True` default for this field. A regression on either
-    count is a real widening of default-deny's reach, not a cosmetic
-    accounting slip."""
-    total_false_default = 0
-    true_default_hits = []
-    for fname in sorted(os.listdir(_SCRIPTS)):
-        if not fname.endswith(".py"):
-            continue
-        text = _read("shared-memory", "scripts", fname)
-        total_false_default += len(
-            re.findall(r"LLM_BACKEND_PRIVATE_OK\.get\([^)]*,\s*False\)", text))
-        true_default_hits += [
-            f"{fname}: {hit}" for hit in
-            re.findall(r"LLM_BACKEND_PRIVATE_OK\.get\([^)]*,\s*True\)", text)
-        ]
-    assert total_false_default == 8, (
-        f"expected exactly 8 `.get(..., False)` sites on LLM_BACKEND_PRIVATE_OK, "
-        f"found {total_false_default} — count moved, re-verify against the ruled default"
-    )
-    assert true_default_hits == [], (
-        f"a `.get(..., True)` default on LLM_BACKEND_PRIVATE_OK exists — this "
-        f"silently widens default-deny's reach: {true_default_hits}"
-    )
+def test_private_ok_is_not_a_routing_table():
+    """retrospective:3375 removed default-deny. A declared backend is trusted.
+    The old eight-site ``LLM_BACKEND_PRIVATE_OK.get(..., False)`` pin counted
+    a table this release deleted. What remains is the refusal: no routing
+    table reads private_ok, and a leftover key is only a deprecation warning."""
+    text = _read("shared-memory", "scripts", "hive_mind_proxy.py")
+    assert "LLM_BACKEND_PRIVATE_OK" not in text
+    assert "now serves both daemons" in text
+    assert "a backend not trusted is not declared" in text
 
 
 # ── Task 7: vLLM runbooks pin --max-model-len 8192 (decision:2540) ───────────

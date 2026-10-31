@@ -17,12 +17,10 @@ calls _encoder_routing_log_line() -- so a revert cannot leave a passing dead
 twin (the helper existing and being individually correct, but main() quietly
 reverted to inlining the unscrubbed render again).
 
-M2-partial (fix round, merger ruling) adds ONE parametrized test covering
-the rest of the closed scrub set from H3: the four role_config_errors
-construction sites (_parse_roles, driven via a real LLM_BACKENDS_JSON reload
--- same reload pattern as tests/test_provider_key_startup_refusal.py) and
-the five S-05/M-5/P-5 guard-message renders (two log.warning calls captured
-via caplog, three SystemExit messages captured via pytest.raises).
+One parametrized test covers the journal renders that still name a backend:
+the leftover-key warning (roles and private_ok are ignored), the widening
+warning, and the auth-off provider-key refusal and its override warning.
+Each one must show the scrubbed host and never the query secret.
 """
 import importlib
 import inspect
@@ -71,7 +69,7 @@ def test_line_shape_unchanged_apart_from_scrubbing(monkeypatch):
     line = mod._encoder_routing_log_line()
     assert line.startswith("### /v1/embeddings->")
     assert " | /v1/reranking->" in line
-    assert line.endswith(" | default->LLM pool")
+    assert line.endswith(" | chat->LLM pool")
 
 
 def test_main_actually_calls_the_helper(monkeypatch):
@@ -89,21 +87,9 @@ def test_main_actually_calls_the_helper(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# M2-partial (fix round, merger ruling): no raw userinfo secret in the rest
-# of the closed scrub set -- the four role_config_errors construction sites
-# and the five S-05/M-5/P-5 guard-message renders.
-#
-# SEC A (R-1, 2026-09-02): this fixture originally embedded its SECRET in
-# USERINFO ("https://leakuser:{SECRET}@backend.example.test/v1") -- that
-# shape is now refused/excluded by _load_llm_backends() at parse time,
-# BEFORE roles/token_env/private_ok are ever inspected, so it can no longer
-# reach any of the scenarios below (userinfo-URL coverage for the NEW
-# refusal itself lives in tests/test_llm_backend_secrets.py's SEC-A tests).
-# A query-string credential (R-2, deliberately NOT refused by A) is the
-# fixture that still reaches every one of these later code paths
-# unmodified, keeping this file's actual point -- scrub_url_credentials
-# drops queries exactly like it drops userinfo, so the property under test
-# is unchanged.
+# Query-string credential. Userinfo is a declaration FATAL and never reaches
+# these renders (tests/test_llm_backend_secrets.py). scrub_url_credentials
+# drops the query, so the secret stays out and the host stays in.
 # ---------------------------------------------------------------------------
 
 SECRET = "sm-test-must-never-leak-9f3ac2"
@@ -114,8 +100,7 @@ def _reload_with_backends(monkeypatch, *, agent_tokens="", backends_json=None,
                            allow_unauth=None):
     """Same reload pattern as tests/test_provider_key_startup_refusal.py:
     coordinator first (so AUTH_CONFIGURED_AT_STARTUP reflects the env this
-    call just set), then hive_mind_proxy (so LLM_BACKEND_TOKENS/_LLM_BACKEND_
-    ROLE_CONFIG_ERRORS reflect LLM_BACKENDS_JSON)."""
+    call just set), then hive_mind_proxy (so the pool reflects LLM_BACKENDS_JSON)."""
     import secure_env
     secure_env._secrets.pop("AGENT_TOKENS", None)
     for key in ("AGENT_TOKENS", "LLM_BACKENDS_JSON", "LLM_BACKENDS",
@@ -126,7 +111,7 @@ def _reload_with_backends(monkeypatch, *, agent_tokens="", backends_json=None,
     if backends_json is not None:
         monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps(backends_json))
     else:
-        monkeypatch.setenv("LLM_BACKENDS", "http://a:5000")
+        monkeypatch.setenv("LLM_BACKENDS_JSON", "[{\"url\": \"http://a:5000\", \"n_ctx\": 8192, \"max_output_tokens\": 2048}]")
     if allow_unauth is not None:
         monkeypatch.setenv("ALLOW_UNAUTHENTICATED_PROVIDER_KEYS", allow_unauth)
     import coordinator
@@ -136,19 +121,31 @@ def _reload_with_backends(monkeypatch, *, agent_tokens="", backends_json=None,
     return g
 
 
+def _sized(**extra):
+    entry = {"url": QUERY_CREDENTIAL_URL, "n_ctx": 8192, "max_output_tokens": 2048}
+    entry.update(extra)
+    return [entry]
+
+
 def _role_config_errors_text(monkeypatch, caplog):
-    g = _reload_with_backends(monkeypatch, agent_tokens="claude:tok_abc", backends_json=[
-        {"url": QUERY_CREDENTIAL_URL, "roles": "not-a-list"},
-    ])
-    assert g._LLM_BACKEND_ROLE_CONFIG_ERRORS, "fixture didn't even reach role_config_errors"
-    return " ".join(g._LLM_BACKEND_ROLE_CONFIG_ERRORS)
+    """A leftover roles key is ignored. The load warning names the scrubbed URL."""
+    with caplog.at_level(logging.WARNING, logger="hive-proxy"):
+        g = _reload_with_backends(
+            monkeypatch, agent_tokens="claude:tok_abc",
+            backends_json=_sized(roles="not-a-list"),
+        )
+        g.require_valid_llm_routing_config()
+    assert "ignores leftover key roles" in caplog.text
+    return caplog.text
 
 
 def _s05_warning_text(monkeypatch, caplog):
     monkeypatch.setenv("SM_TEST_TOKEN_S05_WARN", "resolved-token-value")
-    g = _reload_with_backends(monkeypatch, agent_tokens="", backends_json=[
-        {"url": QUERY_CREDENTIAL_URL, "token_env": "SM_TEST_TOKEN_S05_WARN", "private_ok": True},
-    ], allow_unauth="1")
+    g = _reload_with_backends(
+        monkeypatch, agent_tokens="",
+        backends_json=_sized(token_env="SM_TEST_TOKEN_S05_WARN"),
+        allow_unauth="1",
+    )
     with caplog.at_level(logging.WARNING, logger="hive-proxy"):
         g.require_auth_when_provider_keys_configured()
     return caplog.text
@@ -156,49 +153,53 @@ def _s05_warning_text(monkeypatch, caplog):
 
 def _s05_systemexit_text(monkeypatch, caplog):
     monkeypatch.setenv("SM_TEST_TOKEN_S05_EXIT", "resolved-token-value")
-    g = _reload_with_backends(monkeypatch, agent_tokens="", backends_json=[
-        {"url": QUERY_CREDENTIAL_URL, "token_env": "SM_TEST_TOKEN_S05_EXIT", "private_ok": True},
-    ])
+    g = _reload_with_backends(
+        monkeypatch, agent_tokens="",
+        backends_json=_sized(token_env="SM_TEST_TOKEN_S05_EXIT"),
+    )
     with pytest.raises(SystemExit) as exc_info:
         g.require_auth_when_provider_keys_configured()
+    assert exc_info.value.code == 78
     return str(exc_info.value)
 
 
 def _m5_warning_text(monkeypatch, caplog):
-    """M-5′ (W4, decision:1824): a credentialed backend with neither roles
-    nor an explicit private_ok is a loud WARNING now, never a SystemExit —
-    was _m5_systemexit_text."""
+    """A credentialed entry with neither roles nor private_ok loads and does not warn. Declaring means trusting."""
     monkeypatch.setenv("SM_TEST_TOKEN_M5", "resolved-token-value")
-    g = _reload_with_backends(monkeypatch, agent_tokens="claude:tok_abc", backends_json=[
-        {"url": QUERY_CREDENTIAL_URL, "token_env": "SM_TEST_TOKEN_M5"},  # neither roles nor private_ok
-    ])
     with caplog.at_level(logging.WARNING, logger="hive-proxy"):
-        g.require_valid_llm_routing_config()   # must NOT raise
+        g = _reload_with_backends(
+            monkeypatch, agent_tokens="claude:tok_abc",
+            backends_json=_sized(token_env="SM_TEST_TOKEN_M5"),
+        )
+        g.require_valid_llm_routing_config()
+    assert "now serves both daemons" not in caplog.text
+    assert g.LLM_BACKENDS
     return caplog.text
 
 
 def _p5_warning_text(monkeypatch, caplog):
-    g = _reload_with_backends(monkeypatch, agent_tokens="", backends_json=[
-        {"url": QUERY_CREDENTIAL_URL, "private_ok": False},  # uncredentialed -- avoids S-05/M-5 entirely
-    ], allow_unauth="1")
     with caplog.at_level(logging.WARNING, logger="hive-proxy"):
+        g = _reload_with_backends(
+            monkeypatch, agent_tokens="",
+            backends_json=_sized(private_ok=False),
+            allow_unauth="1",
+        )
         g.require_valid_llm_routing_config()
+    assert "ignores leftover key private_ok" in caplog.text
+    assert "now serves both daemons" in caplog.text
     return caplog.text
 
 
 def _p5_no_override_warning_text(monkeypatch, caplog):
-    """P-5′ (W4, decision:1824): auth-off + an EXPLICIT private_ok=false
-    backend is a loud WARNING now, never a SystemExit, and no longer needs
-    ALLOW_UNAUTHENTICATED_PROVIDER_KEYS to avoid one — that override branch
-    is deleted with the exit it existed to bypass. Was
-    _p5_systemexit_text; _p5_warning_text above covers the same predicate
-    with the (now-inert) override env var still set, kept for its own
-    scrub coverage."""
-    g = _reload_with_backends(monkeypatch, agent_tokens="", backends_json=[
-        {"url": QUERY_CREDENTIAL_URL, "private_ok": False},
-    ])
+    """private_ok false is a leftover. It warns and does not refuse, with or without the auth-off override."""
     with caplog.at_level(logging.WARNING, logger="hive-proxy"):
-        g.require_valid_llm_routing_config()   # must NOT raise
+        g = _reload_with_backends(
+            monkeypatch, agent_tokens="",
+            backends_json=_sized(private_ok=False),
+        )
+        g.require_valid_llm_routing_config()
+    assert "ignores leftover key private_ok" in caplog.text
+    assert "now serves both daemons" in caplog.text
     return caplog.text
 
 
@@ -216,9 +217,10 @@ _LEAK_SCENARIOS = {
 def test_no_raw_userinfo_secret_in_journal_renders(scenario, monkeypatch, caplog):
     text = _LEAK_SCENARIOS[scenario](monkeypatch, caplog)
     assert SECRET not in text, f"{scenario} leaked the raw secret into its journal render"
-    assert "backend.example.test" in text, (
-        f"{scenario} never even reached the scrubbed host -- the fixture didn't exercise the target render"
-    )
+    if scenario != "m5_warning":
+        assert "backend.example.test" in text, (
+            f"{scenario} never even reached the scrubbed host -- the fixture didn't exercise the target render"
+        )
 
 
 @pytest.fixture(autouse=True)

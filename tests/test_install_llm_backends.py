@@ -1,36 +1,15 @@
-"""install_llm_backends.sh -- M-5'/S-05-aware access elicitation (W0 item ①).
+"""install_llm_backends.sh asks for context instead of guessing it.
 
-Before this, the script wrote {url, weight, model?, token_env?} only -- never
-`private_ok` or `roles` -- so a credentialed backend it just configured was
-left with neither declared. Under W4 default-deny (decision:1824, SEC M-2
-fix round: this docstring itself was stale) that is M-5': a loud,
-NON-FATAL startup WARNING (the backend is simply never selected) -- pre-W4
-it was a fatal `SystemExit`, which is the world this docstring used to
-describe. Auth-off installs additionally hit S-05 (AGENT_TOKENS unset + any
-credentialed backend -> SystemExit, UNCHANGED by W4) with no warning from
-this script at all.
-
-The fix: `build_backend_entry()` (between the `# >>> BACKEND_ACCESS` /
-`# <<< BACKEND_ACCESS` markers in the real script) now elicits the M-5
-choice for a credentialed backend, elicits a general-traffic/roles choice
-for an uncredentialed one, warns about S-05 when AGENT_TOKENS is unset, and
-never writes the one shape that newly bricks an install (private_ok: false)
-or the one shape that is fatal at the gateway (roles: []).
-
-This test extracts that block VERBATIM (same technique as
-tests/test_install_framework_password_validation.py's ASK_SECRET
-extraction) and runs `build_backend_entry` standalone via subprocess with
-scripted stdin -- exercising the actual shipped source, never a
-reimplementation that could silently drift from it. Per the brief: the
-JSON-value cases must see the finished entry on stdout with every
-prompt/warning/caveat on stderr (the script's own `entry="$(build_backend_
-entry ...)"` capture idiom depends on that separation); the auth-warning
-cases drive a temp ENV_FILE rather than the real shared-memory/.env.
+A defined backend with no n_ctx stops the gateway. The marker block queries
+the URL and, when the URL does not say, asks. It never writes roles or private_ok.
 """
+import json
+import os
 import re
 import shlex
 import shutil
 import subprocess
+import textwrap
 from pathlib import Path
 
 import pytest
@@ -38,7 +17,6 @@ import pytest
 INSTALL_LLM_BACKENDS = (
     Path(__file__).parent.parent / "shared-memory" / "ops" / "install_llm_backends.sh"
 )
-
 BEGIN_MARKER = "# >>> BACKEND_ACCESS"
 END_MARKER = "# <<< BACKEND_ACCESS"
 
@@ -50,308 +28,148 @@ pytestmark = pytest.mark.skipif(
 def _extract_block() -> str:
     text = INSTALL_LLM_BACKENDS.read_text()
     pattern = re.escape(BEGIN_MARKER) + r".*?\n(.*?)\n" + re.escape(END_MARKER)
-    m = re.search(pattern, text, re.S)
-    assert m, (
-        f"could not find a {BEGIN_MARKER} ... {END_MARKER} block in "
-        f"{INSTALL_LLM_BACKENDS} -- the extraction markers moved or were removed"
-    )
-    return m.group(1)
+    match = re.search(pattern, text, re.S)
+    assert match, "BACKEND_ACCESS markers missing"
+    return match.group(1)
 
 
-def _run(
-    stdin_text: str,
-    env_file: Path,
-    url: str = "http://backend.example:9/v1",
-    weight: str = "1",
-    model: str = "",
-    token_env: str = "",
-    timeout: float = 15,
-) -> subprocess.CompletedProcess:
+def _run(stdin_text: str, env_file: Path, *, token_env: str = "", curl: str | None = None,
+         url: str = "http://backend.example:9/v1", extra_env: dict | None = None) -> subprocess.CompletedProcess:
     source = _extract_block()
     invocation = "build_backend_entry {} {} {} {} {}".format(
-        shlex.quote(url), shlex.quote(weight), shlex.quote(model),
+        shlex.quote(url), shlex.quote("1"), shlex.quote(""),
         shlex.quote(token_env), shlex.quote(str(env_file)),
     )
-    # M7 (fix round): run under the SAME `set -euo pipefail` the real
-    # script has at its own top -- a bug that only misbehaves under set -e
-    # (an unguarded command whose failure would abort the real script)
-    # could otherwise pass here while still being live in production.
     script = "set -euo pipefail\n" + source + "\n" + invocation
+    env = os.environ.copy()
+    if extra_env:
+        env.update(extra_env)
+    if curl is not None:
+        bindir = env_file.parent / "bin"
+        bindir.mkdir(exist_ok=True)
+        curl_path = bindir / "curl"
+        curl_path.write_text(curl)
+        curl_path.chmod(0o755)
+        env["PATH"] = str(bindir) + os.pathsep + env.get("PATH", "")
     return subprocess.run(
-        ["bash", "-c", script],
-        input=stdin_text, capture_output=True, text=True, timeout=timeout,
+        ["bash", "-c", script], input=stdin_text, capture_output=True, text=True,
+        timeout=15, env=env,
     )
 
-
-# ---------------------------------------------------------------------------
-# Extraction sanity
-# ---------------------------------------------------------------------------
 
 def test_markers_present_exactly_once():
     text = INSTALL_LLM_BACKENDS.read_text()
     assert text.count(BEGIN_MARKER) == 1
     assert text.count(END_MARKER) == 1
+    block = _extract_block()
+    assert "ask_backend_roles" not in block
+    assert "private_ok" not in block
+    assert "ROLE_VOCABULARY" not in text
+    assert "--max-time" not in block
+    assert "-K -" in block
 
 
-def test_extracted_block_defines_build_backend_entry():
-    source = _extract_block()
-    assert "build_backend_entry()" in source
-
-
-# ---------------------------------------------------------------------------
-# T1 JSON-value cases (auth check made moot via an existing, non-empty
-# AGENT_TOKENS -- these cases care about the entry shape, not the warning)
-# ---------------------------------------------------------------------------
-
-def test_credentialed_private_ok_writes_true(tmp_path):
-    env_file = tmp_path / "auth_on.env"
-    env_file.write_text("AGENT_TOKENS=some-real-token\n")
-    proc = _run("private_ok\n", env_file, token_env="DEEPSEEK_API_KEY")
+def test_advertised_context_is_offered_and_not_guessed(tmp_path):
+    env_file = tmp_path / "auth.env"
+    env_file.write_text("AGENT_TOKENS=present\n")
+    curl = textwrap.dedent("""\
+        #!/bin/sh
+        printf '%s' '{"default_generation_settings":{"n_ctx":4096}}'
+    """)
+    proc = _run("\n256\n", env_file, curl=curl)
     assert proc.returncode == 0, proc.stderr
-    import json
+    assert "advertised n_ctx=4096" in proc.stderr
     entry = json.loads(proc.stdout)
-    assert entry["private_ok"] is True
-    assert "roles" not in entry
-    assert entry["token_env"] == "DEEPSEEK_API_KEY"
+    assert entry["n_ctx"] == 4096
+    assert entry["max_output_tokens"] == 256
+    assert "roles" not in entry and "private_ok" not in entry
 
 
-def test_credentialed_roles_writes_exact_array_no_private_ok_key(tmp_path):
-    env_file = tmp_path / "auth_on.env"
-    env_file.write_text("AGENT_TOKENS=some-real-token\n")
-    proc = _run("roles\nextract judge\n", env_file, token_env="DEEPSEEK_API_KEY")
+def test_declining_the_advertised_context_asks(tmp_path):
+    env_file = tmp_path / "auth.env"
+    env_file.write_text("AGENT_TOKENS=present\n")
+    curl = "#!/bin/sh\nprintf '%s' '{\"default_generation_settings\":{\"n_ctx\":4096}}'\n"
+    proc = _run("n\n2048\n128\n", env_file, curl=curl)
     assert proc.returncode == 0, proc.stderr
-    import json
     entry = json.loads(proc.stdout)
-    assert sorted(entry["roles"]) == ["extract", "judge"]
-    assert "private_ok" not in entry
-    # H2 fix round: "never serves role-less traffic" is TRUE on the
-    # CREDENTIALED roles path (effective private_ok defaults false there) --
-    # must be printed here.
-    assert "never serves role-less" in proc.stderr
+    assert entry["n_ctx"] == 2048
+    assert entry["max_output_tokens"] == 128
 
 
-def test_credentialed_single_role_writes_exact_array(tmp_path):
-    env_file = tmp_path / "auth_on.env"
-    env_file.write_text("AGENT_TOKENS=some-real-token\n")
-    proc = _run("roles\nextract\n", env_file, token_env="DEEPSEEK_API_KEY")
+def test_unreadable_context_asks_and_never_defaults(tmp_path):
+    env_file = tmp_path / "auth.env"
+    env_file.write_text("AGENT_TOKENS=present\n")
+    curl = "#!/bin/sh\nexit 1\n"
+    proc = _run("1024\n64\n", env_file, curl=curl)
     assert proc.returncode == 0, proc.stderr
-    import json
+    assert "COULD NOT READ THE CONTEXT" in proc.stderr
+    assert "Never guess" in proc.stderr
     entry = json.loads(proc.stdout)
-    assert entry["roles"] == ["extract"]
-    assert "private_ok" not in entry
-    # Strict-subset dream-slot caveat must fire for a single role.
-    assert "does not count toward dream" in proc.stderr
-    # The full-set caveat must NOT fire for a single role.
+    assert entry["n_ctx"] == 1024
+    assert entry["max_output_tokens"] == 64
 
 
-def test_credentialed_full_roleset_no_subset_caveat(tmp_path):
-    """H1 fix round: the caveat sentence spans two echo lines ("...does not
-    count toward dream\\n  slots -- ..."), so the assertion below must match
-    a substring that is actually contiguous on ONE line -- "does not count
-    toward dream slots" (with a literal space where the real text has a
-    newline) can never appear even when the caveat DOES fire, which made
-    the original version of this test vacuous. "does not count toward
-    dream" has no line break in it either way, so it is a faithful presence/
-    absence probe. See HANDOFF.md for the mutation check proving this one
-    actually bites."""
-    env_file = tmp_path / "auth_on.env"
-    env_file.write_text("AGENT_TOKENS=some-real-token\n")
-    proc = _run("roles\nextract judge\n", env_file, token_env="DEEPSEEK_API_KEY")
-    assert proc.returncode == 0, proc.stderr
-    assert "does not count toward dream" not in proc.stderr
-
-
-def test_credentialed_refusing_both_reasks_no_fatal_shape(tmp_path):
-    """An answer that is neither 'private_ok' nor 'roles' must re-ask, never
-    fall through to a broken/empty shape. Exhausted stdin after one bad
-    answer must fail loudly (nonzero exit) and emit NOTHING on stdout --
-    never a half-built entry."""
-    env_file = tmp_path / "auth_on.env"
-    env_file.write_text("AGENT_TOKENS=some-real-token\n")
-    proc = _run("maybe\n", env_file, token_env="DEEPSEEK_API_KEY")
+def test_eof_refuses_and_writes_nothing(tmp_path):
+    env_file = tmp_path / "auth.env"
+    env_file.write_text("AGENT_TOKENS=present\n")
+    curl = "#!/bin/sh\nexit 1\n"
+    proc = _run("", env_file, curl=curl)
     assert proc.returncode != 0
     assert proc.stdout == ""
-    assert "private_ok" in proc.stderr or "roles" in proc.stderr  # re-ask guidance
-
-
-def test_credentialed_reasks_then_succeeds(tmp_path):
-    env_file = tmp_path / "auth_on.env"
-    env_file.write_text("AGENT_TOKENS=some-real-token\n")
-    proc = _run("maybe\nprivate_ok\n", env_file, token_env="DEEPSEEK_API_KEY")
-    assert proc.returncode == 0, proc.stderr
-    import json
-    entry = json.loads(proc.stdout)
-    assert entry["private_ok"] is True
-
-
-@pytest.mark.parametrize("roles_input", [",", "summarize", "bogus", "summarize bogus"])
-def test_role_input_summarize_or_invalid_reasks_never_written(tmp_path, roles_input):
-    """A garbage/invalid/reserved answer to the roles sub-prompt must
-    re-ask rather than ever writing an empty or invalid roles list. A lone
-    "," parses to ZERO role tokens (it normalises to whitespace) without
-    being the literal blank-Enter line that the FINDING in HANDOFF.md
-    documents as the (interpreted) DEFAULT-to-both shortcut -- `read`
-    itself strips a purely-whitespace line down to empty, so a bare space
-    is indistinguishable from Enter and cannot exercise this path; see
-    test_blank_role_input_defaults_to_both for that one. This test pairs
-    each bad answer with a valid follow-up to prove the loop recovers
-    rather than merely failing."""
-    env_file = tmp_path / "auth_on.env"
-    env_file.write_text("AGENT_TOKENS=some-real-token\n")
-    proc = _run(f"roles\n{roles_input}\nextract\n", env_file, token_env="DEEPSEEK_API_KEY")
-    assert proc.returncode == 0, proc.stderr
-    import json
-    entry = json.loads(proc.stdout)
-    assert entry["roles"] == ["extract"]
-    assert "extract judge" in proc.stderr  # the re-ask guidance line
-
-
-def test_blank_role_input_defaults_to_both(tmp_path):
-    env_file = tmp_path / "auth_on.env"
-    env_file.write_text("AGENT_TOKENS=some-real-token\n")
-    proc = _run("roles\n\n", env_file, token_env="DEEPSEEK_API_KEY")
-    assert proc.returncode == 0, proc.stderr
-    import json
-    entry = json.loads(proc.stdout)
-    assert sorted(entry["roles"]) == ["extract", "judge"]
-
-
-def test_uncredentialed_general_writes_private_ok_true(tmp_path):
-    env_file = tmp_path / "auth_on.env"
-    env_file.write_text("AGENT_TOKENS=some-real-token\n")
-    proc = _run("y\n", env_file, token_env="")
-    assert proc.returncode == 0, proc.stderr
-    import json
-    entry = json.loads(proc.stdout)
-    assert entry["private_ok"] is True
-    assert "roles" not in entry
-    assert "token_env" not in entry
-
-
-def test_uncredentialed_blank_defaults_yes(tmp_path):
-    """Yes is the default for the uncredentialed general-traffic question --
-    matches today's effective value (no token_env => private_ok defaults
-    true at the gateway)."""
-    env_file = tmp_path / "auth_on.env"
-    env_file.write_text("AGENT_TOKENS=some-real-token\n")
-    proc = _run("\n", env_file, token_env="")
-    assert proc.returncode == 0, proc.stderr
-    import json
-    entry = json.loads(proc.stdout)
-    assert entry["private_ok"] is True
-
-
-def test_uncredentialed_exhausted_stdin_never_defaults_to_private_ok_true(tmp_path):
-    """SEC-HIGH fix round: before this fix, exhausted stdin at the
-    uncredentialed general-traffic prompt left `v` empty, the regex
-    `[[ ! "$v" =~ ^[Nn]$ ]]` matched (empty does not match ^[Nn]$), and
-    yesno_y silently returned TRUE -- writing private_ok:true with no
-    operator answer at all. An unanswered access question must never widen
-    access: exhausted stdin here must fail loudly, write NOTHING to stdout,
-    and must NOT be indistinguishable from a real "yes"."""
-    env_file = tmp_path / "auth_on.env"
-    env_file.write_text("AGENT_TOKENS=some-real-token\n")
-    proc = _run("", env_file, token_env="")  # closed stdin, not even a blank line
-    assert proc.returncode != 0
-    assert proc.stdout == ""
-    assert '"private_ok":true' not in proc.stdout.replace(" ", "")
     assert "refusing to guess" in proc.stderr
 
 
-def test_uncredentialed_no_writes_roles_and_honest_caveat(tmp_path):
-    """W4 default-deny (decision:1824): the "never serves role-less traffic"
-    claim is now TRUE on THIS path too -- _role_eligible's role-less branch
-    falls back to the effective private_ok, which now defaults FALSE
-    regardless of credential. This sentence is now IDENTICAL to the one
-    printed on the credentialed roles path (see
-    test_credentialed_roles_writes_exact_array_no_private_ok_key); the old
-    "still routes role-less traffic" correction described a pre-W4 gap that
-    no longer exists and must not be printed."""
-    env_file = tmp_path / "auth_on.env"
-    env_file.write_text("AGENT_TOKENS=some-real-token\n")
-    proc = _run("n\nextract\n", env_file, token_env="")
+def test_credentialed_auth_off_warns_without_claiming_any_caller_can_sign(tmp_path):
+    env_file = tmp_path / "off.env"
+    env_file.write_text("SOME_OTHER_KEY=1\n")
+    curl = "#!/bin/sh\nexit 1\n"
+    proc = _run("1024\n64\n", env_file, token_env="DEEPSEEK_API_KEY", curl=curl)
     assert proc.returncode == 0, proc.stderr
-    import json
+    assert "AGENT_TOKENS is not set" in proc.stderr
+    assert "spawned daemon" in proc.stderr
+    assert "any caller" not in proc.stderr
+
+
+def test_provider_key_is_not_a_curl_argument(tmp_path):
+    """The bearer is curl's stdin config. A process listing must not show it."""
+    env_file = tmp_path / "auth.env"
+    env_file.write_text("AGENT_TOKENS=present\n")
+    argv_file = tmp_path / "argv"
+    curl = textwrap.dedent(f"""\
+        #!/bin/sh
+        printf '%s\\n' "$@" > {shlex.quote(str(argv_file))}
+        printf '%s' '{{"default_generation_settings":{{"n_ctx":4096}}}}'
+    """)
+    secret = "probe-token-value"
+    proc = _run("\n64\n", env_file, token_env="PROVIDER_KEY", curl=curl,
+                extra_env={"PROVIDER_KEY": secret})
+    assert proc.returncode == 0, proc.stderr
+    argv = argv_file.read_text()
+    assert secret not in argv
+    assert "-K" in argv.split()
+
+
+def test_url_ending_v1_reads_max_context_length_from_models(tmp_path):
+    """A url that already ends in /v1 must probe /v1/models, not /v1/v1/models. /props failing falls through to max_context_length."""
+    env_file = tmp_path / "auth.env"
+    env_file.write_text("AGENT_TOKENS=present\n")
+    urls = tmp_path / "urls"
+    curl = textwrap.dedent(f"""\
+        #!/bin/sh
+        last=
+        for a in "$@"; do last=$a; done
+        printf '%s\\n' "$last" >> {shlex.quote(str(urls))}
+        case "$last" in
+            */props) exit 1 ;;
+        esac
+        printf '%s' '{{"data":[{{"id":"m","max_context_length":8192}}]}}'
+    """)
+    proc = _run("\n64\n", env_file, curl=curl, url="http://backend.example:9/v1")
+    assert proc.returncode == 0, proc.stderr
+    seen = urls.read_text().splitlines()
+    assert "http://backend.example:9/props" in seen
+    assert "http://backend.example:9/v1/models" in seen
+    assert not any("/v1/v1/" in line for line in seen)
     entry = json.loads(proc.stdout)
-    assert entry["roles"] == ["extract"]
-    assert "private_ok" not in entry
-    # The retired pre-W4 correction must never appear here.
-    assert "still routes" not in proc.stderr
-    # The TRUE claim is now printed on this path too.
-    assert "never serves role-less" in proc.stderr
-
-
-def test_never_writes_private_ok_false(tmp_path):
-    """There is no answer sequence that makes this script write
-    private_ok: false -- the M-5 choice only ever writes true or omits the
-    key; the uncredentialed general-traffic choice only ever writes true or
-    omits the key."""
-    env_file = tmp_path / "auth_on.env"
-    env_file.write_text("AGENT_TOKENS=some-real-token\n")
-    for stdin in ("private_ok\n", "roles\nextract judge\n"):
-        proc = _run(stdin, env_file, token_env="DEEPSEEK_API_KEY")
-        assert proc.returncode == 0, proc.stderr
-        assert '"private_ok":false' not in proc.stdout.replace(" ", "")
-    for stdin in ("y\n", "n\nextract\n"):
-        proc = _run(stdin, env_file, token_env="")
-        assert proc.returncode == 0, proc.stderr
-        assert '"private_ok":false' not in proc.stdout.replace(" ", "")
-
-
-# ---------------------------------------------------------------------------
-# Auth-warning cases (value-sensitive ENV_FILE, per the brief)
-# ---------------------------------------------------------------------------
-
-def test_no_agent_tokens_line_warns(tmp_path):
-    env_file = tmp_path / "no_tokens.env"
-    env_file.write_text("SOME_OTHER_KEY=1\n")
-    proc = _run("private_ok\n", env_file, token_env="DEEPSEEK_API_KEY")
-    assert proc.returncode == 0, proc.stderr
-    assert "AGENT_TOKENS is not set" in proc.stderr
-    assert "bootstrap_tokens.sh" in proc.stderr
-    assert "ALLOW_UNAUTHENTICATED_PROVIDER_KEYS" in proc.stderr
-
-
-def test_agent_tokens_empty_value_warns(tmp_path):
-    """A cleared `AGENT_TOKENS=` line is auth-OFF too (the gateway keys on
-    bool(_AGENT_TOKENS)) -- must still warn."""
-    env_file = tmp_path / "empty_tokens.env"
-    env_file.write_text("AGENT_TOKENS=\n")
-    proc = _run("private_ok\n", env_file, token_env="DEEPSEEK_API_KEY")
-    assert proc.returncode == 0, proc.stderr
-    assert "AGENT_TOKENS is not set" in proc.stderr
-
-
-def test_agent_tokens_set_no_warning(tmp_path):
-    env_file = tmp_path / "tokens.env"
-    env_file.write_text("AGENT_TOKENS=x\n")
-    proc = _run("private_ok\n", env_file, token_env="DEEPSEEK_API_KEY")
-    assert proc.returncode == 0, proc.stderr
-    assert "AGENT_TOKENS is not set" not in proc.stderr
-
-
-def test_uncredentialed_backend_never_triggers_auth_warning(tmp_path):
-    """S-05 only cares about credentialed backends -- an uncredentialed one
-    must never print the auth-off warning even when AGENT_TOKENS is unset."""
-    env_file = tmp_path / "no_tokens.env"
-    env_file.write_text("SOME_OTHER_KEY=1\n")
-    proc = _run("y\n", env_file, token_env="")
-    assert proc.returncode == 0, proc.stderr
-    assert "AGENT_TOKENS is not set" not in proc.stderr
-
-
-def test_auth_off_roles_path_adds_p5_caveat(tmp_path):
-    """W4 (§3, P-5′): the old refusal + override the ROLES-path caveat used
-    to warn about is gone -- P-5′ only fires on an EXPLICIT private_ok:false,
-    which this script never writes on either path, so the roles-path note
-    must now say P-5′ does NOT apply, on both paths."""
-    env_file = tmp_path / "no_tokens.env"
-    env_file.write_text("SOME_OTHER_KEY=1\n")
-
-    proc_roles = _run("roles\nextract judge\n", env_file, token_env="DEEPSEEK_API_KEY")
-    assert proc_roles.returncode == 0, proc_roles.stderr
-    assert "does NOT apply to this entry" in proc_roles.stderr
-
-    proc_private_ok = _run("private_ok\n", env_file, token_env="DEEPSEEK_API_KEY")
-    assert proc_private_ok.returncode == 0, proc_private_ok.stderr
-    assert "does NOT apply to this entry" not in proc_private_ok.stderr
+    assert entry["n_ctx"] == 8192
+    assert entry["max_output_tokens"] == 64

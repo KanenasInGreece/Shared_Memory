@@ -24,7 +24,7 @@ from neo4j import AsyncGraphDatabase
 sys.path.insert(0, os.path.dirname(__file__))
 from ontology import ONT
 from record_ref import doc_record_type
-from pool_status import pool_has_free_slot
+from pool_status import pool_roster_state
 from log_hygiene import append_secure
 from dream_telemetry import (
     record_llm_call, adaptive_ceiling, call_timing_summary,
@@ -87,7 +87,7 @@ def _routing_refusal(resp) -> dict | None:
     error = body.get("error") if isinstance(body, dict) else None
     if error not in ("no_eligible_backend", "backend_at_capacity"):
         return None
-    return {"error": error, "constraint": body.get("constraint"), "role": body.get("role")}
+    return {"error": error, "constraint": body.get("constraint")}
 
 
 def _require_db_credentials() -> None:
@@ -806,7 +806,7 @@ class REMDaemon:
                 async with httpx.AsyncClient(timeout=_ceiling, trust_env=False) as client:
                     resp = await client.post(
                         REASONER_URL,
-                        headers={**_auth_headers(), "X-SM-LLM-Role": "extract"},
+                        headers=_auth_headers(),
                         json={
                             "model": LLM_MODEL,
                             "messages": [
@@ -828,9 +828,9 @@ class REMDaemon:
                 # A routing refusal is a config gap, not evidence about this record, so the attempt is not charged.
                 logger.warning(
                     "REM: pg_id=%s solo enrichment call REFUSED by gateway "
-                    "routing (constraint=%s role=%s) — skipping WITHOUT "
+                    "routing (constraint=%s) — skipping WITHOUT "
                     "charging rem_attempts; record stays eligible next cycle",
-                    pg_id, refusal["constraint"], refusal["role"],
+                    pg_id, refusal["constraint"],
                 )
                 record_llm_call("REM", None, backend=_backend,
                                 wall_s=time.monotonic() - _start, ceiling_s=_ceiling,
@@ -988,7 +988,7 @@ class REMDaemon:
         try:
             async with httpx.AsyncClient(timeout=_ceiling, trust_env=False) as client:
                 resp = await client.post(
-                    REASONER_URL, headers={**_auth_headers(), "X-SM-LLM-Role": "extract"},
+                    REASONER_URL, headers=_auth_headers(),
                     json={"model": LLM_MODEL,
                           "messages": [
                               {"role": "system", "content": "You are a technical knowledge curator. Output only JSONL — one JSON object per line, no prose, no markdown fences, no thinking."},
@@ -1003,9 +1003,9 @@ class REMDaemon:
                     # A routing refusal says nothing about these records, so none of them is charged.
                     logger.warning(
                         "REM batch: call (%d facts) REFUSED by gateway "
-                        "routing (constraint=%s role=%s) — skipping WITHOUT "
+                        "routing (constraint=%s) — skipping WITHOUT "
                         "charging any attempt; all %d fact(s) retry next cycle",
-                        len(sent), refusal["constraint"], refusal["role"], len(sent),
+                        len(sent), refusal["constraint"], len(sent),
                     )
                     record_llm_call("REM", None, backend=_backend,
                                     wall_s=time.monotonic() - _start, ceiling_s=_ceiling,
@@ -1280,7 +1280,11 @@ class REMDaemon:
                 return 0, 0
 
             # Defer only when every LLM slot is busy. A global GPU gate would wait on our own dream work and ignore a free card.
-            if not await pool_has_free_slot(headers=_auth_headers()):
+            pool_state = await pool_roster_state(headers=_auth_headers())
+            if pool_state == "empty":
+                logger.warning("REM: no usable backend — deferring enrichment cycle (no_backend)")
+                return 0, 0
+            if pool_state == "busy":
                 logger.warning("REM: LLM pool has no free slot — deferring enrichment cycle")
                 return 0, 0
 

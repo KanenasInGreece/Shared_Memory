@@ -30,7 +30,7 @@ def _load(monkeypatch, *, agent_tokens: str = "", backends_json: list | None = N
     if backends_json is not None:
         monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps(backends_json))
     else:
-        monkeypatch.setenv("LLM_BACKENDS", "http://a:5000")  # a plain, uncredentialed default
+        monkeypatch.setenv("LLM_BACKENDS_JSON", "[{\"url\": \"http://a:5000\", \"n_ctx\": 8192, \"max_output_tokens\": 2048}]")  # a plain, uncredentialed default
     if allow_unauth is not None:
         monkeypatch.setenv("ALLOW_UNAUTHENTICATED_PROVIDER_KEYS", allow_unauth)
 
@@ -44,7 +44,7 @@ def _load(monkeypatch, *, agent_tokens: str = "", backends_json: list | None = N
 def test_refuses_to_start_auth_off_with_credentialed_backend(monkeypatch):
     monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-refusal-test")
     g = _load(monkeypatch, agent_tokens="", backends_json=[
-        {"url": "https://api.deepseek.com/v1", "token_env": "DEEPSEEK_API_KEY"},
+        {"url": "https://api.deepseek.com/v1", "token_env": "DEEPSEEK_API_KEY", "n_ctx": 8192, "max_output_tokens": 2048},
     ])
     assert g.AUTH_CONFIGURED_AT_STARTUP is False
     assert g.LLM_BACKEND_TOKENS["https://api.deepseek.com/v1"] == "sk-refusal-test"
@@ -56,7 +56,7 @@ def test_refuses_to_start_auth_off_with_credentialed_backend(monkeypatch):
 def test_refusal_names_both_fixes(monkeypatch):
     monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-refusal-test")
     g = _load(monkeypatch, agent_tokens="", backends_json=[
-        {"url": "https://api.deepseek.com/v1", "token_env": "DEEPSEEK_API_KEY"},
+        {"url": "https://api.deepseek.com/v1", "token_env": "DEEPSEEK_API_KEY", "n_ctx": 8192, "max_output_tokens": 2048},
     ])
     with pytest.raises(SystemExit) as exc_info:
         g.require_auth_when_provider_keys_configured()
@@ -69,7 +69,7 @@ def test_refusal_names_both_fixes(monkeypatch):
 def test_refusal_message_never_leaks_the_key(monkeypatch):
     monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-must-never-appear-anywhere")
     g = _load(monkeypatch, agent_tokens="", backends_json=[
-        {"url": "https://api.deepseek.com/v1", "token_env": "DEEPSEEK_API_KEY"},
+        {"url": "https://api.deepseek.com/v1", "token_env": "DEEPSEEK_API_KEY", "n_ctx": 8192, "max_output_tokens": 2048},
     ])
     with pytest.raises(SystemExit) as exc_info:
         g.require_auth_when_provider_keys_configured()
@@ -79,7 +79,7 @@ def test_refusal_message_never_leaks_the_key(monkeypatch):
 def test_allow_unauthenticated_override_permits_start(monkeypatch):
     monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-refusal-test")
     g = _load(monkeypatch, agent_tokens="", backends_json=[
-        {"url": "https://api.deepseek.com/v1", "token_env": "DEEPSEEK_API_KEY"},
+        {"url": "https://api.deepseek.com/v1", "token_env": "DEEPSEEK_API_KEY", "n_ctx": 8192, "max_output_tokens": 2048},
     ], allow_unauth="1")
     g.require_auth_when_provider_keys_configured()  # must not raise
 
@@ -92,7 +92,7 @@ def test_override_logs_a_warning_naming_the_exposed_backends(monkeypatch, caplog
     import logging
     monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-refusal-test")
     g = _load(monkeypatch, agent_tokens="", backends_json=[
-        {"url": "https://api.deepseek.com/v1", "token_env": "DEEPSEEK_API_KEY"},
+        {"url": "https://api.deepseek.com/v1", "token_env": "DEEPSEEK_API_KEY", "n_ctx": 8192, "max_output_tokens": 2048},
     ], allow_unauth="1")
     with caplog.at_level(logging.WARNING, logger="hive-proxy"):
         g.require_auth_when_provider_keys_configured()
@@ -119,13 +119,13 @@ def test_override_active_helper_true_only_when_all_three_conditions_hold(monkeyp
 
     # All three: auth off + credentialed backend + override set.
     g = _load(monkeypatch, agent_tokens="", backends_json=[
-        {"url": "https://api.deepseek.com/v1", "token_env": "DEEPSEEK_API_KEY"},
+        {"url": "https://api.deepseek.com/v1", "token_env": "DEEPSEEK_API_KEY", "n_ctx": 8192, "max_output_tokens": 2048},
     ], allow_unauth="1")
     assert g._unauthenticated_provider_keys_override_active() is True
 
     # Auth configured -> False regardless of the override.
     g = _load(monkeypatch, agent_tokens="claude:tok_abc", backends_json=[
-        {"url": "https://api.deepseek.com/v1", "token_env": "DEEPSEEK_API_KEY"},
+        {"url": "https://api.deepseek.com/v1", "token_env": "DEEPSEEK_API_KEY", "n_ctx": 8192, "max_output_tokens": 2048},
     ], allow_unauth="1")
     assert g._unauthenticated_provider_keys_override_active() is False
 
@@ -135,7 +135,7 @@ def test_override_active_helper_true_only_when_all_three_conditions_hold(monkeyp
 
     # Override not set -> False (this is the refusal path, not the override path).
     g = _load(monkeypatch, agent_tokens="", backends_json=[
-        {"url": "https://api.deepseek.com/v1", "token_env": "DEEPSEEK_API_KEY"},
+        {"url": "https://api.deepseek.com/v1", "token_env": "DEEPSEEK_API_KEY", "n_ctx": 8192, "max_output_tokens": 2048},
     ])
     assert g._unauthenticated_provider_keys_override_active() is False
 
@@ -143,7 +143,7 @@ def test_override_active_helper_true_only_when_all_three_conditions_hold(monkeyp
 def test_auth_configured_permits_start_regardless_of_provider_keys(monkeypatch):
     monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-refusal-test")
     g = _load(monkeypatch, agent_tokens="claude:tok_abc", backends_json=[
-        {"url": "https://api.deepseek.com/v1", "token_env": "DEEPSEEK_API_KEY"},
+        {"url": "https://api.deepseek.com/v1", "token_env": "DEEPSEEK_API_KEY", "n_ctx": 8192, "max_output_tokens": 2048},
     ])
     assert g.AUTH_CONFIGURED_AT_STARTUP is True
     g.require_auth_when_provider_keys_configured()  # must not raise
@@ -191,7 +191,7 @@ def test_health_config_field_present_only_while_override_active(monkeypatch):
     import asyncio
     monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-refusal-test")
     g = _load(monkeypatch, agent_tokens="", backends_json=[
-        {"url": "https://api.deepseek.com/v1", "token_env": "DEEPSEEK_API_KEY"},
+        {"url": "https://api.deepseek.com/v1", "token_env": "DEEPSEEK_API_KEY", "n_ctx": 8192, "max_output_tokens": 2048},
     ], allow_unauth="1")
 
     class _Proxy:
@@ -208,7 +208,7 @@ def test_health_config_field_absent_when_auth_configured(monkeypatch):
     import asyncio
     monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-refusal-test")
     g = _load(monkeypatch, agent_tokens="claude:tok_abc", backends_json=[
-        {"url": "https://api.deepseek.com/v1", "token_env": "DEEPSEEK_API_KEY"},
+        {"url": "https://api.deepseek.com/v1", "token_env": "DEEPSEEK_API_KEY", "n_ctx": 8192, "max_output_tokens": 2048},
     ])
 
     class _Proxy:
@@ -227,6 +227,29 @@ def test_health_config_field_absent_when_no_credentialed_backend(monkeypatch):
 
     checks = asyncio.run(g._build_health_checks(_Proxy(), None))
     assert "allow_unauthenticated_provider_keys" not in checks["config"]
+
+
+def test_no_false_warning_on_an_uncredentialed_backend(monkeypatch, caplog):
+    """An install with no provider key must not get the S-05 warning. That warning means a live key is exposed."""
+    import logging
+    g = _load(monkeypatch, agent_tokens="", backends_json=None)
+    with caplog.at_level(logging.WARNING, logger="hive-proxy"):
+        g.require_auth_when_provider_keys_configured()
+    assert "ALLOW_UNAUTHENTICATED_PROVIDER_KEYS" not in caplog.text
+    assert "AGENT_TOKENS is unset" not in caplog.text
+
+
+def test_tokens_set_gives_no_provider_key_warning(monkeypatch, caplog):
+    """Auth on is the other negative. A credentialed backend with AGENT_TOKENS set does not warn and does not refuse."""
+    import logging
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-refusal-test")
+    g = _load(monkeypatch, agent_tokens="claude:tok_abc", backends_json=[
+        {"url": "https://api.deepseek.com/v1", "token_env": "DEEPSEEK_API_KEY", "n_ctx": 8192, "max_output_tokens": 2048},
+    ])
+    with caplog.at_level(logging.WARNING, logger="hive-proxy"):
+        g.require_auth_when_provider_keys_configured()
+    assert "ALLOW_UNAUTHENTICATED_PROVIDER_KEYS" not in caplog.text
+    assert "AGENT_TOKENS is unset" not in caplog.text
 
 
 # ── Mutation check target ────────────────────────────────────────────────────

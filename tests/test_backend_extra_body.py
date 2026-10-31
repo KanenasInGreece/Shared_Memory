@@ -5,9 +5,9 @@ the motivating case is a hybrid reasoning model whose thinking mode is ON by
 default and is disabled per REQUEST, in the body. The gateway owns the
 backend's dialect exactly as it owns its model id and its credential: the
 operator declares the overrides once, per backend, and every routed payload
-carries them. A malformed extra_body excludes the backend from the pool —
-for a metered backend, "reached without its overrides" is the very
-misconfiguration the field exists to prevent.
+carries them. A non-object extra_body is a declaration FATAL: the pool stays
+empty and the refusal names the field, so a metered backend is never reached
+without its overrides.
 """
 import asyncio
 import importlib
@@ -15,6 +15,9 @@ import json
 import os
 import sys
 from yarl import URL
+
+import pytest
+pytestmark = pytest.mark.usefixtures("chat_caller_is_consolidation")
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "shared-memory", "scripts"))
 
@@ -94,27 +97,34 @@ def test_no_overrides_means_the_body_is_untouched_bytes(monkeypatch):
 
 def test_extra_body_lands_in_the_backend_table(monkeypatch):
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
-        {"url": "http://a:5000"},
-        {"url": "http://b:4000", "extra_body": {"thinking": {"type": "disabled"}}},
+        {"url": "http://a:5000", "n_ctx": 8192, "max_output_tokens": 2048},
+        {"url": "http://b:4000", "n_ctx": 8192, "max_output_tokens": 2048,
+         "extra_body": {"thinking": {"type": "disabled"}}},
     ]))
     g = _fresh()
     assert g.LLM_BACKEND_EXTRAS["http://a:5000"] is None
     assert g.LLM_BACKEND_EXTRAS["http://b:4000"] == {"thinking": {"type": "disabled"}}
 
 
-def test_non_object_extra_body_excludes_the_backend(monkeypatch):
+def test_non_object_extra_body_is_a_declaration_fatal(monkeypatch):
+    """A non-object extra_body refuses the whole declaration. The pool stays empty
+    and the error names the entry and the field. Per-entry exclusion was the old rule."""
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
-        {"url": "http://a:5000"},
-        {"url": "http://b:4000", "extra_body": "thinking=off"},
+        {"url": "http://a:5000", "n_ctx": 8192, "max_output_tokens": 2048},
+        {"url": "http://b:4000", "extra_body": "thinking=off", "n_ctx": 8192, "max_output_tokens": 2048},
     ]))
     g = _fresh()
-    assert "http://b:4000" not in g.LLM_BACKENDS
-    assert "http://a:5000" in g.LLM_BACKENDS
+    assert g.LLM_BACKENDS == []
+    assert ("http://b:4000", "extra_body") in g.LLM_DECLARATION_ERRORS
+    with pytest.raises(SystemExit) as exc:
+        g.require_valid_llm_routing_config()
+    assert exc.value.code == 78
+    assert "extra_body" in str(exc.value)
 
 
 def test_legacy_comma_form_has_no_extras(monkeypatch):
     monkeypatch.delenv("LLM_BACKENDS_JSON", raising=False)
-    monkeypatch.setenv("LLM_BACKENDS", "http://a:5000@2,http://b:4000")
+    monkeypatch.setenv("LLM_BACKENDS_JSON", "[{\"url\": \"http://a:5000\", \"n_ctx\": 8192, \"max_output_tokens\": 2048, \"weight\": 2}, {\"url\": \"http://b:4000\", \"n_ctx\": 8192, \"max_output_tokens\": 2048}]")
     g = _fresh()
     assert g.LLM_BACKEND_EXTRAS == {"http://a:5000": None, "http://b:4000": None}
 
@@ -123,8 +133,8 @@ def test_legacy_comma_form_has_no_extras(monkeypatch):
 
 def test_routed_payload_carries_the_backend_overrides(monkeypatch):
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
-        {"url": "http://a:5000", "model": "real-model-id",
-         "extra_body": {"thinking": {"type": "disabled"}}, "private_ok": True},
+        {"url": "http://a:5000", "model": "real-model-id", "n_ctx": 8192, "max_output_tokens": 2048,
+         "extra_body": {"thinking": {"type": "disabled"}}},
     ]))
     g = _fresh()
     proxy = g.AsyncHiveMindProxy()

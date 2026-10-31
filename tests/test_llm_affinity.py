@@ -14,8 +14,8 @@ def _fresh(monkeypatch):
     # both backends declare it explicitly (fact:1195-safe public fixture names).
     monkeypatch.delenv("LLM_BACKENDS", raising=False)
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
-        {"url": "http://a:5000", "private_ok": True},
-        {"url": "http://b:4000", "private_ok": True},
+        {"url": "http://a:5000", "private_ok": True, "n_ctx": 8192, "max_output_tokens": 2048},
+        {"url": "http://b:4000", "private_ok": True, "n_ctx": 8192, "max_output_tokens": 2048},
     ]))
     import hive_mind_proxy
     importlib.reload(hive_mind_proxy)
@@ -38,9 +38,9 @@ def test_affinity_key_prefix_stable(monkeypatch):
 def test_rem_pins_to_one_warm_card(monkeypatch):
     g = _fresh(monkeypatch)
     k = g._affinity_key(_body("G" * 7000, " f1"))
-    r1 = g._select_llm_backend("", k)
+    r1 = g._select_llm_backend(k)
     g._llm_inflight[r1] = 0            # request completed
-    r2 = g._select_llm_backend("", k)  # same prefix → cache hit → same card
+    r2 = g._select_llm_backend(k)  # same prefix → cache hit → same card
     assert r1 == r2
     assert g._llm_affinity_hits >= 1
 
@@ -48,12 +48,12 @@ def test_rem_pins_to_one_warm_card(monkeypatch):
 def test_nrem_avoids_protected_rem_card(monkeypatch):
     g = _fresh(monkeypatch)
     krem = g._affinity_key(_body("G" * 7000, " f1"))
-    rem = g._select_llm_backend("", krem)
+    rem = g._select_llm_backend(krem)
     g._llm_inflight[rem] = 0
-    g._select_llm_backend("", krem)    # 2nd route → hits>=2 → rem card protected
+    g._select_llm_backend(krem)    # 2nd route → hits>=2 → rem card protected
     g._llm_inflight[rem] = 0
     knrem = g._affinity_key(_body("N" * 7000, " cluster"))
-    nrem = g._select_llm_backend("", knrem)
+    nrem = g._select_llm_backend(knrem)
     assert nrem != rem                 # NREM routed to the other card, protecting the warm cache
 
 
@@ -61,8 +61,8 @@ def test_unhealthy_affine_backend_falls_back(monkeypatch):
     g = _fresh(monkeypatch)
     import time
     k = g._affinity_key(_body("G" * 7000, " f1"))
-    first = g._select_llm_backend("", k)
+    first = g._select_llm_backend(k)
     g._llm_unhealthy_until[first] = time.monotonic() + 300   # affine card in cooldown
     g._llm_inflight[first] = 0
-    second = g._select_llm_backend("", k)
+    second = g._select_llm_backend(k)
     assert second != first             # falls back to a healthy card

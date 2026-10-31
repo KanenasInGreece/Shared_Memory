@@ -19,6 +19,7 @@ import os
 import sys
 
 import pytest
+pytestmark = pytest.mark.usefixtures("chat_caller_is_consolidation")
 from yarl import URL
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "shared-memory", "scripts"))
@@ -72,78 +73,52 @@ def _body(**fields) -> bytes:
     return json.dumps(payload).encode()
 
 
-# ── C-1: free_slots must count a full-dream-roles backend ───────────────────
+# ── C-1: free_slots counts every available declared backend ─────────────────
 
-def test_c1_full_roles_backend_counts_free_slot(monkeypatch):
+def test_c1_partial_roles_backend_still_counts(monkeypatch):
+    """A leftover partial roles list does not remove the backend from free_slots."""
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
-        {"url": "http://a:5000", "roles": ["extract", "judge"]},
+        {"url": "http://a:5000", "roles": ["extract"], "n_ctx": 8192, "max_output_tokens": 2048},
     ]))
     g = _fresh(monkeypatch)
-    assert g._counts_free_slot("http://a:5000") is True
+    resp = asyncio.run(g.handle_pool_status(_req({}, b"")))
+    body = json.loads(resp.body.decode())
+    assert body["free_slots"] == 1
+    assert body["backends"]["http://a:5000"]["available"] is True
 
 
-def test_c1_partial_roles_backend_does_not_count(monkeypatch):
+def test_c1_private_ok_false_still_counts(monkeypatch):
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
-        {"url": "http://a:5000", "roles": ["extract"]},
+        {"url": "http://a:5000", "private_ok": True, "n_ctx": 8192, "max_output_tokens": 2048},
+        {"url": "http://b:4000", "private_ok": False, "n_ctx": 8192, "max_output_tokens": 2048},
     ]))
     g = _fresh(monkeypatch)
-    assert g._counts_free_slot("http://a:5000") is False
-
-
-def test_c1_serves_all_still_counts_and_private_false_roleless_does_not(monkeypatch):
-    monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
-        {"url": "http://a:5000", "private_ok": True},
-        {"url": "http://b:4000", "private_ok": False},
-    ]))
-    g = _fresh(monkeypatch)
-    assert g._counts_free_slot("http://a:5000") is True
-    assert g._counts_free_slot("http://b:4000") is False
+    resp = asyncio.run(g.handle_pool_status(_req({}, b"")))
+    body = json.loads(resp.body.decode())
+    assert body["free_slots"] == 2
+    assert body["backends"]["http://b:4000"]["available"] is True
 
 
 def test_c1_pool_status_free_slots_nonzero_for_all_declared_fleet(monkeypatch):
-    """The exact probe from the security review: one idle backend declaring
-    every dream role must yield free_slots == 1, not 0."""
+    """One idle declared backend yields free_slots == 1. Role display keys are gone."""
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
-        {"url": "http://a:5000", "roles": ["extract", "judge"]},
+        {"url": "http://a:5000", "roles": ["extract", "judge"], "n_ctx": 8192, "max_output_tokens": 2048},
     ]))
     g = _fresh(monkeypatch)
     resp = asyncio.run(g.handle_pool_status(_req({}, b"")))
     body = json.loads(resp.body.decode())
     assert body["free_slots"] == 1
     entry = body["backends"]["http://a:5000"]
-    assert entry["counts_free_slot"] is True
-    assert entry["serves_all"] is False   # additive display unchanged in meaning
-
-
-def test_c1_startup_warning_when_no_dream_slot_possible(monkeypatch, caplog):
-    monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
-        {"url": "http://a:5000", "roles": ["extract"]},
-    ]))
-    g = _fresh(monkeypatch)
-    import logging
-    with caplog.at_level(logging.WARNING):
-        g.warn_if_dream_slots_impossible()
-    assert any("free_slots" in r.message and "NEVER run" in r.message
-               for r in caplog.records)
-
-
-def test_c1_no_warning_when_a_dream_slot_exists(monkeypatch, caplog):
-    monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
-        {"url": "http://a:5000", "roles": ["extract"]},
-        {"url": "http://b:4000", "private_ok": True},
-    ]))
-    g = _fresh(monkeypatch)
-    import logging
-    with caplog.at_level(logging.WARNING):
-        g.warn_if_dream_slots_impossible()
-    assert not any("NEVER run" in r.message for r in caplog.records)
+    assert entry["available"] is True
+    assert "counts_free_slot" not in entry
+    assert "serves_all" not in entry
 
 
 # ── R-1: 503 backend_at_capacity gets its own counter ───────────────────────
 
 def test_r1_capacity_503_increments_counter_and_last_ts(monkeypatch):
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
-        {"url": "http://a:5000", "max_inflight": 1, "private_ok": True},
+        {"url": "http://a:5000", "max_inflight": 1, "private_ok": True, "n_ctx": 8192, "max_output_tokens": 2048},
     ]))
     monkeypatch.setenv("LLM_MAX_INFLIGHT_WAIT_S", "0.05")
     g = _fresh(monkeypatch)
@@ -175,37 +150,44 @@ def test_r1_counter_surfaced_on_health(monkeypatch):
     ("max_inflight", 0), ("max_inflight", -1), ("max_inflight", True),
     ("n_ctx", 0), ("n_ctx", -5), ("n_ctx", True),
 ])
-def test_r2_invalid_int_descriptor_excludes_backend(monkeypatch, field, value):
+def test_r2_invalid_int_descriptor_is_a_declaration_fatal(monkeypatch, field, value):
+    """An invalid int is a declaration FATAL for the whole file. The sibling entry does not load."""
+    bad = {"url": "http://bad:5000", "n_ctx": 8192, "max_output_tokens": 2048}
+    bad[field] = value
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
-        {"url": "http://bad:5000", field: value},
-        {"url": "http://good:4000"},
+        bad,
+        {"url": "http://good:4000", "n_ctx": 8192, "max_output_tokens": 2048},
     ]))
     g = _fresh(monkeypatch)
-    assert "http://bad:5000" not in g.LLM_BACKENDS
-    assert g.LLM_BACKENDS == ["http://good:4000"]
-
-
-# ── R-3: empty roles list refuses startup ───────────────────────────────────
-
-def test_r3_empty_roles_list_refuses_startup(monkeypatch):
-    monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
-        {"url": "http://a:5000", "roles": []},
-    ]))
-    g = _fresh(monkeypatch)
-    with pytest.raises(SystemExit) as e:
+    assert g.LLM_BACKENDS == []
+    with pytest.raises(SystemExit) as exc:
         g.require_valid_llm_routing_config()
-    assert "EMPTY" in str(e.value)
+    assert exc.value.code == 78
+    assert f"field {field}" in str(exc.value)
+    assert "http://bad:5000" in str(exc.value)
 
 
-def test_r3_empty_roles_does_not_sidestep_m5(monkeypatch):
-    """The security probe: a credentialed backend with roles: [] must still
-    refuse startup (previously it slipped past M-5's `is None` test and the
-    backend silently went eligible-for-nothing)."""
+# ── R-3: an empty roles list is a leftover, not a refusal ───────────────────
+
+def test_r3_empty_roles_list_loads(monkeypatch, caplog):
+    monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
+        {"url": "http://a:5000", "roles": [], "n_ctx": 8192, "max_output_tokens": 2048},
+    ]))
+    import logging
+    with caplog.at_level(logging.WARNING, logger="hive-proxy"):
+        g = _fresh(monkeypatch)
+        g.require_valid_llm_routing_config()
+    assert g.LLM_BACKENDS == ["http://a:5000"]
+    assert any("ignores leftover key roles" in r.message for r in caplog.records)
+
+
+def test_r3_empty_roles_on_a_credentialed_backend_loads(monkeypatch):
+    """roles: [] does not refuse a credentialed backend. The provider key stays out of the refusal text because there is no refusal."""
     monkeypatch.setenv("SM_TEST_PROVIDER_KEY", "k")
     monkeypatch.setenv("AGENT_TOKENS", "tester:tok")
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
         {"url": "https://api.example.com/v1", "token_env": "SM_TEST_PROVIDER_KEY",
-         "roles": []},
+         "roles": [], "n_ctx": 8192, "max_output_tokens": 2048},
     ]))
     import secure_env
     secure_env._secrets.pop("AGENT_TOKENS", None)
@@ -213,15 +195,16 @@ def test_r3_empty_roles_does_not_sidestep_m5(monkeypatch):
     importlib.reload(coordinator)
     import hive_mind_proxy as g
     importlib.reload(g)
-    with pytest.raises(SystemExit):
-        g.require_valid_llm_routing_config()
+    g.require_valid_llm_routing_config()
+    assert g.LLM_BACKENDS == ["https://api.example.com/v1"]
+    assert "k" not in json.dumps(g.LLM_DECLARATION_ERRORS)
 
 
 # ── R-4: waiter cap + doomed-route pre-wait denial ──────────────────────────
 
 def test_r4_waiter_cap_immediate_503_beyond_cap(monkeypatch):
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
-        {"url": "http://a:5000", "max_inflight": 1, "private_ok": True},
+        {"url": "http://a:5000", "max_inflight": 1, "private_ok": True, "n_ctx": 8192, "max_output_tokens": 2048},
     ]))
     monkeypatch.setenv("LLM_MAX_INFLIGHT_WAIT_S", "5")
     g = _fresh(monkeypatch)
@@ -241,7 +224,7 @@ def test_r4_waiter_cap_immediate_503_beyond_cap(monkeypatch):
 
 def test_r4_waiter_count_released_after_wait(monkeypatch):
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
-        {"url": "http://a:5000", "max_inflight": 1, "private_ok": True},
+        {"url": "http://a:5000", "max_inflight": 1, "private_ok": True, "n_ctx": 8192, "max_output_tokens": 2048},
     ]))
     monkeypatch.setenv("LLM_MAX_INFLIGHT_WAIT_S", "0.05")
     g = _fresh(monkeypatch)
@@ -276,42 +259,37 @@ def test_r4_doomed_route_denied_before_any_wait(monkeypatch):
     assert resp.status == 403
 
 
-def test_r4_mixed_fleet_not_doomed_falls_through(monkeypatch):
-    """With an uncredentialed eligible backend present, the same
-    non-allowlisted route proceeds (selection picks the local one)."""
+def test_r4_mixed_fleet_still_refuses_a_non_chat_path(monkeypatch):
+    """A non-chat path is refused before selection, including when a local backend is declared."""
     monkeypatch.setenv("SM_TEST_PROVIDER_KEY", "k")
-    # local FIRST: at equal inflight the least-inflight tie-break keeps pool
-    # order, so selection deterministically picks the uncredentialed backend
-    # (if it picked the credentialed one, the post-selection S-04 check would
-    # 403 — pre-existing behavior, not the doomed-denial under test here).
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
-        {"url": "http://local:5000", "private_ok": True},
+        {"url": "http://local:5000", "n_ctx": 8192, "max_output_tokens": 2048},
         {"url": "https://api.example.com/v1", "token_env": "SM_TEST_PROVIDER_KEY",
-         "private_ok": True},
+         "n_ctx": 8192, "max_output_tokens": 2048},
     ]))
     g = _fresh(monkeypatch)
 
     class _S:
         closed = False
-        captured_url = None
+        called = False
 
         def request(self, method, url, **kw):
-            _S.captured_url = url
-            raise RuntimeError("capture only")
+            _S.called = True
+            raise AssertionError("a non-chat path must not reach upstream")
     proxy = g.AsyncHiveMindProxy()
     proxy.session = _S()
     resp = asyncio.run(proxy.handle_proxy(
         _req({}, _body(), method="GET", path="/v1/models")))
-    # not the 403 doomed-denial; the attempt reached upstream selection
-    assert resp.status != 403
-    assert _S.captured_url is not None and _S.captured_url.startswith("http://local:5000")
+    assert resp.status == 403
+    assert "framework endpoints" in resp.body.decode()
+    assert _S.called is False
 
 
 # ── R-5: fit-422 carries the estimate ───────────────────────────────────────
 
 def test_r5_fit_422_names_the_estimate(monkeypatch):
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
-        {"url": "http://a:5000", "n_ctx": 100, "private_ok": True},
+        {"url": "http://a:5000", "n_ctx": 100, "private_ok": True, "max_output_tokens": 2048},
     ]))
     g = _fresh(monkeypatch)
     proxy = g.AsyncHiveMindProxy()
@@ -329,21 +307,29 @@ def test_r5_fit_422_names_the_estimate(monkeypatch):
     assert body["est_prompt_tokens"] > 100   # sanity: bigger than n_ctx
 
 
-def test_r5_role_422_body_gains_only_the_additive_declaration_key(monkeypatch):
-    """W4 (§5, Ruling C(α)/E(α2), was
-    test_r5_role_422_body_shape_unchanged): the three ORIGINAL keys are
-    still exactly unchanged; the body now ALSO carries the additive
-    `declaration` key for this undeclared, roles-only fleet."""
+def test_r5_a_role_header_does_not_refuse(monkeypatch):
+    """A leftover role header is not a routing constraint. The call reaches the declared backend."""
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
-        {"url": "http://a:5000", "roles": ["extract"]},
+        {"url": "http://a:5000", "roles": ["extract"], "n_ctx": 8192, "max_output_tokens": 2048},
     ]))
     g = _fresh(monkeypatch)
+
+    class _S:
+        closed = False
+        url = None
+
+        def request(self, method, url, **kw):
+            _S.url = url
+            raise RuntimeError("capture only")
     proxy = g.AsyncHiveMindProxy()
-    proxy.session = _RaisingSession()
+    proxy.session = _S()
     resp = asyncio.run(proxy.handle_proxy(_req({"X-SM-LLM-Role": "judge"}, _body())))
     body = json.loads(resp.body.decode())
-    assert body == {"error": "no_eligible_backend", "constraint": "role", "role": "judge",
-                     "declaration": "no_role_less_opt_in"}
+    assert resp.status != 422
+    assert body.get("constraint") != "role"
+    assert "declaration" not in body
+    assert "role" not in body
+    assert _S.url is not None and _S.url.startswith("http://a:5000")
 
 
 # ── R-6: operator-declared extra steer-permitted names ──────────────────────
@@ -371,35 +357,4 @@ def test_opt_poll_interval_floor(monkeypatch):
     assert g.LLM_MAX_INFLIGHT_POLL_S == 0.05
 
 
-def test_opt_unknown_role_warned_once_per_value(monkeypatch, caplog):
-    monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
-        {"url": "http://a:5000"},
-    ]))
-    g = _fresh(monkeypatch)
-    import logging
-    with caplog.at_level(logging.WARNING):
-        g._warn_unknown_role_once("summarise")
-        g._warn_unknown_role_once("summarise")
-        g._warn_unknown_role_once("chat")
-    msgs = [r.message for r in caplog.records if "not a known routing role" in r.message]
-    assert len(msgs) == 2   # one per DISTINCT value, not per call
 
-
-def test_opt_routed_role_counted_at_dispatch_not_selection(monkeypatch):
-    """A request refused at S-04 AFTER selection must not bump the per-role
-    routed counter — the counter now lives beside the inflight increment."""
-    monkeypatch.setenv("SM_TEST_PROVIDER_KEY", "k")
-    monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
-        {"url": "https://api.example.com/v1", "token_env": "SM_TEST_PROVIDER_KEY",
-         "roles": ["extract"]},
-    ]))
-    g = _fresh(monkeypatch)
-    before = g._llm_routed_by_role["extract"]
-    proxy = g.AsyncHiveMindProxy()
-    proxy.session = _RaisingSession()
-    # extract-role traffic on a non-allowlisted route: eligible (role listed),
-    # doomed (only credentialed backends) → 403 pre-dispatch
-    resp = asyncio.run(proxy.handle_proxy(
-        _req({"X-SM-LLM-Role": "extract"}, _body(), method="GET", path="/v1/models")))
-    assert resp.status == 403
-    assert g._llm_routed_by_role["extract"] == before

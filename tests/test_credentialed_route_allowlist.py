@@ -3,8 +3,9 @@ credentialed backend (one with a resolved token_env) may only be POST to a
 framework-owned endpoint. Everything else gets 403 before any upstream call
 is attempted, plus one credential-audit line — never the key itself.
 
-Binds ONLY the credentialed branch: an uncredentialed backend (no token_env)
-keeps today's full pass-through, unaffected.
+The chat handler admits only the exact path with no query, credentialed or not.
+An arbitrary path or a query is refused before a provider key is attached.
+GET is the router's 405, also before the handler.
 
 Reload pattern (coordinator then hive_mind_proxy) mirrors tests/test_llm_
 fault_origin.py's proven approach for tests that need a real credential-
@@ -16,6 +17,7 @@ import os
 import sys
 
 import pytest
+pytestmark = pytest.mark.usefixtures("chat_caller_is_consolidation")
 from yarl import URL
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "shared-memory", "scripts"))
@@ -103,7 +105,7 @@ def _load_credentialed_gateway(monkeypatch):
     monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-allowlist-test")
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
         {"url": "https://api.deepseek.com/v1", "token_env": "DEEPSEEK_API_KEY",
-         "model": "deepseek-chat", "private_ok": True},
+         "model": "deepseek-chat", "private_ok": True, "n_ctx": 8192, "max_output_tokens": 2048},
     ]))
     import hive_mind_proxy as g
     importlib.reload(g)
@@ -128,17 +130,41 @@ def test_post_chat_completions_to_credentialed_backend_passes(monkeypatch):
 
 
 def test_get_to_credentialed_backend_403s_before_any_upstream_call(monkeypatch):
+    """GET never enters the chat handler. The router returns 405, stamped as the gateway, with no upstream call and no key in the body."""
+    from aiohttp import web
+    from aiohttp.test_utils import TestClient, TestServer
+    import coordinator
+
     g = _load_credentialed_gateway(monkeypatch)
+    # A prior test can leave coordinator.AUTH_CONFIGURED_AT_STARTUP true after
+    # its own env is restored. This GET is anonymous; reload so the middleware
+    # matches a process with no operator tokens, and the router can return 405.
+    monkeypatch.delenv("AGENT_TOKENS", raising=False)
+    import secure_env
+    secure_env._secrets.pop("AGENT_TOKENS", None)
+    importlib.reload(coordinator)
     proxy = g.AsyncHiveMindProxy()
     proxy.session = _MustNotCallSession()
-    _forbid_selection(monkeypatch, g)
-    resp = asyncio.run(proxy.handle_proxy(_req("GET", "/v1/chat/completions")))
-    assert resp.status == 403
-    body = json.loads(resp.body.decode())
-    assert "sk-allowlist-test" not in json.dumps(body)
-    # Honest, non-leaky: names the RULE, not the backend roster.
-    assert "framework endpoints" in body["error"]
-    assert "deepseek" not in body["error"].lower()
+    app = web.Application(middlewares=[coordinator.auth_middleware])
+    app["proxy"] = proxy
+    app.router.add_post("/v1/chat/completions", proxy.handle_proxy)
+
+    async def scenario():
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            resp = await client.get("/v1/chat/completions")
+            body = await resp.read()
+            return resp.status, dict(resp.headers), body
+        finally:
+            await client.close()
+
+    status, headers, body = asyncio.run(scenario())
+    assert status == 405
+    assert headers.get("X-SM-Fault-Origin") == "gateway"
+    assert "POST" in (headers.get("Allow") or "")
+    assert b"sk-allowlist-test" not in body
+    assert b"deepseek" not in body.lower()
 
 
 def test_s5_model_mismatch_is_refused_before_any_upstream_call(monkeypatch):
@@ -200,20 +226,42 @@ def test_arbitrary_path_to_credentialed_backend_403s(monkeypatch):
     assert resp.status == 403
 
 
-def test_uncredentialed_backend_keeps_full_pass_through(monkeypatch):
-    """The allowlist binds ONLY the credentialed branch -- a local backend
-    with no token_env is unaffected, same as before this change."""
+def test_uncredentialed_backend_refuses_an_arbitrary_path(monkeypatch):
+    """An arbitrary path is refused before selection, with or without a provider key."""
     monkeypatch.delenv("LLM_BACKENDS", raising=False)
-    monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([{"url": "http://a:5000", "private_ok": True}]))
+    monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([{"url": "http://a:5000", "private_ok": True, "n_ctx": 8192, "max_output_tokens": 2048}]))
     import hive_mind_proxy as g
     importlib.reload(g)
 
     proxy = g.AsyncHiveMindProxy()
-    session = _HeaderCaptureSession()
-    proxy.session = session
+    proxy.session = _MustNotCallSession()
+    _forbid_selection(monkeypatch, g)
     resp = asyncio.run(proxy.handle_proxy(_req("GET", "/some/arbitrary/path")))
-    assert resp.status != 403
-    assert session.captured_headers is not None
+    assert resp.status == 403
+    body = json.loads(resp.body.decode())
+    assert "framework endpoints" in body["error"]
+
+
+def test_bad_spelling_without_a_provider_key_does_not_bump_the_counter(monkeypatch, tmp_path):
+    """Auth-off, no provider key: a bad spelling is still 403, and the monitor counter stays put."""
+    log_path = tmp_path / "credential-audit.jsonl"
+    monkeypatch.setenv("CREDENTIAL_AUDIT_LOG_PATH", str(log_path))
+    monkeypatch.delenv("AGENT_TOKENS", raising=False)
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+    monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
+        {"url": "http://127.0.0.1:9", "n_ctx": 8192, "max_output_tokens": 2048},
+    ]))
+    import coordinator
+    importlib.reload(coordinator)
+    import hive_mind_proxy as g
+    importlib.reload(g)
+    proxy = g.AsyncHiveMindProxy()
+    proxy.session = _MustNotCallSession()
+    resp = asyncio.run(proxy.handle_proxy(_req("POST", "/v1/chat/completions?x=1")))
+    assert resp.status == 403
+    assert coordinator._credential_counters["credentialed_route_denied"] == 0
+    if log_path.exists():
+        assert "credentialed_route_denied" not in log_path.read_text()
 
 
 def test_denied_route_bumps_credential_counter_and_writes_audit_line(monkeypatch, tmp_path):
@@ -221,7 +269,7 @@ def test_denied_route_bumps_credential_counter_and_writes_audit_line(monkeypatch
     monkeypatch.setenv("CREDENTIAL_AUDIT_LOG_PATH", str(log_path))
     monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-allowlist-test")
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
-        {"url": "https://api.deepseek.com/v1", "token_env": "DEEPSEEK_API_KEY", "private_ok": True},
+        {"url": "https://api.deepseek.com/v1", "token_env": "DEEPSEEK_API_KEY", "private_ok": True, "n_ctx": 8192, "max_output_tokens": 2048},
     ]))
     import coordinator
     importlib.reload(coordinator)
@@ -369,9 +417,10 @@ def _load_mixed_fleet(monkeypatch):
     monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-allowlist-test")
     monkeypatch.delenv("LLM_BACKENDS", raising=False)
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
-        {"url": "http://local:5000", "private_ok": True},
+        {"url": "http://local:5000", "private_ok": True, "n_ctx": 8192, "max_output_tokens": 2048},
         {"url": _CREDENTIALED_URL, "token_env": "DEEPSEEK_API_KEY",
-         "model": "deepseek-chat", "private_ok": True},
+         "model": "deepseek-chat", "private_ok": True,
+         "n_ctx": 8192, "max_output_tokens": 2048},
     ]))
     import hive_mind_proxy as g
     importlib.reload(g)
@@ -433,22 +482,20 @@ def test_s04_denies_a_query_string_on_an_allowed_credentialed_route(monkeypatch)
         "S-04 (post-selection) must deny a query on a credentialed route")
 
 
-def test_an_uncredentialed_backend_still_accepts_a_query(monkeypatch):
-    """R-B binds the CREDENTIALED branch only (ADV2-8). A local backend with
-    no key keeps today's full pass-through, query and all — the same
-    boundary the rest of this file draws."""
+def test_an_uncredentialed_backend_refuses_a_query(monkeypatch):
+    """A query is refused before a credential is attached, including when the backend has no key."""
     monkeypatch.delenv("LLM_BACKENDS", raising=False)
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps(
-        [{"url": "http://a:5000", "private_ok": True}]))
+        [{"url": "http://a:5000", "private_ok": True, "n_ctx": 8192, "max_output_tokens": 2048}]))
     import hive_mind_proxy as g
     importlib.reload(g)
 
     proxy = g.AsyncHiveMindProxy()
-    session = _HeaderCaptureSession()
-    proxy.session = session
+    proxy.session = _MustNotCallSession()
+    _forbid_selection(monkeypatch, g)
     resp = asyncio.run(proxy.handle_proxy(_req("POST", "/v1/chat/completions?x=y")))
-    assert resp.status != 403
-    assert session.captured_headers is not None
+    assert resp.status == 403
+    assert "framework endpoints" in json.loads(resp.body.decode())["error"]
 
 
 # ── QA-1 (HYG fix round): the audit line must explain the denial it records ──

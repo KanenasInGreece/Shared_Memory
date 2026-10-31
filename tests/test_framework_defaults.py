@@ -76,12 +76,13 @@ def test_reranker_url_default_value():
     assert framework_defaults.FRAMEWORK_DEFAULTS["RERANKER_URL"]["default"] == "http://localhost:8071"
 
 
-def test_llm_default_target_default_value():
-    assert framework_defaults.FRAMEWORK_DEFAULTS["LLM_DEFAULT_TARGET"]["default"] == "http://localhost:5000"
+def test_llm_default_target_is_not_a_framework_default():
+    """LLM_BACKENDS_JSON is the only declaration. A leftover default target is not a row."""
+    assert "LLM_DEFAULT_TARGET" not in framework_defaults.FRAMEWORK_DEFAULTS
 
 
-def test_llm_backends_default_value_is_empty_string():
-    assert framework_defaults.FRAMEWORK_DEFAULTS["LLM_BACKENDS"]["default"] == ""
+def test_llm_backends_csv_is_not_a_framework_default():
+    assert "LLM_BACKENDS" not in framework_defaults.FRAMEWORK_DEFAULTS
 
 
 def test_neo4j_uri_documented_default_value():
@@ -134,9 +135,9 @@ def test_embedder_and_reranker_use_the_or_idiom():
     assert framework_defaults.FRAMEWORK_DEFAULTS["RERANKER_URL"]["idiom"] == "or"
 
 
-def test_llm_default_target_and_llm_backends_use_the_get_idiom():
-    assert framework_defaults.FRAMEWORK_DEFAULTS["LLM_DEFAULT_TARGET"]["idiom"] == "get"
-    assert framework_defaults.FRAMEWORK_DEFAULTS["LLM_BACKENDS"]["idiom"] == "get"
+def test_llm_default_target_and_llm_backends_are_absent():
+    assert "LLM_DEFAULT_TARGET" not in framework_defaults.FRAMEWORK_DEFAULTS
+    assert "LLM_BACKENDS" not in framework_defaults.FRAMEWORK_DEFAULTS
 
 
 # ── Per-edited-consumer: effective default == table value, env unset ───────
@@ -187,14 +188,15 @@ def test_proxy_embedder_reranker_defaults_match_the_table(monkeypatch):
     assert mod.RERANKER_URL == framework_defaults.FRAMEWORK_DEFAULTS["RERANKER_URL"]["default"]
 
 
-def test_proxy_default_target_matches_the_table_when_llm_default_target_unset(monkeypatch):
+def test_proxy_has_no_default_target_when_nothing_is_declared(monkeypatch):
     mod = _reload_proxy(monkeypatch)
-    assert mod.DEFAULT_TARGET == framework_defaults.FRAMEWORK_DEFAULTS["LLM_DEFAULT_TARGET"]["default"]
+    assert not hasattr(mod, "DEFAULT_TARGET")
+    assert mod.LLM_BACKENDS == []
 
 
-def test_proxy_llm_backends_falls_back_to_default_target_when_llm_backends_unset(monkeypatch):
+def test_proxy_llm_backends_stay_empty_when_the_legacy_names_are_unset(monkeypatch):
     mod = _reload_proxy(monkeypatch)
-    assert mod.LLM_BACKENDS == [framework_defaults.FRAMEWORK_DEFAULTS["LLM_DEFAULT_TARGET"]["default"]]
+    assert mod.LLM_BACKENDS == []
 
 
 # ── Empty-string idiom pins — one per NEWLY-edited site ─────────────────────
@@ -202,32 +204,20 @@ def test_proxy_llm_backends_falls_back_to_default_target_when_llm_backends_unset
 # byte-identical, by test_coordinator_encoder_urls.py:44/:71-72 — not
 # duplicated here.)
 
-def test_llm_default_target_empty_value_is_honoured_as_empty_not_the_default(monkeypatch):
-    """'get' idiom: LLM_DEFAULT_TARGET= (present but EMPTY) resolves to the
-    empty string, NOT the table default — pinned as the exact current behaviour
-    (see framework_defaults.py's own row note)."""
-    mod = _reload_proxy(monkeypatch, LLM_DEFAULT_TARGET="")
-    assert mod.DEFAULT_TARGET == ""
+def test_legacy_default_target_is_ignored(monkeypatch):
+    """A leftover LLM_DEFAULT_TARGET does not become a backend."""
+    mod = _reload_proxy(monkeypatch, LLM_DEFAULT_TARGET="http://localhost:5000")
+    assert mod.LLM_BACKENDS == []
 
 
-def test_llm_backends_empty_value_produces_an_empty_pool_list(monkeypatch):
-    """'get' idiom + the empty-string split/filter: LLM_BACKENDS= (present
-    but EMPTY) parses to no entries, so the empty-fallback branch fires and
-    the pool becomes [DEFAULT_TARGET] — same shape as LLM_BACKENDS unset."""
-    mod = _reload_proxy(monkeypatch, LLM_BACKENDS="")
-    assert mod.LLM_BACKENDS == [framework_defaults.FRAMEWORK_DEFAULTS["LLM_DEFAULT_TARGET"]["default"]]
+def test_legacy_csv_is_ignored(monkeypatch):
+    mod = _reload_proxy(monkeypatch, LLM_BACKENDS="http://a:5000")
+    assert mod.LLM_BACKENDS == []
 
 
-def test_known_latent_both_llm_default_target_and_llm_backends_empty_yields_backends_of_empty_string(monkeypatch):
-    """The composed KNOWN LATENT documented in framework_defaults.py's
-    LLM_DEFAULT_TARGET row: LLM_DEFAULT_TARGET= (present-but-empty, 'get'
-    idiom keeps it "") AND LLM_BACKENDS unset/empty (falls back to
-    [DEFAULT_TARGET] verbatim) composes into LLM_BACKENDS == [""] — a
-    latent the code does not fix today; this pins it AS-IS, per the brief,
-    rather than silently changing behaviour."""
-    mod = _reload_proxy(monkeypatch, LLM_DEFAULT_TARGET="")
-    assert mod.DEFAULT_TARGET == ""
-    assert mod.LLM_BACKENDS == [""]
+def test_both_legacy_names_empty_leave_the_pool_empty(monkeypatch):
+    mod = _reload_proxy(monkeypatch, LLM_DEFAULT_TARGET="", LLM_BACKENDS="")
+    assert mod.LLM_BACKENDS == []
 
 
 # ── Binding-time guard — reads stay MODULE-LEVEL, never a runtime lookup ───
@@ -267,7 +257,8 @@ def test_proxy_encoder_and_default_target_reads_are_module_level():
     src = inspect.getsource(hive_mind_proxy)
     assert _assigned_at_module_level(src, "EMBEDDER_URL")
     assert _assigned_at_module_level(src, "RERANKER_URL")
-    assert _assigned_at_module_level(src, "DEFAULT_TARGET")
+    # LLM_DEFAULT_TARGET is not a source. The name must not come back as a module global.
+    assert not _assigned_at_module_level(src, "DEFAULT_TARGET")
 
 
 def test_proxy_llm_backends_is_bound_once_at_module_level_via_tuple_unpack():

@@ -31,6 +31,7 @@ import re
 import sys
 
 import pytest
+pytestmark = pytest.mark.usefixtures("chat_caller_is_consolidation")
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 from yarl import URL
@@ -95,7 +96,7 @@ def _load_gateway(monkeypatch, *, backends=None):
     monkeypatch.delenv("LLM_BACKENDS", raising=False)
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps(
         backends if backends is not None
-        else [{"url": _LLM_BACKEND, "private_ok": True}]))
+        else [{"url": _LLM_BACKEND, "n_ctx": 8192, "max_output_tokens": 2048}]))
     import secure_env
     secure_env._secrets.pop("AGENT_TOKENS", None)
     import coordinator
@@ -124,9 +125,8 @@ def _build_app_like_main(c, g, proxy):
     app.router.add_get("/pool/status", g.handle_pool_status)
     app.router.add_post("/v1/embeddings", proxy.handle_encoder)
     app.router.add_post("/v1/reranking", proxy.handle_encoder)
-    proxy.set_known_routes(app.router)
+    app.router.add_post("/v1/chat/completions", proxy.handle_proxy)
     c.require_unprotected_paths_are_plain_routes(app.router)
-    app.router.add_route("*", "/{tail:.*}", proxy.handle_proxy)
     return app
 
 
@@ -190,7 +190,7 @@ def test_no_credential_is_ever_attached_on_the_encoder_path(monkeypatch):
     (status, _, _), _ = _probe_with(
         monkeypatch, session, "POST", "/v1/embeddings",
         backends=[{"url": "https://api.deepseek.com/v1",
-                   "token_env": "DEEPSEEK_API_KEY", "private_ok": True}])
+                   "token_env": "DEEPSEEK_API_KEY", "private_ok": True, "n_ctx": 8192, "max_output_tokens": 2048}])
     assert session.captured is not None
     assert "Authorization" not in (session.headers or {})
     assert "sk-encoder-must-not-see-this" not in json.dumps(dict(session.headers or {}))
@@ -214,7 +214,6 @@ def test_wrong_method_on_an_encoder_path_is_405_with_allow_post(monkeypatch):
     assert status == 405, f"got {status} {body!r} — the route is not registered"
     assert headers.get("Allow") == "POST"
     assert headers.get("X-SM-Fault-Origin") == "gateway"
-    assert b"NOT forwarded" in body
 
 
 def test_trailing_slash_encoder_spelling_is_404_not_forwarded(monkeypatch):
@@ -226,8 +225,6 @@ def test_trailing_slash_encoder_spelling_is_404_not_forwarded(monkeypatch):
         monkeypatch, _MustNotCallSession(), "POST", "/v1/embeddings/")
     assert status == 404, f"got {status} {body!r}"
     assert headers.get("X-SM-Fault-Origin") == "gateway"
-    assert b"near-miss spelling" in body
-    assert b"registers /v1/embeddings exactly" in body
 
 
 @pytest.mark.parametrize("spelling", ["/v1/embedding%73", "/v1/rerankin%67"])
@@ -259,9 +256,8 @@ def test_encoded_slash_encoder_spelling_is_405_never_the_encoder(monkeypatch, sp
     the known key, and stops it unconditionally."""
     (status, headers, body), _ = _probe_with(
         monkeypatch, _MustNotCallSession(), "POST", spelling)
-    assert status == 405, f"{spelling} → {status} {body!r}"
-    assert headers.get("Allow") == "POST"
-    assert b"NOT forwarded" in body
+    assert status == 404, f"{spelling} → {status} {body!r}"
+    assert headers.get("X-SM-Fault-Origin") == "gateway"
 
 
 @pytest.mark.parametrize("spelling", [
@@ -280,8 +276,6 @@ def test_encoder_prefix_near_miss_is_404_never_an_llm_dispatch(monkeypatch, spel
         monkeypatch, _MustNotCallSession(), "POST", spelling)
     assert status == 404, f"{spelling} → {status} {body!r}"
     assert headers.get("X-SM-Fault-Origin") == "gateway"
-    assert b"NOT forwarded to any LLM backend" in body
-    assert b"X-SM-LLM-Backend" not in body
     assert headers.get("X-SM-LLM-Backend") is None
 
 
@@ -321,7 +315,6 @@ def test_a_raw_traversal_spelling_of_an_encoder_path_is_404(monkeypatch):
     app = _build_app_like_main(c, g, proxy)
     raw = _run(_raw_probe(app, "POST", "/v1/embeddings/../x"))
     assert raw.startswith(b"HTTP/1.1 404"), raw[:200]
-    assert b"NOT forwarded to any LLM backend" in raw
     assert b"X-SM-LLM-Backend" not in raw
 
 
@@ -336,42 +329,33 @@ def test_llm_passthrough_is_untouched(monkeypatch):
     assert session.captured[1].startswith(_LLM_BACKEND)
 
 
-def test_a_non_framework_path_outside_the_encoder_prefixes_still_dispatches(monkeypatch):
-    """`_encoder_near_miss` must key on the encoder paths only — an ordinary
-    passthrough path that merely lives under /v1/ is not a near-miss."""
+def test_a_non_framework_path_is_not_forwarded(monkeypatch):
+    """Only the chat route and the two encoder routes are proxied. /v1/models is aiohttp's 404."""
     session = _CapturingSession()
-    (status, _, body), _ = _probe_with(monkeypatch, session, "POST", "/v1/models")
-    assert session.captured is not None, f"refused a legitimate passthrough: {status} {body!r}"
+    (status, headers, body), _ = _probe_with(monkeypatch, session, "POST", "/v1/models")
+    assert session.captured is None, f"forwarded a non-framework path: {status} {body!r}"
+    assert status == 404
+    assert headers.get("X-SM-Fault-Origin") == "gateway"
 
 
-def test_encoder_near_miss_helper_is_pure_and_total(monkeypatch):
-    """The helper on its own, so a mutation of the pure function is visible
-    without a socket. Values, not shapes (fact:1309)."""
+def test_encoder_near_miss_helper_is_gone(monkeypatch):
+    """The router owns near-misses. A helper that classifies them would be a second opinion."""
     _, g = _load_gateway(monkeypatch)
-    assert g._encoder_near_miss("/v1/embeddings") is None      # the exact path is a ROUTE
-    assert g._encoder_near_miss("/v1/chat/completions") is None
-    assert g._encoder_near_miss("/") is None
-    assert g._encoder_near_miss("/v1/embeddingsX") == "/v1/embeddings"
-    assert g._encoder_near_miss("/v1/embeddings/") == "/v1/embeddings"
-    assert g._encoder_near_miss("/v1/embeddings/../x") == "/v1/embeddings"
-    assert g._encoder_near_miss("/v1/rerankingZ") == "/v1/reranking"
+    assert not hasattr(g, "_encoder_near_miss")
+    assert not hasattr(g.AsyncHiveMindProxy, "_route_guard")
 
 
 def test_the_encoder_routes_are_plain_resources(monkeypatch):
-    """The guard's near-miss branch only looks at STATIC keys, and
-    require_unprotected_paths_are_plain_routes has the same requirement of
-    everything it inspects. A dynamic encoder route would silently drop out
-    of the trailing-slash refusal above."""
+    """A dynamic encoder route would match spellings the exact POST must not."""
     c, g = _load_gateway(monkeypatch)
     proxy = g.AsyncHiveMindProxy()
     app = _build_app_like_main(c, g, proxy)
+    found = {}
+    for route in app.router.routes():
+        if route.method == "POST":
+            found.setdefault(route.resource.canonical, set()).add(route.method)
     for key in ("/v1/embeddings", "/v1/reranking"):
-        assert key in proxy._known_routes, f"{key} missing from the route snapshot"
-        assert proxy._known_routes[key]["pattern"] is None, (
-            f"{key} registered as a DynamicResource — the guard's near-miss "
-            f"branch skips patterns, so its trailing-slash spelling would be "
-            f"forwarded to the LLM pool")
-        assert proxy._known_routes[key]["methods"] == {"POST"}
+        assert found.get(key) == {"POST"}, found
 
 
 def test_handle_proxy_no_longer_routes_on_a_path_prefix(monkeypatch):
@@ -412,7 +396,7 @@ def _registrations(source: str) -> set:
 def _main_registration_window() -> str:
     src = open(PROXY_SRC_PATH, encoding="utf-8").read()
     start = src.index("attach_coordinator(app, coordinator)")
-    end = src.index("proxy.set_known_routes(app.router)")
+    end = src.index("require_unprotected_paths_are_plain_routes(app.router)")
     assert start < end
     return src[start:end]
 
@@ -444,7 +428,7 @@ def test_every_main_route_registration_has_a_counterpart_in_each_test_mirror(pat
     assert got == expected, (
         f"{os.path.basename(path)}::{helper} registers {sorted(got)}, "
         f"hive_mind_proxy.main() registers {sorted(expected)} between "
-        f"attach_coordinator and set_known_routes. Mirror it exactly.")
+        f"attach_coordinator and require_unprotected_paths_are_plain_routes. Mirror it exactly.")
 
 
 def test_main_binds_the_encoder_paths_to_the_dedicated_handler():
@@ -465,11 +449,9 @@ def test_main_binds_the_encoder_paths_to_the_dedicated_handler():
     for encoder_path in ("/v1/embeddings", "/v1/reranking"):
         assert f'add_post("{encoder_path}", proxy.handle_encoder)' in window, (
             f"main() must register {encoder_path} to proxy.handle_encoder — "
-            f"binding it to handle_proxy, or wrapping it in _route_guard, "
-            f"turns every legitimate POST into a 405")
-    assert "handle_proxy" not in window, (
-        "handle_proxy appears in main()'s registration window; it belongs to "
-        "the catch-all, which is registered after set_known_routes")
+            f"binding it to handle_proxy turns a mistyped encoder call into a chat completion")
+    assert window.count("handle_proxy") == 1
+    assert 'add_post("/v1/chat/completions", proxy.handle_proxy)' in window
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -519,7 +501,7 @@ def test_exactly_one_authorization_header_reaches_a_credentialed_upstream(monkey
     (_, _, _), _ = _probe_with(
         monkeypatch, session, "POST", "/v1/chat/completions",
         backends=[{"url": "https://api.deepseek.com/v1",
-                   "token_env": "DEEPSEEK_API_KEY", "private_ok": True}],
+                   "token_env": "DEEPSEEK_API_KEY", "private_ok": True, "n_ctx": 8192, "max_output_tokens": 2048}],
         headers={"Authorization": "Bearer client-gateway-token"})
     assert session.headers is not None
     auth = [k for k in session.headers if k.lower() == "authorization"]

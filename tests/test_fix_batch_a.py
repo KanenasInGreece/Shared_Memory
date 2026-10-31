@@ -1,10 +1,11 @@
 """Fix batch A (v1.0.29): default connection strings encode the password, project
-registration absorbs a spelling race, ENTITY_CONFUSABLE_SIMILARITY is validated, and
-`_may_steer_llm` uses the effective role."""
+registration absorbs a spelling race, and ENTITY_CONFUSABLE_SIMILARITY is validated.
+
+The steering gate this file used to pin is gone. X-SM-LLM-* is stripped for every
+caller; tests/test_llm_steering_headers.py pins that strip."""
 import ast
 import importlib
 import importlib.util
-import json
 import sys
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
@@ -242,35 +243,3 @@ def test_the_entity_floor_defaults_to_point_six(monkeypatch):
     assert mod.ENTITY_CONFUSABLE_SIMILARITY == 0.6
 
 
-# -- A4 ------------------------------------------------------------------------
-
-def _gateway(monkeypatch, tokens, roles):
-    monkeypatch.delenv("LLM_BACKENDS", raising=False)
-    monkeypatch.setenv("LLM_BACKENDS_JSON",
-                       json.dumps([{"url": "http://a:5000", "private_ok": True}]))
-    monkeypatch.setenv("AGENT_TOKENS", tokens)
-    if roles:
-        monkeypatch.setenv("AGENT_ROLES", roles)
-    else:
-        monkeypatch.delenv("AGENT_ROLES", raising=False)
-    secure_env._secrets.pop("AGENT_TOKENS", None)
-    import coordinator
-    importlib.reload(coordinator)
-    import hive_mind_proxy as g
-    importlib.reload(g)
-    return g
-
-
-class _Req(dict):
-    headers: dict = {}
-
-
-def _request(agent):
-    return _Req({"authenticated_agent": agent})
-
-
-def test_may_steer_uses_the_effective_role(monkeypatch):
-    g = _gateway(monkeypatch, "monitor:tok_m", "monitor:admin")
-    assert g._may_steer_llm(_request("monitor")) is False
-    g = _gateway(monkeypatch, "maintenance-admin:tok_ma", "")
-    assert g._may_steer_llm(_request("maintenance-admin")) is True

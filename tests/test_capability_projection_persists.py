@@ -29,7 +29,7 @@ def _load_gateway(monkeypatch, capacity_log_path):
     package here, and every other file in this suite duplicates it too."""
     import importlib
     monkeypatch.delenv("LLM_BACKENDS_JSON", raising=False)
-    monkeypatch.setenv("LLM_BACKENDS", "http://a:5000")
+    monkeypatch.setenv("LLM_BACKENDS_JSON", "[{\"url\": \"http://a:5000\", \"n_ctx\": 8192, \"max_output_tokens\": 2048}]")
     monkeypatch.setenv("CAPACITY_LOG_PATH", str(capacity_log_path))
     import secure_env
     secure_env._secrets.pop("AGENT_TOKENS", None)

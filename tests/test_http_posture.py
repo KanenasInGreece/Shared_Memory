@@ -13,7 +13,7 @@ Two kinds of test, per surface:
 
   T-1  VALUE tests — class-patch the client class itself (never a bound
        method), then drive the REAL call sites (the CLI's `search` action,
-       the MCP server's `_search_payload`, the daemon's `pool_has_free_slot`,
+       the MCP server's `_search_payload`, the daemon's `pool_roster_state`,
        the coordinator's `handle_search`, the gateway's `start_session`) and
        read `trust_env` off the constructor's own `call_args`. This is what
        proves the posture is not just present in the source text the census
@@ -35,7 +35,7 @@ Mutation table (measured in a scratchpad copy, never in this checkout,
 | remove it from `memory_bridge.py:362` (async TCP) | `test_census_no_escape_hatch_and_literal_trust_env`, `test_cli_async_client_tcp_trust_env_false`, `test_cli_real_search_action_trust_env_false` | the environment leg; every other value test |
 | remove it from `hive_mind_proxy.py:1845`'s `ClientSession(...)` | `test_census_aiohttp_clientsession_trust_env`, `test_aiohttp_start_session_trust_env_false` | every httpx test |
 | add `proxy="http://127.0.0.1:1"` beside an existing `trust_env=False` | `test_census_no_escape_hatch_and_literal_trust_env` only | everything else |
-| add `httpx.get("http://127.0.0.1:1/")` as an unreachable statement inside `pool_has_free_slot` (after its final `return True`) | `test_census_no_bare_verb_calls` only | all value tests, `test_census_total_constructor_count_is_20` |
+| add `httpx.get("http://127.0.0.1:1/")` as an unreachable statement inside `pool_roster_state` (after its final `return`) | `test_census_no_bare_verb_calls` only | all value tests, `test_census_total_constructor_count_is_20` |
 
 The census COUNT assertion and its PER-CALL keyword assertion are different
 guards — a keyword removal never changes how many constructor calls exist,
@@ -199,16 +199,17 @@ def test_census_total_constructor_count_is_20():
     factory (`fact:2106`/`decision:2113` had measured 29: 12 in
     `coordinator.py`+daemons+CLI, 11 in `vector-skill.py`, 4 in the two
     `memory_bridge.py` copies + the 2 tooling scripts; `vector-skill.py` now
-    holds 2, one per socket/TCP branch) are the ONLY
+    holds 2, one per socket/TCP branch). `pool_has_free_slot` is gone.
+    `pool_roster_state` is the daemon client. These are the ONLY
     `httpx.Client`/`httpx.AsyncClient` constructions in the walked trees. A
     LITERAL 20 (`fact:1309`): a 21st unmarked constructor is a new httpx
     client the framework grew without this rule.
 
     Mutation: removing a `trust_env=False` keyword from an existing call
     never changes this count — that failure belongs to
-    `test_census_no_escape_hatch_and_literal_trust_env` instead. Adding the
-    `pool_has_free_slot` bare-verb mutation also does not change this count
-    (a bare `httpx.get(...)` is not a `Client`/`AsyncClient` construction) —
+    `test_census_no_escape_hatch_and_literal_trust_env` instead. Adding a
+    bare `httpx.get` inside `pool_roster_state` also does not change this count
+    (a bare verb call is not a `Client`/`AsyncClient` construction) —
     that failure belongs to `test_census_no_bare_verb_calls`.
     """
     calls = _httpx_constructor_calls()
@@ -226,7 +227,7 @@ def test_census_no_bare_verb_calls():
     which the census over constructor calls would never see.
 
     Mutation: adding `httpx.get("http://127.0.0.1:1/")` as an unreachable
-    statement inside `pool_has_free_slot` (after its own `return True`, never
+    statement inside `pool_roster_state` (after its own `return`, never
     at module level — the daemons import this module) kills ONLY this test;
     the constructor count in `test_census_total_constructor_count_is_20`
     is unaffected because a bare verb call is not a `Client`/`AsyncClient`
@@ -507,19 +508,18 @@ async def test_mcp_search_payload_trust_env_false(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_daemon_pool_has_free_slot_trust_env_false():
-    """Daemon surface: `pool_status.pool_has_free_slot()` (`:40`), consumed
-    by `rem_loop.py`/`consolidation_loop.py` to gate dream-cycle scheduling."""
+async def test_daemon_pool_roster_state_trust_env_false():
+    """Daemon surface: `pool_status.pool_roster_state`, called by rem_loop and consolidation_loop."""
     mock_response = MagicMock(status_code=200)
-    mock_response.json.return_value = {"free_slots": 1}
+    mock_response.json.return_value = {"free_slots": 1, "backends": {"http://a:9": {}}}
     with patch.object(pool_status.httpx, "AsyncClient") as mock_cls:
         mock_client = AsyncMock()
         mock_client.get = AsyncMock(return_value=mock_response)
         mock_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
         mock_cls.return_value.__aexit__ = AsyncMock(return_value=None)
-        result = await pool_status.pool_has_free_slot()
+        result = await pool_status.pool_roster_state()
     assert mock_cls.call_args.kwargs["trust_env"] is False
-    assert result is True
+    assert result == "free"
 
 
 # ── coordinator harness (mirrors tests/test_rerank_contract.py:33-105) ──────

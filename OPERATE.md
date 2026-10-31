@@ -69,7 +69,7 @@ printf '%s\n%s\n%s\n%s\n%s\n%s\n\n\nn\nn\n' "$NEO4J_DIR" "$PG_DIR" "$MODELS_DIR"
 git check-ignore shared-memory/.env
 ```
 
-`git check-ignore` must print the path. Under ~8 GB RAM, set `NEO4J_HEAP_INITIAL`, `NEO4J_HEAP_MAX`, and `NEO4J_PAGECACHE` from `shared-memory/.env.example` after the script. A credentialed reasoning backend: drive `bash shared-memory/ops/install_llm_backends.sh`. The JSON key is `url`, never `base_url`. Ask for the env-var name, never the key. Then `python3 shared-memory/scripts/check_config.py --phase-a-only`.
+`git check-ignore` must print the path. Under ~8 GB RAM, set `NEO4J_HEAP_INITIAL`, `NEO4J_HEAP_MAX`, and `NEO4J_PAGECACHE` from `shared-memory/.env.example` after the script. A credentialed reasoning backend: drive `bash shared-memory/ops/install_llm_backends.sh`. The JSON key is `url`, never `base_url`. Ask for the env-var name, never the key. Then `python3 shared-memory/scripts/check_config.py --phase-a-only`. A defined backend with no `n_ctx` or no `max_output_tokens` stops the gateway. `max_output_tokens` is the provider's published limit, or a self-hosted server's context size. Query the URL; if it does not say, ask the operator. Never guess.
 
 ### Phase 2 — Preflight
 
@@ -184,7 +184,7 @@ Ask first. Copy the block from the installed skill's `CONSTITUTION_SNIPPET.md`, 
 
 ### Phase 9 — Prove the install
 
-`bash shared-memory/scripts/postflight.sh` exits 0 iff assertions **A1–A5, A8 and A9** all pass. A8 skips, rather than fails, when no reasoning backend is healthy. Do not `cat`, `grep`, or source the skill `.env`. This `sed` is the allowed read. Do not print the token.
+`bash shared-memory/scripts/postflight.sh` exits 0 iff assertions **A1–A5 and A9** pass. A8 reports and does not decide. A8 reads the last daemon chat this process forwarded. It warns, and does not fail the run, when none is recorded or that status is not 2xx. A down reasoning backend does not skip A8. Exit 0 does not mean a completion was posted. Do not `cat`, `grep`, or source the skill `.env`. This `sed` is the allowed read. Do not print the token.
 
 ```bash
 AGENT_ENV=${AGENT_ENV:-$HOME/.claude/skills/shared-memory/.env}
@@ -209,6 +209,14 @@ Do not hand-roll the migration order. Do not run `merge_release.sh` unless the o
 A checkout on a DETACHED HEAD makes `update_framework.sh` refuse. Recover with `git checkout main`, then re-run. A deliberate pinned tag is checked out as that tag, or installed from a tarball. Do not pull from a detached HEAD.
 
 A tarball host has no repository to pull. Unpack the new tag, copy `shared-memory/.env` across, and continue in the new directory.
+
+A defined backend with no `n_ctx` or no `max_output_tokens` stops the gateway. `max_output_tokens` is the provider's published limit, or a self-hosted server's context size. Query the URL; if it does not say, ask the operator. Never guess. `bash shared-memory/ops/install_llm_backends.sh` queries it: strip a trailing `/v1`, read `default_generation_settings.n_ctx` from `/props`, then `max_context_length` from `/v1/models`. A credential goes to curl on stdin (`-K -`), never on the argument list.
+
+The first update runs the previous `update_framework.sh`, so it does not write `RestartPreventExitStatus=78`. The manual drop-in matters only when that first run reaches the restart. A run that stops earlier has not restarted the gateway. Before the restart, add the directive in `${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/hive-mind-gateway.service.d/restart-prevent-78.conf` and run `systemctl --user daemon-reload`. That old script's die text recommends `--skip-env-migration`. Do not follow it: the gateway would refuse the file and exit 78.
+
+A non-empty `LLM_BACKENDS` or `LLM_DEFAULT_TARGET` is no longer read. Convert it to `LLM_BACKENDS_JSON` or delete the line, then re-run. `python3 shared-memory/scripts/migrate_env.py --apply` stops while either leftover is set and JSON declares nothing. The same command lists each declared backend whose address is not self-hosted (it receives corpus text from both daemons; remove it if not trusted) and does not stop for that notice.
+
+A client that is not a framework daemon gets 403 `framework_only` on `POST /v1/chat/completions` and calls its model directly. With auth off, only the spawned daemons `consolidation` and `rem_daemon` are admitted. With auth on, `LLM_FRAMEWORK_AGENT_NAMES` (comma-separated) adds those names to the same list. It does not admit an outside client.
 
 ```bash
 AGENT_ENV=${AGENT_ENV:-$HOME/.claude/skills/shared-memory/.env}
@@ -240,7 +248,7 @@ systemctl --user restart hive-mind-gateway.service
 curl -s -H "Authorization: Bearer $AGENT_TOKEN" http://localhost:8888/health
 ```
 
-Expect `status` `ok`. On `degraded`, read each `dependencies.*.reason`. A `registry` reason `census_failures:N` means Postgres was not ready yet; restart again.
+A declared fleet with healthy stores reads `status` `ok`. On `degraded`, read each `dependencies.*.reason`. `llm_pool` reason `no_backend_declared` means no backend was declared; memory, including Tier 3, still works. A `registry` reason `census_failures:N` means Postgres was not ready yet; restart again.
 
 Then, on the operator's word, free disk by explicit tag. Keep every image `docker ps -a` lists, the pins in `shared-memory/ops/postgres_neo4j_limits.yaml`, and any image another project on the host uses. Remove the older `neo4j` and `pgvector/pgvector` tags. A llama.cpp tag whose encoders all run at 0 replicas here may go too; a reconcile that finds drift pulls it again. When a pull moves a floating llama.cpp tag this host runs, the previous image is left untagged and the `docker images` lines below do not show it. `docker images -f dangling=true` lists it; remove it by id. `docker rmi` refuses an image a container still uses.
 

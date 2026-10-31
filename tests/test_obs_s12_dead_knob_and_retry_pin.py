@@ -52,6 +52,7 @@ import os
 import sys
 
 import pytest
+pytestmark = pytest.mark.usefixtures("chat_caller_is_consolidation")
 from aiohttp import web
 from aiohttp.client_exceptions import ClientConnectionResetError
 from yarl import URL
@@ -234,7 +235,7 @@ def test_first_attempt_reset_retries_same_target_single_provider_authorization(m
     monkeypatch.delenv("LLM_BACKENDS", raising=False)
     monkeypatch.setenv("SM_TEST_PROVIDER_KEY", "sk-provider-key")
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps(
-        [{"url": "http://a:5000", "token_env": "SM_TEST_PROVIDER_KEY", "private_ok": True}]))
+        [{"url": "http://a:5000", "token_env": "SM_TEST_PROVIDER_KEY", "private_ok": True, "n_ctx": 8192, "max_output_tokens": 2048}]))
     import hive_mind_proxy as g
     importlib.reload(g)
     _patch_stream_response(monkeypatch)

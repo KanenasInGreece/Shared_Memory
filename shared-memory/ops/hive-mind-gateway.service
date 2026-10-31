@@ -18,6 +18,8 @@ KillSignal=SIGTERM
 TimeoutStopSec=30
 Restart=on-failure
 RestartSec=5
+# Exit 78 is a refused configuration. Restarting it would loop.
+RestartPreventExitStatus=78
 
 # Files this process creates default to 0600/0700, including ones that never set their own mode.
 UMask=0077

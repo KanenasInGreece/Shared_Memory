@@ -3,6 +3,7 @@ import json
 import os
 import sys
 import pytest
+pytestmark = pytest.mark.usefixtures("chat_caller_is_consolidation")
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "shared-memory", "scripts"))
 
@@ -530,7 +531,7 @@ def test_handle_proxy_does_not_413_on_encoder_buffer_cap(monkeypatch):
     monkeypatch.delenv("LLM_BACKENDS", raising=False)
     monkeypatch.setenv(
         "LLM_BACKENDS_JSON",
-        json.dumps([{"url": "http://a:5000", "private_ok": True}]),
+        json.dumps([{"url": "http://a:5000", "private_ok": True, "n_ctx": 8192, "max_output_tokens": 2048}]),
     )
     import hive_mind_proxy as g
     importlib.reload(g)

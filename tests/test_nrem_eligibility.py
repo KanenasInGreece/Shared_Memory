@@ -212,8 +212,8 @@ async def test_busy_pool_refreshes_the_consolidation_clock(monkeypatch):
     d.last_activity = d.last_busy = stale
 
     async def _busy(**kwargs):
-        return False
-    monkeypatch.setattr(cl, "pool_has_free_slot", _busy)
+        return "busy"
+    monkeypatch.setattr(cl, "pool_roster_state", _busy)
 
     await d._note_pool_activity(NOW)
     assert d.last_busy == NOW
@@ -231,8 +231,8 @@ async def test_busy_pool_does_NOT_touch_the_sweep_clock(monkeypatch):
     d.last_activity = d.last_busy = stale
 
     async def _busy(**kwargs):
-        return False
-    monkeypatch.setattr(cl, "pool_has_free_slot", _busy)
+        return "busy"
+    monkeypatch.setattr(cl, "pool_roster_state", _busy)
 
     await d._note_pool_activity(NOW)
     assert d.last_activity == stale
@@ -248,12 +248,43 @@ async def test_free_pool_leaves_both_clocks_running(monkeypatch):
     d.last_activity = d.last_busy = stale
 
     async def _free(**kwargs):
-        return True
-    monkeypatch.setattr(cl, "pool_has_free_slot", _free)
+        return "free"
+    monkeypatch.setattr(cl, "pool_roster_state", _free)
 
     await d._note_pool_activity(NOW)
     assert d.last_busy == stale and d.last_activity == stale
     assert d._quiet_since(NOW) == 3600
+
+
+@pytest.mark.asyncio
+async def test_empty_roster_does_not_reset_last_busy(monkeypatch):
+    """An empty roster is not busy. Resetting last_busy there would hold the consolidation gate shut."""
+    d = ConsolidationDaemon()
+    stale = NOW - timedelta(hours=1)
+    d.last_activity = d.last_busy = stale
+
+    async def _empty(**kwargs):
+        return "empty"
+    monkeypatch.setattr(cl, "pool_roster_state", _empty)
+
+    await d._note_pool_activity(NOW)
+    assert d.last_busy == stale
+    assert d.last_activity == stale
+
+
+@pytest.mark.asyncio
+async def test_wait_for_slot_treats_an_empty_roster_as_not_busy(monkeypatch):
+    """The slot wait returns as soon as the roster is empty. Treating empty as busy defers the fold."""
+    d = ConsolidationDaemon()
+    d.is_running = True
+
+    async def _empty(**kwargs):
+        return "empty"
+    monkeypatch.setattr(cl, "pool_roster_state", _empty)
+    monkeypatch.setattr(cl, "_take_nrem_priority_lock", lambda: None)
+    monkeypatch.setattr(cl, "NREM_FORCED_SLOT_WAIT", 0.2)
+    monkeypatch.setattr(cl, "NREM_FORCED_SLOT_POLL", 0.05)
+    assert await d._wait_for_slot() is True
 
 
 def test_quiet_since_takes_the_LATER_of_the_two_clocks():
@@ -276,8 +307,8 @@ async def test_pool_probe_is_rate_limited(monkeypatch):
 
     async def _busy(**kwargs):
         probes.append(1)
-        return False
-    monkeypatch.setattr(cl, "pool_has_free_slot", _busy)
+        return "busy"
+    monkeypatch.setattr(cl, "pool_roster_state", _busy)
     monkeypatch.setattr(cl, "NREM_POOL_PROBE_SEC", 15)
 
     await d._note_pool_activity(NOW)

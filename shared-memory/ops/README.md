@@ -170,22 +170,20 @@ Interactive, per backend: URL, whether this machine should supervise it as a
 systemd service (takes *your* launch command — it won't construct one, GPUs
 and models vary too much), and whether it needs a credential — if so, it takes
 **only** the env-var name, with a shape check that rejects anything that looks
-like a pasted literal key rather than a name. The script then asks the
-mandatory routing choice too — `private_ok: true` or `roles: [...]` for a
-credentialed backend, general-traffic vs. roles-only for one that isn't —
-and warns loudly, without printing the credential, if `AGENT_TOKENS` isn't
-set yet (the gateway refuses to start with a credentialed backend and no
-auth, S-05, until you mint tokens or set the documented override). Writes
-`LLM_BACKENDS_JSON` below. Safe to re-run (each run replaces the line
-fresh). `install_framework.sh` also offers this as a prompt at the end of
-first-time setup (default Yes, interactively).
+like a pasted literal key rather than a name. It queries the URL for context
+and asks you to confirm `n_ctx`; if the URL does not say, it asks and does not
+guess. It also asks `max_output_tokens`. It writes no `roles` or `private_ok`.
+It warns, without printing the credential, if `AGENT_TOKENS` is unset (the
+gateway refuses to start with a provider key and no auth, S-05, until you mint
+tokens or set the documented override). Writes `LLM_BACKENDS_JSON`. Safe to
+re-run. `install_framework.sh` offers this at the end of first-time setup.
 
 By hand: `LLM_BACKENDS_JSON` (see `shared-memory/.env.example`) lets the
 gateway route to more than one reasoning LLM, local or remote, including a
 paid cloud API. Each entry is a URL plus an optional `token_env` — the
 **name** of an env var, never a literal key:
 
-**Per-entry parameters** (all optional except `url`):
+**Per-entry parameters** (`url`, `n_ctx` and `max_output_tokens` are required):
 
 | field | type | default | what it does |
 |---|---|---|---|
@@ -194,11 +192,11 @@ paid cloud API. Each entry is a URL plus an optional `token_env` — the
 | `model` | string | none | Model id rewritten into every request body routed here — a cloud endpoint needs its real id, not the `local-model` clients send. |
 | `extra_body` | object | none | Merged into every chat payload routed here, overriding the caller's fields — provider-specific switches (e.g. disabling hybrid-model thinking) or as a spend ceiling (e.g. `{"max_tokens": 500}`). A non-object excludes the backend. |
 | `weight` | float | `1.0` | ⚠ Currently affects **no** live routing decision — dispatch is cache-affinity then least-in-flight. Stored and displayed only. |
-| `roles` | list | absent = serves all | Which dream functions this backend may serve: `extract` (REM's per-record summary call) or `judge` (NREM's insight fold) (`summarize` is reserved and refused). An explicit list is itself the per-function privacy opt-in; an **empty** list refuses startup. |
-| `n_ctx` | int ≥ 1 | absent = always fits | The model's usable context. When set, a request whose estimated size cannot fit is excluded here rather than sent and truncated. |
+| `n_ctx` | int ≥ 1 | *(required)* | The model's usable context. A request that cannot fit is not sent here. A missing or invalid value stops the gateway (exit 78) and names the field. |
+| `max_output_tokens` | int ≥ 1 | *(required)* | Output budget the fit check reserves. A bool or a non-positive value stops the gateway and names the field. |
+| `priority` | int ≥ 1 | `1` | Parsed and shown. |
 | `plaintext_ok` | bool | `false` | **Transport assertion.** A credentialed entry is accepted over `https`, or over plaintext `http` to a private path (loopback, RFC1918, Tailscale CGNAT, link-local, ULA, an unqualified name, `.local`/`.lan`/`.internal`/`.home`/`.ts.net`). Over plaintext to a **public** address or FQDN it is **excluded at startup** unless you set this `true` — you asserting the path is private (VPN, reverse tunnel). The gateway never sends a provider key in the clear across the internet; the `/health` probe follows the same rule. |
-| `private_ok` | bool | `false`, unconditionally (W4 default-deny, `decision:1824`) | May record content land here as unrestricted/role-less traffic? An undeclared backend, credentialed or not, serves NOTHING until this is set `true`. A **credentialed entry with neither `roles` nor an explicit `private_ok` is safe by construction (simply never selected) but is loudly warned about at startup and by `check_config.py`** — the choice is yours to state, loudly, once. ⚠ **(SEC M-1) an unresolved choice does not stop the credential from being used** — the backend is still probed with its bearer on every `/health` liveness cycle even though it can serve nothing; remove the entry if you did not mean to attach the key. |
-| `max_inflight` | int ≥ 1 | absent = unbounded | Per-backend concurrency ceiling. At cap the backend counts busy; a sole-eligible capped backend makes requests wait (bounded), never overrides the cap. |
+| `max_inflight` | int ≥ 1 | absent = unbounded | Per-backend concurrency ceiling. At cap the backend counts busy; a sole-eligible capped backend makes requests wait (bounded), never overrides the cap. A declared backend serves both daemons. A leftover `roles` or `private_ok` key is ignored, with a deprecation warning. The warning that a restricted entry now serves both daemons fires only for `private_ok: false` or a `roles` list that omits extract or judge. An omitted `private_ok` does not warn: declaring means trusting. |
 | `price_per_mtok_in` / `price_per_mtok_out` | float | none | Operator-maintained prices surfaced on the authenticated `/health` for a dashboard to multiply against the per-backend token counters. Never read by routing. |
 
 ### Installing a provider API key, start to finish
@@ -235,13 +233,10 @@ the framework's own files never hold the key either way.
    resolution order is `$CREDENTIALS_DIRECTORY` > `<NAME>_FILE` > a plain
    env var, which is advisory-warned).
 3. **Write the backend entry** in `LLM_BACKENDS_JSON` with
-   `"url":"https://api.deepseek.com/v1"` (that key is `url`, not OpenAI SDK's
-   `base_url`) and `"token_env":"DEEPSEEK_API_KEY"` — the var **name** from step 2 — plus
-   the mandatory routing choice: `"private_ok": true` (may serve everything)
-   or `"roles": [...]` (per-function opt-in). A credentialed entry with
-   neither is never selected under default-deny — safe by construction, but
-   loudly warned about at startup and by `check_config.py`, so declare one
-   explicitly.
+   `"url"` (not OpenAI SDK's `base_url`), `"token_env"` as the var **name**
+   from step 2, and required `n_ctx` and `max_output_tokens`. A defined backend
+   with no `n_ctx` stops the gateway. Query the URL; if it does not say, ask
+   the operator. Never guess. A declared backend serves both daemons.
 4. **Restart and verify:** `systemctl --user restart hive-mind-gateway.service`,
    then the authenticated `/health` — the backend reads `ok` in
    `llm_backends` (a bare-probe 401/403 from a credentialed backend counts
@@ -288,11 +283,12 @@ on a hard kill. The byte cap bounds how much of a response body is buffered
 for the `usage` parse; compressed and streaming responses skip capture.
 
 ```json
-LLM_BACKENDS_JSON=[{"url":"http://localhost:5000"},
-                    {"url":"https://api.deepseek.com/v1",
-                     "token_env":"DEEPSEEK_API_KEY","model":"deepseek-chat",
-                     "extra_body":{"thinking":{"type":"disabled"}}}]
+LLM_BACKENDS_JSON=[{"url":"http://localhost:5000","n_ctx":8192,"max_output_tokens":2048},
+                    {"url":"https://api.example/v1","token_env":"EXAMPLE_API_KEY",
+                     "n_ctx":8192,"max_output_tokens":2048}]
 ```
+
+The second entry is an example. Check your provider's published limits.
 
 An optional `extra_body` object is merged into every chat payload routed to
 that backend, overriding the caller's fields — the place for provider-specific
@@ -301,10 +297,7 @@ reasoning model's thinking mode. A non-object `extra_body` excludes the
 backend from the pool (logged): for a metered backend, being reached without
 its configured overrides is exactly the misconfiguration to prevent.
 
-**Model-attributes routing** (`roles`, `n_ctx`, `private_ok`, `max_inflight`,
-`price_per_mtok_in`/`price_per_mtok_out`) — see the **per-entry parameter
-table above** for the full reference, and `shared-memory/.env.example` for
-the same fields documented inline where you edit them.
+`n_ctx`, `max_output_tokens`, `max_inflight` and the price fields are in the table above. `priority` is shown.
 
 The gateway resolves `token_env` once at startup from its **own process
 environment** and sends it as `Authorization` only to that backend — the
@@ -404,17 +397,12 @@ without ever booting it. Two phases:
   misconfiguration (a bad encoder URL, a malformed `LLM_BACKENDS_JSON` entry, or the daemon
   dependencies simply not being installed under whatever python ran this) degrades to "Phase A
   printed, Phase B unavailable, exit 2" rather than a raw traceback. On success, renders one line
-  per configured LLM backend (url — credential-scrubbed, weight, model, roles, `n_ctx`,
-  `has_credential`, `private_ok` effective + explicit) and then calls the gateway's OWN startup
-  guard functions (never re-implementing their predicates) to say whether
-  it would actually boot. A `token_env` delivered through `LoadCredential=`
-  cannot be resolved in this process, so a backend that needs it is excluded
-  from the Phase B roster here; when that empties the fleet, the rows shown
-  are the legacy fallback. Trust the authenticated `/memory/telemetry`
-  (`config.llm_backends[].has_credential`) for what the gateway process
-  resolved. The note covers only a whole-fleet fallback, not one credentialed
-  backend dropped from a larger fleet. On that fallback Phase B asks
-  `systemctl --user`, and `busctl --user` when present: no note when the
+  per configured LLM backend (url — credential-scrubbed, model, `n_ctx`,
+  `max_output_tokens`, `priority`, `has_credential`) and then calls the gateway's own startup
+  guards. A `token_env` the unit supplies and this process cannot see is excluded
+  with reason `token_missing`. Trust authenticated `/memory/telemetry` for the
+  process roster. The note follows an excluded entry with that reason: it asks
+  `systemctl --user`, and `busctl --user` when present. No note when the
   `systemctl` query fails; without `busctl`, credential-directive ids are not
   seen, but a secret `Environment=` value still produces the note.
 
@@ -435,15 +423,9 @@ uv run --with aiohttp --with asyncpg --with httpx --with neo4j \
 | `1` | Readable, but the gateway WILL refuse to start (reachable only once Phase B's import succeeds). |
 | `2` | Could not read/render at all — an unreadable-but-PRESENT `.env`, or a Phase-B import crash. An ABSENT `.env` is NOT exit 2. |
 
-⚠ **A `LLM_BACKENDS_JSON` that fails to PARSE (bad JSON syntax, or valid JSON that isn't an array)
-is NOT exit 2** — `hive_mind_proxy`'s own loader catches that internally and falls back to the
-legacy `LLM_BACKENDS`/`LLM_DEFAULT_TARGET` pool, so the import still succeeds. `check_config.py`
-surfaces this as a prominent `⚠ DECLARED FLEET NOT USABLE` warning before the backend roster,
-exit **0** (the gateway genuinely does boot, just not on the fleet you declared) — never a second
-meaning for exit 1. Exit 2 is reserved for a shape the loader's own try/except does not catch (e.g.
-a JSON array of bare strings instead of objects).
+A defined declaration that is unusable (bad JSON, a non-list, a missing or invalid `n_ctx` or `max_output_tokens`, or any other FATAL class) makes the gateway exit 78. This check reports the same class as exit 1 once Phase B imports. There is no fallback pool. An absent key or `[]` is not FATAL: the gateway stays up and `llm_pool` is degraded with reason `no_backend_declared`.
 
-When every entry is excluded, and a `token_env` this check cannot resolve is one the gateway's unit supplies (a credential directive or a secret `Environment=` value), a note naming that variable follows the line. `migrate_env.py` prints the same note during an update. The gateway's own roster, with `has_credential` per backend, is on the authenticated `/memory/telemetry` under `config.llm_backends`.
+When an excluded entry's reason is `token_missing` and the unit supplies that name, a note follows the line. `migrate_env.py` prints the same note. The roster is on authenticated `/memory/telemetry`.
 
 ⛔ **Not wired into `preflight.sh`.** preflight's exit contract is 0/1 (hard requirements only) and
 it deliberately runs before `shared-memory/.env` is expected to exist — this script's 0/1/2

@@ -23,6 +23,7 @@ import os
 import sys
 
 import pytest
+pytestmark = pytest.mark.usefixtures("chat_caller_is_consolidation")
 from yarl import URL
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "shared-memory", "scripts"))
@@ -84,7 +85,7 @@ def _clean_two_backend_gateway(monkeypatch):
     """Mixed-case + IPv6 hosts, both clean (no credential) — loads through
     the normal ingest path unaffected by item A."""
     monkeypatch.delenv("LLM_BACKENDS_JSON", raising=False)
-    monkeypatch.setenv("LLM_BACKENDS", "http://MyHost:8000,http://[fd00::1]:9443")
+    monkeypatch.setenv("LLM_BACKENDS_JSON", "[{\"url\": \"http://MyHost:8000\", \"n_ctx\": 8192, \"max_output_tokens\": 2048}, {\"url\": \"http://[fd00::1]:9443\", \"n_ctx\": 8192, \"max_output_tokens\": 2048}]")
     g = _load()
     importlib.reload(g)
     return g
@@ -113,7 +114,7 @@ def _seed_credentialed_backend(g, url):
 
 def test_llm_runtime_snapshot_scrubs_a_directly_seeded_credentialed_backend(monkeypatch):
     monkeypatch.delenv("LLM_BACKENDS_JSON", raising=False)
-    monkeypatch.setenv("LLM_BACKENDS", "http://a:5000")
+    monkeypatch.setenv("LLM_BACKENDS_JSON", "[{\"url\": \"http://a:5000\", \"n_ctx\": 8192, \"max_output_tokens\": 2048}]")
     g = _load()
     importlib.reload(g)
     cred_url = f"https://leakuser:{SECRET}@backend.example.test/v1"
@@ -131,7 +132,7 @@ def test_llm_runtime_snapshot_scrubs_a_directly_seeded_credentialed_backend(monk
 
 def test_llm_runtime_snapshot_reserved_list_is_scrubbed(monkeypatch):
     monkeypatch.delenv("LLM_BACKENDS_JSON", raising=False)
-    monkeypatch.setenv("LLM_BACKENDS", "http://a:5000")
+    monkeypatch.setenv("LLM_BACKENDS_JSON", "[{\"url\": \"http://a:5000\", \"n_ctx\": 8192, \"max_output_tokens\": 2048}]")
     g = _load()
     importlib.reload(g)
     cred_url = f"https://leakuser:{SECRET}@backend.example.test/v1"
@@ -145,7 +146,7 @@ def test_llm_runtime_snapshot_reserved_list_is_scrubbed(monkeypatch):
 
 def test_llm_runtime_snapshot_hot_prefix_backend_field_is_scrubbed(monkeypatch):
     monkeypatch.delenv("LLM_BACKENDS_JSON", raising=False)
-    monkeypatch.setenv("LLM_BACKENDS", "http://a:5000")
+    monkeypatch.setenv("LLM_BACKENDS_JSON", "[{\"url\": \"http://a:5000\", \"n_ctx\": 8192, \"max_output_tokens\": 2048}]")
     g = _load()
     importlib.reload(g)
     cred_url = f"https://leakuser:{SECRET}@backend.example.test/v1"
@@ -172,7 +173,7 @@ def _auth_off(monkeypatch, g):
 
 def test_pool_status_clean_mixed_case_and_ipv6_byte_identical(monkeypatch):
     monkeypatch.delenv("LLM_BACKENDS_JSON", raising=False)
-    monkeypatch.setenv("LLM_BACKENDS", "http://MyHost:8000,http://[fd00::1]:9443")
+    monkeypatch.setenv("LLM_BACKENDS_JSON", "[{\"url\": \"http://MyHost:8000\", \"n_ctx\": 8192, \"max_output_tokens\": 2048}, {\"url\": \"http://[fd00::1]:9443\", \"n_ctx\": 8192, \"max_output_tokens\": 2048}]")
     g = _load()
     _auth_off(monkeypatch, g)
     d = json.loads(asyncio.run(g.handle_pool_status(None)).body)
@@ -181,7 +182,7 @@ def test_pool_status_clean_mixed_case_and_ipv6_byte_identical(monkeypatch):
 
 def test_pool_status_scrubs_a_directly_seeded_credentialed_backend(monkeypatch):
     monkeypatch.delenv("LLM_BACKENDS_JSON", raising=False)
-    monkeypatch.setenv("LLM_BACKENDS", "http://a:5000")
+    monkeypatch.setenv("LLM_BACKENDS_JSON", "[{\"url\": \"http://a:5000\", \"n_ctx\": 8192, \"max_output_tokens\": 2048}]")
     g = _load()
     _auth_off(monkeypatch, g)
     cred_url = f"https://leakuser:{SECRET}@backend.example.test/v1"
@@ -201,7 +202,7 @@ def test_pool_status_key_collapse_guard(monkeypatch, caplog):
     SCRUBBED, de-duplicated keys here of all places — never the raw
     (credential-bearing) originals the pre-fix guard fell back to."""
     monkeypatch.delenv("LLM_BACKENDS_JSON", raising=False)
-    monkeypatch.setenv("LLM_BACKENDS", "http://a:5000")
+    monkeypatch.setenv("LLM_BACKENDS_JSON", "[{\"url\": \"http://a:5000\", \"n_ctx\": 8192, \"max_output_tokens\": 2048}]")
     g = _load()
     _auth_off(monkeypatch, g)
     url1 = f"https://u1:{SECRET}@backend.example.test/v1"
@@ -229,7 +230,7 @@ def test_pool_status_key_collapse_guard(monkeypatch, caplog):
 
 def test_config_snapshot_clean_mixed_case_byte_identical(monkeypatch):
     monkeypatch.delenv("LLM_BACKENDS_JSON", raising=False)
-    monkeypatch.setenv("LLM_BACKENDS", "http://MyHost:8000")
+    monkeypatch.setenv("LLM_BACKENDS_JSON", "[{\"url\": \"http://MyHost:8000\", \"n_ctx\": 8192, \"max_output_tokens\": 2048}]")
     g = _load()
     importlib.reload(g)
     cfg = g._config_snapshot()
@@ -238,16 +239,15 @@ def test_config_snapshot_clean_mixed_case_byte_identical(monkeypatch):
 
 def test_config_snapshot_scrubs_a_directly_seeded_credentialed_backend(monkeypatch):
     monkeypatch.delenv("LLM_BACKENDS_JSON", raising=False)
-    monkeypatch.setenv("LLM_BACKENDS", "http://a:5000")
+    monkeypatch.setenv("LLM_BACKENDS_JSON", "[{\"url\": \"http://a:5000\", \"n_ctx\": 8192, \"max_output_tokens\": 2048}]")
     g = _load()
     importlib.reload(g)
     cred_url = f"https://leakuser:{SECRET}@backend.example.test/v1"
     _seed_credentialed_backend(g, cred_url)
     g.LLM_BACKEND_TOKENS[cred_url] = None
     g.LLM_BACKEND_MODELS[cred_url] = None
-    g.LLM_BACKEND_ROLES[cred_url] = None
     g.LLM_BACKEND_NCTX[cred_url] = None
-    g.LLM_BACKEND_PRIVATE_OK[cred_url] = True
+    g.LLM_BACKEND_MAX_OUTPUT[cred_url] = None
     g.LLM_BACKEND_MAX_INFLIGHT[cred_url] = None
     g.LLM_BACKEND_PRICE_IN[cred_url] = None
     g.LLM_BACKEND_PRICE_OUT[cred_url] = None
@@ -333,7 +333,7 @@ def _patch_stream_response(monkeypatch):
 def test_x_sm_llm_backend_header_clean_mixed_case_byte_identical(monkeypatch):
     monkeypatch.delenv("LLM_BACKENDS", raising=False)
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps(
-        [{"url": "http://MyHost:8000", "private_ok": True}]))
+        [{"url": "http://MyHost:8000", "private_ok": True, "n_ctx": 8192, "max_output_tokens": 2048}]))
     g = _load()
     importlib.reload(g)
     written = _patch_stream_response(monkeypatch)
@@ -348,7 +348,7 @@ def test_x_sm_llm_backend_header_clean_mixed_case_byte_identical(monkeypatch):
 def test_x_sm_llm_backend_header_clean_ipv6_byte_identical(monkeypatch):
     monkeypatch.delenv("LLM_BACKENDS", raising=False)
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps(
-        [{"url": "http://[fd00::1]:9443", "private_ok": True}]))
+        [{"url": "http://[fd00::1]:9443", "private_ok": True, "n_ctx": 8192, "max_output_tokens": 2048}]))
     g = _load()
     importlib.reload(g)
     written = _patch_stream_response(monkeypatch)
@@ -365,7 +365,7 @@ def test_x_sm_llm_backend_header_scrubs_a_directly_seeded_credentialed_backend(m
     structures rather than through LLM_BACKENDS/LLM_BACKENDS_JSON, so it is
     the only candidate handle_proxy's selection can pick."""
     monkeypatch.delenv("LLM_BACKENDS_JSON", raising=False)
-    monkeypatch.setenv("LLM_BACKENDS", "http://placeholder-unused:1")
+    monkeypatch.setenv("LLM_BACKENDS_JSON", "[{\"url\": \"http://placeholder-unused:1\", \"n_ctx\": 8192, \"max_output_tokens\": 2048}]")
     g = _load()
     importlib.reload(g)
     cred_url = f"https://leakuser:{SECRET}@backend.example.test/v1"
@@ -379,14 +379,10 @@ def test_x_sm_llm_backend_header_scrubs_a_directly_seeded_credentialed_backend(m
     g.LLM_BACKEND_MODELS[cred_url] = None
     g.LLM_BACKEND_EXTRAS.clear()
     g.LLM_BACKEND_EXTRAS[cred_url] = None
-    g.LLM_BACKEND_ROLES.clear()
-    g.LLM_BACKEND_ROLES[cred_url] = None
     g.LLM_BACKEND_NCTX.clear()
     g.LLM_BACKEND_NCTX[cred_url] = None
-    g.LLM_BACKEND_PRIVATE_OK.clear()
-    g.LLM_BACKEND_PRIVATE_OK[cred_url] = True
-    g.LLM_BACKEND_PRIVATE_OK_EXPLICIT.clear()
-    g.LLM_BACKEND_PRIVATE_OK_EXPLICIT[cred_url] = True
+    g.LLM_BACKEND_MAX_OUTPUT.clear()
+    g.LLM_BACKEND_MAX_OUTPUT[cred_url] = None
     g.LLM_BACKEND_MAX_INFLIGHT.clear()
     g.LLM_BACKEND_MAX_INFLIGHT[cred_url] = None
     g.LLM_BACKEND_PRICE_IN.clear()
@@ -412,17 +408,20 @@ def test_x_sm_llm_backend_header_scrubs_a_directly_seeded_credentialed_backend(m
 # ── 6. _emit_token_lifecycle_sums ────────────────────────────────────────
 
 def test_emit_token_lifecycle_sums_scrubs_query_credential(monkeypatch, tmp_path, caplog):
-    """R-2: a query-string credential loads through the NORMAL ingest path
-    (not refused by item A) — the lifecycle-sum journal line and the
-    gateway audit JSONL must both render it query-less."""
-    monkeypatch.delenv("LLM_BACKENDS_JSON", raising=False)
+    """A query credential is not a userinfo FATAL. It loads, and the lifecycle
+    line and the audit JSONL both render the URL without the query. The secret
+    is absent from both."""
+    monkeypatch.delenv("LLM_BACKENDS", raising=False)
     query_url = f"http://a:5000?key={SECRET}"
-    monkeypatch.setenv("LLM_BACKENDS", query_url)
+    monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
+        {"url": query_url, "n_ctx": 8192, "max_output_tokens": 2048},
+    ]))
     audit_path = tmp_path / "gateway-audit.jsonl"
     monkeypatch.setenv("GATEWAY_AUDIT_LOG_PATH", str(audit_path))
     g = _load()
     importlib.reload(g)
     assert query_url in g.LLM_BACKENDS
+    assert SECRET not in json.dumps(g.LLM_DECLARATION_ERRORS)
 
     g._llm_tokens_prompt_total[query_url] = 10
     g._llm_tokens_completion_total[query_url] = 5
@@ -443,7 +442,7 @@ def test_emit_token_lifecycle_sums_scrubs_query_credential(monkeypatch, tmp_path
 
 def test_telemetry_extras_faults_scrubs_a_directly_seeded_credentialed_backend(monkeypatch):
     monkeypatch.delenv("LLM_BACKENDS_JSON", raising=False)
-    monkeypatch.setenv("LLM_BACKENDS", "http://a:5000")
+    monkeypatch.setenv("LLM_BACKENDS_JSON", "[{\"url\": \"http://a:5000\", \"n_ctx\": 8192, \"max_output_tokens\": 2048}]")
     import coordinator
     importlib.reload(coordinator)
     g = _load()
@@ -467,9 +466,12 @@ def test_request_path_debug_log_scrubs_target_url(monkeypatch, caplog):
     """SEC-3: request-path debug log '→ METHOD target_url' must scrub URL query credentials."""
     monkeypatch.delenv("LLM_BACKENDS", raising=False)
     query_url = f"http://a:5000?key={SECRET}"
-    monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([{"url": query_url, "private_ok": True}]))
+    monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
+        {"url": query_url, "n_ctx": 8192, "max_output_tokens": 2048},
+    ]))
     g = _load()
     importlib.reload(g)
+    assert query_url in g.LLM_BACKENDS
 
     _patch_stream_response(monkeypatch)
     proxy = g.AsyncHiveMindProxy()
@@ -486,9 +488,12 @@ def test_request_path_upstream_unreachable_error_log_scrubs_target_url(monkeypat
     """SEC-3: request-path ClientError log must scrub URL query credentials."""
     monkeypatch.delenv("LLM_BACKENDS", raising=False)
     query_url = f"http://a:5000?key={SECRET}"
-    monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([{"url": query_url, "private_ok": True}]))
+    monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
+        {"url": query_url, "n_ctx": 8192, "max_output_tokens": 2048},
+    ]))
     g = _load()
     importlib.reload(g)
+    assert query_url in g.LLM_BACKENDS
 
     class _ErrSession:
         closed = False
@@ -510,9 +515,12 @@ def test_request_path_connect_timeout_log_scrubs_target_url(monkeypatch, caplog)
     """SEC-3: request-path TimeoutError log must scrub URL query credentials."""
     monkeypatch.delenv("LLM_BACKENDS", raising=False)
     query_url = f"http://a:5000?key={SECRET}"
-    monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([{"url": query_url, "private_ok": True}]))
+    monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
+        {"url": query_url, "n_ctx": 8192, "max_output_tokens": 2048},
+    ]))
     g = _load()
     importlib.reload(g)
+    assert query_url in g.LLM_BACKENDS
 
     class _TimeoutSession:
         closed = False

@@ -59,7 +59,7 @@ def _load_gateway(monkeypatch, agent_tokens: str = "", backends_json: list | Non
     """Reloads coordinator FIRST then hive_mind_proxy with clean environment."""
     monkeypatch.delenv("LLM_BACKENDS", raising=False)
     if backends_json is None:
-        backends_json = [{"url": "http://a:5000", "private_ok": True}]
+        backends_json = [{"url": "http://a:5000", "private_ok": True, "n_ctx": 8192, "max_output_tokens": 2048}]
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps(backends_json))
     import secure_env
     secure_env._secrets.pop("AGENT_TOKENS", None)
@@ -270,12 +270,11 @@ def test_handler_a4_auth_on_anonymous(monkeypatch, tmp_path):
                        tmp_path=tmp_path)
 
 
-def test_handler_a5_stall_with_no_dream_slots(monkeypatch, tmp_path):
-    """A5 stall with no backend counting toward dream slots (LLM_BACKENDS_JSON entry
-    without private_ok) -> top status is degraded by co-degradation (rem_daemon carries
-    the slots reason too). F1 is the test that kills the prefix-match mutant."""
-    g = _load_gateway(monkeypatch, backends_json=[{"url": "http://a:5000"}])
-    assert g._dream_slots_impossible_reason() is not None
+def test_handler_a5_a_declared_backend_does_not_invent_a_slots_outage(monkeypatch, tmp_path):
+    """A declared backend serves both daemons. Omitting private_ok is not a slots outage,
+    so an insight stall stays the exempt reason and does not co-degrade REM."""
+    g = _load_gateway(monkeypatch, backends_json=[{"url": "http://a:5000", "n_ctx": 8192, "max_output_tokens": 2048}])
+    assert not hasattr(g, "_dream_slots_impossible_reason")
 
     proxy = g.AsyncHiveMindProxy()
     proxy.session = _HealthProbeSession()
@@ -290,10 +289,10 @@ def test_handler_a5_stall_with_no_dream_slots(monkeypatch, tmp_path):
     resp = asyncio.run(g.handle_health(req))
     body = json.loads(resp.body.decode())
 
-    assert body["dependencies"]["nrem_daemon"]["reason"].startswith("stalled:insight; ")
+    assert body["dependencies"]["nrem_daemon"]["reason"] == "stalled:insight"
     assert body["dependencies"]["nrem_daemon"]["state"] == "degraded"
-    assert body["dependencies"]["rem_daemon"]["state"] == "degraded"
-    assert body["status"] == "degraded"
+    assert body["dependencies"]["rem_daemon"]["state"] == "ok"
+    assert body["status"] == "ok"
     assert resp.status == 200
 
     _record_transcript("A5", body["status"], resp.status,

@@ -22,7 +22,10 @@ import importlib
 import json
 import os
 import sys
+
+import pytest
 from yarl import URL
+pytestmark = pytest.mark.usefixtures("chat_caller_is_consolidation")
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "shared-memory", "scripts"))
 
@@ -205,11 +208,10 @@ def _fresh(monkeypatch, backends="http://a:5000"):
     tests."""
     monkeypatch.delenv("AGENT_TOKENS", raising=False)
     monkeypatch.delenv("LLM_BACKENDS", raising=False)
-    # W4 default-deny: this fixture is about telemetry counters, not privacy
-    # — declare every backend with an explicit private_ok opt-in so role-less
-    # traffic still reaches it (mirrors test_llm_affinity.py's fixture).
-    monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps(
-        [{"url": u.strip(), "private_ok": True} for u in backends.split(",") if u.strip()]))
+    monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
+        {"url": u.strip(), "n_ctx": 8192, "max_output_tokens": 2048}
+        for u in backends.split(",") if u.strip()
+    ]))
     import secure_env
     secure_env._secrets.pop("AGENT_TOKENS", None)
     import coordinator

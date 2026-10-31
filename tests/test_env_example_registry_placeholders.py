@@ -32,6 +32,15 @@ import secure_env  # noqa: E402
 ENV_EXAMPLE = Path(__file__).parent.parent / "shared-memory" / ".env.example"
 
 
+def test_env_example_names_the_internet_and_who_reaches_chat():
+    """The provider-key sentence is not truncated, and auth-on admits named framework agents."""
+    text = ENV_EXAMPLE.read_text()
+    assert "the gateway never sends a provider key in the clear across the internet." in text
+    assert "never sends a provider key in the clear." not in text
+    assert "With AGENT_TOKENS set, LLM_FRAMEWORK_AGENT_NAMES entries are admitted too." in text
+    assert "Only a spawned daemon reaches the chat route either way." not in text
+
+
 def test_env_example_ships_no_live_agent_tokens_roles_or_installs_assignment():
     text = ENV_EXAMPLE.read_text()
     for line in text.splitlines():

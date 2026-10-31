@@ -26,7 +26,7 @@ from project_axis import PROJECT_SQL, fold_eligible
 from nrem_gate import eligible_domain_level_clusters, project_domain_maps, grounded_fact_groups_cypher
 from nrem_gate import count_domain_level_cycles  # noqa: F401 — re-exported from nrem_gate; importing this file pulls psycopg2, which telemetry does not ship
 from domain_axis import resolve_domains
-from pool_status import pool_has_free_slot
+from pool_status import pool_roster_state
 from dream_telemetry import (record_llm_call, adaptive_ceiling, embed_ceiling,
                              EMBED_MAX_CHARS, EMBED_MAX_CONTEXT_TOKENS)
 from record_ref import make_ref
@@ -535,7 +535,7 @@ def _routing_refusal(resp) -> dict | None:
     error = body.get("error") if isinstance(body, dict) else None
     if error not in ("no_eligible_backend", "backend_at_capacity"):
         return None
-    return {"error": error, "constraint": body.get("constraint"), "role": body.get("role")}
+    return {"error": error, "constraint": body.get("constraint")}
 
 
 logging.basicConfig(level=logging.INFO)
@@ -553,17 +553,15 @@ async def _post_nrem(client: httpx.AsyncClient, payload: dict,
     `prompt_chars` (N-4) is the caller's own char-count of the prompt it built,
     additive and optional — passed straight through to record_llm_call.
 
-    Sends `X-SM-LLM-Role: judge` (R-1: the insight fold is the ONLY NREM LLM
-    path — the thematic fold itself makes no LLM call, though the facts it
-    folds may already carry REM-generated `rem_summary` text). A
-    gateway routing refusal (422/503, X-SM-Fault-Origin: gateway) is recorded
+    The insight fold is the only NREM LLM path. A gateway routing refusal
+    (422/503, X-SM-Fault-Origin: gateway) is recorded
     with a distinguishing note, same as any other non-200 — the LOUD,
     entity-scoped log and the no-retry decision belong to the caller
     (_call_insight_llm), which has the fold's own identity to name."""
     _start = time.monotonic()
     resp = await client.post(
         REASONER_URL,
-        headers={**_auth_headers(), "X-SM-LLM-Role": "judge"},
+        headers=_auth_headers(),
         json=payload,
     )
     ok = resp.status_code == 200
@@ -2439,7 +2437,7 @@ class ConsolidationDaemon:
                 and (now - self._pool_probed_at).total_seconds() < NREM_POOL_PROBE_SEC):
             return
         self._pool_probed_at = now
-        if not await pool_has_free_slot(headers=_auth_headers()):
+        if await pool_roster_state(headers=_auth_headers()) == "busy":
             self.last_busy = now
 
     @contextlib.asynccontextmanager
@@ -2656,9 +2654,9 @@ class ConsolidationDaemon:
                         # A gateway routing refusal is a config gap. Do not set the truncation or slot flags, and do not retry the wider bound; the ledger stays open.
                         logger.warning(
                             "NREM: insight fold for '%s' REFUSED by gateway "
-                            "routing (constraint=%s role=%s) — fold skipped, "
+                            "routing (constraint=%s) — fold skipped, "
                             "ledger rows stay open for the next sweep",
-                            entity, refusal["constraint"], refusal["role"],
+                            entity, refusal["constraint"],
                         )
                         return None
                     if resp.status_code != 200:
@@ -4140,7 +4138,7 @@ class ConsolidationDaemon:
         try:
             deadline = time.monotonic() + NREM_FORCED_SLOT_WAIT
             while self.is_running:
-                if await pool_has_free_slot(headers=_auth_headers()):
+                if await pool_roster_state(headers=_auth_headers()) != "busy":
                     return True
                 if time.monotonic() >= deadline:
                     return False
@@ -4203,7 +4201,7 @@ class ConsolidationDaemon:
 
                     if should_consolidate:
                         # Never fire into a busy serial slot. The backstop may wait for one; it does not skip the wait.
-                        slot_free = await pool_has_free_slot(headers=_auth_headers())
+                        slot_free = await pool_roster_state(headers=_auth_headers()) != "busy"
                         if not slot_free:
                             # Both the normal and forced paths queue. Deferring the normal path immediately let faster REM starve consolidation.
                             logger.warning(
@@ -4250,7 +4248,7 @@ class ConsolidationDaemon:
                          sweep_due(now, self.last_sweep_time, self.last_activity,
                                    should_consolidate):
                         # The sweep queues for a slot too. Deferring immediately let the insight backlog sit unfolded for days.
-                        if not await pool_has_free_slot(headers=_auth_headers()) and not await self._wait_for_slot():
+                        if await pool_roster_state(headers=_auth_headers()) == "busy" and not await self._wait_for_slot():
                             from datetime import timedelta as _td
                             self._sweep_backoff_until = now + _td(seconds=60)
                             logger.info("NREM: LLM pool has no free slot — deferring sweep "

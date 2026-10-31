@@ -1010,7 +1010,7 @@ def test_audit_log_write_is_offloaded_and_ordered(tmp_path, monkeypatch):
     still drained — asserting the executor received the work is the guard."""
     vs = load_vector_skill()
     monkeypatch.setenv("MEMORY_LOG_LEVEL", "3")
-    monkeypatch.setenv("MEMORY_LOG_DIR", str(tmp_path))
+    monkeypatch.setenv("MEMORY_LOG_PATH", str(tmp_path))
     calls = []
     real_submit = vs._LOG_EXECUTOR.submit
     monkeypatch.setattr(vs._LOG_EXECUTOR, "submit",

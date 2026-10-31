@@ -174,64 +174,39 @@ def test_overflow_token_slack_appears_nowhere():
 
 # ── 4. migrate_env ──────────────────────────────────────────────────────────
 
-_JSON = json.dumps([{"url": "http://a:5000", "token_env": "BATCH_G_ABSENT_TOKEN"}])
+_JSON = json.dumps([{"url": "http://a:5000", "token_env": "BATCH_G_ABSENT_TOKEN", "n_ctx": 8192, "max_output_tokens": 2048}])
 
 
-def test_loader_stderr_drops_only_the_no_usable_backend_error(tmp_path):
-    snippet = m._LOADER_SNIPPET.format(here=str(SCRIPTS), loader_semantics=m.LOADER_SEMANTICS)
-    env = {"PATH": os.environ["PATH"], "HOME": str(tmp_path), "LLM_BACKENDS_JSON": _JSON,
-           "SECURE_ENV_FILE": ""}
-    proc = subprocess.run([sys.executable, "-c", snippet], env=env, capture_output=True,
-                          text=True, timeout=60)
-    image = json.loads(proc.stdout.strip().splitlines()[-1])
-    assert image["fallback_reason"]  # the scenario really produced the fallback
-    assert "produced no usable backend" not in proc.stderr
-    assert "BATCH_G_ABSENT_TOKEN" in proc.stderr  # the token_env warning is kept
+def test_hidden_load_credential_prints_one_plain_sentence():
+    """The note names the variable the unit supplies. It does not name a fallback or a credential path."""
+    unit = m.UnitQuery("ok", credential_ids=frozenset({"batch_g_absent_token"}))
+    image = {"llm_backends_excluded": [{"url": "http://a:5000", "reason": "token_missing"}]}
+    line = m._hidden_credential_line(unit, image, ["BATCH_G_ABSENT_TOKEN"])
+    assert line is not None
+    assert "is supplied by the gateway's systemd unit" in line
+    assert "token_missing" in line
+    assert "deepseek" not in line.lower() and "/run/credentials" not in line
+    assert "SENTINEL" not in line
 
 
-def _unit(monkeypatch, **kw):
-    kw.setdefault("environment", {"LLM_BACKENDS_JSON": _JSON})
-    monkeypatch.setattr(m, "query_gateway_unit", lambda unit: m.UnitQuery("ok", **kw))
+def test_withheld_secret_environment_key_prints_the_sentence_without_the_value():
+    """A secret Environment= value never enters the faithful env, and the note carries the name only."""
+    unit = m.UnitQuery("ok", environment={"BATCH_G_ABSENT_TOKEN": "sk-VALUE-NOT-PRINTED", "LLM_BACKENDS_JSON": _JSON})
+    faithful = m.build_faithful_env(unit)
+    assert "sk-VALUE-NOT-PRINTED" not in faithful.values()
+    assert "BATCH_G_ABSENT_TOKEN" not in faithful
+    image = {"llm_backends_excluded": [{"url": "http://a:5000", "reason": "token_missing"}]}
+    line = m._hidden_credential_line(unit, image, ["BATCH_G_ABSENT_TOKEN"])
+    assert line is not None
+    assert "sk-VALUE-NOT-PRINTED" not in line
+    assert "BATCH_G_ABSENT_TOKEN" in line
 
 
-_REASON = "LLM_BACKENDS_JSON produced no usable backend (every entry excluded) — SENTINEL"
-
-
-def _run_report(tmp_path, monkeypatch, capsys):
-    env_path = tmp_path / ".env"
-    env_path.write_text(f"LLM_BACKENDS_JSON={_JSON}\n")
-    monkeypatch.setenv("SECURE_ENV_FILE", str(env_path))
-    pre = tmp_path / "pre.json"
-    pre.write_text(json.dumps({"capture_schema": m.CAPTURE_SCHEMA,
-                               "image": {"urls": [], "fallback_reason": _REASON,
-                                         "config_empty": False,
-                                         "token_env_unresolved": ["BATCH_G_ABSENT_TOKEN"]}}))
-    rc = m.do_apply_or_dryrun(str(pre), False, "unit.service")
-    assert rc == m.EXIT_OK
-    return capsys.readouterr().out
-
-
-def test_hidden_load_credential_prints_one_plain_sentence(tmp_path, monkeypatch, capsys):
-    _unit(monkeypatch, credential_ids=frozenset({"batch_g_absent_token"}))
-    out = _run_report(tmp_path, monkeypatch, capsys)
-    assert "is supplied by the gateway's systemd unit" in out
-    assert "SENTINEL" in out
-    assert "deepseek" not in out.lower() and "/run/credentials" not in out
-
-
-def test_withheld_secret_environment_key_prints_the_sentence_without_the_value(
-        tmp_path, monkeypatch, capsys):
-    _unit(monkeypatch, environment={"BATCH_G_ABSENT_TOKEN": "sk-VALUE-NOT-PRINTED", "LLM_BACKENDS_JSON": _JSON})
-    out = _run_report(tmp_path, monkeypatch, capsys)
-    assert "is supplied by the gateway's systemd unit" in out
-    assert "sk-VALUE-NOT-PRINTED" not in out and "SENTINEL" in out
-
-
-def test_empty_load_credential_keeps_the_old_report(tmp_path, monkeypatch, capsys):
-    _unit(monkeypatch, credential_ids=frozenset())
-    out = _run_report(tmp_path, monkeypatch, capsys)
-    assert "is supplied by the gateway's systemd unit" not in out
-    assert "is present but unusable" in out and "SENTINEL" in out
+def test_empty_load_credential_keeps_the_old_report():
+    """No matching credential id means no note. There is no fallback sentence to print."""
+    unit = m.UnitQuery("ok", credential_ids=frozenset())
+    image = {"llm_backends_excluded": [{"url": "http://a:5000", "reason": "token_missing"}]}
+    assert m._hidden_credential_line(unit, image, ["BATCH_G_ABSENT_TOKEN"]) is None
 
 
 def test_busctl_credential_property_parsing():
@@ -272,11 +247,11 @@ def test_query_asks_busctl_for_the_credential_properties(monkeypatch):
     assert any("LoadCredentialEncrypted" in cmd for cmd in get_prop_calls)
 
 
-def test_capture_output_carries_the_sentence(tmp_path, monkeypatch, capsys):
-    _unit(monkeypatch, credential_ids=frozenset({"batch_g_absent_token"}))
-    monkeypatch.setattr(m, "run_loader", lambda env: {"urls": [], "fallback_reason": _REASON,
-                                                      "config_empty": False,
-                                                      "token_env_unresolved": ["BATCH_G_ABSENT_TOKEN"]})
-    assert m.do_capture(str(tmp_path / "pre.json"), "unit.service") == m.EXIT_OK
-    out = capsys.readouterr().out
-    assert "is supplied by the gateway's systemd unit" in out and "SENTINEL" not in out
+def test_capture_writes_nothing_about_a_credential(tmp_path, capsys):
+    """Capture is a read-only stub. It does not print a token name or a fallback reason."""
+    out_path = tmp_path / "pre.json"
+    assert m.do_capture(str(out_path), "unit.service") == m.EXIT_OK
+    text = out_path.read_text() + capsys.readouterr().out
+    assert "BATCH_G_ABSENT_TOKEN" not in text
+    assert "fallback_reason" not in text
+    assert "read-only capture" in text

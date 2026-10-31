@@ -6,7 +6,9 @@ import json
 import os
 import sys
 
+import pytest
 from yarl import URL
+pytestmark = pytest.mark.usefixtures("chat_caller_is_consolidation")
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "shared-memory", "scripts"))
 
@@ -46,8 +48,8 @@ def _auth_off_gateway(monkeypatch):
 def test_pool_status_reports_free_slots(monkeypatch):
     monkeypatch.delenv("LLM_BACKENDS", raising=False)
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
-        {"url": "http://a:5000", "private_ok": True},
-        {"url": "http://b:4000", "private_ok": True},
+        {"url": "http://a:5000", "private_ok": True, "n_ctx": 8192, "max_output_tokens": 2048},
+        {"url": "http://b:4000", "private_ok": True, "n_ctx": 8192, "max_output_tokens": 2048},
     ]))
     g = _auth_off_gateway(monkeypatch)
     g._llm_inflight["http://a:5000"] = 1          # A busy, B free
@@ -59,7 +61,7 @@ def test_pool_status_reports_free_slots(monkeypatch):
 
 
 def test_pool_status_none_free_when_all_busy(monkeypatch):
-    monkeypatch.setenv("LLM_BACKENDS", "http://a:5000,http://b:4000")
+    monkeypatch.setenv("LLM_BACKENDS_JSON", "[{\"url\": \"http://a:5000\", \"n_ctx\": 8192, \"max_output_tokens\": 2048}, {\"url\": \"http://b:4000\", \"n_ctx\": 8192, \"max_output_tokens\": 2048}]")
     g = _auth_off_gateway(monkeypatch)
     g._llm_inflight["http://a:5000"] = 1
     g._llm_inflight["http://b:4000"] = 2
@@ -70,8 +72,8 @@ def test_pool_status_none_free_when_all_busy(monkeypatch):
 def test_pool_status_excludes_reserved(monkeypatch):
     monkeypatch.delenv("LLM_BACKENDS", raising=False)
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
-        {"url": "http://a:5000", "private_ok": True},
-        {"url": "http://b:4000", "private_ok": True},
+        {"url": "http://a:5000", "private_ok": True, "n_ctx": 8192, "max_output_tokens": 2048},
+        {"url": "http://b:4000", "private_ok": True, "n_ctx": 8192, "max_output_tokens": 2048},
     ]))
     g = _auth_off_gateway(monkeypatch)
     g._llm_reserved.add("http://b:4000")          # reserved → not available
@@ -84,8 +86,8 @@ def test_client_fail_open_when_gateway_unreachable(monkeypatch):
     monkeypatch.setenv("POOL_STATUS_URL", "http://127.0.0.1:1/pool/status")
     import pool_status
     importlib.reload(pool_status)
-    # unreachable gateway → assume available so dreaming is never permanently blocked
-    assert asyncio.run(pool_status.pool_has_free_slot(timeout=0.5)) is True
+    # unreachable gateway → unreachable, and the dream gates fail open on that word
+    assert asyncio.run(pool_status.pool_roster_state(timeout=0.5)) == "unreachable"
 
 
 # ── F11: the in-flight slot must never leak ──────────────────────────────────
@@ -114,7 +116,7 @@ class _FakeReq:
 
 
 def test_inflight_slot_released_when_dispatch_raises(monkeypatch):
-    monkeypatch.setenv("LLM_BACKENDS", "http://a:5000")
+    monkeypatch.setenv("LLM_BACKENDS_JSON", "[{\"url\": \"http://a:5000\", \"n_ctx\": 8192, \"max_output_tokens\": 2048}]")
     import hive_mind_proxy as g
     importlib.reload(g)
 
@@ -129,7 +131,7 @@ def test_inflight_slot_released_when_dispatch_raises(monkeypatch):
 def test_inflight_not_reserved_when_request_never_dispatches(monkeypatch):
     """A failure BEFORE the try (header/url construction) must not reserve a slot
     at all — nothing to leak."""
-    monkeypatch.setenv("LLM_BACKENDS", "http://a:5000")
+    monkeypatch.setenv("LLM_BACKENDS_JSON", "[{\"url\": \"http://a:5000\", \"n_ctx\": 8192, \"max_output_tokens\": 2048}]")
     import hive_mind_proxy as g
     importlib.reload(g)
 
@@ -176,7 +178,7 @@ class _ResetOnceThenBoomSession:
 
 def test_retries_once_on_client_connection_reset(monkeypatch):
     monkeypatch.delenv("LLM_BACKENDS", raising=False)
-    monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([{"url": "http://a:5000", "private_ok": True}]))
+    monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([{"url": "http://a:5000", "private_ok": True, "n_ctx": 8192, "max_output_tokens": 2048}]))
     import hive_mind_proxy as g
     importlib.reload(g)
 
@@ -194,7 +196,7 @@ def test_embed_body_buffered_under_cap_is_retry_eligible(monkeypatch):
     """Embeddings/reranking requests get the same protection as LLM traffic
     when their body is small enough to buffer (the gap PR #145 was meant to
     close) — verified via the same real exception type as the LLM-path test."""
-    monkeypatch.setenv("LLM_BACKENDS", "http://a:5000")
+    monkeypatch.setenv("LLM_BACKENDS_JSON", "[{\"url\": \"http://a:5000\", \"n_ctx\": 8192, \"max_output_tokens\": 2048}]")
     import hive_mind_proxy as g
     importlib.reload(g)
 

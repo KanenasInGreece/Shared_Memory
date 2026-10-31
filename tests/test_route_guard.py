@@ -26,8 +26,9 @@ import sys
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+pytestmark = pytest.mark.usefixtures("chat_caller_is_consolidation")
 from aiohttp import web
-from aiohttp.test_utils import make_mocked_request
+from aiohttp.test_utils import TestClient, TestServer, make_mocked_request
 from yarl import URL
 
 REPO_ROOT = os.path.normpath(os.path.join(os.path.dirname(__file__), ".."))
@@ -101,47 +102,42 @@ def _req(method: str, path: str, headers: dict | None = None, body: bytes = b"")
 
 
 def _build_real_gateway_app(g, proxy=None) -> web.Application:
-    """The gateway's actual registered route set (attach_coordinator +
-    /health + /pool/status + the two encoder routes), EXCLUDING the catch-all
-    — exactly what set_known_routes() is meant to see, and exactly what main()
-    builds before adding the catch-all route. `coordinator` is a MagicMock:
-    attach() only needs the handler ATTRIBUTES to exist for registration, it
-    never calls them.
+    """Mirror of main()'s registration window, including the exact chat route.
 
-    ⚠ This is a HAND-WRITTEN MIRROR of main()'s registration window. It is
-    kept honest by test_gateway_edge_hygiene.py::
-    test_every_main_route_registration_has_a_counterpart_in_each_test_mirror,
-    which reads both sources — a route added to main() and not here would
-    otherwise make every test in this file assert against a route table the
-    gateway does not have."""
-    app = web.Application()
-    # AsyncMock, not MagicMock: attach() registers coordinator.handle_* as
-    # aiohttp route handlers, and aiohttp warns ("bare functions are
-    # deprecated") when a registered handler isn't a coroutine function —
-    # cosmetic only (never invoked in these tests), but AsyncMock's
-    # auto-speccing attributes are coroutine functions, so it's free to avoid.
+    Kept honest by test_gateway_edge_hygiene.py::
+    test_every_main_route_registration_has_a_counterpart_in_each_test_mirror.
+    """
+    import coordinator
+    app = web.Application(middlewares=[coordinator.auth_middleware])
     mock_coordinator = AsyncMock()
     g.attach_coordinator(app, mock_coordinator)
     app.router.add_get("/health", g.handle_health)
     app.router.add_get("/pool/status", g.handle_pool_status)
     if proxy is None:
         proxy = g.AsyncHiveMindProxy()
+    app["proxy"] = proxy
     app.router.add_post("/v1/embeddings", proxy.handle_encoder)
     app.router.add_post("/v1/reranking", proxy.handle_encoder)
+    app.router.add_post("/v1/chat/completions", proxy.handle_proxy)
     return app
 
 
 def _build_proxy_with_known_routes(g, *, with_catchall: bool = False):
     proxy = g.AsyncHiveMindProxy()
     app = _build_real_gateway_app(g, proxy)
-    if with_catchall:
-        # Deliberately the WORST-CASE order: the catch-all is already
-        # registered when the snapshot is taken. set_known_routes() must be
-        # correct anyway (its wildcard-method filter, not startup ordering,
-        # is what excludes the catch-all) — RG-2/RG-3 review fix.
-        app.router.add_route("*", "/{tail:.*}", proxy.handle_proxy)
-    proxy.set_known_routes(app.router)
     return app, proxy
+
+
+async def _probe_app(app, method, path):
+    server = TestServer(app)
+    client = TestClient(server)
+    await client.start_server()
+    try:
+        resp = await client.request(method, path, data=b"{}")
+        body = await resp.read()
+        return resp.status, dict(resp.headers), body
+    finally:
+        await client.close()
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -149,63 +145,67 @@ def _build_proxy_with_known_routes(g, *, with_catchall: bool = False):
 # ══════════════════════════════════════════════════════════════════════════
 
 def test_wrong_method_on_a_post_only_memory_route_405(monkeypatch):
-    """The shape the guard exists for: a GET at a path the gateway registers
-    POST-only. It must 405 and name the method AND the path, never fall
-    through to the LLM pool."""
+    """GET on a POST-only framework route is aiohttp's 405, stamped as the gateway, and not forwarded."""
     g = _fresh_gateway(monkeypatch)
-    _, proxy = _build_proxy_with_known_routes(g)
-    resp = asyncio.run(proxy.handle_proxy(_req("GET", "/memory/save")))
-    assert resp.status == 405
-    assert resp.headers["Allow"] == "POST"
-    body = json.loads(resp.body.decode())
-    assert "GET" in body["error"]
-    assert "/memory/save" in body["error"]
-    assert "NOT forwarded" in body["error"]
+    app, proxy = _build_proxy_with_known_routes(g)
+    proxy.session = _CapturingSession()
+    status, headers, _body = asyncio.run(_probe_app(app, "GET", "/memory/save"))
+    assert status == 405
+    assert headers.get("Allow") == "POST"
+    assert headers.get("X-SM-Fault-Origin") == "gateway"
+    assert proxy.session.captured is None
 
 
 @pytest.mark.parametrize("method", ["GET", "POST"])
 def test_unknown_path_under_memory_prefix_404(monkeypatch, method):
     g = _fresh_gateway(monkeypatch)
-    _, proxy = _build_proxy_with_known_routes(g)
-    resp = asyncio.run(proxy.handle_proxy(_req(method, "/memory/no-such-route")))
-    assert resp.status == 404
-    body = json.loads(resp.body.decode())
-    assert "/memory/no-such-route" in body["error"]
-    assert "NOT forwarded" in body["error"]
+    app, proxy = _build_proxy_with_known_routes(g)
+    proxy.session = _CapturingSession()
+    status, headers, _body = asyncio.run(_probe_app(app, method, "/memory/no-such-route"))
+    assert status == 404
+    assert headers.get("X-SM-Fault-Origin") == "gateway"
+    assert proxy.session.captured is None
 
 
 def test_unknown_path_under_admin_prefix_404(monkeypatch):
     g = _fresh_gateway(monkeypatch)
-    _, proxy = _build_proxy_with_known_routes(g)
-    resp = asyncio.run(proxy.handle_proxy(_req("POST", "/admin/no-such-route")))
-    assert resp.status == 404
-    assert "/admin/no-such-route" in json.loads(resp.body.decode())["error"]
+    app, proxy = _build_proxy_with_known_routes(g)
+    proxy.session = _CapturingSession()
+    status, headers, _body = asyncio.run(_probe_app(app, "POST", "/admin/no-such-route"))
+    assert status == 404
+    assert headers.get("X-SM-Fault-Origin") == "gateway"
+    assert proxy.session.captured is None
 
 
 def test_wrong_method_on_health_405(monkeypatch):
     g = _fresh_gateway(monkeypatch)
-    _, proxy = _build_proxy_with_known_routes(g)
-    resp = asyncio.run(proxy.handle_proxy(_req("POST", "/health")))
-    assert resp.status == 405
-    assert resp.headers["Allow"] == "GET, HEAD"
+    app, proxy = _build_proxy_with_known_routes(g)
+    proxy.session = _CapturingSession()
+    status, headers, _body = asyncio.run(_probe_app(app, "POST", "/health"))
+    assert status == 405
+    assert headers.get("Allow") == "GET, HEAD"
+    assert headers.get("X-SM-Fault-Origin") == "gateway"
+    assert proxy.session.captured is None
 
 
 def test_wrong_method_on_memory_telemetry_405(monkeypatch):
     g = _fresh_gateway(monkeypatch)
-    _, proxy = _build_proxy_with_known_routes(g)
-    resp = asyncio.run(proxy.handle_proxy(_req("POST", "/memory/telemetry")))
-    assert resp.status == 405
-    assert resp.headers["Allow"] == "GET, HEAD"
+    app, proxy = _build_proxy_with_known_routes(g)
+    proxy.session = _CapturingSession()
+    status, headers, _body = asyncio.run(_probe_app(app, "POST", "/memory/telemetry"))
+    assert status == 405
+    assert headers.get("Allow") == "GET, HEAD"
+    assert proxy.session.captured is None
 
 
 def test_dynamic_status_route_wrong_method_405(monkeypatch):
-    """/memory/status/{pg_id} is a DynamicResource — the guard must match it
-    by resource PATTERN, not string equality, per the brief."""
     g = _fresh_gateway(monkeypatch)
-    _, proxy = _build_proxy_with_known_routes(g)
-    resp = asyncio.run(proxy.handle_proxy(_req("POST", "/memory/status/42")))
-    assert resp.status == 405
-    assert resp.headers["Allow"] == "GET, HEAD"
+    app, proxy = _build_proxy_with_known_routes(g)
+    proxy.session = _CapturingSession()
+    status, headers, _body = asyncio.run(_probe_app(app, "POST", "/memory/status/42"))
+    assert status == 405
+    assert headers.get("Allow") == "GET, HEAD"
+    assert proxy.session.captured is None
 
 
 class _CapturingSession:
@@ -243,7 +243,7 @@ def test_v1_embeddings_still_dispatches_unchanged(monkeypatch):
 
 
 def test_v1_chat_completions_still_dispatches_unchanged(monkeypatch):
-    monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([{"url": "http://a:5000", "private_ok": True}]))
+    monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([{"url": "http://a:5000", "private_ok": True, "n_ctx": 8192, "max_output_tokens": 2048}]))
     g = _fresh_gateway(monkeypatch)
     _, proxy = _build_proxy_with_known_routes(g)
     session = _CapturingSession()
@@ -258,46 +258,52 @@ def test_v1_chat_completions_still_dispatches_unchanged(monkeypatch):
 
 
 def test_route_view_derived_from_router_not_hand_written(monkeypatch):
-    """decision:1032 class — set_known_routes must derive from the actual
-    router, so a route this test never lists anywhere is still caught."""
+    """A route the chat handler does not know about is still the router's 405, not a forward."""
     g = _fresh_gateway(monkeypatch)
-    app = web.Application()
+    import coordinator
+    app = web.Application(middlewares=[coordinator.auth_middleware])
 
     async def _stub_handler(request):
         return web.json_response({})
     app.router.add_put("/some/new/framework/route", _stub_handler)
     proxy = g.AsyncHiveMindProxy()
-    proxy.set_known_routes(app.router)
-    resp = asyncio.run(proxy.handle_proxy(_req("GET", "/some/new/framework/route")))
-    assert resp.status == 405
-    assert resp.headers["Allow"] == "PUT"
+    proxy.session = _CapturingSession()
+    status, headers, _body = asyncio.run(_probe_app(app, "GET", "/some/new/framework/route"))
+    assert status == 405
+    assert headers.get("Allow") == "PUT"
+    assert proxy.session.captured is None
 
 
-def test_catchall_excluded_from_known_routes(monkeypatch):
-    """The snapshot must exclude the catch-all's wildcard resource EVEN WHEN
-    it is taken after the catch-all is registered (the helper registers it
-    first on purpose) — the guard's correctness must come from
-    set_known_routes() itself, never from main()'s call ordering. A swapped
-    ordering in main() must be harmless; removing the wildcard-method filter
-    must kill this test (RG-2/RG-3 review fix)."""
+def test_no_catchall_is_registered(monkeypatch):
+    """main() builds the app that listens. A wildcard route on that app would forward a mistyped framework path."""
+    monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
+        {"url": "http://127.0.0.1:9/v1", "n_ctx": 8192, "max_output_tokens": 2048},
+    ]))
     g = _fresh_gateway(monkeypatch)
-    _, proxy = _build_proxy_with_known_routes(g, with_catchall=True)
-    for key, entry in proxy._known_routes.items():
-        assert "*" not in entry["methods"], (
-            f"wildcard method captured for {key} — the catch-all leaked into "
-            "the known-routes snapshot")
-        assert "tail" not in key, (
-            f"catch-all resource {key} leaked into the known-routes snapshot")
-    # Behavioural proof in the same worst-case order: the LLM passthrough
-    # still dispatches, and the guard still refuses what it should.
-    session = _CapturingSession()
-    proxy.session = session
-    asyncio.run(proxy.handle_encoder(_req("POST", "/v1/embeddings")))
-    assert session.captured is not None
-    resp = asyncio.run(proxy.handle_proxy(_req("GET", "/memory/save")))
-    assert resp.status == 405 and resp.headers["Allow"] == "POST"
-    resp = asyncio.run(proxy.handle_proxy(_req("GET", "/memory/no-such-route")))
-    assert resp.status == 404
+    seen = {}
+
+    class _Runner:
+        def __init__(self, app, *args, **kwargs):
+            seen["app"] = app
+            raise RuntimeError("stop before listen")
+
+    async def _noop(self):
+        return None
+
+    monkeypatch.setattr(g.AsyncHiveMindProxy, "start_session", _noop)
+    monkeypatch.setattr(g.MemoryCoordinator, "start", _noop)
+    monkeypatch.setattr(g.web, "AppRunner", _Runner)
+    monkeypatch.setattr(sys, "argv", ["hive_mind_proxy"])
+    with pytest.raises(RuntimeError, match="stop before listen"):
+        asyncio.run(g.main())
+    app = seen["app"]
+    for route in app.router.routes():
+        assert route.method != "*"
+        canonical = route.resource.canonical if route.resource is not None else ""
+        assert "tail" not in (canonical or "")
+    status, headers, body = asyncio.run(_probe_app(app, "GET", "/memory/no-such-route"))
+    assert status == 404, body
+    assert headers.get("X-SM-Fault-Origin") == "gateway"
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -462,6 +468,7 @@ _REGISTERED_ROUTES = {
     # a token can reach, and one aiohttp's router now owns exclusively.
     ("POST", "/v1/embeddings"),
     ("POST", "/v1/reranking"),
+    ("POST", "/v1/chat/completions"),
 }
 
 

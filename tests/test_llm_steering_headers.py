@@ -24,6 +24,9 @@ import json
 import os
 import sys
 
+import pytest
+pytestmark = pytest.mark.usefixtures("chat_caller_is_consolidation")
+
 from yarl import URL
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "shared-memory", "scripts"))
@@ -69,7 +72,7 @@ def _load_gateway(monkeypatch):
     a freshly-set AGENT_TOKENS must reload coordinator before hive_mind_
     proxy re-imports the name by value."""
     monkeypatch.delenv("LLM_BACKENDS", raising=False)
-    monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([{"url": "http://a:5000", "private_ok": True}]))
+    monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([{"url": "http://a:5000", "private_ok": True, "n_ctx": 8192, "max_output_tokens": 2048}]))
     import secure_env
     secure_env._secrets.pop("AGENT_TOKENS", None)  # see test_auth.load_coordinator's docstring
     import coordinator
@@ -186,20 +189,6 @@ def test_rem_daemon_identity_also_keeps_steering_header(monkeypatch):
     assert "X-SM-LLM-Role" not in session.captured_headers
 
 
-def test_admin_role_identity_also_exempt(monkeypatch):
-    """Direct unit test of _may_steer_llm's admin branch -- unreachable via
-    the real routing today (auth_middleware confines admin tokens to
-    /admin/*, so one can never reach handle_proxy at all), but the gate
-    itself must still be correct per spec."""
-    monkeypatch.setenv("AGENT_TOKENS", "backup:tok_backup_test")
-    monkeypatch.setenv("AGENT_ROLES", "backup:admin")
-    g = _load_gateway(monkeypatch)
-
-    req = _req({"X-SM-LLM-Role": "judge"})
-    req["authenticated_agent"] = "backup"
-    assert g._may_steer_llm(req) is True
-
-
 def test_non_llm_headers_pass_through_unaffected(monkeypatch):
     """The strip is scoped to X-SM-LLM-* only -- an unrelated custom header
     a client sent survives even while X-SM-LLM-Role is being stripped."""
@@ -216,7 +205,5 @@ def test_non_llm_headers_pass_through_unaffected(monkeypatch):
 
 
 # ── Mutation check target ────────────────────────────────────────────────────
-# See A5_HANDOFF.md's mutation-check table: making _may_steer_llm always
-# return True makes test_client_steering_header_stripped_before_forwarding
-# and test_full_role_client_identity_gets_header_stripped_even_with_auth_on
-# both fail (the header starts surviving for a plain client identity).
+# X-SM-LLM-* is stripped on the way upstream for every caller. A mutant that
+# forwards X-SM-LLM-Role fails the strip tests above. There is no steer gate.

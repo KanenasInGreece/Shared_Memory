@@ -51,6 +51,7 @@ import sys
 import time
 
 import pytest
+pytestmark = pytest.mark.usefixtures("chat_caller_is_consolidation")
 from aiohttp import web
 from aiohttp.client_exceptions import ClientConnectionResetError, ServerDisconnectedError
 from yarl import URL
@@ -146,7 +147,9 @@ def _patch_stream_response(monkeypatch, *, prepare_raises: Exception | None = No
 
 def _reload(monkeypatch, backend="http://a:5000"):
     monkeypatch.delenv("LLM_BACKENDS", raising=False)
-    monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([{"url": backend, "private_ok": True}]))
+    monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
+        {"url": backend, "private_ok": True, "n_ctx": 8192, "max_output_tokens": 2048},
+    ]))
     import coordinator
     importlib.reload(coordinator)
     import hive_mind_proxy as g

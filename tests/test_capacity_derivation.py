@@ -26,7 +26,7 @@ def _load_gateway(monkeypatch, capacity_log_path, agent_tokens: str = ""):
     correct), then hive_mind_proxy -- plus CAPACITY_LOG_PATH set BEFORE the
     hive_mind_proxy reload, since that module reads it at import time."""
     monkeypatch.delenv("LLM_BACKENDS_JSON", raising=False)
-    monkeypatch.setenv("LLM_BACKENDS", "http://a:5000")
+    monkeypatch.setenv("LLM_BACKENDS_JSON", "[{\"url\": \"http://a:5000\", \"n_ctx\": 8192, \"max_output_tokens\": 2048}]")
     monkeypatch.setenv("CAPACITY_LOG_PATH", str(capacity_log_path))
     import secure_env
     secure_env._secrets.pop("AGENT_TOKENS", None)

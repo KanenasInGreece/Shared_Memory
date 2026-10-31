@@ -640,6 +640,20 @@ def _write_agent_token_file(path: str, token: str) -> bool:
         os.close(dir_fd)
 
 
+_RESERVED_DAEMON_NAMES = frozenset({"rem_daemon", "consolidation"})
+
+
+def _refuse_reserved_daemon_names(roster: "list[str] | None") -> None:
+    """rem_daemon and consolidation are minted by the gateway. Mint must not write them."""
+    names = sorted(set(roster or []) & _RESERVED_DAEMON_NAMES)
+    if names:
+        raise ValueError(
+            "reserved daemon name(s) "
+            + ", ".join(names)
+            + ": the gateway mints rem_daemon and consolidation. Remove them from the roster."
+        )
+
+
 def _refuse_injectable_roster() -> None:
     """Raise ValueError if a read-only roster name could forge a .env line.
 
@@ -712,6 +726,7 @@ def mint(
             nothing to carry forward, matches D19's original intent (never
             register a digest nobody holds the matching plaintext for).
     """
+    _refuse_reserved_daemon_names(roster)
     _refuse_injectable_roster()
     if env_path is None:
         env_path = _DEFAULT_GATEWAY_ENV
@@ -1383,6 +1398,7 @@ def main(argv=None) -> int:
         return 1
 
     try:
+        _refuse_reserved_daemon_names(roster)
         _refuse_injectable_roster()
     except ValueError as exc:
         print(f"✗ {exc}", file=sys.stderr)

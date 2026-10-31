@@ -956,7 +956,7 @@ def _cycle_daemon(monkeypatch, pg_ids, kinds, *, queuing=None, attempts=None,
     daemon._bump_rem_attempts = AsyncMock()
 
     monkeypatch.setattr(rem_mod, "_take_shared_backup_lock", lambda c: True)
-    monkeypatch.setattr(rem_mod, "pool_has_free_slot", AsyncMock(return_value=True))
+    monkeypatch.setattr(rem_mod, "pool_roster_state", AsyncMock(return_value="free"))
     monkeypatch.setattr(rem_mod, "_nrem_is_queuing", queuing or (lambda c: False))
     return daemon
 
