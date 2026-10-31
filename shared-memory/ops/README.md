@@ -256,17 +256,18 @@ no part (see the table).
 
 **Fit check** (`LLM_CHARS_PER_TOKEN_RATIO`, `FIT_MARGIN`,
 `FIT_DEFAULT_OUTPUT_TOKENS`) — only active for backends declaring `n_ctx`.
-The estimate is `body_chars / RATIO`. The shipped `1.2` is the **most
-conservative measured ratio** from 20 live `/tokenize` comparisons (v0.9.13
-build, Qwen3 tokenizer, prose/JSON/code/SQL/Greek samples ranging
-1.205–6.905 chars per token); a live chat-completion check showed this floor
-already overestimates real chat-template prompt tokens by 83–525%, so the
-ratio — not the margin — does the protective work. Re-measure for a
-materially different tokenizer (denser tokenization needs a lower ratio).
-`FIT_MARGIN` (0.10) and `FIT_DEFAULT_OUTPUT_TOKENS` (2048) are deliberately
-flagged **unmeasured** conservative buffers. A fit rejection is a structured
-`422` naming the estimate, and a gateway journal line says which knob to
-retune.
+The estimate is the request body's UTF-8 byte length divided by `RATIO`, so
+non-ASCII text such as Greek counts two or more per character, which adds
+caution. The shipped `1.2` is the **most conservative measured ratio** from
+20 live `/tokenize` comparisons (v0.9.13 build, Qwen3 tokenizer,
+prose/JSON/code/SQL/Greek samples ranging 1.205–6.905 chars per token); a live
+chat-completion check showed this floor already overestimates real
+chat-template prompt tokens by 83–525%, so the ratio — not the margin — does
+the protective work. Re-measure for a materially different tokenizer (denser
+tokenization needs a lower ratio). `FIT_MARGIN` (0.10) and
+`FIT_DEFAULT_OUTPUT_TOKENS` (2048) are deliberately flagged **unmeasured**
+conservative buffers. A fit rejection is a structured `422` naming the
+estimate, and a gateway journal line says which knob to retune.
 
 **Capacity wait** (`LLM_MAX_INFLIGHT_WAIT_S`, `LLM_MAX_INFLIGHT_POLL_S`,
 `LLM_MAX_CAPACITY_WAITERS`) — when every eligible backend sits at its

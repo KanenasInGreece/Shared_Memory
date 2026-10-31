@@ -53,8 +53,8 @@ def nrem_insight_bounds(*, backend: str | None = None) -> list[int]:
     """Return initial and widened token bounds for an NREM insight fold call.
 
     Widen a truncated bound once before failing the fold, so a longer draft is
-    not dead-lettered by the default; 8192 stays above the growing
-    previous-insight floor after 2048 stalled the busiest cluster (decision:1205).
+    not dead-lettered by the default. Output grows with the judgement count, and
+    8192 has no measured basis; decision:3336 rules deriving it from that count.
     """
     base = _nrem_insight_base()
     factor = _nrem_retry_factor()

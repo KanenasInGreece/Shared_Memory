@@ -129,6 +129,7 @@ All live in `shared-memory/scripts/` and run on the gateway host only.
 | `consolidation_loop.py` | NREM daemon — synthesises Tier‑3 community summaries: grounded facts fold on the **(project, domain)** spine at density ≥ 3 (fact 1215), never on an entity hub. |
 | `gpu_load.py` | GPU‑busy probe (`nvtop --snapshot`), polled by the coordinator's health refresher to feed the `inference_busy` signal on `GET /health`; the dream-cycle daemons no longer gate on it directly. |
 | `ontology.py` | Loads `shared-memory/ontology.yaml` (repo-root fallback for older checkouts; `SMEM_ONTOLOGY_PATH` overrides) for the configurable entity sub-labels; relationship types are spine, pinned in code, not configurable. |
+| `request_sizing.py` | Decides the size of every reasoning request: REM and NREM output bounds, the insight input cut, and the gateway's fit estimate. Imported by the gateway and both daemons. |
 | `generate_tokens.py` | Token minting helper (write-through mint flow, `--reveal`, `--convert-digests` — see below). |
 
 None of these ship with the skill. See [`sync_skills.sh`](../scripts/sync_skills.sh).
