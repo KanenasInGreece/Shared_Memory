@@ -397,10 +397,10 @@ confusable lookups, and neither was ever used: those queries filter on
 `similarity(name, $1) >= <floor>`, and a GIN trigram index answers the `%`
 similarity **operator**, not a function call compared against a literal — so the
 planner has always chosen a sequential scan (measured: sub-millisecond, on
-two-digit registries). The `pg_trgm` **extension** stays; `similarity()` comes
-from it and every proposal lookup calls it. If either registry ever grows to
-where the scan matters, the fix is the `%` operator with
-`pg_trgm.similarity_threshold` — not these indexes back.
+two-digit registries). The `pg_trgm` **extension** stays; `similarity()` and
+`strict_word_similarity()` come from it, and every proposal lookup calls one of
+them. If either registry ever grows to where the scan matters, the fix is the
+`%` operator with `pg_trgm.similarity_threshold` — not these indexes back.
 
 **Who controls the axis.** A **fact** and a **decision** each assert their own
 project and domain. A **retrospective** asserts neither: both come from the

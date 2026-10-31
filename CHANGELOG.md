@@ -7,6 +7,18 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.0.40] - 2026-10-31
+
+Fix round, batch I: when a save names an unknown section, the suggestions now also come from words in section descriptions. `API_VERSION` stays 4. Restart the gateway. Update the skills for the version pins.
+
+### Fixed
+- **Section suggestions match description words.** The description half of the `domain_unknown` proposal query compared one typed word with a whole sentence using `similarity()`, which never reached its floor, so it had never fired. It now uses `strict_word_similarity` at its own floor of 0.40 (`DOMAIN_DESCRIPTION_PROPOSAL_SIMILARITY`, a constant); the name half keeps 0.25. A section's better score ranks first, and on equal scores a name match comes before a description match, so a typed name is not pushed out of the list by sections that merely mention it.
+- **Documentation of reasoning-request sizing.** `.env.example`: a truncated REM batch is not retried; `REM_TRUNCATION_RETRY_FACTOR` applies to an honest solo retry; the insight paragraph no longer describes the retired cumulative prompt and preservation gate, and says that 8192 has no measured basis and can both truncate a large cluster and be refused by the fit check on a small context. `.env.example` and `ops/README.md`: the fit estimate divides the body's UTF-8 bytes, not characters. `Documentation/server-setup.md` lists `request_sizing.py`; `Documentation/schema.md` names `strict_word_similarity()` as a reason `pg_trgm` stays.
+- **Monitor:** none. No telemetry key, type or `/health` field changed.
+
+### Security
+- Dependency scan: no new advisory on an exercised path. `fastmcp` stays the recorded residual: its fixed release is under the 14-day floor until 2026-11-03.
+
 ## [1.0.39] - 2026-10-30
 
 Fix round, batch H: one module, `request_sizing.py`, now decides how large every reasoning request is. No behaviour change. `API_VERSION` stays 4. Restart the gateway. Update the skills for the version.

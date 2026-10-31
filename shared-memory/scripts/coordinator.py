@@ -54,7 +54,8 @@ from project_axis import (
 )
 from domain_axis import (
     DOMAIN_EXISTS_SQL, DOMAIN_PROPOSALS_SQL, DOMAIN_PROPOSAL_SIMILARITY,
-    DOMAIN_PROPOSAL_LIMIT, DOMAIN_CONFUSABLE_SQL, DOMAIN_CONFUSABLE_SIMILARITY,
+    DOMAIN_DESCRIPTION_PROPOSAL_SIMILARITY, DOMAIN_PROPOSAL_LIMIT,
+    DOMAIN_CONFUSABLE_SQL, DOMAIN_CONFUSABLE_SIMILARITY,
     DOMAIN_ALIAS_RESOLVE_SQL, DOMAIN_REGISTER_SQL, DOMAIN_KEYS,
     DOMAIN_NAMES_SQL, DOMAIN_ALIASES_SQL, DOMAIN_NAME_OR_KEY_SQL,
     DOMAIN_BY_KEY_SQL, _similarity_from_env,
@@ -129,7 +130,7 @@ def _short(value: Any, cap: int = 200) -> str:
 
 
 # FRAMEWORK_VERSION is the build string and may drift. API_VERSION is the wire contract with memory_bridge.py; bump it only when shape, auth, or routes break older clients.
-FRAMEWORK_VERSION = "1.0.39"
+FRAMEWORK_VERSION = "1.0.40"
 # API v2: retrospective is a full record. v4: unregistered project is 400 (proposal / new_project / sentinel).
 API_VERSION = 4
 CLIENT_VERSION_HEADER = "X-SM-Api-Version"
@@ -5341,7 +5342,8 @@ class MemoryCoordinator:
         async with self._acquire() as conn:
             rows = await conn.fetch(
                 DOMAIN_PROPOSALS_SQL, project_id, name,
-                DOMAIN_PROPOSAL_SIMILARITY, DOMAIN_PROPOSAL_LIMIT,
+                DOMAIN_PROPOSAL_SIMILARITY,
+                DOMAIN_DESCRIPTION_PROPOSAL_SIMILARITY, DOMAIN_PROPOSAL_LIMIT,
             )
         return [r["name"] for r in rows]
 

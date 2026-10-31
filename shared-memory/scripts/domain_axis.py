@@ -98,21 +98,26 @@ DOMAIN_NAME_OR_KEY_SQL = (
 )
 
 # Description match is the difference from projects. `crypto` will never trigram-match a section named `security`.
+# Both arms rank by a section's better score, a name match first on a tie, then
+# its name; decision:3261 chose the arms' measures, tested each alone.
 DOMAIN_PROPOSALS_SQL = (
     "SELECT name FROM ("
-    "  SELECT name, max(score) AS score FROM ("
-    "    SELECT name, similarity(name, $2) AS score"
+    "  SELECT name, max(score) AS score, bool_or(from_name) AS name_hit FROM ("
+    "    SELECT name, similarity(name, $2) AS score, true AS from_name"
     "      FROM project_domains WHERE project_id = $1 AND similarity(name, $2) >= $3"
     "    UNION ALL"
-    "    SELECT name, similarity(coalesce(description, ''), $2) AS score"
+    "    SELECT name, strict_word_similarity($2, coalesce(description, '')) AS score, false AS from_name"
     "      FROM project_domains"
-    "     WHERE project_id = $1 AND similarity(coalesce(description, ''), $2) >= $3"
+    "     WHERE project_id = $1 AND strict_word_similarity($2, coalesce(description, '')) >= $4"
     "  ) u GROUP BY name"
-    ") m ORDER BY score DESC, name LIMIT $4"
+    ") m ORDER BY score DESC, name_hit DESC, name LIMIT $5"
 )
 
 # Same floor as projects: a rejected save with no usable proposals is a dead end.
 DOMAIN_PROPOSAL_SIMILARITY = 0.25
+# Strict word similarity of the typed word to the closest words in the description;
+# decision:3261 chose it for the fewest false proposals on typos.
+DOMAIN_DESCRIPTION_PROPOSAL_SIMILARITY = 0.40
 # Bounds the proposal list only.
 DOMAIN_PROPOSAL_LIMIT = 5
 
