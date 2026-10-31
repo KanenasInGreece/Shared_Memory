@@ -7,6 +7,36 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.0.41] - 2026-11-01
+
+Reasoning backends are declared in one place and the gateway serves the framework only. `API_VERSION` stays 4. Read "Before you update" first: an update stops if a declaration is incomplete, and the gateway no longer answers outside clients on the chat route.
+
+### Before you update
+
+- Every entry in `LLM_BACKENDS_JSON` now needs `url`, `n_ctx` and `max_output_tokens`. The update stops before any schema step and names the field if one is missing. Use the provider's published limit, or for a self-hosted server its context size. Query the URL; if it does not say, ask the operator. Never guess.
+- The script that runs this first update is the previous one, whose message recommends `--skip-env-migration`. Do not follow it: the gateway would refuse the file and exit 78.
+- That previous script does not install the new restart guard either. Add `RestartPreventExitStatus=78` by hand, as `OPERATE.md` shows. Without it, a refused file restarts in a loop.
+
+### Changed
+
+- A declared backend serves both daemons. Declaring means trusting. `roles` and `private_ok` are ignored with a deprecation warning, and later versions will not accept them. A backend that served nothing for lack of `private_ok` now receives corpus text; `migrate_env.py --apply` lists every off-host backend at each update so you can remove one you do not trust.
+- `LLM_BACKENDS` and `LLM_DEFAULT_TARGET` are no longer read. With no declaration, memory keeps working, including Tier 3, and `/health` is degraded with `no_backend_declared`. NREM's folds and lineage pass no longer wait on an empty pool.
+- A defined backend with bad fields stops the gateway with exit 78. A backend whose key is missing is excluded and named in `llm_backends_excluded` on `/health` and `/memory/telemetry`.
+- The catch-all forward is gone. `POST /v1/chat/completions` admits spawned daemons, plus names in `LLM_FRAMEWORK_AGENT_NAMES` when `AGENT_TOKENS` is set. Anyone else gets 403 `framework_only`, and an encoded path or a query string is refused before any credential. Other unknown paths are 404 after auth. Call your model directly for chat. `LLM_STEER_EXTRA_AGENT_NAMES` is renamed; the old name warns for one release.
+- Daemon tokens are always minted, auth off included, so daemons keep working with no configuration.
+- Postflight A8 now reports the last daemon chat instead of posting a completion, and it no longer decides the exit code. Exit 0 no longer means a completion was posted.
+- `install_llm_backends.sh` asks the backend for its context size, stays loud when the backend does not say, and no longer asks for roles.
+- `migrate_env.py` no longer rewrites `.env`. It validates what the gateway will read, and `check_config.py` uses the same picture.
+- `shared-memory/.env.example` went from about 70 KB to about 30 KB. Defaults did not change.
+
+### Telemetry
+
+Monitor contract change. Removed: `llm.routing.routed_role_*`, `config.llm_backends[].roles` and `.private_ok`, `/pool/status` `serves_all` and `counts_free_slot`, refusal keys `role` and `declaration`. Added: `llm_backends_excluded`, `llm.backends_excluded`, `priority`, `llm.pool.*.last_call` with `ts`, `status` and `origin`.
+
+### Dependency sweep, 2026-11-01
+
+No pin moved. Not moved: joserfc GHSA-9pg5-8c7x-5hfx (moderate, published 2026-10-30; the fix is under the 14-day floor) and GHSA-jpxq-7h8p-2q76 in `requirements.lock`; fastmcp GHSA-7xgj-8392-5q4r and GHSA-vqqp-x5qm-5qp4 in `requirements.lock` and the MCP connector. None is in `requirements-gateway.lock`.
+
 ## [1.0.40] - 2026-10-31
 
 Fix round, batch I: when a save names an unknown section, the suggestions now also come from words in section descriptions. `API_VERSION` stays 4. Restart the gateway. Update the skills for the version pins.

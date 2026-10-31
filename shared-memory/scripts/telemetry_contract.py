@@ -83,7 +83,7 @@ __all__ = [
 ]
 
 #: Not a free-running today: this is the fifth version pin, so a missed bump is visible (decision:1832).
-VERSION = "1.0.40"
+VERSION = "1.0.41"
 
 
 def _version_tuple(v: str) -> tuple:
@@ -166,6 +166,8 @@ INTRODUCED_0_9_114 = "0.9.114"
 INTRODUCED_1_0_2 = "1.0.2"
 #: compliance.label_distribution and top_paths, the monitor's graph-shape view (decision:2768).
 INTRODUCED_1_0_7 = "1.0.7"
+#: Declaration fields and last-call rows. VERSION in this file stays 1.0.40 until the coordinator stamps the release.
+INTRODUCED_1_0_41 = "1.0.41"
 #: A lone consolidation stall stopped degrading the top /health status (fact:2996 ruling 3).
 INTRODUCED_1_0_17 = "1.0.17"
 #: Quiesce sheds writes on auth-off installs and counts every write in flight (fact:2996 ruling 1: the container check).
@@ -401,7 +403,10 @@ HEALTH: dict[str, dict] = {
         removed_in=DUAL_EMIT_DROP_TARGET),
 
     # ── llm: the enum map stays (the monitor's tiles read it); detail moves ──
-    "llm": _k("str", "llm", note="ok | unknown | down — ok iff ANY backend answered; unknown while the background probe's first cycle is still pending"),
+    "llm": _k("str", "llm", note="ok | degraded | unknown | down — degraded when no backend is declared or the whole fleet is excluded; ok iff any serving backend answered"),
+    "llm_backends_excluded[]": _k("list", "llm", since=INTRODUCED_1_0_41, note="declared backends the gateway did not load, each {url, reason}. Empty when every declaration loaded."),
+    "llm_backends_excluded[].url": _k("str", "llm", since=INTRODUCED_1_0_41),
+    "llm_backends_excluded[].reason": _k("str", "llm", since=INTRODUCED_1_0_41),
     "llm_backends.*": _k("str", "llm",
                          note="per-backend enum: ok | unknown | timeout | down | http_<code>"),
     "llm_reserved[]": _k("list", "llm", moved_to="telemetry:llm.reserved",
@@ -444,19 +449,6 @@ HEALTH: dict[str, dict] = {
     "llm_affinity.hot_prefixes.*.hits": _k(
         "int", "llm", moved_to="telemetry:llm.affinity.hot_prefixes.*.hits",
         removed_in=DUAL_EMIT_DROP_TARGET),
-    "llm_routing.routed_role_extract": _k(
-        "int", "llm", moved_to="telemetry:llm.routing.routed_role_extract",
-        removed_in=DUAL_EMIT_DROP_TARGET),
-    "llm_routing.routed_role_extract_last_ts": _k(
-        "str|null", "llm",
-        moved_to="telemetry:llm.routing.routed_role_extract_last_ts",
-        removed_in=DUAL_EMIT_DROP_TARGET),
-    "llm_routing.routed_role_judge": _k(
-        "int", "llm", moved_to="telemetry:llm.routing.routed_role_judge",
-        removed_in=DUAL_EMIT_DROP_TARGET),
-    "llm_routing.routed_role_judge_last_ts": _k(
-        "str|null", "llm",
-        moved_to="telemetry:llm.routing.routed_role_judge_last_ts", removed_in=DUAL_EMIT_DROP_TARGET),
     "llm_routing.routing_no_eligible_backend": _k(
         "int", "llm", moved_to="telemetry:llm.routing.routing_no_eligible_backend",
         removed_in=DUAL_EMIT_DROP_TARGET),
@@ -923,6 +915,11 @@ TELEMETRY: dict[str, dict] = {
     "llm.backends": _k("dict", "llm", since=INTRODUCED_0_9_74,
                        note="empty when no backend is configured"),
     "llm.backends.*": _k("str", "llm", since=INTRODUCED_0_9_74),
+    "llm.backends_excluded[]": _k(
+        "list", "llm", since=INTRODUCED_1_0_41,
+        note="declared backends the gateway did not load, each {url, reason}. Empty when every declaration loaded."),
+    "llm.backends_excluded[].url": _k("str", "llm", since=INTRODUCED_1_0_41),
+    "llm.backends_excluded[].reason": _k("str", "llm", since=INTRODUCED_1_0_41),
     "llm.reserved[]": _k("list", "llm", since=INTRODUCED_0_9_74),
     "llm.oldest_inflight_age_s": _k("float|null", "llm", unit="_s", since=INTRODUCED_0_9_74),
     "llm.suspect_wedged[]": _k("list", "llm", since=INTRODUCED_0_9_74),
@@ -933,6 +930,10 @@ TELEMETRY: dict[str, dict] = {
     "llm.pool.*.fails": _k("int", "llm", since=INTRODUCED_0_9_74),
     "llm.pool.*.cooldown": _k("float", "llm", unit="_s", since=INTRODUCED_0_9_74),
     "llm.pool.*.reserved": _k("bool", "llm", since=INTRODUCED_0_9_74),
+    "llm.pool.*.priority": _k("int", "llm", since=INTRODUCED_1_0_41, note="stored and shown"),
+    "llm.pool.*.last_call.ts": _k("str|null", "llm", since=INTRODUCED_1_0_41, note="UTC time of the last chat status, or null when this process has not forwarded one. 503 and 504 can be the status this gateway returned when no upstream status arrived; last_call.origin says which."),
+    "llm.pool.*.last_call.status": _k("int|null", "llm", since=INTRODUCED_1_0_41, note="HTTP status of that call, or null when this process has not forwarded one. A 2xx is upstream. 500, 503 and 504 may be gateway-made; origin distinguishes them."),
+    "llm.pool.*.last_call.origin": _k("str|null", "llm", since=INTRODUCED_1_0_41, note="upstream when the backend answered, gateway when this process recorded the status because no upstream status arrived, null before any call"),
     "llm.affinity.hits": _k("int", "llm", since=INTRODUCED_0_9_74),
     "llm.affinity.misses": _k("int", "llm", since=INTRODUCED_0_9_74),
     "llm.affinity.hit_rate": _k("float|null", "llm", since=INTRODUCED_0_9_74),
@@ -940,10 +941,6 @@ TELEMETRY: dict[str, dict] = {
     "llm.affinity.hot_prefixes.*.hits": _k("int", "llm", since=INTRODUCED_0_9_74),
     "llm.affinity.hot_prefixes": _k("dict", "llm", since=INTRODUCED_0_9_74,
                                     note="empty when no prefix is hot"),
-    "llm.routing.routed_role_extract": _k("int", "llm", since=INTRODUCED_0_9_74),
-    "llm.routing.routed_role_extract_last_ts": _k("str|null", "llm", since=INTRODUCED_0_9_74),
-    "llm.routing.routed_role_judge": _k("int", "llm", since=INTRODUCED_0_9_74),
-    "llm.routing.routed_role_judge_last_ts": _k("str|null", "llm", since=INTRODUCED_0_9_74),
     "llm.routing.routing_no_eligible_backend": _k("int", "llm", since=INTRODUCED_0_9_74),
     "llm.routing.routing_no_eligible_backend_last_ts": _k("str|null", "llm", since=INTRODUCED_0_9_74),
     "llm.routing.routing_fit_rejected": _k("int", "llm", since=INTRODUCED_0_9_74),
@@ -1038,9 +1035,9 @@ TELEMETRY: dict[str, dict] = {
     "config.llm_backends[].weight": _k("float", "llm", since=INTRODUCED_0_9_74),
     "config.llm_backends[].has_credential": _k("bool", "credentials", since=INTRODUCED_0_9_74),
     "config.llm_backends[].model": _k("str|null", "llm", since=INTRODUCED_0_9_74),
-    "config.llm_backends[].roles": _k("list|null", "llm", since=INTRODUCED_0_9_74),
     "config.llm_backends[].n_ctx": _k("int|null", "llm", since=INTRODUCED_0_9_74),
-    "config.llm_backends[].private_ok": _k("bool", "llm", since=INTRODUCED_0_9_74),
+    "config.llm_backends[].max_output_tokens": _k("int|null", "llm", since=INTRODUCED_1_0_41, note="declared ceiling"),
+    "config.llm_backends[].priority": _k("int", "llm", since=INTRODUCED_1_0_41, note="stored and shown"),
     "config.llm_backends[].max_inflight": _k("int|null", "llm", since=INTRODUCED_0_9_74),
     "config.llm_backends[].price_per_mtok_in": _k("float|null", "llm", since=INTRODUCED_0_9_74),
     "config.llm_backends[].price_per_mtok_out": _k("float|null", "llm", since=INTRODUCED_0_9_74),
@@ -1657,6 +1654,39 @@ REMOVED_IN_0_9_88: tuple[dict, ...] = (
 )
 
 
+# Grew because the declaration release drops role routing and privacy flags. VERSION stays until the coordinator stamps it.
+REMOVED_IN_1_0_41: tuple[dict, ...] = (
+    {"endpoint": "health", "path": "llm_routing.routed_role_extract",
+     "reason": "role routing is gone; /health no longer emits this counter"},
+    {"endpoint": "health", "path": "llm_routing.routed_role_extract_last_ts",
+     "reason": "same role counter, removed rather than moved"},
+    {"endpoint": "health", "path": "llm_routing.routed_role_judge",
+     "reason": "same role counter, removed rather than moved"},
+    {"endpoint": "health", "path": "llm_routing.routed_role_judge_last_ts",
+     "reason": "same role counter, removed rather than moved"},
+    {"endpoint": "telemetry", "path": "llm.routing.routed_role_extract",
+     "reason": "role routing is gone; a declared backend serves both daemons"},
+    {"endpoint": "telemetry", "path": "llm.routing.routed_role_extract_last_ts",
+     "reason": "same role counter"},
+    {"endpoint": "telemetry", "path": "llm.routing.routed_role_judge",
+     "reason": "same role counter"},
+    {"endpoint": "telemetry", "path": "llm.routing.routed_role_judge_last_ts",
+     "reason": "same role counter"},
+    {"endpoint": "telemetry", "path": "config.llm_backends[].roles",
+     "reason": "roles is no longer a declaration field"},
+    {"endpoint": "telemetry", "path": "config.llm_backends[].private_ok",
+     "reason": "private_ok is no longer a declaration field"},
+    {"endpoint": "refusal", "path": "role",
+     "reason": "a routing refusal no longer names a role"},
+    {"endpoint": "refusal", "path": "declaration",
+     "reason": "a routing refusal no longer names a declaration gap"},
+    {"endpoint": "/pool/status", "path": "backends.*.serves_all",
+     "reason": "free_slots is availability only"},
+    {"endpoint": "/pool/status", "path": "backends.*.counts_free_slot",
+     "reason": "free_slots is availability only"},
+)
+
+
 # Keys that may be absent from a full payload. Adding one is the cheap way to silence the completeness check.
 # Each entry is identity, a live condition, or an empty-versus-populated shape.
 CONDITIONAL: frozenset = frozenset({
@@ -1664,6 +1694,10 @@ CONDITIONAL: frozenset = frozenset({
     "health:agent",
     "health:role",
     # (b) condition-gated
+    "health:llm_backends_excluded[].url",
+    "health:llm_backends_excluded[].reason",
+    "telemetry:llm.backends_excluded[].url",
+    "telemetry:llm.backends_excluded[].reason",
     "health:llm_reserved[]",
     "health:llm_oldest_inflight_age_s",
     "health:llm_suspect_wedged[]",
@@ -1789,9 +1823,7 @@ CONDITIONAL: frozenset = frozenset({
     "health:config.llm_backends[].weight",
     "health:config.llm_backends[].has_credential",
     "health:config.llm_backends[].model",
-    "health:config.llm_backends[].roles",
     "health:config.llm_backends[].n_ctx",
-    "health:config.llm_backends[].private_ok",
     "health:config.llm_backends[].max_inflight",
     "health:config.llm_backends[].price_per_mtok_in",
     "health:config.llm_backends[].price_per_mtok_out",
@@ -1799,9 +1831,7 @@ CONDITIONAL: frozenset = frozenset({
     "telemetry:config.llm_backends[].weight",
     "telemetry:config.llm_backends[].has_credential",
     "telemetry:config.llm_backends[].model",
-    "telemetry:config.llm_backends[].roles",
     "telemetry:config.llm_backends[].n_ctx",
-    "telemetry:config.llm_backends[].private_ok",
     "telemetry:config.llm_backends[].max_inflight",
     "telemetry:config.llm_backends[].price_per_mtok_in",
     "telemetry:config.llm_backends[].price_per_mtok_out",
@@ -2124,6 +2154,15 @@ def render_markdown() -> str:
     a("| endpoint | key | why |")
     a("|---|---|---|")
     for rm in REMOVED_IN_0_9_88:
+        a(f"| {rm['endpoint']} | `{rm['path']}` | {rm['reason']} |")
+    a("")
+    a("## Removed outright in the declaration release")
+    a("")
+    a("Not moved. Role counters and privacy flags left the payload. VERSION in this file is still the previous stamp; the coordinator stamps the release.")
+    a("")
+    a("| endpoint | key | why |")
+    a("|---|---|---|")
+    for rm in REMOVED_IN_1_0_41:
         a(f"| {rm['endpoint']} | `{rm['path']}` | {rm['reason']} |")
     a("")
     a("## Dual-emitted copies dropped")

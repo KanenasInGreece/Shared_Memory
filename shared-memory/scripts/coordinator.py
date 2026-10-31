@@ -130,7 +130,7 @@ def _short(value: Any, cap: int = 200) -> str:
 
 
 # FRAMEWORK_VERSION is the build string and may drift. API_VERSION is the wire contract with memory_bridge.py; bump it only when shape, auth, or routes break older clients.
-FRAMEWORK_VERSION = "1.0.40"
+FRAMEWORK_VERSION = "1.0.41"
 # API v2: retrospective is a full record. v4: unregistered project is 400 (proposal / new_project / sentinel).
 API_VERSION = 4
 CLIENT_VERSION_HEADER = "X-SM-Api-Version"
@@ -225,12 +225,15 @@ def require_unprotected_paths_are_plain_routes(router) -> None:
             f"_UNPROTECTED_PATHS entry {entry!r} is not the canonical of any "
             f"registered route. An exemption for a path the router does not "
             f"own cannot be honoured by the router — it can only be honoured "
-            f"by the catch-all, which forwards to an LLM backend."
+            f"by a route the gateway does not own. An unknown path is aiohttp's 404, after auth."
         )
 
 
 # Parse accepts plaintext so boot can name the agents; require_no_plaintext_agent_tokens() then refuses.
 _PLAINTEXT_AGENT_TOKENS_SEEN: list[str] = []
+# rem_daemon and consolidation are minted by the gateway. Collect here; main() refuses. Import must not raise.
+_RESERVED_DAEMON_NAMES = frozenset({"rem_daemon", "consolidation"})
+_RESERVED_DAEMON_NAMES_SEEN: list[str] = []
 
 # Digest-form AGENT_TOKENS entries: name:sha256:<64-hex-char digest>.
 _DIGEST_HEX_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -246,6 +249,7 @@ def _load_agent_tokens() -> dict[str, str]:
     """Parse AGENT_TOKENS via get_secret into digest→name; plaintext entries are hashed then refused at boot."""
     raw = get_secret("AGENT_TOKENS", "").strip()
     _PLAINTEXT_AGENT_TOKENS_SEEN.clear()
+    _RESERVED_DAEMON_NAMES_SEEN.clear()
     if not raw:
         return {}
     result: dict[str, str] = {}
@@ -285,6 +289,8 @@ def _load_agent_tokens() -> dict[str, str]:
                 "name:sha256:<hex>)", pair,
             )
             continue
+        if name in _RESERVED_DAEMON_NAMES and name not in _RESERVED_DAEMON_NAMES_SEEN:
+            _RESERVED_DAEMON_NAMES_SEEN.append(name)
         if digest in result:
             log.warning(
                 "AGENT_TOKENS: digest for %r collides with an existing entry "
@@ -315,11 +321,24 @@ def require_no_plaintext_agent_tokens() -> None:
     """
     if _PLAINTEXT_AGENT_TOKENS_SEEN:
         names = ", ".join(sorted(_PLAINTEXT_AGENT_TOKENS_SEEN))
-        raise SystemExit(
+        from secure_env import config_fatal
+        config_fatal(
             f"FATAL: AGENT_TOKENS has plaintext entries for: {names} — plaintext "
             "tokens are refused as of v0.9.3. Convert with: uv run python "
             "shared-memory/scripts/generate_tokens.py --convert-digests"
         )
+
+
+def require_reserved_daemon_names() -> None:
+    """Refuse operator tokens named rem_daemon or consolidation. The gateway mints those."""
+    if not _RESERVED_DAEMON_NAMES_SEEN:
+        return
+    from secure_env import config_fatal
+    names = ", ".join(sorted(_RESERVED_DAEMON_NAMES_SEEN))
+    config_fatal(
+        f"FATAL: AGENT_TOKENS names reserved daemon identities ({names}). "
+        "The gateway mints those tokens itself. Remove them from AGENT_TOKENS."
+    )
 
 
 def _lookup_agent_by_token(token: str) -> "str | None":
@@ -1924,6 +1943,20 @@ def _error_body(message: str) -> dict:
             "content_type": "application/json"}
 
 
+def _stamp_gateway_not_found(exc: web.HTTPException) -> None:
+    """A 404 or 405 with no fault header is read as upstream. This one is the gateway's.
+
+    aiohttp joins Allow with a bare comma. The route guard this replaced joined with ", ".
+    """
+    if exc.status in (404, 405) and "X-SM-Fault-Origin" not in exc.headers:
+        exc.headers["X-SM-Fault-Origin"] = "gateway"
+    if exc.status == 405:
+        allow = exc.headers.get("Allow")
+        if allow and ", " not in allow and "," in allow:
+            exc.headers["Allow"] = ", ".join(
+                part.strip() for part in allow.split(",") if part.strip())
+
+
 @web.middleware
 async def auth_middleware(request: web.Request, handler):
     """DEFAULT DENY, and the single identity → govern → audit choke point.
@@ -1996,6 +2029,7 @@ async def auth_middleware(request: web.Request, handler):
                     return resp
             except web.HTTPException as exc:
                 _status = exc.status
+                _stamp_gateway_not_found(exc)
                 raise
             finally:
                 _record_gateway_request(_status, None)
@@ -2011,6 +2045,7 @@ async def auth_middleware(request: web.Request, handler):
                 return resp
             except web.HTTPException as exc:
                 _status = exc.status
+                _stamp_gateway_not_found(exc)
                 raise
             finally:
                 _record_gateway_request(_status, None)
@@ -2127,6 +2162,7 @@ async def auth_middleware(request: web.Request, handler):
             )
         except web.HTTPException as exc:
             status = exc.status
+            _stamp_gateway_not_found(exc)
             raise
         finally:
             latency_ms = (asyncio.get_running_loop().time() - started) * 1000
@@ -11901,7 +11937,7 @@ class MemoryCoordinator:
 # ── Registration ──────────────────────────────────────────────────────────────
 
 def attach(app: web.Application, coordinator: MemoryCoordinator) -> None:
-    """Register the coordinator's exact-path routes before the proxy catch-all."""
+    """Register the coordinator's exact routes. A path this does not register is aiohttp's 404 after auth (fact:1535: a mistyped framework path is not forwarded)."""
     app.router.add_post("/memory/save",           coordinator.handle_save)
     app.router.add_post("/memory/retrospective",  coordinator.handle_retrospective)
     app.router.add_post("/memory/supersede",      coordinator.handle_supersede)

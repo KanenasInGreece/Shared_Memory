@@ -37,7 +37,7 @@ from typing import Any
 
 import httpx
 
-VERSION = "1.0.40"
+VERSION = "1.0.41"
 # Must match GET /health api_version; v4 refuses unregistered project on fact save.
 API_VERSION = 4
 
@@ -1131,7 +1131,8 @@ def _save_argparser() -> "argparse.ArgumentParser":
                         "is a different section. Optional — a record with none "
                         "is filed under its project, which is always correct. "
                         "An unregistered name returns 400 domain_unknown with "
-                        "near matches; add \"new_domain\": true to the metadata "
+                        "sections whose name or "
+                        "description is close; add \"new_domain\": true to the metadata "
                         "to register it, after asking the operator.")
     p.add_argument("--acknowledge-standing", action="append", nargs="+", metavar="ID_AND_WORDS",
                    help="decision id and the operator's words, repeated per decision: "
