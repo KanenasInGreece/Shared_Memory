@@ -10,6 +10,7 @@ import os
 import sys
 
 import pytest
+pytestmark = pytest.mark.usefixtures("chat_caller_is_consolidation")
 from yarl import URL
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "shared-memory", "scripts"))
@@ -64,7 +65,7 @@ class _Req:
 
 def test_client_authorization_never_forwarded_to_llm_backend(monkeypatch):
     monkeypatch.delenv("LLM_BACKENDS", raising=False)
-    monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([{"url": "http://a:5000", "private_ok": True}]))
+    monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([{"url": "http://a:5000", "private_ok": True, "n_ctx": 8192, "max_output_tokens": 2048}]))
     import hive_mind_proxy as g
     importlib.reload(g)
 
@@ -86,7 +87,7 @@ def test_backend_token_env_injected_as_authorization(monkeypatch):
     # explicit here so role-less traffic stays eligible for this backend.
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
         {"url": "https://api.deepseek.com/v1", "token_env": "DEEPSEEK_API_KEY",
-         "model": "deepseek-chat", "private_ok": True},
+         "model": "deepseek-chat", "private_ok": True, "n_ctx": 8192, "max_output_tokens": 2048},
     ]))
     import hive_mind_proxy as g
     importlib.reload(g)
@@ -104,8 +105,8 @@ def test_backend_token_env_injected_as_authorization(monkeypatch):
 def test_missing_token_env_excludes_backend_not_silently_unauthenticated(monkeypatch):
     monkeypatch.delenv("XAI_API_KEY", raising=False)
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
-        {"url": "http://local:5000"},
-        {"url": "https://api.x.ai/v1", "token_env": "XAI_API_KEY"},
+        {"url": "http://local:5000", "n_ctx": 8192, "max_output_tokens": 2048},
+        {"url": "https://api.x.ai/v1", "token_env": "XAI_API_KEY", "n_ctx": 8192, "max_output_tokens": 2048},
     ]))
     import hive_mind_proxy as g
     importlib.reload(g)
@@ -120,23 +121,31 @@ def test_literal_secret_field_rejected_not_silently_dropped(monkeypatch):
     the whole point is to catch the exact mistake that would otherwise put a
     real secret in a file this framework reads (.env / an EnvironmentFile)."""
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
-        {"url": "http://local:5000"},
-        {"url": "https://api.deepseek.com/v1", "token": "sk-oops-a-literal-secret"},
-        {"url": "https://api.x.ai/v1", "api_key": "xai-oops-another-literal-secret"},
+        {"url": "http://local:5000", "n_ctx": 8192, "max_output_tokens": 2048},
+        {"url": "https://api.deepseek.com/v1", "token": "sk-oops-a-literal-secret", "n_ctx": 8192, "max_output_tokens": 2048},
+        {"url": "https://api.x.ai/v1", "api_key": "xai-oops-another-literal-secret", "n_ctx": 8192, "max_output_tokens": 2048},
     ]))
     import hive_mind_proxy as g
     importlib.reload(g)
 
-    assert g.LLM_BACKENDS == ["http://local:5000"]
-    assert "https://api.deepseek.com/v1" not in g.LLM_BACKENDS
-    assert "https://api.x.ai/v1" not in g.LLM_BACKENDS
-    assert "sk-oops-a-literal-secret" not in (g.LLM_BACKEND_TOKENS.values())
-    assert "xai-oops-another-literal-secret" not in (g.LLM_BACKEND_TOKENS.values())
+    assert g.LLM_BACKENDS == []
+    assert "sk-oops-a-literal-secret" not in "".join(str(v) for v in g.LLM_BACKEND_TOKENS.values())
+    assert "xai-oops-another-literal-secret" not in "".join(str(v) for v in g.LLM_BACKEND_TOKENS.values())
+    declared = " ".join(f"{entry} {field}" for entry, field in g.LLM_DECLARATION_ERRORS)
+    assert "sk-oops-a-literal-secret" not in declared
+    assert "xai-oops-another-literal-secret" not in declared
+    assert ("https://api.deepseek.com/v1", "token") in g.LLM_DECLARATION_ERRORS
+    assert ("https://api.x.ai/v1", "api_key") in g.LLM_DECLARATION_ERRORS
+    with pytest.raises(SystemExit) as exc:
+        g.require_valid_llm_routing_config()
+    assert exc.value.code == 78
+    assert "sk-oops-a-literal-secret" not in str(exc.value)
+    assert "xai-oops-another-literal-secret" not in str(exc.value)
 
 
 def test_legacy_llm_backends_unaffected_when_json_unset(monkeypatch):
     monkeypatch.delenv("LLM_BACKENDS_JSON", raising=False)
-    monkeypatch.setenv("LLM_BACKENDS", "http://a:5000@2,http://b:4000")
+    monkeypatch.setenv("LLM_BACKENDS_JSON", "[{\"url\": \"http://a:5000\", \"n_ctx\": 8192, \"max_output_tokens\": 2048, \"weight\": 2}, {\"url\": \"http://b:4000\", \"n_ctx\": 8192, \"max_output_tokens\": 2048}]")
     import hive_mind_proxy as g
     importlib.reload(g)
 
@@ -148,7 +157,7 @@ def test_legacy_llm_backends_unaffected_when_json_unset(monkeypatch):
 
 def test_backend_model_override_rewrites_request_body(monkeypatch):
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
-        {"url": "http://a:5000", "model": "custom-model-id", "private_ok": True},
+        {"url": "http://a:5000", "model": "custom-model-id", "private_ok": True, "n_ctx": 8192, "max_output_tokens": 2048},
     ]))
     import hive_mind_proxy as g
     importlib.reload(g)
@@ -187,9 +196,9 @@ def test_backend_whose_keyfile_holds_a_control_character_is_excluded(
     monkeypatch.setenv("DEEPSEEK_API_KEY_FILE", str(keyfile))
     monkeypatch.delenv("CREDENTIALS_DIRECTORY", raising=False)
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
-        {"url": "http://local:5000"},
+        {"url": "http://local:5000", "n_ctx": 8192, "max_output_tokens": 2048},
         {"url": "https://api.deepseek.com/v1", "token_env": "DEEPSEEK_API_KEY",
-         "model": "deepseek-chat", "private_ok": True},
+         "model": "deepseek-chat", "private_ok": True, "n_ctx": 8192, "max_output_tokens": 2048},
     ]))
     import hive_mind_proxy as g
     with caplog.at_level(logging.WARNING, logger="hive-proxy"):
@@ -205,9 +214,9 @@ def test_backend_whose_keyfile_holds_a_control_character_is_excluded(
     _excl = [r.getMessage() for r in caplog.records
              if "api.deepseek.com" in r.getMessage()
              and "DEEPSEEK_API_KEY" in r.getMessage()
-             and "excluding this backend" in r.getMessage()]
+             and "token_refused" in r.getMessage()]
     assert _excl
-    assert any("refused by secure_env" in m for m in _excl)
+    assert any("Fill the file named by DEEPSEEK_API_KEY_FILE" in m for m in _excl)
     assert not any("is not set in the gateway's own environment" in m
                    for m in _excl)
     # The reader's own line named the FILE — the thing the operator must fix.
@@ -220,32 +229,27 @@ def test_backend_whose_keyfile_holds_a_control_character_is_excluded(
     assert not any("sk-test" in r.getMessage() for r in caplog.records)
 
 
-def test_all_json_backends_excluded_falls_back_LOUDLY_and_health_says_so(monkeypatch):
-    """Every entry needs a token_env that isn't set -> the pool must still be
-    non-empty (falls back to LLM_BACKENDS/DEFAULT_TARGET) so _select_llm_backend
-    never raises. Reasoning-LLM outages must degrade per-request (503/504), never
-    take down the whole gateway process — save/search don't touch this pool at all."""
+def test_all_json_backends_excluded_leaves_an_empty_pool_and_health_says_so(monkeypatch):
+    """Every entry's token is missing. The pool stays empty. There is no fallback target. The dependency is degraded and names token_missing."""
     monkeypatch.delenv("XAI_API_KEY", raising=False)
     monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
     monkeypatch.delenv("LLM_BACKENDS", raising=False)
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
-        {"url": "https://api.x.ai/v1", "token_env": "XAI_API_KEY"},
-        {"url": "https://api.deepseek.com/v1", "token_env": "DEEPSEEK_API_KEY"},
+        {"url": "https://api.x.ai/v1", "token_env": "XAI_API_KEY", "n_ctx": 8192, "max_output_tokens": 2048},
+        {"url": "https://api.deepseek.com/v1", "token_env": "DEEPSEEK_API_KEY", "n_ctx": 8192, "max_output_tokens": 2048},
     ]))
     import hive_mind_proxy as g
     importlib.reload(g)
 
-    assert len(g.LLM_BACKENDS) > 0                  # fell back, never empty
-    # W4 default-deny (decision:1824): the fallback backend is undeclared, so
-    # it is no longer eligible for role-less traffic — _select_llm_backend
-    # returns None (the 422 case), never raises. Was: silently routed there.
-    assert g._select_llm_backend("", None) is None
-    # RE-RULED v0.9.75 (review F6): the fallback still happens — an empty pool
-    # would crash the selector — but it is no longer silent: the reason is
-    # remembered and the llm_pool dependency reports DEGRADED with it.
-    assert g.LLM_POOL_FALLBACK_REASON and "no usable backend" in g.LLM_POOL_FALLBACK_REASON
-    dep = g._llm_pool_dependency({g.LLM_BACKENDS[0]: "ok"})
-    assert dep["state"] == "degraded" and "fallback" in dep["reason"]
+    assert g.LLM_BACKENDS == []
+    assert g._select_llm_backend(None) is None
+    assert not hasattr(g, "LLM_POOL_FALLBACK_REASON")
+    dep = g._llm_pool_dependency({})
+    assert dep["state"] == "degraded"
+    assert "token_missing" in dep["reason"]
+    assert "fallback" not in dep["reason"]
+    assert "api.x.ai" in dep["reason"]
+    assert "api.deepseek.com" in dep["reason"]
 
 
 def test_json_entry_with_openai_base_url_key_is_excluded_loudly(monkeypatch, caplog):
@@ -261,15 +265,18 @@ def test_json_entry_with_openai_base_url_key_is_excluded_loudly(monkeypatch, cap
          "private_ok": True},
     ]))
     import hive_mind_proxy as g
-    with caplog.at_level(logging.ERROR, logger="hive-proxy"):
+    with caplog.at_level(logging.DEBUG, logger="hive-proxy"):
         importlib.reload(g)
 
     assert "https://api.deepseek.com/v1" not in g.LLM_BACKENDS
-    assert g.LLM_POOL_FALLBACK_REASON and "no usable backend" in g.LLM_POOL_FALLBACK_REASON
-    msgs = [r.getMessage() for r in caplog.records]
-    assert any("base_url" in m and "url" in m and "excluding" in m.lower() for m in msgs)
+    assert g.LLM_BACKENDS == []
+    with pytest.raises(SystemExit) as exc:
+        g.require_valid_llm_routing_config()
+    assert exc.value.code == 78
+    assert "field url" in str(exc.value)
     # Do not echo the value: a mistaken key can still carry a credentialed URL.
-    assert not any("api.deepseek.com" in m for m in msgs)
+    assert "api.deepseek.com" not in str(exc.value)
+    assert not any("api.deepseek.com" in r.getMessage() for r in caplog.records)
 
 
 def test_json_entry_missing_url_entirely_is_excluded_loudly(monkeypatch, caplog):
@@ -279,12 +286,15 @@ def test_json_entry_missing_url_entirely_is_excluded_loudly(monkeypatch, caplog)
         {"token_env": "DEEPSEEK_API_KEY", "private_ok": True},
     ]))
     import hive_mind_proxy as g
-    with caplog.at_level(logging.ERROR, logger="hive-proxy"):
+    with caplog.at_level(logging.DEBUG, logger="hive-proxy"):
         importlib.reload(g)
 
-    assert g.LLM_POOL_FALLBACK_REASON and "no usable backend" in g.LLM_POOL_FALLBACK_REASON
-    msgs = [r.getMessage() for r in caplog.records]
-    assert any("no url" in m and "excluding" in m.lower() for m in msgs)
+    assert g.LLM_BACKENDS == []
+    with pytest.raises(SystemExit) as exc:
+        g.require_valid_llm_routing_config()
+    assert exc.value.code == 78
+    assert "field url" in str(exc.value)
+    assert "DEEPSEEK_API_KEY" not in str(exc.value)
 
 
 class _HealthProbeResp:
@@ -327,7 +337,7 @@ def test_health_config_hides_credential_fields_from_unauthenticated_caller(monke
     fields that used to be hidden inside it."""
     monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-should-never-leak")
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
-        {"url": "https://api.deepseek.com/v1", "token_env": "DEEPSEEK_API_KEY", "model": "deepseek-chat"},
+        {"url": "https://api.deepseek.com/v1", "token_env": "DEEPSEEK_API_KEY", "model": "deepseek-chat", "n_ctx": 8192, "max_output_tokens": 2048},
     ]))
     monkeypatch.setenv("AGENT_TOKENS", "claude:tok_health_hide_test")
     import secure_env
@@ -354,8 +364,8 @@ def test_health_config_shows_bool_and_model_for_authenticated_caller_never_the_t
     and the model override -- but never the raw token value, under any caller."""
     monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-should-never-leak")
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
-        {"url": "https://api.deepseek.com/v1", "token_env": "DEEPSEEK_API_KEY", "model": "deepseek-chat"},
-        {"url": "http://localhost:5000"},
+        {"url": "https://api.deepseek.com/v1", "token_env": "DEEPSEEK_API_KEY", "model": "deepseek-chat", "n_ctx": 8192, "max_output_tokens": 2048},
+        {"url": "http://localhost:5000", "n_ctx": 8192, "max_output_tokens": 2048},
     ]))
     import hive_mind_proxy as g
     importlib.reload(g)
@@ -414,7 +424,7 @@ def test_token_never_leaks_into_client_visible_error_response(monkeypatch):
     # actually reach dispatch (and then fail) to exercise the leak check.
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
         {"url": "https://api.deepseek.com/v1", "token_env": "DEEPSEEK_API_KEY",
-         "model": "deepseek-chat", "private_ok": True},
+         "model": "deepseek-chat", "private_ok": True, "n_ctx": 8192, "max_output_tokens": 2048},
     ]))
     import hive_mind_proxy as g
     importlib.reload(g)
@@ -444,7 +454,7 @@ def test_embedder_target_never_gets_authorization_either(monkeypatch):
     embedder. That is a false green: it would assert the property while
     exercising the wrong path."""
     monkeypatch.delenv("LLM_BACKENDS_JSON", raising=False)
-    monkeypatch.setenv("LLM_BACKENDS", "http://a:5000")
+    monkeypatch.setenv("LLM_BACKENDS_JSON", "[{\"url\": \"http://a:5000\", \"n_ctx\": 8192, \"max_output_tokens\": 2048}]")
     import hive_mind_proxy as g
     importlib.reload(g)
 
@@ -482,16 +492,16 @@ def test_a_credentialed_backend_over_plaintext_to_a_remote_host_is_excluded(monk
     monkeypatch.setenv("LOCAL_KEY", "sk-local")
     monkeypatch.setenv("CLOUD_KEY", "sk-cloud")
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
-        {"url": "http://8.8.8.8:8000/v1", "token_env": "REMOTE_KEY", "private_ok": True},   # PUBLIC, plaintext
-        {"url": "http://127.0.0.1:5001/v1", "token_env": "LOCAL_KEY", "private_ok": True},
-        {"url": "https://api.example.com/v1", "token_env": "CLOUD_KEY", "private_ok": True},
-        {"url": "http://192.168.1.9:5000"},   # uncredentialed plaintext is fine
-        {"url": "http://llama-box:8000/v1", "token_env": "LOCAL_KEY", "private_ok": True},        # LAN name
-        {"url": "http://100.101.102.103:8000/v1", "token_env": "LOCAL_KEY", "private_ok": True},  # tailnet
-        {"url": "http://1.1.1.1:8000/v1", "token_env": "LOCAL_KEY", "private_ok": True, "plaintext_ok": True},  # operator-asserted
+        {"url": "http://8.8.8.8:8000/v1", "token_env": "REMOTE_KEY", "private_ok": True, "n_ctx": 8192, "max_output_tokens": 2048},   # PUBLIC, plaintext
+        {"url": "http://127.0.0.1:5001/v1", "token_env": "LOCAL_KEY", "private_ok": True, "n_ctx": 8192, "max_output_tokens": 2048},
+        {"url": "https://api.example.com/v1", "token_env": "CLOUD_KEY", "private_ok": True, "n_ctx": 8192, "max_output_tokens": 2048},
+        {"url": "http://192.168.1.9:5000", "n_ctx": 8192, "max_output_tokens": 2048},   # uncredentialed plaintext is fine
+        {"url": "http://llama-box:8000/v1", "token_env": "LOCAL_KEY", "private_ok": True, "n_ctx": 8192, "max_output_tokens": 2048},        # LAN name
+        {"url": "http://100.101.102.103:8000/v1", "token_env": "LOCAL_KEY", "private_ok": True, "n_ctx": 8192, "max_output_tokens": 2048},  # tailnet
+        {"url": "http://1.1.1.1:8000/v1", "token_env": "LOCAL_KEY", "private_ok": True, "plaintext_ok": True, "n_ctx": 8192, "max_output_tokens": 2048},  # operator-asserted
     ]))
     import hive_mind_proxy as g
-    with caplog.at_level(logging.ERROR, logger="hive-proxy"):
+    with caplog.at_level(logging.WARNING, logger="hive-proxy"):
         importlib.reload(g)
     assert "http://8.8.8.8:8000/v1" not in g.LLM_BACKENDS
     assert "http://llama-box:8000/v1" in g.LLM_BACKENDS
@@ -500,8 +510,10 @@ def test_a_credentialed_backend_over_plaintext_to_a_remote_host_is_excluded(monk
     assert "http://127.0.0.1:5001/v1" in g.LLM_BACKENDS
     assert "https://api.example.com/v1" in g.LLM_BACKENDS
     assert "http://192.168.1.9:5000" in g.LLM_BACKENDS
-    line = [r.getMessage() for r in caplog.records if "plaintext" in r.getMessage()]
-    assert line and "REMOTE_KEY" in line[0] and "sk-remote" not in line[0]
+    line = [r.getMessage() for r in caplog.records if "plaintext_public_host" in r.getMessage()]
+    assert line and any("8.8.8.8" in m for m in line)
+    assert all("sk-remote" not in m and "sk-local" not in m and "sk-cloud" not in m for m in line)
+    assert all("sk-remote" not in r.getMessage() for r in caplog.records)
 
 
 def test_bearer_transport_rule_is_strict_about_odd_urls(monkeypatch):
@@ -558,8 +570,8 @@ def test_the_gateway_cold_imports_with_a_credentialed_backend(tmp_path):
         "DS_TEST_KEY": "sk-test-cold-import",
         "LLM_BACKENDS_JSON": json.dumps([
             {"url": "https://api.example.com/v1", "token_env": "DS_TEST_KEY",
-             "model": "m", "private_ok": True},
-            {"url": "http://llama-box:8000/v1", "token_env": "DS_TEST_KEY", "private_ok": True},
+             "model": "m", "private_ok": True, "n_ctx": 8192, "max_output_tokens": 2048},
+            {"url": "http://llama-box:8000/v1", "token_env": "DS_TEST_KEY", "private_ok": True, "n_ctx": 8192, "max_output_tokens": 2048},
         ]),
         "PYTHONPATH": os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "shared-memory", "scripts")),
     })
@@ -593,174 +605,172 @@ def test_the_gateway_cold_imports_with_a_credentialed_backend(tmp_path):
 _URL_CRED_SECRET = "sm-test-secret-9f3a"
 
 
+def _declared(g) -> str:
+    return " ".join(f"{entry} {field}" for entry, field in g.LLM_DECLARATION_ERRORS)
+
+
 def test_json_entry_with_userinfo_excluded_and_flagged_for_fatal_refusal(monkeypatch):
-    """SEC A: a JSON backend URL with userinfo must never reach the pool, and
-    must make require_no_backend_url_credentials() (main()'s startup guard)
-    refuse. Import itself stays CLEAN (invariant 6) — the refusal is
-    deferred to the guard function, never raised merely by importing."""
+    """A JSON backend URL with userinfo never reaches the pool. Import stays quiet. The startup guard refuses."""
     monkeypatch.delenv("LLM_BACKENDS", raising=False)
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
-        {"url": f"https://leakuser:{_URL_CRED_SECRET}@backend.example.test/v1", "private_ok": True},
+        {"url": f"https://leakuser:{_URL_CRED_SECRET}@backend.example.test/v1",
+         "n_ctx": 8192, "max_output_tokens": 2048},
     ]))
     import hive_mind_proxy as g
     importlib.reload(g)   # must not raise
-    assert not any("leakuser" in b for b in g.LLM_BACKENDS)
-    assert g._LLM_BACKEND_URL_CREDENTIAL_ERRORS, "the credentialed entry was never flagged"
-    assert _URL_CRED_SECRET not in " ".join(g._LLM_BACKEND_URL_CREDENTIAL_ERRORS)
+    assert not any("leakuser" in b or _URL_CRED_SECRET in b for b in g.LLM_BACKENDS)
+    assert any(field == "url" for _entry, field in g.LLM_DECLARATION_ERRORS)
+    assert _URL_CRED_SECRET not in _declared(g)
+    assert "leakuser" not in _declared(g)
     with pytest.raises(SystemExit) as exc_info:
         g.require_no_backend_url_credentials()
+    assert exc_info.value.code == 78
     assert _URL_CRED_SECRET not in str(exc_info.value)
+    assert "leakuser" not in str(exc_info.value)
     assert "backend.example.test" in str(exc_info.value)
 
 
-def test_csv_entry_with_userinfo_excluded_and_flagged_for_fatal_refusal(monkeypatch):
-    """The legacy CSV form had NO per-entry validation at all before this."""
+def test_csv_entry_with_userinfo_is_ignored_and_never_loaded(monkeypatch, caplog):
+    """The CSV pool is not a declaration. Its userinfo never enters the pool or a log line."""
+    import logging
     monkeypatch.delenv("LLM_BACKENDS_JSON", raising=False)
     monkeypatch.setenv("LLM_BACKENDS", f"http://leakuser:{_URL_CRED_SECRET}@backend.example.test:8000")
     import hive_mind_proxy as g
-    importlib.reload(g)
-    assert not any("leakuser" in b for b in g.LLM_BACKENDS)
-    assert g._LLM_BACKEND_URL_CREDENTIAL_ERRORS
-    assert _URL_CRED_SECRET not in " ".join(g._LLM_BACKEND_URL_CREDENTIAL_ERRORS)
-    with pytest.raises(SystemExit) as exc_info:
-        g.require_no_backend_url_credentials()
-    assert _URL_CRED_SECRET not in str(exc_info.value)
+    with caplog.at_level(logging.DEBUG, logger="hive-proxy"):
+        importlib.reload(g)
+    assert g.LLM_BACKENDS == []
+    assert _URL_CRED_SECRET not in " ".join(g.LLM_BACKENDS)
+    assert all(_URL_CRED_SECRET not in r.getMessage() for r in caplog.records)
+    g.require_no_backend_url_credentials()
 
 
 def test_query_string_backend_url_loads_r2(monkeypatch):
-    """R-2: a bare query string is NOT flagged — an Azure-style
-    ?api-version= backend stays loadable, and require_no_backend_url_
-    credentials() does not refuse over it."""
+    """A query string is not userinfo. The backend loads and startup does not refuse."""
     monkeypatch.delenv("LLM_BACKENDS", raising=False)
     azure_url = "https://my-res.openai.azure.com/openai?api-version=2024-02-01"
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
-        {"url": azure_url, "private_ok": True},
+        {"url": azure_url, "n_ctx": 8192, "max_output_tokens": 2048},
     ]))
     import hive_mind_proxy as g
     importlib.reload(g)
     assert azure_url in g.LLM_BACKENDS
-    assert not g._LLM_BACKEND_URL_CREDENTIAL_ERRORS
-    g.require_no_backend_url_credentials()   # must not raise
+    assert not any(field == "url" for _entry, field in g.LLM_DECLARATION_ERRORS)
+    g.require_no_backend_url_credentials()
 
 
-def test_csv_weight_forms_unchanged(monkeypatch):
+def test_csv_weight_forms_are_ignored(monkeypatch):
     monkeypatch.delenv("LLM_BACKENDS_JSON", raising=False)
     monkeypatch.setenv("LLM_BACKENDS", "url@2,url2@1.5")
     import hive_mind_proxy as g
     importlib.reload(g)
-    assert g.LLM_WEIGHTS["url"] == 2.0
-    assert g.LLM_WEIGHTS["url2"] == 1.5
-    assert not g._LLM_BACKEND_URL_CREDENTIAL_ERRORS
+    assert g.LLM_BACKENDS == []
+    assert "url" not in g.LLM_WEIGHTS
+    assert "url2" not in g.LLM_WEIGHTS
 
 
-def test_csv_existing_at_weight_fixture_keeps_parsing(monkeypatch):
-    """Regression guard: the pre-existing fixture from
-    test_legacy_llm_backends_unaffected_when_json_unset must still split
-    into url="http://a:5000", weight=2.0 under the new rpartition logic."""
+def test_json_weight_field_still_parses(monkeypatch):
     monkeypatch.delenv("LLM_BACKENDS_JSON", raising=False)
-    monkeypatch.setenv("LLM_BACKENDS", "http://a:5000@2,http://b:4000")
+    monkeypatch.setenv("LLM_BACKENDS_JSON", "[{\"url\": \"http://a:5000\", \"n_ctx\": 8192, \"max_output_tokens\": 2048, \"weight\": 2}, {\"url\": \"http://b:4000\", \"n_ctx\": 8192, \"max_output_tokens\": 2048}]")
     import hive_mind_proxy as g
     importlib.reload(g)
     assert set(g.LLM_BACKENDS) == {"http://a:5000", "http://b:4000"}
     assert g.LLM_WEIGHTS["http://a:5000"] == 2.0
-    assert not g._LLM_BACKEND_URL_CREDENTIAL_ERRORS
+    assert not any(field == "url" for _entry, field in g.LLM_DECLARATION_ERRORS)
 
 
-def test_csv_nan_weight_is_not_a_bare_float_never_treated_as_weight(monkeypatch):
-    """NOT bare float() — "nan" must never parse as a weight; the whole
-    entry becomes the url instead, per the brief's own stated outcome."""
+def test_csv_nan_weight_is_not_loaded(monkeypatch):
+    """A CSV weight tail is not parsed. It is not admitted as a backend."""
     monkeypatch.delenv("LLM_BACKENDS_JSON", raising=False)
     monkeypatch.setenv("LLM_BACKENDS", "http://a:5000@nan")
     import hive_mind_proxy as g
     importlib.reload(g)
-    assert "http://a:5000" not in g.LLM_BACKENDS   # never split into url="http://a:5000", weight=nan
-    # The whole string "http://a:5000@nan" parses as one URL with userinfo
-    # "a:5000" -- caught by the credential refusal rather than silently lost.
-    assert g._LLM_BACKEND_URL_CREDENTIAL_ERRORS
+    assert g.LLM_BACKENDS == []
+    assert "http://a:5000" not in g.LLM_BACKENDS
+    g.require_no_backend_url_credentials()
 
 
 def test_ambiguous_user_at_numeric_host_not_silently_treated_as_weight(monkeypatch):
-    """ADV2-6: "http://user@10" must NOT become url="http://user" weight=10
-    — that would silently discard "user" (this URL's own embedded
-    credential) without ever routing it through the new refusal. See
-    HANDOFF.md for why the brief's literal "head username is None" rule
-    alone cannot distinguish this from the http://a:5000@2 fixture above."""
-    monkeypatch.delenv("LLM_BACKENDS_JSON", raising=False)
-    monkeypatch.setenv("LLM_BACKENDS", "http://user@10")
+    """http://user@10 is userinfo. It must not load as url http://user with the name discarded."""
+    monkeypatch.delenv("LLM_BACKENDS", raising=False)
+    monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
+        {"url": "http://user@10", "n_ctx": 8192, "max_output_tokens": 2048},
+    ]))
     import hive_mind_proxy as g
     importlib.reload(g)
     assert "http://user" not in g.LLM_BACKENDS
-    assert g._LLM_BACKEND_URL_CREDENTIAL_ERRORS
-    joined = " ".join(g._LLM_BACKEND_URL_CREDENTIAL_ERRORS)
-    assert "user@10" not in joined   # scrubbed — host "10" survives, "user" doesn't
+    assert g.LLM_BACKENDS == []
+    assert "user@10" not in _declared(g)
+    assert "user@" not in _declared(g)
+    with pytest.raises(SystemExit) as exc:
+        g.require_no_backend_url_credentials()
+    assert exc.value.code == 78
+    assert "user@10" not in str(exc.value)
+    assert "user@" not in str(exc.value)
 
 
-# ── Fix round F1 (QA HIGH-1): port-less, path-bearing "url@weight" ─────────
-# README.md's own generic "LLM_BACKENDS=url@weight,..." form, applied to a
-# URL with a path but no port, used to silently mis-split: the stray "@2"
-# landed in urlsplit's PATH (not netloc), so no refusal fired either — the
-# backend loaded with weight 1.0 and a URL nothing answers at. Prove-
-# failing-first: this assertion fails on unmodified code (git stash),
-# yielding url="https://api.example.com/v1@2", weight=1.0, no refusal.
-
-def test_port_less_path_at_weight_recovers_correctly(monkeypatch):
+def test_json_weight_on_a_path_url_loads(monkeypatch):
     monkeypatch.delenv("LLM_BACKENDS_JSON", raising=False)
-    monkeypatch.setenv("LLM_BACKENDS", "https://api.example.com/v1@2")
+    monkeypatch.setenv("LLM_BACKENDS_JSON", "[{\"url\": \"https://api.example.com/v1\", \"n_ctx\": 8192, \"max_output_tokens\": 2048, \"weight\": 2}]")
     import hive_mind_proxy as g
     importlib.reload(g)
     assert "https://api.example.com/v1" in g.LLM_BACKENDS
     assert g.LLM_WEIGHTS["https://api.example.com/v1"] == 2.0
-    assert not g._LLM_BACKEND_URL_CREDENTIAL_ERRORS
+    assert not any(field == "url" for _entry, field in g.LLM_DECLARATION_ERRORS)
 
 
-def test_port_less_no_path_at_weight_stays_genuinely_ambiguous_and_refuses(monkeypatch):
-    """"http://myhost@2" has neither a port nor a path — _parse_backend
-    cannot tell "myhost" is a credential (host "2") apart from a missing-
-    port weight shorthand, so this stays a fatal refusal (F1 recovers only
-    the path-bearing case, per the brief's own scoping)."""
+def test_csv_host_at_weight_is_not_loaded(monkeypatch):
+    """http://myhost@2 is not a JSON declaration. The CSV parser that used to split it is gone."""
     monkeypatch.delenv("LLM_BACKENDS_JSON", raising=False)
     monkeypatch.setenv("LLM_BACKENDS", "http://myhost@2")
     import hive_mind_proxy as g
     importlib.reload(g)
+    assert g.LLM_BACKENDS == []
     assert "http://myhost" not in g.LLM_BACKENDS
-    assert g._LLM_BACKEND_URL_CREDENTIAL_ERRORS
+    assert "myhost@2" not in " ".join(g.LLM_BACKENDS)
 
 
-def test_genuinely_ambiguous_weight_shaped_entry_gets_the_improved_refusal_message(monkeypatch):
-    """F1: the improved message names the ambiguity and both remedies,
-    rather than the generic 'URL embeds a credential' text."""
-    monkeypatch.delenv("LLM_BACKENDS_JSON", raising=False)
-    monkeypatch.setenv("LLM_BACKENDS", "http://user@10")
+def test_userinfo_refusal_names_the_field_and_not_the_credential(monkeypatch):
+    monkeypatch.delenv("LLM_BACKENDS", raising=False)
+    monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
+        {"url": "http://user@10", "n_ctx": 8192, "max_output_tokens": 2048},
+    ]))
     import hive_mind_proxy as g
     importlib.reload(g)
-    joined = " ".join(g._LLM_BACKEND_URL_CREDENTIAL_ERRORS)
-    assert "ambiguous" in joined
-    assert "explicit" in joined and "port" in joined
-    assert "LLM_BACKENDS_JSON" in joined
+    with pytest.raises(SystemExit) as exc:
+        g.require_no_backend_url_credentials()
+    text = str(exc.value)
+    assert "field url" in text
+    assert "user@10" not in text
+    assert "user@" not in text
 
 
-def test_plain_credentialed_url_keeps_the_generic_refusal_message(monkeypatch):
-    """A real credentialed URL with an explicit port is NOT ambiguous —
-    it must keep the original 'URL embeds a credential' wording, not the
-    new ambiguity message (which only applies to a weight-shaped tail)."""
-    monkeypatch.delenv("LLM_BACKENDS_JSON", raising=False)
-    monkeypatch.setenv("LLM_BACKENDS", "http://u:p@host:8000")
+def test_plain_credentialed_url_refuses_without_the_password(monkeypatch):
+    monkeypatch.delenv("LLM_BACKENDS", raising=False)
+    monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
+        {"url": "http://u:p@host:8000", "n_ctx": 8192, "max_output_tokens": 2048},
+    ]))
     import hive_mind_proxy as g
     importlib.reload(g)
-    joined = " ".join(g._LLM_BACKEND_URL_CREDENTIAL_ERRORS)
-    assert "embeds a credential" in joined
-    assert "ambiguous" not in joined
+    assert g.LLM_BACKENDS == []
+    assert "u:p@" not in _declared(g)
+    with pytest.raises(SystemExit) as exc:
+        g.require_no_backend_url_credentials()
+    assert exc.value.code == 78
+    assert "u:p@" not in str(exc.value)
+    assert "host:8000" in str(exc.value)
+    assert "field url" in str(exc.value)
 
-
-# ── Fix round finding 6 (QA LOW): unparseable URL fails CLOSED, not open ───
 
 def test_unparseable_backend_url_refuses_rather_than_silently_admitted(monkeypatch):
-    """Prove-failing-first: urlsplit("http://u:p@[::1") raises ValueError
-    (invalid IPv6 URL) — on unmodified code _backend_url_credential_error
-    caught that exception and returned None ("clean"), admitting a
-    credentialed, unparseable URL to the pool with no refusal at all."""
+    """An unparseable credentialed URL is a declaration fatal. The credential is not admitted and not echoed."""
+    monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
+        {"url": "http://u:p@[::1", "n_ctx": 8192, "max_output_tokens": 2048},
+    ]))
     import hive_mind_proxy as g
     importlib.reload(g)
-    err = g._backend_url_credential_error("http://u:p@[::1")
-    assert err is not None
-    assert "unparseable" in err
+    assert g.LLM_BACKENDS == []
+    assert "u:p" not in _declared(g)
+    with pytest.raises(SystemExit) as exc:
+        g.require_no_backend_url_credentials()
+    assert exc.value.code == 78
+    assert "u:p" not in str(exc.value)

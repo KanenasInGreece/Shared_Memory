@@ -18,12 +18,12 @@ AGENT_TOKEN=$(sed -n 's/^AGENT_TOKEN=//p' "$AGENT_ENV" | head -1); export AGENT_
 bash shared-memory/scripts/postflight.sh
 ```
 
-- **Exit code:** `0` iff assertions **A1–A5, A8 and A9** all pass. A6 is a measurement, never a gate;
-  A7 holds by construction and is documented below. A8 **SKIPs** (never gates) when no reasoning
-  backend is reported *healthy* on the gateway right now, **or** when the real completion itself
-  comes back a declared, gateway-origin `no_eligible_backend` refusal (W4 default-deny, an
-  undeclared or ineligible fleet) — see A8 below for exactly when either applies (this is
-  deliberately not the same thing as "no backend configured" — see A8's own note on why).
+- **Exit code:** `0` iff assertions **A1–A5 and A9** all pass. A8 reports and does not decide. A6 is a measurement, never a gate;
+  A7 holds by construction and is documented below. A8 reads the last daemon chat this gateway
+  process forwarded. No recorded chat warns and does not fail A8 (`not exercised yet`), including
+  right after an update. A recorded status outside 2xx warns with that status and does not fail
+  A8. A telemetry read that is not HTTP 200, or a body that is not JSON, names that failure
+  instead of saying the chat was not exercised. Exit 0 does not mean a completion was posted.
 - **Configuration:** `GATEWAY_URL` (default `http://localhost:8888`), `AGENT_TOKEN` (environment
   only), `PG_CONTAINER`/`NEO4J_CONTAINER`/`PG_DB` (defaults `postgres-vector`/`neo4j-memory`/
   `agent_data`, as in `init_db.sh`). `shared-memory/.env` is read key-by-key (grep/cut), never
@@ -339,87 +339,13 @@ its output rather than testing them.
 **Failure meaning.** A change to the script that violates one of these is a defect against this
 contract, whatever its tests say.
 
-## A8 — Reasoning-backend liveness, end to end
+## A8 — Last daemon chat
 
-**Why this assertion exists.** In v0.9.24, `hive_mind_proxy.py` joined a configured backend base
-and the incoming request path with a naive concatenation, so a base ending in `/v1` — every cloud
-provider's documented shape, and this framework's own shipped `.env.example` before the fix —
-doubled into `/v1/v1/chat/completions`, which providers answer with `404`. It failed **completely
-silently**: a `404` is never billed (no token-counter or provider-dashboard signal), `/health`
-reported the backend `"ok"` (that check is a bare `/v1/models` liveness probe — a different code
-path that happened not to share the bug), both daemons said `"running"`, and A1–A7 (there was no
-A8 yet) passed green while REM retried the same dead completion every 30 s for 45 minutes,
-achieving nothing. A8 exists specifically to close that hole.
+**What this does not prove.** A completion on a fresh install. Postflight does not call the chat route. A daemon's own call is what exercises it, and that call is what this check reads afterwards.
 
-**Check.** Determine whether a reasoning backend is currently **healthy** by reading the
-**gateway's own** per-backend status map — the top-level `llm_backends` field off the
-authenticated (or, on an auth-off install, anonymous) `/health` payload — never by re-parsing
-`LLM_BACKENDS` / `LLM_BACKENDS_JSON` / `LLM_DEFAULT_TARGET` in bash (same reasoning as A3:
-postflight never duplicates the gateway's own resolution logic, it asks and trusts the answer).
-⚠ **Do not confuse this with `/memory/telemetry`'s `config.llm_backends`** — that is the *configured* list,
-and `hive_mind_proxy.py`'s `_load_llm_backends()` **never returns it empty**: an unset
-`LLM_BACKENDS`/`LLM_BACKENDS_JSON` falls back to a single-entry list built from
-`LLM_DEFAULT_TARGET`, itself defaulting to `http://localhost:5000`. A fix-round build keyed A8 on
-that list and made its SKIP branch effectively unreachable — every ordinary install (configured or
-not) would fire a doomed completion at the fallback default and fail postflight for lacking an LLM
-at all, contradicting AGENTS.md Phase 7 (`"llm":"down"` blocks dreaming only, never saves/search).
-The top-level `llm_backends` map is a *different* field: the per-backend liveness verdict the
-gateway's own probe already computes every request cycle, e.g.
-`{"http://localhost:5000": "ok", "https://api.deepseek.com": "timeout"}`. Confirmed vocabulary
-(`hive_mind_proxy.py`, the loop building `backend_status` just above `checks["llm"] = ...`): `"ok"`
-(probe answered `<400`, or a credentialed backend's unauthenticated `401`/`403` — see that code's
-own H-1/H-2 comment), `"http_<code>"` (any other status), `"timeout"`, or `"down"`
-(connect/other exception). **`"ok"` is the only healthy value.**
+**Check.** Authenticated `GET /memory/telemetry` with the agent token this script already holds (curl `-K` on stdin, so the bearer stays off argv). On an auth-off install the same URL is read without a token. The field is `telemetry.llm.pool.<backend>.last_call` (`ts`, `status`), in memory only. The newest `ts` wins. The line names status, scrubbed backend and age in seconds.
 
-If no backend in that map reports `"ok"`, A8 **SKIPs**. Otherwise, issue one minimal **real
-completion** — `POST $GATEWAY_URL/v1/chat/completions`, the exact proxy route and body shape the
-daemons themselves use (`model` from `LLM_MODEL`, defaulting to `"local-model"` exactly like
-`rem_loop.py`/`consolidation_loop.py`; a small deterministic prompt; `max_tokens: 16`) — with a
-Bearer `AGENT_TOKEN` when auth is configured, via curl's `-K` stdin config idiom so the token
-never appears in argv. This is **never** a `/health` field read, a `/v1/models` probe, or a bare
-TCP connect — none of those observed the D23 incident; only a real completion through the real
-join does.
-
-**Pass criterion.** HTTP `200` **and** a non-empty `choices[0].message.content` string, **or** a
-non-empty `choices[0].message.reasoning_content` string (Item B, W5, measured 2026-08-30): a
-thinking model at A8's `max_tokens: 16` can return 16 tokens of `reasoning_content`, empty
-`content`, `finish_reason: length` — that is still proof a real completion crossed the gateway
-proxy join, the one thing A8 exists to prove. The reasoning check mirrors the content guard
-exactly (a real string, non-whitespace) — a structured `reasoning_content` object (e.g.
-`{"blocks": []}`) does **not** count. **Accepted semantic shift:** a `finish_reason:
-"content_filter"` response carrying reasoning but no content now also grades a pass — correct for
-A8's question (did a completion cross the join?), not "did the model comply". A `200` with BOTH
-fields empty or absent is graded a failure, not a pass — liveness is not capability, and a shape
-check is not a content check. This is precisely the D23 signature made testable: `/health` said a
-backend was `"ok"`, but the real work path did not work.
-
-**Failure meaning.** `404`: the message names the known cause (a doubled `/v1` path segment when
-the configured base already ends in `/v1`) and lists the backend(s) that reported `"ok"` at
-request time, read off the same `llm_backends` status map — never a credential, never
-`has_credential`, never a `token_env` name (that map carries no credential-shaped fields at all).
-Any other non-`200`, or `200` with no usable content: the status/shape is stated plainly alongside
-the same healthy-backend list. No response within `CLIENT_TIMEOUT`: reported as a
-timeout-or-connection-failure.
-
-**When A8 SKIPs — and never gates.** Four cases, none of which may ever call the failure path:
-**(1)** `AGENT_TOKEN` missing while auth is configured — same precondition as A4/A5/A6, and marked
-at A1 the same way A5 already is (needed in **every** postflight mode, unlike A4 which re-baseline
-mode exempts). **(2)** The gateway is unreachable — this is a real problem A1 already reports; A8
-marks itself failed here too (matching A2/A4/A5's own cascading-failure convention) rather than
-SKIP, since "unreachable" is not "no healthy backend". **(3)** No backend in the `llm_backends`
-status map reports `"ok"` right now — the honest "no working LLM here" case. This is reachable in
-two realistic shapes: the map is empty, or (the common case, since the *configured* list is never
-empty by construction) every reported backend is `"down"`/`"timeout"`/`"http_<code>"`. **(4)** The
-real completion itself came back `422` with a body naming `no_eligible_backend` and a
-`declaration` (W4 default-deny, `decision:1824`) — an undeclared or ineligible fleet, e.g. no
-backend was ever declared at all, or a credentialed backend declares neither `roles` nor an
-explicit `private_ok` — **provided** `constraint` is not `"fit"` (a genuine oversized-request fit
-refusal stays fatal) **and** the gateway itself stamped the response (`X-SM-Fault-Origin:
-gateway`) — a passed-through *upstream* provider `422` must never be misread as this documented
-state. The skip message names the declaration value (`none` or `no_role_less_opt_in`) and points
-at `check_config.py` for the per-backend detail. **Only cases (3) and (4) print as a SKIP** (never
-`bad()`); they exist so A8 can never fail an install that legitimately has no working LLM right
-now, or one whose fleet is honestly undeclared rather than broken.
+**Pass.** A recorded 2xx prints the line and does not fail A8. Any other recorded status warns with that status and does not fail A8. No `ts` in a JSON body, a missing token, or an unreachable gateway prints `not exercised yet` and does not fail A8. HTTP other than 200, and a body that is not JSON, name that failure instead. Right after an update the gateway process has not forwarded a chat, so `not exercised yet` is the expected line. A1 still fails the run when the gateway or the token is missing.
 
 ## A9 — Encoder window contract
 

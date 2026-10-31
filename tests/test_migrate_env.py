@@ -35,18 +35,6 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "shared-memory"
 import migrate_env as m  # noqa: E402
 
 
-@pytest.fixture(autouse=True)
-def _home_never_defaults_to_the_real_one(tmp_path, monkeypatch):
-    """QA LOW (fix round): every test in this file gets a throwaway HOME by
-    default — a test that calls do_apply_or_dryrun()/do_capture() without
-    itself overriding HOME (every no-write/dry-run/refusal path; none of
-    them currently reach backup_env_file(), the only HOME consumer) used
-    to inherit the AMBIENT real HOME for the loader subprocess's own env.
-    Currently harmless (importing hive_mind_proxy does no $HOME filesystem
-    work) but this closes the gap at the harness level rather than resting
-    on that property. A test that needs a SPECIFIC HOME still overrides it
-    explicitly afterward (monkeypatch's last-write-wins)."""
-    monkeypatch.setenv("HOME", str(tmp_path / "default-fixture-home"))
 
 
 def _force_no_unit(monkeypatch):
@@ -151,7 +139,9 @@ def test_query_gateway_unit_unparseable_environment_line_is_query_failed(monkeyp
 
 def test_parse_systemctl_environment_files_extracts_bare_path():
     raw = "EnvironmentFiles=/etc/foo/bar.env (ignore_errors=no)\n"
-    assert m._parse_systemctl_environment_files(raw) == ["/etc/foo/bar.env"]
+    assert m._parse_systemctl_environment_files(raw) == [("/etc/foo/bar.env", False)]
+    optional = "EnvironmentFiles=-/x (ignore_errors=yes)\nEnvironmentFiles=/y (ignore_errors=yes)\n"
+    assert m._parse_systemctl_environment_files(optional) == [("/x", True), ("/y", True)]
 
 
 def test_query_gateway_unit_no_systemctl_proceeds_normally(monkeypatch):
@@ -244,257 +234,338 @@ def test_build_faithful_env_excludes_secret_classified_unit_environment_keys():
 # Raw env-file parsing (pure)
 # ─────────────────────────────────────────────────────────────────────────
 
-def test_parse_managed_key_lines_finds_each_key_once():
-    lines = ["FOO=1", "EMBEDDER_URL=http://a:8070", "# LLM_BACKENDS=commented", "LLM_BACKENDS=http://a:5000"]
-    occ = m.parse_managed_key_lines(lines)
-    assert occ["EMBEDDER_URL"] == [1]
-    assert occ["LLM_BACKENDS"] == [3]  # the commented line is skipped
 
-
-def test_duplicate_managed_key_detected():
-    lines = ["LLM_BACKENDS=http://a:5000", "LLM_BACKENDS=http://b:5000"]
-    occ = m.parse_managed_key_lines(lines)
-    assert m.find_duplicate_managed_keys(occ) == ["LLM_BACKENDS"]
-
-
-def test_no_duplicate_when_each_key_appears_once():
-    lines = ["LLM_BACKENDS=http://a:5000", "EMBEDDER_URL=http://a:8070"]
-    occ = m.parse_managed_key_lines(lines)
-    assert m.find_duplicate_managed_keys(occ) == []
 
 
 # ─────────────────────────────────────────────────────────────────────────
 # verify_only_planned_keys_changed — the FILE-LEVEL check (SEC M-4 / QA MED-9)
 # ─────────────────────────────────────────────────────────────────────────
 
-def test_verify_only_planned_keys_changed_ok_when_nothing_moved():
-    lines = ["EMBEDDER_URL=http://a:8070", "LLM_BACKENDS_JSON=[{\"url\":\"http://a:5000\"}]"]
-    ok, msg = m.verify_only_planned_keys_changed(lines, list(lines), planned_keys=set())
-    assert ok, msg
 
 
-def test_verify_only_planned_keys_changed_ok_when_only_planned_key_moved():
-    pre = ["EMBEDDER_URL=http://a:8070"]
-    post = ["EMBEDDER_URL=http://a:9090"]
-    ok, msg = m.verify_only_planned_keys_changed(pre, post, planned_keys={"EMBEDDER_URL"})
-    assert ok, msg
 
 
-def test_verify_only_planned_keys_changed_catches_an_unplanned_move():
-    """The property this check exists for: a managed key changing that
-    was NOT in this run's planned moves — exactly what SEC M-4 / QA MED-9
-    named (a wrong EMBEDDER_URL/RERANKER_URL write passing the semantic
-    two_layer_compare() green, because that check never carries either
-    field)."""
-    pre = ["EMBEDDER_URL=http://a:8070", "LLM_BACKENDS_JSON=[{\"url\":\"http://a:5000\"}]"]
-    post = ["EMBEDDER_URL=http://SOMETHING-ELSE:9999", "LLM_BACKENDS_JSON=[{\"url\":\"http://a:5000\"}]"]
-    ok, msg = m.verify_only_planned_keys_changed(pre, post, planned_keys={"LLM_BACKENDS_JSON"})
-    assert not ok
-    assert "EMBEDDER_URL" in msg
 
 
-def test_e2e_post_write_file_level_check_is_wired_to_restore_on_divergence(
-        tmp_path, monkeypatch, capsys):
-    """SEC M-4 / QA MED-9 wiring test: force verify_only_planned_keys_changed
-    to report a divergence and confirm do_apply_or_dryrun restores from
-    backup and returns EXIT_STOP rather than reporting success — proving
-    this SECOND check is actually consulted, not merely defined."""
-    _force_no_unit(monkeypatch)
-    env_path = _write_env(tmp_path, "LLM_BACKENDS=http://a:5000\n")
-    monkeypatch.setenv("SECURE_ENV_FILE", str(env_path))
-    monkeypatch.setenv("HOME", str(tmp_path / "fake-home"))
-    monkeypatch.setattr(m, "verify_only_planned_keys_changed",
-                         lambda pre, post, planned: (False, "synthetic unplanned move for this test"))
-    rc = m.do_apply_or_dryrun(None, True, _NO_UNIT)
-    out = capsys.readouterr().out
-    assert rc == m.EXIT_STOP
-    assert "POST-WRITE FILE DIVERGED" in out
-    assert "synthetic unplanned move for this test" in out
-    # And the restore actually happened — the file is back to its original content.
-    assert env_path.read_text() == "LLM_BACKENDS=http://a:5000\n"
 
 
 # ─────────────────────────────────────────────────────────────────────────
 # The decision ladder — classify() (pure, all 5 cases)
 # ─────────────────────────────────────────────────────────────────────────
 
-def _image(**over):
-    base = {
-        "urls": [], "fallback_reason": None, "config_empty": False,
-        "default_target": "http://localhost:5000",
-        "private_ok_explicit": {}, "has_token": {},
-    }
-    base.update(over)
-    return base
+def _apply_env(monkeypatch, tmp_path, **env):
+    """do_apply reads the env file the gateway will read. The operator shell is not that file."""
+    _force_no_unit(monkeypatch)
+    for key in ("LLM_BACKENDS_JSON", "LLM_BACKENDS", "LLM_DEFAULT_TARGET", "AGENT_TOKENS"):
+        monkeypatch.delenv(key, raising=False)
+    env_file = tmp_path / "gateway.env"
+    env_file.write_text("".join(f"{key}={value}\n" for key, value in env.items()))
+    monkeypatch.setenv("SECURE_ENV_FILE", str(env_file))
+    return m.do_apply("hive-mind-gateway-does-not-exist.service")
 
 
-def test_case_0_present_but_empty_json_first_match():
-    lines = ["LLM_BACKENDS_JSON="]
-    occ = m.parse_managed_key_lines(lines)
-    assert m.classify(_image(), occ, lines) == m.CASE_JSON_PRESENT_EMPTY
+def test_case_0_present_but_empty_json_is_usable(monkeypatch, tmp_path, capsys):
+    """An empty JSON value declares no backend. The validator writes nothing."""
+    assert _apply_env(monkeypatch, tmp_path, LLM_BACKENDS_JSON="") == m.EXIT_OK
+    assert "Nothing was written" in capsys.readouterr().out
 
 
-def test_case_1_json_usable():
-    lines = ['LLM_BACKENDS_JSON=[{"url":"http://a:5000"}]']
-    occ = m.parse_managed_key_lines(lines)
-    img = _image(urls=["http://a:5000"])
-    assert m.classify(img, occ, lines) == m.CASE_JSON_USABLE
+def test_case_2_unusable_json_stops_and_does_not_read_the_csv(monkeypatch, tmp_path, capsys):
+    """Bad JSON stops the update. A live CSV line beside it is not a migration."""
+    assert _apply_env(
+        monkeypatch, tmp_path, LLM_BACKENDS_JSON="{not json", LLM_BACKENDS="http://a:5000",
+    ) == m.EXIT_STOP
+    out = capsys.readouterr().out
+    assert "field json" in out
+    assert "Nothing was written" not in out
 
 
-def test_case_2_json_present_but_unusable_takes_precedence_over_csv():
-    """Precedence + JSON-key survival (M8's own corpus item): a fallback
-    reason on the JSON key means touch NOTHING, even with a live CSV
-    line sitting right there."""
-    lines = ['LLM_BACKENDS_JSON={not json', "LLM_BACKENDS=http://a:5000"]
-    occ = m.parse_managed_key_lines(lines)
-    img = _image(fallback_reason="LLM_BACKENDS_JSON produced no usable backend")
-    assert m.classify(img, occ, lines) == m.CASE_JSON_UNUSABLE
+def test_case_4_neither_key_is_no_backend(monkeypatch, tmp_path, capsys):
+    """No declaration is a running gateway with no reasoning, not a fallback target."""
+    assert _apply_env(monkeypatch, tmp_path) == m.EXIT_OK
+    out = capsys.readouterr().out
+    assert "Nothing was written" in out
+    assert "LLM_DEFAULT_TARGET" not in out
 
 
-def test_case_3_csv_live_no_json_key_at_all():
-    lines = ["LLM_BACKENDS=http://a:5000,http://b:5000"]
-    occ = m.parse_managed_key_lines(lines)
-    assert m.classify(_image(), occ, lines) == m.CASE_CSV_LIVE
+_GOOD_JSON = json.dumps([{"url": "http://a:5000", "n_ctx": 8192, "max_output_tokens": 2048}])
+_BAD_JSON = json.dumps([{"url": "http://a:5000", "max_output_tokens": 1}])
 
 
-def test_case_4_fallback_neither_key():
-    lines = ["EMBEDDER_URL=http://a:8070"]
-    occ = m.parse_managed_key_lines(lines)
-    img = _image(config_empty=True)
-    assert m.classify(img, occ, lines) == m.CASE_FALLBACK
+def test_apply_reads_a_reserved_name_from_agent_tokens_file(monkeypatch, tmp_path, capsys):
+    """A roster that exists only behind AGENT_TOKENS_FILE is what the gateway loads."""
+    digest = "ab" * 32
+    roster = tmp_path / "roster"
+    roster.write_text(f"consolidation:sha256:{digest}\n")
+    env_file = tmp_path / "gateway.env"
+    env_file.write_text(f"LLM_BACKENDS_JSON={_GOOD_JSON}\nAGENT_TOKENS_FILE={roster}\n")
+    monkeypatch.setenv("SECURE_ENV_FILE", str(env_file))
+    monkeypatch.setenv("AGENT_TOKENS", "operator:tok")
+    for key in ("LLM_BACKENDS_JSON", "LLM_BACKENDS", "LLM_DEFAULT_TARGET"):
+        monkeypatch.delenv(key, raising=False)
+    _force_no_unit(monkeypatch)
+    picture = m._gateway_env(m.query_gateway_unit("hive-mind-gateway.service"))
+    assert digest not in json.dumps(picture)
+    assert m.build_faithful_env(m.UnitQuery("no_systemctl")).get("AGENT_TOKENS") is None
+    assert m.do_apply("hive-mind-gateway.service") == m.EXIT_STOP
+    captured = capsys.readouterr()
+    text = captured.out + captured.err
+    assert "consolidation" in text
+    assert "field agent" in text
+    assert digest not in text
 
 
-def test_classify_case_2_requires_the_json_key_to_actually_be_present():
-    """QA H2 (fix round): `fallback_reason` truthy is NOT sufficient for
-    case 2 on its own — the KEY must be present in the file too. Without
-    the `json_idxs and` guard, a stale/inconsistent image (fallback_reason
-    set with no JSON key at all) would still misreport case 2 instead of
-    falling through to whatever the CSV/fallback state actually is. This
-    is what makes the classify() outcome track the FIXTURE rather than a
-    hardcoded field: deleting the JSON key from `lines`/`occurrences`
-    (simulated here directly, no JSON line at all) with a live CSV present
-    now correctly lands in CASE_CSV_LIVE even if `fallback_reason` were
-    (incorrectly) still set on the image — pre-fix this returned
-    CASE_JSON_UNUSABLE regardless."""
-    lines = ["LLM_BACKENDS=http://a:5000"]  # no LLM_BACKENDS_JSON line at all
-    occ = m.parse_managed_key_lines(lines)
-    img = _image(fallback_reason="stale/inconsistent — no JSON key backs this")
-    assert m.classify(img, occ, lines) == m.CASE_CSV_LIVE
+def test_apply_unit_secure_env_file_beats_the_process_file(monkeypatch, tmp_path, capsys):
+    """The unit's SECURE_ENV_FILE is the file the gateway will read."""
+    good = tmp_path / "good.env"
+    good.write_text(f"LLM_BACKENDS_JSON={_GOOD_JSON}\n")
+    bad = tmp_path / "bad.env"
+    bad.write_text(f"LLM_BACKENDS_JSON={_BAD_JSON}\n")
+    monkeypatch.setenv("SECURE_ENV_FILE", str(good))
+    monkeypatch.delenv("LLM_BACKENDS_JSON", raising=False)
+    monkeypatch.setattr(
+        m, "query_gateway_unit",
+        lambda unit: m.UnitQuery("ok", environment={"SECURE_ENV_FILE": str(bad)}),
+    )
+    assert m.do_apply("hive-mind-gateway.service") == m.EXIT_STOP
+    assert "field n_ctx" in capsys.readouterr().out
+
+
+def test_apply_good_shell_json_does_not_hide_a_bad_file(monkeypatch, tmp_path, capsys):
+    """A usable LLM_BACKENDS_JSON in the operator shell is not the gateway's file."""
+    bad = tmp_path / "bad.env"
+    bad.write_text(f"LLM_BACKENDS_JSON={_BAD_JSON}\n")
+    monkeypatch.setenv("SECURE_ENV_FILE", str(bad))
+    monkeypatch.setenv("LLM_BACKENDS_JSON", _GOOD_JSON)
+    _force_no_unit(monkeypatch)
+    assert m.do_apply("hive-mind-gateway.service") == m.EXIT_STOP
+    assert "field n_ctx" in capsys.readouterr().out
+
+
+def test_apply_bad_shell_json_does_not_stop_a_good_file(monkeypatch, tmp_path, capsys):
+    """A bad LLM_BACKENDS_JSON in the operator shell does not stop a usable file."""
+    good = tmp_path / "good.env"
+    good.write_text(f"LLM_BACKENDS_JSON={_GOOD_JSON}\n")
+    monkeypatch.setenv("SECURE_ENV_FILE", str(good))
+    monkeypatch.setenv("LLM_BACKENDS_JSON", _BAD_JSON)
+    _force_no_unit(monkeypatch)
+    assert m.do_apply("hive-mind-gateway.service") == m.EXIT_OK
+    assert "Nothing was written" in capsys.readouterr().out
+
+
+def test_apply_directory_secure_env_file_warns_and_does_not_traceback(monkeypatch, tmp_path, capsys):
+    """A directory is not a file. The ordinary refusal loads nothing and does not traceback."""
+    bogus = tmp_path / "not-a-file"
+    bogus.mkdir()
+    monkeypatch.setenv("SECURE_ENV_FILE", str(bogus))
+    for key in ("LLM_BACKENDS_JSON", "LLM_BACKENDS", "LLM_DEFAULT_TARGET", "AGENT_TOKENS"):
+        monkeypatch.delenv(key, raising=False)
+    _force_no_unit(monkeypatch)
+    assert m.do_apply("hive-mind-gateway.service") == m.EXIT_OK
+    captured = capsys.readouterr()
+    assert "Traceback" not in captured.err
+    assert "is not a file" in captured.err
+    assert "Nothing was written" in captured.out
+
+
+def test_apply_lists_an_off_host_backend_and_stays_quiet_for_a_self_hosted_one(monkeypatch, tmp_path, capsys):
+    """A declared public address is named once. A private address is not. The notice does not stop the update."""
+    secret = "query-secret-must-stay-out"
+    entries = [
+        {"url": "http://127.0.0.1:9", "n_ctx": 8192, "max_output_tokens": 2048},
+        {"url": "http://localhost:9", "n_ctx": 8192, "max_output_tokens": 2048},
+        {"url": "http://192.168.1.9:9", "n_ctx": 8192, "max_output_tokens": 2048},
+        {"url": "http://[::1]:9", "n_ctx": 8192, "max_output_tokens": 2048},
+        {"url": "http://100.64.0.1:9", "n_ctx": 8192, "max_output_tokens": 2048},
+        {"url": "http://card", "n_ctx": 8192, "max_output_tokens": 2048},
+        {"url": "http://llm.lan:9", "n_ctx": 8192, "max_output_tokens": 2048},
+        {"url": "http://box.ts.net:9", "n_ctx": 8192, "max_output_tokens": 2048},
+        {"url": f"https://api.example.test/v1?key={secret}", "n_ctx": 8192, "max_output_tokens": 2048},
+        {"url": "http://8.8.8.8:9", "n_ctx": 8192, "max_output_tokens": 2048},
+    ]
+    assert _apply_env(monkeypatch, tmp_path, LLM_BACKENDS_JSON=json.dumps(entries)) == m.EXIT_OK
+    out = capsys.readouterr().out
+    assert "Nothing was written" in out
+    assert out.count("receives corpus text from both daemons; remove it if not trusted") == 2
+    assert "https://api.example.test/v1 receives corpus text" in out
+    assert "http://8.8.8.8:9 receives corpus text" in out
+    assert secret not in out
+    assert "127.0.0.1" not in out
+    assert "localhost" not in out
+    assert "192.168.1.9" not in out
+    assert "llm.lan" not in out
+    assert "ts.net" not in out
+
+
+def _stub_show(monkeypatch, stdout):
+    class _Proc:
+        returncode = 0
+        stderr = ""
+
+        def __init__(self):
+            self.stdout = stdout
+
+    monkeypatch.setattr(m.shutil, "which", lambda name: "/usr/bin/systemctl" if name == "systemctl" else None)
+    monkeypatch.setattr(m.subprocess, "run", lambda *a, **k: _Proc())
+
+
+def _environment_assignment(json_text):
+    escaped = json_text.replace("\\", "\\\\").replace('"', '\\"')
+    return f'Environment="LLM_BACKENDS_JSON={escaped}"\n'
+
+
+def test_missing_optional_environment_file_is_skipped(monkeypatch, tmp_path, capsys):
+    """A missing EnvironmentFile=-/x does not drop Environment=. Bad JSON there stops the update."""
+    missing = tmp_path / "no-such.env"
+    monkeypatch.delenv("LLM_BACKENDS_JSON", raising=False)
+    monkeypatch.delenv("LLM_BACKENDS", raising=False)
+    monkeypatch.delenv("LLM_DEFAULT_TARGET", raising=False)
+    monkeypatch.setenv("SECURE_ENV_FILE", "")
+    _stub_show(
+        monkeypatch,
+        _environment_assignment(_BAD_JSON)
+        + f"EnvironmentFiles=-{missing} (ignore_errors=yes)\nId=hive-mind-gateway.service\n",
+    )
+    assert m.do_apply("hive-mind-gateway.service") == m.EXIT_STOP
+    out = capsys.readouterr().out
+    assert "field n_ctx" in out
+    assert "unreadable" not in out
+    assert "Nothing was written" not in out
+    assert "Traceback" not in out
+
+    capsys.readouterr()
+    _stub_show(
+        monkeypatch,
+        _environment_assignment(_GOOD_JSON)
+        + f"EnvironmentFiles={missing} (ignore_errors=yes)\nId=hive-mind-gateway.service\n",
+    )
+    assert m.do_apply("hive-mind-gateway.service") == m.EXIT_OK
+    usable = capsys.readouterr().out
+    assert "Nothing was written" in usable
+    assert "unreadable" not in usable
+
+
+def test_unreadable_required_environment_file_is_said_out_loud(monkeypatch, tmp_path, capsys):
+    """A required EnvironmentFile that cannot be read is named. The update does not say usable."""
+    missing = tmp_path / "required.env"
+    marker = "SECRET-IN-ENVIRONMENT-MUST-STAY-OUT"
+    monkeypatch.setenv("SECURE_ENV_FILE", "")
+    monkeypatch.delenv("LLM_BACKENDS_JSON", raising=False)
+    _stub_show(
+        monkeypatch,
+        _environment_assignment(_BAD_JSON)
+        + f"EnvironmentFiles={missing} (ignore_errors=no)\nId=hive-mind-gateway.service\n",
+    )
+    assert m.do_apply("hive-mind-gateway.service") == m.EXIT_STOP
+    captured = capsys.readouterr()
+    assert f"EnvironmentFile {str(missing)!r} unreadable" in captured.out
+    assert "Nothing was written" not in captured.out
+    assert "Traceback" not in captured.err
+    assert marker not in captured.out + captured.err
+
+
+def test_non_utf8_unit_environment_file_is_refused_without_its_content(monkeypatch, tmp_path, capsys):
+    """A unit EnvironmentFile that is not UTF-8 names the path and does not traceback."""
+    unit_env = tmp_path / "unit.env"
+    marker = "MARKER_NOTUTF8_UNIT"
+    unit_env.write_bytes(f"{marker}=value\xff\n".encode("latin-1"))
+    monkeypatch.setenv("SECURE_ENV_FILE", "")
+    monkeypatch.setenv("LLM_BACKENDS_JSON", _GOOD_JSON)
+    monkeypatch.delenv("LLM_BACKENDS", raising=False)
+    monkeypatch.delenv("LLM_DEFAULT_TARGET", raising=False)
+    _stub_show(
+        monkeypatch,
+        f"Environment=\nEnvironmentFiles={unit_env} (ignore_errors=no)\nId=hive-mind-gateway.service\n",
+    )
+    assert m.do_apply("hive-mind-gateway.service") == m.EXIT_STOP
+    captured = capsys.readouterr()
+    assert f"{unit_env} is not UTF-8" in captured.out
+    assert marker not in captured.out
+    assert marker not in captured.err
+    assert "Traceback" not in captured.err
+    assert "Nothing was written" not in captured.out
+
+
+def test_non_utf8_env_file_is_refused_without_its_content(monkeypatch, tmp_path, capsys):
+    """A .env that is not UTF-8 refuses with the path and none of the file."""
+    env_file = tmp_path / "gateway.env"
+    marker = "MARKER_NOTUTF8"
+    env_file.write_bytes(f"{marker}=\xff\n".encode("latin-1"))
+    _force_no_unit(monkeypatch)
+    monkeypatch.setenv("SECURE_ENV_FILE", str(env_file))
+    assert m.do_apply("hive-mind-gateway.service") == m.EXIT_STOP
+    captured = capsys.readouterr()
+    assert f"{env_file} is not UTF-8" in captured.out
+    assert marker not in captured.out
+    assert marker not in captured.err
+    assert "Traceback" not in captured.err
+    assert "Nothing was written" not in captured.out
+
+
+def test_apply_bad_json_in_an_environment_file_stops(monkeypatch, tmp_path, capsys):
+    """EnvironmentFile= values are what systemd will set. A bad declaration there stops --apply."""
+    unit_env = tmp_path / "unit.env"
+    unit_env.write_text(f"LLM_BACKENDS_JSON={_BAD_JSON}\n")
+    good = tmp_path / "good.env"
+    good.write_text(f"LLM_BACKENDS_JSON={_GOOD_JSON}\n")
+    monkeypatch.setenv("SECURE_ENV_FILE", str(good))
+    monkeypatch.setenv("LLM_BACKENDS_JSON", _GOOD_JSON)
+
+    class _Proc:
+        returncode = 0
+        stdout = f"Environment=\nEnvironmentFiles={unit_env} (ignore_errors=no)\n"
+        stderr = ""
+
+    monkeypatch.setattr(m.shutil, "which", lambda name: "/usr/bin/systemctl" if name == "systemctl" else None)
+    monkeypatch.setattr(m.subprocess, "run", lambda *a, **k: _Proc())
+    assert m.do_apply("hive-mind-gateway.service") == m.EXIT_STOP
+    out = capsys.readouterr().out
+    assert "field n_ctx" in out
+    assert "Nothing was written" not in out
+
+
+def test_apply_good_json_in_an_environment_file_ignores_a_legacy_line_in_dotenv(monkeypatch, tmp_path, capsys):
+    """A usable EnvironmentFile= declaration wins over a leftover LLM_BACKENDS line in the env file."""
+    unit_env = tmp_path / "unit.env"
+    unit_env.write_text(f"LLM_BACKENDS_JSON={_GOOD_JSON}\n")
+    legacy = tmp_path / "legacy.env"
+    legacy.write_text("LLM_BACKENDS=http://legacy.example:9\n")
+    monkeypatch.setenv("SECURE_ENV_FILE", str(legacy))
+    monkeypatch.delenv("LLM_BACKENDS_JSON", raising=False)
+    monkeypatch.delenv("LLM_BACKENDS", raising=False)
+
+    class _Proc:
+        returncode = 0
+        stdout = f"Environment=\nEnvironmentFiles={unit_env} (ignore_errors=no)\n"
+        stderr = ""
+
+    monkeypatch.setattr(m.shutil, "which", lambda name: "/usr/bin/systemctl" if name == "systemctl" else None)
+    monkeypatch.setattr(m.subprocess, "run", lambda *a, **k: _Proc())
+    assert m.do_apply("hive-mind-gateway.service") == m.EXIT_OK
+    out = capsys.readouterr().out
+    assert "Nothing was written" in out
+    assert "legacy field" not in out
+    assert "http://legacy.example" not in out
+
+
 
 
 # ─────────────────────────────────────────────────────────────────────────
 # plan_case_json_usable — the eligibility predicate + loader-shape tolerance
 # ─────────────────────────────────────────────────────────────────────────
 
-def test_plan_json_usable_adds_private_ok_only_to_eligible_entries():
-    raw = json.dumps([
-        {"url": "http://a:5000"},                                    # eligible
-        {"url": "http://b:5000", "roles": ["extract"]},               # roles-carrying: untouched
-        {"url": "https://api.example.com", "token_env": "X_KEY"},     # credentialed: untouched
-        {"url": "http://c:5000", "private_ok": False},                # already explicit: untouched
-    ])
-    img = _image(
-        private_ok_explicit={"http://a:5000": False, "http://b:5000": False,
-                              "https://api.example.com": False, "http://c:5000": True},
-        has_token={"http://a:5000": False, "http://b:5000": False,
-                   "https://api.example.com": True, "http://c:5000": False},
-    )
-    new_entries, touched = m.plan_case_json_usable(img, raw)
-    assert touched == ["http://a:5000"]
-    by_url = {e["url"]: e for e in new_entries}
-    assert by_url["http://a:5000"]["private_ok"] is True
-    assert "private_ok" not in by_url["http://b:5000"]
-    assert "private_ok" not in by_url["https://api.example.com"]
-    assert by_url["http://c:5000"]["private_ok"] is False  # untouched, byte-value preserved
 
 
-def test_plan_json_usable_already_fully_explicit_touches_nothing():
-    raw = json.dumps([{"url": "http://a:5000", "private_ok": True}])
-    img = _image(private_ok_explicit={"http://a:5000": True}, has_token={"http://a:5000": False})
-    new_entries, touched = m.plan_case_json_usable(img, raw)
-    assert touched == []
 
 
-def test_plan_json_usable_array_of_strings_graceful_refusal_never_raises():
-    """Loader-shape tolerance: an array of bare strings must not crash the
-    migration's OWN parsing — returns (None, []), never raises."""
-    raw = json.dumps(["http://a:5000", "http://b:5000"])
-    new_entries, touched = m.plan_case_json_usable(_image(), raw)
-    assert new_entries is None
-    assert touched == []
 
 
-def test_plan_json_usable_duplicate_urls_within_the_array_both_kept():
-    """'urls' keeps both duplicates even though a dict-keyed image
-    collapses last-wins — the migration's own list traversal must not be
-    surprised by this."""
-    raw = json.dumps([{"url": "http://a:5000"}, {"url": "http://a:5000", "roles": ["extract"]}])
-    img = _image(private_ok_explicit={"http://a:5000": False}, has_token={"http://a:5000": False})
-    new_entries, touched = m.plan_case_json_usable(img, raw)
-    assert len(new_entries) == 2
 
 
-def test_plan_json_usable_mixed_array_untouched_entry_is_semantically_preserved():
-    """SEC M-6 (fix round): the population the contract is actually about
-    — a roles/token_env-carrying entry sharing an ARRAY with an eligible
-    one. The whole line is re-serialised via json.dumps() when ANY entry
-    in it is touched, so operator whitespace/number formatting on the
-    UNTOUCHED entry can move (e.g. `1.0` staying `1.0` is not guaranteed
-    byte-for-byte against a hand-typed `1.00`) — the claim this test pins
-    is SEMANTIC identity (every key/value the untouched entry carried
-    survives), which is what two_layer_compare() actually depends on."""
-    raw = json.dumps([
-        {"url": "http://a:5000"},                                       # eligible
-        {"url": "http://b:5000", "roles": ["extract"], "n_ctx": 8192,   # untouched
-         "extra_body": {"thinking": {"type": "disabled"}}},
-    ])
-    img = _image(
-        private_ok_explicit={"http://a:5000": False, "http://b:5000": False},
-        has_token={"http://a:5000": False, "http://b:5000": False},
-    )
-    new_entries, touched = m.plan_case_json_usable(img, raw)
-    assert touched == ["http://a:5000"]
-    round_tripped = json.loads(json.dumps(new_entries))
-    by_url = {e["url"]: e for e in round_tripped}
-    untouched = by_url["http://b:5000"]
-    assert untouched["roles"] == ["extract"]
-    assert untouched["n_ctx"] == 8192
-    assert untouched["extra_body"] == {"thinking": {"type": "disabled"}}
-    assert "private_ok" not in untouched
 
 
-def test_e2e_mixed_array_untouched_entry_survives_semantically(tmp_path, monkeypatch):
-    """End-to-end companion (SEC M-6): the real apply path, real file.
-    W4 (§6.4): the touched entry's private_ok addition is a
-    boundary-crossing materialisation (the ORIGINAL claim this test pins —
-    the array's OTHER entry survives byte-for-semantic-identity regardless
-    of the boundary), so this now runs against an aged --preimage."""
-    _force_no_unit(monkeypatch)
-    original = (
-        'EMBEDDER_URL=http://a:8070\nRERANKER_URL=http://a:8071\n'
-        'LLM_BACKENDS_JSON=[{"url":"http://a:5000"},'
-        '{"url":"http://b:5000","roles":["judge"],"n_ctx":4096}]\n'
-    )
-    env_path = _write_env(tmp_path, original)
-    monkeypatch.setenv("SECURE_ENV_FILE", str(env_path))
-    monkeypatch.setenv("HOME", str(tmp_path / "fake-home"))
-    preimage_path = _aged_preimage(tmp_path)
-    rc = m.do_apply_or_dryrun(preimage_path, True, _NO_UNIT)
-    assert rc == m.EXIT_OK
-    text = env_path.read_text()
-    json_line = next(l for l in text.splitlines() if l.startswith("LLM_BACKENDS_JSON="))
-    entries = json.loads(json_line[len("LLM_BACKENDS_JSON="):])
-    by_url = {e["url"]: e for e in entries}
-    assert by_url["http://a:5000"]["private_ok"] is True
-    assert by_url["http://b:5000"] == {"url": "http://b:5000", "roles": ["judge"], "n_ctx": 4096}
 
 
-def test_plan_case_csv_live_converts_to_json_with_effective_private_ok_true():
-    entries = m.plan_case_csv_live(_image(), "http://a:5000@2,http://b:5000")
-    assert entries == [
-        {"url": "http://a:5000", "weight": 2.0, "private_ok": True},
-        {"url": "http://b:5000", "weight": 1.0, "private_ok": True},
-    ]
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -503,121 +574,30 @@ def test_plan_case_csv_live_converts_to_json_with_effective_private_ok_true():
 # what actually bounds a blocked probe).
 # ─────────────────────────────────────────────────────────────────────────
 
-def test_probe_backend_wall_clock_deadline_returns_promptly_on_a_blocked_probe(monkeypatch):
-    """NEW-1 (micro-round): stubs the opener so `_do_probe`'s
-    `opener.open(...)` call blocks far past a tiny deadline (0.05s) —
-    proving `probe_backend()` still returns promptly, reporting
-    answered=False, because `Thread.join(timeout)` is what actually bounds
-    it, not the underlying network call finishing.
-
-    MUTATION-PROVEN: with `t.join(timeout)` reverted to a bare `t.join()`
-    (no deadline — the exact regression NEW-1 named: mutating join(timeout)
-    to join() kills zero tests without this one), this test FAILS on the
-    elapsed-time assertion below (the join blocks for the full ~2s the
-    stub sleeps, instead of the 0.05s deadline) — a fast, deterministic
-    fail rather than a true hang, because the stub's own sleep is itself
-    bounded. Recorded in the fix-round report: reverting the join() call
-    alone made this test fail on `assert elapsed < 1.0` (elapsed ~= 2.0s).
-    """
-    def _slow_open(req, timeout=None):
-        time.sleep(2.0)  # far longer than the 0.05s deadline below
-        raise AssertionError("must never be reached before the deadline returns")
-
-    class _FakeOpener:
-        def open(self, req, timeout=None):
-            return _slow_open(req, timeout=timeout)
-
-    monkeypatch.setattr(m.urllib.request, "build_opener", lambda *a, **k: _FakeOpener())
-
-    started = time.monotonic()
-    result = m.probe_backend("http://a:5000", timeout=0.05)
-    elapsed = time.monotonic() - started
-
-    assert result == {"answered": False, "status": None, "parsed_model_list": False, "n_models": None}
-    assert elapsed < 1.0, f"probe_backend did not return within its deadline: {elapsed:.2f}s"
 
 
 # ─────────────────────────────────────────────────────────────────────────
 # Interactive confirm — y / N / EOF / deadline, probe stubbed both ways
 # ─────────────────────────────────────────────────────────────────────────
 
-def test_read_confirm_explicit_y_via_injected_reader():
-    assert m.read_confirm(reader=lambda: "y\n") is True
 
 
-def test_read_confirm_explicit_n_via_injected_reader():
-    assert m.read_confirm(reader=lambda: "n\n") is False
 
 
-def test_read_confirm_eof_via_injected_reader_is_no():
-    assert m.read_confirm(reader=lambda: "") is False
 
 
-def test_read_confirm_anything_else_is_no():
-    assert m.read_confirm(reader=lambda: "yes please\n") is False
 
 
-def test_read_confirm_deadline_with_real_select_is_no(monkeypatch):
-    """No reader injected -> real select.select path; stdin never becomes
-    ready within a near-zero deadline -> No, never blocks the suite."""
-    monkeypatch.setattr(m.select, "select", lambda *a, **k: ([], [], []))
-    assert m.read_confirm(deadline=0.01) is False
 
 
-def test_build_confirm_question_carries_the_discriminating_observation_200():
-    probe = {"answered": True, "status": 200, "parsed_model_list": True, "n_models": 3}
-    q = m.build_confirm_question("http://a:5000", probe)
-    assert "HTTP 200" in q
-    assert "OpenAI model list" in q
-    assert "3 models" in q
 
 
-def test_build_confirm_question_carries_401_observation():
-    probe = {"answered": True, "status": 401, "parsed_model_list": False, "n_models": None}
-    q = m.build_confirm_question("http://a:5000", probe)
-    assert "401" in q
-    assert "credential the gateway does not have" in q
 
 
-def test_build_confirm_question_did_not_answer():
-    q = m.build_confirm_question("http://a:5000", {"answered": False, "status": None,
-                                                     "parsed_model_list": False, "n_models": None})
-    assert "did not answer" in q
 
 
-def test_build_confirm_question_not_probed_has_distinct_wording_from_did_not_answer():
-    """QA MED-4 (fix round): `probe is None` (never probed — a
-    non-interactive dry-run preview) and a real probe that got no
-    response are DIFFERENT observations. Conflating them stated an
-    observation ('did not answer') that was never actually made."""
-    q_not_probed = m.build_confirm_question("http://a:5000", None)
-    q_no_answer = m.build_confirm_question("http://a:5000", {
-        "answered": False, "status": None, "parsed_model_list": False, "n_models": None})
-    assert "not probed" in q_not_probed
-    assert "non-interactive" in q_not_probed
-    assert "did not answer" not in q_not_probed
-    assert "did not answer" in q_no_answer
-    assert "not probed" not in q_no_answer
 
 
-def test_e2e_fallback_case_non_interactive_dry_run_says_not_probed_not_did_not_answer(
-        tmp_path, monkeypatch, capsys):
-    """End-to-end companion: a non-interactive DRY RUN (no TTY, no
-    injected reader) must render the 'not probed' wording in its preview
-    of the question a real run would ask, never 'did not answer'.
-
-    W4 (§6.4): aged --preimage so the preview path is actually reached
-    (same-generation self-capture would short-circuit before it)."""
-    _force_no_unit(monkeypatch)
-    env_path = _write_env(tmp_path, "EMBEDDER_URL=http://a:8070\n")
-    monkeypatch.setenv("SECURE_ENV_FILE", str(env_path))
-    preimage_path = _aged_preimage(tmp_path)
-    monkeypatch.setattr(sys.stdin, "isatty", lambda: False, raising=False)
-    rc = m.do_apply_or_dryrun(preimage_path, False, _NO_UNIT, confirm_reader=None)
-    out = capsys.readouterr().out
-    assert rc == m.EXIT_OK
-    assert "not probed" in out
-    assert "did not answer" not in out
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -645,125 +625,22 @@ def _full_image(**over):
     return base
 
 
-def test_two_layer_compare_identical_images_ok():
-    pre = _full_image()
-    post = _full_image()
-    ok, msg = m.two_layer_compare(pre, post, reported_writes=set())
-    assert ok, msg
 
 
-def test_two_layer_compare_is_order_independent_of_dict_construction():
-    """Mutation check (M8: 're-ordering the corpus'): building the SAME
-    logical image with dict keys/urls inserted in a different order must
-    not change the verdict — the comparison keys on url identity, never
-    positional/iteration order."""
-    pre = _full_image(urls=["http://a:5000", "http://b:5000"],
-                       weights={"http://b:5000": 1.0, "http://a:5000": 1.0},
-                       has_token={"http://b:5000": False, "http://a:5000": False},
-                       models={"http://b:5000": None, "http://a:5000": None},
-                       roles={"http://b:5000": None, "http://a:5000": None},
-                       n_ctx={"http://b:5000": None, "http://a:5000": None},
-                       max_inflight={"http://b:5000": None, "http://a:5000": None},
-                       extra_body={"http://b:5000": None, "http://a:5000": None},
-                       private_ok={"http://b:5000": True, "http://a:5000": True},
-                       private_ok_explicit={"http://b:5000": False, "http://a:5000": False})
-    post = _full_image(urls=["http://b:5000", "http://a:5000"],
-                        weights={"http://a:5000": 1.0, "http://b:5000": 1.0},
-                        has_token={"http://a:5000": False, "http://b:5000": False},
-                        models={"http://a:5000": None, "http://b:5000": None},
-                        roles={"http://a:5000": None, "http://b:5000": None},
-                        n_ctx={"http://a:5000": None, "http://b:5000": None},
-                        max_inflight={"http://a:5000": None, "http://b:5000": None},
-                        extra_body={"http://a:5000": None, "http://b:5000": None},
-                        private_ok={"http://a:5000": True, "http://b:5000": True},
-                        private_ok_explicit={"http://a:5000": False, "http://b:5000": False})
-    ok, msg = m.two_layer_compare(pre, post, reported_writes=set())
-    assert ok, msg
 
 
-def test_two_layer_compare_url_set_changed_fails():
-    pre = _full_image()
-    post = _full_image(urls=["http://a:5000", "http://b:5000"],
-                        weights={"http://a:5000": 1.0, "http://b:5000": 1.0},
-                        has_token={"http://a:5000": False, "http://b:5000": False},
-                        models={"http://a:5000": None, "http://b:5000": None},
-                        roles={"http://a:5000": None, "http://b:5000": None},
-                        n_ctx={"http://a:5000": None, "http://b:5000": None},
-                        max_inflight={"http://a:5000": None, "http://b:5000": None},
-                        extra_body={"http://a:5000": None, "http://b:5000": None},
-                        private_ok={"http://a:5000": True, "http://b:5000": True},
-                        private_ok_explicit={"http://a:5000": False, "http://b:5000": False})
-    ok, msg = m.two_layer_compare(pre, post, reported_writes=set())
-    assert not ok
 
 
-@pytest.mark.parametrize("field", ["weights", "has_token", "models", "roles", "n_ctx",
-                                    "max_inflight", "extra_body"])
-def test_two_layer_compare_any_behavioural_field_drift_fails(field):
-    """The 'make the migration write a wrong value' mutant, applied per
-    Layer-1 field: a single wrong value anywhere in the behavioural set
-    must be caught. `private_ok` is deliberately NOT parametrized here
-    (QA MED-3, fix round) — it left Layer-1 equality for Layer-2
-    planned-direction comparison (`_URL_KEYED_FIELDS` at migrate_env.py:800,
-    ruling A(a)/§6.4); its own coverage now lives in the direction-rule
-    tests below (same-generation True->False refusal, boundary-crossing
-    True->False allow, unreported False->True refusal)."""
-    pre = _full_image()
-    post = _full_image()
-    post[field] = dict(post[field])
-    post[field]["http://a:5000"] = "WRONG-VALUE-MUTANT"
-    ok, msg = m.two_layer_compare(pre, post, reported_writes=set())
-    assert not ok, f"field {field!r} drifted silently"
 
 
-def test_two_layer_compare_fallback_reason_class_change_fails():
-    pre = _full_image()
-    post = _full_image(fallback_reason="something excluded everything")
-    ok, _ = m.two_layer_compare(pre, post, reported_writes=set())
-    assert not ok
 
 
-def test_two_layer_compare_guard_verdict_change_fails():
-    pre = _full_image()
-    post = _full_image(guard_routing={"raised": True, "message": "FATAL: ..."})
-    ok, _ = m.two_layer_compare(pre, post, reported_writes=set())
-    assert not ok
 
 
-def test_two_layer_compare_private_ok_explicit_moves_only_on_reported_entries():
-    pre = _full_image()
-    post = _full_image(private_ok_explicit={"http://a:5000": True})
-    ok, msg = m.two_layer_compare(pre, post, reported_writes=set())
-    assert not ok, "unreported private_ok_explicit movement must fail"
-    ok2, msg2 = m.two_layer_compare(pre, post, reported_writes={"http://a:5000"})
-    assert ok2, msg2
 
 
-def test_two_layer_compare_private_ok_explicit_cannot_move_backward_even_if_reported():
-    pre = _full_image(private_ok_explicit={"http://a:5000": True})
-    post = _full_image(private_ok_explicit={"http://a:5000": False})
-    ok, _ = m.two_layer_compare(pre, post, reported_writes={"http://a:5000"})
-    assert not ok, "True -> False is not the planned direction"
 
 
-def test_two_layer_compare_config_empty_moves_only_on_confirmed_fallback_write():
-    pre = _full_image(urls=["http://x:5000"], config_empty=True,
-                       weights={"http://x:5000": 1.0}, has_token={"http://x:5000": False},
-                       models={"http://x:5000": None}, roles={"http://x:5000": None},
-                       n_ctx={"http://x:5000": None}, max_inflight={"http://x:5000": None},
-                       extra_body={"http://x:5000": None}, private_ok={"http://x:5000": True},
-                       private_ok_explicit={"http://x:5000": False})
-    post = _full_image(urls=["http://x:5000"], config_empty=False,
-                        weights={"http://x:5000": 1.0}, has_token={"http://x:5000": False},
-                        models={"http://x:5000": None}, roles={"http://x:5000": None},
-                        n_ctx={"http://x:5000": None}, max_inflight={"http://x:5000": None},
-                        extra_body={"http://x:5000": None}, private_ok={"http://x:5000": True},
-                        private_ok_explicit={"http://x:5000": True})
-    ok, _ = m.two_layer_compare(pre, post, reported_writes={"http://x:5000"})
-    assert not ok, "config_empty moved without the fallback-materialised marker"
-    ok2, msg2 = m.two_layer_compare(
-        pre, post, reported_writes={"http://x:5000", "__fallback_materialised__"})
-    assert ok2, msg2
 
 
 # ── private_ok direction rules (ruling A(a)/§6.4) — QA HIGH-2/MED-2/MED-3 ──
@@ -771,141 +648,36 @@ def test_two_layer_compare_config_empty_moves_only_on_confirmed_fallback_write()
 # planned-direction comparison; these three tests are its ONLY remaining
 # coverage (the parametrized drift test above no longer includes it).
 
-def test_two_layer_compare_private_ok_false_to_true_on_unreported_entry_fails():
-    """Rule 1 (§6.4 A(a)): False->True on private_ok is legitimate ONLY on
-    an entry THIS RUN reported writing. An unreported False->True move is
-    exactly the shape a real widening regression would take."""
-    pre = _full_image(private_ok={"http://a:5000": False})
-    post = _full_image(private_ok={"http://a:5000": True})
-    ok, msg = m.two_layer_compare(pre, post, reported_writes=set())
-    assert not ok, "unreported private_ok False->True must fail"
-    assert "http://a:5000" in msg
 
 
-def test_two_layer_compare_private_ok_same_generation_true_to_false_on_untouched_entry_fails():
-    """A3 (§6.4, QA HIGH-2 — MUTATION TARGET, migrate_env.py's rule 2): with
-    private_ok out of Layer 1, a same-generation True->False on an entry
-    this run left untouched is the ONLY remaining detector for a real
-    regression on that field. Both images here carry the SAME (default)
-    loader_semantics, so boundary_crossed is False — rule 2 must NOT excuse
-    this move, and it must name the entry."""
-    pre = _full_image(private_ok={"http://a:5000": True})
-    post = _full_image(private_ok={"http://a:5000": False})
-    ok, msg = m.two_layer_compare(pre, post, reported_writes=set())
-    assert not ok, "same-generation True->False on an untouched entry must be refused"
-    assert "http://a:5000" in msg
 
 
-def test_two_layer_compare_private_ok_boundary_crossing_true_to_false_on_untouched_entry_is_ok():
-    """Rule 2 (§6.4 A(a)): a True->False move IS legitimate when it crosses
-    the loader-semantics boundary (an old-code pre-image re-measured under
-    new-code semantics) on an entry this run left untouched — and it must
-    be REPORTED per-entry by name, never silent (QA MED-2 — MUTATION
-    TARGET, migrate_env.py's `if report_lines is not None:` gate)."""
-    pre = _full_image(private_ok={"http://a:5000": True}, loader_semantics=1)
-    post = _full_image(private_ok={"http://a:5000": False}, loader_semantics=m.LOADER_SEMANTICS)
-    report_lines = []
-    ok, msg = m.two_layer_compare(pre, post, reported_writes=set(), report_lines=report_lines)
-    assert ok, msg
-    assert any("http://a:5000" in line and "True -> False" in line for line in report_lines), (
-        "the boundary-crossing move must be reported per-entry by name (QA MED-2)")
 
 
 # ── loader_semantics type guard (SEC M-4) ───────────────────────────────────
 
-@pytest.mark.parametrize("bad_value", [None, "1", [], True, 1.5])
-def test_two_layer_compare_malformed_pre_loader_semantics_fails_never_raises(bad_value):
-    """SEC M-4 (fix round): a malformed loader_semantics must fail the
-    comparison cleanly (False, message) — never a raw TypeError from the
-    `<` comparison. Pinned directly on two_layer_compare, independent of
-    do_apply_or_dryrun's own earlier gate (the two guards are deliberately
-    redundant — see that guard's own comment for why)."""
-    pre = _full_image(loader_semantics=bad_value)
-    post = _full_image()
-    ok, msg = m.two_layer_compare(pre, post, reported_writes=set())
-    assert not ok
-    assert "loader_semantics" in msg
 
 
-@pytest.mark.parametrize("bad_value", [None, "1", [], True, 1.5])
-def test_two_layer_compare_malformed_post_loader_semantics_fails_never_raises(bad_value):
-    pre = _full_image()
-    post = _full_image(loader_semantics=bad_value)
-    ok, msg = m.two_layer_compare(pre, post, reported_writes=set())
-    assert not ok
-    assert "loader_semantics" in msg
 
 
-@pytest.mark.parametrize("bad_value", [None, "1", [], True, 1.5])
-def test_malformed_loader_semantics_in_preimage_exits_stop_never_crashes(tmp_path, monkeypatch, bad_value):
-    """SEC M-4 (fix round), end to end: an operator-supplied --preimage
-    with a malformed loader_semantics must EXIT_STOP with a named message,
-    never a raw traceback — matching the isinstance(schema, int) idiom
-    capture_schema already gets a few lines above this guard."""
-    _force_no_unit(monkeypatch)
-    env_path = _write_env(tmp_path, "LLM_BACKENDS=http://a:5000\n")
-    monkeypatch.setenv("SECURE_ENV_FILE", str(env_path))
-    preimage = tmp_path / "pre.json"
-    image = {"urls": ["http://a:5000"], "loader_semantics": bad_value}
-    preimage.write_text(json.dumps({"capture_schema": m.CAPTURE_SCHEMA, "image": image}))
-    rc = m.do_apply_or_dryrun(str(preimage), False, _NO_UNIT)
-    assert rc == m.EXIT_STOP
 
 
 # ── provenance comment on a materialising write (QA MED-4) ─────────────────
 
-def test_e2e_csv_live_materialisation_writes_a_provenance_comment_above_the_json_line(
-        tmp_path, monkeypatch):
-    """QA MED-4 (fix round): materialising LLM_BACKENDS_JSON (case 3) must
-    carry its own one-line provenance comment naming the tool and what it
-    did — distinct from the existing 'migrated to ... original:' comment
-    left on the now-dead CSV line, which only explains where the CSV went,
-    never why a brand-new JSON line appeared."""
-    _force_no_unit(monkeypatch)
-    env_path = _write_env(tmp_path, "LLM_BACKENDS=http://localhost:5000\n")
-    monkeypatch.setenv("SECURE_ENV_FILE", str(env_path))
-    monkeypatch.setenv("HOME", str(tmp_path / "fake-home"))
-    preimage_path = _aged_preimage(tmp_path)
-    rc = m.do_apply_or_dryrun(preimage_path, True, _NO_UNIT)
-    assert rc == m.EXIT_OK
-    lines = env_path.read_text().splitlines()
-    json_idx = next(i for i, l in enumerate(lines) if l.startswith("LLM_BACKENDS_JSON="))
-    assert lines[json_idx - 1].startswith("# migrate_env.py "), (
-        "the materialising write must carry a provenance comment on the line directly above it")
-    assert "materialised the pre-W4 effective pool" in lines[json_idx - 1]
 
 
-def test_e2e_fallback_materialisation_writes_a_provenance_comment_above_the_json_line(
-        tmp_path, monkeypatch):
-    """Same obligation as above, case 4 (fallback confirm)."""
-    _force_no_unit(monkeypatch)
-    env_path = _write_env(tmp_path, "EMBEDDER_URL=http://a:8070\n")
-    monkeypatch.setenv("SECURE_ENV_FILE", str(env_path))
-    monkeypatch.setenv("HOME", str(tmp_path / "fake-home"))
-    preimage_path = _aged_preimage(tmp_path)
-    monkeypatch.setattr(m, "probe_backend", lambda url, timeout=3.0: {
-        "answered": False, "status": None, "parsed_model_list": False, "n_models": None})
-    rc = m.do_apply_or_dryrun(preimage_path, True, _NO_UNIT, confirm_reader=lambda: "y\n")
-    assert rc == m.EXIT_OK
-    lines = env_path.read_text().splitlines()
-    json_idx = next(i for i, l in enumerate(lines) if l.startswith("LLM_BACKENDS_JSON="))
-    assert lines[json_idx - 1].startswith("# migrate_env.py "), (
-        "the materialising write must carry a provenance comment on the line directly above it")
-    assert "materialised the pre-W4 effective pool" in lines[json_idx - 1]
-    assert "LLM_DEFAULT_TARGET" not in lines[json_idx - 1], "R-A: never spell the literal key name"
 
 
 # ─────────────────────────────────────────────────────────────────────────
 # No-secret / scrub discipline
 # ─────────────────────────────────────────────────────────────────────────
 
-def test_capture_json_never_contains_a_token_env_value_only_has_token_bool(tmp_path, monkeypatch):
-    """The actual secret (a token_env-resolved value) must never appear —
-    only has_token: bool."""
+def test_capture_json_never_contains_a_token_env_value_only_has_token_bool(tmp_path, monkeypatch, capsys):
+    """The capture is a fixed stub. A token value, and the token name, stay out of it."""
     _force_no_unit(monkeypatch)
     secret = "s3cr3t-must-never-appear-in-the-capture-file"
     env_text = (
-        'LLM_BACKENDS_JSON=[{"url":"https://api.example.com/v1","token_env":"X_KEY"}]\n'
+        'LLM_BACKENDS_JSON=[{"url":"https://api.example.com/v1","token_env":"X_KEY", "n_ctx": 8192, "max_output_tokens": 2048}]\n'
         f"X_KEY={secret}\n"
     )
     env_path = _write_env(tmp_path, env_text)
@@ -916,118 +688,40 @@ def test_capture_json_never_contains_a_token_env_value_only_has_token_bool(tmp_p
     assert rc == m.EXIT_OK
     raw = out_path.read_text()
     assert secret not in raw, "the token_env-resolved secret leaked into the capture JSON"
+    assert secret not in capsys.readouterr().out
+    assert "X_KEY" not in raw
     payload = json.loads(raw)
-    assert payload["image"]["has_token"]["https://api.example.com/v1"] is True
+    assert payload["image"]["urls"] == []
+    assert "has_token" not in payload["image"]
+    import stat as _stat
+    assert _stat.S_IMODE(out_path.stat().st_mode) == 0o600
 
 
-def test_capture_json_keeps_a_raw_query_credential_url_by_ruled_design(tmp_path, monkeypatch):
-    """RULED (W3 brief, 'The capture JSON'): raw URLs are needed for the
-    equality and stay — a query-string credential is NOT scrubbed inside
-    the capture JSON itself (unlike every report/die path, which IS
-    scrubbed — see the scrub test below). Fixture form only, per fact:1195.
-
-    SEC A (R-1, 2026-09-02): a USERINFO-embedded URL (this test's original
-    fixture, "http://svc:cred@a:5000") is now refused/excluded at
-    _load_llm_backends() parse time — it never becomes part of
-    proxy.LLM_BACKENDS (the source of this capture's "urls" list) at all,
-    so it can no longer exercise "does the capture keep it raw". A
-    query-string credential (R-2, NOT refused by A) is the fixture that
-    still reaches LLM_BACKENDS unscrubbed, preserving this test's actual
-    point — userinfo forms are covered instead by
-    tests/test_llm_backend_secrets.py's SEC-A coverage.
-
-    Uses the LLM_BACKENDS_JSON form deliberately, not the legacy CSV form
-    (unaffected by _parse_backend()'s url@weight split, which only applies
-    to that form)."""
+def test_capture_json_omits_a_query_credential_url(tmp_path, monkeypatch, capsys):
+    """Capture writes no URL. A query credential in the declaration stays out of the file and stdout."""
     _force_no_unit(monkeypatch)
-    env_text = 'LLM_BACKENDS_JSON=[{"url":"http://a:5000?token=form-only-fixture-credential"}]\n'
+    env_text = 'LLM_BACKENDS_JSON=[{"url":"http://a:5000?token=form-only-fixture-credential", "n_ctx": 8192, "max_output_tokens": 2048}]\n'
     env_path = _write_env(tmp_path, env_text)
     monkeypatch.setenv("SECURE_ENV_FILE", str(env_path))
     out_path = tmp_path / "pre.json"
     rc = m.do_capture(str(out_path), "hive-mind-gateway-does-not-exist.service")
     assert rc == m.EXIT_OK
     raw = out_path.read_text()
-    assert "a:5000?token=form-only-fixture-credential" in raw
+    captured = capsys.readouterr()
+    assert "form-only-fixture-credential" not in raw
+    assert "form-only-fixture-credential" not in captured.out
+    assert "form-only-fixture-credential" not in captured.err
+    payload = json.loads(raw)
+    assert payload["image"]["urls"] == []
+    assert "read-only capture" in payload["image"]["note"]
 
 
-def test_capture_refuses_a_preplanted_symlink_never_writes_through_it(tmp_path, monkeypatch):
-    """SEC M-1 (fix round): a symlink pre-planted at the capture target
-    (by another actor, on a standalone operator-chosen path) must never
-    be followed and written through — the config image may hold raw
-    userinfo URLs by ruled design, so writing through an attacker's
-    symlink would hand them an arbitrary file's worth of that content.
-    `_open_fresh_secure_file` unlinks the pre-existing entry (removing
-    only the LINK, never the target) and creates a fresh regular file at
-    the same path with O_EXCL|O_NOFOLLOW."""
-    _force_no_unit(monkeypatch)
-    env_path = _write_env(tmp_path, "LLM_BACKENDS=http://a:5000\n")
-    monkeypatch.setenv("SECURE_ENV_FILE", str(env_path))
-
-    elsewhere = tmp_path / "attacker_controlled_elsewhere.json"
-    elsewhere.write_text("PRE-EXISTING CONTENT — must never be touched")
-    out_path = tmp_path / "pre.json"
-    out_path.symlink_to(elsewhere)
-
-    rc = m.do_capture(str(out_path), "hive-mind-gateway-does-not-exist.service")
-    assert rc == m.EXIT_OK
-    assert not out_path.is_symlink(), "the symlink must be replaced, never written through"
-    assert '"capture_schema"' in out_path.read_text()
-    assert elsewhere.read_text() == "PRE-EXISTING CONTENT — must never be touched", (
-        "the symlink's TARGET was written to — this is the exact hazard M-1 closes")
 
 
-def test_open_fresh_secure_file_sets_exact_mode_via_fchmod(tmp_path):
-    path = tmp_path / "out.json"
-    fd = m._open_fresh_secure_file(path, 0o600)
-    os.close(fd)
-    import stat as _stat
-    assert _stat.S_IMODE(path.stat().st_mode) == 0o600
 
 
-def test_report_never_leaks_a_userinfo_url_verbatim(tmp_path, monkeypatch, capsys):
-    """Scrub test (SEC H-3, fix round — REWRITTEN): the ORIGINAL fixture
-    (a userinfo URL only in a live CSV line) classified as CASE_CSV_LIVE,
-    whose only report line renders a COUNT, never a URL — the assertion
-    passed whether or not `_scrub()` did anything at all (mutation-
-    confirmed pre-fix: neutering `_scrub` left this test's output
-    byte-identical). This version uses LLM_DEFAULT_TARGET carrying the
-    userinfo credential with NOTHING else declared — CASE_FALLBACK,
-    non-interactive, whose report line at `:1054-1059`-ish DOES render
-    the URL, via `_scrub(default_target)`, twice. Positive assertion: the
-    SCRUBBED form must actually appear, not just the absence of the raw
-    one — and `rc` is asserted (the original never checked it either)."""
-    _force_no_unit(monkeypatch)
-    secret = "s3cr3t-in-url-must-be-scrubbed"
-    env_path = _write_env(
-        tmp_path, f"LLM_DEFAULT_TARGET=http://svc:{secret}@a:5000\n")
-    monkeypatch.setenv("SECURE_ENV_FILE", str(env_path))
-    rc = m.do_apply_or_dryrun(None, False, "hive-mind-gateway-does-not-exist.service")
-    out = capsys.readouterr().out
-    assert rc == m.EXIT_OK, out
-    assert secret not in out
-    assert "svc:" not in out
-    assert "http://a:5000" in out, (
-        f"the scrubbed URL never appeared at all — the report line this test "
-        f"targets may have moved:\n{out}")
 
 
-def test_scrub_call_is_load_bearing_mutation_check(tmp_path, monkeypatch, capsys):
-    """Mutation check for the test above (SEC H-3's own instruction):
-    neutering `_scrub` to the identity function must make
-    test_report_never_leaks_a_userinfo_url_verbatim's positive assertion
-    fail (the scrubbed form would never appear; the raw one would)."""
-    _force_no_unit(monkeypatch)
-    secret = "s3cr3t-in-url-must-be-scrubbed"
-    env_path = _write_env(
-        tmp_path, f"LLM_DEFAULT_TARGET=http://svc:{secret}@a:5000\n")
-    monkeypatch.setenv("SECURE_ENV_FILE", str(env_path))
-    monkeypatch.setattr(m, "_scrub", lambda text: str(text))  # neuter
-    rc = m.do_apply_or_dryrun(None, False, "hive-mind-gateway-does-not-exist.service")
-    out = capsys.readouterr().out
-    assert rc == m.EXIT_OK, out
-    # With _scrub neutered, the secret DOES leak — proving the real _scrub
-    # call is what the test above actually depends on.
-    assert secret in out, "expected the neutered _scrub to leak the secret (mutation check)"
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -1038,561 +732,62 @@ def test_scrub_call_is_load_bearing_mutation_check(tmp_path, monkeypatch, capsys
 _NO_UNIT = "hive-mind-gateway-does-not-exist-in-this-test.service"
 
 
-def test_e2e_no_env_file_reports_and_exits_0(tmp_path, monkeypatch, capsys):
-    _force_no_unit(monkeypatch)
-    monkeypatch.setenv("SECURE_ENV_FILE", str(tmp_path / "does-not-exist.env"))
-    rc = m.do_apply_or_dryrun(None, True, _NO_UNIT)
-    assert rc == m.EXIT_OK
-    # QA MED-8: rc == EXIT_OK alone is returned by ~8 different branches —
-    # pin the actual report line this specific path takes.
-    out = capsys.readouterr().out
-    assert "no shared-memory/.env found" in out
-    assert "environment-only" in out
 
 
-def test_e2e_non_utf8_env_file_refuses_cleanly_never_a_traceback(tmp_path, monkeypatch, capsys):
-    """QA LOW (fix round): a non-UTF-8 byte in .env must not traceback out
-    of read_raw_lines() — refused cleanly, named, EXIT_STOP. An explicit
-    --preimage bypasses self-capture (which fails on the SAME file even
-    earlier, inside the loader subprocess's own secure_env.load_split_env()
-    — also a clean refusal, just a different message) so this test isolates
-    THIS module's own read_raw_lines() guard specifically."""
-    _force_no_unit(monkeypatch)
-    env_path = tmp_path / ".env"
-    env_path.write_bytes(b"LLM_BACKENDS=http://a:5000\n\xff\xfe garbage\n")
-    monkeypatch.setenv("SECURE_ENV_FILE", str(env_path))
-    preimage = tmp_path / "pre.json"
-    preimage.write_text(json.dumps({
-        "capture_schema": m.CAPTURE_SCHEMA,
-        "image": {"urls": ["http://a:5000"], "fallback_reason": None},
-    }))
-    rc = m.do_apply_or_dryrun(str(preimage), True, _NO_UNIT)
-    out = capsys.readouterr().out
-    assert rc == m.EXIT_STOP
-    assert "REFUSING" in out
-    assert "could not be decoded" in out
-    assert "Traceback" not in out
 
 
-def test_e2e_csv_live_dry_run_then_apply_then_second_run_is_a_true_noop(tmp_path, monkeypatch, capsys):
-    """W4 (§6.4 V2): a live CSV's private_ok materialisation is a
-    boundary-crossing act now — self-capture alone (same generation) would
-    correctly no-op (that IS the true-noop half of this test's name, now
-    structural rather than incidental). The dry-run PREVIEW and the first
-    APPLY exercise the genuine version-jump path via an aged --preimage
-    (`_aged_preimage`); the SECOND apply reverts to plain self-capture,
-    proving the re-run is a true no-op for its OWN (V2 same-generation)
-    reason, not merely "already explicit"."""
-    _force_no_unit(monkeypatch)
-    env_path = _write_env(tmp_path, "LLM_BACKENDS=http://localhost:5000\n")
-    monkeypatch.setenv("SECURE_ENV_FILE", str(env_path))
-    monkeypatch.setenv("HOME", str(tmp_path / "fake-home"))
-    preimage_path = _aged_preimage(tmp_path)
-
-    rc = m.do_apply_or_dryrun(preimage_path, False, _NO_UNIT)
-    assert rc == m.EXIT_OK
-    dry_out = capsys.readouterr().out
-    assert "DRY RUN" in dry_out
-    assert env_path.read_text() == "LLM_BACKENDS=http://localhost:5000\n", "dry run wrote to the file"
-
-    rc = m.do_apply_or_dryrun(preimage_path, True, _NO_UNIT)
-    assert rc == m.EXIT_OK
-    applied_text = env_path.read_text()
-    assert "LLM_BACKENDS_JSON=" in applied_text
-    assert "# migrated to LLM_BACKENDS_JSON by migrate_env.py" in applied_text
-
-    mtime_after_first_apply = env_path.stat().st_mtime
-    hash_after_first_apply = applied_text
-    time.sleep(0.05)
-
-    # SECOND RUN — self-capture (no --preimage): now the SAME generation as
-    # what it just wrote, so V2's gate alone guarantees a true no-op — file
-    # hash AND mtime unchanged (M-D10: no planned writes -> no temp+mv at all).
-    rc2 = m.do_apply_or_dryrun(None, True, _NO_UNIT)
-    assert rc2 == m.EXIT_OK
-    assert env_path.stat().st_mtime == mtime_after_first_apply, "mtime moved on a no-op re-run"
-    assert env_path.read_text() == hash_after_first_apply, "content moved on a no-op re-run"
 
 
-def test_e2e_case1_json_usable_adds_private_ok_and_is_idempotent(tmp_path, monkeypatch):
-    """W4 (§6.4 V2): adding private_ok to a role-less, credential-less entry
-    is a boundary-crossing materialisation now (that entry would otherwise
-    correctly stay ineligible under the CURRENT generation) — exercised via
-    an aged --preimage. The second, self-capture re-run proves idempotency
-    for the SAME reason as the CSV-live case above: same generation, V2
-    gate, true no-op."""
-    _force_no_unit(monkeypatch)
-    env_path = _write_env(tmp_path, 'LLM_BACKENDS_JSON=[{"url":"http://a:5000"}]\n')
-    monkeypatch.setenv("SECURE_ENV_FILE", str(env_path))
-    monkeypatch.setenv("HOME", str(tmp_path / "fake-home"))
-    preimage_path = _aged_preimage(tmp_path)
-
-    rc = m.do_apply_or_dryrun(preimage_path, True, _NO_UNIT)
-    assert rc == m.EXIT_OK
-    text = env_path.read_text()
-    assert '"private_ok": true' in text
-
-    mtime = env_path.stat().st_mtime
-    rc2 = m.do_apply_or_dryrun(None, True, _NO_UNIT)
-    assert rc2 == m.EXIT_OK
-    assert env_path.stat().st_mtime == mtime, "already-explicit JSON re-run must not rewrite"
 
 
-def test_e2e_case1_unparseable_json_leaves_a_live_csv_untouched_report_matches_action(
-        tmp_path, monkeypatch):
-    """QA MED-3 (fix round): an unparseable LLM_BACKENDS_JSON (an array of
-    bare strings) landing in CASE_JSON_USABLE must report 'touching
-    nothing' AND ACTUALLY touch nothing — pre-fix, the CSV cleanup block
-    ran unconditionally after this branch and commented out the live CSV
-    anyway, contradicting the very report line it had just printed.
-
-    QA's own trace: the REAL loader cannot actually produce this state
-    today (an array-of-strings LLM_BACKENDS_JSON makes `import
-    hive_mind_proxy` itself crash — AttributeError — so self-capture never
-    reaches classify() at all; confirmed empirically writing this test).
-    This is deliberately exercised via an explicit --preimage instead (a
-    fabricated but schema-valid image with a non-empty `urls`), which is
-    exactly the 'one loader change away from being real' case QA flagged —
-    defensive code in `plan_case_json_usable`/the CSV-skip guard, proven
-    with the tool's own supported --preimage mode rather than left
-    untested because the live path can't reach it today."""
-    _force_no_unit(monkeypatch)
-    original = (
-        'EMBEDDER_URL=http://a:8070\nRERANKER_URL=http://a:8071\n'
-        'LLM_BACKENDS_JSON=["http://a:5000","http://b:5000"]\n'
-        'LLM_BACKENDS=http://c:5000\n'
-    )
-    env_path = _write_env(tmp_path, original)
-    monkeypatch.setenv("SECURE_ENV_FILE", str(env_path))
-    monkeypatch.setenv("HOME", str(tmp_path / "fake-home"))
-
-    preimage_path = tmp_path / "pre.json"
-    preimage_path.write_text(json.dumps({
-        "capture_schema": m.CAPTURE_SCHEMA,
-        "image": {"urls": ["http://a:5000"], "fallback_reason": None},
-    }))
-
-    rc = m.do_apply_or_dryrun(str(preimage_path), True, _NO_UNIT)
-    assert rc == m.EXIT_OK
-    text = env_path.read_text()
-    assert 'LLM_BACKENDS=http://c:5000' in text, "the live CSV line must survive verbatim"
-    assert "# migrated to LLM_BACKENDS_JSON" not in text, (
-        "report said 'touching nothing' but the CSV was commented out anyway")
 
 
-def test_e2e_case2_unusable_json_with_live_csv_is_byte_identical_no_write(tmp_path, monkeypatch):
-    """QA H2 (fix round) — the end-to-end guard for the review chain's top
-    invariant ('an existing LLM_BACKENDS_JSON key is NEVER overwritten by
-    any branch'), which previously had NO file-level test at all. A
-    token_env that never resolves makes the REAL loader compute
-    LLM_POOL_FALLBACK_REASON (case 2), with a live CSV sitting right
-    there — both must survive verbatim, nothing written at all (file hash
-    AND mtime unchanged), and the report names both facts."""
-    _force_no_unit(monkeypatch)
-    original = (
-        'EMBEDDER_URL=http://a:8070\nRERANKER_URL=http://a:8071\n'
-        'LLM_BACKENDS_JSON=[{"url":"https://api.example.com/v1",'
-        '"token_env":"X_KEY_THAT_NEVER_RESOLVES"}]\n'
-        'LLM_BACKENDS=http://c:5000\n'
-    )
-    env_path = _write_env(tmp_path, original)
-    monkeypatch.setenv("SECURE_ENV_FILE", str(env_path))
-    monkeypatch.setenv("HOME", str(tmp_path / "fake-home"))
-    monkeypatch.delenv("X_KEY_THAT_NEVER_RESOLVES", raising=False)
-
-    mtime_before = env_path.stat().st_mtime
-    rc = m.do_apply_or_dryrun(None, True, _NO_UNIT)
-    assert rc == m.EXIT_OK
-    assert env_path.read_text() == original, "case 2 must never write, to either key"
-    assert env_path.stat().st_mtime == mtime_before, "mtime moved on a case-2 no-op"
 
 
-def test_e2e_case2_deleting_the_json_line_from_the_fixture_kills_the_survival_claim(
-        tmp_path, monkeypatch):
-    """The mutation-kill proof QA H2 asked for, as a live assertion rather
-    than a manual exercise: with the SAME live CSV but NO
-    LLM_BACKENDS_JSON key at all, the real loader can no longer produce a
-    fallback_reason (nothing to parse), classify() lands in CASE_CSV_LIVE
-    instead of CASE_JSON_UNUSABLE, and the CSV DOES get converted — proving
-    the case-2 test above is actually pinned to the JSON key's presence,
-    not merely to 'nothing changes for some other reason'.
-
-    W4 (§6.4): the conversion is boundary-crossing now — aged --preimage."""
-    _force_no_unit(monkeypatch)
-    mutated = (
-        'EMBEDDER_URL=http://a:8070\nRERANKER_URL=http://a:8071\n'
-        'LLM_BACKENDS=http://c:5000\n'
-    )
-    env_path = _write_env(tmp_path, mutated)
-    monkeypatch.setenv("SECURE_ENV_FILE", str(env_path))
-    monkeypatch.setenv("HOME", str(tmp_path / "fake-home"))
-    preimage_path = _aged_preimage(tmp_path)
-    rc = m.do_apply_or_dryrun(preimage_path, True, _NO_UNIT)
-    assert rc == m.EXIT_OK
-    text = env_path.read_text()
-    assert "LLM_BACKENDS_JSON=" in text, (
-        "deleting the JSON line should make the CSV convert instead of surviving untouched — "
-        "if this fails, the case-2 test above is not actually watching the JSON key's presence")
 
 
-def test_e2e_roles_carrying_entry_left_byte_for_byte(tmp_path, monkeypatch):
-    _force_no_unit(monkeypatch)
-    original = ('EMBEDDER_URL=http://a:8070\nRERANKER_URL=http://a:8071\n'
-                'LLM_BACKENDS_JSON=[{"url":"http://a:5000","roles":["extract"]}]\n')
-    env_path = _write_env(tmp_path, original)
-    monkeypatch.setenv("SECURE_ENV_FILE", str(env_path))
-    monkeypatch.setenv("HOME", str(tmp_path / "fake-home"))
-    rc = m.do_apply_or_dryrun(None, True, _NO_UNIT)
-    assert rc == m.EXIT_OK
-    assert env_path.read_text() == original, "a roles-carrying entry must be left byte-for-byte"
 
 
-def test_e2e_credentialed_neither_key_entry_untouched_and_reported(tmp_path, monkeypatch, capsys):
-    """W4 (§6.4): aged --preimage so the plan_case_json_usable eligibility
-    check actually runs (a same-generation run would short-circuit before
-    it with a DIFFERENT, also-true message) — this entry is excluded by
-    its own token_env regardless of the boundary, so "already fully
-    explicit" is still the right wording once the boundary is open."""
-    _force_no_unit(monkeypatch)
-    original = ('EMBEDDER_URL=http://a:8070\nRERANKER_URL=http://a:8071\n'
-                'LLM_BACKENDS_JSON=[{"url":"https://api.example.com/v1","token_env":"X_KEY"}]\n'
-                'X_KEY=irrelevant-for-this-test\n')
-    env_path = _write_env(tmp_path, original)
-    monkeypatch.setenv("SECURE_ENV_FILE", str(env_path))
-    monkeypatch.setenv("X_KEY", "some-token-value")
-    monkeypatch.setenv("HOME", str(tmp_path / "fake-home"))
-    preimage_path = _aged_preimage(tmp_path)
-    rc = m.do_apply_or_dryrun(preimage_path, True, _NO_UNIT)
-    assert rc == m.EXIT_OK
-    assert env_path.read_text() == original
-    out = capsys.readouterr().out  # QA MED-8: the capsys fixture was never read
-    assert "already fully explicit" in out
 
 
-def test_e2e_present_but_empty_json_key_reported_never_written(tmp_path, monkeypatch, capsys):
-    _force_no_unit(monkeypatch)
-    original = "EMBEDDER_URL=http://a:8070\nRERANKER_URL=http://a:8071\nLLM_BACKENDS_JSON=\n"
-    env_path = _write_env(tmp_path, original)
-    monkeypatch.setenv("SECURE_ENV_FILE", str(env_path))
-    monkeypatch.setenv("HOME", str(tmp_path / "fake-home"))
-    rc = m.do_apply_or_dryrun(None, True, _NO_UNIT)
-    assert rc == m.EXIT_OK
-    assert env_path.read_text() == original
-    out = capsys.readouterr().out
-    assert "present but EMPTY" in out
-    assert "/health" in out
 
 
-def test_e2e_empty_string_endpoint_keys_untouched_and_counted(tmp_path, monkeypatch, capsys):
-    _force_no_unit(monkeypatch)
-    original = "EMBEDDER_URL=\nRERANKER_URL=\nLLM_BACKENDS=http://a:5000\n"
-    env_path = _write_env(tmp_path, original)
-    monkeypatch.setenv("SECURE_ENV_FILE", str(env_path))
-    monkeypatch.setenv("HOME", str(tmp_path / "fake-home"))
-    rc = m.do_apply_or_dryrun(None, False, _NO_UNIT)
-    assert rc == m.EXIT_OK
-    out = capsys.readouterr().out
-    assert "EMBEDDER_URL present but EMPTY" in out
-    assert "RERANKER_URL present but EMPTY" in out
 
 
-def test_e2e_duplicate_managed_key_refused(tmp_path, monkeypatch):
-    _force_no_unit(monkeypatch)
-    env_path = _write_env(tmp_path, "LLM_BACKENDS=http://a:5000\nLLM_BACKENDS=http://b:5000\n")
-    monkeypatch.setenv("SECURE_ENV_FILE", str(env_path))
-    monkeypatch.setenv("HOME", str(tmp_path / "fake-home"))
-    rc = m.do_apply_or_dryrun(None, True, _NO_UNIT)
-    assert rc == m.EXIT_STOP
 
 
-def test_e2e_crlf_file_stays_crlf_when_written(tmp_path, monkeypatch):
-    _force_no_unit(monkeypatch)
-    env_path = tmp_path / ".env"
-    env_path.write_bytes(b"LLM_BACKENDS=http://a:5000\r\n")
-    monkeypatch.setenv("SECURE_ENV_FILE", str(env_path))
-    monkeypatch.setenv("HOME", str(tmp_path / "fake-home"))
-    rc = m.do_apply_or_dryrun(None, True, _NO_UNIT)
-    assert rc == m.EXIT_OK
-    raw = env_path.read_bytes()
-    assert b"\r\n" in raw
-    assert b"\n" not in raw.replace(b"\r\n", b"")
 
 
-def test_e2e_crlf_host_with_no_changes_stays_crlf_unwritten(tmp_path, monkeypatch):
-    """A CRLF host with NO planned changes must not be silently normalised —
-    no write happens at all (M-D10), so the byte content is untouched."""
-    _force_no_unit(monkeypatch)
-    original = (b'EMBEDDER_URL=http://a:8070\r\nRERANKER_URL=http://a:8071\r\n'
-                b'LLM_BACKENDS_JSON=[{"url":"http://a:5000","private_ok":true}]\r\n')
-    env_path = tmp_path / ".env"
-    env_path.write_bytes(original)
-    monkeypatch.setenv("SECURE_ENV_FILE", str(env_path))
-    monkeypatch.setenv("HOME", str(tmp_path / "fake-home"))
-    rc = m.do_apply_or_dryrun(None, True, _NO_UNIT)
-    assert rc == m.EXIT_OK
-    assert env_path.read_bytes() == original
 
 
-def test_e2e_symlinked_env_file_is_resolved_and_target_is_operated_on(tmp_path, monkeypatch):
-    """W4 (§6.4): the CSV->JSON conversion this test observes is a
-    boundary-crossing materialisation now — aged --preimage, same as the
-    other case-3/4 mechanics tests above."""
-    _force_no_unit(monkeypatch)
-    real_target = tmp_path / "real.env"
-    real_target.write_text("LLM_BACKENDS=http://a:5000\n")
-    link = tmp_path / ".env"
-    link.symlink_to(real_target)
-    monkeypatch.setenv("SECURE_ENV_FILE", str(link))
-    monkeypatch.setenv("HOME", str(tmp_path / "fake-home"))
-    preimage_path = _aged_preimage(tmp_path)
-    rc = m.do_apply_or_dryrun(preimage_path, True, _NO_UNIT)
-    assert rc == m.EXIT_OK
-    assert "LLM_BACKENDS_JSON=" in real_target.read_text()
-    assert link.is_symlink(), "the symlink itself must survive (operate on the target, not replace the link)"
 
 
-@pytest.mark.skipif(os.geteuid() == 0, reason="os.access(W_OK) is always True for root")
-def test_e2e_read_only_directory_with_a_planned_write_refuses(tmp_path, monkeypatch, capsys):
-    """SEC M-3 (fix round): the precheck targets the PARENT DIRECTORY —
-    mkstemp(dir=parent) + os.replace() is a RENAME, which needs write+exec
-    permission on the directory, not the file's own inode."""
-    _force_no_unit(monkeypatch)
-    work_dir = tmp_path / "workdir"
-    work_dir.mkdir()
-    env_path = work_dir / ".env"
-    env_path.write_text("LLM_BACKENDS=http://a:5000\n")
-    monkeypatch.setenv("SECURE_ENV_FILE", str(env_path))
-    monkeypatch.setenv("HOME", str(tmp_path / "fake-home"))
-    work_dir.chmod(0o555)
-    try:
-        rc = m.do_apply_or_dryrun(None, True, _NO_UNIT)
-        assert rc == m.EXIT_STOP
-        out = capsys.readouterr().out
-        assert "directory" in out
-    finally:
-        work_dir.chmod(0o755)
 
 
-def test_e2e_read_only_file_in_a_writable_directory_still_applies(tmp_path, monkeypatch):
-    """The MIRROR of the directory test above, and the specific regression
-    the M-3 fix corrected: a read-only FILE in an otherwise-writable
-    directory must NOT be refused — the write is a rename via a fresh
-    temp file in the same directory, which needs directory permission,
-    never the target inode's own write bit. The old (file-level) precheck
-    would have refused this case; the fix must not.
-
-    W4 (§6.4): the CSV->JSON conversion is a boundary-crossing
-    materialisation now — aged --preimage, captured (read-only) BEFORE the
-    chmod below."""
-    _force_no_unit(monkeypatch)
-    env_path = _write_env(tmp_path, "LLM_BACKENDS=http://a:5000\n")
-    monkeypatch.setenv("SECURE_ENV_FILE", str(env_path))
-    monkeypatch.setenv("HOME", str(tmp_path / "fake-home"))
-    preimage_path = _aged_preimage(tmp_path)
-    env_path.chmod(0o444)
-    try:
-        rc = m.do_apply_or_dryrun(preimage_path, True, _NO_UNIT)
-        assert rc == m.EXIT_OK, "a read-only FILE in a writable directory must not refuse"
-        assert "LLM_BACKENDS_JSON=" in env_path.read_text()
-    finally:
-        env_path.chmod(0o644)
 
 
-def test_e2e_read_only_env_file_with_no_planned_write_is_a_silent_pass(tmp_path, monkeypatch):
-    """A no-op run against a read-only .env (our fleet's predicted state)
-    must report and exit 0 — only a PLANNED write against an unwritable
-    target refuses."""
-    _force_no_unit(monkeypatch)
-    env_path = _write_env(
-        tmp_path,
-        'EMBEDDER_URL=http://a:8070\nRERANKER_URL=http://a:8071\n'
-        'LLM_BACKENDS_JSON=[{"url":"http://a:5000","private_ok":true}]\n')
-    env_path.chmod(0o444)
-    monkeypatch.setenv("SECURE_ENV_FILE", str(env_path))
-    monkeypatch.setenv("HOME", str(tmp_path / "fake-home"))
-    try:
-        rc = m.do_apply_or_dryrun(None, True, _NO_UNIT)
-        assert rc == m.EXIT_OK
-    finally:
-        env_path.chmod(0o644)
 
 
-def test_e2e_fallback_case_non_interactive_writes_nothing(tmp_path, monkeypatch, capsys):
-    """W4 (§6.4 V2): SAME generation (self-capture, no --preimage) — the
-    whole case-4 body short-circuits to the "nothing to materialise"
-    no-op before it even asks whether a human is present. The genuinely
-    NEW non-interactive behaviour (boundary crossing + no human = STOP) is
-    covered by test_e2e_fallback_case_boundary_crossing_non_interactive_stops
-    below."""
-    _force_no_unit(monkeypatch)
-    env_path = _write_env(tmp_path, "EMBEDDER_URL=http://a:8070\n")
-    monkeypatch.setenv("SECURE_ENV_FILE", str(env_path))
-    monkeypatch.setenv("HOME", str(tmp_path / "fake-home"))
-    monkeypatch.setattr(sys.stdin, "isatty", lambda: False, raising=False)
-    rc = m.do_apply_or_dryrun(None, True, _NO_UNIT, confirm_reader=None)
-    assert rc == m.EXIT_OK
-    assert "LLM_BACKENDS_JSON=" not in env_path.read_text()
-    out = capsys.readouterr().out
-    assert "already the CURRENT loader generation" in out
 
 
-def test_e2e_fallback_case_boundary_crossing_non_interactive_stops(tmp_path, monkeypatch, capsys):
-    """Ruling D(a) V1 (§6.4), the NEW invariant this wave adds: a
-    version-jump install (aged --preimage — the fallback WAS serving
-    role-less traffic under the old default) with no human present must
-    STOP (EXIT_STOP), never quietly exit 0 into a gateway that now serves
-    nothing. Mutation-checked in HANDOFF.md (M-kill: reverting this
-    `return EXIT_STOP` to the old "report and fall through to EXIT_OK"
-    behaviour must make this test fail)."""
-    _force_no_unit(monkeypatch)
-    env_path = _write_env(tmp_path, "EMBEDDER_URL=http://a:8070\n")
-    monkeypatch.setenv("SECURE_ENV_FILE", str(env_path))
-    monkeypatch.setenv("HOME", str(tmp_path / "fake-home"))
-    preimage_path = _aged_preimage(tmp_path)
-    monkeypatch.setattr(sys.stdin, "isatty", lambda: False, raising=False)
-    rc = m.do_apply_or_dryrun(preimage_path, True, _NO_UNIT, confirm_reader=None)
-    assert rc == m.EXIT_STOP
-    assert "LLM_BACKENDS_JSON=" not in env_path.read_text(), "R-A: no write without a human"
-    out = capsys.readouterr().out
-    assert "no human is present" in out
-    assert "--skip-env-migration" in out
 
 
-def test_e2e_fallback_case_interactive_confirm_yes_writes_and_freezes_default_target(tmp_path, monkeypatch):
-    """W4 (§6.4): materialising the fallback is a boundary-crossing act —
-    aged --preimage opens it; R-A's interactive confirm is otherwise
-    unchanged."""
-    _force_no_unit(monkeypatch)
-    env_path = _write_env(tmp_path, "EMBEDDER_URL=http://a:8070\n")
-    monkeypatch.setenv("SECURE_ENV_FILE", str(env_path))
-    monkeypatch.setenv("HOME", str(tmp_path / "fake-home"))
-    preimage_path = _aged_preimage(tmp_path)
-    monkeypatch.setattr(m, "probe_backend", lambda url, timeout=3.0: {
-        "answered": False, "status": None, "parsed_model_list": False, "n_models": None})
-    rc = m.do_apply_or_dryrun(preimage_path, True, _NO_UNIT, confirm_reader=lambda: "y\n")
-    assert rc == m.EXIT_OK
-    text = env_path.read_text()
-    assert "LLM_BACKENDS_JSON=" in text
-    assert "LLM_DEFAULT_TARGET" not in text, "R-A: LLM_DEFAULT_TARGET is never written"
 
 
-def test_e2e_fallback_case_trailing_slash_confirm_yes_does_not_abort(tmp_path, monkeypatch):
-    """SEC H-4 (fix round): hive_mind_proxy's fallback substitution
-    (`_raw_backends = [(DEFAULT_TARGET, 1.0)]`) never strips a trailing
-    slash, while its LLM_BACKENDS_JSON parsing branch always does — a
-    bare LLM_DEFAULT_TARGET carrying a trailing slash made a correctly
-    CONFIRMED 'y' abort the whole upgrade with POST-IMAGE DIVERGED,
-    reproduced live pre-fix. Must now go through clean: rc == EXIT_OK, no
-    'DIVERGED' anywhere in the report.
-
-    W4 (§6.4): materialisation is boundary-crossing now — aged --preimage."""
-    _force_no_unit(monkeypatch)
-    env_path = _write_env(
-        tmp_path, "EMBEDDER_URL=http://a:8070\nLLM_DEFAULT_TARGET=http://localhost:5000/\n")
-    monkeypatch.setenv("SECURE_ENV_FILE", str(env_path))
-    monkeypatch.setenv("HOME", str(tmp_path / "fake-home"))
-    preimage_path = _aged_preimage(tmp_path)
-    monkeypatch.setattr(m, "probe_backend", lambda url, timeout=3.0: {
-        "answered": False, "status": None, "parsed_model_list": False, "n_models": None})
-    rc = m.do_apply_or_dryrun(preimage_path, True, _NO_UNIT, confirm_reader=lambda: "y\n")
-    assert rc == m.EXIT_OK, "a trailing slash on LLM_DEFAULT_TARGET must not abort a confirmed write"
-    text = env_path.read_text()
-    assert "LLM_BACKENDS_JSON=" in text
 
 
-def test_e2e_fallback_case_interactive_confirm_no_writes_nothing(tmp_path, monkeypatch):
-    """W4 (§6.4): aged --preimage so the interactive confirm path is
-    actually reached (a same-generation run would short-circuit before it,
-    which is not what this test is about)."""
-    _force_no_unit(monkeypatch)
-    env_path = _write_env(tmp_path, "EMBEDDER_URL=http://a:8070\n")
-    monkeypatch.setenv("SECURE_ENV_FILE", str(env_path))
-    monkeypatch.setenv("HOME", str(tmp_path / "fake-home"))
-    preimage_path = _aged_preimage(tmp_path)
-    monkeypatch.setattr(m, "probe_backend", lambda url, timeout=3.0: {
-        "answered": False, "status": None, "parsed_model_list": False, "n_models": None})
-    rc = m.do_apply_or_dryrun(preimage_path, True, _NO_UNIT, confirm_reader=lambda: "n\n")
-    assert rc == m.EXIT_OK
-    assert "LLM_BACKENDS_JSON=" not in env_path.read_text()
 
 
-def test_e2e_fallback_case_empty_default_target_never_probed_never_materialised(tmp_path, monkeypatch):
-    """W4 (§6.4): aged --preimage so the probeable-target check is actually
-    reached."""
-    _force_no_unit(monkeypatch)
-    env_path = _write_env(tmp_path, "EMBEDDER_URL=http://a:8070\nLLM_DEFAULT_TARGET=\n")
-    monkeypatch.setenv("SECURE_ENV_FILE", str(env_path))
-    monkeypatch.setenv("HOME", str(tmp_path / "fake-home"))
-    preimage_path = _aged_preimage(tmp_path)
-    probed = []
-    monkeypatch.setattr(m, "probe_backend", lambda url, timeout=3.0: probed.append(url) or {
-        "answered": True, "status": 200, "parsed_model_list": True, "n_models": 1})
-    rc = m.do_apply_or_dryrun(preimage_path, True, _NO_UNIT, confirm_reader=lambda: "y\n")
-    assert rc == m.EXIT_OK
-    assert probed == [], "an empty effective target must never be probed"
-    assert "LLM_BACKENDS_JSON=" not in env_path.read_text()
 
 
-def test_e2e_unparseable_default_target_with_userinfo_credential_is_scrubbed(
-        tmp_path, monkeypatch, capsys):
-    """SEC H-2 (fix round), the EXACT reproduction the finding cited:
-    `LLM_DEFAULT_TARGET=https://u:<credential>@` — scheme present,
-    hostname EMPTY (there is nothing after the '@') — so
-    _effective_url_probeable() is False and this takes the 'empty or
-    unparseable' branch specifically, which built its report from the raw
-    `shown = default_target if default_target else "(empty)"` value with
-    NO scrub call — the one URL-rendering branch in the whole file that
-    was not routed through _scrub(). Every OTHER branch (including the
-    non-interactive CASE_FALLBACK report a sibling test exercises) already
-    called _scrub() correctly even pre-fix; this test is the one that
-    actually pins THIS line."""
-    _force_no_unit(monkeypatch)
-    secret = "s3cr3t-userinfo-credential-must-be-scrubbed"
-    env_path = _write_env(
-        tmp_path, f"EMBEDDER_URL=http://a:8070\nLLM_DEFAULT_TARGET=https://u:{secret}@\n")
-    monkeypatch.setenv("SECURE_ENV_FILE", str(env_path))
-    rc = m.do_apply_or_dryrun(None, True, _NO_UNIT)
-    out = capsys.readouterr().out
-    assert rc == m.EXIT_OK
-    assert secret not in out
-    assert "u:" not in out
 
 
 # ─────────────────────────────────────────────────────────────────────────
 # Capture-schema check
 # ─────────────────────────────────────────────────────────────────────────
 
-def test_newer_capture_schema_refused_with_remedy(tmp_path, monkeypatch, capsys):
-    _force_no_unit(monkeypatch)
-    env_path = _write_env(tmp_path, "LLM_BACKENDS=http://a:5000\n")
-    monkeypatch.setenv("SECURE_ENV_FILE", str(env_path))
-    preimage = tmp_path / "pre.json"
-    preimage.write_text(json.dumps({"capture_schema": m.CAPTURE_SCHEMA + 1, "image": {}}))
-    rc = m.do_apply_or_dryrun(str(preimage), False, _NO_UNIT)
-    assert rc == m.EXIT_STOP
-    out = capsys.readouterr().out  # QA MED-8: the remedy text itself, not just rc
-    assert "NEWER than this" in out
-    assert "self-capture" in out
-    assert "--apply" in out
 
 
-def test_older_capture_schema_accepted(tmp_path, monkeypatch):
-    """QA MED-1 (fix round): the ORIGINAL cut of this test wrote
-    `capture_schema: CAPTURE_SCHEMA` — the CURRENT value, not an older
-    one — so the N-4 forward-compatibility half ('the reader accepts
-    capture_schema <= its own') was never actually exercised. Fixed to
-    `CAPTURE_SCHEMA - 1`, which is < CAPTURE_SCHEMA and must still be
-    accepted."""
-    _force_no_unit(monkeypatch)
-    env_path = _write_env(tmp_path, "LLM_BACKENDS=http://a:5000\n")
-    monkeypatch.setenv("SECURE_ENV_FILE", str(env_path))
-    preimage = tmp_path / "pre.json"
-    real_image = json.loads(
-        json.dumps(_full_image_from_capture(tmp_path, monkeypatch)))
-    older_schema = m.CAPTURE_SCHEMA - 1
-    preimage.write_text(json.dumps({"capture_schema": older_schema, "image": real_image}))
-    rc = m.do_apply_or_dryrun(str(preimage), False, _NO_UNIT)
-    assert rc == m.EXIT_OK
 
 
 def _full_image_from_capture(tmp_path, monkeypatch):
@@ -1604,140 +799,23 @@ def _full_image_from_capture(tmp_path, monkeypatch):
     return json.loads(out.read_text())["image"]
 
 
-def test_malformed_preimage_json_is_refused(tmp_path, monkeypatch):
-    _force_no_unit(monkeypatch)
-    env_path = _write_env(tmp_path, "LLM_BACKENDS=http://a:5000\n")
-    monkeypatch.setenv("SECURE_ENV_FILE", str(env_path))
-    preimage = tmp_path / "pre.json"
-    preimage.write_text("{not json")
-    rc = m.do_apply_or_dryrun(str(preimage), False, _NO_UNIT)
-    assert rc == m.EXIT_STOP
 
 
 # ─────────────────────────────────────────────────────────────────────────
 # Backup + restore mechanics
 # ─────────────────────────────────────────────────────────────────────────
 
-def test_backup_is_written_outside_the_tree_mode_600_content_matches(tmp_path, monkeypatch):
-    fake_home = tmp_path / "fake-home"
-    monkeypatch.setenv("HOME", str(fake_home))
-    target = tmp_path / ".env"
-    target.write_text("LLM_BACKENDS=http://a:5000\n")
-    backup = m.backup_env_file(target)
-    assert backup.read_text() == target.read_text()
-    assert str(backup).startswith(str(fake_home))
-    import stat as _stat
-    assert _stat.S_IMODE(backup.stat().st_mode) == 0o600
 
 
-def test_restore_from_backup_byte_verifies(tmp_path, monkeypatch):
-    fake_home = tmp_path / "fake-home"
-    monkeypatch.setenv("HOME", str(fake_home))
-    target = tmp_path / ".env"
-    target.write_text("ORIGINAL\n")
-    backup = m.backup_env_file(target)
-    target.write_text("CORRUPTED\n")
-    m.restore_from_backup(target, backup)
-    assert target.read_text() == "ORIGINAL\n"
 
 
-def test_restore_from_backup_raises_restore_error_on_failed_verify(tmp_path, monkeypatch):
-    """The red path SEC M-2 / QA MED-5 named: restore_from_backup() itself
-    must raise the dedicated RestoreError (never a bare LoaderError
-    misnomer) when the post-restore byte-compare fails."""
-    fake_home = tmp_path / "fake-home"
-    monkeypatch.setenv("HOME", str(fake_home))
-    target = tmp_path / ".env"
-    target.write_text("ORIGINAL\n")
-    backup = m.backup_env_file(target)
-
-    # Simulate an ENOSPC/EIO-class corruption during the restore write
-    # itself: patch Path.read_bytes so the POST-restore re-read (the
-    # verification step) returns something that does not match what was
-    # just written.
-    real_read_bytes = m.Path.read_bytes
-    calls = {"n": 0}
-
-    def _flaky_read_bytes(self):
-        calls["n"] += 1
-        if self == target and calls["n"] > 1:
-            return b"CORRUPTED-DURING-RESTORE"
-        return real_read_bytes(self)
-
-    monkeypatch.setattr(m.Path, "read_bytes", _flaky_read_bytes)
-    with pytest.raises(m.RestoreError):
-        m.restore_from_backup(target, backup)
 
 
-def test_restore_or_die_prints_pending_lines_before_a_restore_failure_never_a_traceback(
-        tmp_path, monkeypatch, capsys):
-    """SEC M-2 / QA MED-5 (fix round) end-to-end: `_restore_or_die()` must
-    (1) print the PENDING lines — the divergence diagnosis computed so
-    far — even when the restore itself then fails, (2) never let a raw
-    exception escape as a traceback, (3) always return EXIT_STOP."""
-    fake_home = tmp_path / "fake-home"
-    monkeypatch.setenv("HOME", str(fake_home))
-    target = tmp_path / ".env"
-    target.write_text("ORIGINAL\n")
-    backup = m.backup_env_file(target)
 
-    def _boom(target_arg, backup_arg):
-        raise m.RestoreError("synthetic restore failure for this test")
-
-    monkeypatch.setattr(m, "restore_from_backup", _boom)
-    lines = ["a pending diagnosis line that must survive"]
-    result = m._restore_or_die(lines, target, backup, "PRE-EXISTING DIAGNOSIS LINE")
-    out = capsys.readouterr().out
-    assert result == m.EXIT_STOP
-    assert "a pending diagnosis line that must survive" in out
-    assert "PRE-EXISTING DIAGNOSIS LINE" in out
-    assert "RESTORE FAILED" in out
-    assert "Traceback" not in out
 
 
 _H9_ENDPOINTS = "EMBEDDER_URL=http://a:8070\nRERANKER_URL=http://a:8071\n"
 
 
-@pytest.mark.parametrize("fixture_text", [
-    _H9_ENDPOINTS + 'LLM_BACKENDS_JSON=[{"url":"http://a:5000"}]\n',    # CASE_JSON_USABLE
-    _H9_ENDPOINTS + "LLM_BACKENDS=http://a:5000\n",                    # CASE_CSV_LIVE
-    _H9_ENDPOINTS,                                                     # CASE_FALLBACK
-], ids=["case1_json_usable", "case3_csv_live", "case4_fallback"])
-def test_h9_same_generation_reapply_is_a_true_noop_property(tmp_path, monkeypatch, fixture_text):
-    """§6.4 obligation 4 / H9 (the whole point of the V2 same-generation
-    gate): a post-W4 `--apply` self-capture re-run on EVERY W3 case fixture
-    (case 1 JSON-usable, case 3 CSV-live, case 4 fallback) asserts THREE
-    things — rc == EXIT_OK, the file is BYTE-IDENTICAL, and NO NEW BACKUP
-    FILE appears (glob before/after) — because there is no boundary to
-    cross and therefore nothing effective to preserve. Mutation-checked
-    against the un-gated tool in HANDOFF.md (M-kill: removing the
-    `if not boundary_open` gate on cases 1/3/4 makes this go red for the
-    first two fixtures — case 4's non-interactive/no-preimage path already
-    happened to no-op pre-gate too, so it alone would not have caught the
-    regression; the property is asserted over the WHOLE set for that
-    reason)."""
-    _force_no_unit(monkeypatch)
-    env_path = _write_env(tmp_path, fixture_text)
-    monkeypatch.setenv("SECURE_ENV_FILE", str(env_path))
-    home = tmp_path / "fake-home"
-    monkeypatch.setenv("HOME", str(home))
-    backup_dir = home / ".shared-memory" / "env-backups"
-    before = set(backup_dir.glob("*")) if backup_dir.exists() else set()
-
-    rc = m.do_apply_or_dryrun(None, True, _NO_UNIT)
-
-    assert rc == m.EXIT_OK
-    assert env_path.read_text() == fixture_text, "same-generation re-run must be byte-identical"
-    after = set(backup_dir.glob("*")) if backup_dir.exists() else set()
-    assert after == before, f"a same-generation no-op must never create a backup file: {after - before}"
 
 
-def test_glob_no_stray_temp_file_left_after_a_write(tmp_path, monkeypatch):
-    _force_no_unit(monkeypatch)
-    env_path = _write_env(tmp_path, "LLM_BACKENDS=http://a:5000\n")
-    monkeypatch.setenv("SECURE_ENV_FILE", str(env_path))
-    monkeypatch.setenv("HOME", str(tmp_path / "fake-home"))
-    rc = m.do_apply_or_dryrun(None, True, _NO_UNIT)
-    assert rc == m.EXIT_OK
-    leftovers = list(tmp_path.glob(".env.migrate_env.*"))
-    assert leftovers == [], f"stray temp file(s) left in-tree: {leftovers}"

@@ -3,7 +3,7 @@
 
 # The Telemetry Contract
 
-Contract version **1.0.40**. Every key the gateway emits on `GET /health` and `GET /memory/telemetry`, what it means, what it is measured in, when it arrived, and where it is going.
+Contract version **1.0.41**. Every key the gateway emits on `GET /health` and `GET /memory/telemetry`, what it means, what it is measured in, when it arrived, and where it is going.
 
 ## The roles
 
@@ -76,6 +76,27 @@ Not moved — **removed**. Each had no writer.
 |---|---|---|
 | health | `config.llm_pool_tuning.max_tries` | no writer — LLM_MAX_TRIES was read by nothing but this render; the comments beside it promised cross-backend failover the pool never implemented |
 | telemetry | `config.llm_pool_tuning.max_tries` | same dead LLM_MAX_TRIES constant, dual-emitted copy |
+
+## Removed outright in the declaration release
+
+Not moved. Role counters and privacy flags left the payload. VERSION in this file is still the previous stamp; the coordinator stamps the release.
+
+| endpoint | key | why |
+|---|---|---|
+| health | `llm_routing.routed_role_extract` | role routing is gone; /health no longer emits this counter |
+| health | `llm_routing.routed_role_extract_last_ts` | same role counter, removed rather than moved |
+| health | `llm_routing.routed_role_judge` | same role counter, removed rather than moved |
+| health | `llm_routing.routed_role_judge_last_ts` | same role counter, removed rather than moved |
+| telemetry | `llm.routing.routed_role_extract` | role routing is gone; a declared backend serves both daemons |
+| telemetry | `llm.routing.routed_role_extract_last_ts` | same role counter |
+| telemetry | `llm.routing.routed_role_judge` | same role counter |
+| telemetry | `llm.routing.routed_role_judge_last_ts` | same role counter |
+| telemetry | `config.llm_backends[].roles` | roles is no longer a declaration field |
+| telemetry | `config.llm_backends[].private_ok` | private_ok is no longer a declaration field |
+| refusal | `role` | a routing refusal no longer names a role |
+| refusal | `declaration` | a routing refusal no longer names a declaration gap |
+| /pool/status | `backends.*.serves_all` | free_slots is availability only |
+| /pool/status | `backends.*.counts_free_slot` | free_slots is availability only |
 
 ## Dual-emitted copies dropped
 
@@ -161,10 +182,6 @@ Each key below was moved to a new home and served from both places while consume
 | `GET /health` | `llm_pool.*.routed_pct` | `telemetry:llm.pool.*.routed_pct` |
 | `GET /health` | `llm_pool.*.weight` | `telemetry:llm.pool.*.weight` |
 | `GET /health` | `llm_reserved[]` | `telemetry:llm.reserved` |
-| `GET /health` | `llm_routing.routed_role_extract` | `telemetry:llm.routing.routed_role_extract` |
-| `GET /health` | `llm_routing.routed_role_extract_last_ts` | `telemetry:llm.routing.routed_role_extract_last_ts` |
-| `GET /health` | `llm_routing.routed_role_judge` | `telemetry:llm.routing.routed_role_judge` |
-| `GET /health` | `llm_routing.routed_role_judge_last_ts` | `telemetry:llm.routing.routed_role_judge_last_ts` |
 | `GET /health` | `llm_routing.routing_backend_at_capacity` | `telemetry:llm.routing.routing_backend_at_capacity` |
 | `GET /health` | `llm_routing.routing_backend_at_capacity_last_ts` | `telemetry:llm.routing.routing_backend_at_capacity_last_ts` |
 | `GET /health` | `llm_routing.routing_fit_rejected` | `telemetry:llm.routing.routing_fit_rejected` |
@@ -298,8 +315,11 @@ Paths are relative to the response object.
 | `consolidation.gpu_probe.state` | str | — | <=0.9.73 | — | — | — | — |
 | `consolidation.inference_busy` | str | — | <=0.9.73 | — | — | — | the top-level inference_busy, inside the cached snapshot |
 | `inference_busy` | str | — | <=0.9.73 | — | — | — | busy \| idle \| unknown |
-| `llm` | str | — | <=0.9.73 | — | — | — | ok \| unknown \| down — ok iff ANY backend answered; unknown while the background probe's first cycle is still pending |
+| `llm` | str | — | <=0.9.73 | — | — | — | ok \| degraded \| unknown \| down — degraded when no backend is declared or the whole fleet is excluded; ok iff any serving backend answered |
 | `llm_backends.*` | str | — | <=0.9.73 | — | — | — | per-backend enum: ok \| unknown \| timeout \| down \| http_<code> |
+| `llm_backends_excluded[]` | list | — | 1.0.41 | — | — | — | declared backends the gateway did not load, each {url, reason}. Empty when every declaration loaded. |
+| `llm_backends_excluded[].reason` | str | — | 1.0.41 | — | — | — | — |
+| `llm_backends_excluded[].url` | str | — | 1.0.41 | — | — | — | — |
 
 ### rem
 
@@ -503,12 +523,12 @@ The envelope is `{"status": "success", "telemetry": {…}}`; paths below are rel
 | `config.llm_affinity.ttl_s` | float/int | _s | 0.9.74 | — | — | — | — |
 | `config.llm_backends[]` | list | — | 0.9.74 | — | — | — | — |
 | `config.llm_backends[].max_inflight` | int/null | — | 0.9.74 | — | — | — | — |
+| `config.llm_backends[].max_output_tokens` | int/null | — | 1.0.41 | — | — | — | declared ceiling |
 | `config.llm_backends[].model` | str/null | — | 0.9.74 | — | — | — | — |
 | `config.llm_backends[].n_ctx` | int/null | — | 0.9.74 | — | — | — | — |
 | `config.llm_backends[].price_per_mtok_in` | float/null | — | 0.9.74 | — | — | — | — |
 | `config.llm_backends[].price_per_mtok_out` | float/null | — | 0.9.74 | — | — | — | — |
-| `config.llm_backends[].private_ok` | bool | — | 0.9.74 | — | — | — | — |
-| `config.llm_backends[].roles` | list/null | — | 0.9.74 | — | — | — | — |
+| `config.llm_backends[].priority` | int | — | 1.0.41 | — | — | — | stored and shown |
 | `config.llm_backends[].url` | str | — | 0.9.74 | — | — | — | — |
 | `config.llm_backends[].weight` | float | — | 0.9.74 | — | — | — | — |
 | `config.llm_pool_tuning.cooldown_s` | float/int | _s | 0.9.74 | — | — | — | — |
@@ -528,6 +548,9 @@ The envelope is `{"status": "success", "telemetry": {…}}`; paths below are rel
 | `llm.affinity.misses` | int | — | 0.9.74 | — | — | — | — |
 | `llm.backends` | dict | — | 0.9.74 | — | — | — | empty when no backend is configured |
 | `llm.backends.*` | str | — | 0.9.74 | — | — | — | — |
+| `llm.backends_excluded[]` | list | — | 1.0.41 | — | — | — | declared backends the gateway did not load, each {url, reason}. Empty when every declaration loaded. |
+| `llm.backends_excluded[].reason` | str | — | 1.0.41 | — | — | — | — |
+| `llm.backends_excluded[].url` | str | — | 1.0.41 | — | — | — | — |
 | `llm.faults` | dict | — | 0.9.74 | — | — | — | empty until a fault occurs |
 | `llm.faults.*.gateway.count` | int | — | 0.9.74 | — | — | — | — |
 | `llm.faults.*.gateway.last` | str/null | — | 0.9.74 | — | — | — | — |
@@ -543,15 +566,15 @@ The envelope is `{"status": "success", "telemetry": {…}}`; paths below are rel
 | `llm.pool.*.cooldown` | float | _s | 0.9.74 | — | — | — | — |
 | `llm.pool.*.fails` | int | — | 0.9.74 | — | — | — | — |
 | `llm.pool.*.inflight` | int | — | 0.9.74 | — | — | — | — |
+| `llm.pool.*.last_call.origin` | str/null | — | 1.0.41 | — | — | — | upstream when the backend answered, gateway when this process recorded the status because no upstream status arrived, null before any call |
+| `llm.pool.*.last_call.status` | int/null | — | 1.0.41 | — | — | — | HTTP status of that call, or null when this process has not forwarded one. A 2xx is upstream. 500, 503 and 504 may be gateway-made; origin distinguishes them. |
+| `llm.pool.*.last_call.ts` | str/null | — | 1.0.41 | — | — | — | UTC time of the last chat status, or null when this process has not forwarded one. 503 and 504 can be the status this gateway returned when no upstream status arrived; last_call.origin says which. |
+| `llm.pool.*.priority` | int | — | 1.0.41 | — | — | — | stored and shown |
 | `llm.pool.*.reserved` | bool | — | 0.9.74 | — | — | — | — |
 | `llm.pool.*.routed` | int | — | 0.9.74 | — | — | — | — |
 | `llm.pool.*.routed_pct` | float | _pct | 0.9.74 | — | — | — | — |
 | `llm.pool.*.weight` | float | — | 0.9.74 | — | — | — | — |
 | `llm.reserved[]` | list | — | 0.9.74 | — | — | — | — |
-| `llm.routing.routed_role_extract` | int | — | 0.9.74 | — | — | — | — |
-| `llm.routing.routed_role_extract_last_ts` | str/null | — | 0.9.74 | — | — | — | — |
-| `llm.routing.routed_role_judge` | int | — | 0.9.74 | — | — | — | — |
-| `llm.routing.routed_role_judge_last_ts` | str/null | — | 0.9.74 | — | — | — | — |
 | `llm.routing.routing_backend_at_capacity` | int | — | 0.9.74 | — | — | — | — |
 | `llm.routing.routing_backend_at_capacity_last_ts` | str/null | — | 0.9.74 | — | — | — | — |
 | `llm.routing.routing_fit_rejected` | int | — | 0.9.74 | — | — | — | — |

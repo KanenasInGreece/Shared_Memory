@@ -68,6 +68,7 @@ value — pointing at the _FILE/LoadCredential= alternative. Advisory, not a
 refusal: the value is still honoured (tier 1 above).
 """
 import json
+import logging
 import os
 import re
 import stat
@@ -349,41 +350,269 @@ def llm_backends_json_parse_failed() -> bool:
     return _llm_backends_json_parse_failed
 
 
+# sysexits EX_CONFIG. The unit's RestartPreventExitStatus=78 stops a refused config from crash-looping.
+EX_CONFIG = 78
+# Daemon identities the gateway mints itself. An operator entry would share the name with that token.
+RESERVED_DAEMON_NAMES = frozenset({"rem_daemon", "consolidation"})
+_LITERAL_SECRET_FIELDS = ("token", "api_key", "apikey", "secret", "key")
+
+
+class ConfigExit(SystemExit):
+    """Exit 78. The string is the refusal, so a traceback still names the field."""
+
+    def __init__(self, message: str):
+        super().__init__(EX_CONFIG)
+        self.message = message
+
+    def __str__(self) -> str:
+        return self.message
+
+
+def config_fatal(message: str) -> None:
+    """Log a configuration refusal, then exit 78 so systemd does not restart it."""
+    logging.getLogger("secure_env").error("%s", message)
+    raise ConfigExit(message)
+
+
 def require_llm_backends_json_parses(daemon_name: str) -> None:
-    """FATAL, one line, naming LLM_BACKENDS_JSON — D.1 (SEC round, ADV1-2).
+    """Refuse a malformed LLM_BACKENDS_JSON at startup, not at import.
 
-    Call from hive_mind_proxy.main() and each daemon's own __main__ guard
-    ONLY, matching require_db_credentials()'s established placement: every
-    test in this repo imports these modules with a malformed
-    LLM_BACKENDS_JSON on purpose (to test hive_mind_proxy's OWN, separate,
-    non-fatal fallback-to-legacy-pool handling of the same malformed value —
-    see _load_llm_backends() and check_config.py's
-    test_llm_pool_fallback_reason_is_rendered_prominently_and_exit_stays_0),
-    so an unconditional check at import time would kill test collection AND
-    contradict that RULED, exit-stays-0 behaviour. This function is never
-    called from check_config.py for exactly that reason — check_config is an
-    audit tool that must keep reporting on a config the gateway would
-    refuse, per its own established architecture (A.4's identical exclusion
-    for require_no_backend_url_credentials()).
-
-    Why this refusal exists at all rather than leaving the existing
-    fallback-to-legacy behaviour as the whole story: a malformed
-    LLM_BACKENDS_JSON silently loses every dynamically-discovered
-    token_env name (_token_env_names() returns an empty set on a parse
-    failure, by design — it must never raise), so a provider key whose name
-    doesn't happen to match the suffix pattern stays classified as ordinary
-    config and can reach _daemon_env()'s copy set into a spawned daemon's
-    child environment — a fail-OPEN specifically because the developer typo'd
-    a comma, not because they intended plaintext delivery. Refusing to start
-    at all closes that path outright rather than degrading it.
+    Import stays quiet so check_config can still report a bad file (decision:1824 item 9; retrospective 3375: a declared backend is trusted, an untrusted one is not declared). A bad array used to fall through to a legacy pool and could copy an unclassified provider key into a daemon.
     """
     if llm_backends_json_parse_failed():
-        raise SystemExit(
+        config_fatal(
             f"FATAL ({daemon_name}): LLM_BACKENDS_JSON is set but is not "
             "valid JSON (or not a JSON array) — fix the syntax (a trailing "
             "comma or an unescaped quote is the usual cause) or unset the "
             "variable entirely."
         )
+
+
+def _lookup_environ(name: str) -> "str | None":
+    """Case-insensitive os.environ read. A `_FILE` pointer is config, not a secret."""
+    if name in os.environ:
+        return os.environ[name]
+    canonical = _normalize_key(name)
+    for key, value in os.environ.items():
+        if _normalize_key(key) == canonical:
+            return value
+    return None
+
+
+def _positive_int(value) -> bool:
+    """True for an int >= 1. A bool is an int subclass and is refused."""
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 1
+
+
+def _scrub_declared_url(url: str) -> str:
+    """Drop userinfo and the query so a refusal can name the backend.
+
+    Parse first. A URL with no scheme is <unparseable>: taking the text before the first :// treats a query that contains :// as the scheme and prints the secret. A credential in userinfo or the query must not reach a journal, check_config, or migrate_env. Never raises, including at import: an unparseable port used to throw from parts.port.
+    """
+    try:
+        parsed = urllib.parse.urlsplit(url)
+        if not parsed.scheme or not parsed.netloc:
+            return "<unparseable>"
+        netloc = parsed.netloc.rpartition("@")[2]
+        return f"{parsed.scheme}://{netloc}{parsed.path}"
+    except Exception:
+        return "<unparseable>"
+
+
+def _url_embeds_userinfo(url: str) -> bool:
+    """True when the URL has userinfo, or cannot be parsed. Query strings are allowed."""
+    try:
+        parts = urllib.parse.urlsplit(url)
+    except Exception:
+        return True
+    return parts.username is not None or parts.password is not None
+
+
+def _classify_secret_file(path: Path) -> str:
+    """token_file_empty or token_refused. Never returns or logs the file's contents."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+    except OSError:
+        return "token_refused"
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_size > _SECRET_FILE_MAX_BYTES:
+            return "token_refused"
+        chunks: list[bytes] = []
+        total = 0
+        while True:
+            chunk = os.read(fd, _SECRET_FILE_MAX_BYTES + 1 - total)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+            if total > _SECRET_FILE_MAX_BYTES:
+                return "token_refused"
+        raw = b"".join(chunks).decode("utf-8", errors="replace").rstrip("\r\n")
+    except OSError:
+        return "token_refused"
+    finally:
+        os.close(fd)
+    if not raw.strip():
+        return "token_file_empty"
+    if _first_control_character(raw) is not None:
+        return "token_refused"
+    return "token_refused"
+
+
+def backend_credential_reason(token_env: str) -> "str | None":
+    """None when the named secret is usable. Otherwise a reason, never the value.
+
+    An empty regular file is token_file_empty. A pointer that is set but unusable is token_refused. No pointer and no value is token_missing.
+    """
+    value = get_secret(token_env)
+    if value is not None and str(value).strip():
+        return None
+    pointer = _lookup_environ(f"{token_env}_FILE")
+    if pointer is None or not str(pointer).strip():
+        return "token_missing"
+    classified = _classify_secret_file(Path(str(pointer).strip()))
+    if classified == "token_file_empty":
+        return "token_file_empty"
+    return "token_refused"
+
+
+_UNPARSED = object()
+
+
+def read_env_file(env_path: "Path | None") -> "dict[str, str]":
+    """Pairs from one env file. Does not write os.environ or the secret store.
+
+    Last line wins. export and a balanced quote pair are stripped the same way as load_split_env. A missing path is an empty map.
+    """
+    if env_path is None or not env_path.is_file():
+        return {}
+    out: dict[str, str] = {}
+    for line in env_path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, val = line.partition("=")
+        key = _strip_export_prefix(key).strip()
+        if not key:
+            continue
+        out[key] = _strip_balanced_quotes(val.strip())
+    return out
+
+
+def path_for_secure_env_file(override: "str | None") -> "Path | None":
+    """The file an explicit SECURE_ENV_FILE names. None loads nothing.
+
+    An empty string loads nothing. A set path that is missing, or is not a file, loads nothing and warns. None means this process's own selection.
+    """
+    if override is None:
+        return _select_env_file()
+    override = override.strip()
+    if not override:
+        return None
+    path = Path(override)
+    if path.is_file():
+        return path
+    why = "does not exist" if not path.exists() else "is not a file"
+    print(f"[secure_env] WARNING: SECURE_ENV_FILE={override!r} {why} "
+          f"— loading NO env file (refusing to fall through to a "
+          f"file you did not name)", file=sys.stderr)
+    return None
+
+
+def read_selected_env_file() -> "dict[str, str]":
+    """Pairs the gateway loader would take from the selected env file.
+
+    migrate_env --apply runs outside the gateway process, so a declaration that lives only in the file is invisible in os.environ. This does not write os.environ or the secret store.
+    """
+    return read_env_file(_select_env_file())
+
+
+_ENV_VAR_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
+
+
+def token_env_is_variable_name(value: str) -> bool:
+    """True when token_env is a variable name. A key in that field is not."""
+    return _ENV_VAR_NAME.fullmatch(value) is not None
+
+
+def _registry_text_from_picture(env: dict) -> str:
+    """AGENT_TOKENS as this picture holds it. Does not consult the operator shell.
+
+    A _FILE pointer is the path. The registry text is read from that file, the same tier the gateway uses, and is not returned anywhere but this check.
+    """
+    pointer = env.get("AGENT_TOKENS_FILE") if "AGENT_TOKENS_FILE" in env else None
+    if pointer and str(pointer).strip():
+        loaded = _read_secret_file(Path(str(pointer).strip()), source="AGENT_TOKENS_FILE")
+        if loaded:
+            return loaded
+    if "AGENT_TOKENS" in env:
+        return str(env.get("AGENT_TOKENS") or "")
+    return ""
+
+
+def llm_declaration_errors(env: "dict | None" = None) -> "list[tuple[str, str]]":
+    """(entry, field) for every FATAL declaration. Absent JSON and [] are not errors.
+
+    Stdlib only, so check_config --phase-a-only and migrate_env --apply can refuse the same classes the gateway refuses. Reserved daemon names are included because an operator token would collide with the gateway-minted one.
+    """
+    source = os.environ if env is None else env
+    errors: list[tuple[str, str]] = []
+    raw = source.get("LLM_BACKENDS_JSON")
+    text = "" if raw is None else str(raw).strip()
+    entries = None
+    if text and text != "[]":
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError:
+            errors.append(("LLM_BACKENDS_JSON", "json"))
+            parsed = _UNPARSED
+        else:
+            # null is not a list. Treating it as absent let a defined value boot.
+            if not isinstance(parsed, list):
+                errors.append(("LLM_BACKENDS_JSON", "type"))
+                parsed = _UNPARSED
+        if isinstance(parsed, list):
+            entries = parsed
+    if isinstance(entries, list):
+        for index, entry in enumerate(entries):
+            if not isinstance(entry, dict):
+                errors.append((f"[{index}]", "entry"))
+                continue
+            url = entry.get("url")
+            if not isinstance(url, str) or not url.strip():
+                errors.append((f"[{index}]", "url"))
+                continue
+            shown = _scrub_declared_url(url.strip().rstrip("/"))
+            if _url_embeds_userinfo(url):
+                errors.append((shown, "url"))
+            for field in ("n_ctx", "max_output_tokens"):
+                if not _positive_int(entry.get(field)):
+                    errors.append((shown, field))
+            if "priority" in entry and not _positive_int(entry.get("priority")):
+                errors.append((shown, "priority"))
+            for secret_field in _LITERAL_SECRET_FIELDS:
+                if entry.get(secret_field):
+                    errors.append((shown, secret_field))
+            if "extra_body" in entry and entry.get("extra_body") is not None and not isinstance(entry.get("extra_body"), dict):
+                errors.append((shown, "extra_body"))
+            if "max_inflight" in entry and entry.get("max_inflight") is not None and not _positive_int(entry.get("max_inflight")):
+                errors.append((shown, "max_inflight"))
+    # The file stores a secret in _secrets, not os.environ. An explicit map is migrate_env's file-plus-unit picture and wins, so a reserved name in that file is refused before the gateway boots. A _FILE pointer in that picture is read here: the map holds the path, and get_secret has not loaded it.
+    if env is None:
+        tokens = get_secret("AGENT_TOKENS") or ""
+    else:
+        tokens = _registry_text_from_picture(env)
+    seen: set[str] = set()
+    for pair in str(tokens).split(","):
+        pair = pair.strip()
+        if not pair:
+            continue
+        name = pair.split(":", 1)[0].strip()
+        if name in RESERVED_DAEMON_NAMES and name not in seen:
+            seen.add(name)
+            errors.append((name, "agent"))
+    return errors
 
 
 # R1 (fix round 1, Opus review, probe-confirmed): hard ceiling on a single
@@ -618,7 +847,8 @@ def _credentials_directory_secret(key: str) -> "str | None":
     example both state the convention so that is a documentation problem,
     not a code one."""
     if not _VALID_KEY_NAME.match(key):
-        print(f"[secure_env] WARNING: candidate key {key!r} fails the "
+        # The candidate is not a variable name. Printing it would publish a key parked in token_env.
+        print("[secure_env] WARNING: candidate key '<not a variable name>' fails the "
               f"safe-name check ({_VALID_KEY_NAME.pattern}) — refusing to "
               f"use it as a path component under $CREDENTIALS_DIRECTORY",
               file=sys.stderr)
@@ -641,7 +871,8 @@ def _file_indirection_secret(key: str, file_values: dict) -> "str | None":
     withheld from os.environ, never the path string, which is not itself
     sensitive."""
     if not _VALID_KEY_NAME.match(key):
-        print(f"[secure_env] WARNING: candidate key {key!r} fails the "
+        # Same omission as the credentials-directory gate: the text is not a name.
+        print("[secure_env] WARNING: candidate key '<not a variable name>' fails the "
               f"safe-name check ({_VALID_KEY_NAME.pattern}) — refusing to "
               f"resolve its _FILE pointer", file=sys.stderr)
         return None
@@ -1018,14 +1249,14 @@ def require_db_credentials(*, pg_password: str, pg_conn: str, neo4j_password: st
     even when it embeds an empty password and would defeat this check.
     """
     if not pg_password and not pg_conn:
-        raise SystemExit(
+        config_fatal(
             f"FATAL ({daemon_name}): no Postgres credential resolved — "
             "PG_PASSWORD and PG_CONN are both empty. Supply PG_PASSWORD (or "
             "a full PG_CONN) via shared-memory/.env, or the A4 file-based "
             "credential path once it ships."
         )
     if not neo4j_password:
-        raise SystemExit(
+        config_fatal(
             f"FATAL ({daemon_name}): no Neo4j credential resolved — "
             "NEO4J_PASSWORD is empty. Supply it via shared-memory/.env, or "
             "the A4 file-based credential path once it ships."

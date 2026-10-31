@@ -98,8 +98,7 @@ DOMAIN_NAME_OR_KEY_SQL = (
 )
 
 # Description match is the difference from projects. `crypto` will never trigram-match a section named `security`.
-# Both arms rank by a section's better score, a name match first on a tie, then
-# its name; decision:3261 chose the arms' measures, tested each alone.
+# On an equal score a name match ranks first, so a description-only section does not outrank the typed name when the scores tie; decision:3261 chose the arms' measures, tested each alone.
 DOMAIN_PROPOSALS_SQL = (
     "SELECT name FROM ("
     "  SELECT name, max(score) AS score, bool_or(from_name) AS name_hit FROM ("

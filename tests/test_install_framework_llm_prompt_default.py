@@ -87,8 +87,9 @@ def test_prompt_sentence_present_and_shows_yn_default(tmp_path):
 def test_old_wording_gone_new_wording_present(tmp_path):
     text = INSTALL_SH.read_text()
     assert "is used until" not in text
-    assert "falls back to" in text
-    assert "being retired" in text
+    assert "falls back to" not in text
+    assert "LLM_DEFAULT_TARGET" not in text
+    assert "The gateway runs with no reasoning until a backend is declared." in text
     assert "bash shared-memory/ops/install_llm_backends.sh" in text
 
 
@@ -105,7 +106,7 @@ def test_exhausted_pipe_at_this_prompt_takes_n_branch_and_exits_zero(tmp_path):
     ]
     proc = _run(root, answers, home)
     assert proc.returncode == 0, proc.stdout + proc.stderr
-    assert "Skipped. Until you configure backends" in proc.stdout
+    assert "Skipped. The gateway runs with no reasoning until a backend is declared." in proc.stdout
     assert (root / "shared-memory" / ".env").exists()
 
 
@@ -115,7 +116,7 @@ def test_explicit_n_still_skips(tmp_path):
     answers = _base_answers(str(tmp_path / "models")) + ["n", "n"]
     proc = _run(root, answers, home)
     assert proc.returncode == 0, proc.stdout + proc.stderr
-    assert "Skipped. Until you configure backends" in proc.stdout
+    assert "Skipped. The gateway runs with no reasoning until a backend is declared." in proc.stdout
 
 
 def test_agents_md_piped_n_n_install_still_passes(tmp_path):

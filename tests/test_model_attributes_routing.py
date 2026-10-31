@@ -15,7 +15,10 @@ import importlib
 import json
 import os
 import sys
+
+import pytest
 from yarl import URL
+pytestmark = pytest.mark.usefixtures("chat_caller_is_consolidation")
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "shared-memory", "scripts"))
 
@@ -87,18 +90,17 @@ def _body(**fields) -> bytes:
 def test_roles_ncontext_private_ok_max_inflight_parsed(monkeypatch):
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
         {"url": "http://a:5000", "roles": ["extract", "judge"], "n_ctx": 8192,
-         "max_inflight": 2, "price_per_mtok_in": 0.14, "price_per_mtok_out": 0.28},
-        {"url": "http://b:4000"},
+         "max_inflight": 2, "price_per_mtok_in": 0.14, "price_per_mtok_out": 0.28, "max_output_tokens": 2048},
+        {"url": "http://b:4000", "n_ctx": 8192, "max_output_tokens": 2048},
     ]))
     g = _fresh(monkeypatch)
-    assert g.LLM_BACKEND_ROLES["http://a:5000"] == frozenset({"extract", "judge"})
+    assert g.LLM_BACKENDS == ["http://a:5000", "http://b:4000"]
+    assert not hasattr(g, "LLM_BACKEND_ROLES")
     assert g.LLM_BACKEND_NCTX["http://a:5000"] == 8192
     assert g.LLM_BACKEND_MAX_INFLIGHT["http://a:5000"] == 2
     assert g.LLM_BACKEND_PRICE_IN["http://a:5000"] == 0.14
     assert g.LLM_BACKEND_PRICE_OUT["http://a:5000"] == 0.28
-    # absent fields: serves-all degenerate case
-    assert g.LLM_BACKEND_ROLES["http://b:4000"] is None
-    assert g.LLM_BACKEND_NCTX["http://b:4000"] is None
+    assert g.LLM_BACKEND_NCTX["http://b:4000"] == 8192
     assert g.LLM_BACKEND_MAX_INFLIGHT["http://b:4000"] is None
 
 
@@ -111,27 +113,25 @@ def test_private_ok_default_is_false_regardless_of_token_env_presence(monkeypatc
     always_wins, unaffected)."""
     monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
-        {"url": "http://local:5000"},
-        {"url": "https://api.deepseek.com/v1", "token_env": "DEEPSEEK_API_KEY", "roles": ["extract"]},
+        {"url": "http://local:5000", "n_ctx": 8192, "max_output_tokens": 2048},
+        {"url": "https://api.deepseek.com/v1", "token_env": "DEEPSEEK_API_KEY", "roles": ["extract"], "n_ctx": 8192, "max_output_tokens": 2048},
     ]))
     g = _fresh(monkeypatch)
-    assert g.LLM_BACKEND_PRIVATE_OK["http://local:5000"] is False   # W4: undeclared -> False, no token needed
-    assert g.LLM_BACKEND_PRIVATE_OK["https://api.deepseek.com/v1"] is False  # has token -> also False (unchanged)
-    assert g.LLM_BACKEND_PRIVATE_OK_EXPLICIT["http://local:5000"] is False
-    assert g.LLM_BACKEND_PRIVATE_OK_EXPLICIT["https://api.deepseek.com/v1"] is False
+    assert "http://local:5000" in g.LLM_BACKENDS
+    assert "https://api.deepseek.com/v1" in g.LLM_BACKENDS
+    assert not hasattr(g, "LLM_BACKEND_PRIVATE_OK")
 
 
 def test_explicit_private_ok_always_wins(monkeypatch):
     monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
-        {"url": "https://api.deepseek.com/v1", "token_env": "DEEPSEEK_API_KEY", "private_ok": True},
-        {"url": "http://local:5000", "private_ok": False, "roles": ["extract"]},
+        {"url": "https://api.deepseek.com/v1", "token_env": "DEEPSEEK_API_KEY", "private_ok": True, "n_ctx": 8192, "max_output_tokens": 2048},
+        {"url": "http://local:5000", "private_ok": False, "roles": ["extract"], "n_ctx": 8192, "max_output_tokens": 2048},
     ]))
     g = _fresh(monkeypatch)
-    assert g.LLM_BACKEND_PRIVATE_OK["https://api.deepseek.com/v1"] is True
-    assert g.LLM_BACKEND_PRIVATE_OK_EXPLICIT["https://api.deepseek.com/v1"] is True
-    assert g.LLM_BACKEND_PRIVATE_OK["http://local:5000"] is False
-    assert g.LLM_BACKEND_PRIVATE_OK_EXPLICIT["http://local:5000"] is True
+    assert "https://api.deepseek.com/v1" in g.LLM_BACKENDS
+    assert "http://local:5000" in g.LLM_BACKENDS
+    assert g._select_llm_backend(None) in g.LLM_BACKENDS
 
 
 def test_legacy_comma_form_is_serves_all_but_private_ok_now_defaults_false(monkeypatch):
@@ -144,34 +144,34 @@ def test_legacy_comma_form_is_serves_all_but_private_ok_now_defaults_false(monke
     eligible for nothing. See test_i5a_descriptor_less_fleet_eligible_set_
     is_the_full_pool's successor below for the eligibility-set half."""
     monkeypatch.delenv("LLM_BACKENDS_JSON", raising=False)
-    monkeypatch.setenv("LLM_BACKENDS", "http://a:5000,http://b:4000")
+    monkeypatch.setenv("LLM_BACKENDS_JSON", "[{\"url\": \"http://a:5000\", \"n_ctx\": 8192, \"max_output_tokens\": 2048}, {\"url\": \"http://b:4000\", \"n_ctx\": 8192, \"max_output_tokens\": 2048}]")
     g = _fresh(monkeypatch)
+    assert g.LLM_BACKENDS == ["http://a:5000", "http://b:4000"]
     for b in g.LLM_BACKENDS:
-        assert g.LLM_BACKEND_ROLES[b] is None
-        assert g.LLM_BACKEND_PRIVATE_OK[b] is False
-        assert g.LLM_BACKEND_PRIVATE_OK_EXPLICIT[b] is False
         assert g.LLM_BACKEND_MAX_INFLIGHT[b] is None
-    assert g._LLM_BACKEND_ROLE_CONFIG_ERRORS == []
+        assert g.LLM_BACKEND_NCTX[b] == 8192
+    assert not hasattr(g, "_LLM_BACKEND_ROLE_CONFIG_ERRORS")
 
 
 def test_unknown_role_recorded_as_config_error_not_raised_at_parse_time(monkeypatch):
     """Module import must never raise (every test in this repo imports this
     module freely) — the problem is collected, not thrown, until main() asks."""
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
-        {"url": "http://a:5000", "roles": ["extract", "bogus_role"]},
+        {"url": "http://a:5000", "roles": ["extract", "bogus_role"], "n_ctx": 8192, "max_output_tokens": 2048},
     ]))
     g = _fresh(monkeypatch)
-    assert any("bogus_role" in e for e in g._LLM_BACKEND_ROLE_CONFIG_ERRORS)
-    # the invalid entries are dropped, valid ones kept
-    assert g.LLM_BACKEND_ROLES["http://a:5000"] == frozenset({"extract"})
+    assert g.LLM_BACKENDS == ["http://a:5000"]
+    assert g.LLM_BACKEND_NCTX["http://a:5000"] == 8192
+    g.require_valid_llm_routing_config()
 
 
 def test_summarize_role_flagged_reserved_not_generic_unknown(monkeypatch):
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
-        {"url": "http://a:5000", "roles": ["summarize"]},
+        {"url": "http://a:5000", "roles": ["summarize"], "n_ctx": 8192, "max_output_tokens": 2048},
     ]))
     g = _fresh(monkeypatch)
-    assert any("RESERVED" in e for e in g._LLM_BACKEND_ROLE_CONFIG_ERRORS)
+    assert g.LLM_BACKENDS == ["http://a:5000"]
+    g.require_valid_llm_routing_config()
 
 
 def test_price_metadata_never_read_by_selection(monkeypatch):
@@ -180,13 +180,13 @@ def test_price_metadata_never_read_by_selection(monkeypatch):
     the "cheaper" one has MORE inflight, and confirm least-in-flight (not
     price) still decides."""
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
-        {"url": "http://cheap:5000", "price_per_mtok_in": 0.01, "private_ok": True},
-        {"url": "http://pricey:4000", "price_per_mtok_in": 100.0, "private_ok": True},
+        {"url": "http://cheap:5000", "price_per_mtok_in": 0.01, "private_ok": True, "n_ctx": 8192, "max_output_tokens": 2048},
+        {"url": "http://pricey:4000", "price_per_mtok_in": 100.0, "private_ok": True, "n_ctx": 8192, "max_output_tokens": 2048},
     ]))
     g = _fresh(monkeypatch)
     g._llm_inflight["http://cheap:5000"] = 5
     g._llm_inflight["http://pricey:4000"] = 0
-    chosen = g._select_llm_backend("", None)
+    chosen = g._select_llm_backend(None)
     assert chosen == "http://pricey:4000"   # least-in-flight, not cheapest
 
 
@@ -194,14 +194,11 @@ def test_price_metadata_never_read_by_selection(monkeypatch):
 
 def test_unknown_role_refuses_startup(monkeypatch):
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
-        {"url": "http://a:5000", "roles": ["not_a_real_role"]},
+        {"url": "http://a:5000", "roles": ["not_a_real_role"], "n_ctx": 8192, "max_output_tokens": 2048},
     ]))
     g = _fresh(monkeypatch)
-    try:
-        g.require_valid_llm_routing_config()
-        assert False, "expected SystemExit"
-    except SystemExit as e:
-        assert "not_a_real_role" in str(e)
+    g.require_valid_llm_routing_config()
+    assert g.LLM_BACKENDS == ["http://a:5000"]
 
 
 def test_m5_credentialed_backend_with_no_choice_degrades_not_refuses(monkeypatch, caplog):
@@ -219,7 +216,7 @@ def test_m5_credentialed_backend_with_no_choice_degrades_not_refuses(monkeypatch
     monkeypatch.setenv("AGENT_TOKENS", "claude:tok_m5_isolated_test")
     monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
-        {"url": "https://api.deepseek.com/v1", "token_env": "DEEPSEEK_API_KEY"},
+        {"url": "https://api.deepseek.com/v1", "token_env": "DEEPSEEK_API_KEY", "n_ctx": 8192, "max_output_tokens": 2048},
     ]))
     import secure_env
     secure_env._secrets.pop("AGENT_TOKENS", None)
@@ -230,15 +227,17 @@ def test_m5_credentialed_backend_with_no_choice_degrades_not_refuses(monkeypatch
     assert g.AUTH_CONFIGURED_AT_STARTUP is True
     import logging
     with caplog.at_level(logging.WARNING):
-        g.require_valid_llm_routing_config()   # must NOT raise (MUTATION TARGET)
-    assert any("api.deepseek.com" in r.message and "never be selected" in r.message
-               for r in caplog.records)
+        g.require_valid_llm_routing_config()
+    assert "https://api.deepseek.com/v1" in g.LLM_BACKENDS
+    assert not any("now serves both daemons" in r.message for r in caplog.records)
+    assert not any("never be selected" in r.message for r in caplog.records)
+    assert all("sk-test" not in r.message for r in caplog.records)
 
 
 def test_m5_satisfied_by_explicit_private_ok_true(monkeypatch):
     monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
-        {"url": "https://api.deepseek.com/v1", "token_env": "DEEPSEEK_API_KEY", "private_ok": True},
+        {"url": "https://api.deepseek.com/v1", "token_env": "DEEPSEEK_API_KEY", "private_ok": True, "n_ctx": 8192, "max_output_tokens": 2048},
     ]))
     g = _fresh(monkeypatch)
     g.require_valid_llm_routing_config()   # must not raise
@@ -253,7 +252,7 @@ def test_m5_satisfied_by_roles(monkeypatch):
     monkeypatch.setenv("AGENT_TOKENS", "claude:tok_m5_roles_test")
     monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
-        {"url": "https://api.deepseek.com/v1", "token_env": "DEEPSEEK_API_KEY", "roles": ["extract"]},
+        {"url": "https://api.deepseek.com/v1", "token_env": "DEEPSEEK_API_KEY", "roles": ["extract"], "n_ctx": 8192, "max_output_tokens": 2048},
     ]))
     import secure_env
     secure_env._secrets.pop("AGENT_TOKENS", None)
@@ -278,15 +277,15 @@ def test_p5_auth_off_plus_explicit_private_ok_false_degrades_not_refuses(monkeyp
     to bypass (bucket iii, its own test below is removed for that reason)."""
     monkeypatch.delenv("ALLOW_UNAUTHENTICATED_PROVIDER_KEYS", raising=False)
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
-        {"url": "http://a:5000", "private_ok": False, "roles": ["extract"]},
+        {"url": "http://a:5000", "private_ok": False, "roles": ["extract"], "n_ctx": 8192, "max_output_tokens": 2048},
     ]))
     g = _fresh(monkeypatch)
     assert g.AUTH_CONFIGURED_AT_STARTUP is False
     import logging
     with caplog.at_level(logging.WARNING):
-        g.require_valid_llm_routing_config()   # must NOT raise (MUTATION TARGET)
-    assert any("EXPLICITLY configured" in r.message and "http://a:5000" in r.message
-               for r in caplog.records)
+        g.require_valid_llm_routing_config()
+    assert g.LLM_BACKENDS == ["http://a:5000"]
+    assert not any("EXPLICITLY configured" in r.message for r in caplog.records)
 
 
 def test_p5_auth_off_plus_undeclared_backend_never_fires(monkeypatch, caplog):
@@ -300,22 +299,22 @@ def test_p5_auth_off_plus_undeclared_backend_never_fires(monkeypatch, caplog):
     noise W4 rules out."""
     monkeypatch.delenv("ALLOW_UNAUTHENTICATED_PROVIDER_KEYS", raising=False)
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
-        {"url": "http://a:5000", "roles": ["extract"]},
+        {"url": "http://a:5000", "roles": ["extract"], "n_ctx": 8192, "max_output_tokens": 2048},
     ]))
     g = _fresh(monkeypatch)
     assert g.AUTH_CONFIGURED_AT_STARTUP is False
-    assert g.LLM_BACKEND_PRIVATE_OK["http://a:5000"] is False
-    assert g.LLM_BACKEND_PRIVATE_OK_EXPLICIT["http://a:5000"] is False
+    assert g.LLM_BACKENDS == ["http://a:5000"]
+    assert not hasattr(g, "LLM_BACKEND_PRIVATE_OK")
     import logging
     with caplog.at_level(logging.WARNING):
-        g.require_valid_llm_routing_config()   # must not raise
+        g.require_valid_llm_routing_config()
     assert not any("EXPLICITLY configured" in r.message for r in caplog.records)
 
 
 def test_auth_on_plus_private_ok_false_is_fine(monkeypatch):
     monkeypatch.setenv("AGENT_TOKENS", "claude:tok_routing_test")
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
-        {"url": "http://a:5000", "private_ok": False, "roles": ["extract"]},
+        {"url": "http://a:5000", "private_ok": False, "roles": ["extract"], "n_ctx": 8192, "max_output_tokens": 2048},
     ]))
     import secure_env
     secure_env._secrets.pop("AGENT_TOKENS", None)
@@ -336,16 +335,16 @@ def test_p5_roles_absent_explicit_false_says_safe_by_construction(monkeypatch, c
     wording for this subset specifically, never the roles-carrying one."""
     monkeypatch.delenv("ALLOW_UNAUTHENTICATED_PROVIDER_KEYS", raising=False)
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
-        {"url": "http://a:5000", "private_ok": False},
+        {"url": "http://a:5000", "private_ok": False, "n_ctx": 8192, "max_output_tokens": 2048},
     ]))
     g = _fresh(monkeypatch)
     assert g.AUTH_CONFIGURED_AT_STARTUP is False
     import logging
     with caplog.at_level(logging.WARNING):
-        g.require_valid_llm_routing_config()   # must not raise
-    assert any("safe by construction" in r.message and "http://a:5000" in r.message
-               for r in caplog.records)
-    assert not any("NOT safe by construction" in r.message for r in caplog.records)
+        g.require_valid_llm_routing_config()
+    assert g.LLM_BACKENDS == ["http://a:5000"]
+    assert g._select_llm_backend(None) == "http://a:5000"
+    assert not any("safe by construction" in r.message for r in caplog.records)
 
 
 def test_p5_roles_carrying_explicit_false_says_not_safe_by_construction(monkeypatch, caplog):
@@ -355,15 +354,16 @@ def test_p5_roles_carrying_explicit_false_says_not_safe_by_construction(monkeypa
     This must be said plainly, never papered over as safe."""
     monkeypatch.delenv("ALLOW_UNAUTHENTICATED_PROVIDER_KEYS", raising=False)
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
-        {"url": "http://a:5000", "private_ok": False, "roles": ["extract"]},
+        {"url": "http://a:5000", "private_ok": False, "roles": ["extract"], "n_ctx": 8192, "max_output_tokens": 2048},
     ]))
     g = _fresh(monkeypatch)
     assert g.AUTH_CONFIGURED_AT_STARTUP is False
     import logging
     with caplog.at_level(logging.WARNING):
-        g.require_valid_llm_routing_config()   # must not raise
-    assert any("NOT safe by construction" in r.message and "http://a:5000" in r.message
-               for r in caplog.records)
+        g.require_valid_llm_routing_config()
+    assert g.LLM_BACKENDS == ["http://a:5000"]
+    assert g._select_llm_backend(None) == "http://a:5000"
+    assert not any("safe by construction" in r.message for r in caplog.records)
 
 
 def test_p5_mixed_roles_absent_and_carrying_backends_get_their_own_warning_each(monkeypatch, caplog):
@@ -372,21 +372,16 @@ def test_p5_mixed_roles_absent_and_carrying_backends_get_their_own_warning_each(
     the other's."""
     monkeypatch.delenv("ALLOW_UNAUTHENTICATED_PROVIDER_KEYS", raising=False)
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
-        {"url": "http://safe:5000", "private_ok": False},
-        {"url": "http://scoped:5000", "private_ok": False, "roles": ["extract"]},
+        {"url": "http://safe:5000", "private_ok": False, "n_ctx": 8192, "max_output_tokens": 2048},
+        {"url": "http://scoped:5000", "private_ok": False, "roles": ["extract"], "n_ctx": 8192, "max_output_tokens": 2048},
     ]))
     g = _fresh(monkeypatch)
     assert g.AUTH_CONFIGURED_AT_STARTUP is False
     import logging
     with caplog.at_level(logging.WARNING):
-        g.require_valid_llm_routing_config()   # must not raise
-    safe_msgs = [r.message for r in caplog.records if "safe by construction" in r.message
-                 and "NOT safe by construction" not in r.message]
-    not_safe_msgs = [r.message for r in caplog.records if "NOT safe by construction" in r.message]
-    assert any("http://safe:5000" in m for m in safe_msgs)
-    assert not any("http://scoped:5000" in m for m in safe_msgs)
-    assert any("http://scoped:5000" in m for m in not_safe_msgs)
-    assert not any("http://safe:5000" in m for m in not_safe_msgs)
+        g.require_valid_llm_routing_config()
+    assert g.LLM_BACKENDS == ["http://safe:5000", "http://scoped:5000"]
+    assert not any("safe by construction" in r.message for r in caplog.records)
 
 
 # ── QA MED-5 (fix round) — explicit "module import never raises" test. The
@@ -400,14 +395,14 @@ def test_module_import_never_raises_under_m5_or_p5_triggering_env(monkeypatch):
     trigger either must still reload hive_mind_proxy cleanly."""
     monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
-        {"url": "https://api.deepseek.com/v1", "token_env": "DEEPSEEK_API_KEY"},
+        {"url": "https://api.deepseek.com/v1", "token_env": "DEEPSEEK_API_KEY", "n_ctx": 8192, "max_output_tokens": 2048},
     ]))
     g = _fresh(monkeypatch)   # M-5'-triggering — must not raise on import/reload
     assert g is not None
 
     monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
-        {"url": "http://a:5000", "private_ok": False},
+        {"url": "http://a:5000", "private_ok": False, "n_ctx": 8192, "max_output_tokens": 2048},
     ]))
     g2 = _fresh(monkeypatch)   # P-5'-triggering — must not raise on import/reload
     assert g2 is not None
@@ -420,12 +415,11 @@ def test_explicit_roles_is_the_privacy_opt_in_even_when_private_ok_false(monkeyp
     eligible for that role's traffic — the explicit assignment IS the
     opt-in."""
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
-        {"url": "http://a:5000", "private_ok": False, "roles": ["extract"]},
+        {"url": "http://a:5000", "private_ok": False, "roles": ["extract"], "n_ctx": 8192, "max_output_tokens": 2048},
     ]))
     g = _fresh(monkeypatch)
-    assert g._role_eligible("http://a:5000", "extract") is True
-    assert g._role_eligible("http://a:5000", "judge") is False
-    assert g._role_eligible("http://a:5000", "") is False   # role-less: roles list ignored, private_ok gates
+    assert g._eligible_backends() == ["http://a:5000"]
+    assert g._select_llm_backend(None) == "http://a:5000"
 
 
 def test_role_scoped_private_ok_backend_still_serves_role_less_traffic(monkeypatch):
@@ -438,10 +432,10 @@ def test_role_scoped_private_ok_backend_still_serves_role_less_traffic(monkeypat
     serves ONLY its declared roles (R-B) — see the sibling test just below
     for that half, unaffected by the flip since it was already False."""
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
-        {"url": "http://a:5000", "roles": ["extract"], "private_ok": True},
+        {"url": "http://a:5000", "roles": ["extract"], "private_ok": True, "n_ctx": 8192, "max_output_tokens": 2048},
     ]))
     g = _fresh(monkeypatch)
-    assert g._role_eligible("http://a:5000", "") is True
+    assert g._select_llm_backend(None) == "http://a:5000"
 
 
 def test_r_b_role_scoped_backend_with_no_explicit_private_ok_serves_no_role_less_traffic(monkeypatch):
@@ -453,21 +447,21 @@ def test_r_b_role_scoped_backend_with_no_explicit_private_ok_serves_no_role_less
     Announced in the CHANGELOG opt-back line and check_config's per-entry
     rendering (§6.3)."""
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
-        {"url": "http://a:5000", "roles": ["extract"]},
+        {"url": "http://a:5000", "roles": ["extract"], "n_ctx": 8192, "max_output_tokens": 2048},
     ]))
     g = _fresh(monkeypatch)
-    assert g._role_eligible("http://a:5000", "") is False
-    assert g._role_eligible("http://a:5000", "extract") is True
+    assert g._eligible_backends() == ["http://a:5000"]
+    assert g._select_llm_backend(None) == "http://a:5000"
 
 
 def test_role_scoped_private_ok_false_backend_never_serves_role_less_traffic(monkeypatch):
     """The other half of R-3: private_ok=false is what actually excludes a
     backend from role-less traffic, regardless of its roles list."""
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
-        {"url": "http://a:5000", "private_ok": False, "roles": ["extract"]},
+        {"url": "http://a:5000", "private_ok": False, "roles": ["extract"], "n_ctx": 8192, "max_output_tokens": 2048},
     ]))
     g = _fresh(monkeypatch)
-    assert g._role_eligible("http://a:5000", "") is False
+    assert g._select_llm_backend(None) == "http://a:5000"
 
 
 def test_serves_all_degenerate_case_eligible_for_role_less_and_every_role(monkeypatch):
@@ -475,11 +469,10 @@ def test_serves_all_degenerate_case_eligible_for_role_less_and_every_role(monkey
     still needs its private_ok opt-in EXPLICIT — an undeclared entry is now
     eligible for NOTHING (see test_i5a below for the retired-invariant
     half). This test now pins the OPT-IN case."""
-    monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([{"url": "http://a:5000", "private_ok": True}]))
+    monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([{"url": "http://a:5000", "private_ok": True, "n_ctx": 8192, "max_output_tokens": 2048}]))
     g = _fresh(monkeypatch)
-    assert g._role_eligible("http://a:5000", "") is True
-    assert g._role_eligible("http://a:5000", "extract") is True
-    assert g._role_eligible("http://a:5000", "judge") is True
+    assert g._eligible_backends() == ["http://a:5000"]
+    assert g._select_llm_backend(None) == "http://a:5000"
 
 
 def test_i5a_descriptor_less_fleet_eligible_set_is_now_empty(monkeypatch):
@@ -490,11 +483,9 @@ def test_i5a_descriptor_less_fleet_eligible_set_is_now_empty(monkeypatch):
     this exactly — the eligible set for ANY role/role-less traffic is now
     EMPTY until the operator declares private_ok/roles explicitly."""
     monkeypatch.delenv("LLM_BACKENDS_JSON", raising=False)
-    monkeypatch.setenv("LLM_BACKENDS", "http://a:5000,http://b:4000")
+    monkeypatch.setenv("LLM_BACKENDS_JSON", "[{\"url\": \"http://a:5000\", \"n_ctx\": 8192, \"max_output_tokens\": 2048}, {\"url\": \"http://b:4000\", \"n_ctx\": 8192, \"max_output_tokens\": 2048}]")
     g = _fresh(monkeypatch)
-    assert g._eligible_backends("") == []
-    assert g._eligible_backends("extract") == []
-    assert g._eligible_backends("judge") == []
+    assert g._eligible_backends() == ["http://a:5000", "http://b:4000"]
 
 
 # ── I-1a: enumerated "never" paths, each its own mutation-checked test ──────
@@ -504,19 +495,17 @@ def test_i1a_affinity_hit_outside_eligible_set_is_a_miss(monkeypatch):
     the current eligible set must be treated as a MISS, not returned
     anyway."""
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
-        {"url": "http://a:5000", "roles": ["extract"]},
-        {"url": "http://b:4000", "roles": ["judge"]},
+        {"url": "http://a:5000", "roles": ["extract"], "n_ctx": 8192, "max_output_tokens": 2048},
+        {"url": "http://b:4000", "roles": ["judge"], "n_ctx": 8192, "max_output_tokens": 2048},
     ]))
     g = _fresh(monkeypatch)
     key = "affine-key-1"
-    first = g._select_llm_backend("extract", key)
+    first = g._select_llm_backend(key)
     assert first == "http://a:5000"
     g._llm_inflight[first] = 0
-    # Same affinity key, but now the traffic needs "judge" -- "a" (the
-    # cached affinity target) is NOT eligible for judge at all.
-    second = g._select_llm_backend("judge", key)
-    assert second == "http://b:4000"
-    assert second != first
+    # Leftover roles do not split the fleet. The affinity hit sticks.
+    second = g._select_llm_backend(key)
+    assert second == first
 
 
 def test_i1a_cold_fallback_never_widens_past_eligible(monkeypatch):
@@ -527,16 +516,16 @@ def test_i1a_cold_fallback_never_widens_past_eligible(monkeypatch):
     return it rather than leaking to an ineligible backend that happens to
     be healthy."""
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
-        {"url": "http://a:5000", "roles": ["extract"]},
-        {"url": "http://b:4000", "roles": ["judge"]},
+        {"url": "http://a:5000", "roles": ["extract"], "n_ctx": 8192, "max_output_tokens": 2048},
+        {"url": "http://b:4000", "roles": ["judge"], "n_ctx": 8192, "max_output_tokens": 2048},
     ]))
     g = _fresh(monkeypatch)
     import time
     g._llm_unhealthy_until["http://a:5000"] = time.monotonic() + 300
     g._llm_reserved.add("http://a:5000")
     try:
-        chosen = g._select_llm_backend("extract", None)
-        assert chosen == "http://a:5000"   # sole eligible backend, still returned
+        chosen = g._select_llm_backend(None)
+        assert chosen == "http://b:4000"
     finally:
         g._llm_reserved.discard("http://a:5000")
 
@@ -545,11 +534,11 @@ def test_i1a_cooldown_ignoring_last_resort_stays_within_eligible(monkeypatch):
     """A single-backend eligible pool in cooldown must still serve (the
     long-standing "one card always serves" behavior) rather than 422 or
     return None purely from cooldown."""
-    monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([{"url": "http://a:5000", "private_ok": True}]))
+    monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([{"url": "http://a:5000", "private_ok": True, "n_ctx": 8192, "max_output_tokens": 2048}]))
     g = _fresh(monkeypatch)
     import time
     g._llm_unhealthy_until["http://a:5000"] = time.monotonic() + 300
-    assert g._select_llm_backend("", None) == "http://a:5000"
+    assert g._select_llm_backend(None) == "http://a:5000"
 
 
 def test_i1a_reserved_backend_deprioritised_but_last_resort_within_eligible(monkeypatch):
@@ -557,12 +546,12 @@ def test_i1a_reserved_backend_deprioritised_but_last_resort_within_eligible(monk
     an available eligible peer, but a SOLE eligible+reserved backend is
     still the last-resort pick (never an ineligible peer)."""
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
-        {"url": "http://a:5000", "private_ok": True}, {"url": "http://b:4000", "private_ok": True},
+        {"url": "http://a:5000", "private_ok": True, "n_ctx": 8192, "max_output_tokens": 2048}, {"url": "http://b:4000", "private_ok": True, "n_ctx": 8192, "max_output_tokens": 2048},
     ]))
     g = _fresh(monkeypatch)
     g._llm_reserved.add("http://a:5000")
     try:
-        assert g._select_llm_backend("", None) == "http://b:4000"
+        assert g._select_llm_backend(None) == "http://b:4000"
     finally:
         g._llm_reserved.discard("http://a:5000")
 
@@ -570,43 +559,43 @@ def test_i1a_reserved_backend_deprioritised_but_last_resort_within_eligible(monk
 # ── I-2a: the 422 refusal ────────────────────────────────────────────────────
 
 def test_422_role_constraint_when_nothing_serves_the_function(monkeypatch):
+    """A role header does not refuse. The header is stripped before the forward."""
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
-        {"url": "http://a:5000", "roles": ["extract"]},
+        {"url": "http://a:5000", "roles": ["extract"], "n_ctx": 8192, "max_output_tokens": 2048},
     ]))
     g = _fresh(monkeypatch)
     proxy = g.AsyncHiveMindProxy()
-    proxy.session = _RaisingSession()
+    session = _CaptureSession()
+    proxy.session = session
     req = _req({"X-SM-LLM-Role": "judge"}, _body())
     resp = asyncio.run(proxy.handle_proxy(req))
-    assert resp.status == 422
-    body = json.loads(resp.body.decode())
-    # Ruling C(α)/E(α2) (§5, W4): this fleet has no explicit private_ok
-    # anywhere and one roles-carrying entry — "no_role_less_opt_in" is the
-    # ADDITIVE declaration key the refusal now carries alongside the
-    # unchanged three original keys.
-    assert body == {"error": "no_eligible_backend", "constraint": "role", "role": "judge",
-                     "declaration": "no_role_less_opt_in"}
-    assert resp.headers["X-SM-Fault-Origin"] == "gateway"
+    assert resp.status != 422
+    assert session.calls == 1
+    assert session.captured_headers is not None
+    assert "X-SM-LLM-Role" not in session.captured_headers
+    assert "x-sm-llm-role" not in {k.lower() for k in session.captured_headers}
+    assert req.get("backend") == "http://a:5000"
 
 
 def test_422_privacy_constraint_when_role_less_and_all_backends_private_false(monkeypatch):
+    """private_ok false does not refuse a role-less chat."""
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
-        {"url": "http://a:5000", "private_ok": False, "roles": ["extract"]},
+        {"url": "http://a:5000", "private_ok": False, "roles": ["extract"], "n_ctx": 8192, "max_output_tokens": 2048},
     ]))
     g = _fresh(monkeypatch)
     proxy = g.AsyncHiveMindProxy()
-    proxy.session = _RaisingSession()
-    req = _req({}, _body())   # role-less traffic
+    session = _CaptureSession()
+    proxy.session = session
+    req = _req({}, _body())
     resp = asyncio.run(proxy.handle_proxy(req))
-    assert resp.status == 422
-    body = json.loads(resp.body.decode())
-    assert body["constraint"] == "privacy"
-    assert body["role"] is None
+    assert resp.status != 422
+    assert session.calls == 1
+    assert req.get("backend") == "http://a:5000"
 
 
 def test_422_fit_constraint_when_oversized(monkeypatch):
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
-        {"url": "http://a:5000", "n_ctx": 100, "private_ok": True},
+        {"url": "http://a:5000", "n_ctx": 100, "private_ok": True, "max_output_tokens": 2048},
     ]))
     g = _fresh(monkeypatch)
     proxy = g.AsyncHiveMindProxy()
@@ -616,19 +605,23 @@ def test_422_fit_constraint_when_oversized(monkeypatch):
     resp = asyncio.run(proxy.handle_proxy(req))
     assert resp.status == 422
     body = json.loads(resp.body.decode())
+    assert body["error"] == "no_eligible_backend"
     assert body["constraint"] == "fit"
+    assert "declaration" not in body
+    assert "role" not in body
 
 
 def test_422_increments_counter_and_last_ts(monkeypatch):
-    g = _fresh(monkeypatch)
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
-        {"url": "http://a:5000", "roles": ["extract"]},
+        {"url": "http://a:5000", "n_ctx": 100, "max_output_tokens": 2048},
     ]))
     g = _fresh(monkeypatch)
     before = g._routing_no_eligible_backend_count
     proxy = g.AsyncHiveMindProxy()
     proxy.session = _RaisingSession()
-    asyncio.run(proxy.handle_proxy(_req({"X-SM-LLM-Role": "judge"}, _body())))
+    huge = _body(**{"messages": [{"role": "user", "content": "x" * 5000}]})
+    resp = asyncio.run(proxy.handle_proxy(_req({}, huge)))
+    assert resp.status == 422
     assert g._routing_no_eligible_backend_count == before + 1
     assert g._routing_no_eligible_backend_last_ts is not None
 
@@ -637,7 +630,7 @@ def test_422_never_touches_inflight_accounting(monkeypatch):
     """I-8b: the refusal is PRE-DISPATCH — no backend's inflight counter may
     move because of it."""
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
-        {"url": "http://a:5000", "roles": ["extract"]},
+        {"url": "http://a:5000", "roles": ["extract"], "n_ctx": 8192, "max_output_tokens": 2048},
     ]))
     g = _fresh(monkeypatch)
     before = dict(g._llm_inflight)
@@ -652,7 +645,7 @@ def test_422_never_waits(monkeypatch):
     without ever sleeping/polling (that behavior is reserved for the
     max_inflight capacity-wait case only)."""
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
-        {"url": "http://a:5000", "roles": ["extract"]},
+        {"url": "http://a:5000", "n_ctx": 100, "max_output_tokens": 2048},
     ]))
     g = _fresh(monkeypatch)
 
@@ -661,91 +654,9 @@ def test_422_never_waits(monkeypatch):
     monkeypatch.setattr(g.asyncio, "sleep", _boom_sleep)
     proxy = g.AsyncHiveMindProxy()
     proxy.session = _RaisingSession()
-    resp = asyncio.run(proxy.handle_proxy(_req({"X-SM-LLM-Role": "judge"}, _body())))
+    huge = _body(**{"messages": [{"role": "user", "content": "x" * 5000}]})
+    resp = asyncio.run(proxy.handle_proxy(_req({}, huge)))
     assert resp.status == 422
-
-
-# ── §5: _declaration_gap() — the 422 body's additive two-valued fact ───────
-
-def test_declaration_gap_none_when_anything_is_explicitly_declared(monkeypatch):
-    """Ruling E(α2) arm 1: an entry with EITHER explicit private_ok value
-    means something was deliberately declared — even a fleet that
-    explicitly scoped itself AWAY from role-less traffic. `declaration` is
-    absent (None), keeping the plain refusal and a FATAL A8."""
-    monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
-        {"url": "http://a:5000", "private_ok": False, "roles": ["extract"]},
-    ]))
-    g = _fresh(monkeypatch)
-    assert g._declaration_gap() is None
-
-
-def test_declaration_gap_none_for_a_credentialed_backend_with_explicit_true(monkeypatch):
-    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
-    monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
-        {"url": "https://api.deepseek.com/v1", "token_env": "DEEPSEEK_API_KEY", "private_ok": True},
-    ]))
-    g = _fresh(monkeypatch)
-    assert g._declaration_gap() is None
-
-
-def test_declaration_gap_none_when_a_role_only_entry_also_declares_explicit_private_ok(monkeypatch):
-    """A mixed fleet: one entry states nothing, another states private_ok
-    explicitly — arm 1's `any()` fires on the SECOND entry, so the whole
-    pool reads None even though the first entry alone would have been
-    'no_role_less_opt_in'."""
-    monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
-        {"url": "http://a:5000", "roles": ["extract"]},
-        {"url": "http://b:4000", "private_ok": True},
-    ]))
-    g = _fresh(monkeypatch)
-    assert g._declaration_gap() is None
-
-
-def test_declaration_gap_none_for_the_fit_case(monkeypatch):
-    """The declaration key must not fire just because a request happens to
-    be oversized (constraint=fit) on an explicitly-declared fleet."""
-    monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
-        {"url": "http://a:5000", "n_ctx": 100, "private_ok": True},
-    ]))
-    g = _fresh(monkeypatch)
-    assert g._declaration_gap() is None
-
-
-def test_declaration_gap_renders_none_string_undeclared_legacy_csv(monkeypatch):
-    """Ruling E(α2) arm 2: a live legacy CSV — every entry has
-    private_ok_explicit False AND roles None — is "nothing was EVER
-    declared", pinned as `declaration == "none"`."""
-    monkeypatch.delenv("LLM_BACKENDS_JSON", raising=False)
-    monkeypatch.setenv("LLM_BACKENDS", "http://a:5000,http://b:4000")
-    g = _fresh(monkeypatch)
-    assert g._declaration_gap() == "none"
-
-
-def test_declaration_gap_renders_none_string_undeclared_builtin_fallback(monkeypatch):
-    monkeypatch.delenv("LLM_BACKENDS_JSON", raising=False)
-    monkeypatch.delenv("LLM_BACKENDS", raising=False)
-    g = _fresh(monkeypatch)
-    assert g._declaration_gap() == "none"
-
-
-def test_declaration_gap_none_vacuous_empty_pool(monkeypatch):
-    """⚠ V6: an EMPTY LLM_POOL vacuously satisfies arm 2 (`all()` over
-    nothing is True) — deliberately pinned, per the brief."""
-    g = _fresh(monkeypatch)
-    monkeypatch.setattr(g, "LLM_POOL", [])
-    assert g._declaration_gap() == "none"
-
-
-def test_declaration_gap_no_role_less_opt_in_for_a_roles_only_fleet(monkeypatch):
-    """Ruling E(α2) arm 3: roles exist somewhere but no privacy intent was
-    EVER stated — the R-B population; the refusal carries the opt-back
-    remedy this wave announces."""
-    monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
-        {"url": "http://a:5000", "roles": ["extract"]},
-        {"url": "http://b:4000", "roles": ["judge"]},
-    ]))
-    g = _fresh(monkeypatch)
-    assert g._declaration_gap() == "no_role_less_opt_in"
 
 
 # ── I-3: fit is a ceiling, never a body mutation ────────────────────────────
@@ -759,7 +670,7 @@ def test_fits_boundary_math(monkeypatch):
     g = _fresh(monkeypatch)
     monkeypatch.setenv("FIT_MARGIN", "0.10")
     importlib.reload(g)
-    monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([{"url": "http://a:5000", "n_ctx": 1000}]))
+    monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([{"url": "http://a:5000", "n_ctx": 1000, "max_output_tokens": 2048}]))
     importlib.reload(g)
     # 1000 * (1 - 0.10) = 900 usable tokens
     assert g._fits("http://a:5000", 800, 99) is True     # 899 <= 900
@@ -770,7 +681,7 @@ def test_fit_never_rewrites_max_tokens_in_the_forwarded_body(monkeypatch):
     """I-3: the fit check may only EXCLUDE a backend; it must never modify
     the request. A backend declaring n_ctx must forward the caller's body
     byte-for-byte (no max_tokens injected) when the caller sent none."""
-    monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([{"url": "http://a:5000", "n_ctx": 100000, "private_ok": True}]))
+    monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([{"url": "http://a:5000", "n_ctx": 100000, "private_ok": True, "max_output_tokens": 2048}]))
     g = _fresh(monkeypatch)
     proxy = g.AsyncHiveMindProxy()
     session = _CaptureSession()
@@ -854,7 +765,7 @@ def test_a_credentialed_backend_that_401s_is_reported_unusable(monkeypatch):
     once before reading /health."""
     monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
-        {"url": "https://api.deepseek.com/v1", "token_env": "DEEPSEEK_API_KEY", "private_ok": True},
+        {"url": "https://api.deepseek.com/v1", "token_env": "DEEPSEEK_API_KEY", "private_ok": True, "n_ctx": 8192, "max_output_tokens": 2048},
     ]))
     g = _fresh(monkeypatch)
     proxy = g.AsyncHiveMindProxy()
@@ -876,7 +787,7 @@ def test_h1_uncredentialed_backend_401_stays_down(monkeypatch):
     uncredentialed (local) backend answering 401 is a real problem, not
     "correctly rejected an unauthenticated probe"."""
     monkeypatch.delenv("LLM_BACKENDS_JSON", raising=False)
-    monkeypatch.setenv("LLM_BACKENDS", "http://a:5000")
+    monkeypatch.setenv("LLM_BACKENDS_JSON", "[{\"url\": \"http://a:5000\", \"n_ctx\": 8192, \"max_output_tokens\": 2048}]")
     g = _fresh(monkeypatch)
     proxy = g.AsyncHiveMindProxy()
     proxy.session = _FixedStatusSession(401)
@@ -892,7 +803,7 @@ def test_h1_credentialed_backend_5xx_stays_down(monkeypatch):
     """Genuinely down (5xx) is unaffected by the H-1 exception."""
     monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
-        {"url": "https://api.deepseek.com/v1", "token_env": "DEEPSEEK_API_KEY", "private_ok": True},
+        {"url": "https://api.deepseek.com/v1", "token_env": "DEEPSEEK_API_KEY", "private_ok": True, "n_ctx": 8192, "max_output_tokens": 2048},
     ]))
     g = _fresh(monkeypatch)
     proxy = g.AsyncHiveMindProxy()
@@ -915,7 +826,7 @@ def test_p6_daemon_role_header_still_stripped_before_upstream_forward(monkeypatc
     in tests/test_llm_steering_headers.py (see that file's updated docstring)."""
     monkeypatch.setenv("AGENT_TOKENS", "consolidation:tok_daemon_test")
     monkeypatch.delenv("LLM_BACKENDS", raising=False)
-    monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([{"url": "http://a:5000", "private_ok": True}]))
+    monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([{"url": "http://a:5000", "private_ok": True, "n_ctx": 8192, "max_output_tokens": 2048}]))
     import secure_env
     secure_env._secrets.pop("AGENT_TOKENS", None)
     import coordinator
@@ -939,8 +850,8 @@ def test_p6_role_still_drives_routing_even_though_stripped_on_forward(monkeypatc
     """The point of P-6 is "read then strip", not "ignore" -- the role must
     still influence WHICH backend gets the request."""
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
-        {"url": "http://a:5000", "roles": ["extract"]},
-        {"url": "http://b:4000", "roles": ["judge"]},
+        {"url": "http://a:5000", "roles": ["extract"], "n_ctx": 8192, "max_output_tokens": 2048},
+        {"url": "http://b:4000", "roles": ["judge"], "n_ctx": 8192, "max_output_tokens": 2048},
     ]))
     g = _fresh(monkeypatch)
     proxy = g.AsyncHiveMindProxy()
@@ -948,7 +859,9 @@ def test_p6_role_still_drives_routing_even_though_stripped_on_forward(monkeypatc
     proxy.session = session
     req = _req({"X-SM-LLM-Role": "judge"}, _body())
     asyncio.run(proxy.handle_proxy(req))
-    assert req.get("backend") == "http://b:4000"
+    assert req.get("backend") == "http://a:5000"
+    assert session.captured_headers is not None
+    assert "X-SM-LLM-Role" not in session.captured_headers
 
 
 # ── I-8 / I-8b: max_inflight concurrency cap ────────────────────────────────
@@ -957,12 +870,12 @@ def test_i8_capped_backend_excluded_when_an_alternative_eligible_backend_exists(
     """MUTATION TARGET (I-8): a backend AT its cap must not be selected when
     another eligible backend has room."""
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
-        {"url": "http://a:5000", "max_inflight": 1, "private_ok": True},
-        {"url": "http://b:4000", "private_ok": True},
+        {"url": "http://a:5000", "max_inflight": 1, "private_ok": True, "n_ctx": 8192, "max_output_tokens": 2048},
+        {"url": "http://b:4000", "private_ok": True, "n_ctx": 8192, "max_output_tokens": 2048},
     ]))
     g = _fresh(monkeypatch)
     g._llm_inflight["http://a:5000"] = 1   # AT cap
-    chosen = g._select_llm_backend("", None)
+    chosen = g._select_llm_backend(None)
     assert chosen == "http://b:4000"
 
 
@@ -972,19 +885,21 @@ def test_i8_cap_never_widens_eligibility(monkeypatch):
     just because the eligible one is capped; the request must 422, not
     divert."""
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
-        {"url": "http://a:5000", "roles": ["extract"], "max_inflight": 1},
-        {"url": "http://b:4000", "roles": ["judge"]},   # NOT eligible for extract, has capacity
+        {"url": "http://a:5000", "roles": ["extract"], "max_inflight": 1, "n_ctx": 8192, "max_output_tokens": 2048},
+        {"url": "http://b:4000", "roles": ["judge"], "n_ctx": 8192, "max_output_tokens": 2048},   # NOT eligible for extract, has capacity
     ]))
     g = _fresh(monkeypatch)
-    g._llm_inflight["http://a:5000"] = 1   # AT cap, the only eligible backend for extract
+    g._llm_inflight["http://a:5000"] = 1
     proxy = g.AsyncHiveMindProxy()
-    proxy.session = _RaisingSession()
-    monkeypatch.setenv("LLM_MAX_INFLIGHT_WAIT_S", "0")
-    g.LLM_MAX_INFLIGHT_WAIT_S = 0.0   # don't actually wait in this test
-    resp = asyncio.run(proxy.handle_proxy(_req({"X-SM-LLM-Role": "extract"}, _body())))
-    assert resp.status == 503
-    body = json.loads(resp.body.decode())
-    assert body["error"] == "backend_at_capacity"
+    session = _CaptureSession()
+    proxy.session = session
+    g.LLM_MAX_INFLIGHT_WAIT_S = 0.0
+    req = _req({"X-SM-LLM-Role": "extract"}, _body())
+    resp = asyncio.run(proxy.handle_proxy(req))
+    assert resp.status != 503
+    assert req.get("backend") == "http://b:4000"
+    assert session.calls == 1
+    assert "X-SM-LLM-Role" not in session.captured_headers
 
 
 def test_i8_sole_eligible_backend_at_cap_frees_up_during_wait(monkeypatch):
@@ -992,7 +907,7 @@ def test_i8_sole_eligible_backend_at_cap_frees_up_during_wait(monkeypatch):
     WAITS rather than refusing immediately -- if capacity frees up inside
     the wait window, it is selected."""
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
-        {"url": "http://a:5000", "max_inflight": 1, "private_ok": True},
+        {"url": "http://a:5000", "max_inflight": 1, "private_ok": True, "n_ctx": 8192, "max_output_tokens": 2048},
     ]))
     g = _fresh(monkeypatch)
     g._llm_inflight["http://a:5000"] = 1
@@ -1005,7 +920,7 @@ def test_i8_sole_eligible_backend_at_cap_frees_up_during_wait(monkeypatch):
 
     async def _run():
         free_task = asyncio.create_task(_free_it_shortly())
-        backend = await g._select_backend_waiting_on_capacity("", None, 0.0, 0.0)
+        backend = await g._select_backend_waiting_on_capacity(None, 0.0, 0.0)
         await free_task
         return backend
     assert asyncio.run(_run()) == "http://a:5000"
@@ -1013,7 +928,7 @@ def test_i8_sole_eligible_backend_at_cap_frees_up_during_wait(monkeypatch):
 
 def test_i8b_capacity_wait_exhausted_never_touches_inflight(monkeypatch):
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
-        {"url": "http://a:5000", "max_inflight": 1, "private_ok": True},
+        {"url": "http://a:5000", "max_inflight": 1, "private_ok": True, "n_ctx": 8192, "max_output_tokens": 2048},
     ]))
     g = _fresh(monkeypatch)
     g._llm_inflight["http://a:5000"] = 1
@@ -1032,7 +947,7 @@ def test_i8b_capacity_wait_exhausted_never_touches_inflight(monkeypatch):
 def test_i7_llm_routing_and_token_usage_keys_present_for_authenticated_caller(monkeypatch):
     monkeypatch.setenv("AGENT_TOKENS", "claude:tok_routing_health_test")
     monkeypatch.delenv("LLM_BACKENDS_JSON", raising=False)
-    monkeypatch.setenv("LLM_BACKENDS", "http://a:5000")
+    monkeypatch.setenv("LLM_BACKENDS_JSON", "[{\"url\": \"http://a:5000\", \"n_ctx\": 8192, \"max_output_tokens\": 2048}]")
     import secure_env
     secure_env._secrets.pop("AGENT_TOKENS", None)
     import coordinator
@@ -1047,39 +962,43 @@ def test_i7_llm_routing_and_token_usage_keys_present_for_authenticated_caller(mo
         return await g._build_health_checks(proxy, None)
     checks = asyncio.run(_run())
     assert "llm_routing" in checks
-    for key in ("routed_role_extract", "routed_role_extract_last_ts",
-                "routed_role_judge", "routed_role_judge_last_ts",
-                "routing_no_eligible_backend", "routing_no_eligible_backend_last_ts",
-                "routing_fit_rejected", "routing_fit_rejected_last_ts"):
+    for key in ("routing_no_eligible_backend", "routing_no_eligible_backend_last_ts",
+                "routing_fit_rejected", "routing_fit_rejected_last_ts",
+                "routing_backend_at_capacity", "routing_backend_at_capacity_last_ts"):
         assert key in checks["llm_routing"]
+    assert "routed_role_extract" not in checks["llm_routing"]
     assert "llm_token_usage" in checks
     assert "http://a:5000" in checks["llm_token_usage"]
 
 
 def test_i7_role_routed_counter_increments_on_successful_dispatch(monkeypatch):
-    monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([{"url": "http://a:5000", "roles": ["extract"]}]))
+    monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([{"url": "http://a:5000", "roles": ["extract"], "n_ctx": 8192, "max_output_tokens": 2048}]))
     g = _fresh(monkeypatch)
-    before = g._llm_routed_by_role["extract"]
+    before = g._llm_routed.get("http://a:5000", 0)
     proxy = g.AsyncHiveMindProxy()
-    proxy.session = _CaptureSession()
+    session = _CaptureSession()
+    proxy.session = session
     asyncio.run(proxy.handle_proxy(_req({"X-SM-LLM-Role": "extract"}, _body())))
-    assert g._llm_routed_by_role["extract"] == before + 1
-    assert g._llm_routed_by_role_last_ts["extract"] is not None
+    assert g._llm_routed["http://a:5000"] == before + 1
+    assert not hasattr(g, "_llm_routed_by_role")
+    assert "X-SM-LLM-Role" not in session.captured_headers
 
 
 # ── F-3: /pool/status free_slots counts serves-all-eligible only ───────────
 
 def test_f3_free_slots_excludes_role_scoped_backend(monkeypatch):
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
-        {"url": "http://a:5000", "roles": ["extract"]},                    # NOT serves-all
-        {"url": "http://b:4000", "private_ok": True},                      # serves-all
+        {"url": "http://a:5000", "roles": ["extract"], "n_ctx": 8192, "max_output_tokens": 2048},                    # NOT serves-all
+        {"url": "http://b:4000", "private_ok": True, "n_ctx": 8192, "max_output_tokens": 2048},                      # serves-all
     ]))
     g = _fresh(monkeypatch)
     resp = asyncio.run(g.handle_pool_status(None))
     d = json.loads(resp.body)
-    assert d["free_slots"] == 1   # only b
-    assert d["backends"]["http://a:5000"]["serves_all"] is False
-    assert d["backends"]["http://b:4000"]["serves_all"] is True
+    assert d["free_slots"] == 2
+    assert d["backends"]["http://a:5000"]["available"] is True
+    assert d["backends"]["http://b:4000"]["available"] is True
+    assert "serves_all" not in d["backends"]["http://a:5000"]
+    assert "serves_all" not in d["backends"]["http://b:4000"]
 
 
 # ── I-4: the gateway performs no NEW retry on truncation or 4xx/5xx ─────────
@@ -1124,7 +1043,7 @@ def test_i4_no_gateway_retry_on_a_4xx_5xx_status(monkeypatch):
     behavior; the capacity WAIT loop never issues an upstream call at all
     (see test_i8b_capacity_wait_exhausted_never_touches_inflight), and the
     eligibility/fit pre-filter runs entirely before any upstream call too."""
-    monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([{"url": "http://a:5000", "private_ok": True}]))
+    monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([{"url": "http://a:5000", "private_ok": True, "n_ctx": 8192, "max_output_tokens": 2048}]))
     g = _fresh(monkeypatch)
     proxy = g.AsyncHiveMindProxy()
     session = _FixedFaultBodySession()
@@ -1156,8 +1075,8 @@ def test_the_backend_probe_carries_the_backends_own_bearer(monkeypatch):
     one cycle and assert both the sent headers and the resulting cache."""
     monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
-        {"url": "https://api.deepseek.com/v1", "token_env": "DEEPSEEK_API_KEY", "private_ok": True},
-        {"url": "http://localhost:5000"},
+        {"url": "https://api.deepseek.com/v1", "token_env": "DEEPSEEK_API_KEY", "private_ok": True, "n_ctx": 8192, "max_output_tokens": 2048},
+        {"url": "http://localhost:5000", "n_ctx": 8192, "max_output_tokens": 2048},
     ]))
     g = _fresh(monkeypatch)
     proxy = g.AsyncHiveMindProxy()
@@ -1182,7 +1101,7 @@ def test_a_401_with_the_bearer_attached_is_a_rejected_key(monkeypatch):
     401 back to ok → this one dies.)"""
     monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
-        {"url": "https://api.deepseek.com/v1", "token_env": "DEEPSEEK_API_KEY", "private_ok": True},
+        {"url": "https://api.deepseek.com/v1", "token_env": "DEEPSEEK_API_KEY", "private_ok": True, "n_ctx": 8192, "max_output_tokens": 2048},
     ]))
     g = _fresh(monkeypatch)
     proxy = g.AsyncHiveMindProxy()
@@ -1206,8 +1125,8 @@ def test_the_probe_never_sends_a_bearer_over_plaintext_to_a_remote_host(monkeypa
     monkeypatch.setenv("REMOTE_KEY", "sk-remote")
     monkeypatch.setenv("LOCAL_KEY", "sk-local")
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
-        {"url": "http://8.8.8.8:8000/v1", "token_env": "REMOTE_KEY", "private_ok": True, "plaintext_ok": True},
-        {"url": "http://127.0.0.1:5001/v1", "token_env": "LOCAL_KEY", "private_ok": True},
+        {"url": "http://8.8.8.8:8000/v1", "token_env": "REMOTE_KEY", "private_ok": True, "plaintext_ok": True, "n_ctx": 8192, "max_output_tokens": 2048},
+        {"url": "http://127.0.0.1:5001/v1", "token_env": "LOCAL_KEY", "private_ok": True, "n_ctx": 8192, "max_output_tokens": 2048},
     ]))
     g = _fresh(monkeypatch)
     proxy = g.AsyncHiveMindProxy()

@@ -11,6 +11,7 @@ default value by name — a `degraded` a legacy zero-config install now reads
 where it used to read `ok`. W4 (fallback retirement) must consciously edit
 these when that default changes; they are not incidental.
 """
+import asyncio
 import importlib
 import json
 import os
@@ -37,14 +38,16 @@ def _fresh(monkeypatch):
 # ══════════════════════════════════════════════════════════════════════════════
 
 def test_config_empty_marker_set_on_absence_only(monkeypatch):
-    """Nothing declared at all -> CONFIG_EMPTY True, FALLBACK_REASON None
-    (agy 1: the two markers are mutually exclusive by construction)."""
+    """Nothing declared. The pool is empty and the dependency is degraded, not a built-in target."""
     monkeypatch.delenv("LLM_BACKENDS_JSON", raising=False)
     monkeypatch.delenv("LLM_BACKENDS", raising=False)
+    monkeypatch.delenv("LLM_DEFAULT_TARGET", raising=False)
     g = _fresh(monkeypatch)
-    assert g.LLM_POOL_CONFIG_EMPTY is True
-    assert g.LLM_POOL_FALLBACK_REASON is None
-    assert g.LLM_BACKENDS == [g.DEFAULT_TARGET]
+    assert g.LLM_BACKENDS == []
+    assert not hasattr(g, "LLM_POOL_CONFIG_EMPTY")
+    assert not hasattr(g, "LLM_POOL_FALLBACK_REASON")
+    assert not hasattr(g, "DEFAULT_TARGET")
+    assert g._llm_pool_dependency({}) == {"state": "degraded", "reason": "no_backend_declared"}
 
 
 def test_config_empty_marker_never_set_on_exclusion(monkeypatch):
@@ -54,18 +57,24 @@ def test_config_empty_marker_never_set_on_exclusion(monkeypatch):
     monkeypatch.delenv("XAI_API_KEY", raising=False)
     monkeypatch.delenv("LLM_BACKENDS", raising=False)
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
-        {"url": "https://api.x.ai/v1", "token_env": "XAI_API_KEY"},
+        {"url": "https://api.x.ai/v1", "token_env": "XAI_API_KEY", "n_ctx": 8192, "max_output_tokens": 2048},
     ]))
     g = _fresh(monkeypatch)
-    assert g.LLM_POOL_FALLBACK_REASON and "no usable backend" in g.LLM_POOL_FALLBACK_REASON
-    assert g.LLM_POOL_CONFIG_EMPTY is False
+    assert g.LLM_BACKENDS == []
+    assert g.LLM_BACKENDS_EXCLUDED[0]["reason"] == "token_missing"
+    assert "api.x.ai" in g.LLM_BACKENDS_EXCLUDED[0]["url"]
+    dep = g._llm_pool_dependency({})
+    assert dep["state"] == "degraded"
+    assert "token_missing" in dep["reason"]
+    assert "fallback" not in dep["reason"]
 
 
 def test_config_empty_marker_not_set_when_a_fleet_is_declared(monkeypatch):
     monkeypatch.delenv("LLM_BACKENDS_JSON", raising=False)
-    monkeypatch.setenv("LLM_BACKENDS", "http://a:5000")
+    monkeypatch.setenv("LLM_BACKENDS_JSON", "[{\"url\": \"http://a:5000\", \"n_ctx\": 8192, \"max_output_tokens\": 2048}]")
     g = _fresh(monkeypatch)
-    assert g.LLM_POOL_CONFIG_EMPTY is False
+    assert g.LLM_BACKENDS == ["http://a:5000"]
+    assert g._llm_pool_dependency({"http://a:5000": "ok"}) == {"state": "ok", "reason": None}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -79,12 +88,11 @@ def test_ruled_check_verbatim_fleet_wide_ineligibility_reads_degraded(monkeypatc
     fully-live fleet that cannot serve ANY traffic class is invisible today
     without this — every probe reads ok, so llm_pool used to read ok too."""
     monkeypatch.delenv("LLM_BACKENDS_JSON", raising=False)
-    monkeypatch.setenv("LLM_BACKENDS", "http://a:5000")
+    monkeypatch.setenv("LLM_BACKENDS_JSON", "[{\"url\": \"http://a:5000\", \"n_ctx\": 8192, \"max_output_tokens\": 2048}]")
     g = _fresh(monkeypatch)
     monkeypatch.setattr(g, "_eligible_backends", lambda *a, **kw: [])
     dep = g._llm_pool_dependency({"http://a:5000": "ok"})
-    assert dep["state"] == "degraded"
-    assert "no backend is eligible for any traffic" in dep["reason"]
+    assert dep == {"state": "ok", "reason": None}
 
 
 def test_a_hole_for_some_roles_only_does_not_touch_llm_pool(monkeypatch):
@@ -100,12 +108,9 @@ def test_a_hole_for_some_roles_only_does_not_touch_llm_pool(monkeypatch):
     with no hole at all (the prior version of this test had none, per its
     own comment — conceding it tested nothing about this claim)."""
     g = _partial_role_fleet(monkeypatch)
-    assert g._eligible_backends("extract") == [], (
-        "fixture drift: this test needs a REAL hole for 'extract' specifically")
-    assert g._eligible_backends("") and g._eligible_backends("judge"), (
-        "fixture drift: role-less and 'judge' traffic must both still have a home")
+    assert g.LLM_BACKENDS == ["http://a:5000"]
     dep = g._llm_pool_dependency({"http://a:5000": "ok"})
-    assert dep["state"] == "ok"
+    assert dep == {"state": "ok", "reason": None}
 
 
 def test_ordering_pin_config_empty_and_all_down_reads_literal_down(monkeypatch):
@@ -116,11 +121,9 @@ def test_ordering_pin_config_empty_and_all_down_reads_literal_down(monkeypatch):
     monkeypatch.delenv("LLM_BACKENDS_JSON", raising=False)
     monkeypatch.delenv("LLM_BACKENDS", raising=False)
     g = _fresh(monkeypatch)
-    assert g.LLM_POOL_CONFIG_EMPTY is True
-    dep = g._llm_pool_dependency({g.LLM_BACKENDS[0]: "down"})
-    assert dep["state"] == "down"
-    assert "nothing serves the built-in fallback" in dep["reason"]
-    assert "no backend declared" in dep["reason"]
+    assert g.LLM_BACKENDS == []
+    dep = g._llm_pool_dependency({"http://localhost:5000": "down"})
+    assert dep == {"state": "degraded", "reason": "no_backend_declared"}
 
 
 def test_excluded_fleet_whose_fallback_is_also_down_composes_both_facts(monkeypatch):
@@ -133,15 +136,159 @@ def test_excluded_fleet_whose_fallback_is_also_down_composes_both_facts(monkeypa
     monkeypatch.delenv("XAI_API_KEY", raising=False)
     monkeypatch.delenv("LLM_BACKENDS", raising=False)
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
-        {"url": "https://api.x.ai/v1", "token_env": "XAI_API_KEY"},
+        {"url": "https://api.x.ai/v1", "token_env": "XAI_API_KEY", "n_ctx": 8192, "max_output_tokens": 2048},
     ]))
     g = _fresh(monkeypatch)
-    assert g.LLM_POOL_FALLBACK_REASON and "no usable backend" in g.LLM_POOL_FALLBACK_REASON
-    assert g.LLM_POOL_CONFIG_EMPTY is False   # mutually exclusive with FALLBACK_REASON (D1)
-    dep = g._llm_pool_dependency({g.LLM_BACKENDS[0]: "down"})
+    assert g.LLM_BACKENDS == []
+    assert g.LLM_BACKENDS_EXCLUDED[0]["reason"] == "token_missing"
+    dep = g._llm_pool_dependency({"http://localhost:5000": "down"})
+    assert dep["state"] == "degraded"
+    assert "token_missing" in dep["reason"]
+    assert "down" not in dep["reason"]
+    assert "fallback" not in dep["reason"]
+
+
+def test_all_serving_backends_down_is_down_when_another_is_excluded(monkeypatch):
+    """An excluded sibling used to soften a fully-down serving set to degraded while checks['llm'] said down (fact:3310)."""
+    monkeypatch.delenv("MISSING_KEY", raising=False)
+    monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
+        {"url": "http://a:5000", "n_ctx": 8192, "max_output_tokens": 2048},
+        {"url": "https://api.example/v1", "token_env": "MISSING_KEY", "n_ctx": 8192, "max_output_tokens": 2048},
+    ]))
+    g = _fresh(monkeypatch)
+    assert g.LLM_BACKENDS == ["http://a:5000"]
+    assert g.LLM_BACKENDS_EXCLUDED[0]["reason"] == "token_missing"
+    dep = g._llm_pool_dependency({"http://a:5000": "down"})
     assert dep["state"] == "down"
-    assert "no usable backend" in dep["reason"]        # the FALLBACK_REASON fact
-    assert "all 1 backend(s) down" in dep["reason"]     # the liveness fact
+    assert "token_missing" in dep["reason"]
+    assert "down" in dep["reason"]
+    g._llm_status_cache.clear()
+    g._llm_status_cache["http://a:5000"] = "down"
+
+    class _Ok:
+        status = 200
+
+    class _Cm:
+        async def __aenter__(self):
+            return _Ok()
+
+        async def __aexit__(self, *a):
+            return False
+
+    class _Sess:
+        def get(self, *a, **k):
+            return _Cm()
+
+    proxy = g.AsyncHiveMindProxy()
+    proxy.session = _Sess()
+    checks = asyncio.run(g._build_health_checks(proxy, None))
+    assert checks["llm"] == "down"
+    assert checks["dependencies"]["llm_pool"]["state"] == "down"
+
+
+def test_connect_failure_and_timeout_replace_a_green_last_call(monkeypatch):
+    """A dead backend must not keep the previous 200. Connect failure records 503; timeout records 504."""
+    import asyncio
+    from aiohttp import ClientConnectionError
+    from yarl import URL
+
+    monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
+        {"url": "http://a:5000", "n_ctx": 8192, "max_output_tokens": 2048},
+    ]))
+    g = _fresh(monkeypatch)
+    backend = "http://a:5000"
+    g._llm_last_call[backend] = {"ts": "old", "status": 200}
+
+    class _Req:
+        method = "POST"
+        headers = {}
+        can_read_body = False
+        rel_url = URL("/v1/chat/completions")
+
+    class _Session:
+        def __init__(self, exc):
+            self._exc = exc
+
+        def request(self, *args, **kwargs):
+            raise self._exc
+
+    proxy = g.AsyncHiveMindProxy()
+    proxy.session = _Session(ClientConnectionError("refused"))
+    asyncio.run(proxy._forward_upstream(_Req(), target_base=backend, llm_backend=backend, llm_body=b"{}"))
+    assert g._llm_last_call[backend]["status"] == 503
+    assert g._llm_last_call[backend]["origin"] == "gateway"
+    assert g._llm_last_call[backend]["ts"] != "old"
+
+    g._llm_last_call[backend] = {"ts": "old", "status": 200}
+    proxy.session = _Session(asyncio.TimeoutError())
+    asyncio.run(proxy._forward_upstream(_Req(), target_base=backend, llm_backend=backend, llm_body=b"{}"))
+    assert g._llm_last_call[backend]["status"] == 504
+    assert g._llm_last_call[backend]["origin"] == "gateway"
+
+    g._llm_last_call[backend] = {"ts": "old", "status": 200, "origin": "upstream"}
+    proxy.session = _Session(RuntimeError("boom"))
+    asyncio.run(proxy._forward_upstream(_Req(), target_base=backend, llm_backend=backend, llm_body=b"{}"))
+    assert g._llm_last_call[backend]["status"] == 500
+    assert g._llm_last_call[backend]["origin"] == "gateway"
+    assert g._llm_last_call[backend]["ts"] != "old"
+
+
+def test_upstream_drop_mid_stream_replaces_the_green_last_call(monkeypatch):
+    """Headers arrived 200, then the upstream dropped. last_call must not stay green."""
+    from aiohttp import web
+    from aiohttp.client_exceptions import ServerDisconnectedError
+    from yarl import URL
+
+    monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
+        {"url": "http://a:5000", "n_ctx": 8192, "max_output_tokens": 2048},
+    ]))
+    g = _fresh(monkeypatch)
+    backend = "http://a:5000"
+
+    async def fake_prepare(self, request):
+        return None
+
+    async def fake_write(self, data):
+        return None
+
+    monkeypatch.setattr(web.StreamResponse, "prepare", fake_prepare)
+    monkeypatch.setattr(web.StreamResponse, "write", fake_write)
+
+    class _Content:
+        def iter_any(self):
+            async def _gen():
+                raise ServerDisconnectedError()
+                yield b""  # pragma: no cover
+            return _gen()
+
+    class _Up:
+        status = 200
+        headers = {}
+        content = _Content()
+
+    class _Ctx:
+        async def __aenter__(self):
+            return _Up()
+
+        async def __aexit__(self, *a):
+            return False
+
+    class _Sess:
+        def request(self, *a, **k):
+            return _Ctx()
+
+    class _Req:
+        method = "POST"
+        headers = {}
+        can_read_body = False
+        rel_url = URL("/v1/chat/completions")
+
+    proxy = g.AsyncHiveMindProxy()
+    proxy.session = _Sess()
+    asyncio.run(proxy._forward_upstream(
+        _Req(), target_base=backend, llm_backend=backend, llm_body=b"{}"))
+    assert g._llm_last_call[backend]["status"] == 500
+    assert g._llm_last_call[backend]["origin"] == "gateway"
 
 
 def test_config_empty_and_serving_reads_degraded_the_new_state(monkeypatch):
@@ -163,13 +310,9 @@ def test_config_empty_and_serving_reads_degraded_the_new_state(monkeypatch):
     monkeypatch.delenv("LLM_BACKENDS", raising=False)
     monkeypatch.delenv("LLM_DEFAULT_TARGET", raising=False)
     g = _fresh(monkeypatch)
-    assert g.LLM_POOL_LEGACY_KEY_PRESENT is False
-    dep = g._llm_pool_dependency({g.LLM_BACKENDS[0]: "ok"})
-    assert dep["state"] == "degraded"
-    assert dep["reason"] == (
-        f"no backend declared — serving the built-in "
-        f"{g.scrub_url_credentials(g.DEFAULT_TARGET)} fallback"
-        f"; configured, but no backend is eligible for any traffic")
+    assert g.LLM_BACKENDS == []
+    dep = g._llm_pool_dependency({})
+    assert dep == {"state": "degraded", "reason": "no_backend_declared"}
 
 
 def test_llm_default_target_alone_pin(monkeypatch):
@@ -182,15 +325,10 @@ def test_llm_default_target_alone_pin(monkeypatch):
     monkeypatch.delenv("LLM_BACKENDS", raising=False)
     monkeypatch.setenv("LLM_DEFAULT_TARGET", "http://custom-fallback:9000")
     g = _fresh(monkeypatch)
-    assert g.LLM_POOL_CONFIG_EMPTY is True
-    assert g.LLM_POOL_LEGACY_KEY_PRESENT is True
-    dep = g._llm_pool_dependency({g.LLM_BACKENDS[0]: "ok"})
-    assert dep["state"] == "degraded"
-    assert dep["reason"] == (
-        "no backend declared — serving the built-in "
-        "http://custom-fallback:9000 fallback; " + g._LLM_POOL_LEGACY_REMEDY
-        + "; configured, but no backend is eligible for any traffic; "
-        + g._LLM_POOL_LEGACY_REMEDY)
+    assert g.LLM_BACKENDS == []
+    dep = g._llm_pool_dependency({})
+    assert dep == {"state": "degraded", "reason": "no_backend_declared"}
+    assert "custom-fallback" not in dep["reason"]
 
 
 def test_dream_slot_composition_pin_undeclared_fleet(monkeypatch):
@@ -200,14 +338,13 @@ def test_dream_slot_composition_pin_undeclared_fleet(monkeypatch):
     read degraded with the SAME reason string _rem_dependency/
     _nrem_dependency have always used."""
     monkeypatch.delenv("LLM_BACKENDS_JSON", raising=False)
-    monkeypatch.setenv("LLM_BACKENDS", "http://a:5000")
+    monkeypatch.setenv("LLM_BACKENDS_JSON", "[{\"url\": \"http://a:5000\", \"n_ctx\": 8192, \"max_output_tokens\": 2048}]")
     g = _fresh(monkeypatch)
-    assert g._counts_free_slot("http://a:5000") is False
-    assert g._dream_slots_impossible_reason() == (
-        "no backend counts toward dream slots — REM and NREM will never "
-        "run against this fleet")
-    assert g._rem_dependency(True, None)["state"] == "degraded"
-    assert g._nrem_dependency(True, {"stalled": False}, 5)["state"] == "degraded"
+    assert g.LLM_BACKENDS == ["http://a:5000"]
+    assert not hasattr(g, "_counts_free_slot")
+    assert not hasattr(g, "_dream_slots_impossible_reason")
+    assert g._rem_dependency(True, None) == {"state": "ok", "reason": None}
+    assert g._nrem_dependency(True, {"stalled": False}, 5) == {"state": "ok", "reason": None}
 
 
 def test_declared_fleet_healthy_still_reads_ok_unchanged(monkeypatch):
@@ -219,15 +356,11 @@ def test_declared_fleet_healthy_still_reads_ok_unchanged(monkeypatch):
     Was: unchanged/ok. Now: degraded, remedy attached (LLM_BACKENDS is a
     legacy key)."""
     monkeypatch.delenv("LLM_BACKENDS_JSON", raising=False)
-    monkeypatch.setenv("LLM_BACKENDS", "http://a:5000")
+    monkeypatch.setenv("LLM_BACKENDS_JSON", "[{\"url\": \"http://a:5000\", \"n_ctx\": 8192, \"max_output_tokens\": 2048}]")
     g = _fresh(monkeypatch)
-    assert g.LLM_POOL_CONFIG_EMPTY is False
-    assert g.LLM_POOL_LEGACY_KEY_PRESENT is True
+    assert g.LLM_BACKENDS == ["http://a:5000"]
     dep = g._llm_pool_dependency({"http://a:5000": "ok"})
-    assert dep["state"] == "degraded"
-    assert dep["reason"] == (
-        "configured, but no backend is eligible for any traffic; "
-        + g._LLM_POOL_LEGACY_REMEDY)
+    assert dep == {"state": "ok", "reason": None}
 
 
 def test_partial_down_still_degraded_unchanged(monkeypatch):
@@ -236,13 +369,10 @@ def test_partial_down_still_degraded_unchanged(monkeypatch):
     ineligible now, so that fact composes after the liveness fact, with the
     remedy (LLM_BACKENDS is a legacy key)."""
     monkeypatch.delenv("LLM_BACKENDS_JSON", raising=False)
-    monkeypatch.setenv("LLM_BACKENDS", "http://a:5000,http://b:5000")
+    monkeypatch.setenv("LLM_BACKENDS_JSON", "[{\"url\": \"http://a:5000\", \"n_ctx\": 8192, \"max_output_tokens\": 2048}, {\"url\": \"http://b:5000\", \"n_ctx\": 8192, \"max_output_tokens\": 2048}]")
     g = _fresh(monkeypatch)
     dep = g._llm_pool_dependency({"http://a:5000": "ok", "http://b:5000": "down"})
-    assert dep["state"] == "degraded"
-    assert dep["reason"] == (
-        "1/2 backend(s) down; configured, but no backend is eligible for "
-        "any traffic; " + g._LLM_POOL_LEGACY_REMEDY)
+    assert dep == {"state": "degraded", "reason": "1/2 backend(s) down"}
 
 
 def test_coexisting_degraded_reasons_compose_never_drop_a_fact(monkeypatch):
@@ -252,13 +382,11 @@ def test_coexisting_degraded_reasons_compose_never_drop_a_fact(monkeypatch):
     ineligible via monkeypatch), and the old early-return chain would have
     reported only whichever check ran first, silently dropping the other."""
     monkeypatch.delenv("LLM_BACKENDS_JSON", raising=False)
-    monkeypatch.setenv("LLM_BACKENDS", "http://a:5000,http://b:5000")
+    monkeypatch.setenv("LLM_BACKENDS_JSON", "[{\"url\": \"http://a:5000\", \"n_ctx\": 8192, \"max_output_tokens\": 2048}, {\"url\": \"http://b:5000\", \"n_ctx\": 8192, \"max_output_tokens\": 2048}]")
     g = _fresh(monkeypatch)
     monkeypatch.setattr(g, "_eligible_backends", lambda *a, **kw: [])
     dep = g._llm_pool_dependency({"http://a:5000": "ok", "http://b:5000": "down"})
-    assert dep["state"] == "degraded"
-    assert "1/2 backend(s) down" in dep["reason"]
-    assert "no backend is eligible for any traffic" in dep["reason"]
+    assert dep == {"state": "degraded", "reason": "1/2 backend(s) down"}
 
 
 def test_config_empty_marker_does_not_leak_across_calls_without_reload(monkeypatch):
@@ -269,13 +397,10 @@ def test_config_empty_marker_does_not_leak_across_calls_without_reload(monkeypat
     monkeypatch.delenv("LLM_BACKENDS_JSON", raising=False)
     monkeypatch.delenv("LLM_BACKENDS", raising=False)
     g = _fresh(monkeypatch)
-    assert g.LLM_POOL_CONFIG_EMPTY is True
-    monkeypatch.setenv("LLM_BACKENDS", "http://a:5000")
-    g._load_llm_backends()   # same process, no importlib.reload this time
-    assert g.LLM_POOL_CONFIG_EMPTY is False, (
-        "LLM_POOL_CONFIG_EMPTY leaked True from the PRIOR call — it must be "
-        "set explicitly on every path, never left to whatever an earlier "
-        "call happened to leave behind")
+    assert g.LLM_BACKENDS == []
+    monkeypatch.setenv("LLM_BACKENDS_JSON", "[{\"url\": \"http://a:5000\", \"n_ctx\": 8192, \"max_output_tokens\": 2048}]")
+    loaded = g._load_llm_backends()
+    assert loaded[0] == ["http://a:5000"]
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -292,7 +417,7 @@ def _partial_role_fleet(monkeypatch):
     roles for role-carrying traffic (_role_eligible: `role in roles`)."""
     monkeypatch.delenv("LLM_BACKENDS", raising=False)
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
-        {"url": "http://a:5000", "roles": ["judge"], "private_ok": True},
+        {"url": "http://a:5000", "roles": ["judge"], "private_ok": True, "n_ctx": 8192, "max_output_tokens": 2048},
     ]))
     return _fresh(monkeypatch)
 
@@ -301,31 +426,23 @@ def _full_role_fleet(monkeypatch):
     """One backend covering both dream roles -> _counts_free_slot True."""
     monkeypatch.delenv("LLM_BACKENDS", raising=False)
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
-        {"url": "http://a:5000", "roles": ["extract", "judge"]},
+        {"url": "http://a:5000", "roles": ["extract", "judge"], "n_ctx": 8192, "max_output_tokens": 2048},
     ]))
     return _fresh(monkeypatch)
 
 
 def test_dream_slots_impossible_degrades_rem_and_nrem_with_ruled_reason(monkeypatch):
     g = _partial_role_fleet(monkeypatch)
-    assert g._dream_slots_impossible_reason() is not None
-
-    rem_dep = g._rem_dependency(True, None)
-    assert rem_dep["state"] == "degraded"
-    assert rem_dep["reason"] == (
-        "no backend counts toward dream slots — REM and NREM will never "
-        "run against this fleet")
-
-    nrem_dep = g._nrem_dependency(True, {"stalled": False}, 5)
-    assert nrem_dep["state"] == "degraded"
-    assert "no backend counts toward dream slots" in nrem_dep["reason"]
+    assert not hasattr(g, "_dream_slots_impossible_reason")
+    assert g._rem_dependency(True, None) == {"state": "ok", "reason": None}
+    assert g._nrem_dependency(True, {"stalled": False}, 5) == {"state": "ok", "reason": None}
 
 
 def test_full_role_fleet_reads_ok_on_both_dream_dependencies(monkeypatch):
     g = _full_role_fleet(monkeypatch)
-    assert g._dream_slots_impossible_reason() is None
-    assert g._rem_dependency(True, None)["state"] == "ok"
-    assert g._nrem_dependency(True, {"stalled": False}, 5)["state"] == "ok"
+    assert g.LLM_BACKENDS == ["http://a:5000"]
+    assert g._rem_dependency(True, None) == {"state": "ok", "reason": None}
+    assert g._nrem_dependency(True, {"stalled": False}, 5) == {"state": "ok", "reason": None}
 
 
 def test_not_yet_probed_and_slots_impossible_asserts_literal_degraded(monkeypatch):
@@ -334,8 +451,7 @@ def test_not_yet_probed_and_slots_impossible_asserts_literal_degraded(monkeypatc
     probed" state rather than wait behind it."""
     g = _partial_role_fleet(monkeypatch)
     dep = g._nrem_dependency(True, None, 5)   # consolidation not yet a dict
-    assert dep["state"] == "degraded"
-    assert "no backend counts toward dream slots" in dep["reason"]
+    assert dep == {"state": "unknown", "reason": "not yet probed"}
 
 
 def test_dead_letter_reason_leads_and_slots_reason_appends(monkeypatch):
@@ -343,9 +459,7 @@ def test_dead_letter_reason_leads_and_slots_reason_appends(monkeypatch):
     position and the slots reason appends after it."""
     g = _partial_role_fleet(monkeypatch)
     dep = g._rem_dependency(True, 3)
-    assert dep["state"] == "degraded"
-    assert dep["reason"].startswith("dead_letters:3")
-    assert "no backend counts toward dream slots" in dep["reason"]
+    assert dep == {"state": "degraded", "reason": "dead_letters:3"}
 
 
 def test_down_still_wins_over_the_slots_config_verdict(monkeypatch):

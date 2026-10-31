@@ -251,78 +251,36 @@ def test_t5_hidden_credentials_filtering_and_matching():
 
 # ── T6: migrate_env report ordering and omission ─────────────────────────────
 
-def test_t6_migrate_env_report_ordering_and_omission(tmp_path, monkeypatch, capsys):
-    """fails on a7438c8: migrate_env reports both fallback reason and hidden credential note in order, omitting note for non-matching ids."""
-    token_json = json.dumps([{"url": "http://a:5000", "token_env": "G2_TOKEN"}])
-    reason = "LLM_BACKENDS_JSON produced no usable backend (every entry excluded) — SENTINEL"
-
-    def _run_case(unit_q, unresolved=None):
-        env_path = tmp_path / ".env"
-        env_path.write_text(f"LLM_BACKENDS_JSON={token_json}\n")
-        monkeypatch.setenv("SECURE_ENV_FILE", str(env_path))
-        monkeypatch.setattr(m, "query_gateway_unit", lambda u: unit_q)
-        pre = tmp_path / f"pre_{os.urandom(4).hex()}.json"
-        img = {
-            "urls": [],
-            "fallback_reason": reason,
-            "config_empty": False,
-        }
-        if unresolved is not None:
-            img["token_env_unresolved"] = unresolved
-        pre.write_text(
-            json.dumps(
-                {
-                    "capture_schema": m.CAPTURE_SCHEMA,
-                    "image": img,
-                }
-            )
-        )
-        rc = m.do_apply_or_dryrun(str(pre), False, "unit.service")
-        assert rc == m.EXIT_OK
-        return capsys.readouterr().out
-
-    # Case 1: matching token_env -> old fallback text AND the note, in that order
+def test_t6_migrate_env_report_ordering_and_omission():
+    """The note follows a token_missing exclusion when the unit supplies that name. Anything else prints nothing."""
+    missing = {"llm_backends_excluded": [{"url": "http://a:5000", "reason": "token_missing"}]}
+    other = {"llm_backends_excluded": [{"url": "http://a:5000", "reason": "token_file_empty"}]}
     uq_matching = m.UnitQuery("ok", credential_ids=frozenset({"g2_token"}))
-    out1 = _run_case(uq_matching, unresolved=["G2_TOKEN"])
-    assert "SENTINEL" in out1
-    assert "is supplied by the gateway's systemd unit" in out1
-    assert out1.index("SENTINEL") < out1.index("is supplied by the gateway's systemd unit")
-    assert "unaffected" not in out1
-    assert "Nothing was changed" not in out1
+    line = m._hidden_credential_line(uq_matching, missing, ["G2_TOKEN"])
+    assert line is not None
+    assert "G2_TOKEN" in line
+    assert "token_missing" in line
+    assert "SENTINEL" not in line
 
-    # Case 2: {"pg_password"} -> old text and no note
     uq_pg = m.UnitQuery("ok", credential_ids=frozenset({"pg_password"}))
-    out2 = _run_case(uq_pg, unresolved=["G2_TOKEN"])
-    assert "SENTINEL" in out2
-    assert "is supplied by the gateway's systemd unit" not in out2
-    assert "unaffected" not in out2
-    assert "Nothing was changed" not in out2
-
-    # Case 3 (new T6 row, P-1): matching id {"g2_token"} but token_env_unresolved is [] -> old text and no note
-    out3 = _run_case(uq_matching, unresolved=[])
-    assert "SENTINEL" in out3
-    assert "is supplied by the gateway's systemd unit" not in out3
+    assert m._hidden_credential_line(uq_pg, missing, ["G2_TOKEN"]) is None
+    assert m._hidden_credential_line(uq_matching, other, ["G2_TOKEN"]) is None
+    assert m._hidden_credential_line(uq_matching, missing, []) is None
 
 
 # ── T7: check_config in-process with fake proxy ──────────────────────────────
 
 def test_t7_check_config_in_process_fake_proxy(monkeypatch):
-    """fails on a7438c8: check_config phase_b_render appends note directly after DECLARED FLEET line when token matches, safe on error."""
+    """An excluded token_missing entry names the unit-supplied variable. A miss, a raised query, or a visible secret prints no note and no secret."""
     class _FakeProxy:
-        LLM_POOL_FALLBACK_REASON = "SENTINEL reason"
-        LLM_POOL_CONFIG_EMPTY = False
         LLM_BACKENDS = []
+        LLM_BACKENDS_EXCLUDED = [{"url": "http://a:5000", "reason": "token_missing"}]
         LLM_WEIGHTS = {}
         LLM_BACKEND_MODELS = {}
-        LLM_BACKEND_ROLES = {}
-        LLM_BACKEND_EXTRAS = {}
         LLM_BACKEND_NCTX = {}
+        LLM_BACKEND_MAX_OUTPUT = {}
+        LLM_BACKEND_PRIORITY = {}
         LLM_BACKEND_TOKENS = {}
-        LLM_BACKEND_PRIVATE_OK = {}
-        LLM_BACKEND_PRIVATE_OK_EXPLICIT = {}
-        AUTH_CONFIGURED_AT_STARTUP = True
-        _LLM_BACKEND_ROLE_CONFIG_ERRORS = []
-        DEFAULT_TARGET = ""
 
         @staticmethod
         def require_auth_when_provider_keys_configured():
@@ -334,12 +292,12 @@ def test_t7_check_config_in_process_fake_proxy(monkeypatch):
 
     fake_proxy = _FakeProxy()
     monkeypatch.setitem(sys.modules, "hive_mind_proxy", fake_proxy)
+    monkeypatch.delenv("G2_TEST_TOKEN", raising=False)
     monkeypatch.setenv(
         "LLM_BACKENDS_JSON",
-        json.dumps([{"url": "http://a:5000", "token_env": "G2_TEST_TOKEN"}]),
+        json.dumps([{"url": "http://a:5000", "token_env": "G2_TEST_TOKEN", "n_ctx": 8192, "max_output_tokens": 2048}]),
     )
 
-    # 1. Matching token: exit 0, DECLARED FLEET line with SENTINEL reason, note naming G2_TEST_TOKEN on next line
     monkeypatch.setattr(
         m,
         "query_gateway_unit",
@@ -347,16 +305,12 @@ def test_t7_check_config_in_process_fake_proxy(monkeypatch):
     )
     lines, code = check_config.phase_b_render()
     assert code == 0
-    declared_idx = None
-    for i, line in enumerate(lines):
-        if "⚠ DECLARED FLEET NOT USABLE" in line and "SENTINEL reason" in line:
-            declared_idx = i
-            break
-    assert declared_idx is not None, f"DECLARED FLEET line missing: {lines}"
-    assert declared_idx + 1 < len(lines)
-    assert "note: G2_TEST_TOKEN is supplied by the gateway's systemd unit" in lines[declared_idx + 1]
+    body = "\n".join(lines)
+    assert "reason=token_missing" in body
+    assert "note: G2_TEST_TOKEN is supplied by the gateway's systemd unit" in body
+    excluded_at = body.index("reason=token_missing")
+    assert excluded_at < body.index("note: G2_TEST_TOKEN")
 
-    # 2. Other token: no note
     monkeypatch.setattr(
         m,
         "query_gateway_unit",
@@ -365,10 +319,9 @@ def test_t7_check_config_in_process_fake_proxy(monkeypatch):
     lines2, code2 = check_config.phase_b_render()
     assert code2 == 0
     body2 = "\n".join(lines2)
-    assert "⚠ DECLARED FLEET NOT USABLE" in body2
+    assert "reason=token_missing" in body2
     assert "supplied by the gateway's systemd unit" not in body2
 
-    # 3. query_gateway_unit raises RuntimeError("SECRETVALUE"): no note, SECRETVALUE absent
     def _boom_query(u):
         raise RuntimeError("SECRETVALUE")
 
@@ -376,11 +329,10 @@ def test_t7_check_config_in_process_fake_proxy(monkeypatch):
     lines3, code3 = check_config.phase_b_render()
     assert code3 == 0
     body3 = "\n".join(lines3)
-    assert "⚠ DECLARED FLEET NOT USABLE" in body3
+    assert "reason=token_missing" in body3
     assert "supplied by the gateway's systemd unit" not in body3
     assert "SECRETVALUE" not in body3
 
-    # 4. G2_TEST_TOKEN set in env, matching id -> no note (unseen filter)
     monkeypatch.setenv("G2_TEST_TOKEN", "secret-value")
     monkeypatch.setattr(
         m,
@@ -390,8 +342,9 @@ def test_t7_check_config_in_process_fake_proxy(monkeypatch):
     lines4, code4 = check_config.phase_b_render()
     assert code4 == 0
     body4 = "\n".join(lines4)
-    assert "⚠ DECLARED FLEET NOT USABLE" in body4
+    assert "reason=token_missing" in body4
     assert "supplied by the gateway's systemd unit" not in body4
+    assert "secret-value" not in body4
 
 
 # ── T8: check_config subprocess filters error log ────────────────────────────
@@ -400,7 +353,7 @@ def test_t8_check_config_subprocess_filters_fallback_error(tmp_path):
     """fails on a7438c8: check_config filters the gateway's no-usable-backend error while keeping token warnings."""
     from test_check_config import _run
 
-    backends_json = json.dumps([{"url": "http://a:5000", "token_env": "G2_ABSENT_TOKEN"}])
+    backends_json = json.dumps([{"url": "http://a:5000", "token_env": "G2_ABSENT_TOKEN", "n_ctx": 8192, "max_output_tokens": 2048}])
     proc = _run(
         env_overrides={
             "SECURE_ENV_FILE": "",
@@ -409,8 +362,9 @@ def test_t8_check_config_subprocess_filters_fallback_error(tmp_path):
         tmp_path=tmp_path,
     )
     assert "falling back to LLM_BACKENDS/LLM_DEFAULT_TARGET" not in proc.stderr
-    assert "DECLARED FLEET NOT USABLE" in proc.stdout
+    assert "reason=token_missing" in proc.stdout
     assert "G2_ABSENT_TOKEN" in proc.stderr
+    assert "sk-" not in proc.stdout
 
 
 # ── T9: HIDDEN_CREDENTIAL_NOTE value assert ──────────────────────────────────
@@ -419,16 +373,17 @@ def test_t9_hidden_credential_note_exact_wording():
     """pins the new contract: HIDDEN_CREDENTIAL_NOTE format string matches the exact wording specified in M1.6."""
     expected = (
         "note: A is supplied by the gateway's systemd unit (a credential directive or a secret "
-        "Environment= value), which this check cannot see, so the backend that needs it looks "
-        "uncredentialed here. The running gateway reads it from the unit; the authenticated /memory/telemetry "
+        "Environment= value), which this check cannot see, so the entry is excluded with token_missing. "
+        "The running gateway reads it from the unit; the authenticated /memory/telemetry "
         "shows the gateway's own roster, with has_credential per backend, under config.llm_backends."
     )
     assert m.HIDDEN_CREDENTIAL_NOTE.format(names="A", verb="is") == expected
     assert m.format_hidden_credential_note(["A"]) == expected
+    assert "sk-" not in expected
     expected_multi = (
         "note: A, B are supplied by the gateway's systemd unit (a credential directive or a secret "
-        "Environment= value), which this check cannot see, so the backend that needs it looks "
-        "uncredentialed here. The running gateway reads it from the unit; the authenticated /memory/telemetry "
+        "Environment= value), which this check cannot see, so the entry is excluded with token_missing. "
+        "The running gateway reads it from the unit; the authenticated /memory/telemetry "
         "shows the gateway's own roster, with has_credential per backend, under config.llm_backends."
     )
     assert m.format_hidden_credential_note(["A", "B"]) == expected_multi
@@ -436,43 +391,3 @@ def test_t9_hidden_credential_note_exact_wording():
     assert m.extract_token_env_names(None) == []
 
 
-# ── Loader subprocess: image reports token_env_unresolved ────────────────────
-
-def test_loader_snippet_reports_token_env_unresolved(tmp_path):
-    """fails on a7438c8: _LOADER_SNIPPET reports token_env_unresolved in image for unresolved tokens only."""
-    snippet = m._LOADER_SNIPPET.format(here=str(SCRIPTS), loader_semantics=m.LOADER_SEMANTICS)
-    backends_json = json.dumps([{"url": "http://a:5000", "token_env": "G2_ABSENT_TOKEN"}])
-
-    # 1. G2_ABSENT_TOKEN not set -> token_env_unresolved == ["G2_ABSENT_TOKEN"]
-    env1 = {
-        "PATH": os.environ["PATH"],
-        "HOME": str(tmp_path),
-        "LLM_BACKENDS_JSON": backends_json,
-        "SECURE_ENV_FILE": "",
-    }
-    proc1 = subprocess.run([sys.executable, "-c", snippet], env=env1, capture_output=True, text=True, timeout=60)
-    assert proc1.returncode == 0
-    image1 = json.loads(proc1.stdout.strip().splitlines()[-1])
-    assert image1.get("token_env_unresolved") == ["G2_ABSENT_TOKEN"]
-
-    # 2. G2_ABSENT_TOKEN set -> token_env_unresolved == []
-    env2 = dict(env1)
-    env2["G2_ABSENT_TOKEN"] = "x"
-    proc2 = subprocess.run([sys.executable, "-c", snippet], env=env2, capture_output=True, text=True, timeout=60)
-    assert proc2.returncode == 0
-    image2 = json.loads(proc2.stdout.strip().splitlines()[-1])
-    assert image2.get("token_env_unresolved") == []
-
-    # 3. G2_ABSENT_TOKEN reaches child through a .env file -> token_env_unresolved == []
-    env_file = tmp_path / "test.env"
-    env_file.write_text("G2_ABSENT_TOKEN=x\n")
-    env3 = {
-        "PATH": os.environ["PATH"],
-        "HOME": str(tmp_path),
-        "LLM_BACKENDS_JSON": backends_json,
-        "SECURE_ENV_FILE": str(env_file),
-    }
-    proc3 = subprocess.run([sys.executable, "-c", snippet], env=env3, capture_output=True, text=True, timeout=60)
-    assert proc3.returncode == 0
-    image3 = json.loads(proc3.stdout.strip().splitlines()[-1])
-    assert image3.get("token_env_unresolved") == []

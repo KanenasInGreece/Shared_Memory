@@ -31,6 +31,7 @@ import os
 import sys
 
 import pytest
+pytestmark = pytest.mark.usefixtures("chat_caller_is_consolidation")
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "shared-memory", "scripts"))
 
@@ -227,7 +228,8 @@ def _credentialed_backend(monkeypatch, url="http://a:5000", token_var="SM_TEST_T
     was already testing."""
     monkeypatch.setenv(token_var, "sk-test-credential")
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps(
-        [{"url": url, "token_env": token_var, "private_ok": True}]))
+        [{"url": url, "token_env": token_var, "private_ok": True,
+          "n_ctx": 8192, "max_output_tokens": 2048}]))
 
 
 # ── 1 + 2. X-SM-Fault-Origin header + verbatim passthrough ──────────────────
@@ -235,7 +237,7 @@ def _credentialed_backend(monkeypatch, url="http://a:5000", token_var="SM_TEST_T
 def test_upstream_fault_gets_upstream_origin_header_and_typed_refusal(monkeypatch):
     monkeypatch.delenv("LLM_BACKENDS", raising=False)
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps(
-        [{"url": "http://a:5000", "private_ok": True}]))
+        [{"url": "http://a:5000", "private_ok": True, "n_ctx": 8192, "max_output_tokens": 2048}]))
     import hive_mind_proxy as g
     importlib.reload(g)
 
@@ -262,7 +264,7 @@ def test_successful_response_never_gets_fault_origin_header(monkeypatch):
     must never carry it."""
     monkeypatch.delenv("LLM_BACKENDS", raising=False)
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps(
-        [{"url": "http://a:5000", "private_ok": True}]))
+        [{"url": "http://a:5000", "private_ok": True, "n_ctx": 8192, "max_output_tokens": 2048}]))
     import hive_mind_proxy as g
     importlib.reload(g)
     written = _patch_stream_response(monkeypatch)
@@ -287,7 +289,7 @@ def test_embedding_400_attaches_overflow_without_provider_text(monkeypatch):
     """decision:2583 — encoder embed 400 gets overflow fields, never the vLLM sentence."""
     monkeypatch.delenv("LLM_BACKENDS", raising=False)
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps(
-        [{"url": "http://a:5000", "private_ok": True}]))
+        [{"url": "http://a:5000", "private_ok": True, "n_ctx": 8192, "max_output_tokens": 2048}]))
     import hive_mind_proxy as g
     importlib.reload(g)
 
@@ -328,7 +330,7 @@ def test_reranking_400_has_no_overflow_key(monkeypatch):
     """Overflow attach is embed-only; rerank 400 stays typed S8 without overflow."""
     monkeypatch.delenv("LLM_BACKENDS", raising=False)
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps(
-        [{"url": "http://a:5000", "private_ok": True}]))
+        [{"url": "http://a:5000", "private_ok": True, "n_ctx": 8192, "max_output_tokens": 2048}]))
     import hive_mind_proxy as g
     importlib.reload(g)
 
@@ -364,7 +366,7 @@ def test_embedding_route_fault_also_gets_upstream_origin_header(monkeypatch):
     X-SM-LLM-Backend header and no fault recording)."""
     monkeypatch.delenv("LLM_BACKENDS", raising=False)
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps(
-        [{"url": "http://a:5000", "private_ok": True}]))
+        [{"url": "http://a:5000", "private_ok": True, "n_ctx": 8192, "max_output_tokens": 2048}]))
     import hive_mind_proxy as g
     importlib.reload(g)
 
@@ -398,7 +400,7 @@ def test_embedding_route_fault_also_gets_upstream_origin_header(monkeypatch):
 def test_gateway_origin_error_gets_gateway_fault_origin_header(monkeypatch):
     monkeypatch.delenv("LLM_BACKENDS", raising=False)
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps(
-        [{"url": "http://a:5000", "private_ok": True}]))
+        [{"url": "http://a:5000", "private_ok": True, "n_ctx": 8192, "max_output_tokens": 2048}]))
     import hive_mind_proxy as g
     importlib.reload(g)
 
@@ -413,7 +415,7 @@ def test_gateway_origin_error_gets_gateway_fault_origin_header(monkeypatch):
 def test_gateway_timeout_gets_gateway_fault_origin_header(monkeypatch):
     monkeypatch.delenv("LLM_BACKENDS", raising=False)
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps(
-        [{"url": "http://a:5000", "private_ok": True}]))
+        [{"url": "http://a:5000", "private_ok": True, "n_ctx": 8192, "max_output_tokens": 2048}]))
     import hive_mind_proxy as g
     importlib.reload(g)
 
@@ -428,7 +430,7 @@ def test_gateway_timeout_gets_gateway_fault_origin_header(monkeypatch):
 def test_gateway_generic_exception_gets_gateway_fault_origin_header(monkeypatch):
     monkeypatch.delenv("LLM_BACKENDS", raising=False)
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps(
-        [{"url": "http://a:5000", "private_ok": True}]))
+        [{"url": "http://a:5000", "private_ok": True, "n_ctx": 8192, "max_output_tokens": 2048}]))
     import hive_mind_proxy as g
     importlib.reload(g)
 
@@ -478,7 +480,7 @@ def test_uncredentialed_401_still_counted_but_not_logged(monkeypatch, tmp_path):
     monkeypatch.setenv("CREDENTIAL_AUDIT_LOG_PATH", str(log_path))
     monkeypatch.delenv("LLM_BACKENDS", raising=False)
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps(
-        [{"url": "http://a:5000", "private_ok": True}]))   # no token_env -> not credentialed
+        [{"url": "http://a:5000", "private_ok": True, "n_ctx": 8192, "max_output_tokens": 2048}]))   # no token_env -> not credentialed
     import coordinator
     importlib.reload(coordinator)
     import hive_mind_proxy as g
@@ -521,7 +523,7 @@ def test_empty_body_fault_response_still_classified(monkeypatch):
     status alone, so the fault still counts as credential (S8)."""
     monkeypatch.delenv("LLM_BACKENDS", raising=False)
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps(
-        [{"url": "http://a:5000", "private_ok": True}]))
+        [{"url": "http://a:5000", "private_ok": True, "n_ctx": 8192, "max_output_tokens": 2048}]))
     import coordinator
     import hive_mind_proxy as g
     importlib.reload(g)
@@ -553,7 +555,7 @@ def test_backend_and_key_attached_stashed_when_credentialed(monkeypatch):
 def test_key_attached_not_stashed_when_backend_has_no_token(monkeypatch):
     monkeypatch.delenv("LLM_BACKENDS", raising=False)
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps(
-        [{"url": "http://a:5000", "private_ok": True}]))
+        [{"url": "http://a:5000", "private_ok": True, "n_ctx": 8192, "max_output_tokens": 2048}]))
     import hive_mind_proxy as g
     importlib.reload(g)
 
@@ -593,7 +595,7 @@ def test_upstream_success_cannot_spoof_fault_origin_header(monkeypatch):
     from the response-direction _filter_headers call and this fails."""
     monkeypatch.delenv("LLM_BACKENDS", raising=False)
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps(
-        [{"url": "http://a:5000", "private_ok": True}]))
+        [{"url": "http://a:5000", "private_ok": True, "n_ctx": 8192, "max_output_tokens": 2048}]))
     import hive_mind_proxy as g
     importlib.reload(g)
     written = _patch_stream_response(monkeypatch)
@@ -622,7 +624,7 @@ def test_upstream_fault_cannot_spoof_a_different_backend_label(monkeypatch):
     headers on the typed refusal; the upstream's spoofed header is dropped)."""
     monkeypatch.delenv("LLM_BACKENDS", raising=False)
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps(
-        [{"url": "http://a:5000", "private_ok": True}]))
+        [{"url": "http://a:5000", "private_ok": True, "n_ctx": 8192, "max_output_tokens": 2048}]))
     import hive_mind_proxy as g
     importlib.reload(g)
 
@@ -642,7 +644,7 @@ def test_request_direction_headers_unaffected_by_gateway_namespace_strip(monkeyp
     break some future legitimate use) is unaffected."""
     monkeypatch.delenv("LLM_BACKENDS", raising=False)
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps(
-        [{"url": "http://a:5000", "private_ok": True}]))
+        [{"url": "http://a:5000", "private_ok": True, "n_ctx": 8192, "max_output_tokens": 2048}]))
     import hive_mind_proxy as g
     importlib.reload(g)
 
@@ -662,7 +664,7 @@ def test_classification_exception_never_breaks_the_typed_refusal(monkeypatch):
     401 typed refusal)."""
     monkeypatch.delenv("LLM_BACKENDS", raising=False)
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps(
-        [{"url": "http://a:5000", "private_ok": True}]))
+        [{"url": "http://a:5000", "private_ok": True, "n_ctx": 8192, "max_output_tokens": 2048}]))
     import hive_mind_proxy as g
     importlib.reload(g)
     monkeypatch.setattr(g, "record_llm_upstream_fault",
@@ -687,7 +689,7 @@ def test_classification_exception_on_empty_body_never_breaks_the_response(monkey
     status-only credential classification)."""
     monkeypatch.delenv("LLM_BACKENDS", raising=False)
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps(
-        [{"url": "http://a:5000", "private_ok": True}]))
+        [{"url": "http://a:5000", "private_ok": True, "n_ctx": 8192, "max_output_tokens": 2048}]))
     import hive_mind_proxy as g
     importlib.reload(g)
     monkeypatch.setattr(g, "record_llm_upstream_fault",
@@ -714,7 +716,7 @@ def test_gzip_compressed_429_body_classifies_as_credential_end_to_end(monkeypatc
     import gzip
     monkeypatch.delenv("LLM_BACKENDS", raising=False)
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps(
-        [{"url": "http://a:5000", "private_ok": True}]))
+        [{"url": "http://a:5000", "private_ok": True, "n_ctx": 8192, "max_output_tokens": 2048}]))
     import coordinator
     import hive_mind_proxy as g
     importlib.reload(g)
@@ -741,7 +743,7 @@ def test_typed_refusal_never_passes_through_the_compressed_body(monkeypatch):
     import gzip
     monkeypatch.delenv("LLM_BACKENDS", raising=False)
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps(
-        [{"url": "http://a:5000", "private_ok": True}]))
+        [{"url": "http://a:5000", "private_ok": True, "n_ctx": 8192, "max_output_tokens": 2048}]))
     import hive_mind_proxy as g
     importlib.reload(g)
 
@@ -781,7 +783,7 @@ def test_client_error_body_never_echoes_exception_text(monkeypatch):
     """O-6: the client-visible body uses the exception's CLASS NAME only."""
     monkeypatch.delenv("LLM_BACKENDS", raising=False)
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps(
-        [{"url": "http://a:5000", "private_ok": True}]))
+        [{"url": "http://a:5000", "private_ok": True, "n_ctx": 8192, "max_output_tokens": 2048}]))
     import hive_mind_proxy as g
     importlib.reload(g)
 
@@ -806,7 +808,7 @@ def test_client_error_log_line_scrubs_url_credentials(monkeypatch, caplog):
     import logging
     monkeypatch.delenv("LLM_BACKENDS", raising=False)
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps(
-        [{"url": "http://a:5000", "private_ok": True}]))
+        [{"url": "http://a:5000", "private_ok": True, "n_ctx": 8192, "max_output_tokens": 2048}]))
     import hive_mind_proxy as g
     importlib.reload(g)
 
@@ -825,7 +827,7 @@ def test_generic_exception_body_and_log_never_echo_text(monkeypatch, caplog):
     import logging
     monkeypatch.delenv("LLM_BACKENDS", raising=False)
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps(
-        [{"url": "http://a:5000", "private_ok": True}]))
+        [{"url": "http://a:5000", "private_ok": True, "n_ctx": 8192, "max_output_tokens": 2048}]))
     import hive_mind_proxy as g
     importlib.reload(g)
 

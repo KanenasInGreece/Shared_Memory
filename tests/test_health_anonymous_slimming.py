@@ -69,7 +69,7 @@ def _load_gateway(monkeypatch, agent_tokens: str = ""):
     happened to leave it, which is exactly the untested gap SEC-A5-03's
     review found (zero references to AUTH_CONFIGURED_AT_STARTUP here)."""
     monkeypatch.delenv("LLM_BACKENDS", raising=False)
-    monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([{"url": "http://a:5000", "private_ok": True}]))
+    monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([{"url": "http://a:5000", "private_ok": True, "n_ctx": 8192, "max_output_tokens": 2048}]))
     import secure_env
     secure_env._secrets.pop("AGENT_TOKENS", None)  # see test_auth.load_coordinator's docstring
     if agent_tokens:

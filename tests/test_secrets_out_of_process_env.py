@@ -144,7 +144,7 @@ def test_token_env_name_referenced_by_llm_backends_json_is_classified_secret():
     """SEC-09's third clause: 'every token_env name from backend config' —
     covers a token_env name that would NOT match the suffix pattern on its
     own (unlike DEEPSEEK_API_KEY, which already matches *_API_KEY)."""
-    raw = json.dumps([{"url": "https://x", "token_env": "MY_CUSTOM_SECRET_NAME"}])
+    raw = json.dumps([{"url": "https://x", "token_env": "MY_CUSTOM_SECRET_NAME", "n_ctx": 8192, "max_output_tokens": 2048}])
     names = secure_env._token_env_names(raw)
     assert names == {"MY_CUSTOM_SECRET_NAME"}
 
@@ -178,7 +178,7 @@ def test_load_split_env_never_exports_a_secret_key_to_os_environ(monkeypatch, tm
         "DEEPSEEK_API_KEY=sk-provider-secret\n"
         "MY_CUSTOM_SECRET_NAME=custom-secret-value\n"
         "PG_CONN=postgresql://postgres:super-secret-pg@localhost:5432/agent_data\n"
-        'LLM_BACKENDS_JSON=[{"url":"https://x","token_env":"MY_CUSTOM_SECRET_NAME"}]\n'
+        'LLM_BACKENDS_JSON=[{"url":"https://x","token_env":"MY_CUSTOM_SECRET_NAME", "n_ctx": 8192, "max_output_tokens": 2048}]\n'
         "EMBEDDER_URL=http://localhost:8070\n"
     )
     monkeypatch.setattr(secure_env, "__file__", str(fake_file))
@@ -295,7 +295,7 @@ def test_daemon_env_excludes_dynamically_classified_token_env_key(monkeypatch):
     its value) into both daemons' child environments."""
     monkeypatch.setenv("OPENROUTER_CREDENTIAL", "sk-custom-provider-secret")
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
-        {"url": "https://openrouter.example/v1", "token_env": "OPENROUTER_CREDENTIAL"},
+        {"url": "https://openrouter.example/v1", "token_env": "OPENROUTER_CREDENTIAL", "n_ctx": 8192, "max_output_tokens": 2048},
     ]))
     monkeypatch.delenv("AGENT_TOKENS", raising=False)
 
@@ -484,7 +484,7 @@ def test_token_env_names_normalises_before_storing(monkeypatch):
     _dynamic_secret_names regardless of the case is_secret_key() is later
     asked about -- both sides of the ADV1-3 inversion fixed together."""
     monkeypatch.setattr(secure_env, "_dynamic_secret_names", set())
-    raw = json.dumps([{"url": "https://x", "token_env": "openrouter_cred"}])
+    raw = json.dumps([{"url": "https://x", "token_env": "openrouter_cred", "n_ctx": 8192, "max_output_tokens": 2048}])
     names = secure_env._token_env_names(raw)
     assert names == {"OPENROUTER_CRED"}
     secure_env._dynamic_secret_names.update(names)
@@ -562,7 +562,7 @@ def test_load_split_env_dynamic_token_env_still_reachable_under_its_own_case(mon
     fake_file = _write_env_file(
         tmp_path,
         "openrouter_cred=sk-provider-secret\n"
-        'LLM_BACKENDS_JSON=[{"url":"https://x","token_env":"openrouter_cred"}]\n'
+        'LLM_BACKENDS_JSON=[{"url":"https://x","token_env":"openrouter_cred", "n_ctx": 8192, "max_output_tokens": 2048}]\n'
     )
     monkeypatch.setattr(secure_env, "__file__", str(fake_file))
     for key in ("openrouter_cred", "OPENROUTER_CRED", "LLM_BACKENDS_JSON"):
@@ -583,13 +583,13 @@ def test_token_env_names_flags_invalid_json_syntax():
 
 
 def test_token_env_names_flags_valid_json_that_is_not_an_array():
-    assert secure_env._token_env_names('{"url": "https://x"}') == set()
+    assert secure_env._token_env_names('{"url": "https://x", "n_ctx": 8192, "max_output_tokens": 2048}') == set()
     assert secure_env.llm_backends_json_parse_failed() is True
 
 
 def test_token_env_names_clean_array_does_not_flag():
     secure_env._llm_backends_json_parse_failed = True  # start dirty
-    secure_env._token_env_names(json.dumps([{"url": "https://x"}]))
+    secure_env._token_env_names(json.dumps([{"url": "https://x", "n_ctx": 8192, "max_output_tokens": 2048}]))
     assert secure_env.llm_backends_json_parse_failed() is False
 
 
@@ -684,7 +684,7 @@ def test_load_split_env_sees_lowercase_llm_backends_json_key(monkeypatch, tmp_pa
     unclassified. Probed exactly per SEC1 finding 2."""
     fake_file = _write_env_file(
         tmp_path,
-        'llm_backends_json=[{"url":"https://x","token_env":"OPENROUTER_CRED"}]\n'
+        'llm_backends_json=[{"url":"https://x","token_env":"OPENROUTER_CRED", "n_ctx": 8192, "max_output_tokens": 2048}]\n'
         "OPENROUTER_CRED=sk-should-be-secret\n"
     )
     monkeypatch.setattr(secure_env, "__file__", str(fake_file))
@@ -704,7 +704,7 @@ def test_load_split_env_sees_bom_prefixed_llm_backends_json_key(monkeypatch, tmp
     lands on the file's FIRST key when saved as UTF-8-with-BOM)."""
     fake_file = _write_env_file(
         tmp_path,
-        '﻿LLM_BACKENDS_JSON=[{"url":"https://x","token_env":"OPENROUTER_CRED"}]\n'
+        '﻿LLM_BACKENDS_JSON=[{"url":"https://x","token_env":"OPENROUTER_CRED", "n_ctx": 8192, "max_output_tokens": 2048}]\n'
         "OPENROUTER_CRED=sk-should-be-secret\n"
     )
     monkeypatch.setattr(secure_env, "__file__", str(fake_file))

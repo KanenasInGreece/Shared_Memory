@@ -37,6 +37,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
+pytestmark = pytest.mark.usefixtures("chat_caller_is_consolidation")
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
@@ -169,8 +170,7 @@ def _build_app(c, g, proxy):
     app["coordinator"] = AsyncMock()
     app.on_response_prepare.append(g._set_server_header)
     app.router.add_get("/pool/status", g.handle_pool_status)
-    proxy.set_known_routes(app.router)
-    app.router.add_route("*", "/{tail:.*}", proxy.handle_proxy)
+    app.router.add_post("/v1/chat/completions", proxy.handle_proxy)
     return app
 
 
@@ -204,8 +204,8 @@ def test_e2e_a_declared_multi_slot_backend_stays_available_while_busy(monkeypatc
         hosted = f"http://{up.host}:{up.port}"
         local = f"http://{up_local.host}:{up_local.port}"
         c, g = _load_gateway(monkeypatch, [
-            {"url": hosted, "max_inflight": 4, "private_ok": True},
-            {"url": local, "private_ok": True},
+            {"url": hosted, "max_inflight": 4, "n_ctx": 8192, "max_output_tokens": 2048, "private_ok": True},
+            {"url": local, "n_ctx": 8192, "max_output_tokens": 2048, "private_ok": True},
         ])
         obs["fleet"] = {"hosted": hosted, "local": local,
                         "hosted_max_inflight": 4, "local_max_inflight": None}
@@ -283,8 +283,10 @@ def test_e2e_an_http_erroring_backend_is_cooled_down_and_traffic_moves_off_it(mo
         await up_good.start_server()
         bad_url = f"http://{up_bad.host}:{up_bad.port}"
         good_url = f"http://{up_good.host}:{up_good.port}"
-        c, g = _load_gateway(monkeypatch, [{"url": bad_url, "private_ok": True},
-                              {"url": good_url, "private_ok": True}])
+        c, g = _load_gateway(monkeypatch, [
+            {"url": bad_url, "n_ctx": 8192, "max_output_tokens": 2048, "private_ok": True},
+            {"url": good_url, "n_ctx": 8192, "max_output_tokens": 2048, "private_ok": True},
+        ])
         obs["fleet"] = {"failing": bad_url, "healthy": good_url,
                         "http_fail_threshold": g.LLM_HTTP_FAIL_THRESHOLD}
         proxy = g.AsyncHiveMindProxy()
@@ -345,7 +347,9 @@ def test_e2e_a_rate_limited_probe_does_not_report_a_working_pool_as_down(monkeyp
         up = TestServer(stub.app)
         await up.start_server()
         url = f"http://{up.host}:{up.port}"
-        c, g = _load_gateway(monkeypatch, [{"url": url, "private_ok": True}])
+        c, g = _load_gateway(monkeypatch, [
+            {"url": url, "n_ctx": 8192, "max_output_tokens": 2048, "private_ok": True},
+        ])
         proxy = g.AsyncHiveMindProxy()
         await proxy.start_session()
         app = _build_app(c, g, proxy)
@@ -418,9 +422,9 @@ def test_e2e_a_credentialed_backend_is_probed_far_less_often(monkeypatch):
         # own boundary.
         monkeypatch.setenv("LLM_PROBE_INTERVAL_CREDENTIALED_S", "2.0")
         c, g = _load_gateway(monkeypatch, [
-            {"url": plain_url, "private_ok": True},
-            {"url": keyed_url, "private_ok": True, "token_env": "E2E_PROVIDER_KEY",
-             "plaintext_ok": True},
+            {"url": plain_url, "n_ctx": 8192, "max_output_tokens": 2048, "private_ok": True},
+            {"url": keyed_url, "n_ctx": 8192, "max_output_tokens": 2048, "private_ok": True,
+             "token_env": "E2E_PROVIDER_KEY", "plaintext_ok": True},
         ])
         obs["intervals"] = {"plain_s": g.LLM_PROBE_INTERVAL_S,
                             "credentialed_s": g.LLM_PROBE_INTERVAL_CREDENTIALED_S}

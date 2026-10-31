@@ -6,14 +6,13 @@
 #   bash shared-memory/scripts/update_framework.sh --from-restore
 #   bash shared-memory/scripts/update_framework.sh --dry-run    # print, run nothing
 #   bash shared-memory/scripts/update_framework.sh --domain-backfill  # also run the domain backfill (opt-in)
-#   bash shared-memory/scripts/update_framework.sh --skip-env-migration  # see below
 #   bash shared-memory/scripts/update_framework.sh --skip-backup  # see below
 #
 # --skip-backup skips the backup-before-migrate step and asserts you already have a current one. NEVER pass it on a host holding the only copy of the data.
 #
 # --no-domain-backfill is a one-release no-op so an existing invocation does not break: the domain backfill is opt-in now (fact:1734). Pass --domain-backfill to run it.
 #
-# --skip-env-migration skips the pre-pull capture and the migrate_env.py --apply step, so a capture bug cannot block a security update. Run migrate_env.py by hand for this upgrade.
+# --skip-env-migration still exists. Do not use it to get past a missing n_ctx: the gateway would refuse the file and exit 78.
 #
 # Env overrides: GATEWAY_URL, GATEWAY_UNIT, GATEWAY_RESTART_CMD.
 #
@@ -257,15 +256,12 @@ if [[ "$FROM_RESTORE" == "0" ]]; then
         fi
 
         if [[ "$pull_blocked" == "0" ]]; then
-            # Capture the pre-upgrade config from the old checkout, immediately before the pull (decision:1846). The equality only holds if this runs against that old copy. SM_PRE_UPDATE_VERSION is exported first because the capture stamps captured_by from it.
-            SM_PRE_UPDATE_VERSION="$(sed -n 's/^FRAMEWORK_VERSION[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' \
-                "$REPO_ROOT/shared-memory/scripts/coordinator.py" | head -1)"
-            export SM_PRE_UPDATE_VERSION
+            # Capture the pre-upgrade config from the old checkout, immediately before the pull (decision:1846). The equality only holds if this runs against that old copy.
             if [[ "$SKIP_ENV_MIGRATION" == "1" ]]; then
                 step=$((step + 1))
                 echo; ylw "── Step $step: capture pre-upgrade effective config"
-                echo "   SKIPPED — --skip-env-migration given. §4 coverage for this"
-                echo "   upgrade is deferred to a manual standalone run of migrate_env.py."
+                echo "   SKIPPED — --skip-env-migration given. A defined backend with no n_ctx"
+                echo "   stops the gateway. Do not use this flag to get past that refusal."
             else
                 if [[ "$DRY_RUN" == "0" ]]; then
                     # Without -e, a failed mktemp would leave PREIMAGE_JSON pointed at /preimage.json. Refuse before the pull.
@@ -288,10 +284,10 @@ if [[ "$FROM_RESTORE" == "0" ]]; then
                 rc=$?
                 if [[ "$DRY_RUN" == "0" && "$rc" != "0" ]]; then
                     die "capture pre-upgrade effective config FAILED (exit $rc) — refusing
-  before the pull (nothing has moved; cost zero). SM_PRE_UPDATE_VERSION=
-  $SM_PRE_UPDATE_VERSION. Re-run with --skip-env-migration to defer §4 coverage
-  for this upgrade to a manual standalone run of migrate_env.py, or fix the
-  failure above and re-run."
+  before the pull (nothing has moved; cost zero). A defined backend with no n_ctx stops the gateway.
+  Query the URL; if it does not say, ask the operator. Never guess.
+  Do not pass --skip-env-migration: the gateway would refuse the file and exit 78.
+  Fix the failure above and re-run."
                 fi
             fi
 
@@ -337,8 +333,8 @@ fi
 if [[ "$SKIP_ENV_MIGRATION" == "1" ]]; then
     step=$((step + 1))
     echo; ylw "── Step $step: migrate .env to explicit configuration"
-    echo "   SKIPPED — --skip-env-migration given. §4 coverage for this upgrade"
-    echo "   is deferred to a manual standalone run of migrate_env.py."
+    echo "   SKIPPED — --skip-env-migration given. A defined backend with no n_ctx"
+    echo "   stops the gateway. Do not use this flag to get past that refusal."
 elif [[ -n "$PREIMAGE_JSON" ]]; then
     run_soft "migrate .env to explicit configuration" \
         uv run --no-project --with-requirements "$REPO_ROOT/requirements-gateway.lock" \
@@ -347,9 +343,9 @@ elif [[ -n "$PREIMAGE_JSON" ]]; then
     rc=$?
     if [[ "$DRY_RUN" == "0" && "$rc" != "0" ]]; then
         die "migrate .env to explicit configuration FAILED (exit $rc, message above).
-  Re-run with --skip-env-migration to defer §4 coverage for this upgrade to a
-  manual standalone run of migrate_env.py, or fix the failure above and re-run —
-  every earlier step (backup included) is idempotent."
+  A defined backend with no n_ctx stops the gateway. Query the URL; if it does not say, ask the operator. Never guess.
+  Do not pass --skip-env-migration: the gateway would refuse the file and exit 78.
+  Fix the declaration and re-run — every earlier step (backup included) is idempotent."
     fi
 else
     run_soft "migrate .env to explicit configuration (self-capture)" \
@@ -359,9 +355,9 @@ else
     rc=$?
     if [[ "$DRY_RUN" == "0" && "$rc" != "0" ]]; then
         die "migrate .env to explicit configuration FAILED (exit $rc, message above).
-  Re-run with --skip-env-migration to defer §4 coverage for this upgrade to a
-  manual standalone run of migrate_env.py, or fix the failure above and re-run —
-  every earlier step (backup included) is idempotent."
+  A defined backend with no n_ctx stops the gateway. Query the URL; if it does not say, ask the operator. Never guess.
+  Do not pass --skip-env-migration: the gateway would refuse the file and exit 78.
+  Fix the declaration and re-run — every earlier step (backup included) is idempotent."
     fi
 fi
 
@@ -419,6 +415,46 @@ if [[ "$DRY_RUN" == "0" && "$GATEWAY_RESTART_CMD" == systemctl* ]] \
   Set GATEWAY_RESTART_CMD to whatever restarts the gateway here and re-run —
   the migration steps above are idempotent, so re-running is safe."
 fi
+# --- restart-prevent-dropin ---
+# The unit template is not re-rendered on update. Ask systemctl show first: a unit that already lists RestartPreventExitStatus=78 needs nothing. A user drop-in applies only to a --user restart of GATEWAY_UNIT. A system unit ignores that file. When the file cannot be written, or the restart is not --user, warn with the directive and continue. --apply already validated the config. This step never stops the update.
+install_restart_prevent_dropin() {
+    local word user=0
+    for word in $GATEWAY_RESTART_CMD; do
+        [[ "$word" == "--user" ]] && user=1
+    done
+    local show_scope=()
+    [[ "$user" == 1 ]] && show_scope=(--user)
+    local shown=""
+    shown="$(systemctl "${show_scope[@]}" show "$GATEWAY_UNIT" -p LoadState -p RestartPreventExitStatus 2>/dev/null || true)"
+    local status=""
+    status="$(printf '%s\n' "$shown" | sed -n 's/^RestartPreventExitStatus=//p')"
+    if [[ " $status " == *" 78 "* ]]; then
+        return 0
+    fi
+    local directive="RestartPreventExitStatus=78"
+    if [[ "$user" != 1 ]]; then
+        echo "GATEWAY_RESTART_CMD is systemctl without --user. A user drop-in would not apply to ${GATEWAY_UNIT}. Add ${directive} on that unit and daemon-reload before this restart."
+        return 0
+    fi
+    local drop_dir="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/${GATEWAY_UNIT}.d"
+    if ! mkdir -p "$drop_dir" || ! printf '%s\n' '[Service]' "$directive" > "$drop_dir/restart-prevent-78.conf"; then
+        echo "${directive} could not be written for ${GATEWAY_UNIT}. Add this drop-in and daemon-reload: [Service] ${directive}"
+        return 0
+    fi
+    systemctl --user daemon-reload
+    local rc=$?
+    if [[ "$rc" != 0 ]]; then
+        echo "systemctl --user daemon-reload failed (exit ${rc}). ${drop_dir}/restart-prevent-78.conf is not loaded. ${directive} is not in effect until daemon-reload succeeds."
+        return 0
+    fi
+    return 0
+}
+# --- end restart-prevent-dropin ---
+if [[ "$DRY_RUN" == "0" && "$GATEWAY_RESTART_CMD" == systemctl* ]] && command -v systemctl >/dev/null 2>&1; then
+    install_restart_prevent_dropin
+elif [[ "$DRY_RUN" == "0" && "$GATEWAY_RESTART_CMD" != systemctl* ]]; then
+    echo "GATEWAY_RESTART_CMD is not systemctl. RestartPreventExitStatus=78 was not installed. A refused config exits 78; the supervisor must treat that as a stop, not a restart."
+fi
 run "restart the gateway" bash -c "$GATEWAY_RESTART_CMD"
 
 if [[ "$DRY_RUN" == "0" ]]; then
@@ -428,7 +464,7 @@ if [[ "$DRY_RUN" == "0" ]]; then
         sleep 1
     done
     curl -sf --max-time 5 "$GATEWAY_URL/health" >/dev/null 2>&1 \
-        || die "gateway did not come back after restart — check: journalctl --user -u $GATEWAY_UNIT -n 50"
+        || die "gateway did not come back after restart — a refused configuration exits 78 and will not answer /health. Run: python3 shared-memory/scripts/check_config.py ; journalctl --user -u $GATEWAY_UNIT -n 50"
 
     # A health answer is not proof the new code is running. An old process still listening would accept the repair rows below and blank record content, so the version must match this checkout.
     _running="$(curl -s --max-time 5 "$GATEWAY_URL/health" \

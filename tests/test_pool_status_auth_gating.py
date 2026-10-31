@@ -6,7 +6,7 @@ Gated the same way as /health, including SEC-A5-03's condition (slimming
 applies ONLY when AUTH_CONFIGURED_AT_STARTUP is true).
 
 Also covers the HARD REQUIREMENT: every real internal caller of /pool/status
-(pool_status.pool_has_free_slot(), consumed by rem_loop.py and
+(pool_status.pool_roster_state, consumed by rem_loop.py and
 consolidation_loop.py) must send its daemon/agent token, so slot-awareness is
 never silently lost."""
 import asyncio
@@ -24,7 +24,7 @@ def _load_gateway(monkeypatch, agent_tokens: str = ""):
     """Same reload-coordinator-first pattern as test_health_anonymous_
     slimming.py's _load_gateway — AUTH_CONFIGURED_AT_STARTUP must reflect
     `agent_tokens` exactly, not whatever an earlier test file left behind."""
-    monkeypatch.setenv("LLM_BACKENDS", "http://a:5000")
+    monkeypatch.setenv("LLM_BACKENDS_JSON", "[{\"url\": \"http://a:5000\", \"n_ctx\": 8192, \"max_output_tokens\": 2048}]")
     import secure_env
     secure_env._secrets.pop("AGENT_TOKENS", None)
     if agent_tokens:
@@ -91,9 +91,8 @@ def test_none_request_still_works_when_auth_off():
 
 # ── HARD REQUIREMENT: every real internal caller sends its token ────────────
 
-def test_pool_has_free_slot_forwards_headers_to_the_gateway(monkeypatch):
-    """Functional proof for pool_status.pool_has_free_slot() itself -- the
-    one function both rem_loop.py and consolidation_loop.py call through."""
+def test_pool_roster_state_forwards_headers_to_the_gateway(monkeypatch):
+    """rem_loop and consolidation_loop call pool_roster_state. The daemon token must be the header the gateway sees."""
     import pool_status
     importlib.reload(pool_status)
 
@@ -102,7 +101,7 @@ def test_pool_has_free_slot_forwards_headers_to_the_gateway(monkeypatch):
     class _FakeResp:
         status_code = 200
         def json(self):
-            return {"free_slots": 1}
+            return {"free_slots": 1, "backends": {"http://a:9": {}}}
 
     class _FakeClient:
         async def __aenter__(self):
@@ -114,14 +113,13 @@ def test_pool_has_free_slot_forwards_headers_to_the_gateway(monkeypatch):
             return _FakeResp()
 
     monkeypatch.setattr(pool_status.httpx, "AsyncClient", lambda timeout, trust_env, **_k: _FakeClient())
-    result = asyncio.run(pool_status.pool_has_free_slot(headers={"Authorization": "Bearer daemon-tok"}))
-    assert result is True
+    result = asyncio.run(pool_status.pool_roster_state(headers={"Authorization": "Bearer daemon-tok"}))
+    assert result == "free"
     assert captured["headers"] == {"Authorization": "Bearer daemon-tok"}
 
 
-def test_pool_has_free_slot_defaults_to_empty_headers_when_omitted(monkeypatch):
-    """Backward compatible for a standalone/debug caller with no token --
-    matches pool_status.py's own documented fallback story."""
+def test_pool_roster_state_defaults_to_empty_headers_when_omitted(monkeypatch):
+    """A caller that omits headers sends {}. An anonymous body is unreachable, not free."""
     import pool_status
     importlib.reload(pool_status)
 
@@ -130,7 +128,7 @@ def test_pool_has_free_slot_defaults_to_empty_headers_when_omitted(monkeypatch):
     class _FakeResp:
         status_code = 200
         def json(self):
-            return {"free_slots": 1}
+            return {}
 
     class _FakeClient:
         async def __aenter__(self):
@@ -142,8 +140,9 @@ def test_pool_has_free_slot_defaults_to_empty_headers_when_omitted(monkeypatch):
             return _FakeResp()
 
     monkeypatch.setattr(pool_status.httpx, "AsyncClient", lambda timeout, trust_env, **_k: _FakeClient())
-    asyncio.run(pool_status.pool_has_free_slot())
+    result = asyncio.run(pool_status.pool_roster_state())
     assert captured["headers"] == {}
+    assert result == "unreachable"
 
 
 def _code_lines(relpath: str) -> list[str]:
@@ -159,26 +158,21 @@ def _real_call_sites(relpath: str) -> list[str]:
     calls = []
     for ln in _code_lines(relpath):
         code = ln.split("#", 1)[0]  # drop a trailing inline comment too
-        calls.extend(re.findall(r"pool_has_free_slot\([^)]*\)", code))
+        calls.extend(re.findall(r"pool_roster_state\([^)]*\)", code))
     return calls
 
 
-def test_every_pool_has_free_slot_call_site_in_rem_loop_sends_headers():
-    """Source-level completeness check (call-site inventory, PR A5 fix
-    round hard requirement) -- every REAL pool_has_free_slot(...) call in
-    rem_loop.py must pass headers=, so REM never silently loses real
-    slot-awareness. Complements the functional proof above (that the
-    shared function actually forwards whatever it's given). Comment
-    mentions are excluded -- this counts invocations, not prose."""
+def test_every_pool_roster_state_call_site_in_rem_loop_sends_headers():
+    """Every pool_roster_state(...) call in rem_loop.py passes headers=, so REM reads the real roster."""
     calls = _real_call_sites("rem_loop.py")
-    assert calls, "expected at least one pool_has_free_slot(...) call site in rem_loop.py"
+    assert calls, "expected at least one pool_roster_state(...) call site in rem_loop.py"
     for call in calls:
         assert "headers=" in call, f"call site missing headers=: {call!r}"
 
 
-def test_every_pool_has_free_slot_call_site_in_consolidation_loop_sends_headers():
+def test_every_pool_roster_state_call_site_in_consolidation_loop_sends_headers():
     calls = _real_call_sites("consolidation_loop.py")
-    assert len(calls) >= 4, f"expected >=4 pool_has_free_slot(...) call sites, found {len(calls)}"
+    assert len(calls) >= 4, f"expected >=4 pool_roster_state(...) call sites, found {len(calls)}"
     for call in calls:
         assert "headers=" in call, f"call site missing headers=: {call!r}"
 

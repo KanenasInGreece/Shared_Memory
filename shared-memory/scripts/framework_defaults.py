@@ -15,9 +15,9 @@ from types import MappingProxyType
 
 FRAMEWORK_DEFAULTS = MappingProxyType({
 
-    # ── env-default rows — EMBEDDER_URL, RERANKER_URL, LLM_DEFAULT_TARGET,
-    # LLM_BACKENDS and the embed knobs take their fallback from this table;
-    # EMBED_MAX_CHARS is derived instead (see its note) ──────────────────────
+    # ── env-default rows — EMBEDDER_URL, RERANKER_URL and the embed knobs
+    # take their fallback from this table; EMBED_MAX_CHARS is derived
+    # (see its note). LLM backends are LLM_BACKENDS_JSON only. ──────────────
 
     "EMBEDDER_URL": MappingProxyType({
         "default": "http://localhost:8070",
@@ -43,31 +43,6 @@ FRAMEWORK_DEFAULTS = MappingProxyType({
             "coordinator.py (RERANK_URL, via _encoder_url)",
         ),
         "note": "Same one-setting-moves-both-consumers shape as EMBEDDER_URL.",
-    }),
-    "LLM_DEFAULT_TARGET": MappingProxyType({
-        "default": "http://localhost:5000",
-        "kind": "env-default",
-        "idiom": "get",
-        "consumers": ("hive_mind_proxy.py (DEFAULT_TARGET)",),
-        "note": (
-            "The consumer uses .get(name, default), so a present-but-empty value "
-            "is the empty string, not this default. Because the LLM_BACKENDS "
-            "fallback wraps it verbatim, the pool becomes [''] (pinned by a test; "
-            "normalising the idiom would change what an empty value does)."
-        ),
-    }),
-    "LLM_BACKENDS": MappingProxyType({
-        "default": "",
-        "kind": "env-default",
-        "idiom": "get",
-        "consumers": ("hive_mind_proxy.py (_load_llm_backends fallback)",),
-        "note": (
-            "LLM_BACKENDS_JSON is tried first and wins when it yields any usable "
-            "URL; when it is absent, invalid, empty or excludes every entry, the "
-            "legacy LLM_BACKENDS CSV is read. Only when that CSV also yields no "
-            "URL (absent, empty, or every entry rejected) is the single-entry pool "
-            "[(LLM_DEFAULT_TARGET, 1.0)] used."
-        ),
     }),
     "EMBED_MAX_CONTEXT_TOKENS": MappingProxyType({
         "default": 8192,
@@ -202,7 +177,7 @@ FRAMEWORK_DEFAULTS = MappingProxyType({
             "bypass pooling, cache-affinity, wedge detection and "
             "telemetry, so it is deliberately NOT an env knob: the "
             "shipped compose fixes the topology. LLM choice belongs to "
-            "the gateway (LLM_BACKENDS), never to a client of it."
+            "the gateway (LLM_BACKENDS_JSON), never to a client of it."
         ),
     }),
     "RETRIEVER_URL": MappingProxyType({

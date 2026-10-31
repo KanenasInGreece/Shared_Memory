@@ -28,13 +28,15 @@ SCRIPT_PATH = os.path.join(
 )
 
 
-def _run(args=(), env_overrides=None, tmp_path=None, python_flags=(), timeout=30):
+def _run(args=(), env_overrides=None, tmp_path=None, python_flags=(), timeout=30, env_unset=()):
     env = dict(os.environ)
     env.setdefault("SECURE_ENV_FILE", "")
     env["GATEWAY_UNIT"] = "sm-test-nonexistent-gateway.service"
     if tmp_path is not None:
         env["CREDENTIAL_AUDIT_LOG_PATH"] = str(tmp_path / "credential-audit.jsonl")
         env["CAPACITY_LOG_PATH"] = str(tmp_path / "capacity-derivations.jsonl")
+    for key in env_unset:
+        env.pop(key, None)
     if env_overrides:
         env.update(env_overrides)
     cmd = [sys.executable, *python_flags, SCRIPT_PATH, *args]
@@ -129,12 +131,14 @@ def test_present_but_empty_state_for_an_or_idiom_site_falls_back_to_default(monk
 
 
 def test_present_but_empty_state_for_a_get_idiom_site_stays_empty(monkeypatch):
+    """A get-idiom row still keeps a present-but-empty value. LLM_DEFAULT_TARGET
+    is no longer a row; EMBED_MAX_CONTEXT_TOKENS is."""
     monkeypatch.setenv("SECURE_ENV_FILE", "")
-    monkeypatch.setenv("LLM_DEFAULT_TARGET", "")
+    monkeypatch.setenv("EMBED_MAX_CONTEXT_TOKENS", "")
     check_config.phase_a_render()
-    v = check_config._verdict("LLM_DEFAULT_TARGET")
+    v = check_config._verdict("EMBED_MAX_CONTEXT_TOKENS")
     assert v["state"] == "present-but-empty"
-    assert v["effective"] == ""  # NOT the default — get idiom, matches the known latent
+    assert v["effective"] == ""
 
 
 def test_inherited_default_state_when_absent(monkeypatch):
@@ -184,37 +188,30 @@ def test_secret_census_notes_canonical_normalisation(monkeypatch):
 # ── Phase B: role-error → exit 1, malformed config → exit 2 (no traceback) ─
 
 def test_role_config_error_leads_to_exit_1_would_refuse_to_start(tmp_path):
-    backends_json = json.dumps([{"url": "http://a:5000", "roles": ["bogus"]}])
+    """A leftover roles list is not a startup refusal. The entry loads and the gateway would boot."""
+    backends_json = json.dumps([{"url": "http://a:5000", "roles": ["bogus"], "n_ctx": 8192, "max_output_tokens": 2048}])
     proc = _run(env_overrides={"SECURE_ENV_FILE": "", "LLM_BACKENDS_JSON": backends_json},
                 tmp_path=tmp_path)
-    assert proc.returncode == 1, proc.stdout + proc.stderr
-    assert "WOULD REFUSE TO START" in proc.stdout
+    full = proc.stdout + proc.stderr
+    assert proc.returncode == 0, full
+    assert "http://a:5000" in proc.stdout
+    assert "WOULD REFUSE TO START" not in full
+    assert "would boot" in proc.stdout.lower()
     assert "Traceback" not in proc.stderr
-    # H2 (HYG round S2): the false-comfort line -- "the gateway would boot
-    # on the legacy fallback" (LLM_POOL_FALLBACK_REASON's own wording) --
-    # must never appear alongside a genuine exit-1 refusal. By construction
-    # (hive_mind_proxy._load_llm_backends(): an entry with a bad `roles`
-    # value is still ADDED to the returned pool, so `if urls:` is true and
-    # LLM_POOL_FALLBACK_REASON is never set for this fixture) the two do not
-    # co-occur today -- this pins that outcome so a future change to either
-    # side cannot silently reintroduce the false comfort.
-    assert "would boot" not in proc.stdout.lower()
 
 
 def test_malformed_llm_backends_json_array_of_strings_is_excluded_not_an_import_crash(tmp_path):
-    """Valid JSON, valid array — but each ENTRY is a string, not an object.
-    The loader used to AttributeError at import ('str' has no .get). It now
-    excludes the entry, falls back, and still boots — same class as a
-    missing url. Phase A names the shape; Phase B names the fallback.
-    Neither phase may print the string value (it can be a credentialed URL)."""
+    """A string entry is a declaration FATAL (field entry), exit 1.
+    The string value can be a credentialed URL and must not be printed."""
     proc = _run(env_overrides={"SECURE_ENV_FILE": "", "LLM_BACKENDS_JSON": '["http://a:5000"]'},
                 tmp_path=tmp_path)
-    assert proc.returncode == 0, proc.stdout + proc.stderr
+    full = proc.stdout + proc.stderr
+    assert proc.returncode == 1, full
     assert "Phase A" in proc.stdout
-    assert "not an object" in proc.stdout
-    assert "DECLARED FLEET NOT USABLE" in proc.stdout or "no usable backend" in proc.stdout
-    assert "AttributeError" not in proc.stdout
-    assert "http://a:5000" not in proc.stdout
+    assert "field entry" in proc.stdout
+    assert "WOULD REFUSE TO START" in proc.stdout
+    assert "AttributeError" not in full
+    assert "http://a:5000" not in full
     assert "Traceback" not in proc.stderr
 
 
@@ -274,23 +271,22 @@ def test_valid_config_with_a_local_backend_is_exit_0(tmp_path):
 #    declared fleet. ───────────────────────────────────────────────────────
 
 def test_llm_pool_fallback_reason_is_rendered_prominently_and_exit_stays_0(tmp_path):
-    """Ruled: exit STAYS 0 — the gateway genuinely DOES boot on the legacy
-    fallback, and exit 1 must keep its one meaning ('would refuse to
-    start'), never acquire a second one ('boots on a fleet you probably
-    didn't intend'). This also corrects the original D3 wording gap: the
-    build brief said this input exits 2 — it does not; this warning is the
-    honest report."""
+    """Unusable JSON is a declaration FATAL. There is no legacy fallback."""
     proc = _run(env_overrides={"SECURE_ENV_FILE": "", "LLM_BACKENDS_JSON": "{not json"},
                 tmp_path=tmp_path)
-    assert proc.returncode == 0, proc.stdout + proc.stderr
-    assert "DECLARED FLEET NOT USABLE" in proc.stdout
-    assert "legacy fallback" in proc.stdout
+    full = proc.stdout + proc.stderr
+    assert proc.returncode == 1, full
+    assert "field json" in proc.stdout
+    assert "WOULD REFUSE TO START" in proc.stdout
+    assert "DECLARED FLEET NOT USABLE" not in full
+    assert "legacy fallback" not in full.lower()
+    assert "{not json" not in full
 
 
 def test_a_clean_llm_backends_json_shows_no_fallback_warning(tmp_path):
     """Negative case for the above: a genuinely usable declared fleet gets
     no fallback warning at all."""
-    proc = _run(env_overrides={"SECURE_ENV_FILE": "", "LLM_BACKENDS_JSON": '[{"url":"http://a:5000"}]'},
+    proc = _run(env_overrides={"SECURE_ENV_FILE": "", "LLM_BACKENDS_JSON": '[{"url":"http://a:5000", "n_ctx": 8192, "max_output_tokens": 2048}]'},
                 tmp_path=tmp_path)
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert "DECLARED FLEET NOT USABLE" not in proc.stdout
@@ -312,25 +308,27 @@ def test_config_empty_is_rendered_as_its_own_flagged_line_and_exit_stays_0(tmp_p
 
 
 def test_config_empty_line_absent_when_a_backend_is_declared(tmp_path):
-    """The existing FALLBACK_REASON rendering is unchanged, and a genuinely
-    declared, usable fleet shows NEITHER flagged line."""
+    """A CSV LLM_BACKENDS line is not a declaration. The roster stays empty."""
     proc = _run(env_overrides={"SECURE_ENV_FILE": "", "LLM_BACKENDS": "http://a:5000"},
                 tmp_path=tmp_path)
-    assert proc.returncode == 0, proc.stdout + proc.stderr
-    assert "NO BACKEND DECLARED" not in proc.stdout
-    assert "DECLARED FLEET NOT USABLE" not in proc.stdout
+    full = proc.stdout + proc.stderr
+    assert proc.returncode == 0, full
+    assert "NO BACKEND DECLARED" in proc.stdout
+    assert "DECLARED FLEET NOT USABLE" not in full
+    assert "http://a:5000" not in full
 
 
 def test_config_empty_and_fallback_reason_lines_are_mutually_exclusive(tmp_path):
-    """D1: a declared-but-excluded fleet (FALLBACK_REASON) is never ALSO
-    reported as CONFIG_EMPTY (nothing declared at all) — the two states
-    are mutually exclusive by construction, and this is the existing
-    FALLBACK_REASON line's rendering left unchanged by the W3 addition."""
+    """Unusable JSON empties the pool and refuses startup. No fallback line."""
     proc = _run(env_overrides={"SECURE_ENV_FILE": "", "LLM_BACKENDS_JSON": "{not json"},
                 tmp_path=tmp_path)
-    assert proc.returncode == 0, proc.stdout + proc.stderr
-    assert "DECLARED FLEET NOT USABLE" in proc.stdout
-    assert "NO BACKEND DECLARED" not in proc.stdout
+    full = proc.stdout + proc.stderr
+    assert proc.returncode == 1, full
+    assert "NO BACKEND DECLARED" in proc.stdout
+    assert "WOULD REFUSE TO START" in proc.stdout
+    assert "field json" in proc.stdout
+    assert "DECLARED FLEET NOT USABLE" not in full
+    assert "{not json" not in full
 
 
 # ── §6.2 (M11 + case-0 census, W4/decision:1824) — present-but-empty /
@@ -339,7 +337,7 @@ def test_config_empty_and_fallback_reason_lines_are_mutually_exclusive(tmp_path)
 
 def test_w4_census_zero_latents_on_a_clean_declared_fleet(tmp_path):
     proc = _run(env_overrides={"SECURE_ENV_FILE": "",
-                                "LLM_BACKENDS_JSON": '[{"url":"http://a:5000","private_ok":true}]'},
+                                "LLM_BACKENDS_JSON": '[{"url":"http://a:5000","private_ok":true, "n_ctx": 8192, "max_output_tokens": 2048}]'},
                 tmp_path=tmp_path)
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert "W4 census" in proc.stdout
@@ -363,30 +361,34 @@ def test_w4_census_counts_present_but_empty_llm_backends_json(tmp_path):
 
 
 def test_w4_census_counts_the_llm_default_target_composed_empty_latent(tmp_path):
-    """The known latent framework_defaults.py documents: LLM_DEFAULT_TARGET
-    present-but-empty, with neither LLM_BACKENDS nor LLM_BACKENDS_JSON
-    declared, composes to `LLM_BACKENDS == ['']`."""
+    """An empty LLM_DEFAULT_TARGET is ignored. It does not compose a backend."""
     proc = _run(env_overrides={"SECURE_ENV_FILE": "", "LLM_DEFAULT_TARGET": ""},
                 tmp_path=tmp_path)
-    assert proc.returncode == 0, proc.stdout + proc.stderr
-    assert "LLM_BACKENDS composed to ['']" in proc.stdout
+    full = proc.stdout + proc.stderr
+    assert proc.returncode == 0, full
+    assert "NO BACKEND DECLARED" in proc.stdout
+    assert "LLM_BACKENDS composed to ['']" not in full
 
 
 # ── §6.3 (R-B announce, W4/decision:1824) — a roles-carrying entry with no
 #    explicit private_ok no longer serves role-less traffic. ───────────────
 
 def test_r_b_announce_on_a_roles_only_entry_with_no_explicit_private_ok(tmp_path):
+    """A roles list does not keep the backend out of the roster."""
     proc = _run(env_overrides={"SECURE_ENV_FILE": "",
-                                "LLM_BACKENDS_JSON": '[{"url":"http://a:5000","roles":["extract"]}]'},
+                                "LLM_BACKENDS_JSON": '[{"url":"http://a:5000","roles":["extract"], "n_ctx": 8192, "max_output_tokens": 2048}]'},
                 tmp_path=tmp_path)
-    assert proc.returncode == 0, proc.stdout + proc.stderr
-    assert "R-B (W4): role-less traffic no longer reaches this backend" in proc.stdout
+    full = proc.stdout + proc.stderr
+    assert proc.returncode == 0, full
+    assert "http://a:5000" in proc.stdout
+    assert "would boot" in proc.stdout
+    assert "R-B (W4)" not in full
 
 
 def test_r_b_announce_absent_when_private_ok_is_explicit(tmp_path):
     proc = _run(env_overrides={"SECURE_ENV_FILE": "",
                                 "LLM_BACKENDS_JSON":
-                                    '[{"url":"http://a:5000","roles":["extract"],"private_ok":true}]'},
+                                    '[{"url":"http://a:5000","roles":["extract"],"private_ok":true, "n_ctx": 8192, "max_output_tokens": 2048}]'},
                 tmp_path=tmp_path)
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert "R-B (W4)" not in proc.stdout
@@ -398,16 +400,20 @@ def test_r_b_announce_absent_when_private_ok_is_explicit(tmp_path):
 #    also stop reading as an unqualified all-clear once either fires. ──────
 
 def test_m5_announce_on_a_credentialed_backend_with_neither_roles_nor_private_ok(tmp_path):
+    """A credentialed entry with no roles is in the roster. The key stays out of the report."""
     proc = _run(env_overrides={"SECURE_ENV_FILE": "", "AGENT_TOKENS": "claude:tok_abc",
                                 "DEEPSEEK_API_KEY": "sk-test",
                                 "LLM_BACKENDS_JSON":
-                                    '[{"url":"https://api.deepseek.com/v1","token_env":"DEEPSEEK_API_KEY"}]'},
+                                    '[{"url":"https://api.deepseek.com/v1","token_env":"DEEPSEEK_API_KEY", "n_ctx": 8192, "max_output_tokens": 2048}]'},
                 tmp_path=tmp_path)
-    assert proc.returncode == 0, proc.stdout + proc.stderr
-    assert "M-5' (W4): configured but will NEVER be selected" in proc.stdout
-    assert "SEC M-1" in proc.stdout
+    full = proc.stdout + proc.stderr
+    assert proc.returncode == 0, full
+    assert "https://api.deepseek.com/v1" in proc.stdout
+    assert "has_credential=True" in proc.stdout
+    assert "sk-test" not in full
+    assert "M-5' (W4)" not in full
+    assert "NEVER be selected" not in full
     assert "none — the gateway would boot with this configuration." in proc.stdout
-    assert "Degraded, not clean" in proc.stdout
 
 
 def test_m5_announce_absent_when_roles_are_declared(tmp_path):
@@ -415,7 +421,7 @@ def test_m5_announce_absent_when_roles_are_declared(tmp_path):
                                 "DEEPSEEK_API_KEY": "sk-test",
                                 "LLM_BACKENDS_JSON":
                                     '[{"url":"https://api.deepseek.com/v1","token_env":"DEEPSEEK_API_KEY",'
-                                    '"roles":["extract"]}]'},
+                                    '"roles":["extract"], "n_ctx": 8192, "max_output_tokens": 2048}]'},
                 tmp_path=tmp_path)
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert "M-5' (W4)" not in proc.stdout
@@ -423,25 +429,31 @@ def test_m5_announce_absent_when_roles_are_declared(tmp_path):
 
 
 def test_p5_announce_roles_absent_says_safe_by_construction(tmp_path):
+    """private_ok false does not exclude the backend and does not degrade the roster."""
     proc = _run(env_overrides={"SECURE_ENV_FILE": "", "AGENT_TOKENS": "",
                                 "LLM_BACKENDS_JSON":
-                                    '[{"url":"http://a:5000","private_ok":false}]'},
+                                    '[{"url":"http://a:5000","private_ok":false, "n_ctx": 8192, "max_output_tokens": 2048}]'},
                 tmp_path=tmp_path)
-    assert proc.returncode == 0, proc.stdout + proc.stderr
-    assert "P-5' (W4)" in proc.stdout
-    assert "safe by construction" in proc.stdout
-    assert "NOT safe by construction" not in proc.stdout
-    assert "Degraded, not clean" in proc.stdout
+    full = proc.stdout + proc.stderr
+    assert proc.returncode == 0, full
+    assert "http://a:5000" in proc.stdout
+    assert "would boot" in proc.stdout
+    assert "P-5' (W4)" not in full
+    assert "Degraded, not clean" not in proc.stdout
 
 
 def test_p5_announce_roles_carrying_says_not_safe_by_construction(tmp_path):
+    """private_ok false plus a roles list still loads. Neither key is a refusal."""
     proc = _run(env_overrides={"SECURE_ENV_FILE": "", "AGENT_TOKENS": "",
                                 "LLM_BACKENDS_JSON":
-                                    '[{"url":"http://a:5000","private_ok":false,"roles":["extract"]}]'},
+                                    '[{"url":"http://a:5000","private_ok":false,"roles":["extract"], "n_ctx": 8192, "max_output_tokens": 2048}]'},
                 tmp_path=tmp_path)
-    assert proc.returncode == 0, proc.stdout + proc.stderr
-    assert "P-5' (W4)" in proc.stdout
-    assert "NOT safe by construction" in proc.stdout
+    full = proc.stdout + proc.stderr
+    assert proc.returncode == 0, full
+    assert "http://a:5000" in proc.stdout
+    assert "would boot" in proc.stdout
+    assert "P-5' (W4)" not in full
+    assert "WOULD REFUSE TO START" not in full
 
 
 def test_p5_announce_absent_on_an_undeclared_backend(tmp_path):
@@ -449,7 +461,7 @@ def test_p5_announce_absent_on_an_undeclared_backend(tmp_path):
     must NOT fire on the pervasive, unremarkable default -- an undeclared
     backend never states private_ok at all."""
     proc = _run(env_overrides={"SECURE_ENV_FILE": "", "AGENT_TOKENS": "",
-                                "LLM_BACKENDS_JSON": '[{"url":"http://a:5000","roles":["extract"]}]'},
+                                "LLM_BACKENDS_JSON": '[{"url":"http://a:5000","roles":["extract"], "n_ctx": 8192, "max_output_tokens": 2048}]'},
                 tmp_path=tmp_path)
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert "P-5' (W4)" not in proc.stdout
@@ -457,7 +469,7 @@ def test_p5_announce_absent_on_an_undeclared_backend(tmp_path):
 
 def test_no_degraded_warning_qualifier_on_a_fully_explicit_clean_fleet(tmp_path):
     proc = _run(env_overrides={"SECURE_ENV_FILE": "", "AGENT_TOKENS": "claude:tok_abc",
-                                "LLM_BACKENDS_JSON": '[{"url":"http://a:5000","private_ok":true}]'},
+                                "LLM_BACKENDS_JSON": '[{"url":"http://a:5000","private_ok":true, "n_ctx": 8192, "max_output_tokens": 2048}]'},
                 tmp_path=tmp_path)
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert "none — the gateway would boot with this configuration." in proc.stdout
@@ -472,39 +484,59 @@ def test_no_degraded_warning_qualifier_on_a_fully_explicit_clean_fleet(tmp_path)
 #    anything, including a key). N2: mutation-checked below. ───────────────
 
 def test_extra_body_recognised_deepseek_shape_is_rendered(tmp_path):
+    """The report lists the backend and does not print the extra_body dict."""
     proc = _run(env_overrides={"SECURE_ENV_FILE": "",
                                 "LLM_BACKENDS_JSON":
-                                    '[{"url":"http://a:5000",'
+                                    '[{"url":"http://a:5000","n_ctx":8192,"max_output_tokens":2048,'
                                     '"extra_body":{"thinking":{"type":"disabled"}}}]'},
                 tmp_path=tmp_path)
-    assert proc.returncode == 0, proc.stdout + proc.stderr
-    assert "thinking suppression declared" in proc.stdout
-    assert "DeepSeek" in proc.stdout
-    # Never the raw dict contents alongside the recognised-shape line.
-    assert '"type": "disabled"' not in proc.stdout
-    assert '"type":"disabled"' not in proc.stdout
+    full = proc.stdout + proc.stderr
+    assert proc.returncode == 0, full
+    assert "http://a:5000" in proc.stdout
+    assert '"type": "disabled"' not in full
+    assert '"type":"disabled"' not in full
+    assert "disabled" not in full
 
 
 def test_extra_body_absent_renders_none_declared(tmp_path):
-    proc = _run(env_overrides={"SECURE_ENV_FILE": "", "LLM_BACKENDS_JSON": '[{"url":"http://a:5000"}]'},
+    proc = _run(env_overrides={"SECURE_ENV_FILE": "", "LLM_BACKENDS_JSON": '[{"url":"http://a:5000", "n_ctx": 8192, "max_output_tokens": 2048}]'},
                 tmp_path=tmp_path)
-    assert proc.returncode == 0, proc.stdout + proc.stderr
-    assert "extra_body: none declared" in proc.stdout
+    full = proc.stdout + proc.stderr
+    assert proc.returncode == 0, full
+    assert "http://a:5000" in proc.stdout
+    assert "extra_body" not in full
 
 
 def test_extra_body_unrecognised_shape_renders_present_unrecognised_never_raw(tmp_path):
-    # N2: the unrecognised case must render its OWN fixed phrase, never the
-    # dict's contents -- extra_body is operator-supplied and could carry
-    # anything, including a key.
+    # extra_body is operator-supplied and could carry a key. The report must not print it.
     proc = _run(env_overrides={"SECURE_ENV_FILE": "",
                                 "LLM_BACKENDS_JSON":
-                                    '[{"url":"http://a:5000",'
+                                    '[{"url":"http://a:5000","n_ctx":8192,"max_output_tokens":2048,'
                                     '"extra_body":{"some_future_key":"sk-should-never-appear"}}]'},
                 tmp_path=tmp_path)
-    assert proc.returncode == 0, proc.stdout + proc.stderr
-    assert "present, unrecognised shape" in proc.stdout
-    assert "sk-should-never-appear" not in proc.stdout
-    assert "some_future_key" not in proc.stdout
+    full = proc.stdout + proc.stderr
+    assert proc.returncode == 0, full
+    assert "http://a:5000" in proc.stdout
+    assert "sk-should-never-appear" not in full
+    assert "some_future_key" not in full
+
+
+def test_token_env_key_is_absent_from_check_config_output(tmp_path):
+    """A key parked in token_env is not a variable name and must not be printed."""
+    secret = "sk-fixture-not-a-name-9917"
+    proc = _run(env_overrides={
+        "SECURE_ENV_FILE": "",
+        "LLM_BACKENDS_JSON": json.dumps([{
+            "url": "http://a:5000",
+            "n_ctx": 8192,
+            "max_output_tokens": 2048,
+            "token_env": secret,
+        }]),
+    }, tmp_path=tmp_path)
+    full = proc.stdout + proc.stderr
+    assert secret not in full
+    assert secret.upper() not in full
+    assert "<not a variable name>" in full
 
 
 def test_phase_a_flags_openai_base_url_key_without_printing_the_url(tmp_path):
@@ -523,10 +555,11 @@ def test_phase_a_flags_openai_base_url_key_without_printing_the_url(tmp_path):
         tmp_path=tmp_path,
         python_flags=["-S"],
     )
-    assert proc.returncode == 0, proc.stdout + proc.stderr
-    assert "base_url" in proc.stdout
-    assert "field name is url" in proc.stdout
-    assert "api.example.invalid" not in proc.stdout
+    full = proc.stdout + proc.stderr
+    assert proc.returncode == 1, full
+    assert "field url" in proc.stdout
+    assert "exit 78" in proc.stdout
+    assert "api.example.invalid" not in full
 
 
 def test_check_config_module_contract_no_longer_says_extra_body_is_a_later_wave():
@@ -634,12 +667,15 @@ def test_would_refuse_line_and_role_errors_never_leak_a_raw_credential(tmp_path)
     tests/test_llm_backend_secrets.py's SEC-A tests instead). A query-string
     credential (R-2, NOT refused by A) is the fixture that still reaches
     _parse_roles unmodified, keeping this test's actual point intact."""
-    backends_json = ('[{"url":"http://a:5000?key=s3cr3t-in-url","roles":["bogus"]}]')
+    backends_json = ('[{"url":"http://a:5000?key=s3cr3t-in-url","roles":["bogus"], "n_ctx": 8192, "max_output_tokens": 2048}]')
     proc = _run(env_overrides={"SECURE_ENV_FILE": "", "LLM_BACKENDS_JSON": backends_json},
                 tmp_path=tmp_path)
-    assert proc.returncode == 1, proc.stdout + proc.stderr
-    assert "WOULD REFUSE TO START" in proc.stdout
-    assert "s3cr3t-in-url" not in proc.stdout
+    full = proc.stdout + proc.stderr
+    assert proc.returncode == 0, full
+    assert "http://a:5000" in proc.stdout
+    assert "WOULD REFUSE TO START" not in full
+    assert "s3cr3t-in-url" not in full
+    assert "?key=" not in full
 
 
 def test_userinfo_credential_username_never_reaches_check_config_output(tmp_path):
@@ -653,7 +689,7 @@ def test_userinfo_credential_username_never_reaches_check_config_output(tmp_path
     either half of a userinfo credential, even for an entry A excludes
     before check_config ever sees a role/refusal path for it), not an
     accidental drop."""
-    backends_json = '[{"url":"http://svc:s3cr3t-userinfo-pw@a:5000"}]'
+    backends_json = '[{"url":"http://svc:s3cr3t-userinfo-pw@a:5000", "n_ctx": 8192, "max_output_tokens": 2048}]'
     proc = _run(env_overrides={"SECURE_ENV_FILE": "", "LLM_BACKENDS_JSON": backends_json},
                 tmp_path=tmp_path)
     full_output = proc.stdout + proc.stderr
@@ -695,31 +731,6 @@ def test_proxy_bind_idiom_comes_from_the_framework_defaults_table():
 #    on a future rename. Same defensive shape as hive_mind_proxy.py's own
 #    _chmod_created_ancestors import guard (hive_mind_proxy.py:39-56). ─────
 
-class _FakeProxyMissingRoleErrors:
-    """A stand-in 'hive_mind_proxy' module missing ONLY the private
-    _LLM_BACKEND_ROLE_CONFIG_ERRORS symbol — everything else phase_b_
-    render() reads is present, so this isolates that one guard."""
-    LLM_BACKENDS = ["http://a:5000"]
-    LLM_WEIGHTS = {"http://a:5000": 1.0}
-    LLM_BACKEND_MODELS = {"http://a:5000": None}
-    LLM_BACKEND_ROLES = {"http://a:5000": None}
-    LLM_BACKEND_EXTRAS = {"http://a:5000": None}
-    LLM_BACKEND_NCTX = {"http://a:5000": None}
-    LLM_BACKEND_TOKENS = {"http://a:5000": None}
-    LLM_BACKEND_PRIVATE_OK = {"http://a:5000": True}
-    LLM_BACKEND_PRIVATE_OK_EXPLICIT = {"http://a:5000": False}
-    LLM_POOL_FALLBACK_REASON = None
-    AUTH_CONFIGURED_AT_STARTUP = True  # QA HIGH-1 (fix round): now read for P-5' rendering
-
-    @staticmethod
-    def require_auth_when_provider_keys_configured():
-        return None
-
-    @staticmethod
-    def require_valid_llm_routing_config():
-        return None
-
-
 class _FakeProxyMissingGuardFunctions:
     """A stand-in 'hive_mind_proxy' module missing BOTH guard functions —
     everything else present, isolating that guard."""
@@ -748,15 +759,6 @@ def _patch_import_to_return(monkeypatch, fake_module):
         return real_import(name, *a, **kw)
 
     monkeypatch.setattr(builtins, "__import__", _fake_import)
-
-
-def test_missing_role_config_errors_symbol_degrades_honestly_not_a_crash(monkeypatch):
-    _patch_import_to_return(monkeypatch, _FakeProxyMissingRoleErrors)
-    lines, code = check_config.phase_b_render()
-    body = "\n".join(lines)
-    assert "UNKNOWN" in body
-    assert "_LLM_BACKEND_ROLE_CONFIG_ERRORS" in body
-    assert code == 0  # the missing role-errors symbol alone doesn't block the guard-function path
 
 
 def test_missing_guard_functions_degrade_to_exit_2_not_a_crash(monkeypatch):
@@ -802,3 +804,470 @@ def test_phase_b_render_never_raises_on_a_broken_import(monkeypatch, tmp_path):
     assert any("UNAVAILABLE" in line for line in lines)
     assert any("RuntimeError" in line for line in lines)
     assert not any("synthetic import failure" in line for line in lines)
+
+
+def _stub_systemctl(tmp_path, body):
+    """A systemctl that prints one show result. The tests never call the host bus."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir(parents=True)
+    exe = bin_dir / "systemctl"
+    exe.write_text("#!/bin/sh\n" + body)
+    exe.chmod(0o755)
+    return bin_dir
+
+
+def test_restart_prevent_is_silent_without_systemctl(monkeypatch, tmp_path):
+    monkeypatch.setenv("PATH", str(tmp_path))
+    assert check_config._restart_prevent_line() is None
+
+
+def test_restart_prevent_ignores_a_unit_that_is_not_loaded(monkeypatch, tmp_path):
+    bindir = _stub_systemctl(
+        tmp_path, "echo LoadState=not-found\necho RestartPreventExitStatus=\nexit 0\n")
+    monkeypatch.setenv("PATH", str(bindir))
+    assert check_config._restart_prevent_line() is None
+
+
+def test_restart_prevent_matches_78_exactly(monkeypatch, tmp_path):
+    loaded = "echo LoadState=loaded\necho RestartPreventExitStatus=%s\nexit 0\n"
+    bindir = _stub_systemctl(tmp_path, loaded % "178")
+    monkeypatch.setenv("PATH", str(bindir))
+    warned = check_config._restart_prevent_line()
+    assert warned is not None and "RestartPreventExitStatus=78" in warned
+    bindir = _stub_systemctl(tmp_path / "exact", loaded % "178 78")
+    monkeypatch.setenv("PATH", str(bindir))
+    assert check_config._restart_prevent_line() is None
+
+
+def test_unit_environment_file_bad_json_is_not_would_boot(tmp_path):
+    """A bad EnvironmentFile= is what the gateway will load. A good shell does not hide it."""
+    unit_env = tmp_path / "unit.env"
+    unit_env.write_text('LLM_BACKENDS_JSON=[{"url":"http://a:5000","max_output_tokens":1}]\n')
+    bindir = _stub_systemctl(
+        tmp_path,
+        f"printf '%s\\n' 'EnvironmentFiles={unit_env} (ignore_errors=no)'\nexit 0\n",
+    )
+    proc = _run(env_overrides={
+        "PATH": str(bindir) + os.pathsep + os.environ.get("PATH", ""),
+        "SECURE_ENV_FILE": "",
+        "LLM_BACKENDS_JSON": '[{"url":"http://a:5000","n_ctx":8192,"max_output_tokens":2048}]',
+    }, tmp_path=tmp_path)
+    text = proc.stdout + proc.stderr
+    assert proc.returncode == 1, text
+    assert "would boot" not in proc.stdout
+    assert "WOULD REFUSE" in proc.stdout
+    assert "field n_ctx" in proc.stdout
+
+
+def test_good_shell_does_not_hide_a_bad_env_file(tmp_path):
+    bad = tmp_path / "bad.env"
+    bad.write_text('LLM_BACKENDS_JSON=[{"url":"http://a:5000","max_output_tokens":1}]\n')
+    proc = _run(env_overrides={
+        "SECURE_ENV_FILE": str(bad),
+        "LLM_BACKENDS_JSON": '[{"url":"http://a:5000","n_ctx":8192,"max_output_tokens":2048}]',
+    }, tmp_path=tmp_path)
+    text = proc.stdout + proc.stderr
+    assert proc.returncode == 1, text
+    assert "would boot" not in proc.stdout
+    assert "field n_ctx" in proc.stdout
+
+
+def test_bad_shell_does_not_stop_a_good_env_file(tmp_path):
+    good = tmp_path / "good.env"
+    good.write_text('LLM_BACKENDS_JSON=[{"url":"http://a:5000","n_ctx":8192,"max_output_tokens":2048}]\n')
+    proc = _run(env_overrides={
+        "SECURE_ENV_FILE": str(good),
+        "LLM_BACKENDS_JSON": '[{"url":"http://a:5000"}]',
+    }, tmp_path=tmp_path)
+    text = proc.stdout + proc.stderr
+    assert proc.returncode == 0, text
+    assert "would boot" in proc.stdout
+    assert "WOULD REFUSE" not in proc.stdout
+
+
+_GOOD_BACKEND = '[{"url":"http://127.0.0.1:9","n_ctx":8192,"max_output_tokens":2048}]'
+_KEYED_BACKEND = (
+    '[{"url":"http://127.0.0.1:9","token_env":"PROV_KEY",'
+    '"n_ctx":8192,"max_output_tokens":2048}]'
+)
+_FILE_ONLY_BACKEND = (
+    '[{"url":"http://127.0.0.1:9","token_env":"FILE_ONLY_TOKEN",'
+    '"n_ctx":8192,"max_output_tokens":2048}]'
+)
+_PROVIDER_MARKER = "sk-file-only-marker"
+
+
+def _show_stub(tmp_path, stdout, credential="file_only_token"):
+    """systemctl and busctl that print a fixed show result. The host bus is not called."""
+    bindir = tmp_path / "show-bin"
+    bindir.mkdir(parents=True)
+    systemctl = bindir / "systemctl"
+    systemctl.write_text("#!/usr/bin/env python3\nimport sys\nsys.stdout.write(" + repr(stdout) + ")\n")
+    systemctl.chmod(0o755)
+    payload = '{"type":"a(ss)","data":[["' + credential + '","/run/unused"]]}' if credential else '{"type":"a(ss)","data":[]}'
+    busctl = bindir / "busctl"
+    busctl.write_text("#!/usr/bin/env python3\nimport sys\nsys.stdout.write(" + repr(payload + "\n") + ")\n")
+    busctl.chmod(0o755)
+    return bindir
+
+
+def _show_stub_empty_bus(tmp_path, stdout):
+    return _show_stub(tmp_path, stdout, credential="")
+
+
+def test_file_override_is_visible_for_the_rest_of_phase_b(tmp_path):
+    """Values that exist only in the env file stay visible until phase B returns."""
+    env_file = tmp_path / "gateway.env"
+    env_file.write_text(
+        "ALLOW_UNAUTHENTICATED_PROVIDER_KEYS=1\n"
+        f"LLM_BACKENDS_JSON={_KEYED_BACKEND}\n"
+        f"PROV_KEY={_PROVIDER_MARKER}\n"
+    )
+    absent = (
+        "ALLOW_UNAUTHENTICATED_PROVIDER_KEYS", "LLM_BACKENDS_JSON",
+        "AGENT_TOKENS", "PROV_KEY", "EMBEDDER_URL",
+    )
+    allowed = _run(env_overrides={"SECURE_ENV_FILE": str(env_file)}, tmp_path=tmp_path, env_unset=absent)
+    text = allowed.stdout + allowed.stderr
+    assert allowed.returncode == 0, text
+    assert "WOULD REFUSE TO START" not in allowed.stdout
+    assert _PROVIDER_MARKER not in text
+
+    refused_file = tmp_path / "refused.env"
+    refused_file.write_text(
+        f"LLM_BACKENDS_JSON={_KEYED_BACKEND}\nPROV_KEY={_PROVIDER_MARKER}\n"
+    )
+    refused = _run(
+        env_overrides={"SECURE_ENV_FILE": str(refused_file)}, tmp_path=tmp_path, env_unset=absent,
+    )
+    refused_text = refused.stdout + refused.stderr
+    assert refused.returncode == 1, refused_text
+    assert "WOULD REFUSE TO START" in refused.stdout
+    assert _PROVIDER_MARKER not in refused_text
+
+
+def test_shell_override_is_visible_for_the_rest_of_phase_b(tmp_path):
+    """The same auth override in the process environment, with no env file, still decides the exit."""
+    absent = ("AGENT_TOKENS",)
+    allowed = _run(env_overrides={
+        "SECURE_ENV_FILE": "",
+        "ALLOW_UNAUTHENTICATED_PROVIDER_KEYS": "1",
+        "LLM_BACKENDS_JSON": _KEYED_BACKEND,
+        "PROV_KEY": _PROVIDER_MARKER,
+    }, tmp_path=tmp_path, env_unset=absent)
+    text = allowed.stdout + allowed.stderr
+    assert allowed.returncode == 0, text
+    assert "WOULD REFUSE TO START" not in allowed.stdout
+    assert _PROVIDER_MARKER not in text
+
+    refused = _run(env_overrides={
+        "SECURE_ENV_FILE": "",
+        "LLM_BACKENDS_JSON": _KEYED_BACKEND,
+        "PROV_KEY": _PROVIDER_MARKER,
+    }, tmp_path=tmp_path, env_unset=("AGENT_TOKENS", "ALLOW_UNAUTHENTICATED_PROVIDER_KEYS"))
+    refused_text = refused.stdout + refused.stderr
+    assert refused.returncode == 1, refused_text
+    assert "WOULD REFUSE TO START" in refused.stdout
+    assert _PROVIDER_MARKER not in refused_text
+
+
+def test_file_json_with_a_unit_token_keeps_the_hidden_credential_note(tmp_path):
+    """JSON that lives only in the file still names a token the unit supplies."""
+    env_file = tmp_path / "gateway.env"
+    env_file.write_text(f"LLM_BACKENDS_JSON={_FILE_ONLY_BACKEND}\n")
+    bindir = _show_stub(
+        tmp_path,
+        "Environment=\nEnvironmentFiles=\nId=hive-mind-gateway.service\n",
+    )
+    proc = _run(env_overrides={
+        "PATH": str(bindir) + os.pathsep + os.environ.get("PATH", ""),
+        "SECURE_ENV_FILE": str(env_file),
+    }, tmp_path=tmp_path, env_unset=("LLM_BACKENDS_JSON", "FILE_ONLY_TOKEN", "AGENT_TOKENS"))
+    text = proc.stdout + proc.stderr
+    assert proc.returncode == 0, text
+    assert "note: FILE_ONLY_TOKEN is supplied by the gateway's systemd unit" in proc.stdout
+
+    quiet = _show_stub_empty_bus(
+        tmp_path / "quiet",
+        "Environment=\nEnvironmentFiles=\nId=hive-mind-gateway.service\n",
+    )
+    proc_quiet = _run(env_overrides={
+        "PATH": str(quiet) + os.pathsep + os.environ.get("PATH", ""),
+        "SECURE_ENV_FILE": str(env_file),
+    }, tmp_path=tmp_path, env_unset=("LLM_BACKENDS_JSON", "FILE_ONLY_TOKEN", "AGENT_TOKENS"))
+    assert "supplied by the gateway's systemd unit" not in proc_quiet.stdout
+
+
+def test_shell_json_with_a_unit_token_keeps_the_hidden_credential_note(monkeypatch):
+    """The same note when the JSON is in the process environment and no unit is loaded."""
+    import migrate_env as mig
+    monkeypatch.setenv("SECURE_ENV_FILE", "")
+    monkeypatch.setenv("LLM_BACKENDS_JSON", _FILE_ONLY_BACKEND)
+    monkeypatch.delenv("FILE_ONLY_TOKEN", raising=False)
+    monkeypatch.delenv("AGENT_TOKENS", raising=False)
+    monkeypatch.setattr(
+        mig, "query_gateway_unit",
+        lambda unit: mig.UnitQuery("ok", credential_ids=frozenset({"file_only_token"})),
+    )
+    lines, code = check_config.phase_b_render()
+    text = "\n".join(lines)
+    assert code == 0, text
+    assert "note: FILE_ONLY_TOKEN is supplied by the gateway's systemd unit" in text
+
+    monkeypatch.setattr(
+        mig, "query_gateway_unit",
+        lambda unit: mig.UnitQuery("ok", credential_ids=frozenset()),
+    )
+    lines_quiet, code_quiet = check_config.phase_b_render()
+    assert code_quiet == 0
+    assert "supplied by the gateway's systemd unit" not in "\n".join(lines_quiet)
+
+
+def test_empty_file_keys_are_counted_and_the_shell_is_restored(monkeypatch, tmp_path):
+    """Empty LLM_BACKENDS_JSON and EMBEDDER_URL in the file count as two latents, then the shell returns."""
+    env_file = tmp_path / "empty.env"
+    env_file.write_text("LLM_BACKENDS_JSON=\nEMBEDDER_URL=\n")
+    monkeypatch.setenv("EMBEDDER_URL", "http://keep.example:9")
+    monkeypatch.setenv("LLM_BACKENDS_JSON", _GOOD_BACKEND)
+    monkeypatch.setenv("SECURE_ENV_FILE", str(env_file))
+    monkeypatch.delenv("AGENT_TOKENS", raising=False)
+    lines, code = check_config.phase_b_render()
+    text = "\n".join(lines)
+    assert code == 0, text
+    assert "2 latent case(s) present on this install." in text
+    assert os.environ["EMBEDDER_URL"] == "http://keep.example:9"
+    assert os.environ["LLM_BACKENDS_JSON"] == _GOOD_BACKEND
+
+
+def test_empty_shell_keys_count_as_two_latents(tmp_path):
+    """The same two empty assignments in the process environment, with no env file, count as two."""
+    proc = _run(env_overrides={
+        "SECURE_ENV_FILE": "",
+        "LLM_BACKENDS_JSON": "",
+        "EMBEDDER_URL": "",
+    }, tmp_path=tmp_path)
+    text = proc.stdout + proc.stderr
+    assert proc.returncode == 0, text
+    assert "2 latent case(s) present on this install." in proc.stdout
+
+
+def test_loaded_unit_ignores_a_shell_only_bad_json(tmp_path):
+    """A loaded unit with no JSON of its own does not take a bad shell LLM_BACKENDS_JSON. --apply ignores that shell too."""
+    bad = '[{"url":"http://a:5000"}]'
+    bindir = _show_stub(
+        tmp_path,
+        "Environment=\nEnvironmentFiles=\nId=hive-mind-gateway.service\n",
+    )
+    proc = _run(env_overrides={
+        "PATH": str(bindir) + os.pathsep + os.environ.get("PATH", ""),
+        "SECURE_ENV_FILE": "",
+        "LLM_BACKENDS_JSON": bad,
+    }, tmp_path=tmp_path, env_unset=("AGENT_TOKENS",))
+    text = proc.stdout + proc.stderr
+    assert proc.returncode == 0, text
+    assert "WOULD REFUSE" not in proc.stdout
+    assert "field n_ctx" not in proc.stdout
+
+    good = '[{"url":"http://a:5000","n_ctx":8192,"max_output_tokens":2048}]'
+    escaped = bad.replace("\\", "\\\\").replace('"', '\\"')
+    bindir_bad = _show_stub(
+        tmp_path / "unit-has-bad",
+        f'Environment="LLM_BACKENDS_JSON={escaped}"\nEnvironmentFiles=\nId=hive-mind-gateway.service\n',
+    )
+    proc_bad = _run(env_overrides={
+        "PATH": str(bindir_bad) + os.pathsep + os.environ.get("PATH", ""),
+        "SECURE_ENV_FILE": "",
+        "LLM_BACKENDS_JSON": good,
+    }, tmp_path=tmp_path, env_unset=("AGENT_TOKENS",))
+    bad_text = proc_bad.stdout + proc_bad.stderr
+    assert proc_bad.returncode == 1, bad_text
+    assert "field n_ctx" in proc_bad.stdout
+
+
+def test_no_loaded_unit_still_sees_a_bad_shell_json(tmp_path):
+    """With no loaded unit, the shell remains the picture. A bad shell JSON still refuses."""
+    proc = _run(env_overrides={
+        "SECURE_ENV_FILE": "",
+        "LLM_BACKENDS_JSON": '[{"url":"http://a:5000"}]',
+    }, tmp_path=tmp_path, env_unset=("AGENT_TOKENS",))
+    text = proc.stdout + proc.stderr
+    assert proc.returncode == 1, text
+    assert "field n_ctx" in proc.stdout
+
+
+def test_restart_warning_does_not_claim_an_excluded_roster(monkeypatch, tmp_path):
+    bindir = _stub_systemctl(
+        tmp_path,
+        "echo LoadState=loaded\necho RestartPreventExitStatus=\nexit 0\n",
+    )
+    monkeypatch.setenv("PATH", str(bindir))
+    monkeypatch.setenv("SECURE_ENV_FILE", "")
+    monkeypatch.setenv(
+        "LLM_BACKENDS_JSON",
+        '[{"url":"http://a:5000","n_ctx":8192,"max_output_tokens":2048}]',
+    )
+    monkeypatch.delenv("AGENT_TOKENS", raising=False)
+    import importlib
+    import hive_mind_proxy
+    importlib.reload(hive_mind_proxy)
+    lines, code = check_config.phase_b_render()
+    text = "\n".join(lines)
+    assert code == 0, text
+    assert "RestartPreventExitStatus=78" in text
+    assert "excluded backend or an empty roster" not in text
+
+
+_ACME_MARKER = "MARKER_ACME_HANDLE_LEAK"
+_WIDGET_MARKER = "MARKER_WIDGET_FILE_LEAK"
+_ACME_JSON = json.dumps([{
+    "url": "http://127.0.0.1:9",
+    "token_env": "ACME_HANDLE",
+    "n_ctx": 8192,
+    "max_output_tokens": 2048,
+}])
+
+
+def _logging_child_stub(tmp_path, show_text):
+    """systemctl and busctl that append the environment they inherited."""
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    log_path = tmp_path / "child-env.log"
+    show_path = tmp_path / "show.txt"
+    show_path.write_text(show_text)
+    bindir = tmp_path / "child-bin"
+    bindir.mkdir()
+    script = (
+        "#!/usr/bin/env python3\n"
+        "import os, sys\n"
+        "with open(os.environ['SM_CHILD_ENV_LOG'], 'a', encoding='utf-8') as fh:\n"
+        "    fh.write('cmd=' + os.path.basename(sys.argv[0]) + '\\n')\n"
+        "    for key in sorted(os.environ):\n"
+        "        fh.write(key + '=' + os.environ[key] + '\\n')\n"
+        "    fh.write('---\\n')\n"
+        "if os.path.basename(sys.argv[0]) == 'busctl':\n"
+        "    sys.stdout.write('{\"type\":\"a(ss)\",\"data\":[]}\\n')\n"
+        "    raise SystemExit(0)\n"
+        "if 'LoadState' in sys.argv:\n"
+        "    sys.stdout.write('LoadState=loaded\\nRestartPreventExitStatus=78\\n')\n"
+        "    raise SystemExit(0)\n"
+        "with open(os.environ['SM_CHILD_SHOW'], encoding='utf-8') as fh:\n"
+        "    sys.stdout.write(fh.read())\n"
+    )
+    for name in ("systemctl", "busctl"):
+        exe = bindir / name
+        exe.write_text(script)
+        exe.chmod(0o755)
+    return bindir, log_path
+
+
+def _quoted_environment(pairs):
+    lines = []
+    for key, value in pairs.items():
+        escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+        lines.append(f'Environment="{key}={escaped}"')
+    return "\n".join(lines) + "\n"
+
+
+def _secret_lines():
+    return (
+        f"LLM_BACKENDS_JSON={_ACME_JSON}\n"
+        f"ACME_HANDLE={_ACME_MARKER}\n"
+        "WIDGET_FILE=/tmp/widget-not-read\n"
+        f"WIDGET={_WIDGET_MARKER}\n"
+    )
+
+
+def test_unsuffixed_token_env_is_not_in_the_child_environment(tmp_path):
+    """A token_env name with no secret suffix, and a *_FILE stem, stay out of systemctl and busctl.
+
+    The value is declared in the env file, on the unit Environment= line, or in a unit EnvironmentFile=.
+    Both check_config modes are covered. The stub log is the environment the child inherited.
+    """
+    absent = (
+        "LLM_BACKENDS_JSON", "ACME_HANDLE", "WIDGET", "WIDGET_FILE", "AGENT_TOKENS",
+    )
+    sources = []
+
+    env_file = tmp_path / "gateway.env"
+    env_file.write_text(_secret_lines())
+    sources.append((
+        "dotenv",
+        env_file.parent / "dotenv-stub",
+        "Environment=\nEnvironmentFiles=\nId=hive-mind-gateway.service\n",
+        {"SECURE_ENV_FILE": str(env_file)},
+    ))
+
+    unit_show = tmp_path / "unit-show"
+    sources.append((
+        "environment",
+        unit_show,
+        _quoted_environment({
+            "LLM_BACKENDS_JSON": _ACME_JSON,
+            "ACME_HANDLE": _ACME_MARKER,
+            "WIDGET_FILE": "/tmp/widget-not-read",
+            "WIDGET": _WIDGET_MARKER,
+        }) + "EnvironmentFiles=\nId=hive-mind-gateway.service\n",
+        {"SECURE_ENV_FILE": ""},
+    ))
+
+    unit_env = tmp_path / "unit.env"
+    unit_env.write_text(_secret_lines())
+    sources.append((
+        "environment-file",
+        unit_env.parent / "file-stub",
+        f"Environment=\nEnvironmentFiles={unit_env} (ignore_errors=no)\nId=hive-mind-gateway.service\n",
+        {"SECURE_ENV_FILE": ""},
+    ))
+
+    for name, stub_dir, show_text, extra in sources:
+        for mode in (["--phase-a-only"], []):
+            bindir, log_path = _logging_child_stub(stub_dir / mode_label(mode), show_text)
+            proc = _run(mode, env_overrides={
+                "PATH": str(bindir) + os.pathsep + os.environ.get("PATH", ""),
+                "SM_CHILD_ENV_LOG": str(log_path),
+                "SM_CHILD_SHOW": str(stub_dir / mode_label(mode) / "show.txt"),
+                **extra,
+            }, tmp_path=tmp_path, env_unset=absent)
+            logged = log_path.read_text(encoding="utf-8") if log_path.exists() else ""
+            leaked = [line for line in logged.splitlines() if _ACME_MARKER in line or _WIDGET_MARKER in line]
+            assert logged, f"{name} {mode} did not run systemctl"
+            assert "cmd=systemctl" in logged
+            assert "cmd=busctl" in logged
+            assert leaked == [], f"{name} {mode} leaked {leaked}"
+            text = proc.stdout + proc.stderr
+            assert _ACME_MARKER not in text
+            assert _WIDGET_MARKER not in text
+            assert "Traceback" not in proc.stderr
+
+
+def mode_label(mode):
+    return "phase-a" if mode else "full"
+
+
+def test_non_utf8_unit_environment_file_does_not_exit_0(tmp_path):
+    """A unit EnvironmentFile that is not UTF-8 is named and is not a clean check."""
+    marker = "MARKER_NOTUTF8_UNIT"
+    unit_env = tmp_path / "unit.env"
+    unit_env.write_bytes(f"{marker}=value\xff\n".encode("latin-1"))
+    show = (
+        "Environment=\n"
+        f"EnvironmentFiles={unit_env} (ignore_errors=no)\n"
+        "Id=hive-mind-gateway.service\n"
+    )
+    good = '[{"url":"http://127.0.0.1:9","n_ctx":8192,"max_output_tokens":2048}]'
+    for mode in (["--phase-a-only"], []):
+        bindir = _stub_systemctl(tmp_path / mode_label(mode), f"printf '%s\\n' { _show_as_printf(show) }\nexit 0\n")
+        # The shell JSON is good. A swallowed decode used to leave that picture and exit 0.
+        proc = _run(mode, env_overrides={
+            "PATH": str(bindir) + os.pathsep + os.environ.get("PATH", ""),
+            "SECURE_ENV_FILE": "",
+            "LLM_BACKENDS_JSON": good,
+        }, tmp_path=tmp_path, env_unset=("AGENT_TOKENS",))
+        text = proc.stdout + proc.stderr
+        assert proc.returncode != 0, text
+        assert f"{unit_env} is not UTF-8" in proc.stdout
+        assert marker not in text
+        assert "Traceback" not in proc.stderr
+
+
+def _show_as_printf(show):
+    return " ".join("'" + line.replace("'", "'\\''") + "'" for line in show.splitlines())

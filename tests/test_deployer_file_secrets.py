@@ -940,7 +940,7 @@ def test_hostile_token_env_name_never_reaches_the_filesystem(monkeypatch, tmp_pa
     fake_file = _write_env_file(
         tmp_path,
         'LLM_BACKENDS_JSON=' + _json.dumps([
-            {"url": "https://x", "token_env": hostile_name}
+            {"url": "https://x", "token_env": hostile_name, "n_ctx": 8192, "max_output_tokens": 2048}
         ]) + "\n",
     )
     monkeypatch.setattr(secure_env, "__file__", str(fake_file))

@@ -4,9 +4,9 @@
 #
 # Implements A1–A9 of shared-memory/Documentation/postflight.md. Where this script and that document disagree, the document wins.
 #
-# A1 liveness and shape. A2 contract. A3 schema truth. A4 write path. A5 read path, graded. A6 baseline emission, never a gate. A7 conduct, stated not tested. A8 a real completion through the gateway, skipped when no backend is healthy. A9 encoder window: advertised context and a full payload (decision:2540).
+# A1 liveness and shape. A2 contract. A3 schema truth. A4 write path. A5 read path, graded. A6 baseline emission, never a gate. A7 conduct, stated not tested. A8 the last daemon chat this process forwarded, not a new completion. A9 encoder window: advertised context and a full payload (decision:2540).
 #
-# Exit 0 iff A1–A5, A8 and A9 all pass. A8 skips, and does not gate, when no reasoning backend is healthy. Run after first install and after every upgrade.
+# Exit 0 iff A1–A5 and A9 pass. A8 reports the last daemon chat and does not decide the exit. A8 warns, and does not fail the run, when this process has not forwarded a chat or the recorded status is not 2xx. A telemetry read that is not HTTP 200, or a body that is not JSON, is named. A8 does not prove a completion. Run after first install and after every upgrade.
 #
 # Read AGENT_TOKEN from a minted agent's skill .env. Never `. file` (that executes it) and never cat or grep it (fact:1499):
 #   AGENT_ENV=${AGENT_ENV:-$HOME/.claude/skills/shared-memory/.env}
@@ -130,84 +130,40 @@ else:
 }
 # <<< SELECT_SUMMARY_PHRASE
 
-# >>> A8_BACKEND_INFO (tests/test_postflight_a8.py extracts this block
-# Read llm_backends, the status map, not config.llm_backends. The configured list is never empty, so keying on it made an LLM-less install fail A8. Only status "ok" is healthy, and the map's keys are URLs, not credentials.
-a8_backend_info() {  # reads /health JSON on stdin
+# >>> A8_LAST_CALL (tests/test_postflight_a8.py extracts this block)
+# Reads /memory/telemetry. Prints status|backend|age_s, NOT_EXERCISED when the JSON has no chat, or UNPARSEABLE when the body is not JSON.
+a8_last_call() {
     python3 -c '
 import json, sys
+from datetime import datetime, timezone
 try:
-    d = json.load(sys.stdin)
+    d = json.loads(sys.stdin.read() or "")
 except Exception:
-    d = {}
-statuses = d.get("llm_backends")
-if not isinstance(statuses, dict):
-    statuses = {}
-healthy = [url for url, status in statuses.items() if status == "ok"]
-summary = ",".join(f"{url}={status}" for url, status in statuses.items())
-print(str(len(healthy)) + "|" + ",".join(healthy) + "|" + summary)
+    print("UNPARSEABLE")
+    raise SystemExit(0)
+root = d.get("telemetry") if isinstance(d, dict) and isinstance(d.get("telemetry"), dict) else d
+llm = root.get("llm") if isinstance(root, dict) else None
+pool = llm.get("pool") if isinstance(llm, dict) else None
+best = None
+if isinstance(pool, dict):
+    for url, entry in pool.items():
+        call = entry.get("last_call") if isinstance(entry, dict) else None
+        if not isinstance(call, dict) or not call.get("ts"):
+            continue
+        try:
+            when = datetime.fromisoformat(str(call["ts"]).replace("Z", "+00:00"))
+        except Exception:
+            continue
+        if best is None or when > best[0]:
+            best = (when, url, call.get("status"))
+if best is None:
+    print("NOT_EXERCISED")
+else:
+    age = max(0, int((datetime.now(timezone.utc) - best[0]).total_seconds()))
+    print(f"{best[2]}|{best[1]}|{age}")
 '
 }
-# <<< A8_BACKEND_INFO
-
-# >>> A8_GRADE_COMPLETION (tests/test_postflight_a8.py extracts this block
-# A 200 with empty content is not a completion, unless reasoning_content is a non-empty string: a thinking model can spend the whole token budget there and still prove the proxy join. A structured reasoning object must not pass.
-# SKIP_ is a named non-fatal 422 only when the body says no_eligible_backend, names a declaration, is not a fit failure, and X-SM-Fault-Origin is gateway. An upstream 422 is not that refusal.
-a8_grade_completion() {  # a8_grade_completion <status_code> <fault_origin_header>  (body on stdin)
-    local status="$1"
-    local fault_origin="$2"
-    if [[ -z "$status" || "$status" == "000" ]]; then
-        echo "NO_RESPONSE"
-        return
-    fi
-    if [[ "$status" == "422" ]]; then
-        # Body read FIRST, before the generic HTTP_$status branch below —
-        # the caller cannot discriminate afterward (it rm -f's the body
-        # file before its own case statement).
-        local body skip
-        body="$(cat)"
-        skip="$(printf '%s' "$body" | python3 -c '
-import json, sys
-try:
-    d = json.load(sys.stdin)
-except Exception:
-    sys.exit(0)
-if not isinstance(d, dict):
-    sys.exit(0)
-if (d.get("error") == "no_eligible_backend" and d.get("declaration") is not None
-        and d.get("constraint") != "fit"):
-    print(d["declaration"])
-')"
-        if [[ -n "$skip" && "$fault_origin" == "gateway" ]]; then
-            echo "SKIP_$skip"
-            return
-        fi
-        echo "HTTP_422"
-        return
-    fi
-    if [[ "$status" != "200" ]]; then
-        echo "HTTP_$status"
-        return
-    fi
-    python3 -c '
-import json, sys
-try:
-    d = json.load(sys.stdin)
-except Exception:
-    print("EMPTY"); sys.exit(0)
-try:
-    message = (d.get("choices") or [{}])[0].get("message", {})
-except (AttributeError, IndexError, TypeError):
-    message = {}
-if not isinstance(message, dict):
-    message = {}
-content = message.get("content")
-reasoning = message.get("reasoning_content")
-ok = ((isinstance(content, str) and content.strip())
-      or (isinstance(reasoning, str) and reasoning.strip()))
-print("OK" if ok else "EMPTY")
-'
-}
-# <<< A8_GRADE_COMPLETION
+# <<< A8_LAST_CALL
 
 # >>> A9_GRADE_WINDOW (tests/test_postflight_a9.py extracts this block
 # Prints VERDICT|DETAIL|WARNING from encoder_window. Verdicts: OK, STILL_NULL, FAIL_WINDOW_SHORT, FAIL_EMBED_OVERRUN, FAIL_MISSING_BLOCK, UNPARSEABLE, EMPTY.
@@ -368,7 +324,6 @@ print(",".join(k for k in ("nrem_daemon_process", "backend_capability", "depende
             fi
             token_missing=1
             afail[A5]=1
-            afail[A8]=1
             afail[A9]=1
         fi
     else
@@ -950,93 +905,43 @@ ok "A7 postflight's own store access was docker exec, read-only queries only —
 ok "A7 writes outside the gateway path: A6's baseline JSON, plus A3's throwaway verification database (created and dropped by verify_schema_init.py)"
 ok "A7 canaries live under the reserved project 'install-verification' and STAY in the corpus — the install's birth certificate"
 
-# ── A8 — reasoning-backend liveness, end to end ────────────────────────────────
+# ── A8 — last daemon chat ─────────────────────────────────────────────────────
 echo
-echo "A8 — reasoning-backend liveness, end to end:"
-# A8 posts a real completion through the proxy join. A doubled /v1 path 404'd silently while /health, a models probe, and every older assertion stayed green.
-reasoning_ms=""
-# The summary reads this skip name. A named skip leaves afail[A8] unset, so that array cannot tell a clean pass from a skipped A8.
-a8_skip_declaration=""
-if [[ "$token_missing" == "1" ]]; then
-    warn "A8 skipped — AGENT_TOKEN missing (see A1)"
-elif [[ "$gateway_down" == "1" ]]; then
-    bad A8 "skipped — gateway unreachable (see A1)"
+echo "A8 — last daemon chat this gateway forwarded:"
+# A8 does not post a completion. The record is in-memory, so right after an update it reads not exercised yet.
+a8_not_exercised=""
+if [[ "$gateway_down" == "1" ]]; then
+    a8_not_exercised="gateway unreachable (see A1)"
+    warn "A8 not exercised yet — ${a8_not_exercised}"
+elif [[ "$token_missing" == "1" ]]; then
+    a8_not_exercised="no agent token to read telemetry"
+    warn "A8 not exercised yet — ${a8_not_exercised}"
 else
-    # Read on '|' because the status field can be empty, and a prefix/suffix trim mishandles two delimiters.
-    backend_info="$(printf '%s' "${health_full:-}" | a8_backend_info)"
-    IFS='|' read -r backend_count backend_urls backend_status_summary <<< "$backend_info"
-    if [[ ! "$backend_count" =~ ^[0-9]+$ || "$backend_count" -lt 1 ]]; then
-        # No healthy backend is not a failure. A1 already reports llm down, and this branch must warn, never call bad().
-        warn "A8 skipped — no reasoning backend reported healthy on this gateway right now (per /health's llm_backends status map${backend_status_summary:+: $backend_status_summary}) — this is the documented non-fatal no-working-LLM state; A8 can never fail an install for it"
+    a8_body="$(mktemp)"
+    if [[ "$auth_on" == "1" && -n "${AGENT_TOKEN:-}" ]]; then
+        a8_http="$(curl -s --compressed --max-time 15 -o "$a8_body" -w '%{http_code}' -K - "$GATEWAY_URL/memory/telemetry" <<< "header = \"Authorization: Bearer $AGENT_TOKEN\"" || true)"
     else
-        # Same route and body the daemons send, including the default model id. A postflight-only model would hide a routing difference.
-        a8_model="$(read_env LLM_MODEL)"
-        [[ -z "$a8_model" ]] && a8_model="local-model"
-        a8_body_file="$(mktemp)"
-        a8_resp_file="$(mktemp)"
-        a8_header_file="$(mktemp)"
-        python3 -c '
-import json, sys
-print(json.dumps({
-    "model": sys.argv[1],
-    "messages": [{"role": "user", "content": "Reply with exactly one word: ok"}],
-    "max_tokens": 16,
-    "temperature": 0,
-}))
-' "$a8_model" > "$a8_body_file"
-
-        t0="$(now_ms)"
-        if [[ "$auth_on" == "1" && -n "${AGENT_TOKEN:-}" ]]; then
-            # Token via curl config on stdin, never argv — same idiom as A1
-            # (argv is world-readable in /proc/<pid>/cmdline for the
-            # request's lifetime).
-            a8_status="$(curl -s --compressed --max-time "$CLIENT_TIMEOUT" -K - \
-                    -H "Content-Type: application/json" \
-                    --data-binary @"$a8_body_file" \
-                    -D "$a8_header_file" -o "$a8_resp_file" -w '%{http_code}' \
-                    "$GATEWAY_URL/v1/chat/completions" \
-                    <<< "header = \"Authorization: Bearer $AGENT_TOKEN\"" 2>/dev/null)"
+        a8_http="$(curl -s --compressed --max-time 15 -o "$a8_body" -w '%{http_code}' "$GATEWAY_URL/memory/telemetry" || true)"
+    fi
+    if [[ "$a8_http" != "200" ]]; then
+        warn "A8 telemetry read failed: HTTP ${a8_http:-000}"
+        rm -f "$a8_body"
+    else
+        a8_parsed="$(a8_last_call < "$a8_body")"
+        rm -f "$a8_body"
+        if [[ "$a8_parsed" == UNPARSEABLE || -z "$a8_parsed" ]]; then
+            warn "A8 telemetry unparseable"
+        elif [[ "$a8_parsed" == NOT_EXERCISED ]]; then
+            a8_not_exercised="no daemon chat recorded in this gateway process"
+            warn "A8 not exercised yet — ${a8_not_exercised}"
         else
-            a8_status="$(curl -s --compressed --max-time "$CLIENT_TIMEOUT" \
-                    -H "Content-Type: application/json" \
-                    --data-binary @"$a8_body_file" \
-                    -D "$a8_header_file" -o "$a8_resp_file" -w '%{http_code}' \
-                    "$GATEWAY_URL/v1/chat/completions" 2>/dev/null)"
+            IFS='|' read -r a8_status a8_backend a8_age <<< "$a8_parsed"
+            if [[ "$a8_status" =~ ^2[0-9][0-9]$ ]]; then
+                ok "A8 last daemon chat: status ${a8_status} backend ${a8_backend} age ${a8_age}s"
+            else
+                warn "A8 last daemon chat: status ${a8_status} is not 2xx. backend ${a8_backend} age ${a8_age}s"
+            fi
         fi
-        t1="$(now_ms)"
-        rm -f "$a8_body_file"
-
-        # Read the fault-origin header here, outside the graded function. An upstream 422 is not a gateway refusal, and tail -1 keeps the last hop of a redirect.
-        a8_fault_origin="$(grep -i '^X-SM-Fault-Origin:' "$a8_header_file" 2>/dev/null \
-                | tail -1 | cut -d: -f2- | tr -d ' \t\r\n')"
-        rm -f "$a8_header_file"
-
-        a8_verdict="$(a8_grade_completion "$a8_status" "$a8_fault_origin" < "$a8_resp_file")"
-        rm -f "$a8_resp_file"
-
-        case "$a8_verdict" in
-            OK)
-                reasoning_ms=$((t1 - t0))
-                ok "A8 real completion returned through the gateway proxy path (model $a8_model, ${reasoning_ms} ms)"
-                ;;
-            EMPTY)
-                bad A8 "gateway returned HTTP 200 but no usable completion content or reasoning_content — a 200 with both fields empty/absent is a failure, not a pass. Healthy backend(s) at request time: ${backend_urls:-<none>}"
-                ;;
-            HTTP_404)
-                bad A8 "gateway returned 404 from the reasoning-backend proxy path — the known cause (D23) is a doubled /v1 path segment when a configured base already ends in /v1. Healthy backend(s) at request time: ${backend_urls:-<none>}"
-                ;;
-            SKIP_*)
-                # A named skip exits 0. Fit and other join defects stay fatal below. This is the only place the skip name is set; the summary reads it and does not look at afail.
-                a8_skip_declaration="${a8_verdict#SKIP_}"
-                warn "A8 skipped: ${a8_skip_declaration} — documented post-0.9.81 state; run check_config.py to see per-backend declaration status. Healthy backend(s) at request time: ${backend_urls:-<none>}"
-                ;;
-            HTTP_*)
-                bad A8 "gateway returned HTTP ${a8_verdict#HTTP_} from the reasoning-backend proxy path. Healthy backend(s) at request time: ${backend_urls:-<none>}"
-                ;;
-            *)
-                bad A8 "no response from $GATEWAY_URL/v1/chat/completions (timeout after ${CLIENT_TIMEOUT}s, or connection failed). Healthy backend(s) at request time: ${backend_urls:-<none>}"
-                ;;
-        esac
     fi
 fi
 
@@ -1120,17 +1025,15 @@ fi
 # ── Summary ───────────────────────────────────────────────────────────────────
 echo
 fail=0
+# A8 is named in these loops and does not decide the exit.
 for a in A1 A2 A3 A4 A5 A8 A9; do
     [[ "${afail[$a]:-0}" == "1" ]] && fail=1
 done
 if [[ "$fail" -eq 0 ]]; then
-    if [[ -n "${a8_skip_declaration:-}" ]]; then
-        # ND6: the skip is loud at the A8 check itself, but must survive a
-        # scrolled-past terminal — a passing run with A8 named-skipped reads
-        # identically to a full pass unless the summary says otherwise.
-        grn "Postflight passed (A1–A5, A8 skipped: ${a8_skip_declaration}, A9). The install works end to end for what is declared; A6's baseline is your performance reference."
+    if [[ -n "${a8_not_exercised:-}" ]]; then
+        grn "Postflight passed (A1–A5 and A9). A8 reports and does not decide. A8 not exercised yet. A fresh process has no daemon chat to report; A6's baseline is your performance reference."
     else
-        grn "Postflight passed (A1–A5, A8 and A9). The install works end to end; A6's baseline is your performance reference."
+        grn "Postflight passed (A1–A5 and A9). A8 reports and does not decide. A8 reported the last daemon chat this process forwarded. That is not a new completion. A6's baseline is your performance reference."
     fi
 else
     failed=""

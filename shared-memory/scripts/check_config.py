@@ -9,6 +9,8 @@ import json
 import logging
 import math
 import os
+import shutil
+import subprocess
 import sys
 import urllib.parse
 
@@ -22,8 +24,6 @@ from log_hygiene import scrub_url_credentials  # noqa: E402
 ENV_ROW_ORDER = (
     "EMBEDDER_URL",
     "RERANKER_URL",
-    "LLM_DEFAULT_TARGET",
-    "LLM_BACKENDS",
     "PROXY_BIND",
     "EMBED_MAX_CONTEXT_TOKENS",
     "EMBED_CHARS_PER_TOKEN",
@@ -129,9 +129,8 @@ def _encoder_base_problem(base: str) -> str:
 def _verdict(key: str, gateway: "tuple[dict | None, str | None] | None" = None) -> dict:
     """The three-valued state for `key`, plus the value THIS process would
     actually resolve — mirroring the real consumer site's own idiom exactly
-    (never normalised; see framework_defaults.py's LLM_DEFAULT_TARGET row
-    for why an 'or' vs 'get' difference here is documented, not a bug to
-    silently fix). Rows whose consumer does more than get/or (the embed
+    (never normalised). An 'or' vs 'get' difference is the consumer's own
+    idiom, not a bug to silently fix. Rows whose consumer does more than get/or (the embed
     values, PROXY_BIND, the encoder URLs) take the
     consumer's own result, or name why the gateway would not start, in `note`
     ('' when there is nothing to add). `gateway` is _gateway_embed_values()'s
@@ -177,6 +176,27 @@ def _verdict(key: str, gateway: "tuple[dict | None, str | None] | None" = None) 
     return {"key": key, "state": state, "idiom": idiom, "effective": effective, "note": note}
 
 
+def _redact_token_env_keys(text: str) -> str:
+    """A token_env value that is not a variable name is omitted from the report."""
+    try:
+        data = json.loads(text)
+    except (json.JSONDecodeError, ValueError):
+        return text
+    if not isinstance(data, list):
+        return text
+    changed = False
+    for entry in data:
+        if not isinstance(entry, dict):
+            continue
+        name = entry.get("token_env")
+        if isinstance(name, str) and name and not secure_env.token_env_is_variable_name(name):
+            entry["token_env"] = "<not a variable name>"
+            changed = True
+    if not changed:
+        return text
+    return json.dumps(data)
+
+
 def _secret_names() -> "list[str]":
     """Every secret-classified name Phase A can see BEFORE any daemon
     import: the fixed KNOWN_SECRET_NAMES list plus every LLM_BACKENDS_JSON
@@ -197,6 +217,17 @@ def phase_a_render() -> "tuple[list[str], bool]":
     whole of Phase A's env access, not just the read call afterward."""
     lines: list[str] = []
     lines.append("== Phase A — environment ==")
+    saved = _push_gateway_picture()
+    try:
+        if _unit_file_error:
+            lines.append(_unit_file_error)
+            return lines, False
+        return _phase_a_render_body(lines)
+    finally:
+        _pop_picture(saved)
+
+
+def _phase_a_render_body(lines: list) -> "tuple[list[str], bool]":
     try:
         env_path = secure_env._select_env_file()
         if env_path is None:
@@ -216,6 +247,8 @@ def phase_a_render() -> "tuple[list[str], bool]":
     for key in ENV_ROW_ORDER:
         v = _verdict(key, gateway)
         effective = scrub_url_credentials(str(v["effective"]))
+        if key == "LLM_BACKENDS_JSON":
+            effective = _redact_token_env_keys(effective)
         suffix = f"  ({v['note']})" if v["note"] else ""
         lines.append(f"  {key:<28} {v['state']:<20} -> {effective!r}  [idiom={v['idiom']}]{suffix}")
     if gateway[0] is None and gateway[1] is None:
@@ -236,84 +269,166 @@ def phase_a_render() -> "tuple[list[str], bool]":
     lines.append("  (names below are CANONICAL/upper-cased — a lowercase-"
                   "declared token_env spelling is normalised for display)")
     for name in _secret_names():
+        # A token_env value that is not a variable name is a key. Printing it upper-cased would publish the key.
+        if name not in secure_env.KNOWN_SECRET_NAMES and not secure_env.token_env_is_variable_name(name):
+            continue
         has_cred = secure_env.get_secret(name) is not None
         lines.append(f"  {name:<20} has_credential={has_cred}")
 
-    shape_lines = _phase_a_json_shape_lines()
+    shape_lines = _phase_a_declaration_lines()
     if shape_lines:
         lines.append("")
-        lines.append("LLM_BACKENDS_JSON shape (no values rendered):")
         lines.extend(shape_lines)
 
     return lines, True
 
 
-def _phase_a_json_shape_lines() -> "list[str]":
-    """Stdlib-only census of LLM_BACKENDS_JSON keys. Never prints a URL or
-    token — only whether each entry has the required `url` field. An OpenAI
-    SDK `base_url` key is the measured first-install trap: the loader used
-    to skip it silently and dreaming looked down."""
-    raw = os.environ.get("LLM_BACKENDS_JSON")
-    if raw is None or not raw.strip():
-        return []
-    try:
-        data = json.loads(raw)
-    except json.JSONDecodeError:
-        return ["  ⚠ not valid JSON — the gateway ignores it and falls back"]
-    if not isinstance(data, list):
-        return ["  ⚠ must be a JSON array of objects — the gateway ignores it and falls back"]
-    out: list[str] = []
-    for i, ent in enumerate(data):
-        if not isinstance(ent, dict):
-            out.append(
-                f"  ⚠ [{i}] is {type(ent).__name__}, not an object — excluded. "
-                "Each entry needs a url field (not OpenAI SDK's base_url)."
-            )
-            continue
-        keys = sorted(str(k) for k in ent)
-        url = str(ent.get("url", "")).rstrip("/")
-        if url:
-            continue
-        if "base_url" in ent or "baseURL" in ent:
-            alias = "base_url" if "base_url" in ent else "baseURL"
-            out.append(
-                f"  ⚠ [{i}] has {alias} but the field name is url — excluded; "
-                f"dreaming will look down. Rename the key to url. Keys: {keys}"
-            )
-        else:
-            out.append(
-                f"  ⚠ [{i}] has no url — excluded. The required field is url "
-                f"(not base_url). Keys: {keys}"
-            )
-    return out
+# A loaded unit does not inherit these from the operator shell. --apply never reads them from the shell either.
+_HIDDEN_WHEN_UNIT_LOADED = ("LLM_BACKENDS_JSON", "LLM_BACKENDS", "LLM_DEFAULT_TARGET")
 
 
-def _render_extra_body_suppression(extra_body) -> str:
-    """W5 E-reduced (declared half only): renders a backend's declared
-    thinking-suppression state as a RECOGNISED-SHAPE match, never the raw
-    `extra_body` dict — it is operator-supplied and could contain anything,
-    including a key (N2, mutation-checked: render the dict here instead and
-    the unrecognised-shape test dies).
+# Set when a unit EnvironmentFile= is not UTF-8. phase_a_render prints it and does not exit 0.
+_unit_file_error: "str | None" = None
 
-    PARKED (ruling 1, `fact:1338`): probe-time `emits_reasoning` detection
-    and any budget factor derived from it. This function renders only what
-    was DECLARED, never anything measured or probed — see the brief's §2
-    for the full set of refutations (H1/H2/H3/H5/M9/ND5) a future designer
-    should read before reopening that half. Reopen trigger: a measured
-    reasoning-caused REM/NREM dead-letter on a live fleet.
+
+def _picture_llm_json(picture: dict) -> str:
+    for key, value in picture.items():
+        if secure_env._normalize_key(str(key)) == "LLM_BACKENDS_JSON" and value:
+            return str(value)
+    return ""
+
+
+def _remember_picture_secrets(*pictures: dict) -> None:
+    """A token_env name and a *_FILE stem are secret before the picture is copied.
+
+    The copy runs before load_split_env, so a name with no secret suffix is still ordinary config. systemctl and busctl inherit this process.
     """
-    if not extra_body:
-        return "none declared"
-    if not isinstance(extra_body, dict):
-        return "present, unrecognised shape"
-    # DeepSeek shape: {"thinking": {"type": "disabled"}}.
-    thinking = extra_body.get("thinking")
-    if isinstance(thinking, dict) and thinking.get("type") == "disabled":
-        return "thinking suppression declared (DeepSeek shape: thinking.type=disabled)"
-    # Qwen/DashScope shape: {"enable_thinking": false}.
-    if extra_body.get("enable_thinking") is False:
-        return "thinking suppression declared (enable_thinking=false)"
-    return "present, unrecognised shape"
+    flag = secure_env._llm_backends_json_parse_failed
+    found: set[str] = set()
+    try:
+        for picture in pictures:
+            raw = _picture_llm_json(picture)
+            if raw:
+                found.update(secure_env._token_env_names(raw))
+            for key in picture:
+                norm = secure_env._normalize_key(str(key))
+                if not norm.endswith("_FILE"):
+                    continue
+                stem = norm[: -len("_FILE")]
+                if stem:
+                    found.add(stem)
+    finally:
+        secure_env._llm_backends_json_parse_failed = flag
+    if found:
+        secure_env._dynamic_secret_names.update(found)
+
+
+def _unit_loaded_picture() -> "tuple[dict, bool] | None":
+    """(picture, hide_shell_only). None when the query raised: the shell picture stands, and nothing is printed."""
+    global _unit_file_error
+    import migrate_env
+    _unit_file_error = None
+    unit = os.environ.get("GATEWAY_UNIT", migrate_env.DEFAULT_GATEWAY_UNIT)
+    try:
+        query = migrate_env.query_gateway_unit(unit)
+    except Exception:
+        # A unit query that raises must not become a traceback, and its text can carry a secret. The shell picture remains.
+        return None
+    if query.status == "query_failed" and query.error and "is not UTF-8" in query.error:
+        # Checked before _gateway_env so a later read cannot hide this refusal.
+        _unit_file_error = query.error
+        return None
+    try:
+        overlay = migrate_env._gateway_env(query)
+    except Exception:
+        return None
+    if query.status == "ok" and query.unit_id:
+        # Same rule as --apply: the operator shell is not what that unit will read.
+        return overlay, True
+    merged = dict(os.environ)
+    for key, value in overlay.items():
+        if key in ("PATH", "HOME"):
+            continue
+        merged[key] = value
+    return merged, False
+
+
+def _gateway_picture() -> dict:
+    """What migrate_env --apply validates.
+
+    A loaded unit (systemctl show returned an Id) is that unit's Environment= and EnvironmentFile=, then the secure env file. The operator shell is not part of it. A check with no loaded unit is this process, so the shell remains visible underneath. PATH and HOME stay the process's.
+    """
+    loaded = _unit_loaded_picture()
+    if loaded is None:
+        return dict(os.environ)
+    return loaded[0]
+
+
+_PICTURE_ABSENT = object()
+
+
+def _push_picture(picture: dict, hide_absent: "tuple[str, ...]" = ()) -> dict:
+    """Copy non-secret picture keys into os.environ so a gateway import sees the same file the declaration check read.
+
+    hide_absent names shell keys a loaded unit did not set. Those are removed for the duration of the check and restored by _pop_picture.
+    """
+    saved = {}
+    for key, value in picture.items():
+        if key in ("PATH", "HOME") or secure_env.is_secret_key(key):
+            continue
+        text = "" if value is None else str(value)
+        current = os.environ.get(key, _PICTURE_ABSENT)
+        if current == text:
+            continue
+        saved[key] = current
+        os.environ[key] = text
+    for key in hide_absent:
+        if key in picture or key in ("PATH", "HOME") or secure_env.is_secret_key(key):
+            continue
+        current = os.environ.get(key, _PICTURE_ABSENT)
+        if current is _PICTURE_ABSENT:
+            continue
+        saved[key] = current
+        os.environ.pop(key, None)
+    return saved
+
+
+def _push_gateway_picture() -> dict:
+    loaded = _unit_loaded_picture()
+    if _unit_file_error:
+        return {}
+    if loaded is None:
+        picture: dict = dict(os.environ)
+        hide: "tuple[str, ...]" = ()
+    else:
+        picture, hide_shell = loaded
+        hide = _HIDDEN_WHEN_UNIT_LOADED if hide_shell else ()
+    # Names from every picture, including one this copy will not apply. The value may sit in a different picture than the JSON.
+    _remember_picture_secrets(os.environ, picture)
+    return _push_picture(picture, hide)
+
+
+def _pop_picture(saved: dict) -> None:
+    for key, old in saved.items():
+        if old is _PICTURE_ABSENT:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = old
+
+
+def _phase_a_declaration_lines() -> "list[str]":
+    """The same FATAL classes the gateway refuses. Names the entry and the field, never a secret."""
+    errors = secure_env.llm_declaration_errors(_gateway_picture())
+    if not errors:
+        return []
+    out = ["LLM_BACKENDS_JSON would stop the gateway (exit 78):"]
+    for entry, field in errors:
+        out.append(f"  {entry} field {field}")
+    out.append(
+        "  Each entry needs url, n_ctx and max_output_tokens, positive integers. "
+        "Query the URL; if it does not say, ask the operator. Never guess."
+    )
+    return out
 
 
 def _w4_census_lines(proxy) -> "list[str]":
@@ -335,17 +450,43 @@ def _w4_census_lines(proxy) -> "list[str]":
             count += 1
     raw_json = os.environ.get("LLM_BACKENDS_JSON")
     if raw_json is not None and raw_json.strip() == "":
-        lines.append("  LLM_BACKENDS_JSON is present but EMPTY — never used; the legacy "
-                     "LLM_BACKENDS/LLM_DEFAULT_TARGET pool is what actually serves "
-                     "(migrate_env.py's own case 0, CASE_JSON_PRESENT_EMPTY).")
-        count += 1
-    if list(getattr(proxy, "LLM_BACKENDS", [])) == [""]:
-        lines.append("  LLM_BACKENDS composed to [''] — LLM_DEFAULT_TARGET is present but "
-                     "EMPTY and neither LLM_BACKENDS nor LLM_BACKENDS_JSON is declared; "
-                     "the gateway will attempt to route to an empty URL.")
+        lines.append("  LLM_BACKENDS_JSON is present but EMPTY — no reasoning backend is declared.")
         count += 1
     lines.append(f"  {count} latent case(s) present on this install.")
     return lines
+
+
+def _restart_prevent_line() -> "str | None":
+    """Warn when the loaded unit would restart a config refusal.
+
+    A missing systemctl, or a unit that is not LoadState=loaded, is not a warning: show succeeds for a name that does not exist. 78 must be its own status. 178 contains those digits and is a different code.
+    """
+    systemctl = shutil.which("systemctl")
+    if systemctl is None:
+        return None
+    unit = os.environ.get("GATEWAY_UNIT") or "hive-mind-gateway.service"
+    try:
+        proc = subprocess.run(
+            [systemctl, "--user", "show", unit, "-p", "LoadState", "-p", "RestartPreventExitStatus"],
+            capture_output=True, text=True, timeout=10,
+        )
+    except Exception:
+        return None
+    if proc.returncode != 0:
+        return None
+    fields: dict[str, str] = {}
+    for line in proc.stdout.splitlines():
+        if "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        fields[key.strip()] = value.strip()
+    if fields.get("LoadState") != "loaded":
+        return None
+    statuses = fields.get("RestartPreventExitStatus", "").split()
+    if "78" in statuses:
+        return None
+    return ("  ⚠ the gateway unit has no RestartPreventExitStatus=78. "
+            "A refused config exits 78 and systemd would restart it.")
 
 
 class _DropNoBackendError(logging.Filter):
@@ -366,28 +507,57 @@ def phase_b_render() -> "tuple[list[str], int]":
     proxy_filter = _DropNoBackendError()
     proxy_logger = logging.getLogger("hive-proxy")
     proxy_logger.addFilter(proxy_filter)
+    # The picture stays until this function returns. require_auth, the census, and the hidden-credential note read os.environ after the import.
+    saved = _push_gateway_picture()
     try:
-        import hive_mind_proxy as proxy  # noqa: PLC0415
-    except Exception as exc:
-        lines.append("")
-        lines.append("== Phase B — backends ==")
-        lines.append("UNAVAILABLE — import failed: " + _render_exception(exc, _PHASE_B_EXCEPTION_HINT))
-        return lines, 2
+        if _unit_file_error:
+            lines.append(_unit_file_error)
+            return lines, 2
+        return _phase_b_body(lines, proxy_logger, proxy_filter)
+    finally:
+        _pop_picture(saved)
+
+
+def _phase_b_body(lines: list, proxy_logger, proxy_filter) -> "tuple[list[str], int]":
+    try:
+        try:
+            import importlib
+            import sys
+            import types
+            was_loaded = "hive_mind_proxy" in sys.modules
+            import hive_mind_proxy as proxy  # noqa: PLC0415
+            # Reload only the real module. A test's stand-in in sys.modules is not a module file, and reloading it is not this check.
+            if (was_loaded and isinstance(proxy, types.ModuleType)
+                    and getattr(proxy, "__file__", None)):
+                proxy = importlib.reload(proxy)
+        except Exception as exc:
+            lines.append("")
+            lines.append("== Phase B — backends ==")
+            lines.append("UNAVAILABLE — import failed: " + _render_exception(exc, _PHASE_B_EXCEPTION_HINT))
+            return lines, 2
     finally:
         proxy_logger.removeFilter(proxy_filter)
 
     lines.append("")
     lines.append("== Phase B — backends ==")
 
-    # A bad LLM_BACKENDS_JSON is swallowed into the legacy fallback, so import still succeeds. Exit stays 0; this line is the warning, not a second meaning for exit 1.
-    fallback_reason = getattr(proxy, "LLM_POOL_FALLBACK_REASON", None)
-    if fallback_reason:
-        lines.append("⚠ DECLARED FLEET NOT USABLE — the gateway would boot on the "
-                     "legacy fallback: " + scrub_url_credentials(str(fallback_reason)))
+    excluded = list(getattr(proxy, "LLM_BACKENDS_EXCLUDED", []))
+    any_degraded_warnings = bool(excluded) or not proxy.LLM_BACKENDS
+    if not proxy.LLM_BACKENDS and not excluded:
+        lines.append("⚠ NO BACKEND DECLARED — the gateway runs with no reasoning. "
+                     "Saves and search keep working. Declare LLM_BACKENDS_JSON to add a backend.")
+        lines.append("")
+    for item in excluded:
+        lines.append(f"  excluded {scrub_url_credentials(str(item.get('url', '')))} "
+                     f"reason={item.get('reason')}")
+    if any(item.get("reason") == "token_missing" for item in excluded):
         try:
             import migrate_env  # noqa: PLC0415
             token_env_names = migrate_env.extract_token_env_names(os.environ.get("LLM_BACKENDS_JSON"))
-            unseen = [name for name in token_env_names if not secure_env.get_secret(name)]
+            unseen = [
+                name for name in token_env_names
+                if secure_env.token_env_is_variable_name(name) and not secure_env.get_secret(name)
+            ]
             unit_name = os.environ.get("GATEWAY_UNIT") or migrate_env.DEFAULT_GATEWAY_UNIT
             unit_q = migrate_env.query_gateway_unit(unit_name)
             hidden = migrate_env.hidden_credentials(unit_q, unseen)
@@ -395,105 +565,23 @@ def phase_b_render() -> "tuple[list[str], int]":
                 lines.append("  " + migrate_env.format_hidden_credential_note(hidden))
         except Exception:
             pass
-        lines.append("")
-
-    # Nothing was declared, as opposed to a declared fleet that was excluded above. The two warnings are mutually exclusive.
-    config_empty = getattr(proxy, "LLM_POOL_CONFIG_EMPTY", False)
-    if config_empty:
-        # Remedy honesty (§6.5): migrate_env.py's same-generation gate means
-        # it correctly plans NOTHING for an install already on the current
-        # loader semantics — naming it here as the fix would be a false
-        # remedy. Declare LLM_BACKENDS_JSON directly instead.
-        lines.append("⚠ NO BACKEND DECLARED — the gateway is falling back to "
-                     + scrub_url_credentials(str(getattr(proxy, "DEFAULT_TARGET", "")))
-                     + " (LLM_DEFAULT_TARGET/its own built-in default), and it is now "
-                       "INELIGIBLE for role-less traffic (W4 default-deny). Declare "
-                       "LLM_BACKENDS_JSON yourself.")
-        lines.append("")
 
     if not proxy.LLM_BACKENDS:
         lines.append("(no backends configured)")
-    # QA HIGH-1 (fix round): M-5'/P-5' are DEGRADED WARNINGS now (never a
-    # SystemExit) — set True the moment either fires anywhere in the fleet,
-    # so the "Gateway startup refusals" closing line below can stop reading
-    # as an unqualified all-clear (neither guard function raises for
-    # either shape, so "none" alone would say "clean" for a degraded pool).
-    any_degraded_warnings = False
     for url in proxy.LLM_BACKENDS:
         lines.append(f"  {scrub_url_credentials(url)}")
         lines.append(f"    weight={proxy.LLM_WEIGHTS.get(url, 1.0)}")
         lines.append(f"    model={proxy.LLM_BACKEND_MODELS.get(url)}")
-        roles = proxy.LLM_BACKEND_ROLES.get(url)
-        lines.append(f"    roles={sorted(roles) if roles else None}")
         lines.append(f"    n_ctx={proxy.LLM_BACKEND_NCTX.get(url)}")
-        has_credential = proxy.LLM_BACKEND_TOKENS.get(url) is not None
-        lines.append(f"    has_credential={has_credential}")
-        explicit = proxy.LLM_BACKEND_PRIVATE_OK_EXPLICIT.get(url, False)
-        private_ok = proxy.LLM_BACKEND_PRIVATE_OK.get(url, False)
-        lines.append(f"    private_ok={private_ok} (explicit={explicit})")
-        # W5 E-reduced (declared half only): recognised-shape match, never
-        # the raw extra_body dict — see _render_extra_body_suppression's
-        # own docstring for the parked probe/budget half.
-        extra_body = proxy.LLM_BACKEND_EXTRAS.get(url)
-        lines.append(f"    extra_body: {_render_extra_body_suppression(extra_body)}")
-        # R-B announce (§6.3, W4/decision:1824): a roles-carrying entry with
-        # no explicit private_ok used to also serve role-less traffic (the
-        # plain default was True); it no longer does. Source-pinned
-        # alongside the CHANGELOG opt-back line this release drafts.
-        if roles and not explicit:
-            lines.append(
-                "    ⚠ R-B (W4): role-less traffic no longer reaches this backend — "
-                "add \"private_ok\": true to opt back in."
-            )
-        # Credentialed, and neither roles nor an explicit private_ok: default-deny never selects it, but the key is still sent on every health probe. A warning, not a refusal.
-        if has_credential and roles is None and not explicit:
-            any_degraded_warnings = True
-            lines.append(
-                "    ⚠ M-5' (W4): configured but will NEVER be selected — declare "
-                "\"roles\" or \"private_ok\" explicitly. Its credential is still "
-                "sent on every /health probe cycle even though it can serve "
-                "nothing (SEC M-1) — remove the entry if you did not mean to "
-                "attach the key."
-            )
-        # Auth is off and private_ok was set false. That serves nothing only when roles are also absent; with roles, every caller of those roles is still served.
-        if not proxy.AUTH_CONFIGURED_AT_STARTUP and explicit and not private_ok:
-            any_degraded_warnings = True
-            if roles:
-                lines.append(
-                    "    ⚠ P-5' (W4): AGENT_TOKENS is unset (auth off) and private_ok "
-                    "is explicitly false, but this entry still declares "
-                    f"roles={sorted(roles)} — NOT safe by construction: those roles "
-                    "still serve EVERY caller, and with auth off the gateway cannot "
-                    "tell callers apart. Set AGENT_TOKENS if that scoping was meant "
-                    "to be enforceable."
-                )
-            else:
-                lines.append(
-                    "    ⚠ P-5' (W4): AGENT_TOKENS is unset (auth off) and private_ok "
-                    "is explicitly false — safe by construction (no roles, so this "
-                    "backend already serves nothing)."
-                )
+        lines.append(f"    max_output_tokens={proxy.LLM_BACKEND_MAX_OUTPUT.get(url)}")
+        lines.append(f"    priority={proxy.LLM_BACKEND_PRIORITY.get(url, 1)}")
+        lines.append(f"    has_credential={proxy.LLM_BACKEND_TOKENS.get(url) is not None}")
 
-    # QA Q3 (fold round, LOW): guarded getattr on the one PRIVATE proxy
-    # symbol this script reads, same defensive shape hive_mind_proxy.py
-    # itself uses for its own private-member imports (hive_mind_proxy.py
-    # :39-56) — a future rename degrades this report (an honest line),
-    # never crashes it.
     _MISSING = object()
-    role_errors = getattr(proxy, "_LLM_BACKEND_ROLE_CONFIG_ERRORS", _MISSING)
-    if role_errors is _MISSING:
-        lines.append("  role config errors: UNKNOWN — hive_mind_proxy no longer exposes "
-                     "_LLM_BACKEND_ROLE_CONFIG_ERRORS; update check_config.py to match "
-                     "its current internals")
-    elif role_errors:
-        lines.append("  role config errors:")
-        for e in role_errors:
-            # Belt-and-braces (SEC-MED, fold round): _load_llm_backends()
-            # already scrubs every URL it puts into this list at
-            # construction time — this re-wrap costs nothing and guards
-            # against a future change to that construction site silently
-            # dropping the scrub.
-            lines.append(f"    {scrub_url_credentials(str(e))}")
+    prevent = _restart_prevent_line()
+    if prevent:
+        # This warning is the unit, not an excluded backend or an empty roster. Those already set any_degraded_warnings above.
+        lines.append(prevent)
 
     lines.extend(_w4_census_lines(proxy))
 
@@ -546,22 +634,19 @@ def phase_b_render() -> "tuple[list[str], int]":
     try:
         require_auth()
         require_routing()
+        from coordinator import require_reserved_daemon_names
+        require_reserved_daemon_names()
     except SystemExit as exc:
         # SEC-MED (fold round): belt-and-braces — both guard functions
         # already scrub every URL in their own message at construction
         # time; this re-wrap guards against a future change there.
-        lines.append("  WOULD REFUSE TO START: " + scrub_url_credentials(str(exc)))
+        detail = getattr(exc, "message", "") or ""
+        lines.append("  WOULD REFUSE TO START: " + scrub_url_credentials(str(detail)))
         return lines, 1
-    # QA HIGH-1 (fix round): "none" here used to be read as an unqualified
-    # all-clear — but neither guard function raises for M-5'/P-5' any more,
-    # so a fleet with one or more ⚠ lines above would print this exact
-    # sentence too. Qualify it rather than let "none" carry a meaning it no
-    # longer has; the base sentence text is left intact (tests key on it).
     closing = "  none — the gateway would boot with this configuration."
     if any_degraded_warnings:
-        closing += (" ⚠ Degraded, not clean — see the M-5'/P-5' warning(s) above: "
-                    "the gateway boots, but not every backend you configured serves "
-                    "what you may have intended.")
+        closing += (" ⚠ Degraded, not clean — an excluded backend or an empty roster "
+                    "is listed above. The gateway still boots.")
     lines.append(closing)
     return lines, 0
 
@@ -579,7 +664,8 @@ def main(argv: "list[str] | None" = None) -> int:
     if not a_ok:
         return 2
     if args.phase_a_only:
-        return 0
+        # Declaration fatals are exit 1. An unreadable env already returned 2.
+        return 1 if secure_env.llm_declaration_errors(_gateway_picture()) else 0
 
     b_lines, code = phase_b_render()
     for line in b_lines:

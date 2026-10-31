@@ -59,7 +59,7 @@ canonical. Two adversarial reviewers measured, independently, that:
 
 So Layer 1 is now ONE comparison, and it is the router's own. The tests added
 for it are `test_encoded_slash_spelling_is_not_auth_exempt` (the exemption)
-and `test_encoded_slash_spelling_of_an_owned_route_is_never_proxied` (the
+and `test_encoded_slash_on_auth_off_is_the_routers_404` (the
 containment that the auth-off default depends on).
 
 ⚠ A WEAK TEST CANNOT TELL THIS FIX FROM A ONE-CHARACTER ONE. Measured:
@@ -117,7 +117,6 @@ pytestmark = pytest.mark.filterwarnings(
 # AUTH + the guard, and the identity of the handler that ran is the whole
 # question. `handle_health`'s payload is pinned by tests/test_telemetry_contract.py.
 
-_LLM_DISPATCH_STATUS = 299          # "the request reached the LLM proxy dispatch"
 _LLM_BACKEND_HEADER = "X-SM-LLM-Backend"
 
 
@@ -153,19 +152,11 @@ def _load_gateway(agent_tokens: str):
 
 
 def _build_gateway_app(c, g):
-    """The gateway's REAL route table, in main()'s order, with the real auth
-    middleware and the real route guard.
+    """main()'s registration window: auth middleware, then the routes main() adds, then the unprotected-path assertion.
 
-    Deliberately mirrors hive_mind_proxy.main():
-      attach_coordinator → /health → /pool/status → /v1/embeddings →
-      /v1/reranking → set_known_routes →
-      require_unprotected_paths_are_plain_routes → catch-all.
-
-    ⚠ HAND-WRITTEN MIRROR. Kept honest by test_gateway_edge_hygiene.py::
-    test_every_main_route_registration_has_a_counterpart_in_each_test_mirror
-    — a route main() registers and this helper does not would make every
-    refusal assertion below run against a route table the gateway does not
-    have, and pass.
+    No wildcard. tests/test_gateway_edge_hygiene.py::test_every_main_route_registration_has_a_counterpart_in_each_test_mirror
+    checks this helper against that window. The app main() itself builds is
+    tests/test_route_guard.py::test_no_catchall_is_registered.
     """
     app = web.Application(middlewares=[c.auth_middleware])
     g.attach_coordinator(app, AsyncMock())
@@ -173,29 +164,10 @@ def _build_gateway_app(c, g):
     app.router.add_get("/pool/status", _sentinel_pool_status)
 
     proxy = g.AsyncHiveMindProxy()
-    # R-A (HYG round): registered before the snapshot, exactly as main() does,
-    # so /v1/embeddings is a KNOWN key here too — which is what makes
-    # `/v1/embeddings/` a guard near-miss rather than a passthrough.
     app.router.add_post("/v1/embeddings", proxy.handle_encoder)
     app.router.add_post("/v1/reranking", proxy.handle_encoder)
-    proxy.set_known_routes(app.router)
+    app.router.add_post("/v1/chat/completions", proxy.handle_proxy)
     c.require_unprotected_paths_are_plain_routes(app.router)
-
-    async def _catchall(request):
-        # handle_proxy's FIRST statement is this guard call — pinned by
-        # test_route_guard_is_the_first_statement_of_handle_proxy below, so
-        # stopping here instead of running the real upstream dispatch does
-        # not weaken what these assertions mean.
-        guard = proxy._route_guard(request)
-        if guard is not None:
-            return guard
-        return web.json_response(
-            {"served_by": "LLM_PROXY_DISPATCH"},
-            status=_LLM_DISPATCH_STATUS,
-            headers={_LLM_BACKEND_HEADER: "http://llm.invalid:5000"},
-        )
-
-    app.router.add_route("*", "/{tail:.*}", _catchall)
     return app, proxy
 
 
@@ -252,22 +224,12 @@ def test_exact_pool_status_is_served_anonymously_by_its_own_handler():
 # ══════════════════════════════════════════════════════════════════════════
 
 @pytest.mark.parametrize("spelling", ["/health/", "/health//", "/health%2f", "/pool/status/"])
-def test_near_miss_spelling_is_never_proxied_anonymously(spelling):
-    """THE DEFECT. Each of these was served anonymously and forwarded to the
-    LLM backend before the fix. The status must not be 200 and must not be
-    the LLM-dispatch sentinel, and the response must not carry the
-    X-SM-LLM-Backend header the gateway stamps on a proxied reply — status
-    alone is satisfiable by an upstream that happened to answer 401."""
+def test_near_miss_spelling_requires_a_token(spelling):
+    """Auth on. A trailing-slash or encoded spelling is not an unprotected path, so the middleware answers 401 before the router."""
     c, g = _load_gateway("claude:tok_abc")
     app, _ = _build_gateway_app(c, g)
-    status, headers, body = _run(_probe(app, "GET", spelling))
+    status, _headers, body = _run(_probe(app, "GET", spelling))
     assert status == 401, f"{spelling} must require a token, got {status} {body!r}"
-    assert status != _LLM_DISPATCH_STATUS
-    assert _LLM_BACKEND_HEADER not in headers, (
-        f"{spelling} reached the LLM proxy dispatch — the response carries "
-        f"the gateway's backend header"
-    )
-    assert b"LLM_PROXY_DISPATCH" not in body
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -303,47 +265,24 @@ def test_encoded_slash_spelling_is_not_auth_exempt(spelling):
     below), and this test pins the exemption itself."""
     c, g = _load_gateway("claude:tok_abc")
     app, _ = _build_gateway_app(c, g)
-    status, headers, body = _run(_probe(app, "GET", spelling))
+    status, _headers, body = _run(_probe(app, "GET", spelling))
     assert status == 401, (
         f"{spelling} → {status} {body!r}: an encoded slash decodes to a "
         f"complete exempt key while the ROUTER matched something no route "
         f"owns. The exemption must compare rel_url.path_safe, not request.path"
     )
-    assert _LLM_BACKEND_HEADER not in headers
-    assert b"LLM_PROXY_DISPATCH" not in body
 
 
 @pytest.mark.parametrize("spelling", ["/pool%2fstatus", "/pool%2Fstatus"])
-def test_encoded_slash_spelling_of_an_owned_route_is_never_proxied(spelling):
-    """SEC-1b — THE CONTAINMENT PIN, and the reason it exists.
-
-    On the SHIPPED DEFAULT (AGENT_TOKENS unset) auth_middleware returns before
-    the exemption is ever consulted, so the coordinator-side fix above is inert
-    and the ONLY thing between `GET /pool%2fstatus` and the LLM backend is
-    `_route_guard`'s wrong-method branch — which returns 405 for any known key
-    *including one whose method is allowed*, because it reads the DECODED
-    `request.path`.
-
-    That containment is accidental and reads like a bug against its own
-    message ("Method GET not allowed on /pool/status"). A maintainer
-    "correcting" it to `and request.method not in methods` reopens A1 on every
-    auth-off install — MEASURED by the security reviewer, with all 3110 other
-    tests staying green. This test is the one that dies. Do not delete it
-    without first teaching the near-miss branch to compare rel_url.path_safe."""
+def test_encoded_slash_on_auth_off_is_the_routers_404(spelling):
+    """Auth off does not consult the exemption. The encoded slash matches no route, so the answer is aiohttp's own 404."""
     c, g = _load_gateway("")
     assert c.AUTH_CONFIGURED_AT_STARTUP is False, "sanity: this is the auth-off shape"
     app, _ = _build_gateway_app(c, g)
     status, headers, body = _run(_probe(app, "GET", spelling))
-    assert status != _LLM_DISPATCH_STATUS, (
-        f"auth-off install: {spelling} → {status} {body!r} — an anonymous "
-        f"encoded-slash spelling of an owned route reached the LLM dispatch"
-    )
-    assert _LLM_BACKEND_HEADER not in headers, (
-        f"{spelling} was proxied: the reply carries the gateway's backend header"
-    )
-    assert b"LLM_PROXY_DISPATCH" not in body
+    assert status == 404, body
+    assert body.startswith(b"404:"), body
     assert headers.get("X-SM-Fault-Origin") == "gateway"
-    assert b"NOT forwarded to any LLM backend" in body
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -352,17 +291,14 @@ def test_encoded_slash_spelling_of_an_owned_route_is_never_proxied(spelling):
 # ══════════════════════════════════════════════════════════════════════════
 
 @pytest.mark.parametrize("spelling", ["/health/", "/health//", "/health%2f", "/pool/status/"])
-def test_authenticated_near_miss_is_refused_by_the_gateway_not_proxied(spelling):
+def test_authenticated_near_miss_is_the_routers_404(spelling):
+    """A valid token does not create a route. The spelling matches nothing, so aiohttp's 404 answers."""
     c, g = _load_gateway("claude:tok_abc")
     app, _ = _build_gateway_app(c, g)
     status, headers, body = _run(_probe(app, "GET", spelling, token="tok_abc"))
-    assert status == 404, (
-        f"a valid token must not buy a near-miss spelling of an owned route "
-        f"a trip to the LLM pool: {spelling} → {status} {body!r}"
-    )
+    assert status == 404, f"{spelling} → {status} {body!r}"
+    assert body.startswith(b"404:"), body
     assert headers.get("X-SM-Fault-Origin") == "gateway"
-    assert _LLM_BACKEND_HEADER not in headers
-    assert b"NOT forwarded to any LLM backend" in body
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -371,42 +307,34 @@ def test_authenticated_near_miss_is_refused_by_the_gateway_not_proxied(spelling)
 # ══════════════════════════════════════════════════════════════════════════
 
 @pytest.mark.parametrize("spelling", ["/health/", "/health//", "/health%2f", "/pool/status/"])
-def test_near_miss_is_refused_on_an_auth_off_install(spelling):
-    """`.env.example` ships AGENT_TOKENS unset — "the backward-compatible
-    default". On that install auth_middleware returns before its exemption
-    ever runs, so Layer 1 is a NO-OP and this is the only thing closing the
-    hole. If this test passes while the guard extension is gone, the fix
-    would be recorded as closed while every fresh install still had it."""
+def test_near_miss_on_auth_off_is_the_routers_404(spelling):
+    """Auth off reaches the router. These spellings are not routes, so the body is aiohttp's 404."""
     c, g = _load_gateway("")
     assert c.AUTH_CONFIGURED_AT_STARTUP is False, "sanity: this is the auth-off shape"
     app, _ = _build_gateway_app(c, g)
     status, headers, body = _run(_probe(app, "GET", spelling))
-    assert status == 404, (
-        f"auth-off install: {spelling} → {status} {body!r} — an anonymous "
-        f"near-miss reached the LLM proxy on the SHIPPED DEFAULT"
-    )
+    assert status == 404, f"{spelling} → {status} {body!r}"
+    assert body.startswith(b"404:"), body
     assert headers.get("X-SM-Fault-Origin") == "gateway"
-    assert _LLM_BACKEND_HEADER not in headers
 
 
-def test_auth_off_install_still_serves_exact_health_and_still_proxies_llm_paths():
-    """The auth-off counterweight: Layer 2 must refuse the near-miss WITHOUT
-    breaking the passthrough contract. `/v1/chat/completions` on an auth-off
-    install is a supported anonymous LLM call, and it must still dispatch —
-    a guard that 404s it would be a far worse regression than the hole."""
+def test_auth_off_install_still_serves_exact_health_and_refuses_anonymous_chat():
+    """Health stays anonymous. Chat does not: on an auth-off install only a spawned daemon passes."""
     c, g = _load_gateway("")
-    # A fresh Application per probe: aiohttp binds an Application to the
-    # event loop of its first runner, and each _run() is its own loop.
     app, _ = _build_gateway_app(c, g)
     status, _, body = _run(_probe(app, "GET", "/health"))
     assert status == 200 and b"handle_health" in body
 
-    app, _ = _build_gateway_app(c, g)
-    status, headers, body = _run(_probe(app, "POST", "/v1/chat/completions"))
-    assert status == _LLM_DISPATCH_STATUS, (
-        "the LLM passthrough must be untouched by the near-miss guard"
-    )
-    assert headers.get(_LLM_BACKEND_HEADER)
+    os.environ["SM_TEST_REAL_CHAT_IDENTITY"] = "1"
+    try:
+        app, _ = _build_gateway_app(c, g)
+        status, headers, body = _run(_probe(app, "POST", "/v1/chat/completions"))
+    finally:
+        os.environ.pop("SM_TEST_REAL_CHAT_IDENTITY", None)
+    assert status == 403, body
+    assert b"framework_only" in body
+    assert headers.get("X-SM-Fault-Origin") == "gateway"
+    assert _LLM_BACKEND_HEADER not in headers
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -422,22 +350,14 @@ def test_auth_off_install_still_serves_exact_health_and_still_proxies_llm_paths(
 # ══════════════════════════════════════════════════════════════════════════
 
 @pytest.mark.parametrize("spelling", ["/memory/save/", "/admin/backup/", "/memory/graph/"])
-def test_reserved_prefix_slash_spelling_keeps_the_reserved_prefix_message(spelling):
-    """A trailing-slash spelling of a REGISTERED reserved-prefix route must
-    answer with the reserved-prefix refusal, byte-identically to an
-    unregistered one — otherwise the reply distinguishes them."""
+def test_trailing_slash_under_a_framework_prefix_is_not_a_route(spelling):
+    """A trailing slash is a different path. Nothing is registered there, so aiohttp's 404 answers."""
     c, g = _load_gateway("")
     app, _ = _build_gateway_app(c, g)
     status, headers, body = _run(_probe(app, "GET", spelling))
     assert status == 404, f"{spelling} → {status} {body!r}"
+    assert body.startswith(b"404:"), body
     assert headers.get("X-SM-Fault-Origin") == "gateway"
-    assert _LLM_BACKEND_HEADER not in headers
-    assert b"not registered under the framework's reserved prefix" in body, (
-        f"{spelling} answered with the near-miss message, which names the "
-        f"registered route it is a near-miss OF. The near-miss branch must "
-        f"run after the reserved-prefix branch, not before it."
-    )
-    assert b"near-miss spelling" not in body
 
 
 def test_reserved_prefix_registered_and_unregistered_are_indistinguishable():
@@ -456,18 +376,14 @@ def test_reserved_prefix_registered_and_unregistered_are_indistinguishable():
     )
 
 
-def test_owned_route_outside_the_reserved_prefixes_still_gets_the_near_miss_message():
-    """The counterweight to the reordering: /health and /pool/status sit
-    OUTSIDE the reserved prefixes, so the near-miss branch is still the only
-    thing that answers for them and its message must survive the move."""
+def test_trailing_slash_on_health_is_not_a_route():
+    """`/health/` is not the unprotected `/health` route."""
     c, g = _load_gateway("")
     app, _ = _build_gateway_app(c, g)
-    status, _, body = _run(_probe(app, "GET", "/health/"))
-    assert status == 404
-    assert b"near-miss spelling" in body, (
-        f"the near-miss branch no longer answers for an owned route: {body!r}"
-    )
-    assert b"registers /health exactly" in body
+    status, headers, body = _run(_probe(app, "GET", "/health/"))
+    assert status == 404, body
+    assert body.startswith(b"404:"), body
+    assert headers.get("X-SM-Fault-Origin") == "gateway"
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -475,11 +391,7 @@ def test_owned_route_outside_the_reserved_prefixes_still_gets_the_near_miss_mess
 # ══════════════════════════════════════════════════════════════════════════
 
 def test_options_on_health_is_405_with_allow_header_not_401():
-    """`OPTIONS /health` resolves to the CATCH-ALL (canonical "/{tail}"), so
-    a canonical-only exemption would turn it into 401 and repeal the precise
-    405 fact:1535 requires — for the one caller class /health exists to
-    serve, the unauthenticated one. "Get a token" is not why that request
-    failed. Measured live before the fix: 405 + `Allow: GET, HEAD`."""
+    """OPTIONS matches the /health resource and no OPTIONS handler. aiohttp's 405 names GET and HEAD. The path is unprotected, so this is not a 401 (fact:1535, wrong method on an owned route)."""
     c, g = _load_gateway("claude:tok_abc")
     app, _ = _build_gateway_app(c, g)
     status, headers, body = _run(_probe(app, "OPTIONS", "/health"))
@@ -504,14 +416,7 @@ def test_post_on_health_is_405_not_401():
 
 @pytest.mark.parametrize("spelling", ["/health%0a", "/%0a", "/a%0ab"])
 def test_unresolvable_path_stays_401_and_never_500s(spelling):
-    """The catch-all `"/{tail:.*}"` compiles to `/(?P<tail>.*)` and `.`
-    excludes `\\n` without re.DOTALL, so a decoded newline matches NO
-    resource: aiohttp hands the middleware a MatchInfoError whose route is a
-    SystemRoute with `resource is None`. An unguarded
-    `request.match_info.route.resource.canonical` raises AttributeError →
-    500, and it raises BEFORE the audit block, so the fix would ship a
-    one-byte anonymous unlogged-500 primitive INSIDE a security fix.
-    Measured on the running gateway: 401 today, and it must stay 401."""
+    """A newline in the path matches no resource. The exemption read must not raise, so auth answers 401."""
     c, g = _load_gateway("claude:tok_abc")
     app, _ = _build_gateway_app(c, g)
     status, _, body = _run(_probe(app, "GET", spelling))
@@ -585,9 +490,7 @@ def test_startup_assertion_refuses_a_yarl_without_path_safe():
 
 
 def test_startup_assertion_refuses_an_exempt_path_no_route_owns():
-    """An exemption for a path the router does not own can only ever be
-    honoured by the catch-all — i.e. by forwarding to an LLM backend. That
-    is the A1 defect stated as a route-table property."""
+    """An unprotected path no route owns would be anonymous and then 404, or worse if a later route claimed it. Boot refuses that set."""
     c, g = _load_gateway("claude:tok_abc")
     app = web.Application()
     g.attach_coordinator(app, AsyncMock())
@@ -602,22 +505,20 @@ def test_startup_assertion_refuses_an_exempt_path_no_route_owns():
         c._UNPROTECTED_PATHS.discard("/health/")
 
 
-def test_main_calls_the_startup_assertion_next_to_set_known_routes():
-    """The assertion is only worth anything if the gateway entrypoint runs
-    it. Source-level, because main() cannot be executed in a unit test."""
+def test_main_runs_the_unprotected_path_assertion_after_the_chat_route():
+    """The assertion is only worth anything if main() runs it after the chat route is registered."""
     with open(os.path.join(SCRIPTS_DIR, "hive_mind_proxy.py"), encoding="utf-8") as fh:
         src = fh.read()
     assert "require_unprotected_paths_are_plain_routes(app.router)" in src, (
         "hive_mind_proxy.main() must run the _UNPROTECTED_PATHS startup "
         "assertion — an invariant nothing checks is an intention"
     )
-    snapshot_at = src.index("proxy.set_known_routes(app.router)")
+    chat_at = src.index('add_post("/v1/chat/completions", proxy.handle_proxy)')
     assert_at = src.index("require_unprotected_paths_are_plain_routes(app.router)")
-    catchall_at = src.index('add_route("*", "/{tail:.*}"')
-    assert snapshot_at < assert_at < catchall_at, (
-        "the assertion must run after every real route is registered and "
-        "before the catch-all — the same window as the route snapshot"
+    assert chat_at < assert_at, (
+        "the assertion must run after the chat route is registered"
     )
+    assert 'add_route("*", "/{tail:.*}"' not in src
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -646,10 +547,6 @@ def test_router_match_path_returns_the_routers_own_string_for_a_real_request():
     g.attach_coordinator(app, AsyncMock())
     app.router.add_get("/health", _capturing_health)
     app.router.add_get("/pool/status", _sentinel_pool_status)
-    proxy = g.AsyncHiveMindProxy()
-    proxy.set_known_routes(app.router)
-    app.router.add_route("*", "/{tail:.*}", proxy.handle_proxy)
-
     status, _, _ = _run(_probe(app, "GET", "/health"))
     assert status == 200
     assert isinstance(seen.get("match_path"), str), (
@@ -730,7 +627,7 @@ def test_the_deleted_canonical_limb_is_gone_and_stays_gone():
 # only faithful while _route_guard really is handle_proxy's first statement.
 # ══════════════════════════════════════════════════════════════════════════
 
-def test_route_guard_is_the_first_statement_of_handle_proxy():
+def test_handle_proxy_reads_raw_path_before_attaching_a_credential():
     with open(os.path.join(SCRIPTS_DIR, "hive_mind_proxy.py"), encoding="utf-8") as fh:
         src = fh.read()
     tree = ast.parse(src)
@@ -745,8 +642,7 @@ def test_route_guard_is_the_first_statement_of_handle_proxy():
                                        and isinstance(s.value, ast.Constant))]
     first = body[0]
     assert isinstance(first, ast.Assign), ast.dump(first)
-    assert "_route_guard" in ast.unparse(first.value), (
-        "handle_proxy must call _route_guard before anything else — this "
-        "file's catch-all stub stops there and would otherwise be lying "
-        f"about what a real dispatch does. Got: {ast.unparse(first)}"
+    assert "raw_path" in ast.unparse(first), (
+        "handle_proxy must read the raw path before it attaches a credential. "
+        f"Got: {ast.unparse(first)}"
     )

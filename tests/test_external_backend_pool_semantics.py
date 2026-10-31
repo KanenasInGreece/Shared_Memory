@@ -167,11 +167,11 @@ def declared_fleet(monkeypatch):
     probe.
     """
     url = "https://api.example.com/v1"
-    monkeypatch.setattr(P, "LLM_POOL_CONFIG_EMPTY", False)
-    monkeypatch.setattr(P, "LLM_POOL_FALLBACK_REASON", None)
+    # The dependency reads LLM_BACKENDS. An empty roster is no_backend_declared
+    # no matter what the probe map says, which would hide the verdict under test.
+    monkeypatch.setattr(P, "LLM_BACKENDS", [url])
     monkeypatch.setattr(P, "LLM_POOL", [url])
-    monkeypatch.setitem(P.LLM_BACKEND_ROLES, url, None)
-    monkeypatch.setitem(P.LLM_BACKEND_PRIVATE_OK, url, True)
+    monkeypatch.setattr(P, "LLM_BACKENDS_EXCLUDED", [])
     return url
 
 

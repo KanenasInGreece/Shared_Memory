@@ -68,6 +68,10 @@ Embed and rerank go through the gateway on `:8888`. These four are the `CONTRIBU
 
 Feature branch, not `main`. PR against `main`. No direct push. Apache-2.0. No GPL dependency without asking. Work in a worktree. On a public clone, branch in your fork. Do not commit, pull, or reset in the live checkout.
 
+## Declarations
+
+A defined backend with no `n_ctx` or no `max_output_tokens` stops the gateway. `max_output_tokens` is the provider's published limit, or a self-hosted server's context size. Query the URL; if it does not say, ask the operator. Never guess. The previous `update_framework.sh` die text recommends `--skip-env-migration`. Do not follow it: the gateway refuses the file and exits 78. The drop-in for that first restart is `OPERATE.md`. `migrate_env.py --apply` lists each declared backend whose address is not self-hosted: it receives corpus text from both daemons; remove it if not trusted. That notice does not stop the update.
+
 ## Load when needed
 
 - `README.md` — architecture and Quick Start.

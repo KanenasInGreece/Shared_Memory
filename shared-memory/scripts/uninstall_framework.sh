@@ -69,6 +69,7 @@ LLM_MODELS_DIR="$(env_get LLM_MODELS_DIR)"
 BACKUP_DIR="$(env_get BACKUP_DIR)"; BACKUP_DIR="${BACKUP_DIR:-$HOME/.shared-memory/backups}"
 STATE_DIR="$HOME/.shared-memory"
 UNIT_PATH="$HOME/.config/systemd/user/$GATEWAY_UNIT"
+DROP_IN="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/${GATEWAY_UNIT}.d/restart-prevent-78.conf"
 
 # Prefer AGENT_INSTALLS, because a path is this host's own fact. The historical four are added only when they exist.
 # Entries are name:path or name:kind:path. Stripping only the name turned an mcp path into a directory literally named mcp:.
@@ -107,6 +108,7 @@ echo "  env    : ${ENV_FILE}$([[ -f "$ENV_FILE" ]] || echo ' (absent)')"
 echo
 echo "WILL BE REMOVED:"
 [[ -f "$UNIT_PATH" ]] && echo "  systemd unit      $UNIT_PATH" || echo "  systemd unit      (not installed)"
+[[ -f "$DROP_IN" ]] && echo "  restart drop-in   $DROP_IN" || echo "  restart drop-in   (not installed)"
 echo "  systemd linger    disabled for $USER (re-enable with loginctl enable-linger)"
 if [[ ${#SKILL_DIRS[@]} -eq 0 ]]; then
     echo "  agent skills      (none found)"
@@ -156,7 +158,7 @@ echo "                    this script runs from inside it; the final rm -rf is y
 if [[ "$LEVEL" == "service" ]]; then
     # --level service leaves shared-memory/.env in place (decision:1824). data and all are the levels that remove it, and that must be visible here.
     echo "  framework env     $ENV_FILE   (left in place — every declared LLM backend,"
-    echo "                    its private_ok/roles/extra_body state and any token_env"
+    echo "                    its url, n_ctx, max_output_tokens and any token_env"
     echo "                    NAME reference survives untouched; a later restart resumes"
     echo "                    exactly the pool this file declares)"
 fi
@@ -193,6 +195,12 @@ fi
 
 echo
 echo "Removing the service ..."
+# The drop-in is a file. Removing it does not talk to the session bus. daemon-reload stays inside the unit-file branch below, because systemctl --user talks to the live user systemd even when HOME is a sandbox.
+if [[ -f "$DROP_IN" ]]; then
+    rm -f "$DROP_IN"
+    rmdir "$(dirname "$DROP_IN")" 2>/dev/null || true
+    grn "  ✓ restart drop-in removed"
+fi
 # systemctl --user talks to the session bus, not to $HOME, so a sandboxed HOME still hits the live user systemd. Touch the service only when this install's unit file is present.
 if [[ ! -f "$UNIT_PATH" ]]; then
     ylw "  ! no unit at $UNIT_PATH — this install has no service; leaving systemd alone"
@@ -225,7 +233,7 @@ fi
     echo
     grn "Uninstall complete (level: service)."
     echo "The stores, credentials and corpus are untouched. $ENV_FILE and every"
-    echo "declaration in it (LLM_BACKENDS_JSON, private_ok/roles, AGENT_TOKENS, ...)"
+    echo "declaration in it (LLM_BACKENDS_JSON, AGENT_TOKENS, ...)"
     echo "stay exactly as they are — nothing else config-shaped changes at this level."
     echo "Reverse with:"
     echo "  1. bash shared-memory/ops/install_service.sh"
