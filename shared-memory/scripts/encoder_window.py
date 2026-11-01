@@ -72,6 +72,16 @@ def _upstream_url(base: str, rel: str) -> str:
     return f"{base}{rel}"
 
 
+def _encoder_auth_kwargs(base_url: str, route: str) -> dict:
+    """Headers for this encoder, omitted entirely when no key is sent so an unconfigured probe stays the old call."""
+    from secure_env import encoder_auth_headers
+    kind = "embedder" if "embed" in route else "reranker"
+    headers = encoder_auth_headers(kind, str(base_url))
+    if not headers:
+        return {}
+    return {"headers": headers}
+
+
 async def probe_encoder(
     session: Any,
     base_url: str,
@@ -90,7 +100,8 @@ async def probe_encoder(
     models_url = _upstream_url(base_url, "/v1/models")
     try:
         timeout = ClientTimeout(total=5.0)
-        async with session.get(models_url, timeout=timeout, allow_redirects=False) as r:
+        async with session.get(models_url, timeout=timeout, allow_redirects=False,
+                               **_encoder_auth_kwargs(base_url, route)) as r:
             reachable = True
             if r.status == 200:
                 body = await r.json()
@@ -122,7 +133,8 @@ async def probe_encoder(
         props_url = f"{props_base}/props"
         try:
             timeout = ClientTimeout(total=5.0)
-            async with session.get(props_url, timeout=timeout, allow_redirects=False) as r:
+            async with session.get(props_url, timeout=timeout, allow_redirects=False,
+                                   **_encoder_auth_kwargs(base_url, route)) as r:
                 reachable = True
                 if r.status == 200:
                     body = await r.json()
@@ -165,9 +177,18 @@ async def probe_encoder(
         ceiling = embed_ceiling(EMBED_MAX_CHARS)
         try:
             timeout = ClientTimeout(total=ceiling)
-            async with session.post(post_url, json=payload, timeout=timeout, allow_redirects=False) as r:
+            async with session.post(post_url, json=payload, timeout=timeout, allow_redirects=False,
+                                    **_encoder_auth_kwargs(base_url, route)) as r:
                 await r.read()
-                full_ok = (r.status == 200)
+                if r.status in (401, 403):
+                    from secure_env import encoder_key_configured
+                    # A refused key is not a window overrun. With no key configured, 401 stays False.
+                    if encoder_key_configured("embedder"):
+                        full_ok = None
+                    else:
+                        full_ok = False
+                else:
+                    full_ok = (r.status == 200)
         except Exception:
             full_ok = False
     else:
@@ -180,7 +201,8 @@ async def probe_encoder(
         ceiling = rerank_ceiling([doc])
         try:
             timeout = ClientTimeout(total=ceiling)
-            async with session.post(post_url, json=payload, timeout=timeout, allow_redirects=False) as r:
+            async with session.post(post_url, json=payload, timeout=timeout, allow_redirects=False,
+                                    **_encoder_auth_kwargs(base_url, route)) as r:
                 await r.read()
                 if r.status == 200:
                     full_ok = True

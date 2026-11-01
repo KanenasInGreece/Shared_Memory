@@ -8,6 +8,7 @@ import json
 import os
 import select
 import socket
+import ssl
 import subprocess
 import sys
 import threading
@@ -281,3 +282,170 @@ def test_proxy_environment_is_ignored(rig, monkeypatch):
         assert rig.seen[0][2] == RERANK_BODY
     finally:
         dead.close()
+
+
+def _header(headers, name):
+    for key, value in headers.items():
+        if key.lower() == name.lower():
+            return value
+    return None
+
+
+# 11. The shim forwards the caller's Authorization and invents none when none came.
+def test_shim_forwards_the_callers_key_and_invents_none(rig):
+    rig.routes["POST /v1/rerank"] = lambda h: Upstream.reply(h, 200, RERANK_REPLY)
+    rig.routes["GET /health"] = lambda h: Upstream.reply(h, 200, b"{}")
+    status, _, _ = _call(
+        rig, "POST", "/v1/reranking", RERANK_BODY,
+        {"Authorization": "Bearer SHIM-CANARY", "Content-Type": "application/json"},
+    )
+    assert status == 200
+    assert _header(rig.seen[0][3], "Authorization") == "Bearer SHIM-CANARY"
+    rig.seen.clear()
+    status, _, _ = _call(rig, "GET", "/health")
+    assert status == 200
+    assert _header(rig.seen[0][3], "Authorization") is None
+
+
+def test_shim_opens_a_public_http_upstream_when_a_key_came(monkeypatch):
+    """The shim has no transport check. A key that arrived is forwarded, including toward a public http address."""
+    monkeypatch.setenv("SHIM_VLLM_URL", "http://8.8.8.8:9")
+    seen = []
+
+    class _Conn:
+        def __init__(self, host, port, timeout=None):
+            seen.append((host, port))
+            raise OSError("stopped before the network")
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(shim.http.client, "HTTPConnection", _Conn)
+    server = shim.Threaded(("127.0.0.1", 0), shim.Shim)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    port = server.server_address[1]
+    raw = (
+        b"POST /v1/reranking HTTP/1.1\r\n"
+        b"Host: x\r\n"
+        b"Authorization: Bearer SHIM-CANARY\r\n"
+        b"Content-Type: application/json\r\n"
+        b"Content-Length: 2\r\n"
+        b"Connection: close\r\n"
+        b"\r\n"
+        b"{}"
+    )
+    try:
+        sock = socket.create_connection(("127.0.0.1", port), timeout=10)
+        sock.sendall(raw)
+        chunks = []
+        while True:
+            piece = sock.recv(65536)
+            if not piece:
+                break
+            chunks.append(piece)
+        sock.close()
+    finally:
+        server.shutdown()
+        server.server_close()
+    body = b"".join(chunks)
+    assert seen == [("8.8.8.8", 9)]
+    assert b"public http" not in body
+    assert b"SHIM-CANARY" not in body
+
+
+def _shim_cert(tmp_path):
+    key = tmp_path / "key.pem"
+    cert = tmp_path / "cert.pem"
+    subprocess.check_call(
+        [
+            "openssl", "req", "-x509", "-newkey", "rsa:2048",
+            "-keyout", str(key), "-out", str(cert), "-days", "1", "-nodes",
+            "-subj", "/CN=127.0.0.1",
+            "-addext", "subjectAltName=IP:127.0.0.1",
+            "-addext", "basicConstraints=CA:TRUE",
+        ],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    return key, cert
+
+
+def test_shim_https_verifies_the_certificate_and_forwards_the_key(monkeypatch, tmp_path):
+    key, cert = _shim_cert(tmp_path)
+    seen = []
+
+    class H(http.server.BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def do_POST(self):
+            n = int(self.headers.get("Content-Length") or 0)
+            self.rfile.read(n)
+            seen.append({k: v for k, v in self.headers.items()})
+            body = b"{}"
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *_a):
+            pass
+
+    upstream = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.load_cert_chain(certfile=str(cert), keyfile=str(key))
+    upstream.socket = context.wrap_socket(upstream.socket, server_side=True)
+    threading.Thread(target=upstream.serve_forever, daemon=True).start()
+    port = upstream.server_address[1]
+    monkeypatch.setenv("SHIM_VLLM_URL", f"https://127.0.0.1:{port}")
+    server = shim.Threaded(("127.0.0.1", 0), shim.Shim)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    contexts = []
+    real = ssl.create_default_context
+
+    def _wrapped(*args, **kwargs):
+        made = real(*args, **kwargs)
+        contexts.append(made)
+        made.load_verify_locations(cafile=str(cert))
+        return made
+
+    raw = (
+        b"POST /v1/reranking HTTP/1.1\r\n"
+        b"Host: x\r\n"
+        b"Authorization: Bearer SHIM-CANARY\r\n"
+        b"Content-Type: application/json\r\n"
+        b"Content-Length: 2\r\n"
+        b"Connection: close\r\n"
+        b"\r\n"
+        b"{}"
+    )
+
+    def _once():
+        sock = socket.create_connection(("127.0.0.1", server.server_address[1]), timeout=10)
+        try:
+            sock.sendall(raw)
+            chunks = []
+            while True:
+                piece = sock.recv(65536)
+                if not piece:
+                    return b"".join(chunks)
+                chunks.append(piece)
+        finally:
+            sock.close()
+
+    try:
+        refused = _once()
+        assert seen == []
+        assert b"HTTP/1.1 502 " in refused
+        assert b"SHIM-CANARY" not in refused
+        monkeypatch.setattr(shim.ssl, "create_default_context", _wrapped)
+        accepted = _once()
+        assert b"HTTP/1.1 200 " in accepted
+        assert contexts
+        assert contexts[0].verify_mode == ssl.CERT_REQUIRED
+        assert contexts[0].check_hostname is True
+        assert _header(seen[0], "Authorization") == "Bearer SHIM-CANARY"
+    finally:
+        server.shutdown()
+        server.server_close()
+        upstream.shutdown()
+        upstream.server_close()

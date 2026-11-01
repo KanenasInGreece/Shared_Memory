@@ -253,6 +253,7 @@ async def test_sizing_never_fails_the_search(client, monkeypatch):
 @pytest.mark.parametrize("client", CLIENTS)
 @pytest.mark.parametrize("bad_block", [
     pytest.param({"status": "failing"}, id="status-failing"),
+    pytest.param({"status": "auth_failed"}, id="status-auth-failed"),
     pytest.param({"projection_stale": True}, id="projection-stale"),
     pytest.param({"status": "failing", "projection_stale": True}, id="both"),
 ])
@@ -267,6 +268,22 @@ def test_s7_mixed_probed_and_failing_backend_floors_at_fallback_not_floor(client
     ceiling = client.search_ceiling(capability)
     assert ceiling == client.SEARCH_TIMEOUT_FALLBACK_S
     assert ceiling > client.SEARCH_TIMEOUT_FLOOR_S
+
+
+def test_s7_gateway_auth_failed_floors_at_fallback_not_floor(monkeypatch):
+    """The gateway ceiling is the third copy. auth_failed is an unknown cost, not zero."""
+    scripts = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "shared-memory", "scripts"))
+    if scripts not in sys.path:
+        sys.path.insert(0, scripts)
+    import hive_mind_proxy as gateway
+    monkeypatch.setattr(gateway, "CAPACITY_SEARCH_TIMEOUT_S", 0.0)
+    capability = {
+        "reranker": {"projected_full_payload_s": 1.0, "status": "ok"},
+        "embedder": {"status": "auth_failed"},
+    }
+    ceiling = gateway._capacity_client_ceiling_s(capability)
+    assert ceiling == gateway.CAPACITY_SEARCH_TIMEOUT_FALLBACK_S
+    assert ceiling > gateway.CAPACITY_SEARCH_TIMEOUT_FLOOR_S
 
 
 @pytest.mark.parametrize("client", CLIENTS)

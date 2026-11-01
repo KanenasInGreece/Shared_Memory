@@ -1193,9 +1193,11 @@ def test_a_wholly_dropped_family_goes_whatever_it_is_serving(at_the_drop_release
     payload["project_identity"] = None
     payload["llm_reserved"] = []
     stripped = tc.strip_dropped(payload, tc.HEALTH)
-    for gone in ("config", "llm_affinity", "llm_pool", "daemon",
+    for gone in ("llm_affinity", "llm_pool", "daemon",
                  "gpu_probe", "project_identity", "llm_reserved"):
         assert gone not in stripped, f"{gone} is still served"
+    # The sample config has no children, so it stays an empty dict.
+    assert stripped["config"] == {}
 
 
 def test_a_partially_dropped_family_that_is_not_a_dict_is_left_alone(
