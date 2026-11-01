@@ -7,6 +7,26 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.0.42] - 2026-11-01
+
+An embedder and a reranker can now take an API key, for encoders on another machine. With no key configured, requests and statuses are unchanged. `API_VERSION` stays 4.
+
+### Added
+
+- `EMBEDDER_API_KEY` and `RERANKER_API_KEY`, resolved like a cloud LLM key: the value, a `*_FILE` pointer, or `$CREDENTIALS_DIRECTORY`. Read at start, so restart after changing one. Each goes only to its own encoder, on framework routes. `rerank_shim.py` forwards the header it receives and accepts an https `SHIM_VLLM_URL`.
+- A key the encoder refuses shows `auth_failed`: the embedder is `down` (HTTP 503 on `/health`), the reranker `degraded` (HTTP 200). The gateway keeps running. A missing or empty key file is logged and the request goes without a key, so the encoder's answer decides.
+- `ENCODER_PLAINTEXT_OK`, default true. Plain HTTP is allowed, and an encrypted tunnel (SSH or Tailscale) is expected, the same way a remote client reaches the gateway. A key on plain HTTP is readable on the path. Set false, the key is withheld from a public plain-HTTP address.
+- `/health` config gains `embedder_key_configured` and `reranker_key_configured`, which the monitor can see. They are booleans, never the value.
+
+### Changed
+
+- With a key attached, a query string on an encoder route is refused with 403, as for credentialed LLM backends.
+- An embed that fails past its fixed retries now logs an ERROR line, for every cause. The retries are unchanged.
+
+### Dependency sweep, 2026-11-01
+
+No pin moved. Not moved, as in 1.0.41: joserfc GHSA-9pg5-8c7x-5hfx (the fix is under the 14-day floor) and GHSA-jpxq-7h8p-2q76 in `requirements.lock`; fastmcp GHSA-7xgj-8392-5q4r and GHSA-vqqp-x5qm-5qp4 in `requirements.lock` and the MCP connector. None is in `requirements-gateway.lock`.
+
 ## [1.0.41] - 2026-11-01
 
 Reasoning backends are declared in one place and the gateway serves the framework only. `API_VERSION` stays 4. Read "Before you update" first: an update stops if a declaration is incomplete, and the gateway no longer answers outside clients on the chat route.

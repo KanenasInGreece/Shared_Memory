@@ -217,7 +217,7 @@ AGENT_ID = os.environ.get("AGENT_ID", "vector_skill")
 # v4 a fact save without a registered metadata.project is rejected 400 carrying
 # project_required or project_unknown plus near-match proposals.
 API_VERSION = 4
-VERSION = "1.0.41"
+VERSION = "1.0.42"
 CLIENT_VERSION_HEADER = "X-SM-Api-Version"
 # Framework build, separate from api_version, so two clients on the same wire contract can still be counted apart in clients.versions_seen.
 CLIENT_BUILD_HEADER = "X-Shared-Memory-Client"
@@ -280,7 +280,7 @@ def search_ceiling(capability: dict | None, capacity: dict | None = None) -> flo
         if value > 0:
             projected += value
             probed = True
-        elif block.get("status") == "failing" or block.get("projection_stale"):
+        elif block.get("status") in ("failing", "auth_failed") or block.get("projection_stale"):
             unknown = True   # this backend's real cost is unknown, not zero
 
     if not probed:

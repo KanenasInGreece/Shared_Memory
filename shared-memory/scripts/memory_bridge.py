@@ -37,7 +37,7 @@ from typing import Any
 
 import httpx
 
-VERSION = "1.0.41"
+VERSION = "1.0.42"
 # Must match GET /health api_version; v4 refuses unregistered project on fact save.
 API_VERSION = 4
 
@@ -241,7 +241,7 @@ def search_ceiling(capability: dict | None, capacity: dict | None = None) -> flo
         if value > 0:
             projected += value
             probed = True
-        elif block.get("status") == "failing" or block.get("projection_stale"):
+        elif block.get("status") in ("failing", "auth_failed") or block.get("projection_stale"):
             unknown = True   # this backend's real cost is unknown, not zero
 
     if not probed:

@@ -83,7 +83,7 @@ __all__ = [
 ]
 
 #: Not a free-running today: this is the fifth version pin, so a missed bump is visible (decision:1832).
-VERSION = "1.0.41"
+VERSION = "1.0.42"
 
 
 def _version_tuple(v: str) -> tuple:
@@ -168,6 +168,8 @@ INTRODUCED_1_0_2 = "1.0.2"
 INTRODUCED_1_0_7 = "1.0.7"
 #: Declaration fields and last-call rows. VERSION in this file stays 1.0.40 until the coordinator stamps the release.
 INTRODUCED_1_0_41 = "1.0.41"
+#: Encoder key flags and the auth_failed value.
+INTRODUCED_1_0_42 = "1.0.42"
 #: A lone consolidation stall stopped degrading the top /health status (fact:2996 ruling 3).
 INTRODUCED_1_0_17 = "1.0.17"
 #: Quiesce sheds writes on auth-off installs and counts every write in flight (fact:2996 ruling 1: the container check).
@@ -224,12 +226,18 @@ HEALTH: dict[str, dict] = {
     "dependencies.neo4j.reason": _k("str|null", "dependencies", since=INTRODUCED_0_9_74),
     "dependencies.embedder.state": _k("str", "dependencies", since=INTRODUCED_0_9_74,
                                       log="health.embedder", note=(
-        "ok | degraded | down — down iff the liveness probe itself failed; "
-        "degraded iff live but the capability probe reads too_slow/failing")),
+        "ok | degraded | down. down when the liveness probe failed, or when a "
+        "configured key is refused (the probe or the capability status is "
+        "auth_failed). degraded when the encoder is live but capability is "
+        "too_slow or failing, or the window is short or overrun. A refused "
+        "key is judged before the window, so a window verdict cannot mask it.")),
     "dependencies.embedder.reason": _k("str|null", "dependencies", since=INTRODUCED_0_9_74),
     "dependencies.reranker.state": _k("str", "dependencies", since=INTRODUCED_0_9_74,
                                       log="health.reranker", note=(
-        "ok | degraded | down — same rule as dependencies.embedder.state")),
+        "ok | degraded | down. down when the liveness probe failed for a reason "
+        "other than a refused key. A configured key the reranker refuses "
+        "(probe or capability auth_failed, including /health 401 or 403) is "
+        "degraded, not down. Any other probe failure is still down.")),
     "dependencies.reranker.reason": _k("str|null", "dependencies", since=INTRODUCED_0_9_74),
     "dependencies.llm_pool.state": _k("str", "dependencies", since=INTRODUCED_0_9_74,
                                       log="health.llm_pool", note=(
@@ -285,8 +293,14 @@ HEALTH: dict[str, dict] = {
     "warnings[].unit": _k("str", "warnings", since=INTRODUCED_0_9_74),
 
     # ── encoders (KEPT: a client derives its own timeouts from these) ───────
-    "embedder": _k("str", "encoders", note="ok | timeout | down | http_<code>"),
-    "reranker": _k("str", "encoders", note="ok | timeout | down | http_<code>"),
+    "embedder": _k("str", "encoders", note=(
+        "ok | timeout | down | auth_failed | http_<code>. auth_failed is a "
+        "configured key the encoder refused (401 or 403). With no key "
+        "configured, 401 stays http_401.")),
+    "reranker": _k("str", "encoders", note=(
+        "ok | timeout | down | auth_failed | http_<code>. auth_failed is a "
+        "configured key the encoder refused (401 or 403). With no key "
+        "configured, 401 stays http_401.")),
     "backend_capability.probed_at": _k("str|null", "encoders"),
     "backend_capability.gateway_host_load1": _k("float|null", "encoders"),
     "backend_capability.status": _k("str|null", "encoders"),
@@ -296,7 +310,9 @@ HEALTH: dict[str, dict] = {
     "backend_capability.*.projected_full_payload_s": _k("float", "encoders", unit="_s"),
     "backend_capability.*.ceiling_s": _k("float", "encoders", unit="_s"),
     "backend_capability.*.serves_full_payload": _k("bool", "encoders"),
-    "backend_capability.*.status": _k("str", "encoders"),
+    "backend_capability.*.status": _k("str", "encoders", note=(
+        "ok | too_slow | failing | auth_failed. auth_failed means a configured "
+        "key was refused on the probe POST. With no key configured, a 401 stays failing.")),
     "backend_capability.*.projection_stale": _k("bool", "encoders"),
     "backend_capability.*.last_ok_at": _k("str|null", "encoders"),
     "backend_capability.*.projection_age_s": _k("float|null", "encoders", unit="_s"),
@@ -577,6 +593,13 @@ HEALTH: dict[str, dict] = {
         moved_to="telemetry:config.allow_unauthenticated_provider_keys",
         removed_in=DUAL_EMIT_DROP_TARGET,
         note="present ONLY while the S-05 override is actually in effect"),
+    # No removed_in: the rest of this family left /health at 0.9.90, and a past stamp would strip the key the moment it is added.
+    "config.embedder_key_configured": _k(
+        "bool", "credentials", since=INTRODUCED_1_0_42,
+        note="true when EMBEDDER_API_KEY resolves or EMBEDDER_API_KEY_FILE is set. The token is not a config value."),
+    "config.reranker_key_configured": _k(
+        "bool", "credentials", since=INTRODUCED_1_0_42,
+        note="true when RERANKER_API_KEY resolves or RERANKER_API_KEY_FILE is set. The token is not a config value."),
 
     # ── consolidation: the ADR-018 subset stays on /health ──────────────────
     "consolidation.stalled": _k("bool", "nrem/consolidation"),
@@ -1054,6 +1077,12 @@ TELEMETRY: dict[str, dict] = {
     "config.llm_affinity.ttl_s": _k("float|int", "llm", unit="_s", since=INTRODUCED_0_9_74),
     "config.llm_affinity.max_inflight": _k("int", "llm", since=INTRODUCED_0_9_74),
     "config.embed_max_chars": _k("int", "encoders", unit="_chars", since=INTRODUCED_0_9_74),
+    "config.embedder_key_configured": _k(
+        "bool", "credentials", since=INTRODUCED_1_0_42,
+        note="true when EMBEDDER_API_KEY resolves or EMBEDDER_API_KEY_FILE is set. The token is not a config value."),
+    "config.reranker_key_configured": _k(
+        "bool", "credentials", since=INTRODUCED_1_0_42,
+        note="true when RERANKER_API_KEY resolves or RERANKER_API_KEY_FILE is set. The token is not a config value."),
     "config.allow_unauthenticated_provider_keys": _k("bool", "credentials", since=INTRODUCED_0_9_74),
     "axes.project_identity.nodes": _k("int", "axes/registry", since=INTRODUCED_0_9_74),
     "axes.project_identity.unidentified": _k("int", "axes/registry", since=INTRODUCED_0_9_74),
@@ -1325,6 +1354,15 @@ TELEMETRY: dict[str, dict] = {
 
 # A key whose value changes meaning while its name stays is listed here, or a consumer of the key list sees nothing wrong (fact:1626).
 MEANING_CHANGES: tuple[dict, ...] = (
+    {
+        "endpoint": "health",
+        "path": "dependencies.embedder",
+        "in_version": INTRODUCED_1_0_42,
+        "was": "down meant only that the liveness probe failed",
+        "now": "down also means a configured key was refused on a real route, reason auth_failed. A refused reranker key is degraded with the same reason",
+        "action": "read reason to tell a refused key from a dead encoder",
+        "shape_changed": False,
+    },
     {
         "endpoint": "telemetry",
         "path": "breakdown.domains",
