@@ -1,71 +1,25 @@
-"""Shared split-env loader for the framework's three long-running processes —
-hive_mind_proxy.py, rem_loop.py, consolidation_loop.py (Credential Custody
-workstream (a), PR A1 — secrets out of the process environment).
+"""Shared split-env loader for the framework's three long-running processes.
 
-Every prior release had each process copy the whole framework `.env` into
-`os.environ`, which meant every secret it held (PG_PASSWORD, NEO4J_PASSWORD,
-AGENT_TOKENS, provider keys) was visible to `/proc/<pid>/environ` for that
-process AND to any child it spawned (`os.environ.copy()` in the proxy's old
-`_daemon_env()`). This module replaces that with a SPLIT:
+Separates configuration from secrets:
+  - config keys -> os.environ via setdefault (operator exports win).
+  - secret keys -> held only in this module's in-process dict (_secrets), read only via
+    get_secret(). Never exported to os.environ, so a secret cannot appear in
+    /proc/<pid>/environ or reach a child through a wholesale os.environ.copy().
 
-  - config keys  -> os.environ, via setdefault, exactly as every loader in
-    this family already did. An operator-exported value always wins.
-  - secret keys  -> held ONLY in this module's in-process dict (`_secrets`),
-    read back exclusively through get_secret(). Never exported to os.environ,
-    so a secret can never appear in this process's own /proc/<pid>/environ
-    (that was already true, since it never lived there) NOR leak into a
-    child's environment through a wholesale os.environ.copy().
+Classification uses both an explicit name list and suffix patterns so unlisted
+secret keys are caught automatically.
 
-Classification is deliberately BOTH a known-name list and a suffix pattern
-(SEC-09, ruled 2026-08-14): a new secret key must be caught even when nobody
-remembers to extend the list.
+Precedence (highest first):
+  1. Operator os.environ export (always wins in get_secret).
+  2. $CREDENTIALS_DIRECTORY/<key, lowercased> (systemd LoadCredential=).
+  3. <KEY>_FILE (Docker convention; secret read from file path).
+  4. shared-memory/.env plaintext value (fallback).
 
-Security-review fix round (2026-08-14, same-day re-review of this PR) folded
-in below — each fix is flagged where it lands.
-
-PR A2 (SEC-10) adds `read_daemon_token_from_fd()`: the daemon's own
-AGENT_TOKEN, which PR A1 still passed via the child environment as one
-named interim exception, now crosses only through an inherited pipe fd —
-see hive_mind_proxy._daemon_env_and_token_fd() for the write side.
-
-PR A4 (SEC-06) adds two DEPLOYER file-based ingestion paths for every
-secret-classified key, both feeding this module's internal store directly —
-neither may ever reach os.environ or a child env, extending the same
-invariant PR A1 established for the plaintext .env case:
-
-  - `<KEY>_FILE`         — Docker official-images convention: if set (in the
-    process environment or the framework .env), its value is a path; the
-    secret is read from that file.
-  - `$CREDENTIALS_DIRECTORY/<key, lowercased>` — systemd `LoadCredential=`:
-    if the systemd-managed credentials directory is present and contains a
-    file named after the key (lowercase is the systemd norm), the secret is
-    read from there.
-
-PRECEDENCE (highest first), and this is the ENTIRE precedence — nothing
-above it is skipped, nothing below it is consulted once a tier resolves:
-
-  1. An operator's own os.environ export — unchanged since PR A1 review fix
-     #1 (get_secret() checks os.environ FIRST, always). SEC-06 (ii) below
-     makes this path advisory-flagged, not forbidden.
-  2. $CREDENTIALS_DIRECTORY/<key>   — systemd-managed delivery, the most
-     operationally locked-down of the three; a deployment that configures it
-     did so deliberately.
-  3. <KEY>_FILE                     — Docker official-images convention; a
-     deployer named a specific mount.
-  4. shared-memory/.env plaintext value — what every prior release did; the
-     fallback of last resort.
-
-Tiers 2-4 all land in this module's in-process store, never os.environ,
-exactly like the plaintext case PR A1 already covered — see
-_credentials_directory_secret() / _file_indirection_secret() /
-load_split_env() below, and test_secrets_out_of_process_env.py /
-test_deployer_file_secrets.py for the mutation-checked coverage.
-
-SEC-06 (ii): a known-secret key found ALREADY SET in this process's own exec
-environment when load_split_env() runs (EnvironmentFile=, an exported shell
-var) prints one advisory log line naming the KEY NAME ONLY — never the
-value — pointing at the _FILE/LoadCredential= alternative. Advisory, not a
-refusal: the value is still honoured (tier 1 above).
+This is the entire precedence: nothing below a tier is consulted once it resolves. Tiers
+2-4 land in _secrets and must never reach os.environ or a child env. A known secret
+already in the exec environment logs one advisory naming the key only, never the value;
+it is honoured, not refused. The daemon's own AGENT_TOKEN crosses only through an
+inherited pipe fd (read_daemon_token_from_fd).
 """
 import ipaddress
 import json
@@ -114,16 +68,11 @@ _llm_backends_json_parse_failed: bool = False
 # of passing this dict (or os.environ) through.
 _secrets: dict[str, str] = {}
 
-# SEC-06 (ii): names already advised-on in THIS process, so a module that
-# calls load_split_env() more than once (every test in this file reloads
-# daemons repeatedly) does not spam the same advisory on every call. Cleared
-# only by a test harness that owns the module's lifetime, same as
-# _dynamic_secret_names above.
+# Names already advised-on in this process, de-duplicating across repeated calls.
+# Cleared only by a test harness that owns the module's lifetime.
 _advised_exec_env_names: set[str] = set()
 
-# NEW-1 (fix round 2): the same de-duplication for _derive_file_pointer_
-# candidates()'s "non-secret _FILE pointer ignored" warning — see that
-# function's docstring.
+# De-duplication set for non-secret _FILE pointer warnings.
 _advised_ignored_file_pointer_names: set[str] = set()
 
 # A health probe and a save both build the header. One line per variable for the process.
@@ -131,25 +80,12 @@ _warned_non_ascii_encoder_names: set[str] = set()
 
 
 def _normalize_key(name: str) -> str:
-    """Fix round F11 (SEC1 MED-7 + LOW-8): THE one key normaliser every
-    classification/lookup site in this module uses — is_secret_key(),
-    _token_env_names()'s storage insert, get_secret()'s canonical fallback,
-    load_split_env()'s canonical collapse, and both derived-candidate
-    helpers. Strips BOM (U+FEFF) and whitespace from both ends, in EITHER
-    order and any interleaving, then upper-cases.
+    """The one key normaliser every classification and lookup site must use: strip BOM
+    (U+FEFF) and whitespace from both ends, then upper-case.
 
-    Why a loop instead of one `.strip().lstrip("﻿")` (or the reverse)
-    pass: a single fixed order only handles ONE of the two orderings a raw
-    line can carry. Probed (SEC1 finding 8): "﻿ AGENT_TOKENS" (BOM
-    THEN space) needs BOM stripped first, or the space survives as a
-    leftover middle character once lstrip("﻿") alone is applied
-    second; " ﻿AGENT_TOKENS" (space THEN BOM) needs the reverse order.
-    A fixed single-order strip therefore classifies the SAME logical key
-    (AGENT_TOKENS with incidental BOM/whitespace noise) as secret on one
-    side and config on the other, depending only on which order that
-    particular caller happened to use. This loop strips whichever
-    character is at each end, repeatedly, so both orderings — and any
-    number of repeats — normalise identically."""
+    A loop, because a fixed single-order strip handles only one of "BOM then space" and
+    "space then BOM", classifying one key as secret on one side and config on the other.
+    """
     s = name
     while s and (s[0].isspace() or s[0] == "﻿"):
         s = s[1:]
@@ -162,19 +98,13 @@ _EXPORT_PREFIX_RE = re.compile(r"^export\s+", re.IGNORECASE)
 
 
 def _strip_export_prefix(key: str) -> str:
-    """Fix round F5 (SEC1 HIGH-3 + MED-5): strip an optional leading shell
-    `export ` keyword — CASE-INSENSITIVELY — from a raw .env line's key
-    text, at PARSE time, before it is stored anywhere or classified.
-    "export AGENT_TOKENS=..." / "EXPORT AGENT_TOKENS=..." both become the
-    classifiable key "AGENT_TOKENS", exactly as a plain "AGENT_TOKENS=..."
-    line would. Without this, the stored key was the literal string
-    "export AGENT_TOKENS" — not in KNOWN_SECRET_NAMES (exact-match only)
-    and not matching the "_TOKEN" suffix (it ends in "TOKENS", the plural,
-    with "export " still attached) — so a shell-sourceable .env using this
-    legitimate form had its registry exported straight into os.environ,
-    fail-OPEN on the exact form D.4 had just finished blessing on the MCP
-    detection side. BOM/whitespace is stripped before AND after the prefix
-    check, since either can precede or follow the keyword."""
+    """Strip an optional leading shell `export ` keyword, case-insensitively, at parse
+    time.
+
+    The literal key "export AGENT_TOKENS" matches no secret name or suffix, so a
+    shell-sourceable .env would otherwise send its registry into os.environ. BOM and
+    whitespace are stripped before and after the keyword.
+    """
     s = name = key
     while s and (s[0].isspace() or s[0] == "﻿"):
         s = s[1:]
@@ -185,18 +115,12 @@ def _strip_export_prefix(key: str) -> str:
 
 
 def _strip_balanced_quotes(value: str) -> str:
-    """S16g (HYG round, R-G'): a `.env` VALUE wrapped in ONE balanced pair of
-    surrounding quotes — `"v"` or `'v'` — has that pair stripped; everything
-    else (an unbalanced leading quote with no matching trailing one, a bare
-    quote embedded in the value, mismatched quote characters, or no quotes
-    at all) is kept VERBATIM. Applied identically here, in memory_bridge.py's
-    manual fallback parser, and in mcp/vector-skill.py's manual fallback
-    parser — three independent copies of the same rule, since none of the
-    three may import from another (Group 1: the client/server surface
-    split). Does NOT apply to _read_secret_file()'s `<KEY>_FILE` /
-    $CREDENTIALS_DIRECTORY path (~line 460 above) — that reads a mounted
-    secret FILE, not a `.env` line, and strips only trailing CR/LF, never
-    quotes or spaces; a recorded inconsistency, not fixed by this round."""
+    """Strip one balanced pair of surrounding quotes; anything else is kept verbatim.
+
+    memory_bridge.py and mcp/vector-skill.py hold their own copies, because none of the
+    three may import another: change all three. Never applied to _read_secret_file,
+    which strips only trailing CR/LF.
+    """
     if len(value) >= 2 and value[0] == value[-1] and value[0] in ('"', "'"):
         return value[1:-1]
     return value
@@ -274,28 +198,13 @@ read_env_key = read_env_value
 
 
 def is_secret_key(name: str) -> bool:
-    """True if `name` must never be exported to os.environ or forwarded into
-    a child process environment — the known-config allowlist (checked first,
-    so it always wins), then the known-name list / dynamically-discovered
-    token_env names, then the suffix pattern (case-insensitive, fix #6).
+    """True if name must never be exported to os.environ or forwarded into a child env.
 
-    D.2 (SEC round, ADV1-3): `name` is normalised ONCE, here, before every
-    comparison, via the shared _normalize_key() (F11 — strip surrounding
-    whitespace and a stray leading BOM, U+FEFF, in either order; upper-
-    case). Before this fix the exact-match checks (KNOWN_CONFIG_NAMES /
-    KNOWN_SECRET_NAMES / _dynamic_secret_names) compared the RAW candidate,
-    so a lowercase or BOM-prefixed spelling of a well-known name (a
-    lowercase `agent_tokens=` line, in particular — AGENT_TOKENS does not
-    even match the suffix pattern, since it ends in the PLURAL "_TOKENS",
-    not "_TOKEN") fell through every check and was misclassified as
-    ordinary config, then exported to os.environ by load_split_env()'s
-    config loop and forwarded into a daemon's child env by _daemon_env().
-    Both callers already pass this same normalised form to
-    _dynamic_secret_names (see _token_env_names below) and to
-    load_split_env()'s own storage key (see the CANONICAL-key comment
-    there), so this is the matching normalisation on the lookup side —
-    fixing only one side would be a classification INVERSION (ADV1-3), not
-    a fix."""
+    KNOWN_CONFIG_NAMES is checked first and always wins, then KNOWN_SECRET_NAMES and
+    token_env names, then _SECRET_SUFFIXES. name is normalised once, first, matching
+    the storage side; normalising only one side inverts classification, and
+    AGENT_TOKENS needs the exact match because the plural misses the _TOKEN suffix.
+    """
     key_norm = _normalize_key(name)
     if key_norm in KNOWN_CONFIG_NAMES:
         return False
@@ -305,26 +214,13 @@ def is_secret_key(name: str) -> bool:
 
 
 def _token_env_names(raw_json: str) -> set[str]:
-    """Every `token_env` name LLM_BACKENDS_JSON references — SEC-09's 'every
-    token_env name from backend config' clause, for the case such a name
-    doesn't happen to match the suffix pattern. Malformed/absent JSON yields
-    an empty set; hive_mind_proxy._load_llm_backends() does the real
-    (stricter) validation later — this is classification only, and must not
-    raise on input it will reject anyway.
+    """Normalised token_env names from LLM_BACKENDS_JSON, for classification only;
+    hive_mind_proxy._load_llm_backends() does the real validation.
 
-    D.1 (SEC round, ADV1-2): a genuine parse failure of a NON-EMPTY
-    raw_json — invalid JSON, or valid JSON that isn't a list — sets the
-    module-level _llm_backends_json_parse_failed flag (still returning the
-    empty set; this function must never raise). An absent/empty raw_json is
-    NOT a failure (nothing was ever declared) and clears the flag, as does a
-    later call that parses cleanly — so a corrected value (an operator's
-    fix, or a test's own re-invocation with a clean env) un-wedges the
-    fatal-at-main() check require_llm_backends_json_parses() enforces below.
-
-    D.2 (ADV1-3): every discovered name is normalised (see is_secret_key's
-    docstring) BEFORE it lands in _dynamic_secret_names, so a lowercase or
-    BOM-prefixed `token_env` value classifies correctly regardless of the
-    case is_secret_key() is later asked about."""
+    Must not raise. Invalid JSON or a non-list sets _llm_backends_json_parse_failed and
+    returns empty. Absent or empty is not a failure and clears the flag, as does a later
+    clean parse, so a corrected value un-wedges require_llm_backends_json_parses().
+    """
     global _llm_backends_json_parse_failed
     names: set[str] = set()
     if not raw_json:
@@ -348,10 +244,9 @@ def _token_env_names(raw_json: str) -> set[str]:
 
 
 def llm_backends_json_parse_failed() -> bool:
-    """True iff the most recent load_split_env() call found a non-empty
-    LLM_BACKENDS_JSON that failed to parse as a JSON array (D.1). Consulted
-    by require_llm_backends_json_parses(), never by classification logic
-    itself."""
+    """True if the most recent load_split_env() found a non-empty, malformed LLM_BACKENDS_JSON.
+    Consulted by require_llm_backends_json_parses(), never by classification logic.
+    """
     return _llm_backends_json_parse_failed
 
 
@@ -620,25 +515,20 @@ def llm_declaration_errors(env: "dict | None" = None) -> "list[tuple[str, str]]"
     return errors
 
 
-# R1 (fix round 1, Opus review, probe-confirmed): hard ceiling on a single
-# secret file's size, env-overridable per the portability rule (our 64 KiB
-# default is generous — the largest thing this ever holds is a provider API
-# key or a DSN, both far under 1 KiB in practice; a deployment with a larger
-# legitimate secret can raise it).
+# Hard ceiling on one secret file; a deployment with a larger secret can raise it.
+# FIFOs and devices never reach it: S_ISREG refuses them first.
 _SECRET_FILE_MAX_BYTES = int(
     os.environ.get("SECURE_ENV_SECRET_FILE_MAX_BYTES", str(64 * 1024))
 )
 
 
 def _first_control_character(value: str) -> "tuple[int, str] | None":
-    """(offset, character) of the first C0 control character or DEL in
-    `value`, else None. Deliberately NOT `str.isprintable()` and not a
-    unicodedata category test: those also reject non-ASCII letters and
-    non-breaking spaces, which a secret may legitimately contain. The only
-    class this refuses is the one that cannot survive the journey a secret
-    read from a file actually makes — into an HTTP header value, where
-    aiohttp raises `ValueError: Forbidden control character detected in
-    headers` per request rather than at load."""
+    """(offset, char) of the first C0 control character or DEL, else None.
+
+    Deliberately NOT str.isprintable() or a unicodedata test: those also reject
+    non-ASCII letters and non-breaking spaces a secret may contain. This class is what
+    aiohttp refuses in a header value, per request rather than at load.
+    """
     for offset, ch in enumerate(value):
         if ord(ch) < 0x20 or ch == "\x7f":
             return offset, ch
@@ -646,104 +536,31 @@ def _first_control_character(value: str) -> "tuple[int, str] | None":
 
 
 def _read_secret_file(path: Path, *, source: str) -> "str | None":
-    """Read one secret value from `path` (SEC-06 i, PR A4). Never raises: an
-    unreadable, missing, non-regular, oversized, or empty file WARNS to
-    stderr and returns None so the caller falls through to the next
-    precedence tier — a mount that came and went (or a deployer who has not
-    wired this tier yet) must not crash a daemon's startup.
+    """Read one secret value from path. Never raises: any failure WARNS and returns
+    None so the caller falls through to the next tier; a mount that came and went must
+    not crash a daemon's startup.
 
-    R1 (fix round 1, Opus review, probe-confirmed): the original cut
-    `stat()`'d the PATH (mode check only) then called `path.read_text()`
-    unconditionally — no regular-file check, no size ceiling. A FIFO hangs
-    the open() forever (probe: `timeout 10` against a scratch FIFO exited
-    124, still blocked); `/dev/zero` reads unbounded into memory (probe:
-    exit 124 after only the loose-mode warning). Both are reachable from a
-    typo'd `_FILE` pointer or a same-uid `systemctl --user set-environment
-    PG_PASSWORD_FILE=/path/to/fifo` (still the documented LLM_BACKENDS_JSON
-    delivery channel, and it persists in the user manager across restarts) —
-    a silent, permanent denial of service on the memory hive: the gateway
-    never reaches its listener, never logs, and systemd sees a start that
-    neither succeeds nor fails.
+    The order matters. O_NONBLOCK stops the open blocking on a FIFO with no writer.
+    fstat the OPEN fd, never re-stat the path, so check and read hit the same object.
+    S_ISREG refuses a FIFO, device, directory or socket before a byte is read: a typo'd
+    _FILE pointer to a FIFO or /dev/zero would otherwise hang the gateway before its
+    listener, with no log line. Over-cap is decided from st_size first; the read loops
+    because read(2) may return short and a short read must never pass as the whole
+    secret; the length check stays as a backstop for a file whose st_size lies. An
+    over-cap file is unset, never truncated.
 
-    Fixed with the fd-safe pattern, in this order:
-      1. `os.open(path, O_RDONLY | O_NONBLOCK)` — O_NONBLOCK is what stops
-         the OPEN itself blocking on a FIFO with no writer (open(2): a
-         non-blocking read-only open of a FIFO returns immediately instead
-         of waiting for a writer to connect). Harmless on a regular file —
-         O_NONBLOCK has no effect on regular-file I/O per POSIX.
-      2. `os.fstat(fd)` — fstat the OPEN FD, never re-stat the path. This is
-         also what closes the stat-then-read TOCTOU Opus flagged (O1): the
-         type/mode check and the eventual read both operate on the exact
-         same kernel object, so nothing can be swapped in between.
-      3. `stat.S_ISREG` required, else WARN + return `None` — a FIFO,
-         character device, block device, directory, or socket is refused
-         BEFORE a single byte is read. This alone is what stops the
-         `/dev/zero` scenario: the read call is never reached.
-      4. Over-cap decided from `st.st_size` (already in hand from the same
-         `fstat`) FIRST, before a single byte is read — NEW-3 (fix round 2):
-         the original cut decided over-cap from `len(os.read(fd, cap + 1))`
-         alone, a SINGLE read call. `read(2)` is permitted to return FEWER
-         bytes than requested (a signal, a network filesystem, a pipe) — a
-         short first read on a file genuinely over the cap would have been
-         silently accepted as the WHOLE secret, truncated, with no warning
-         at all. The read itself is now a LOOP that continues until EOF (an
-         empty read) or the running total exceeds the cap, so a short
-         individual `read()` can never be mistaken for end-of-file. The
-         length-based check (`len(raw_bytes) > _SECRET_FILE_MAX_BYTES`)
-         stays as a BACKSTOP after the loop, for a file whose `st_size` lies
-         (a procfs-style pseudo-file reporting 0 while still yielding
-         content). Either path WARNS and is treated as unset rather than
-         partially/silently truncated.
+    Deliberately NO O_NOFOLLOW: Kubernetes mounts a Secret as symlinks through a swapped
+    ..data directory, so it would make every such mount unreadable, and real
+    substitution defence needs an owner/parent-directory check too. Read this before
+    adding it. Loose permissions WARN but do not refuse: the Docker _FILE convention
+    commonly mounts 0444.
 
-    Deliberately NO `O_NOFOLLOW`. A `_FILE` pointer is the Docker/Kubernetes
-    convention this function exists to serve, and Kubernetes mounts a
-    Secret as a chain of symlinks through an atomically-swapped `..data`
-    directory (that indirection is how it rotates a mounted Secret without
-    the consuming process seeing a torn file) — `O_NOFOLLOW` would make
-    every Kubernetes Secret mount unreadable by this loader, which is a
-    bigger and more common failure than the credential-substitution risk it
-    would close (Opus O1's broader point — real substitution defence needs
-    an owner/parent-directory check too, not just `O_NOFOLLOW`, and is
-    deferred past this fix round; see the handoff). This is a considered
-    decision, not an oversight — read this paragraph before adding
-    `O_NOFOLLOW` here.
-
-    Loose permissions (group/world read or write) WARN but do NOT refuse to
-    read: the Docker official-images `_FILE` convention itself commonly
-    mounts secrets 0444 (world-readable inside the container, by design), so
-    a hard refusal here would break the very convention this function exists
-    to support. There is no existing hard-refuse posture anywhere else in
-    this codebase for a file this framework did not itself create (only a
-    tighten-or-warn posture, e.g. log_hygiene.append_secure) — this mirrors
-    that, staying consistent rather than inventing a stricter rule for one
-    ingestion path.
-
-    Strips ALL trailing CR/LF characters (a run of `\\r` and/or `\\n` in any
-    order) — and ONLY those two. Never .strip() / .rstrip(), which would
-    also eat leading/trailing spaces that could be part of the literal
-    secret; that reason is unchanged. What changed (v0.9.63) is the COUNT:
-    stripping exactly one `\\n` left a `\\r` behind on the single most common
-    way an operator produces this file. Every editor that saves with a
-    final newline, `echo`, `pass show > file`, a heredoc, and any Windows
-    or terminal paste appends one or more of these two characters — and
-    NEITHER can ever be part of a legitimate HTTP header value, which is
-    what a bearer token read through here becomes. So the run is a
-    file-write artefact by construction, not secret content.
-
-    Any OTHER control character that survives that normalisation
-    (`ord(ch) < 0x20` or DEL `\\x7f` — an EMBEDDED CR/LF, TAB, NUL, ESC)
-    is NOT an artefact of writing the file: it is a corrupt secret. The
-    read refuses it, returns None, and WARNS with the source, the path,
-    the offending byte as `\\xNN` and its CHARACTER offset (never the
-    value's length), plus the `printf` recipe
-    — never the secret's content. Measured cause (2026-08-26): a 37-byte
-    file holding a 35-char key put one surviving control character into
-    the `Authorization` header, and aiohttp rejected EVERY upstream
-    request with "Forbidden control character detected in headers",
-    per-request, with nothing naming the key file. Refusing at LOAD makes
-    the same misconfiguration one journal line that names the file, and
-    the caller's existing unresolved-secret path (a backend excluded from
-    the pool) takes it from there.
+    Strips only a trailing run of CR and LF, never .strip() or .rstrip(), which would
+    eat spaces that can be part of the secret. Any other control character, a trailing
+    tab included, is corruption and is refused. The warning names the source, path,
+    byte and character offset, never the value or its length. Left in, aiohttp rejects
+    every upstream request with nothing naming the key file; refusing at load makes it
+    one journal line.
     """
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
@@ -766,10 +583,7 @@ def _read_secret_file(path: Path, *, source: str) -> "str | None":
                   f"(mode {oct(stat.S_IMODE(st.st_mode))}) — reading it anyway (a "
                   f"Docker secrets mount is commonly 0444 by design); tighten it "
                   f"if this is not a container mount", file=sys.stderr)
-        # NEW-3 (fix round 2, probe-confirmed reasoning): st_size from the
-        # SAME fstat call above is the PRIMARY over-cap decision, checked
-        # before any byte is read — no reason to touch the file at all once
-        # its own reported size already exceeds the cap.
+        # Check size before reading to avoid touching oversized files.
         if st.st_size > _SECRET_FILE_MAX_BYTES:
             print(f"[secure_env] WARNING: {source} ({path}) is {st.st_size} "
                   f"bytes, over the {_SECRET_FILE_MAX_BYTES}-byte cap "
@@ -777,11 +591,7 @@ def _read_secret_file(path: Path, *, source: str) -> "str | None":
                   f"treating as unset", file=sys.stderr)
             return None
         try:
-            # Loop until EOF or the running total exceeds the cap — a
-            # SINGLE os.read() call may legitimately return fewer bytes than
-            # requested (signal, network filesystem, pipe), and treating
-            # that short read as "the whole file" would silently truncate a
-            # legitimate secret instead of refusing it.
+            # Loop until EOF or cap; a single read may return fewer bytes than available.
             chunks: list[bytes] = []
             total = 0
             while True:
@@ -801,10 +611,7 @@ def _read_secret_file(path: Path, *, source: str) -> "str | None":
     finally:
         os.close(fd)
 
-    # Backstop only: st.st_size already refused an over-cap file above for
-    # every NORMAL regular file. This catches the rare case where st_size
-    # does not reflect the true readable content (a procfs-style pseudo-file
-    # reporting 0 while still yielding bytes).
+    # Backstop in case st_size does not reflect content (e.g. pseudo-files).
     if len(raw_bytes) > _SECRET_FILE_MAX_BYTES:
         print(f"[secure_env] WARNING: {source} ({path}) exceeds "
               f"{_SECRET_FILE_MAX_BYTES} bytes (SECURE_ENV_SECRET_FILE_MAX_BYTES) "
@@ -812,11 +619,8 @@ def _read_secret_file(path: Path, *, source: str) -> "str | None":
         return None
 
     raw = raw_bytes.decode("utf-8", errors="replace")
-    # Normalise the FILE-WRITE ARTEFACT (v0.9.63): every trailing CR and LF,
-    # in any order and any number — `\n`, `\r\n`, `\n\n`, `\r\n\r\n`. Only
-    # those two characters; a trailing SPACE or TAB is left exactly where it
-    # is, because a space can be part of a literal secret (see the docstring)
-    # and a tab is not a write artefact — it is corruption, refused below.
+    # Only trailing CR and LF are write artefacts. A trailing space stays (it can be
+    # part of a secret); a tab is corruption, refused below.
     raw = raw.rstrip("\r\n")
     if not raw.strip():
         print(f"[secure_env] WARNING: {source} ({path}) is empty — treating "
@@ -864,7 +668,7 @@ def _bearer_transport_ok(backend_url: str, plaintext_ok: bool = False) -> bool:
     except ValueError:
         pass
     if host in ("localhost",) or "." not in host:
-        # Reject numeric IPv4 spellings ipaddress.ip_address() misses but the resolver accepts (S3).
+        # Reject numeric IPv4 spellings ipaddress.ip_address() misses but the resolver accepts.
         try:
             socket.inet_aton(host)
             return False
@@ -897,13 +701,16 @@ def _encoder_file_pointer(name: str) -> "str | None":
     return text or None
 
 
+def _encoder_token(kind: str) -> str:
+    """The stripped key, or "" when none resolved."""
+    token = get_secret(_ENCODER_SECRET_NAMES[kind])
+    return "" if token is None else str(token).strip()
+
+
 def encoder_key_configured(kind: str) -> bool:
     """A resolved value, or a *_FILE pointer that is set. The file itself may be missing."""
     name = _ENCODER_SECRET_NAMES[kind]
-    token = get_secret(name)
-    if token is not None and str(token).strip():
-        return True
-    return _encoder_file_pointer(name) is not None
+    return bool(_encoder_token(kind)) or _encoder_file_pointer(name) is not None
 
 
 def encoder_auth_headers(kind: str, url: str) -> dict:
@@ -916,14 +723,13 @@ def encoder_auth_headers(kind: str, url: str) -> dict:
     after stripping is withheld the same way. The warning names the variable
     and is printed once for that variable in the process.
     """
-    name = _ENCODER_SECRET_NAMES[kind]
-    token = get_secret(name)
-    if token is None or not str(token).strip():
+    value = _encoder_token(kind)
+    if not value:
         return {}
     if not _bearer_transport_ok(url, encoder_plaintext_ok()):
         return {}
     # The key file keeps a trailing space, and h11's refusal text is the header value. That text is what each retry logs and what the 503 repeats.
-    value = str(token).strip()
+    name = _ENCODER_SECRET_NAMES[kind]
     if any(ord(ch) < 0x21 or ord(ch) > 0x7E for ch in value):
         if name not in _warned_non_ascii_encoder_names:
             _warned_non_ascii_encoder_names.add(name)
@@ -931,6 +737,17 @@ def encoder_auth_headers(kind: str, url: str) -> dict:
                   f"— withholding the encoder key", file=sys.stderr)
         return {}
     return {"Authorization": "Bearer " + value}
+
+
+def encoder_auth_kwargs(kind: str, url: str) -> dict:
+    """``headers=`` for one encoder call, empty when no key is sent."""
+    headers = encoder_auth_headers(kind, url)
+    return {"headers": headers} if headers else {}
+
+
+def encoder_key_refused(kind: str, http_status: int) -> bool:
+    """A configured key answered 401 or 403. With no key, those statuses keep their old meaning."""
+    return http_status in (401, 403) and encoder_key_configured(kind)
 
 
 def encoder_plaintext_warnings(urls: dict) -> list[str]:
@@ -945,8 +762,7 @@ def encoder_plaintext_warnings(urls: dict) -> list[str]:
     for kind, url in urls.items():
         if kind not in _ENCODER_SECRET_NAMES or not url:
             continue
-        token = get_secret(_ENCODER_SECRET_NAMES[kind])
-        if token is None or not str(token).strip():
+        if not _encoder_token(kind):
             continue
         if not _bearer_transport_ok(str(url), False):
             lines.append(str(url))
@@ -958,15 +774,10 @@ _VALID_KEY_NAME = re.compile(r"^[A-Za-z][A-Za-z0-9_]*$")
 
 
 def _credentials_directory_secret(key: str) -> "str | None":
-    """Tier 2: `$CREDENTIALS_DIRECTORY/<key, lowercased>` — systemd
-    `LoadCredential=`. Lowercase is the systemd norm (`LoadCredential=` names
-    are conventionally lowercase, and $CREDENTIALS_DIRECTORY is systemd's own
-    env var, always already present when the unit uses LoadCredential= — this
-    module only ever reads it, never sets it). A deployer who names the
-    credential in a different case gets a silent miss here by construction;
-    the module docstring and ops/hive-mind-gateway.service's commented
-    example both state the convention so that is a documentation problem,
-    not a code one."""
+    """Tier 2: $CREDENTIALS_DIRECTORY/<key.lower()>, systemd LoadCredential=. This
+    module only reads that variable, never sets it. A credential named in another case
+    is a silent miss by construction.
+    """
     if not _VALID_KEY_NAME.match(key):
         # The candidate is not a variable name. Printing it would publish a key parked in token_env.
         print("[secure_env] WARNING: candidate key '<not a variable name>' fails the "
@@ -984,13 +795,10 @@ def _credentials_directory_secret(key: str) -> "str | None":
 
 
 def _file_indirection_secret(key: str, file_values: dict) -> "str | None":
-    """Tier 3: `<KEY>_FILE` — Docker official-images convention. The pointer
-    itself (the `_FILE` var's VALUE, i.e. the path) follows the same
-    os.environ-first-then-.env-file precedence every other config lookup in
-    this module already uses (matches load_split_env()'s own
-    LLM_BACKENDS_JSON resolution) — only the SECRET the path points at is
-    withheld from os.environ, never the path string, which is not itself
-    sensitive."""
+    """Tier 3: <KEY>_FILE, the Docker convention. The path follows os.environ, then the
+    .env file. Only the secret is withheld from os.environ, never the path, which is
+    not sensitive.
+    """
     if not _VALID_KEY_NAME.match(key):
         # Same omission as the credentials-directory gate: the text is not a name.
         print("[secure_env] WARNING: candidate key '<not a variable name>' fails the "
@@ -1005,17 +813,11 @@ def _file_indirection_secret(key: str, file_values: dict) -> "str | None":
 
 
 def _warn_secrets_in_exec_environment(candidate_keys: set) -> None:
-    """SEC-06 (ii): advisory only, never a refusal. A known-secret key
-    already present in THIS process's own exec environment when
-    load_split_env() runs arrived via EnvironmentFile=, an exported shell
-    var, or similar — visible to /proc/<pid>/environ for this process and
-    inherited by any child that copies os.environ wholesale (the exact
-    exposure PR A1 closed everywhere in this codebase's own control). The
-    value is still honoured (get_secret() checks os.environ first) — this
-    only tells the deployer a safer alternative exists. Never logs a value,
-    only the key NAME. De-duplicated per process via _advised_exec_env_names
-    so a module reloaded many times (every test in this file) does not spam
-    the same line repeatedly."""
+    """Advisory only, never a refusal: a known secret already in this process's exec
+    environment is visible in /proc/<pid>/environ and inherited by a child copying
+    os.environ. The value is still honoured. Logs the key NAME only, never a value, once
+    per process.
+    """
     for key in sorted(candidate_keys):
         if key in os.environ and key not in _advised_exec_env_names:
             _advised_exec_env_names.add(key)
@@ -1032,43 +834,17 @@ def _warn_secrets_in_exec_environment(candidate_keys: set) -> None:
 
 
 def _derive_file_pointer_candidates(file_values: dict) -> set[str]:
-    """R4 / QF-3 (fix round 1, Opus + Fable review, probe-confirmed): scan
-    every `<K>_FILE` name present — in THIS process's own environment OR the
-    parsed .env file — and derive `K` as a secret candidate when
-    `is_secret_key(K)` accepts it.
+    """Derive K as a secret candidate from each <K>_FILE in os.environ or the parsed
+    .env, only when is_secret_key(K) accepts it.
 
-    Without this, setting ONLY `<KEY>_FILE` for a key that is not on
-    KNOWN_SECRET_NAMES, not already present as a plaintext line in .env, and
-    not a discovered LLM_BACKENDS_JSON token_env name resolved to NOTHING —
-    with NO warning at all, because the code never reached
-    `_read_secret_file()` in the first place. Probe-confirmed on
-    `AGENT_TOKEN_FILE` and `DEEPSEEK_API_KEY_FILE`, both of which resolved to
-    `None` before this fix even with the secret file present, readable, and
-    correctly formatted.
-
-    NEW-1 (fix round 2, Opus review, probe-confirmed): CANDIDATE DERIVATION
-    still scans BOTH sources — os.environ (an operator's own
-    `export PG_PASSWORD_FILE=...` must still work) and the parsed .env file
-    — but the "non-secret pointer ignored" WARNING below is now emitted
-    ONLY for a name sourced from the PARSED .ENV FILE. A line in
-    shared-memory/.env is addressed to this framework; an ambient env var
-    ending in `_FILE` (`SSL_CERT_FILE`, `GIT_INDEX_FILE`, and any number of
-    others a shell can already be carrying) is not this framework's
-    business at all. Before this fix the warning fired for every such
-    ambient name on EVERY `load_split_env()` call, un-deduplicated — probe-
-    confirmed live on `SSL_CERT_FILE`/`GIT_INDEX_FILE`. De-duplicated per
-    process via `_advised_ignored_file_pointer_names`, the same pattern
-    `_advised_exec_env_names` already uses for the SEC-06 (ii) advisory.
-
-    Fix round F12 (SEC1 LOW-9): the `_FILE` suffix check used to be exact-
-    case (`name.endswith("_FILE")`), so a lowercase `agent_tokens_file=`
-    line's actual suffix ("_file") never matched at all — the pointer was
-    silently ignored with no candidate derived and no warning (the warning
-    branch is also suffix-gated, so it never fired either). Now case-folds
-    each candidate name via _normalize_key() (F11) before the suffix check,
-    same as every other classification site in this module."""
+    Without this, a pointer for an unlisted key resolves to nothing with no warning. An
+    operator's own `export PG_PASSWORD_FILE=...` must still work, so os.environ stays in
+    the scan, but the non-secret warning fires only for a name from the .env file, once
+    per process: an ambient SSL_CERT_FILE is not this framework's business. Names are
+    case-folded first so `agent_tokens_file=` is not silently ignored.
+    """
     candidates: set[str] = set()
-    file_keys_canonical = set(file_values)   # already canonical (F6 collapse)
+    file_keys_canonical = set(file_values)   # already canonical
     for name in set(os.environ) | file_keys_canonical:
         key_candidate = _normalize_key(name)
         if not key_candidate.endswith("_FILE"):
@@ -1089,12 +865,10 @@ def _derive_file_pointer_candidates(file_values: dict) -> set[str]:
 
 
 def _derive_credentials_directory_candidates() -> set[str]:
-    """R4 / QF-3 (fix round 1): list `$CREDENTIALS_DIRECTORY` (if set) and
-    derive a candidate key from every entry's UPPERCASED filename, honoured
-    only when `is_secret_key()` accepts it. Without this, `LoadCredential=`
-    for a key outside the fixed set (e.g. `agent_token`, `deepseek_api_key`)
-    silently delivered nothing either — same probe-confirmed gap as
-    `_derive_file_pointer_candidates()` above, for the other tier."""
+    """Derive a candidate from each $CREDENTIALS_DIRECTORY entry's uppercased filename,
+    only when is_secret_key() accepts it. Without this, LoadCredential= for an unlisted
+    key silently delivers nothing.
+    """
     candidates: set[str] = set()
     cred_dir = os.environ.get("CREDENTIALS_DIRECTORY", "").strip()
     if not cred_dir:
@@ -1111,19 +885,12 @@ def _derive_credentials_directory_candidates() -> set[str]:
 
 
 def _select_env_file() -> "Path | None":
-    """Which .env file this process loads — the ONE decision point.
+    """Which .env this process loads: the one decision point.
 
-    ``SECURE_ENV_FILE`` overrides the candidate walk entirely: a path names
-    the exact file to load; the EMPTY string means "load no env file at all"
-    — the hermeticity contract the test suite pins in ``tests/conftest.py``,
-    because this loader re-populates ``os.environ`` from the live deployer
-    .env on every module reload, and a test can defeat that only by SETTING
-    a key, never by deleting one (setdefault re-adds what delenv removed).
-    A set-but-missing path is a deployer mistake and must be loud, not a
-    silent fall-through to a DIFFERENT file than the one they named.
-
-    Unset: the candidate walk unchanged from every prior release —
-    shared-memory/.env first, the repo-root .env as the pre-0.6 fallback.
+    SECURE_ENV_FILE overrides the walk. A path names the file; a set-but-missing path
+    warns and loads NOTHING, never a different file than the one named. The empty string
+    loads no file: the hermeticity contract in tests/conftest.py, because setdefault
+    re-adds what delenv removed. Unset: shared-memory/.env, then the repo root.
     """
     override = os.environ.get("SECURE_ENV_FILE")
     if override is not None:
@@ -1143,51 +910,22 @@ def _select_env_file() -> "Path | None":
 
 
 def load_split_env() -> None:
-    """Parse the framework .env and split it between os.environ (config) and
-    the in-process secrets store (everything is_secret_key() catches).
+    """Parse the framework .env and split it between os.environ (config, via setdefault)
+    and in-process secrets.
 
-    Candidate order matches every other loader in this family (CLAUDE.md
-    Group 4 / apply.py): shared-memory/.env first, the repo-root .env as the
-    pre-0.6 fallback. Parsed by hand, one `key=val` per line — never
-    `import dotenv` or any other parser library (an env loader must not
-    depend on a library that might not be installed).
+    Parsed by hand, never with dotenv or any parser library: an env loader must not
+    depend on a library that might be missing. Idempotent and additive; it never clears
+    what an earlier call or an operator's export established.
 
-    Idempotent and additive: safe to call from more than one process/module
-    in the same interpreter, never clears what a previous call (or an
-    operator's own export) already established.
+    Secrets resolve $CREDENTIALS_DIRECTORY, <KEY>_FILE, then the plaintext value.
+    Candidates are secret-classified file keys, KNOWN_SECRET_NAMES, token_env names, and
+    each secret-classified <K>_FILE pointer and $CREDENTIALS_DIRECTORY entry, so a
+    headless deployment with no plaintext .env can resolve any secret-classified key.
 
-    PR A4 (SEC-06): every secret-classified value is now resolved from up to
-    three tiers, in order — $CREDENTIALS_DIRECTORY/<key> (systemd
-    LoadCredential=), then <KEY>_FILE (Docker convention), then the plaintext
-    .env value — see the module docstring for the full precedence statement
-    (an operator's direct os.environ export still wins over all three, via
-    get_secret(), unchanged). The candidate key set is not limited to what
-    the .env file happens to contain: KNOWN_SECRET_NAMES, any dynamically
-    discovered token_env name, every `<K>_FILE` pointer actually present
-    (fix round 1, `_derive_file_pointer_candidates()`), and every entry
-    `$CREDENTIALS_DIRECTORY` actually contains (fix round 1,
-    `_derive_credentials_directory_candidates()`) are all attempted, so a
-    headless systemd deployment with NO plaintext shared-memory/.env at all
-    can resolve ANY secret-classified credential purely from
-    LoadCredential=/_FILE — not only the ones on the fixed list.
-
-    Fix round F5/F6 (SEC1 HIGH-3/MED-5, HIGH-4): each raw line's key has an
-    optional leading `export ` keyword stripped (case-insensitively, via
-    _strip_export_prefix — F5) before it is stored anywhere, so
-    "export AGENT_TOKENS=..."/"EXPORT AGENT_TOKENS=..." classify exactly
-    like a plain "AGENT_TOKENS=..." line. `file_values` (F6) is now
-    collapsed to CANONICAL keys ONCE, here, with the file's own last
-    definition winning deterministically for a given canonical key — before
-    this fix, two case-variant spellings of the same secret competed for
-    the storage slot via SET ITERATION ORDER (`candidate_secret_keys` is a
-    set), not file order, so which line won was unspecified and could even
-    be a STALE line despite a later correction in the same file. This is
-    ALSO the fix for F4 (SEC1 HIGH-2): `LLM_BACKENDS_JSON`'s own file-value
-    read used to be an exact-case `file_values.get("LLM_BACKENDS_JSON")`,
-    so a `llm_backends_json=`/BOM-prefixed spelling was invisible — read as
-    ABSENT, not malformed, bypassing D.1's refusal entirely and leaking any
-    token_env-named provider key the JSON declared. With `file_values`
-    already canonical, the same exact-case read now sees every spelling.
+    File keys collapse to canonical form once, here, the last definition winning, after a
+    leading `export ` is stripped. Otherwise a variant spelling of LLM_BACKENDS_JSON reads
+    as absent, bypassing its malformed-JSON refusal, and case variants of one secret
+    compete by set order instead of file order.
     """
     env_path = _select_env_file()
 
@@ -1249,53 +987,18 @@ def load_split_env() -> None:
 
 
 def get_secret(name: str, default: "str | None" = None) -> "str | None":
-    """The one way a framework process should read a secret value.
+    """The one way a framework process reads a secret.
 
-    Review fix #1 (CRITICAL): os.environ is checked FIRST, then the
-    in-process store. An operator-exported value must always win — that is
-    load_split_env()'s own setdefault semantics for config keys, and this
-    accessor's docstring always claimed it for secrets too, but the lookup
-    order had it backwards: a value in the framework .env silently beat a
-    value the operator (or a test, via monkeypatch.setenv/os.environ
-    assignment) exported directly into the process environment. On any
-    checkout that also has a real shared-memory/.env, that made
-    os.environ-based configuration of a secret key unreachable — including
-    coordinator.py's own AGENT_TOKENS test pattern.
-
-    D.2 (ADV1-3) canonical fallback: an EXACT match on `name` (os.environ)
-    is tried FIRST and unconditionally wins — this preserves every existing
-    exact-case caller byte for byte, including a dynamic token_env lookup
-    that legitimately uses a non-canonical spelling. Only when THAT misses
-    does this fall back to the CANONICAL (stripped/BOM-stripped/upper-cased)
-    form of `name` in os.environ, then the exact form in the in-process
-    store, then the canonical form there — which is where load_split_env()
-    now always stores a secret it resolved (see the storage-key
-    canonicalisation note there). Without the exact-vs-canonical fallback,
-    get_secret("AGENT_TOKENS") (used throughout this codebase as a fixed
-    upper-case literal) would never see a value the .env file declared as
-    `agent_tokens=`, even though is_secret_key() now correctly classifies it
-    as secret and keeps it out of os.environ.
-
-    Fix round F3 (SEC1 HIGH-1): the lookup order used to check the in-
-    process store (`_secrets`, exact match) BEFORE the canonical form of
-    os.environ — so a value the deployer's .env file resolved into
-    `_secrets` won over a case-variant value the OPERATOR had exported
-    directly into the process environment. Probed exactly as SEC1 measured
-    it: `_secrets["AGENT_TOKENS"]="from-file"` +
-    `os.environ["agent_tokens"]="from-operator"` must return
-    "from-operator", never "from-file". The operator's own environment must
-    always beat the file store, at BOTH the exact and the canonical step —
-    this reorders the four checks so every os.environ tier (exact, then
-    canonical) runs before either _secrets tier.
-
-    The os.environ CANONICAL step is a case-insensitive SCAN of
-    os.environ's actual key names, not a second exact lookup of
-    `canonical(name)` — os.environ is a real, case-SENSITIVE mapping on
-    POSIX (confirmed: setting `os.environ["agent_tokens"]` leaves
-    `"AGENT_TOKENS" in os.environ` False), so a fixed-case second lookup
-    can never find a genuinely lowercase operator export in the first
-    place. A second exact-match probe would silently do nothing; the
-    fallback this docstring promises requires actually looking."""
+    Every os.environ step runs before either _secrets step. Do not reorder them: the
+    operator's own export must beat the file store at both the exact and canonical step.
+      1. Exact match in os.environ.
+      2. Canonical match in os.environ, a scan of its key names: POSIX os.environ is
+         case-sensitive, so a second exact lookup could never find a lowercase export.
+      3. Exact match in _secrets.
+      4. Canonical match in _secrets, where load_split_env() stores what it resolved;
+         without it get_secret("AGENT_TOKENS") misses an `agent_tokens=` line.
+    Returns default if unresolved.
+    """
     if name in os.environ:
         return os.environ[name]
     canonical = _normalize_key(name)
@@ -1310,27 +1013,12 @@ def get_secret(name: str, default: "str | None" = None) -> "str | None":
 
 
 def read_daemon_token_from_fd(env_var: str = "AGENT_TOKEN_FD") -> "str | None":
-    """Read this daemon's per-boot AGENT_TOKEN from the pipe fd the proxy
-    handed it at spawn (SEC-10, Credential_Custody_Plan_2026-08-14 PR A2).
+    """Read this daemon's AGENT_TOKEN from the pipe fd inherited at spawn.
 
-    Delivery shape: the fd NUMBER travels via `env_var`, a plain (non-secret)
-    env var — a file descriptor number is meaningless off this process tree,
-    so naming it costs nothing. The token VALUE itself crosses only through
-    the pipe's kernel buffer: it appears in no `/proc/<pid>/environ`, no
-    argv, and no file. See hive_mind_proxy._daemon_env_and_token_fd(), the
-    write side of this same pipe.
-
-    Returns None — never raises — when `env_var` is unset, not a valid
-    integer, or the fd cannot be read (already closed, or this process was
-    not actually spawned with one). That covers a standalone debug run of a
-    daemon started directly (`python rem_loop.py`, no proxy in between): the
-    caller's own fallback (`get_secret("AGENT_TOKEN")`, reading the
-    framework .env or an operator's own export) is what makes that case work
-    instead of a silent 401.
-
-    Reads at most 4096 bytes in one call — token_urlsafe(32) is far under
-    that, and the write side writes-then-closes before this ever runs, so a
-    single read drains the whole buffered value.
+    Only the fd number travels in env_var; the value crosses the pipe buffer alone, so
+    it is in no /proc/<pid>/environ, argv or file. Never raises: returns None when unset,
+    invalid or unreadable, so a daemon started directly falls back to get_secret instead
+    of a silent 401.
     """
     raw_fd = os.environ.get(env_var, "").strip()
     if not raw_fd:
@@ -1354,20 +1042,13 @@ def read_daemon_token_from_fd(env_var: str = "AGENT_TOKEN_FD") -> "str | None":
 
 def require_db_credentials(*, pg_password: str, pg_conn: str, neo4j_password: str,
                             daemon_name: str) -> None:
-    """Review fix #4: fail LOUDLY, naming the cause, when a daemon has no way
-    to authenticate to Postgres or Neo4j — never the bare
-    `fe_sendauth: no password supplied` class of error the plan forbids.
+    """Fail loudly when database authentication is missing.
 
-    Call this from a daemon's `if __name__ == "__main__":` guard ONLY, never
-    at bare module-import time: every test in this repo imports
-    rem_loop/consolidation_loop without ever connecting for real (all SQL/
-    Cypher is stubbed — see the repo's own testing discipline), so an
-    unconditional exit here would kill test collection itself, not just a
-    genuinely misconfigured daemon.
+    Must be called from a daemon's '__main__' guard only, never at module import time,
+    so test collection is not interrupted.
 
-    `pg_conn` is the RAW value of an explicitly-set PG_CONN (empty string if
-    unset) — not a constructed default DSN, which always looks non-empty
-    even when it embeds an empty password and would defeat this check.
+    pg_conn must be the raw PG_CONN, not a default DSN: a constructed DSN always looks
+    non-empty even when it embeds an empty password, which would defeat this check.
     """
     if not pg_password and not pg_conn:
         config_fatal(

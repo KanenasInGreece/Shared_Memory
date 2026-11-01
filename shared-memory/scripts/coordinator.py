@@ -66,7 +66,7 @@ from project_promotion import (
     promote_record, sole_project, METHOD_GROUNDING,
 )
 from project_alias import ALIAS_RESOLVE_SQL, ACTIVE_ALIASES_SQL
-from secure_env import get_secret, pg_dsn, encoder_auth_headers, encoder_plaintext_warnings
+from secure_env import get_secret, pg_dsn, encoder_auth_kwargs, encoder_plaintext_warnings
 from framework_defaults import FRAMEWORK_DEFAULTS
 from telemetry_instruments import LatencyRing, Counter, safe
 # A key whose removed_in this release has reached is stripped in handle_telemetry. Leaf module: its only import is annotations, so it cannot cycle back here.
@@ -2193,23 +2193,14 @@ _ENCODER_BASE_SUFFIXES = ("/v1/embeddings", "/v1/reranking", "/v1")
 
 
 def normalize_encoder_base(base: str) -> str:
-    """Strip a pasted encoder-path suffix from an encoder BASE URL.
-    Parses with urllib.parse so scheme, netloc and userinfo are preserved; only
-    the PATH component is touched. Terminal slashes are removed, then the
-    longest of ('/v1/embeddings', '/v1/reranking', '/v1') that the path ends
-    with is stripped (longest first so '/v1' cannot eat '/v1/embeddings').
-    A path that is not one of those (e.g. a proxy prefix '/api') is retained.
+    """Strip known encoder-path suffixes ('/v1/embeddings', '/v1/reranking', '/v1') from base URL.
 
-    A query string or fragment is REJECTED (ValueError): the framework appends
-    /v1/... itself, and only the coordinator can join onto a query — the
-    gateway's own string joins cannot, so a query-bearing base would work on
-    save/search but break the passthrough, capability probes and /health
-    fan-out. Credentials belong in userinfo (preserved in netloc) or a header,
-    not the query.
+    Preserves proxy path prefixes. Rejects queries and fragments with ValueError because
+    gateway string joins cannot carry them, breaking passthrough and health probes.
 
-    The scheme is lowercased by urlsplit (RFC 3986 schemes are case-
-    insensitive), which is the correct normalization. Returns the normalized
-    base with no trailing slash.
+    The longest suffix is tried first so '/v1' cannot eat '/v1/embeddings'.
+    Credentials belong in userinfo or a header, not the query. Returns no trailing
+    slash.
     """
     parsed = urllib.parse.urlsplit(base)
     if parsed.query or parsed.fragment:
@@ -2229,28 +2220,16 @@ def normalize_encoder_base(base: str) -> str:
 
 
 def _encoder_url(env_name: str, default_base: str, path: str) -> str:
-    """Full endpoint for an encoder backend: env-overridable BASE + fixed PATH.
+    """Full encoder endpoint: env-overridable base + fixed path.
 
-    The BASE is normalized first (normalize_encoder_base): a pasted encoder
-    path — '/v1', '/v1/embeddings', '/v1/reranking' — is stripped so a base
-    copied from an LM Studio-style URL (http://host:1234/v1) does not resolve
-    to the doubled http://host:1234/v1/v1/embeddings that LM Studio answers
-    with 200, masking the defect. A non-encoder prefix (e.g. '/api') is kept.
+    A pasted '/v1', '/v1/embeddings' or '/v1/reranking' is stripped (logged at INFO),
+    because http://host:1234/v1 would resolve to a doubled /v1/v1/embeddings that LM
+    Studio answers with 200, masking the defect. A non-encoder prefix such as '/api'
+    only WARNS, never fails: it is legitimate for a proxy.
 
-    Validated at the same time it is derived (module import/reload) so a bad
-    value is caught before the process ever accepts traffic, rather than
-    surfacing as an opaque connection error on the first save/search:
-      - the resolved BASE must be an http(s) URL — anything else (a bare
-        host, a typo'd scheme, a leftover placeholder) fails LOUDLY, naming
-        env_name, rather than producing a confusing httpx/aiohttp exception
-        deep inside _embed()/_rerank() on the first real request.
-      - a known encoder suffix that was stripped is logged at INFO (the
-        suffix and the scrubbed URL named).
-      - a base still carrying a NON-encoder path segment only WARNS (never
-        fails): the endpoint appends onto that prefix, which is legitimate for
-        a proxy but worth naming.
-      - a query string or fragment on the base fails LOUDLY (the gateway's own
-        joins cannot carry one — see normalize_encoder_base).
+    Validated at import or reload so a bad value is caught before traffic, not as an
+    opaque error on the first save: a non-http(s) base or a query or fragment fails
+    LOUDLY.
     """
     raw_base = (os.environ.get(env_name) or default_base).strip()
     base = normalize_encoder_base(raw_base)
@@ -2290,12 +2269,9 @@ RERANK_URL = _encoder_url("RERANKER_URL", FRAMEWORK_DEFAULTS["RERANKER_URL"]["de
 _encoder_endpoints_logged = False
 
 def log_encoder_endpoints() -> None:
-    """Log the resolved encoder endpoints once per process, scrubbed the same
-    way the failure-path messages already are (see _embed()'s
-    scrub_url_credentials use) so a credential embedded in the URL never
-    lands in a log file even on the success path. Idempotent — a second
-    call is a no-op, so a caller does not need to track whether it already
-    fired."""
+    """Log scrubbed encoder endpoints once per process, so a credential in the URL
+    never lands in a log even on success. Idempotent.
+    """
     global _encoder_endpoints_logged
     if _encoder_endpoints_logged:
         return
@@ -2313,14 +2289,6 @@ def log_encoder_endpoints() -> None:
 
 EMBED_RETRIES = 4
 EMBED_BACKOFF = 0.5      # seconds × attempt number  (0.5 s, 1 s, 1.5 s, 2 s)
-
-
-def _encoder_post_kwargs(kind: str, url: str) -> dict:
-    """Authorization for this encoder, omitted when no key is sent."""
-    headers = encoder_auth_headers(kind, url)
-    if not headers:
-        return {}
-    return {"headers": headers}
 
 
 # Truncate embedding input to the dream_telemetry char budget from the 8192-token context; full text stays in Tier 1.
@@ -3367,7 +3335,7 @@ class MemoryCoordinator:
             _t0 = time.monotonic()
             try:
                 r = await client.post(EMBED_URL, json={"input": text, "model": "bge-m3"},
-                                      timeout=ceiling, **_encoder_post_kwargs("embedder", EMBED_URL))
+                                      timeout=ceiling, **encoder_auth_kwargs("embedder", EMBED_URL))
                 if getattr(r, "status_code", None) == 400:
                     from encoder_window import (
                         classify_overflow,
@@ -3468,7 +3436,7 @@ class MemoryCoordinator:
             try:
                 r = await client.post(
                     EMBED_URL, json={"input": clamped, "model": "bge-m3"},
-                    timeout=ceiling, **_encoder_post_kwargs("embedder", EMBED_URL),
+                    timeout=ceiling, **encoder_auth_kwargs("embedder", EMBED_URL),
                 )
                 if getattr(r, "status_code", None) == 400:
                     from encoder_window import (
@@ -8935,7 +8903,7 @@ class MemoryCoordinator:
                     # Derived from the payload, never constant — a constant
                     # under-provisions exactly the large sets that need it most.
                     timeout=rerank_ceiling(rerank_docs),
-                    **_encoder_post_kwargs("reranker", RERANK_URL),
+                    **encoder_auth_kwargs("reranker", RERANK_URL),
                 )
                 rr.raise_for_status()
                 ranked = rr.json()["results"]
