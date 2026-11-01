@@ -7,6 +7,17 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.0.43] - 2026-11-01
+
+A second clean-up pass on the files 1.0.42 touched. No behaviour changes: requests, statuses and messages are as in 1.0.42, proved by the same end-to-end run.
+
+- **Simplified.** The encoder key helpers built several times in 1.0.42 are now one each, and the provider and encoder forwards share one route refusal.
+- **Comments.** `secure_env.py`, `encoder_window.py`, `rerank_shim.py`, `telemetry_contract.py`, `.env.example` and the encoder sections of the gateway and coordinator lose review-round labels and repetition. Prohibitions and their reasons stay. `.env.example` comments no longer claim a range check on `PROJECT_CONFUSABLE_SIMILARITY`.
+
+### Dependency sweep, 2026-11-01
+
+No pin moved, and the advisories are those listed in 1.0.42.
+
 ## [1.0.42] - 2026-11-01
 
 An embedder and a reranker can now take an API key, for encoders on another machine. With no key configured, requests and statuses are unchanged. `API_VERSION` stays 4.
