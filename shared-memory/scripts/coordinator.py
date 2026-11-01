@@ -66,7 +66,7 @@ from project_promotion import (
     promote_record, sole_project, METHOD_GROUNDING,
 )
 from project_alias import ALIAS_RESOLVE_SQL, ACTIVE_ALIASES_SQL
-from secure_env import get_secret, pg_dsn
+from secure_env import get_secret, pg_dsn, encoder_auth_headers, encoder_plaintext_warnings
 from framework_defaults import FRAMEWORK_DEFAULTS
 from telemetry_instruments import LatencyRing, Counter, safe
 # A key whose removed_in this release has reached is stripped in handle_telemetry. Leaf module: its only import is annotations, so it cannot cycle back here.
@@ -130,7 +130,7 @@ def _short(value: Any, cap: int = 200) -> str:
 
 
 # FRAMEWORK_VERSION is the build string and may drift. API_VERSION is the wire contract with memory_bridge.py; bump it only when shape, auth, or routes break older clients.
-FRAMEWORK_VERSION = "1.0.41"
+FRAMEWORK_VERSION = "1.0.42"
 # API v2: retrospective is a full record. v4: unregistered project is 400 (proposal / new_project / sentinel).
 API_VERSION = 4
 CLIENT_VERSION_HEADER = "X-SM-Api-Version"
@@ -2304,9 +2304,25 @@ def log_encoder_endpoints() -> None:
         "encoder endpoints resolved: EMBED_URL=%s RERANK_URL=%s",
         scrub_url_credentials(EMBED_URL), scrub_url_credentials(RERANK_URL),
     )
+    # ENCODER_PLAINTEXT_OK false withholds a resolved key from a public http address. One line names that URL.
+    for url in encoder_plaintext_warnings({"embedder": EMBED_URL, "reranker": RERANK_URL}):
+        log.warning(
+            "ENCODER_PLAINTEXT_OK is false: encoder key withheld from %s",
+            scrub_url_credentials(url),
+        )
 
 EMBED_RETRIES = 4
 EMBED_BACKOFF = 0.5      # seconds × attempt number  (0.5 s, 1 s, 1.5 s, 2 s)
+
+
+def _encoder_post_kwargs(kind: str, url: str) -> dict:
+    """Authorization for this encoder, omitted when no key is sent."""
+    headers = encoder_auth_headers(kind, url)
+    if not headers:
+        return {}
+    return {"headers": headers}
+
+
 # Truncate embedding input to the dream_telemetry char budget from the 8192-token context; full text stays in Tier 1.
 from dream_telemetry import (EMBED_CHARS_PER_TOKEN, EMBED_MAX_CHARS,  # noqa: E402
                              EMBED_MAX_CONTEXT_TOKENS, EMBED_SPECIAL_TOKEN_RESERVE,
@@ -3351,7 +3367,7 @@ class MemoryCoordinator:
             _t0 = time.monotonic()
             try:
                 r = await client.post(EMBED_URL, json={"input": text, "model": "bge-m3"},
-                                      timeout=ceiling)
+                                      timeout=ceiling, **_encoder_post_kwargs("embedder", EMBED_URL))
                 if getattr(r, "status_code", None) == 400:
                     from encoder_window import (
                         classify_overflow,
@@ -3405,12 +3421,14 @@ class MemoryCoordinator:
                 safe(lambda: self._embed_ring.record_error())
                 if attempt == EMBED_RETRIES:
                     # The encoder URL may carry userinfo, and this text is the client-visible 503, so scrub it.
-                    raise RuntimeError(
+                    message = (
                         f"Embedding failed after {EMBED_RETRIES} attempts at the "
                         f"embedder {scrub_url_credentials(EMBED_URL)} — is it "
                         f"running and is EMBEDDER_URL right? "
                         f"({scrub_url_credentials(str(exc))})"
-                    ) from exc
+                    )
+                    log.error("%s", message)
+                    raise RuntimeError(message) from exc
                 wait = EMBED_BACKOFF * attempt
                 log.warning(
                     "embed attempt %d/%d failed (%s) — retry in %.1f s",
@@ -3450,7 +3468,7 @@ class MemoryCoordinator:
             try:
                 r = await client.post(
                     EMBED_URL, json={"input": clamped, "model": "bge-m3"},
-                    timeout=ceiling,
+                    timeout=ceiling, **_encoder_post_kwargs("embedder", EMBED_URL),
                 )
                 if getattr(r, "status_code", None) == 400:
                     from encoder_window import (
@@ -3524,12 +3542,14 @@ class MemoryCoordinator:
                     raise
                 safe(lambda: self._embed_ring.record_error())
                 if attempt == EMBED_RETRIES:
-                    raise RuntimeError(
+                    message = (
                         f"Batch embedding failed after {EMBED_RETRIES} attempts "
                         f"({len(clamped)} inputs) at the embedder "
                         f"{scrub_url_credentials(EMBED_URL)}: "
                         f"{scrub_url_credentials(str(exc))}"
-                    ) from exc
+                    )
+                    log.error("%s", message)
+                    raise RuntimeError(message) from exc
                 wait = EMBED_BACKOFF * attempt
                 log.warning(
                     "batch embed attempt %d/%d failed (%s) — retry in %.1f s",
@@ -8915,6 +8935,7 @@ class MemoryCoordinator:
                     # Derived from the payload, never constant — a constant
                     # under-provisions exactly the large sets that need it most.
                     timeout=rerank_ceiling(rerank_docs),
+                    **_encoder_post_kwargs("reranker", RERANK_URL),
                 )
                 rr.raise_for_status()
                 ranked = rr.json()["results"]

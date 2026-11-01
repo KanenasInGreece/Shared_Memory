@@ -67,10 +67,12 @@ var) prints one advisory log line naming the KEY NAME ONLY — never the
 value — pointing at the _FILE/LoadCredential= alternative. Advisory, not a
 refusal: the value is still honoured (tier 1 above).
 """
+import ipaddress
 import json
 import logging
 import os
 import re
+import socket
 import stat
 import sys
 import urllib.parse
@@ -123,6 +125,9 @@ _advised_exec_env_names: set[str] = set()
 # candidates()'s "non-secret _FILE pointer ignored" warning — see that
 # function's docstring.
 _advised_ignored_file_pointer_names: set[str] = set()
+
+# A health probe and a save both build the header. One line per variable for the process.
+_warned_non_ascii_encoder_names: set[str] = set()
 
 
 def _normalize_key(name: str) -> str:
@@ -830,6 +835,122 @@ def _read_secret_file(path: Path, *, source: str) -> "str | None":
               file=sys.stderr)
         return None
     return raw
+
+
+_PRIVATE_NAME_SUFFIXES = (".local", ".lan", ".internal", ".home", ".home.arpa", ".ts.net")
+
+
+def _bearer_transport_ok(backend_url: str, plaintext_ok: bool = False) -> bool:
+    """Check whether bearer auth may be sent to `backend_url`.
+
+    A key over plaintext to a public host is a key published to the path.
+    Allows https, non-global IP/local host destinations (.local, .lan, .internal,
+    .home, .home.arpa, .ts.net), or plaintext http with plaintext_ok true."""
+    try:
+        parts = urllib.parse.urlsplit(backend_url)
+    except Exception:
+        return False
+    scheme = (parts.scheme or "").lower()
+    host = (parts.hostname or "").lower()
+    if scheme == "https":
+        return True
+    if scheme != "http" or not host:
+        return False
+    if plaintext_ok:
+        return True
+    try:
+        ip = ipaddress.ip_address(host)
+        return bool(ip.is_loopback or not ip.is_global)
+    except ValueError:
+        pass
+    if host in ("localhost",) or "." not in host:
+        # Reject numeric IPv4 spellings ipaddress.ip_address() misses but the resolver accepts (S3).
+        try:
+            socket.inet_aton(host)
+            return False
+        except OSError:
+            pass
+        return True
+    return host.endswith(_PRIVATE_NAME_SUFFIXES)
+
+
+_ENCODER_SECRET_NAMES = {
+    "embedder": "EMBEDDER_API_KEY",
+    "reranker": "RERANKER_API_KEY",
+}
+
+
+def encoder_plaintext_ok() -> bool:
+    """Encoders send a key over plain HTTP unless ENCODER_PLAINTEXT_OK is false. Unset is true."""
+    raw = os.environ.get("ENCODER_PLAINTEXT_OK")
+    if raw is None or not str(raw).strip():
+        return True
+    return str(raw).strip().lower() not in ("0", "false", "no", "off")
+
+
+def _encoder_file_pointer(name: str) -> "str | None":
+    """The *_FILE path when one is set. The value stays with get_secret."""
+    raw = _lookup_environ(f"{name}_FILE")
+    if raw is None:
+        return None
+    text = str(raw).strip()
+    return text or None
+
+
+def encoder_key_configured(kind: str) -> bool:
+    """A resolved value, or a *_FILE pointer that is set. The file itself may be missing."""
+    name = _ENCODER_SECRET_NAMES[kind]
+    token = get_secret(name)
+    if token is not None and str(token).strip():
+        return True
+    return _encoder_file_pointer(name) is not None
+
+
+def encoder_auth_headers(kind: str, url: str) -> dict:
+    """Authorization for one encoder, or {}. This is the only place the header is built.
+
+    The value comes from get_secret, so a plaintext line, a *_FILE pointer and
+    $CREDENTIALS_DIRECTORY all work. A missing file is the loader's warning and
+    yields no header. ENCODER_PLAINTEXT_OK false withholds the key from a public
+    http address; the request still goes out. A value that is not visible ASCII
+    after stripping is withheld the same way. The warning names the variable
+    and is printed once for that variable in the process.
+    """
+    name = _ENCODER_SECRET_NAMES[kind]
+    token = get_secret(name)
+    if token is None or not str(token).strip():
+        return {}
+    if not _bearer_transport_ok(url, encoder_plaintext_ok()):
+        return {}
+    # The key file keeps a trailing space, and h11's refusal text is the header value. That text is what each retry logs and what the 503 repeats.
+    value = str(token).strip()
+    if any(ord(ch) < 0x21 or ord(ch) > 0x7E for ch in value):
+        if name not in _warned_non_ascii_encoder_names:
+            _warned_non_ascii_encoder_names.add(name)
+            print(f"[secure_env] WARNING: {name} is not visible ASCII "
+                  f"— withholding the encoder key", file=sys.stderr)
+        return {}
+    return {"Authorization": "Bearer " + value}
+
+
+def encoder_plaintext_warnings(urls: dict) -> list[str]:
+    """URLs whose configured key is withheld because ENCODER_PLAINTEXT_OK is false.
+
+    One entry per URL. The value is never included. A missing file is the loader's
+    message, not this list.
+    """
+    if encoder_plaintext_ok():
+        return []
+    lines = []
+    for kind, url in urls.items():
+        if kind not in _ENCODER_SECRET_NAMES or not url:
+            continue
+        token = get_secret(_ENCODER_SECRET_NAMES[kind])
+        if token is None or not str(token).strip():
+            continue
+        if not _bearer_transport_ok(str(url), False):
+            lines.append(str(url))
+    return lines
 
 
 # token_env is an arbitrary string. Without this, `../../../home/user/.ssh/id_rsa` would be read and sent as a bearer token.

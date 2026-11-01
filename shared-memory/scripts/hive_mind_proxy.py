@@ -8,9 +8,7 @@ import re
 import secrets
 import shutil
 import signal
-import socket
 import sys
-import ipaddress
 import itertools
 import urllib.parse
 from datetime import datetime, timezone
@@ -28,6 +26,7 @@ from secure_env import (  # noqa: E402
     load_split_env, get_secret, is_secret_key, require_llm_backends_json_parses,
     config_fatal, llm_declaration_errors, backend_credential_reason,
     token_env_is_variable_name,
+    _bearer_transport_ok, encoder_auth_headers, encoder_key_configured,
 )
 from log_hygiene import append_secure, secure_path, scrub_url_credentials, FILE_MODE  # noqa: E402
 from framework_defaults import FRAMEWORK_DEFAULTS  # noqa: E402
@@ -122,7 +121,7 @@ ROUTING_MAP = {
 }
 
 
-# S-04: a provider key is attached only after the chat path is exact and has no query. Encoder POSTs stay on the list because a future credentialed embedder would need them.
+# S-04: a provider key is attached only after the path is an exact framework POST with no query. Encoder POSTs stay on the list so an encoder key is attached only there.
 CREDENTIALED_BACKEND_ALLOWED_ROUTES = frozenset({
     ("POST", "/v1/chat/completions"),
     ("POST", "/v1/embeddings"),
@@ -131,43 +130,6 @@ CREDENTIALED_BACKEND_ALLOWED_ROUTES = frozenset({
 # handle_encoder counts bytes and returns 413 above this; it never streams the encoder body (decision:2651). LLM traffic uses client_max_size instead.
 EMBED_RERANK_BUFFER_CAP = int(os.environ.get("EMBED_RERANK_BUFFER_CAP", str(1024 * 1024)))
 _CHAT_PATH = "/v1/chat/completions"
-
-
-_PRIVATE_NAME_SUFFIXES = (".local", ".lan", ".internal", ".home", ".home.arpa", ".ts.net")
-
-
-def _bearer_transport_ok(backend_url: str, plaintext_ok: bool = False) -> bool:
-    """Check whether bearer auth may be sent to `backend_url`.
-
-    A key over plaintext to a public host is a key published to the path.
-    Allows https, non-global IP/local host destinations (.local, .lan, .internal,
-    .home, .home.arpa, .ts.net), or plaintext http with "plaintext_ok": true."""
-    try:
-        parts = urllib.parse.urlsplit(backend_url)
-    except Exception:
-        return False
-    scheme = (parts.scheme or "").lower()
-    host = (parts.hostname or "").lower()
-    if scheme == "https":
-        return True
-    if scheme != "http" or not host:
-        return False
-    if plaintext_ok:
-        return True
-    try:
-        ip = ipaddress.ip_address(host)
-        return bool(ip.is_loopback or not ip.is_global)
-    except ValueError:
-        pass
-    if host in ("localhost",) or "." not in host:
-        # Reject numeric IPv4 spellings ipaddress.ip_address() misses but the resolver accepts (S3).
-        try:
-            socket.inet_aton(host)
-            return False
-        except OSError:
-            pass
-        return True
-    return host.endswith(_PRIVATE_NAME_SUFFIXES)
 
 
 # Operator plaintext_ok for a private http path (VPN or tunnel). The loader refuses a public plaintext backend; the health probe reads this map.
@@ -973,6 +935,7 @@ class AsyncHiveMindProxy:
 
         # This handler is only reached through its own registration. aiohttp matches the plain route on rel_url.path_safe, the same string ROUTING_MAP uses.
         target_base = ROUTING_MAP[request.rel_url.path_safe]
+        encoder_kind = "embedder" if request.rel_url.path_safe == "/v1/embeddings" else "reranker"
         llm_body: bytes | None = None
         if request.can_read_body:
             content_length = request.content_length
@@ -1023,6 +986,7 @@ class AsyncHiveMindProxy:
             request,
             target_base=target_base,
             llm_body=llm_body,
+            encoder_kind=encoder_kind,
         )
 
 
@@ -1034,6 +998,7 @@ class AsyncHiveMindProxy:
         llm_backend: "str | None" = None,
         llm_body: "bytes | None" = None,
         body_obj: "dict | None" = None,
+        encoder_kind: "str | None" = None,
     ) -> web.StreamResponse:
         """Forward request upstream, relaying streamed or buffered responses.
         Handles header filtering, optional backend credentials, retries, and
@@ -1071,6 +1036,28 @@ class AsyncHiveMindProxy:
                     request["key_attached"] = True
             except (TypeError, AttributeError):
                 pass
+        elif encoder_kind is not None:
+            encoder_headers = encoder_auth_headers(encoder_kind, target_base)
+            if encoder_headers:
+                # Same S-04 refusal as a provider key: a query string is answered before the header is attached.
+                route = (request.method, request.rel_url.raw_path)
+                if (route not in CREDENTIALED_BACKEND_ALLOWED_ROUTES
+                        or request.rel_url.query_string):
+                    record_credentialed_route_denied(
+                        target_base, request.method,
+                        _audited_route_spelling(request.rel_url),
+                        agent_name=_safe_agent_name(request),
+                        request_id=_safe_request_id(request),
+                    )
+                    return web.json_response(
+                        {"error": "credentialed backends accept only framework endpoints"},
+                        status=403, headers={"X-SM-Fault-Origin": "gateway"},
+                    )
+                upstream_headers["Authorization"] = encoder_headers["Authorization"]
+                try:
+                    request["key_attached"] = True
+                except (TypeError, AttributeError):
+                    pass
 
         # Stream the body unless it is under EMBED_RERANK_BUFFER_CAP (buffering is what makes the stale-socket retry possible).
         embed_body: bytes | None = None
@@ -1713,6 +1700,13 @@ def capability_snapshot() -> dict:
     return snap
 
 
+def _status_after_encoder_post(kind: str, http_status: int, ok: bool) -> str | None:
+    """auth_failed when a configured key is refused. None leaves the caller's ok/failing choice."""
+    if not ok and encoder_key_configured(kind) and http_status in (401, 403):
+        return "auth_failed"
+    return None
+
+
 async def _probe_capability(session) -> dict:
     """Measure backend throughput on a representative payload and project latency
     against worst-case timeouts to verify full payload service."""
@@ -1732,19 +1726,24 @@ async def _probe_capability(session) -> dict:
     entry: dict = {"probe_chars": probe_chars}
     try:
         t0 = time.monotonic()
-        async with session.post(
-            f"{RERANKER_URL}/v1/reranking",
-            json={"query": "capability probe", "documents": docs,
-                  "top_n": len(docs)},
-            timeout=ClientTimeout(total=max(30.0, rerank_ceiling(docs))),
-            allow_redirects=False,
-        ) as r:
+        post_kwargs = {
+            "json": {"query": "capability probe", "documents": docs, "top_n": len(docs)},
+            "timeout": ClientTimeout(total=max(30.0, rerank_ceiling(docs))),
+            "allow_redirects": False,
+        }
+        rerank_headers = encoder_auth_headers("reranker", RERANKER_URL)
+        if rerank_headers:
+            post_kwargs["headers"] = rerank_headers
+        async with session.post(f"{RERANKER_URL}/v1/reranking", **post_kwargs) as r:
             await r.read()
             ok = 200 <= r.status < 300
         dt = max(time.monotonic() - t0, 1e-6)
         entry["latency_s"] = round(dt, 2)
         entry["throughput_chars_s"] = round(probe_chars / dt)
-        if ok and entry["throughput_chars_s"] > 0:
+        refused = _status_after_encoder_post("reranker", r.status, ok)
+        if refused:
+            entry["status"] = refused
+        elif ok and entry["throughput_chars_s"] > 0:
             # Worst case this framework can send: a full candidate set of fully clamped documents.
             full_chars = 20 * RERANK_MAX_DOC_CHARS
             projected = full_chars / entry["throughput_chars_s"]
@@ -1765,18 +1764,24 @@ async def _probe_capability(session) -> dict:
     entry = {"probe_chars": len(text)}
     try:
         t0 = time.monotonic()
-        async with session.post(
-            f"{EMBEDDER_URL}/v1/embeddings",
-            json={"input": text, "model": "bge-m3"},
-            timeout=ClientTimeout(total=max(30.0, embed_ceiling(len(text)))),
-            allow_redirects=False,
-        ) as r:
+        post_kwargs = {
+            "json": {"input": text, "model": "bge-m3"},
+            "timeout": ClientTimeout(total=max(30.0, embed_ceiling(len(text)))),
+            "allow_redirects": False,
+        }
+        embed_headers = encoder_auth_headers("embedder", EMBEDDER_URL)
+        if embed_headers:
+            post_kwargs["headers"] = embed_headers
+        async with session.post(f"{EMBEDDER_URL}/v1/embeddings", **post_kwargs) as r:
             await r.read()
             ok = 200 <= r.status < 300
         dt = max(time.monotonic() - t0, 1e-6)
         entry["latency_s"] = round(dt, 2)
         entry["throughput_chars_s"] = round(len(text) / dt)
-        if ok and entry["throughput_chars_s"] > 0:
+        refused = _status_after_encoder_post("embedder", r.status, ok)
+        if refused:
+            entry["status"] = refused
+        elif ok and entry["throughput_chars_s"] > 0:
             projected = EMBED_MAX_CHARS / entry["throughput_chars_s"]
             allowed = embed_ceiling(EMBED_MAX_CHARS)
             entry["projected_full_payload_s"] = round(projected, 1)
@@ -1865,14 +1870,14 @@ async def _capability_probe_daemon(proxy, stop_event, coordinator=None) -> None:
 def _probe_sleep_s(capability: dict | None,
                    interval_s: float | None = None,
                    retry_s: float | None = None) -> float:
-    """Return retry_s if any backend is failing or unprobed, else interval_s."""
+    """Return retry_s if any backend is failing, auth_failed, or unprobed, else interval_s."""
     interval_s = CAPABILITY_PROBE_INTERVAL_S if interval_s is None else interval_s
     retry_s = CAPABILITY_PROBE_RETRY_S if retry_s is None else retry_s
     cap = capability or {}
     blocks = [cap.get("reranker") or {}, cap.get("embedder") or {}]
     if not any(b.get("status") for b in blocks):
         return retry_s                      # never probed successfully
-    if any(b.get("status") == "failing" for b in blocks):
+    if any(b.get("status") in ("failing", "auth_failed") for b in blocks):
         return retry_s
     return interval_s
 
@@ -2060,7 +2065,7 @@ def _capacity_client_ceiling_s(capability: dict | None) -> float:
         if value > 0:
             projected += value
             probed = True
-        elif block.get("status") == "failing" or block.get("projection_stale"):
+        elif block.get("status") in ("failing", "auth_failed") or block.get("projection_stale"):
             unknown = True   # this backend's real cost is unknown, not zero
 
     if not probed:
@@ -2489,6 +2494,12 @@ def _encoder_dependency(probe: str, capability: object, window: dict | None = No
     8192 tokens were sent payloads tokenising to 8193), treating reranker overflow as prefix
     scoring (decision:2557 — the reranker's 8192 is a ranking prefix it scores, not a rejection
     boundary; only the embedder's 8192 rejects)."""
+    # A refused key is not a window overrun and is not masked by one. The reranker stays up; the embedder does not.
+    cap_status = capability.get("status") if isinstance(capability, dict) else None
+    if probe == "auth_failed" or cap_status == "auth_failed":
+        if kind == "reranker":
+            return _dep(_STATE_DEGRADED, "auth_failed")
+        return _dep(_STATE_DOWN, "auth_failed")
     if probe != "ok":
         return _dep(_STATE_DOWN, f"probe:{probe}")
     if isinstance(window, dict):
@@ -2834,6 +2845,9 @@ def _config_snapshot(*, for_telemetry: bool = False) -> dict:
             "max_inflight": AFFINITY_MAX_INFLIGHT,
         },
         "embed_max_chars": dream_telemetry.EMBED_MAX_CHARS,
+        # Whether a key is configured. The token is not a config value.
+        "embedder_key_configured": encoder_key_configured("embedder"),
+        "reranker_key_configured": encoder_key_configured("reranker"),
     }
     # Present only while auth is off and a live provider key is exposed. Omitted otherwise, so an older monitor still renders.
     if _unauthenticated_provider_keys_override_active():
@@ -2989,14 +3003,23 @@ async def _build_health_checks(proxy: "AsyncHiveMindProxy", coordinator) -> dict
     checks: dict[str, str] = {}
 
     # Embedder and reranker are llama.cpp and expose /health. Do not probe a reasoning backend here; those servers do not standardize /health.
-    for name, url in [
-        ("embedder", f"{EMBEDDER_URL}/health"),
-        ("reranker",  f"{RERANKER_URL}/health"),
+    for name, url, base in [
+        ("embedder", f"{EMBEDDER_URL}/health", EMBEDDER_URL),
+        ("reranker", f"{RERANKER_URL}/health", RERANKER_URL),
     ]:
         try:
             timeout = ClientTimeout(total=2.0)
-            async with proxy.session.get(url, timeout=timeout, allow_redirects=False) as r:
-                checks[name] = "ok" if 200 <= r.status < 300 else f"http_{r.status}"
+            get_kwargs = {"timeout": timeout, "allow_redirects": False}
+            health_headers = encoder_auth_headers(name, base)
+            if health_headers:
+                get_kwargs["headers"] = health_headers
+            async with proxy.session.get(url, **get_kwargs) as r:
+                if 200 <= r.status < 300:
+                    checks[name] = "ok"
+                elif encoder_key_configured(name) and r.status in (401, 403):
+                    checks[name] = "auth_failed"
+                else:
+                    checks[name] = f"http_{r.status}"
         except asyncio.TimeoutError:
             checks[name] = "timeout"
         except Exception:

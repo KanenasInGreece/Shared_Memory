@@ -30,13 +30,14 @@ request the gateway abandons is released when it hangs up -- the shim then
 closes its upstream connection. vLLM may keep computing after that; the shim
 cannot stop it.
 
-SHIM_HOST defaults to LOOPBACK deliberately. Neither vLLM nor a llama.cpp
-encoder carries any authentication, so a shim bound to 0.0.0.0 publishes an
-unauthenticated reranking endpoint to every interface on the host -- the same
-exposure a previous release found in the encoder containers' publish spec.
-Widen it only when you know what is listening.
+SHIM_HOST defaults to LOOPBACK deliberately. The shim checks nothing itself, so
+a shim bound to 0.0.0.0 publishes the reranking endpoint to every interface on
+the host, unless the encoder itself demands a key. Widen it only when you know
+what is listening.
+
+An https SHIM_VLLM_URL verifies against the OS store or SSL_CERT_FILE.
 """
-import http.client, http.server, socketserver, os, sys, math, select, socket
+import http.client, http.server, socketserver, os, sys, math, select, socket, ssl
 import urllib.parse
 
 DEFAULT_VLLM = "http://127.0.0.1:8090"
@@ -60,11 +61,20 @@ def _timeout_from_env(raw):
 
 
 def _upstream_from_env(raw):
-    """Split SHIM_VLLM_URL into (host, port, path prefix); http only."""
+    """Split SHIM_VLLM_URL into (scheme, host, port, path prefix). http or https."""
     url = urllib.parse.urlsplit(raw.strip())
-    if url.scheme != "http" or not url.hostname:
-        raise ValueError("must be an http://host:port URL")
-    return url.hostname, url.port or 80, url.path.rstrip("/")
+    if url.scheme not in ("http", "https") or not url.hostname:
+        raise ValueError("must be an http:// or https:// host:port URL")
+    default_port = 443 if url.scheme == "https" else 80
+    return url.scheme, url.hostname, url.port or default_port, url.path.rstrip("/")
+
+
+def _open_upstream(scheme, host, port, timeout):
+    """A verified TLS context for https. There is no skip."""
+    if scheme == "https":
+        context = ssl.create_default_context()
+        return http.client.HTTPSConnection(host, port, timeout=timeout, context=context)
+    return http.client.HTTPConnection(host, port, timeout=timeout)
 
 
 def _port_from_env(raw):
@@ -110,15 +120,26 @@ class Shim(http.server.BaseHTTPRequestHandler):
             # A pipelined next request is left unread; wait on upstream alone.
             watch = [upstream.sock]
 
+    def _request_authorization(self):
+        """The caller's Authorization, or None. Nothing is invented when the caller sent none."""
+        raw = self.headers.get("Authorization")
+        if raw is None:
+            return None
+        text = raw.strip()
+        return text or None
+
     def _relay(self, upstream_path, body=None, method="GET"):
         upstream = None
+        auth = self._request_authorization()
         try:
-            host, port, prefix = _upstream_from_env(
+            scheme, host, port, prefix = _upstream_from_env(
                 os.environ.get("SHIM_VLLM_URL", DEFAULT_VLLM))
-            upstream = http.client.HTTPConnection(
-                host, port,
-                timeout=_timeout_from_env(os.environ.get("SHIM_TIMEOUT_S")))
+            upstream = _open_upstream(
+                scheme, host, port,
+                _timeout_from_env(os.environ.get("SHIM_TIMEOUT_S")))
             headers = {} if body is None else {"Content-Type": "application/json"}
+            if auth:
+                headers["Authorization"] = auth
             upstream.request(method, prefix + upstream_path, body=body,
                              headers=headers)
             if self._client_hung_up(upstream):

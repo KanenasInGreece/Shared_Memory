@@ -20,7 +20,7 @@ Replace the node id to cover a different edit. Same `--with` list as the one-tes
 
 GitGuard runs only when that script exists. It is gitignored local tooling. Expect `gitguard: ALL LAYERS PRESENT`. A gap means do not dispatch builders. A public clone has no script. Do not invent one.
 
-Gateway start, stop, and backup live in `OPERATE.md`. Do not paste them here.
+Gateway start, stop, and backup live in `OPERATE.md`. Do not paste them here. On install and on update, ask the operator whether each encoder is reached through an encrypted tunnel (SSH or Tailscale), as a remote client reaches the gateway. Plain HTTP is the default, and a key on it is readable on the path. `ENCODER_PLAINTEXT_OK=false` withholds the key from a public plain-HTTP address.
 
 ## Layout
 

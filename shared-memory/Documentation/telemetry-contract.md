@@ -3,7 +3,7 @@
 
 # The Telemetry Contract
 
-Contract version **1.0.41**. Every key the gateway emits on `GET /health` and `GET /memory/telemetry`, what it means, what it is measured in, when it arrived, and where it is going.
+Contract version **1.0.42**. Every key the gateway emits on `GET /health` and `GET /memory/telemetry`, what it means, what it is measured in, when it arrived, and where it is going.
 
 ## The roles
 
@@ -38,6 +38,7 @@ A key whose **value** changed meaning while its **name** stayed. Enumerated beca
 
 | endpoint | key | version | was | now | what to do |
 |---|---|---|---|---|---|
+| health | `dependencies.embedder` | 1.0.42 | down meant only that the liveness probe failed | down also means a configured key was refused on a real route, reason auth_failed. A refused reranker key is degraded with the same reason | read reason to tell a refused key from a dead encoder |
 | telemetry | `breakdown.domains` | 0.9.74 | the PROJECT distribution (it was built from PROJECT_SQL) | the DOMAIN distribution, from metadata->'domains' | read breakdown.projects for the old value |
 | health | `role` | 0.9.74 | two-valued: read | write — an admin token reported `write` | three-valued: read | write | admin | a consumer testing `role == 'write'` for may-I-save now correctly excludes an admin token, which cannot save |
 | health | `llm_backends.*` | 0.9.74 | a 401/403 from a CREDENTIALED backend was reported `ok` — the bare probe carries no key, so the rejection was read as 'the server answered' | http_401 / http_403 for that backend, and it counts as down | expect a credentialed backend that rejects the liveness probe to read down rather than ok |
@@ -242,7 +243,7 @@ Paths are relative to the response object.
 | key | type | unit | since | moved to | removed in | log twin | notes |
 |---|---|---|---|---|---|---|---|
 | `dependencies.embedder.reason` | str/null | — | 0.9.74 | — | — | — | — |
-| `dependencies.embedder.state` | str | — | 0.9.74 | — | — | `health.embedder` | ok \| degraded \| down — down iff the liveness probe itself failed; degraded iff live but the capability probe reads too_slow/failing |
+| `dependencies.embedder.state` | str | — | 0.9.74 | — | — | `health.embedder` | ok \| degraded \| down. down when the liveness probe failed, or when a configured key is refused (the probe or the capability status is auth_failed). degraded when the encoder is live but capability is too_slow or failing, or the window is short or overrun. A refused key is judged before the window, so a window verdict cannot mask it. |
 | `dependencies.llm_pool.reason` | str/null | — | 0.9.74 | — | — | — | — |
 | `dependencies.llm_pool.state` | str | — | 0.9.74 | — | — | `health.llm_pool` | ok \| degraded \| down \| unknown. unknown iff no backend has been probed at all. down iff every probed backend is down — liveness is never softened by configuration. degraded: some (not all) backends down, OR a declared fleet was entirely excluded (the legacy fallback is serving instead), OR nothing was declared at all (W2, decision:1832 — the built-in fallback IS serving), OR every probed backend answers but none is ELIGIBLE for any traffic class (W2, fleet-wide only — see MEANING_CHANGES) |
 | `dependencies.neo4j.reason` | str/null | — | 0.9.74 | — | — | — | — |
@@ -258,7 +259,7 @@ Paths are relative to the response object.
 | `dependencies.rem_daemon.reason` | str/null | — | 0.9.74 | — | — | — | — |
 | `dependencies.rem_daemon.state` | str | — | 0.9.74 | — | — | `health.rem_daemon` | ok \| degraded \| down. down iff the REM process is not running. degraded: dead-letters > 0, OR no backend counts toward dream slots (W2, decision:1832 — REM structurally cannot run against this fleet) — both reasons appear together when both apply |
 | `dependencies.reranker.reason` | str/null | — | 0.9.74 | — | — | — | — |
-| `dependencies.reranker.state` | str | — | 0.9.74 | — | — | `health.reranker` | ok \| degraded \| down — same rule as dependencies.embedder.state |
+| `dependencies.reranker.state` | str | — | 0.9.74 | — | — | `health.reranker` | ok \| degraded \| down. down when the liveness probe failed for a reason other than a refused key. A configured key the reranker refuses (probe or capability auth_failed, including /health 401 or 403) is degraded, not down. Any other probe failure is still down. |
 
 ### warnings
 
@@ -292,19 +293,19 @@ Paths are relative to the response object.
 | `backend_capability.*.projection_age_s` | float/null | _s | <=0.9.73 | — | — | — | — |
 | `backend_capability.*.projection_stale` | bool | — | <=0.9.73 | — | — | — | — |
 | `backend_capability.*.serves_full_payload` | bool | — | <=0.9.73 | — | — | — | — |
-| `backend_capability.*.status` | str | — | <=0.9.73 | — | — | — | — |
+| `backend_capability.*.status` | str | — | <=0.9.73 | — | — | — | ok \| too_slow \| failing \| auth_failed. auth_failed means a configured key was refused on the probe POST. With no key configured, a 401 stays failing. |
 | `backend_capability.*.throughput_chars_s` | int/float | — | <=0.9.73 | — | — | — | — |
 | `backend_capability.gateway_host_load1` | float/null | — | <=0.9.73 | — | — | — | — |
 | `backend_capability.probed_at` | str/null | — | <=0.9.73 | — | — | — | — |
 | `backend_capability.status` | str/null | — | <=0.9.73 | — | — | — | — |
-| `embedder` | str | — | <=0.9.73 | — | — | — | ok \| timeout \| down \| http_<code> |
+| `embedder` | str | — | <=0.9.73 | — | — | — | ok \| timeout \| down \| auth_failed \| http_<code>. auth_failed is a configured key the encoder refused (401 or 403). With no key configured, 401 stays http_401. |
 | `encoder_window.*.advertised_tokens` | int/null | — | 0.9.104 | — | — | — | — |
 | `encoder_window.*.full_payload_ok` | bool/null | — | 0.9.104 | — | — | — | — |
 | `encoder_window.*.source` | str/null | — | 0.9.104 | — | — | — | — |
 | `encoder_window.embed_max_chars` | int | — | 0.9.104 | — | — | — | — |
 | `encoder_window.required_tokens` | int | — | 0.9.104 | — | — | — | — |
 | `encoder_window.special_token_reserve` | int | — | 0.9.104 | — | — | — | — |
-| `reranker` | str | — | <=0.9.73 | — | — | — | ok \| timeout \| down \| http_<code> |
+| `reranker` | str | — | <=0.9.73 | — | — | — | ok \| timeout \| down \| auth_failed \| http_<code>. auth_failed is a configured key the encoder refused (401 or 403). With no key configured, 401 stays http_401. |
 
 ### llm
 
@@ -354,6 +355,13 @@ Paths are relative to the response object.
 | `consolidation.project_identity.nodes` | int | — | <=0.9.73 | — | — | — | — |
 | `consolidation.project_identity.unidentified` | int | — | <=0.9.73 | — | — | — | — |
 | `consolidation.project_identity.unregistered` | int | — | <=0.9.73 | — | — | — | — |
+
+### credentials
+
+| key | type | unit | since | moved to | removed in | log twin | notes |
+|---|---|---|---|---|---|---|---|
+| `config.embedder_key_configured` | bool | — | 1.0.42 | — | — | — | true when EMBEDDER_API_KEY resolves or EMBEDDER_API_KEY_FILE is set. The token is not a config value. |
+| `config.reranker_key_configured` | bool | — | 1.0.42 | — | — | — | true when RERANKER_API_KEY resolves or RERANKER_API_KEY_FILE is set. The token is not a config value. |
 
 ### versions
 
@@ -738,7 +746,9 @@ The envelope is `{"status": "success", "telemetry": {…}}`; paths below are rel
 | key | type | unit | since | moved to | removed in | log twin | notes |
 |---|---|---|---|---|---|---|---|
 | `config.allow_unauthenticated_provider_keys` | bool | — | 0.9.74 | — | — | — | — |
+| `config.embedder_key_configured` | bool | — | 1.0.42 | — | — | — | true when EMBEDDER_API_KEY resolves or EMBEDDER_API_KEY_FILE is set. The token is not a config value. |
 | `config.llm_backends[].has_credential` | bool | — | 0.9.74 | — | — | — | — |
+| `config.reranker_key_configured` | bool | — | 1.0.42 | — | — | — | true when RERANKER_API_KEY resolves or RERANKER_API_KEY_FILE is set. The token is not a config value. |
 | `credentials.audit_log_dropped` | int | — | <=0.9.73 | — | — | — | — |
 | `credentials.audit_log_dropped_last_ts` | str/null | — | <=0.9.73 | — | — | — | — |
 | `credentials.credentialed_route_denied` | int | — | <=0.9.73 | — | — | — | — |
