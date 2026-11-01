@@ -26,7 +26,8 @@ from secure_env import (  # noqa: E402
     load_split_env, get_secret, is_secret_key, require_llm_backends_json_parses,
     config_fatal, llm_declaration_errors, backend_credential_reason,
     token_env_is_variable_name,
-    _bearer_transport_ok, encoder_auth_headers, encoder_key_configured,
+    _bearer_transport_ok, encoder_auth_headers, encoder_auth_kwargs,
+    encoder_key_configured, encoder_key_refused,
 )
 from log_hygiene import append_secure, secure_path, scrub_url_credentials, FILE_MODE  # noqa: E402
 from framework_defaults import FRAMEWORK_DEFAULTS  # noqa: E402
@@ -794,6 +795,26 @@ def _encoder_payload_too_large_response(nbytes: int) -> web.Response:
     return resp
 
 
+def _credentialed_route_refusal(request, audit_target: str) -> "web.Response | None":
+    """S-04: a request about to carry a key may only POST a framework path with no
+    query. Call before Authorization is attached; a non-None result is returned
+    unforwarded.
+    """
+    route = (request.method, request.rel_url.raw_path)
+    if route in CREDENTIALED_BACKEND_ALLOWED_ROUTES and not request.rel_url.query_string:
+        return None
+    record_credentialed_route_denied(
+        audit_target, request.method,
+        _audited_route_spelling(request.rel_url),  # RAW path + query marker
+        agent_name=_safe_agent_name(request),
+        request_id=_safe_request_id(request),
+    )
+    return web.json_response(
+        {"error": "credentialed backends accept only framework endpoints"},
+        status=403, headers={"X-SM-Fault-Origin": "gateway"},
+    )
+
+
 # Proxy
 class AsyncHiveMindProxy:
     def __init__(self):
@@ -1014,20 +1035,9 @@ class AsyncHiveMindProxy:
         if llm_backend is not None:
             backend_token = LLM_BACKEND_TOKENS.get(llm_backend)
             if backend_token:
-                # S-04: a request about to carry a provider key may only POST a framework-owned path (raw_path, no query) before Authorization is attached.
-                route = (request.method, request.rel_url.raw_path)
-                if (route not in CREDENTIALED_BACKEND_ALLOWED_ROUTES
-                        or request.rel_url.query_string):
-                    record_credentialed_route_denied(
-                        llm_backend, request.method,
-                        _audited_route_spelling(request.rel_url),  # QA-1: RAW path + query marker
-                        agent_name=_safe_agent_name(request),
-                        request_id=_safe_request_id(request),
-                    )
-                    return web.json_response(
-                        {"error": "credentialed backends accept only framework endpoints"},
-                        status=403, headers={"X-SM-Fault-Origin": "gateway"},
-                    )
+                refusal = _credentialed_route_refusal(request, llm_backend)
+                if refusal is not None:
+                    return refusal
                 upstream_headers["Authorization"] = f"Bearer {backend_token}"
             # Stash backend and key_attached for the audit line auth_middleware reads after return. The request may be a test double with no mapping interface.
             try:
@@ -1039,20 +1049,9 @@ class AsyncHiveMindProxy:
         elif encoder_kind is not None:
             encoder_headers = encoder_auth_headers(encoder_kind, target_base)
             if encoder_headers:
-                # Same S-04 refusal as a provider key: a query string is answered before the header is attached.
-                route = (request.method, request.rel_url.raw_path)
-                if (route not in CREDENTIALED_BACKEND_ALLOWED_ROUTES
-                        or request.rel_url.query_string):
-                    record_credentialed_route_denied(
-                        target_base, request.method,
-                        _audited_route_spelling(request.rel_url),
-                        agent_name=_safe_agent_name(request),
-                        request_id=_safe_request_id(request),
-                    )
-                    return web.json_response(
-                        {"error": "credentialed backends accept only framework endpoints"},
-                        status=403, headers={"X-SM-Fault-Origin": "gateway"},
-                    )
+                refusal = _credentialed_route_refusal(request, target_base)
+                if refusal is not None:
+                    return refusal
                 upstream_headers["Authorization"] = encoder_headers["Authorization"]
                 try:
                     request["key_attached"] = True
@@ -1700,13 +1699,6 @@ def capability_snapshot() -> dict:
     return snap
 
 
-def _status_after_encoder_post(kind: str, http_status: int, ok: bool) -> str | None:
-    """auth_failed when a configured key is refused. None leaves the caller's ok/failing choice."""
-    if not ok and encoder_key_configured(kind) and http_status in (401, 403):
-        return "auth_failed"
-    return None
-
-
 async def _probe_capability(session) -> dict:
     """Measure backend throughput on a representative payload and project latency
     against worst-case timeouts to verify full payload service."""
@@ -1726,23 +1718,20 @@ async def _probe_capability(session) -> dict:
     entry: dict = {"probe_chars": probe_chars}
     try:
         t0 = time.monotonic()
-        post_kwargs = {
-            "json": {"query": "capability probe", "documents": docs, "top_n": len(docs)},
-            "timeout": ClientTimeout(total=max(30.0, rerank_ceiling(docs))),
-            "allow_redirects": False,
-        }
-        rerank_headers = encoder_auth_headers("reranker", RERANKER_URL)
-        if rerank_headers:
-            post_kwargs["headers"] = rerank_headers
-        async with session.post(f"{RERANKER_URL}/v1/reranking", **post_kwargs) as r:
+        async with session.post(
+            f"{RERANKER_URL}/v1/reranking",
+            json={"query": "capability probe", "documents": docs, "top_n": len(docs)},
+            timeout=ClientTimeout(total=max(30.0, rerank_ceiling(docs))),
+            allow_redirects=False,
+            **encoder_auth_kwargs("reranker", RERANKER_URL),
+        ) as r:
             await r.read()
             ok = 200 <= r.status < 300
         dt = max(time.monotonic() - t0, 1e-6)
         entry["latency_s"] = round(dt, 2)
         entry["throughput_chars_s"] = round(probe_chars / dt)
-        refused = _status_after_encoder_post("reranker", r.status, ok)
-        if refused:
-            entry["status"] = refused
+        if encoder_key_refused("reranker", r.status):
+            entry["status"] = "auth_failed"
         elif ok and entry["throughput_chars_s"] > 0:
             # Worst case this framework can send: a full candidate set of fully clamped documents.
             full_chars = 20 * RERANK_MAX_DOC_CHARS
@@ -1764,23 +1753,20 @@ async def _probe_capability(session) -> dict:
     entry = {"probe_chars": len(text)}
     try:
         t0 = time.monotonic()
-        post_kwargs = {
-            "json": {"input": text, "model": "bge-m3"},
-            "timeout": ClientTimeout(total=max(30.0, embed_ceiling(len(text)))),
-            "allow_redirects": False,
-        }
-        embed_headers = encoder_auth_headers("embedder", EMBEDDER_URL)
-        if embed_headers:
-            post_kwargs["headers"] = embed_headers
-        async with session.post(f"{EMBEDDER_URL}/v1/embeddings", **post_kwargs) as r:
+        async with session.post(
+            f"{EMBEDDER_URL}/v1/embeddings",
+            json={"input": text, "model": "bge-m3"},
+            timeout=ClientTimeout(total=max(30.0, embed_ceiling(len(text)))),
+            allow_redirects=False,
+            **encoder_auth_kwargs("embedder", EMBEDDER_URL),
+        ) as r:
             await r.read()
             ok = 200 <= r.status < 300
         dt = max(time.monotonic() - t0, 1e-6)
         entry["latency_s"] = round(dt, 2)
         entry["throughput_chars_s"] = round(len(text) / dt)
-        refused = _status_after_encoder_post("embedder", r.status, ok)
-        if refused:
-            entry["status"] = refused
+        if encoder_key_refused("embedder", r.status):
+            entry["status"] = "auth_failed"
         elif ok and entry["throughput_chars_s"] > 0:
             projected = EMBED_MAX_CHARS / entry["throughput_chars_s"]
             allowed = embed_ceiling(EMBED_MAX_CHARS)
@@ -2489,11 +2475,12 @@ def _encoder_dependency(probe: str, capability: object, window: dict | None = No
     """Return encoder dependency state.
 
     ⛔ Liveness is not capability: slow capability degrades rather than marks down.
-    Enforces window contracts (decision:2540 — the encoder window contract: a conservative
-    token-reserve clamp, a runtime probe and a postflight check, because encoders advertising
-    8192 tokens were sent payloads tokenising to 8193), treating reranker overflow as prefix
-    scoring (decision:2557 — the reranker's 8192 is a ranking prefix it scores, not a rejection
-    boundary; only the embedder's 8192 rejects)."""
+    Enforces window contracts (decision:2540 — the encoder window contract: a
+    conservative token-reserve clamp, a runtime probe and a postflight check,
+    because encoders advertising 8192 tokens were sent payloads tokenising to 8193),
+    treating reranker overflow as prefix scoring (decision:2557 — the reranker's 8192 is
+    a ranking prefix it scores, not a rejection boundary; only the embedder's 8192
+    rejects)."""
     # A refused key is not a window overrun and is not masked by one. The reranker stays up; the embedder does not.
     cap_status = capability.get("status") if isinstance(capability, dict) else None
     if probe == "auth_failed" or cap_status == "auth_failed":
@@ -3002,21 +2989,22 @@ async def _build_health_checks(proxy: "AsyncHiveMindProxy", coordinator) -> dict
     """Full /health probe shape (S-10 disclosure is handle_health's job, applied after cache)."""
     checks: dict[str, str] = {}
 
-    # Embedder and reranker are llama.cpp and expose /health. Do not probe a reasoning backend here; those servers do not standardize /health.
-    for name, url, base in [
-        ("embedder", f"{EMBEDDER_URL}/health", EMBEDDER_URL),
-        ("reranker", f"{RERANKER_URL}/health", RERANKER_URL),
+    # The encoders expose /health. Do not probe a reasoning backend here; those servers do not standardize /health.
+    for name, base in [
+        ("embedder", EMBEDDER_URL),
+        ("reranker", RERANKER_URL),
     ]:
         try:
             timeout = ClientTimeout(total=2.0)
-            get_kwargs = {"timeout": timeout, "allow_redirects": False}
-            health_headers = encoder_auth_headers(name, base)
-            if health_headers:
-                get_kwargs["headers"] = health_headers
-            async with proxy.session.get(url, **get_kwargs) as r:
+            async with proxy.session.get(
+                f"{base}/health",
+                timeout=timeout,
+                allow_redirects=False,
+                **encoder_auth_kwargs(name, base),
+            ) as r:
                 if 200 <= r.status < 300:
                     checks[name] = "ok"
-                elif encoder_key_configured(name) and r.status in (401, 403):
+                elif encoder_key_refused(name, r.status):
                     checks[name] = "auth_failed"
                 else:
                     checks[name] = f"http_{r.status}"

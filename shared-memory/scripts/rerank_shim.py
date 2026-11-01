@@ -1,51 +1,28 @@
 #!/usr/bin/env python3
 """Path shim: the framework's /v1/reranking -> vLLM's /v1/rerank.
 
-Optional. You only need this if you serve the RERANKER with vLLM instead of
-llama.cpp. The embedder needs no shim -- vLLM already serves /v1/embeddings at
-the path the framework expects.
+Optional: only for a reranker served by vLLM; the embedder needs no shim. vLLM serves
+/v1/rerank but 404s on /v1/reranking, and its body contract already matches, so this
+rewrites the PATH ONLY. It never touches the body; needing to is a contract change that
+belongs in a record, not in this file.
 
-WHY THIS EXISTS (measured 2026-08-25):
-coordinator._encoder_url() takes RERANKER_URL as a BASE and appends the FIXED
-path "/v1/reranking". vLLM serves /rerank, /v1/rerank and /v2/rerank -- it does
-NOT serve /v1/reranking (measured: HTTP 404). Everything else about the contract
-already matches, measured against a live vLLM 0.21.1 XPU server:
-  * a body with NO "model" field is accepted (HTTP 200) -- no injection needed
-  * results[].index is the SUBMITTED array position, not sorted rank
-  * results[].relevance_score is the exact field name the coordinator reads
-  * top_n is honoured
-So this shim rewrites the PATH ONLY. It never touches the body. If it ever needs
-to, that is a contract change and belongs in a record, not in this file.
+There is no default deadline: the gateway's per-call wait governs, and a second
+timer here would cut a slow rerank short. A request the gateway abandons closes the
+upstream connection; vLLM may keep computing and the shim cannot stop it.
 
-Every address is an env-overridable default, never a literal in a code path:
-  SHIM_VLLM_URL  where vLLM listens          (default http://127.0.0.1:8090)
-  SHIM_HOST      address the shim binds      (default 127.0.0.1)
-  SHIM_PORT      port the shim binds         (default 8092)
-  SHIM_TIMEOUT_S upstream socket timeout, seconds (default: none)
-Then point the gateway at it:  RERANKER_URL=http://<SHIM_HOST>:<SHIM_PORT>
-
-There is no default deadline: the gateway's own per-call wait decides what its
-caller sees, and a second timer here would only cut a slow rerank short. A
-request the gateway abandons is released when it hangs up -- the shim then
-closes its upstream connection. vLLM may keep computing after that; the shim
-cannot stop it.
-
-SHIM_HOST defaults to LOOPBACK deliberately. The shim checks nothing itself, so
-a shim bound to 0.0.0.0 publishes the reranking endpoint to every interface on
-the host, unless the encoder itself demands a key. Widen it only when you know
-what is listening.
-
-An https SHIM_VLLM_URL verifies against the OS store or SSL_CERT_FILE.
+SHIM_HOST defaults to loopback because the shim checks nothing itself: bound to
+0.0.0.0 it publishes the reranking endpoint on every interface unless the encoder
+demands a key. Widen it only when you know what is listening. An https SHIM_VLLM_URL
+verifies against the OS store or SSL_CERT_FILE.
 """
 import http.client, http.server, socketserver, os, sys, math, select, socket, ssl
 import urllib.parse
 
 DEFAULT_VLLM = "http://127.0.0.1:8090"
 
-# The gateway calls three things on a reranker base: the rerank POST (search and
-# the capability probe), GET /health (hive_mind_proxy._build_health_checks) and
-# GET /v1/models (encoder_window, the window probe). Anything else is a
-# mistyped framework call and must fail loudly rather than be forwarded blind.
+# The gateway calls three things on a reranker base: POST /v1/reranking, GET /health and
+# GET /v1/models. Anything else is a mistyped framework call and must fail loudly, not
+# forward blind.
 POST_MAP = {"/v1/reranking": "/v1/rerank"}
 GET_MAP  = {"/health": "/health", "/v1/models": "/v1/models"}
 
@@ -122,11 +99,7 @@ class Shim(http.server.BaseHTTPRequestHandler):
 
     def _request_authorization(self):
         """The caller's Authorization, or None. Nothing is invented when the caller sent none."""
-        raw = self.headers.get("Authorization")
-        if raw is None:
-            return None
-        text = raw.strip()
-        return text or None
+        return (self.headers.get("Authorization") or "").strip() or None
 
     def _relay(self, upstream_path, body=None, method="GET"):
         upstream = None

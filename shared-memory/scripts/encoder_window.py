@@ -1,9 +1,6 @@
-"""Classify embed/rerank 400/413 as window mismatch vs overrun, and clamp embedding inputs per string (decision:2540).
+"""Classify embed/rerank 400/413 as window mismatch vs overrun, and clamp inputs (decision:2540: encoder window contract).
 
-Defines:
-- classify_overflow(): detects window mismatch vs overrun on HTTP 400/413.
-- clamp_encoder_payload(): clamps OpenAI-style embedding inputs per string element.
-- OverflowResult: classification result with unpacked tuple compatibility.
+Defines classify_overflow(), clamp_encoder_payload(), and OverflowResult.
 """
 from __future__ import annotations
 
@@ -14,6 +11,7 @@ from typing import Any
 
 from aiohttp import ClientTimeout
 
+from secure_env import encoder_auth_kwargs, encoder_key_refused
 from dream_telemetry import (
     EMBED_CHARS_PER_TOKEN,
     EMBED_MAX_CHARS,
@@ -74,12 +72,8 @@ def _upstream_url(base: str, rel: str) -> str:
 
 def _encoder_auth_kwargs(base_url: str, route: str) -> dict:
     """Headers for this encoder, omitted entirely when no key is sent so an unconfigured probe stays the old call."""
-    from secure_env import encoder_auth_headers
     kind = "embedder" if "embed" in route else "reranker"
-    headers = encoder_auth_headers(kind, str(base_url))
-    if not headers:
-        return {}
-    return {"headers": headers}
+    return encoder_auth_kwargs(kind, str(base_url))
 
 
 async def probe_encoder(
@@ -180,13 +174,9 @@ async def probe_encoder(
             async with session.post(post_url, json=payload, timeout=timeout, allow_redirects=False,
                                     **_encoder_auth_kwargs(base_url, route)) as r:
                 await r.read()
-                if r.status in (401, 403):
-                    from secure_env import encoder_key_configured
-                    # A refused key is not a window overrun. With no key configured, 401 stays False.
-                    if encoder_key_configured("embedder"):
-                        full_ok = None
-                    else:
-                        full_ok = False
+                if encoder_key_refused("embedder", r.status):
+                    # A refused key is not a window overrun.
+                    full_ok = None
                 else:
                     full_ok = (r.status == 200)
         except Exception:
@@ -439,7 +429,7 @@ def _coerce_overflow_int(value: Any) -> int | None:
 
 
 def overflow_fields(classification: OverflowResult) -> dict:
-    """S8 encoder overflow object: enum + ints/null, never provider text."""
+    """Encoder overflow object: enum + ints/null, never provider text."""
     kind = classification.kind if classification.kind in _OVERFLOW_KINDS else "other"
     return {
         "kind": kind,

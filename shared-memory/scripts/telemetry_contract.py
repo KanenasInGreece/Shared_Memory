@@ -83,16 +83,14 @@ __all__ = [
 ]
 
 #: Not a free-running today: this is the fifth version pin, so a missed bump is visible (decision:1832).
-VERSION = "1.0.42"
+VERSION = "1.0.43"
 
 
 def _version_tuple(v: str) -> tuple:
-    """"0.9.79" -> (0, 9, 79) — the same idiom `backfill_domain_of.py`,
-    `backfill_project_of.py`, `backfill_promote_grounded.py` and
-    `reconcile_project_edges.py` already use, so a release string compares
-    numerically (fix round item 1/8, decision:1832): STRING comparison would
-    rank "0.9.9" ahead of "0.9.10", which is exactly the kind of silent wrong
-    answer a version gate must never give."""
+    """'0.9.79' -> (0, 9, 79), so a release compares numerically: a string compare
+    would rank '0.9.9' ahead of '0.9.10', a silent wrong answer a version gate must
+    never give.
+    """
     return tuple(int(p) for p in v.split(".")[:3])
 
 
@@ -130,10 +128,7 @@ def _k(types: str, category: str, *, unit: str | None = None,
        since: str = BASELINE, moved_to: str | None = None,
        removed_in: str | None = None, log: str | None = None,
        note: str | None = None) -> dict:
-    """One contract entry. ``types`` is a ``|``-separated set of JSON type
-    names (``str int float bool list dict null``) — a nullable int is
-    ``"int|null"``, and a key that legitimately reports either is documented as
-    both rather than as whichever one today's corpus happens to produce."""
+    """Create one contract entry with pipe-separated JSON type names."""
     assert category in CATEGORIES, f"unknown category {category!r}"
     return {
         "types": tuple(types.split("|")),
@@ -1910,12 +1905,7 @@ def _json_type(value) -> str:
 
 
 def type_matches(value, spec: dict) -> bool:
-    """True iff ``value``'s JSON type is one the spec allows.
-
-    ``int`` satisfies a ``float`` declaration (JSON has one number type and a
-    percentile that lands exactly on an integer serialises as one), but never
-    the other way round — a float where an int is declared is a real defect.
-    """
+    """Return True if value matches spec types; int satisfies float, but never vice versa."""
     actual = _json_type(value)
     allowed = spec["types"]
     if actual in allowed:
@@ -1926,10 +1916,9 @@ def type_matches(value, spec: dict) -> bool:
 def _trie(paths) -> dict:
     """Build a nested lookup from the contract's dotted paths.
 
-    ⚠ Built from the CONTRACT's paths, never from a payload's — a dynamic map
-    key can itself contain dots (an LLM backend key is a URL), so a payload path
-    can never be recovered by splitting a joined string. ``walk_payload``
-    descends this trie alongside the payload instead.
+    ⛔ Built from the CONTRACT's paths, never a payload's: a dynamic map key can
+    contain dots (an LLM backend key is a URL), so splitting a joined payload path
+    cannot recover it.
     """
     root: dict = {}
     for path in paths:
@@ -1940,17 +1929,12 @@ def _trie(paths) -> dict:
 
 
 def walk_payload(payload: dict, contract: dict) -> list[tuple[str, object]]:
-    """Every (canonical path, value) pair a payload actually emits.
+    """Every (canonical path, value) pair a payload emits, leaves only.
 
-    A dict key is canonicalised to itself when the contract documents it
-    literally, and to ``*`` when the contract documents a dynamic map at that
-    position. An unknown key keeps its literal spelling so the caller can name
-    it in a failure message.
-
-    LEAVES ONLY, with one exception that is not really one: an EMPTY dict or
-    list has no leaves, so the container itself is emitted — otherwise a section
-    that legitimately reports "nothing here" would be invisible to the contract
-    in exactly the state a reader most needs it documented for.
+    A key canonicalises to itself when documented literally and to `*` under a
+    documented dynamic map; an unknown key keeps its spelling so the caller can name
+    it. An empty dict or list is emitted itself, or a section reporting "nothing here"
+    would be invisible.
     """
     trie = _trie(contract)
     out: list[tuple[str, object]] = []
@@ -1987,13 +1971,8 @@ def canonical_paths(payload: dict, contract: dict) -> set[str]:
 
 # The contract decides what is served. Emitters and caches keep the full shape; only the response copy is stripped.
 def is_dropped(spec: dict) -> bool:
-    """True iff this release has reached the row's ``removed_in``.
-
-    Keyed on ``VERSION`` rather than on a single named stamp, so a checkout at
-    any tag serves what THAT release's contract says: 0.9.89 serves the
-    dual-emitted copies, 0.9.90 and later do not, with no code difference
-    between the two trees. Compared as version TUPLES — a string compare would
-    rank "0.9.9" ahead of "0.9.10".
+    """True if VERSION has reached the row's removed_in, compared as version tuples.
+    Keyed on VERSION so a checkout at any tag serves what that release's contract says.
     """
     removed_in = spec.get("removed_in")
     return (removed_in is not None
@@ -2027,22 +2006,11 @@ def _match(node: dict, key: str) -> dict | None:
 def _prune(value: dict, dropped: dict, kept: dict) -> dict:
     """One level of the strip, as a FRESH dict.
 
-    ⛔ NEVER IN PLACE. `capacity_snapshot()` returns a shallow copy whose
-    `derived`/`probe`/`fingerprint` sub-dicts are the module cache itself, and
-    `telemetry_extras()` serves those same objects — pruning them where they
-    lie would blank the new homes and the process-lifetime record. A subtree
-    nothing is removed from is reused by reference; every edited path is rebuilt.
-
-    Two clauses, because nine of the eleven `/health` families are documented
-    only through their dotted children and several are served as `None` before
-    their first probe:
-
-      (a) a key with NO surviving row under it goes, whatever it is serving —
-          a dict, an empty dict, a list or `None`;
-      (b) a key with survivors left keeps them — its dropped leaves are removed
-          from a fresh copy when it is a dict, and it is left exactly as it is
-          when it is not (`capacity` is `null` until the first derivation, and
-          both clients guard on that).
+    ⛔ NEVER IN PLACE: capacity_snapshot() sub-dicts are the module cache itself, and
+    pruning them where they lie would blank the new homes and the process-lifetime
+    record. A key with no surviving row goes, whatever it serves. A key with survivors
+    keeps them: pruned in a fresh copy when a dict, left as it is otherwise (`capacity`
+    is null until the first derivation, and both clients guard on that).
     """
     out: dict = {}
     for key, sub in value.items():
