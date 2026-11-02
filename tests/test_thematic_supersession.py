@@ -196,9 +196,7 @@ async def test_t1_superseded_constituent_retires_and_folds_successor_atomically(
             (4, "proj", "fact", None, d, {}),
             (5, "proj", "fact", None, d, {}),
         ]},
-        # 2. dead-letter counts
-        {"rowcount": 0, "rows": []},
-        # 3. fetch_active_thematic_rows: returns active row 10 with source_pg_ids [1, 2, 3, 4]
+        # 2. fetch_active_thematic_rows: returns active row 10 with source_pg_ids [1, 2, 3, 4]
         {"rowcount": 1, "rows": [
             ("proj", "ops", 10, "old content with 1,2,3,4", [1, 2, 3, 4], []),
         ]},
@@ -393,7 +391,6 @@ async def test_t3_group_drops_below_density_retired_without_successor_and_ledger
             (1, "proj", "fact", None, d, {}),
             (2, "proj", "fact", None, d, {}),
         ]},
-        {"rowcount": 0, "rows": []},
         # No eligible clusters because density_threshold=3 > 2 members
         # Step 5: retire_invalidated_summaries(conn, kinds=("thematic",), skip_ids=())
         # Active row 10 on (proj, sparse) held superseded fact 99; returns retired row 10
@@ -464,9 +461,7 @@ async def test_t4_unchanged_gating_row_with_pg_superseded_fact_logs_warning_and_
             (3, "proj", "fact", None, d, {}),
             (4, "proj", "fact", None, d, {}),
         ]},
-        # 2. dead letter
-        {"rowcount": 0, "rows": []},
-        # 3. Active rows:
+        # 2. Active rows:
         #    - (proj, ops) has id 10 matching content -> unchanged gating key
         #    - (proj, dev) has id 20 differing content -> changed gating key
         {"rowcount": 2, "rows": [
@@ -1052,7 +1047,6 @@ async def test_s4_regate_links_newest_lineage_retired_row(monkeypatch):
     # Subtest 1: Lineage-retired row 40 with superseded_by IS NULL on the key -> found and linked!
     script_1 = [
         {"rowcount": 1, "rows": [(1, "proj", "fact", None, d, {})]},  # _fetch_records
-        {"rowcount": 0, "rows": []},  # dead-letter
         {"rowcount": 0, "rows": []},  # fetch_active_thematic_rows: NO active row!
         {"rowcount": 0, "rows": []},  # census outbox
         {"rowcount": 0, "rows": []},  # step 5 retire_invalidated_summaries

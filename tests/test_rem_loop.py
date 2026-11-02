@@ -57,6 +57,14 @@ def _make_daemon():
     mock_driver = MagicMock()
     mock_driver.session = MagicMock(return_value=_async_ctx(mock_session))
     d.driver = mock_driver
+    d._solo_only = set()
+    d._withheld = set()
+    d._batch_paid = True
+    d._last_llm_failure = None
+    d._last_backlog = None
+    d._batch_action = None
+    d._batch_reason = None
+    d._batch_specimen = ""
     return d, mock_session
 
 
@@ -84,33 +92,30 @@ async def test_fetch_non_rem_batch_orders_pickups_first_then_attempts_then_pg_id
     record-boundary yield always cut at the same place and the tail was
     unreachable. Dead-lettering still keys on rem_ATTEMPTS alone, so a backend
     outage can never retire a healthy record however often it is picked up.
-    Returns the selected LABEL too, for run_cycle's identity check."""
+    Returns the selected LABEL too, for run_cycle's identity check.
+    The failure counter is not selected."""
     daemon, mock_session = _make_daemon()
     mock_result = MagicMock()
     mock_result.data = AsyncMock(return_value=[
-        {"pg_id": 1, "rem_attempts": 0, "rem_passed_over": 0, "labels": [rem_mod.ONT.fact]},
-        {"pg_id": 2, "rem_attempts": 1, "rem_passed_over": 2, "labels": [rem_mod.ONT.decision]}])
+        {"pg_id": 1, "rem_passed_over": 0, "labels": [rem_mod.ONT.fact]},
+        {"pg_id": 2, "rem_passed_over": 2, "labels": [rem_mod.ONT.decision]}])
     mock_session.run = AsyncMock(return_value=mock_result)
 
-    pg_ids, attempts, labels, passed_over = await daemon._fetch_non_rem_batch()
+    with patch.object(rem_mod.llm_backlog, "blocked_keys", return_value=set()):
+        pg_ids, labels, passed_over = await daemon._fetch_non_rem_batch()
 
     assert pg_ids == [1, 2]
-    assert attempts == {1: 0, 2: 1}
     assert passed_over == {1: 0, 2: 2}
     assert labels == {1: rem_mod.ONT.fact, 2: rem_mod.ONT.decision}
+    assert mock_session.run.call_count == 1
     fetch_call = mock_session.run.call_args_list[0]
     cypher = fetch_call.args[0]
-    assert "ORDER BY coalesce(n.rem_pickups, 0) ASC" in cypher
-    assert "coalesce(n.rem_attempts, 0) ASC, n.pg_id ASC" in cypher
-    # the CAP is keyed on attempts alone — pickups must never gate selection
-    assert "coalesce(n.rem_attempts, 0) < $max_attempts" in cypher
-    assert "rem_pickups, 0) < $max_attempts" not in cypher
+    assert "ORDER BY coalesce(n.rem_pickups, 0) ASC, n.pg_id ASC" in cypher
+    assert "rem_attempts" not in cypher
+    assert "NOT n.pg_id IN $blocked" in cypher
+    assert "max_attempts" not in cypher
     assert "coalesce(n.rem_invalid, false) = false" in cypher
     assert "coalesce(n.rem_passed_over, 0) AS rem_passed_over" in cypher
-    assert fetch_call.kwargs["max_attempts"] == rem_mod.REM_MAX_ATTEMPTS
-    # a second query counts the dead-lettered records for the cycle log
-    dead_cypher = mock_session.run.call_args_list[1].args[0]
-    assert ">= $max_attempts" in dead_cypher and "count(n)" in dead_cypher
 
 
 @pytest.mark.asyncio
@@ -513,17 +518,25 @@ def test_parse_jsonl_batch_maps_by_idx_empty_delta_ok():
     assert out[101]["relationships"] == [] and len(out[102]["relationships"]) == 1
 
 
-def test_parse_jsonl_batch_drops_required_summary_missing():
-    """A fact over the threshold (idx in require_summary) whose line carries no
-    summary is dropped → retried solo next cycle; short facts are unaffected."""
+def test_parse_jsonl_batch_keeps_a_non_string_summary_and_drops_an_empty_one():
+    """A non-string summary stays in the map so the caller backlogs that fact.
+
+    An empty string is still missing, and that fact is left for one solo try.
+    """
     rem = load_rem_loop()
     idx_to_pg = {0: 101, 1: 102}
-    raw = (
+    kept = rem.REMDaemon._parse_jsonl_batch(
+        None,
         '{"idx": 0, "relationships": []}\n'
-        '{"idx": 1, "summary": null, "relationships": []}\n'
-    )
-    out = rem.REMDaemon._parse_jsonl_batch(None, raw, idx_to_pg, require_summary={1})
-    assert set(out.keys()) == {101}
+        '{"idx": 1, "summary": null, "relationships": []}\n',
+        idx_to_pg, require_summary={1})
+    assert set(kept.keys()) == {101, 102}
+    dropped = rem.REMDaemon._parse_jsonl_batch(
+        None,
+        '{"idx": 0, "relationships": []}\n'
+        '{"idx": 1, "summary": "", "relationships": []}\n',
+        idx_to_pg, require_summary={1})
+    assert set(dropped.keys()) == {101}
 
 
 def test_parse_jsonl_batch_salvages_and_isolates_failures():
@@ -609,7 +622,7 @@ async def test_llm_process_solo_truncated_fails_unit_no_repair(monkeypatch):
     long = "x" * (rem_mod.REM_SUMMARY_THRESHOLD + 1)
     bounds = []
     async def _fake_post(self, url, **kwargs):
-        bounds.append(kwargs.get("json", {})["max_tokens"])
+        bounds.append(kwargs.get("json", {}))
         # plausibly-complete JSON body — the length-finish must still reject it
         return _length_resp('{"summary":"partial"}')
     monkeypatch.setattr("httpx.AsyncClient.post", _fake_post)
@@ -619,33 +632,29 @@ async def test_llm_process_solo_truncated_fails_unit_no_repair(monkeypatch):
 
     assert result is None
     parse.assert_not_called()
-    import request_sizing
-    first = request_sizing.rem_solo_max_tokens()
-    assert bounds == [first,
-                      request_sizing.rem_retry_bound(first, degenerate=False)]
+    assert len(bounds) == 1
     assert daemon._last_llm_failure == rem_mod.LLM_FAIL_TRUNCATED
+    assert daemon._last_backlog[0] == "cut_off"
 
 
 @pytest.mark.asyncio
-async def test_llm_process_solo_truncation_retry_succeeds_at_wider_bound(monkeypatch):
-    """F4: a record that just needs more room succeeds on the widened retry
-    instead of marching toward a silent dead-letter."""
+async def test_llm_process_solo_cut_off_is_one_try(monkeypatch):
+    """A cut-off does not widen and retry. The partial body is not stored."""
     daemon, _ = _make_daemon()
     monkeypatch.delenv("MOCK_LLM", raising=False)
     long = "x" * (rem_mod.REM_SUMMARY_THRESHOLD + 1)
-    bounds = []
+    calls = []
     async def _fake_post(self, url, **kwargs):
-        bounds.append(kwargs.get("json", {})["max_tokens"])
-        if len(bounds) == 1:
-            return _length_resp('{"summary":"cut"}')
-        return _ok_resp('{"summary":"complete"}')
+        calls.append(kwargs.get("json", {}))
+        return _length_resp('{"summary":"cut"}')
     monkeypatch.setattr("httpx.AsyncClient.post", _fake_post)
 
     result, _model = await daemon._llm_process(long, rem_mod.KIND_FACT, pg_id=1)
 
-    assert result == {"summary": "complete"}
-    assert len(bounds) == 2 and bounds[1] > bounds[0]
-    assert daemon._last_llm_failure is None
+    assert result is None
+    assert len(calls) == 1
+    assert "max_tokens" not in calls[0]
+    assert daemon._last_backlog[0] == "cut_off"
 
 
 @pytest.mark.asyncio
@@ -663,20 +672,17 @@ async def test_solo_transport_failure_does_not_charge_an_attempt(monkeypatch):
     monkeypatch.setattr("httpx.AsyncClient.post", _fake_post)
 
     long = "x" * (rem_mod.REM_SUMMARY_THRESHOLD + 1)
-    with patch.object(daemon, "_bump_rem_attempts", new=AsyncMock()) as bump:
-        ok = await daemon._process_fact(7, long, rem_mod.KIND_FACT,
-                                        None, asyncio.get_running_loop())
+    ok = await daemon._process_fact(7, long, rem_mod.KIND_FACT,
+                                    None, asyncio.get_running_loop())
 
     assert ok is False
-    bump.assert_not_awaited()
     assert daemon._last_llm_failure == rem_mod.LLM_FAIL_TRANSPORT
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("status_code", [400, 404])
 async def test_solo_client_4xx_charges_attempt(monkeypatch, status_code):
-    """ADV-6 Prove-It: deterministic HTTP 400 and 404 must classify as client error
-    and charge rem_attempts."""
+    """A 400 or 404 with no usage queues. No backlog row."""
     daemon, _ = _make_daemon()
     monkeypatch.delenv("MOCK_LLM", raising=False)
 
@@ -692,20 +698,18 @@ async def test_solo_client_4xx_charges_attempt(monkeypatch, status_code):
     monkeypatch.setattr("httpx.AsyncClient.post", _fake_post)
 
     long = "x" * (rem_mod.REM_SUMMARY_THRESHOLD + 1)
-    with patch.object(daemon, "_bump_rem_attempts", new=AsyncMock()) as bump:
-        ok = await daemon._process_fact(7, long, rem_mod.KIND_FACT,
-                                        None, asyncio.get_running_loop())
+    ok = await daemon._process_fact(7, long, rem_mod.KIND_FACT,
+                                    None, asyncio.get_running_loop())
 
     assert ok is False
-    bump.assert_awaited_once_with([7])
-    assert daemon._last_llm_failure == rem_mod.LLM_FAIL_CLIENT
+    assert daemon._last_backlog is None
+    assert daemon._last_llm_failure == rem_mod.LLM_FAIL_TRANSPORT
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("status_code", [401, 403, 408, 429])
+@pytest.mark.parametrize("status_code", [401, 403, 429])
 async def test_solo_transport_4xx_does_not_charge_attempt(monkeypatch, status_code):
-    """ADV-6: HTTP 401, 403, 408, 429 are credential/capacity/timeout, not record defects;
-    they must NOT charge rem_attempts."""
+    """401, 403 and 429 stay queued. They are not a backlog row."""
     daemon, _ = _make_daemon()
     monkeypatch.delenv("MOCK_LLM", raising=False)
 
@@ -721,26 +725,25 @@ async def test_solo_transport_4xx_does_not_charge_attempt(monkeypatch, status_co
     monkeypatch.setattr("httpx.AsyncClient.post", _fake_post)
 
     long = "x" * (rem_mod.REM_SUMMARY_THRESHOLD + 1)
-    with patch.object(daemon, "_bump_rem_attempts", new=AsyncMock()) as bump:
-        ok = await daemon._process_fact(7, long, rem_mod.KIND_FACT,
-                                        None, asyncio.get_running_loop())
+    ok = await daemon._process_fact(7, long, rem_mod.KIND_FACT,
+                                    None, asyncio.get_running_loop())
 
     assert ok is False
-    bump.assert_not_awaited()
     assert daemon._last_llm_failure == rem_mod.LLM_FAIL_TRANSPORT
+    assert daemon._last_backlog is None
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("status_code,expected_failure", [
-    (400, "client"),
-    (404, "client"),
+    (400, rem_mod.LLM_FAIL_TRANSPORT),
+    (404, rem_mod.LLM_FAIL_TRANSPORT),
+    (408, rem_mod.LLM_FAIL_TRANSPORT),
     (401, rem_mod.LLM_FAIL_TRANSPORT),
     (403, rem_mod.LLM_FAIL_TRANSPORT),
-    (408, rem_mod.LLM_FAIL_TRANSPORT),
     (429, rem_mod.LLM_FAIL_TRANSPORT),
 ])
 async def test_batch_failure_classification(monkeypatch, status_code, expected_failure):
-    """fact:2435: batch call status classification sets _last_llm_failure appropriately."""
+    """A batch status with no usage queues. It does not write a row."""
     daemon, _ = _make_daemon()
     monkeypatch.delenv("MOCK_LLM", raising=False)
 
@@ -758,9 +761,9 @@ async def test_batch_failure_classification(monkeypatch, status_code, expected_f
     long = "x" * (rem_mod.REM_SUMMARY_THRESHOLD + 1)
     items = [{"pg_id": 1, "content": long}]
     results, timing, _model = await daemon._llm_process_batch(items)
-    assert results is None
-    expected = getattr(rem_mod, "LLM_FAIL_CLIENT", "client") if expected_failure == "client" else expected_failure
-    assert daemon._last_llm_failure == expected
+    assert results == {}
+    assert daemon._batch_action == "queue"
+    assert daemon._last_llm_failure == expected_failure
 
 
 @pytest.mark.asyncio
@@ -782,18 +785,16 @@ async def test_batch_transport_failure_charges_no_record(monkeypatch):
     items = [{"pg_id": i, "content": long} for i in (1, 2, 3)]
     results, timing, _model = await daemon._llm_process_batch(items)
 
-    assert results is None, "a failed CALL must be distinguishable from empty results"
+    assert results == {}
+    assert daemon._batch_action == "queue"
     assert timing is None
     assert daemon._last_llm_failure == rem_mod.LLM_FAIL_TRANSPORT
 
 
 @pytest.mark.asyncio
-async def test_llm_process_batch_max_tokens_scales_per_fact_and_summary(monkeypatch):
-    """Batch bound = (REM_MAX_TOKENS_PER_FACT + REM_MAX_TOKENS_PER_SUMMARY) × the
-    facts actually SENT — a fact under the threshold is asked for nothing and
-    never sent, so it buys no budget."""
+async def test_llm_process_batch_sends_no_max_tokens(monkeypatch):
+    """The daemon sends no max_tokens. A fact under the threshold is not sent."""
     from rem_loop import REM_SUMMARY_THRESHOLD
-    import request_sizing
     daemon, _ = _make_daemon()
     monkeypatch.delenv("MOCK_LLM", raising=False)
     items = [{"pg_id": 1, "content": "short"},
@@ -810,22 +811,21 @@ async def test_llm_process_batch_max_tokens_scales_per_fact_and_summary(monkeypa
         return _Resp()
     monkeypatch.setattr("httpx.AsyncClient.post", _fake_post)
 
-    await daemon._llm_process_batch(items)
-    assert captured["max_tokens"] == request_sizing.rem_batch_max_tokens(1)
+    out, _timing, _model = await daemon._llm_process_batch(items)
+    assert "max_tokens" not in captured
+    assert 1 in out and out[1] == {}
 
 
-def test_parse_jsonl_batch_truncated_drops_final_line_and_is_strict_only():
-    """truncated=True drops the final (under-the-knife) line AND parses the rest
-    strictly — json_repair NEVER runs, so a repairable-only line is skipped."""
+def test_parse_jsonl_batch_skips_an_incomplete_line():
+    """A cut-off body never reaches this parser. An incomplete line is not a result."""
     daemon, _ = _make_daemon()
     idx_to_pg = {0: 10, 1: 11, 2: 12}
-    raw = ('{"idx":0,"relationships":[]}\n'
-           '{"idx":1,"relationships":[],}\n'     # trailing comma: invalid strict, repairable
-           '{"idx":2,"relationships":[')          # incomplete final line
-    out = daemon._parse_jsonl_batch(raw, idx_to_pg, truncated=True)
-    assert 10 in out          # strict-valid line kept
-    assert 11 not in out      # repairable-only line NOT salvaged under truncation
-    assert 12 not in out      # final line dropped unconditionally
+    raw = ('{"idx":0,"summary":"s","relationships":[]}\n'
+           '{"idx":1,"summary":"t","relationships":[],}\n'
+           '{"idx":2,"relationships":[')
+    out = daemon._parse_jsonl_batch(raw, idx_to_pg, {0, 1, 2})
+    assert 10 in out
+    assert 12 not in out
 
 
 def test_parse_jsonl_batch_untruncated_repairs_lines():
@@ -834,7 +834,7 @@ def test_parse_jsonl_batch_untruncated_repairs_lines():
     idx_to_pg = {0: 10, 1: 11}
     raw = ('{"idx":0,"relationships":[]}\n'
            '{"idx":1,"relationships":[],}')      # trailing comma → repaired
-    out = daemon._parse_jsonl_batch(raw, idx_to_pg, truncated=False)
+    out = daemon._parse_jsonl_batch(raw, idx_to_pg)
     assert 10 in out and 11 in out
 
 
@@ -851,7 +851,7 @@ async def test_revert_rem_mark_unstrands_row_and_counts_attempt():
     query = session.run.call_args.args[0]
     assert f"(n:{ONT.fact}" in query
     assert "rem_processed = false" in query
-    assert "rem_attempts = coalesce(n.rem_attempts, 0) + 1" in query
+    assert "rem_attempts" not in query
     assert session.run.call_args.kwargs["pg_id"] == 42
 
 
@@ -945,7 +945,7 @@ def _cycle_daemon(monkeypatch, pg_ids, kinds, *, queuing=None, attempts=None,
         labels = {p: _k2l[kinds[p]] for p in pg_ids}
 
     daemon._fetch_non_rem_batch = AsyncMock(
-        return_value=(list(pg_ids), attempts, labels, passed_over))
+        return_value=(list(pg_ids), labels, passed_over))
     daemon._bump_rem_pickups = AsyncMock()
     daemon._bump_rem_passed_over = AsyncMock()
     daemon._mark_node_invalid = AsyncMock()
@@ -1201,7 +1201,7 @@ async def test_run_cycle_batch_client_400_charges_batch_members(monkeypatch):
     processed, attempted = await daemon.run_cycle()
 
     assert processed == 0 and attempted == 3
-    daemon._bump_rem_attempts.assert_awaited_once_with(ids)
+    daemon._bump_rem_attempts.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -1224,8 +1224,7 @@ async def test_run_cycle_batch_429_and_503_do_not_charge_batch_members(monkeypat
 
 @pytest.mark.asyncio
 async def test_run_cycle_batch_http_400_end_to_end_charges_attempts(monkeypatch):
-    """ADV-2 Prove-It: live _llm_process_batch returning HTTP 400 sets LLM_FAIL_CLIENT
-    and run_cycle charges rem_attempts."""
+    """A batch HTTP 400 with no usage queues every member. No row is written."""
     ids = [31, 32]
     kinds = {i: rem_mod.KIND_FACT for i in ids}
     content_map = {
@@ -1248,23 +1247,29 @@ async def test_run_cycle_batch_http_400_end_to_end_charges_attempts(monkeypatch)
     processed, attempted = await daemon.run_cycle()
 
     assert processed == 0 and attempted == 2
-    daemon._bump_rem_attempts.assert_awaited_once_with(ids)
+    daemon._bump_rem_attempts.assert_not_awaited()
+    assert daemon._batch_action == "queue"
 
 
 @pytest.mark.asyncio
-async def test_run_cycle_batch_missing_line_charges_only_that_record(monkeypatch):
-    """The complement: when the call SUCCEEDS, a record whose line is missing
-    is chargeable — that is real evidence about that record."""
+async def test_run_cycle_batch_missing_line_gets_one_solo_try(monkeypatch):
+    """A fact missing from a complete batch reply gets one solo try. No attempt is stored."""
     ids = [21, 22]
     kinds = {i: rem_mod.KIND_FACT for i in ids}
-    daemon = _cycle_daemon(monkeypatch, ids, kinds)
+    long = "x" * (rem_mod.REM_SUMMARY_THRESHOLD + 1)
+    content_map = {p: {"content": long, "kind": kinds[p], "created_at": None} for p in ids}
+    daemon = _cycle_daemon(monkeypatch, ids, kinds, content_map=content_map)
     daemon._llm_process_batch = AsyncMock(
-        return_value=({21: {"relationships": []}}, None, "m"))
+        return_value=({21: {"summary": "s"}}, None, "m"))
+    daemon._batch_action = None
     daemon._apply_fact_result = AsyncMock(return_value=True)
+    daemon._process_fact = AsyncMock(return_value=False)
 
     await daemon.run_cycle()
 
-    daemon._bump_rem_attempts.assert_awaited_once_with([22])
+    daemon._process_fact.assert_awaited_once()
+    assert daemon._process_fact.await_args.args[0] == 22
+    daemon._bump_rem_attempts.assert_not_awaited()
 
 
 # ── Finding R1 (fact:2443): malformed-200 envelope handling ──────────────────
@@ -1295,7 +1300,7 @@ async def test_llm_process_solo_envelope_content_null(monkeypatch):
     long = "x" * (rem_mod.REM_SUMMARY_THRESHOLD + 1)
     result, model = await daemon._llm_process(long, rem_mod.KIND_FACT, pg_id=1)
     assert result is None
-    assert daemon._last_llm_failure == rem_mod.LLM_FAIL_TRANSPORT
+    assert daemon._last_llm_failure == rem_mod.LLM_FAIL_PARSE
 
 
 @pytest.mark.asyncio
@@ -1312,7 +1317,7 @@ async def test_llm_process_solo_envelope_choices_null(monkeypatch):
     long = "x" * (rem_mod.REM_SUMMARY_THRESHOLD + 1)
     result, model = await daemon._llm_process(long, rem_mod.KIND_FACT, pg_id=1)
     assert result is None
-    assert daemon._last_llm_failure == rem_mod.LLM_FAIL_TRANSPORT
+    assert daemon._last_llm_failure == rem_mod.LLM_FAIL_PARSE
 
 
 @pytest.mark.asyncio
@@ -1329,7 +1334,7 @@ async def test_llm_process_solo_envelope_message_null(monkeypatch):
     long = "x" * (rem_mod.REM_SUMMARY_THRESHOLD + 1)
     result, model = await daemon._llm_process(long, rem_mod.KIND_FACT, pg_id=1)
     assert result is None
-    assert daemon._last_llm_failure == rem_mod.LLM_FAIL_TRANSPORT
+    assert daemon._last_llm_failure == rem_mod.LLM_FAIL_PARSE
 
 
 @pytest.mark.asyncio
@@ -1346,7 +1351,7 @@ async def test_llm_process_solo_envelope_list_content(monkeypatch):
     long = "x" * (rem_mod.REM_SUMMARY_THRESHOLD + 1)
     result, model = await daemon._llm_process(long, rem_mod.KIND_FACT, pg_id=1)
     assert result is None
-    assert daemon._last_llm_failure == rem_mod.LLM_FAIL_TRANSPORT
+    assert daemon._last_llm_failure == rem_mod.LLM_FAIL_PARSE
 
 
 @pytest.mark.asyncio
@@ -1363,9 +1368,9 @@ async def test_llm_process_batch_envelope_content_null(monkeypatch):
     long = "x" * (rem_mod.REM_SUMMARY_THRESHOLD + 1)
     items = [{"pg_id": 1, "content": long}]
     results, timing, model = await daemon._llm_process_batch(items)
-    assert results is None
-    assert timing is None
-    assert daemon._last_llm_failure == rem_mod.LLM_FAIL_TRANSPORT
+    assert results == {}
+    assert daemon._batch_action == "backlog"
+    assert daemon._last_llm_failure == rem_mod.LLM_FAIL_PARSE
 
 
 @pytest.mark.asyncio
@@ -1383,9 +1388,9 @@ async def test_llm_process_batch_envelope_choices_null(monkeypatch):
     long = "x" * (rem_mod.REM_SUMMARY_THRESHOLD + 1)
     items = [{"pg_id": 1, "content": long}]
     results, timing, model = await daemon._llm_process_batch(items)
-    assert results is None
-    assert timing is None
-    assert daemon._last_llm_failure == rem_mod.LLM_FAIL_TRANSPORT
+    assert results == {}
+    assert daemon._batch_action == "backlog"
+    assert daemon._last_llm_failure == rem_mod.LLM_FAIL_PARSE
 
 
 @pytest.mark.asyncio
@@ -1403,9 +1408,9 @@ async def test_llm_process_batch_envelope_message_null(monkeypatch):
     long = "x" * (rem_mod.REM_SUMMARY_THRESHOLD + 1)
     items = [{"pg_id": 1, "content": long}]
     results, timing, model = await daemon._llm_process_batch(items)
-    assert results is None
-    assert timing is None
-    assert daemon._last_llm_failure == rem_mod.LLM_FAIL_TRANSPORT
+    assert results == {}
+    assert daemon._batch_action == "backlog"
+    assert daemon._last_llm_failure == rem_mod.LLM_FAIL_PARSE
 
 
 @pytest.mark.asyncio
@@ -1422,9 +1427,52 @@ async def test_llm_process_batch_envelope_list_content(monkeypatch):
     long = "x" * (rem_mod.REM_SUMMARY_THRESHOLD + 1)
     items = [{"pg_id": 1, "content": long}]
     results, timing, model = await daemon._llm_process_batch(items)
-    assert results is None
-    assert timing is None
-    assert daemon._last_llm_failure == rem_mod.LLM_FAIL_TRANSPORT
+    assert results == {}
+    assert daemon._batch_action == "backlog"
+    assert daemon._last_llm_failure == rem_mod.LLM_FAIL_PARSE
+
+
+@pytest.mark.asyncio
+async def test_cut_off_batch_stays_solo_across_cycles_when_solos_queue(monkeypatch):
+    """A paid batch that does not finish is solo-only in this process.
+
+    Three cycles with solo 503s: one batch call, then solos only.
+    """
+    ids = [1, 2]
+    kinds = {i: rem_mod.KIND_FACT for i in ids}
+    long = "y" * (rem_mod.REM_SUMMARY_THRESHOLD + 5)
+    content_map = {
+        i: {"content": long, "kind": kinds[i], "created_at": None} for i in ids
+    }
+    daemon = _cycle_daemon(monkeypatch, ids, kinds, content_map=content_map)
+    calls = []
+
+    async def _post(self, url, **kwargs):
+        user = kwargs["json"]["messages"][-1]["content"]
+        kind = "batch" if "JSONL" in user else "solo"
+        calls.append(kind)
+
+        class R:
+            status_code = 200 if kind == "batch" else 503
+            headers = {}
+            text = "busy"
+
+            def json(_self):
+                return {"choices": [{
+                    "finish_reason": "length",
+                    "message": {"content": "cut off here"},
+                }]}
+
+        return R()
+
+    monkeypatch.setattr("httpx.AsyncClient.post", _post)
+    monkeypatch.delenv("MOCK_LLM", raising=False)
+    for _ in range(3):
+        await daemon.run_cycle()
+    assert calls.count("batch") == 1
+    assert calls[0] == "batch"
+    assert calls.count("solo") == 6
+    assert "batch" not in calls[1:]
 
 
 @pytest.mark.asyncio

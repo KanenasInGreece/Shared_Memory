@@ -153,17 +153,15 @@ _CURRENT_CONTENT = (
 
 def _script(active_rows):
     """Cursor script for one _consolidate_clusters pass: record_map fetch,
-    dead-letter counts, then fetch_active_thematic_rows returning
-    `active_rows`; everything after that (census short-circuits when all
-    clusters skip; drop_out_of_scan and the fold writes take stub defaults
-    or explicit entries appended by the caller)."""
+    then fetch_active_thematic_rows returning `active_rows`. A thematic fold
+    has no backlog row, so there is no dead-letter query. Later steps are
+    appended by the caller."""
     d = datetime.date(2026, 7, 11)
     return [
         {"rowcount": 2, "rows": [
             (1, "general", "fact", "tests/test_x.py", d, {"entities": ["Widget"]}),
             (2, "general", "fact", None, d, {}),
         ]},
-        {"rowcount": 0, "rows": []},                       # dead-letter counts
         {"rowcount": len(active_rows), "rows": active_rows},  # active thematic rows
     ]
 

@@ -90,7 +90,6 @@ def test_ruled_check_verbatim_fleet_wide_ineligibility_reads_degraded(monkeypatc
     monkeypatch.delenv("LLM_BACKENDS_JSON", raising=False)
     monkeypatch.setenv("LLM_BACKENDS_JSON", "[{\"url\": \"http://a:5000\", \"n_ctx\": 8192, \"max_output_tokens\": 2048}]")
     g = _fresh(monkeypatch)
-    monkeypatch.setattr(g, "_eligible_backends", lambda *a, **kw: [])
     dep = g._llm_pool_dependency({"http://a:5000": "ok"})
     assert dep == {"state": "ok", "reason": None}
 
@@ -213,21 +212,22 @@ def test_connect_failure_and_timeout_replace_a_green_last_call(monkeypatch):
             raise self._exc
 
     proxy = g.AsyncHiveMindProxy()
-    proxy.session = _Session(ClientConnectionError("refused"))
-    asyncio.run(proxy._forward_upstream(_Req(), target_base=backend, llm_backend=backend, llm_body=b"{}"))
+    proxy.llm_session = _Session(ClientConnectionError("refused"))
+    asyncio.run(proxy._one_llm_try(_Req(), backend, {}, 1.0))
     assert g._llm_last_call[backend]["status"] == 503
     assert g._llm_last_call[backend]["origin"] == "gateway"
     assert g._llm_last_call[backend]["ts"] != "old"
 
+    from aiohttp import ConnectionTimeoutError
     g._llm_last_call[backend] = {"ts": "old", "status": 200}
-    proxy.session = _Session(asyncio.TimeoutError())
-    asyncio.run(proxy._forward_upstream(_Req(), target_base=backend, llm_backend=backend, llm_body=b"{}"))
+    proxy.llm_session = _Session(ConnectionTimeoutError())
+    asyncio.run(proxy._one_llm_try(_Req(), backend, {}, 1.0))
     assert g._llm_last_call[backend]["status"] == 504
     assert g._llm_last_call[backend]["origin"] == "gateway"
 
     g._llm_last_call[backend] = {"ts": "old", "status": 200, "origin": "upstream"}
-    proxy.session = _Session(RuntimeError("boom"))
-    asyncio.run(proxy._forward_upstream(_Req(), target_base=backend, llm_backend=backend, llm_body=b"{}"))
+    proxy.llm_session = _Session(RuntimeError("boom"))
+    asyncio.run(proxy._one_llm_try(_Req(), backend, {}, 1.0))
     assert g._llm_last_call[backend]["status"] == 500
     assert g._llm_last_call[backend]["origin"] == "gateway"
     assert g._llm_last_call[backend]["ts"] != "old"
@@ -255,11 +255,8 @@ def test_upstream_drop_mid_stream_replaces_the_green_last_call(monkeypatch):
     monkeypatch.setattr(web.StreamResponse, "write", fake_write)
 
     class _Content:
-        def iter_any(self):
-            async def _gen():
-                raise ServerDisconnectedError()
-                yield b""  # pragma: no cover
-            return _gen()
+        async def read(self, n=-1):
+            raise ServerDisconnectedError()
 
     class _Up:
         status = 200
@@ -284,10 +281,9 @@ def test_upstream_drop_mid_stream_replaces_the_green_last_call(monkeypatch):
         rel_url = URL("/v1/chat/completions")
 
     proxy = g.AsyncHiveMindProxy()
-    proxy.session = _Sess()
-    asyncio.run(proxy._forward_upstream(
-        _Req(), target_base=backend, llm_backend=backend, llm_body=b"{}"))
-    assert g._llm_last_call[backend]["status"] == 500
+    proxy.llm_session = _Sess()
+    asyncio.run(proxy._one_llm_try(_Req(), backend, {}, 1.0))
+    assert g._llm_last_call[backend]["status"] == 503
     assert g._llm_last_call[backend]["origin"] == "gateway"
 
 
@@ -384,7 +380,6 @@ def test_coexisting_degraded_reasons_compose_never_drop_a_fact(monkeypatch):
     monkeypatch.delenv("LLM_BACKENDS_JSON", raising=False)
     monkeypatch.setenv("LLM_BACKENDS_JSON", "[{\"url\": \"http://a:5000\", \"n_ctx\": 8192, \"max_output_tokens\": 2048}, {\"url\": \"http://b:5000\", \"n_ctx\": 8192, \"max_output_tokens\": 2048}]")
     g = _fresh(monkeypatch)
-    monkeypatch.setattr(g, "_eligible_backends", lambda *a, **kw: [])
     dep = g._llm_pool_dependency({"http://a:5000": "ok", "http://b:5000": "down"})
     assert dep == {"state": "degraded", "reason": "1/2 backend(s) down"}
 
@@ -468,3 +463,99 @@ def test_down_still_wins_over_the_slots_config_verdict(monkeypatch):
     g = _partial_role_fleet(monkeypatch)
     assert g._rem_dependency(False, None)["state"] == "down"
     assert g._nrem_dependency(False, None, 5)["state"] == "down"
+
+
+def test_unreadable_llm_backlog_is_the_rem_health_reason(monkeypatch):
+    """A missing table stops the count from reading 0 and names the reason."""
+    monkeypatch.delenv("LLM_BACKENDS_JSON", raising=False)
+    g = _fresh(monkeypatch)
+    g._LLM_BACKLOG_UNREADABLE = True
+    g._rem_healthy = False
+
+    class _S:
+        def get(self, *a, **k):
+            raise RuntimeError("no encoder")
+
+    proxy = g.AsyncHiveMindProxy()
+    proxy.session = _S()
+    checks = asyncio.run(g._build_health_checks(proxy, None))
+    rem = checks["dependencies"]["rem_daemon"]
+    assert rem["state"] == "down"
+    assert rem["reason"] == "llm_backlog unreadable"
+    assert not any(w.get("key") == "rem_dead_lettered" for w in checks["warnings"])
+
+    import coordinator
+
+    async def _boom(self):
+        raise RuntimeError("down")
+
+    monkeypatch.setattr(coordinator.MemoryCoordinator, "_rem_backlog_pg_ids", _boom)
+    coord = coordinator.MemoryCoordinator.__new__(coordinator.MemoryCoordinator)
+    counted = asyncio.run(coord._rem_dead_letter_count())
+    assert counted == {"unreadable": True}
+    assert counted.get("dead_lettered") != 0
+
+
+def test_unreadable_backlog_does_not_spawn_the_rem_daemon(monkeypatch):
+    """Removing the probe before spawn lets the daemon start. This must die."""
+    g = _fresh(monkeypatch)
+    started = []
+
+    async def _start():
+        started.append(1)
+        return None
+
+    monkeypatch.setattr(g, "_start_rem_daemon", _start)
+
+    async def _probe():
+        g._LLM_BACKLOG_UNREADABLE = True
+        return False
+
+    monkeypatch.setattr(g, "_probe_llm_backlog", _probe)
+    stop = asyncio.Event()
+
+    async def _run():
+        task = asyncio.create_task(g._watchdog_rem_daemon(stop))
+        await asyncio.sleep(0.05)
+        stop.set()
+        await asyncio.wait_for(task, timeout=2)
+
+    asyncio.run(_run())
+    assert started == []
+
+
+def test_probe_llm_backlog_is_false_when_the_read_fails(monkeypatch):
+    """An always-true probe would spawn the daemon against a dark table."""
+    g = _fresh(monkeypatch)
+
+    async def _boom():
+        raise RuntimeError("no table")
+
+    monkeypatch.setattr(g._backlog_coordinator, "_rem_backlog_pg_ids", _boom)
+    assert asyncio.run(g._probe_llm_backlog()) is False
+    assert g._LLM_BACKLOG_UNREADABLE is True
+
+
+def test_probe_llm_backlog_does_not_block_the_loop(monkeypatch):
+    """The backlog read is awaited on the coordinator pool. A slow fetch must yield the loop."""
+    import time
+
+    g = _fresh(monkeypatch)
+
+    async def _slow():
+        await asyncio.sleep(0.3)
+        return []
+
+    monkeypatch.setattr(g._backlog_coordinator, "_rem_backlog_pg_ids", _slow)
+
+    async def _main():
+        started = time.monotonic()
+        task = asyncio.create_task(g._probe_llm_backlog())
+        await asyncio.sleep(0)
+        elapsed = time.monotonic() - started
+        ok = await task
+        return elapsed, ok
+
+    elapsed, ok = asyncio.run(_main())
+    assert ok is True
+    assert elapsed < 0.2

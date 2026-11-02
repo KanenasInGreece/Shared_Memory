@@ -44,16 +44,26 @@ def test_declared_max_inflight_is_reported_verbatim(monkeypatch):
 # NAMED FAILURE: a 400 or a 401 cools a backend down. Those are verdicts on the
 # request, not the backend, and they do not heal on a timer, so a cooldown would
 # hide the cause and cost availability for nothing.
-# MUTATION: `status == 429 or status >= 500` -> `status >= 400` must break this.
+# MUTATION: treating status >= 500 like a 429 must break the 5xx test.
+# Only a 429 calls _llm_mark_fail. Every 5xx stays put and does not cool.
 
-@pytest.mark.parametrize("status", [429, 500, 502, 503, 504])
-def test_backend_faulting_statuses_count_toward_the_cooldown(status):
-    assert P._http_status_faults_backend(status) is True
+def _interpret(backend, status):
+    _reset(backend)
+    P.AsyncHiveMindProxy()._interpret_llm_reply(backend, status, b"{}")
 
 
-@pytest.mark.parametrize("status", [200, 201, 400, 401, 403, 404, 409, 422])
-def test_request_level_statuses_never_cool_a_backend_down(status):
-    assert P._http_status_faults_backend(status) is False
+def test_a_429_counts_toward_the_cooldown():
+    b = "http://local:5000"
+    _interpret(b, 429)
+    assert P._llm_fail_times.get(b)
+
+
+@pytest.mark.parametrize("status", [500, 501, 502, 503, 504, 520, 524, 400, 401, 403, 404, 409, 422])
+def test_request_level_and_5xx_statuses_never_cool_a_backend_down(status):
+    b = "http://local:5000"
+    _interpret(b, status)
+    assert P._llm_fail_times.get(b, []) == []
+    assert P._llm_unhealthy_until.get(b, 0.0) == 0.0
 
 
 # ── F2 shape: consecutive failures, not a rate ───────────────────────────────
@@ -150,7 +160,10 @@ def test_a_served_probe_is_healthy(status):
 
 def test_a_backend_that_404s_everything_cannot_become_a_silent_blackhole():
     reads_healthy = P._classify_probe_status(404) == "ok"
-    cools_down = P._http_status_faults_backend(404)
+    b = "http://blackhole:9"
+    _reset(b)
+    P.AsyncHiveMindProxy()._interpret_llm_reply(b, 404, b"{}")
+    cools_down = P._llm_unhealthy_until.get(b, 0.0) > 0.0
     assert not (reads_healthy and not cools_down), (
         "a backend 404ing every call would read healthy AND never cool down")
 

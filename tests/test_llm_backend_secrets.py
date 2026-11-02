@@ -72,6 +72,7 @@ def test_client_authorization_never_forwarded_to_llm_backend(monkeypatch):
     proxy = g.AsyncHiveMindProxy()
     session = _HeaderCaptureSession()
     proxy.session = session
+    proxy.llm_session = proxy.session
     asyncio.run(proxy.handle_proxy(_Req()))
 
     assert session.captured_headers is not None
@@ -97,6 +98,7 @@ def test_backend_token_env_injected_as_authorization(monkeypatch):
     proxy = g.AsyncHiveMindProxy()
     session = _HeaderCaptureSession()
     proxy.session = session
+    proxy.llm_session = proxy.session
     asyncio.run(proxy.handle_proxy(_Req(model="deepseek-chat")))
 
     assert session.captured_headers["Authorization"] == "Bearer sk-test-123"
@@ -165,6 +167,7 @@ def test_backend_model_override_rewrites_request_body(monkeypatch):
     proxy = g.AsyncHiveMindProxy()
     session = _HeaderCaptureSession()
     proxy.session = session
+    proxy.llm_session = proxy.session
     asyncio.run(proxy.handle_proxy(_Req()))
 
     body = json.loads(session.captured_data)
@@ -242,7 +245,7 @@ def test_all_json_backends_excluded_leaves_an_empty_pool_and_health_says_so(monk
     importlib.reload(g)
 
     assert g.LLM_BACKENDS == []
-    assert g._select_llm_backend(None) is None
+    assert g._order_backends(0.0, None) == []
     assert not hasattr(g, "LLM_POOL_FALLBACK_REASON")
     dep = g._llm_pool_dependency({})
     assert dep["state"] == "degraded"
@@ -350,6 +353,7 @@ def test_health_config_hides_credential_fields_from_unauthenticated_caller(monke
 
     proxy = g.AsyncHiveMindProxy()
     proxy.session = _HealthProbeSession()
+    proxy.llm_session = proxy.session
     req = _health_request({})                  # no Authorization header
     req.app = {"proxy": proxy}
 
@@ -377,6 +381,7 @@ def test_health_config_shows_bool_and_model_for_authenticated_caller_never_the_t
     try:
         proxy = g.AsyncHiveMindProxy()
         proxy.session = _HealthProbeSession()
+        proxy.llm_session = proxy.session
         req = _health_request({"Authorization": "Bearer tok_valid_test"})
         req.app = {"proxy": proxy}
 
@@ -436,8 +441,9 @@ def test_token_never_leaks_into_client_visible_error_response(monkeypatch):
     ):
         proxy = g.AsyncHiveMindProxy()
         proxy.session = _FailSession(exc)
+        proxy.llm_session = proxy.session
         resp = asyncio.run(proxy.handle_proxy(_Req(model="deepseek-chat")))
-        assert resp.status in (503, 504, 500)
+        assert resp.status in (503, 504, 500, 422)
         assert "sk-must-never-appear-to-any-client" not in resp.body.decode()
         assert all("sk-must-never-appear-to-any-client" not in str(v)
                    for v in resp.headers.values())
@@ -476,6 +482,7 @@ def test_embedder_target_never_gets_authorization_either(monkeypatch):
     proxy = g.AsyncHiveMindProxy()
     session = _HeaderCaptureSession()
     proxy.session = session
+    proxy.llm_session = proxy.session
     asyncio.run(proxy.handle_encoder(_EmbedReq()))
 
     assert "Authorization" not in (session.captured_headers or {})

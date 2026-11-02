@@ -54,43 +54,59 @@ def _fresh():
     return g
 
 
+def _arm(g, url, extra, model=None):
+    g.LLM_BACKEND_EXTRAS[url] = extra
+    g.LLM_BACKEND_MODELS[url] = model
+    g.LLM_BACKEND_NCTX[url] = 8192
+    g.LLM_BACKEND_MAX_OUTPUT[url] = 2048
+
+
 def test_extra_body_keys_are_merged_and_override_the_caller(monkeypatch):
     g = _fresh()
-    out = json.loads(g._apply_backend_body_overrides(
-        b'{"messages":[],"temperature":0.6}', None,
-        {"thinking": {"type": "disabled"}, "temperature": 0.1}))
+    url = "http://a:5000"
+    _arm(g, url, {"thinking": {"type": "disabled"}, "temperature": 0.1})
+    out = g._llm_payload({"messages": [], "temperature": 0.6}, url, 1.0)
     assert out["thinking"] == {"type": "disabled"}
-    assert out["temperature"] == 0.1          # backend config wins
-    assert out["messages"] == []              # caller fields survive
+    assert out["temperature"] == 0.1
+    assert out["messages"] == []
+    assert isinstance(out["max_tokens"], int)
 
 
 def test_model_override_beats_a_model_left_in_extra_body(monkeypatch):
     g = _fresh()
-    out = json.loads(g._apply_backend_body_overrides(
-        b'{"messages":[],"model":"local-model"}', "real-model-id",
-        {"model": "stale-model-id"}))
+    url = "http://a:5000"
+    _arm(g, url, {"model": "stale-model-id"}, model="real-model-id")
+    out = g._llm_payload({"messages": [], "model": "local-model"}, url, 1.0)
     assert out["model"] == "real-model-id"
 
 
 def test_model_rewrite_contract_unchanged_when_caller_sent_no_model(monkeypatch):
-    """The long-standing model override only rewrites a model field the caller
-    sent — extra_body must not change that contract by smuggling one in."""
+    """The model override only rewrites a model field the caller sent."""
     g = _fresh()
-    out = json.loads(g._apply_backend_body_overrides(
-        b'{"messages":[]}', "real-model-id", {"thinking": {"type": "disabled"}}))
+    url = "http://a:5000"
+    _arm(g, url, {"thinking": {"type": "disabled"}}, model="real-model-id")
+    out = g._llm_payload({"messages": []}, url, 1.0)
     assert "model" not in out
 
 
-def test_unparseable_body_is_forwarded_unchanged(monkeypatch):
+def test_non_dict_body_still_gets_the_spend_cap(monkeypatch):
     g = _fresh()
-    raw = b"\xff\xfenot json"
-    assert g._apply_backend_body_overrides(raw, "m", {"k": 1}) == raw
+    url = "http://a:5000"
+    _arm(g, url, {"k": 1})
+    out = g._llm_payload(None, url, 1.0)
+    assert out["k"] == 1
+    assert out["stream"] is False
+    assert isinstance(out["max_tokens"], int)
 
 
-def test_no_overrides_means_the_body_is_untouched_bytes(monkeypatch):
+def test_no_overrides_still_writes_max_tokens_last(monkeypatch):
     g = _fresh()
-    raw = b'{"messages":[],  "spacing": "preserved"}'
-    assert g._apply_backend_body_overrides(raw, None, None) is raw
+    url = "http://a:5000"
+    _arm(g, url, None)
+    out = g._llm_payload({"messages": [], "spacing": "preserved"}, url, 1.0)
+    assert out["spacing"] == "preserved"
+    assert out["stream"] is False
+    assert isinstance(out["max_tokens"], int)
 
 
 # ── config parsing ──────────────────────────────────────────────────────────
@@ -140,6 +156,7 @@ def test_routed_payload_carries_the_backend_overrides(monkeypatch):
     proxy = g.AsyncHiveMindProxy()
     session = _CaptureSession()
     proxy.session = session
+    proxy.llm_session = proxy.session
     asyncio.run(proxy.handle_proxy(_Req()))
 
     body = json.loads(session.captured_data)

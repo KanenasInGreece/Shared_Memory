@@ -16,7 +16,9 @@ from pathlib import Path
 from aiohttp import web, ClientSession, ClientTimeout, TCPConnector
 from aiohttp.client_exceptions import (
     ClientConnectionResetError,
+    ClientConnectorError,
     ClientError,
+    ConnectionTimeoutError,
     ServerDisconnectedError,
 )
 from multidict import CIMultiDict
@@ -74,7 +76,8 @@ from coordinator import (
     record_llm_gateway_fault,
     record_llm_upstream_fault,
     record_llm_client_disconnect,
-    _parse_upstream_error_type,
+    _raw_upstream_error_label,
+    _ERROR_TYPE_LABEL_CAP,
     _decompress_prefix_for_parse,
     _decompress_full_for_usage,
     _ERROR_BODY_PARSE_CAP,
@@ -268,49 +271,25 @@ LLM_BACKEND_PRICE_OUT: dict[str, "float | None"]
  LLM_BACKEND_MAX_INFLIGHT, LLM_BACKEND_PRICE_IN, LLM_BACKEND_PRICE_OUT,
  LLM_BACKENDS_EXCLUDED, LLM_DECLARATION_ERRORS) = _load_llm_backends()
 
-def _apply_backend_body_overrides(body: bytes, model: "str | None",
-                                  extra: "dict | None",
-                                  _body_obj: "dict | None" = None) -> bytes:
-    """Apply backend `extra` and `model` overrides to request JSON bytes.
-
-    Merges `extra` and sets `model` if originally present; `_body_obj` may
-    provide the pre-parsed payload to avoid re-parsing, returning unparseable
-    bodies unchanged."""
-    if not model and not extra:
-        return body
-    if _body_obj is not None:
-        payload = dict(_body_obj)
-    else:
-        try:
-            payload = json.loads(body)
-        except (json.JSONDecodeError, UnicodeDecodeError):
-            log.warning("Could not parse request body for backend overrides — forwarding unchanged")
-            return body
-        if not isinstance(payload, dict):
-            return body
-    if extra:
-        # A backend's extra_body may still override max_tokens after the fit check (see request_sizing).
-        payload.update(extra)
-    if model and "model" in payload:
-        payload["model"] = model
-    return json.dumps(payload).encode("utf-8")
-
-# Per-backend fail/cooldown changes future routing; the only retry is one same-target replay of a buffered body on a stale socket (S12).
+# Per-backend fail/cooldown changes later routing. The encoder path retries one
+# buffered body once on a stale socket. The LLM path opens a fresh connection.
 LLM_FAIL_THRESHOLD = int(os.environ.get("LLM_FAIL_THRESHOLD", "2"))
-# Transport failures and HTTP failures get separate thresholds because they mean different things: a refused connection is one backend event, while a hosted provider emits 429s and transient 5xx as part of normal operation, so the transport threshold of 2 would cool a healthy provider for LLM_COOLDOWN on a routine blip.
-# fact:1338 (a proposed parameter value is a measurement claim in disguise): 5 is UNMEASURED — no rate has been observed against a real provider here, so tune it rather than trusting it.
+# Transport failures and HTTP 429s use separate thresholds. On the LLM path a
+# 5xx does not cool the backend. A refused connection is one backend event. A
+# hosted provider emits 429s in normal operation, so the transport threshold of
+# 2 would cool a healthy provider for LLM_COOLDOWN on a routine blip.
+# 5 is unmeasured: no rate has been observed against a real provider here, so
+# tune it rather than trusting it.
 LLM_HTTP_FAIL_THRESHOLD = max(1, int(os.environ.get("LLM_HTTP_FAIL_THRESHOLD", "5")))
 LLM_FAIL_WINDOW = float(os.environ.get("LLM_FAIL_WINDOW", "60"))
 LLM_COOLDOWN = float(os.environ.get("LLM_COOLDOWN", "300"))
 
 # Sizing and fit validation: request_sizing decides request size before routing.
 request_sizing.validate_fit()
-# At max_inflight the backend counts as busy. Wait for an eligible one instead of widening eligibility or picking over cap, and bound the wait so a saturated backend still fails.
-LLM_MAX_INFLIGHT_WAIT_S = float(os.environ.get("LLM_MAX_INFLIGHT_WAIT_S", "120"))
-# decision:1357: floor of 0.05s. A configured 0 would busy-spin the event loop for the whole wait.
+# At max_inflight the backend is busy. This walk waits for it. A free
+# self-hosted peer at the same priority is used first. There is no deadline.
+# Floor of 0.05s. A configured 0 would busy-spin the event loop for the wait.
 LLM_MAX_INFLIGHT_POLL_S = max(0.05, float(os.environ.get("LLM_MAX_INFLIGHT_POLL_S", "0.5")))
-# Cap concurrent capacity-waiters (floor 1); beyond that, 503 backend_at_capacity (decision:1357, fact:1338).
-LLM_MAX_CAPACITY_WAITERS = max(1, int(os.environ.get("LLM_MAX_CAPACITY_WAITERS", "8")))
 
 # Working set the router iterates. Every declared backend is eligible; fit is the only pre-filter.
 LLM_POOL: list[str] = list(LLM_BACKENDS)
@@ -389,19 +368,18 @@ async def _probe_backend_alive(session, backend: str) -> bool:
     return False
 _llm_unhealthy_until: dict[str, float] = {b: 0.0 for b in LLM_BACKENDS}
 _llm_fail_times: dict[str, list] = {b: [] for b in LLM_BACKENDS}
-# Cumulative routed and fail counts, so the realised split can be checked against the weights.
+# Cumulative routed and fail counts. weight is stored with them and does not route.
 _llm_routed: dict[str, int] = {b: 0 for b in LLM_BACKENDS}
 _llm_fail_total: dict[str, int] = {b: 0 for b in LLM_BACKENDS}
-# fact:1314: a refusal counter paired with its own last-event timestamp.
+# A refusal counter paired with its own last-event timestamp.
 _routing_no_eligible_backend_count = 0
 _routing_no_eligible_backend_last_ts: "str | None" = None
 _routing_fit_rejected_count = 0
 _routing_fit_rejected_last_ts: "str | None" = None
-# decision:1357: the 503 backend_at_capacity refusal has its own counter and timestamp. The 422 counters never fire on this path.
+# The capacity counter stays on the health snapshot. A busy backend waits,
+# so this count stays 0 unless something else records it.
 _routing_backend_at_capacity_count = 0
 _routing_backend_at_capacity_last_ts: "str | None" = None
-# decision:1357: how many requests currently hold a capacity-wait slot, bounded by LLM_MAX_CAPACITY_WAITERS.
-_capacity_waiters = 0
 # In-process token totals from usage on a non-streaming response. A parse failure skips the counter and must not break the proxy.
 _llm_tokens_prompt_total: dict[str, int] = {b: 0 for b in LLM_BACKENDS}
 _llm_tokens_completion_total: dict[str, int] = {b: 0 for b in LLM_BACKENDS}
@@ -460,25 +438,6 @@ def _affinity_key(body: bytes) -> str | None:
     return _affinity_key_from_obj(_parse_json_body(body))
 
 
-def _fits(url: str, est_prompt_tokens: float, effective_max_tokens: float) -> bool:
-    """True when the request fits this backend's n_ctx. Fit is the only eligibility filter."""
-    return request_sizing.fits(LLM_BACKEND_NCTX.get(url), est_prompt_tokens, effective_max_tokens)
-
-
-def _eligible_backends(est_prompt_tokens: float = 0.0,
-                       effective_max_tokens: float = 0.0) -> list[str]:
-    """Backends that fit. An empty return is a 422; the constraint says whether the pool itself is empty."""
-    return [b for b in LLM_POOL if _fits(b, est_prompt_tokens, effective_max_tokens)]
-
-
-def _classify_no_eligible_constraint(est_prompt_tokens: float,
-                                     effective_max_tokens: float) -> str:
-    """no_backend when nothing is usable, including a fleet that was entirely excluded. Otherwise fit."""
-    if not LLM_POOL:
-        return "no_backend"
-    return "fit"
-
-
 def _record_no_eligible_backend(constraint: str) -> None:
     global _routing_no_eligible_backend_count, _routing_no_eligible_backend_last_ts
     global _routing_fit_rejected_count, _routing_fit_rejected_last_ts
@@ -506,17 +465,33 @@ def _record_last_call(backend: str, status: int, *, origin: str = "upstream") ->
     }
 
 
+def _token_count(value):
+    """A non-negative finite count. Negative, non-finite, and non-float values are ignored."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        number = float(value)
+    except (OverflowError, ValueError):
+        return None
+    if number < 0 or number != number or number in (float("inf"), float("-inf")):
+        return None
+    try:
+        return int(value)
+    except (OverflowError, ValueError):
+        return None
+
+
 def _record_backend_token_usage(backend: str, usage: dict) -> None:
     """Record cumulative prompt and completion tokens from response `usage` object."""
     try:
-        p = usage.get("prompt_tokens")
-        c = usage.get("completion_tokens")
+        p = _token_count(usage.get("prompt_tokens"))
+        c = _token_count(usage.get("completion_tokens"))
         touched = False
-        if isinstance(p, (int, float)):
-            _llm_tokens_prompt_total[backend] = _llm_tokens_prompt_total.get(backend, 0) + int(p)
+        if p is not None:
+            _llm_tokens_prompt_total[backend] = _llm_tokens_prompt_total.get(backend, 0) + p
             touched = True
-        if isinstance(c, (int, float)):
-            _llm_tokens_completion_total[backend] = _llm_tokens_completion_total.get(backend, 0) + int(c)
+        if c is not None:
+            _llm_tokens_completion_total[backend] = _llm_tokens_completion_total.get(backend, 0) + c
             touched = True
         if touched:
             _llm_tokens_last_ts[backend] = datetime.now(timezone.utc).isoformat()
@@ -539,7 +514,11 @@ def _record_llm_latency(backend: str, elapsed_s: float, failed: bool) -> None:
 
 
 def _llm_mark_fail(backend: str, threshold: "int | None" = None) -> None:
-    """Record a backend failure and trip the cooldown once it fails too often, counting against `threshold` (LLM_FAIL_THRESHOLD for a transport failure, LLM_HTTP_FAIL_THRESHOLD for an upstream 429 or 5xx)."""
+    """Record a backend failure and trip the cooldown once it fails too often.
+
+    Transport failures use LLM_FAIL_THRESHOLD. A 429 uses
+    LLM_HTTP_FAIL_THRESHOLD. An HTTP 5xx does not call this.
+    """
     now = time.monotonic()
     limit = LLM_FAIL_THRESHOLD if threshold is None else max(1, threshold)
     _llm_fail_total[backend] = _llm_fail_total.get(backend, 0) + 1
@@ -552,97 +531,9 @@ def _llm_mark_fail(backend: str, threshold: "int | None" = None) -> None:
         log.warning("LLM backend %s in cooldown for %.0fs (%d fails)", scrub_url_credentials(backend), LLM_COOLDOWN, limit)
 
 
-# 429 and 5xx fault the backend; client 4xx errors reflect request defects and
-# must not trip backend cooldown.
-def _http_status_faults_backend(status: int) -> bool:
-    """True iff this upstream status should count toward the backend's fail streak."""
-    return status == 429 or status >= 500
-
-
 def _llm_mark_ok(backend: str) -> None:
     _llm_fail_times[backend] = []
 
-
-# _ordered_llm_backends was removed; it had no callers.
-
-def _select_llm_backend(affinity_key: str | None = None,
-                        est_prompt_tokens: float = 0.0,
-                        effective_max_tokens: float = 0.0) -> "str | None":
-    """Select an eligible LLM backend via cache affinity or least-in-flight.
-
-    Fit is the only pre-filter. Returns None when nothing fits or every candidate is at capacity."""
-    global _llm_affinity_hits, _llm_affinity_misses
-    now = time.monotonic()
-    for k in [k for k, v in _llm_affinity.items() if now - v[1] > AFFINITY_TTL]:
-        _llm_affinity.pop(k, None)
-
-    eligible = _eligible_backends(est_prompt_tokens, effective_max_tokens)
-    if not eligible:
-        return None
-    eligible_set = set(eligible)
-
-    def _at_cap(b: str) -> bool:
-        cap = LLM_BACKEND_MAX_INFLIGHT.get(b)
-        return cap is not None and _llm_inflight.get(b, 0) >= cap
-
-    def _usable(b: str) -> bool:
-        return (b in eligible_set and b not in _llm_reserved
-                and _llm_unhealthy_until.get(b, 0.0) <= now)
-
-    # Affinity hit only when that card is eligible, usable, and under both the affinity cap and max_inflight.
-    ent = _llm_affinity.get(affinity_key) if affinity_key else None
-    if (ent and ent[0] in eligible_set and _usable(ent[0]) and not _at_cap(ent[0])
-            and _llm_inflight.get(ent[0], 0) < AFFINITY_MAX_INFLIGHT):
-        ent[1] = now
-        ent[2] += 1
-        _llm_affinity_hits += 1
-        return ent[0]
-
-    # Miss: least-in-flight inside the eligible set, protecting a reused hot prefix. Never fall back to the full pool.
-    protected = {v[0] for v in _llm_affinity.values()
-                 if now - v[1] <= AFFINITY_TTL and v[2] >= AFFINITY_PROTECT_HITS}
-    usable = [b for b in eligible if _usable(b)]
-    cold = ([b for b in usable if b not in protected] or usable
-            or [b for b in eligible if b not in _llm_reserved] or eligible)
-    not_capped = [b for b in cold if not _at_cap(b)]
-    if not not_capped:
-        return None   # every eligible candidate is at its concurrency cap
-    chosen = min(not_capped, key=lambda b: _llm_inflight.get(b, 0))
-    if affinity_key:
-        _llm_affinity[affinity_key] = [chosen, now, (ent[2] + 1 if ent else 1)]
-        _llm_affinity_misses += 1
-    return chosen
-
-
-async def _select_backend_waiting_on_capacity(
-        affinity_key: "str | None",
-        est_prompt_tokens: float, effective_max_tokens: float) -> "str | None":
-    """Poll _select_llm_backend up to LLM_MAX_INFLIGHT_WAIT_S for capacity slots.
-    Returns None if all eligible backends remain saturated through the deadline."""
-    deadline = time.monotonic() + LLM_MAX_INFLIGHT_WAIT_S
-    while True:
-        backend = _select_llm_backend(affinity_key, est_prompt_tokens, effective_max_tokens)
-        if backend is not None:
-            return backend
-        if time.monotonic() >= deadline:
-            return None
-        await asyncio.sleep(LLM_MAX_INFLIGHT_POLL_S)
-
-
-async def _wait_for_capacity_slot(affinity_key: "str | None",
-                                  est_prompt_tokens: float,
-                                  effective_max_tokens: float) -> "str | None":
-    """Wait for a free slot on the already-eligible set. The cap does not widen eligibility.
-    Returns None immediately when the waiter limit is reached."""
-    global _capacity_waiters
-    if _capacity_waiters >= LLM_MAX_CAPACITY_WAITERS:
-        return None
-    _capacity_waiters += 1
-    try:
-        return await _select_backend_waiting_on_capacity(
-            affinity_key, est_prompt_tokens, effective_max_tokens)
-    finally:
-        _capacity_waiters -= 1
 
 # Hop-by-hop headers (RFC 7230 §6.1) plus Content-Length are never forwarded; Accept-Encoding stays (auto_decompress=False).
 HOP_BY_HOP = frozenset({
@@ -815,30 +706,621 @@ def _credentialed_route_refusal(request, audit_target: str) -> "web.Response | N
     )
 
 
+# Random token for this process. A restart respawns the daemons with a new
+# value, which is when connection_lost and write_failed may be retried.
+_GATEWAY_BOOT_ID = secrets.token_urlsafe(16)
+_LLM_BACKLOG_UNREADABLE = False
+# Set in main() after the pool exists. A probe before that is unreadable.
+_backlog_coordinator = None
+
+
+def _move_on_down() -> bool:
+    """True unless LLM_MOVE_ON_DOWN is a false word.
+
+    Default true. A refused connection, a connect timeout, a 429, a 502,
+    a 504, or a 503 from a backend that is not self-hosted moves. A
+    self-hosted 503 stays. Every other 5xx stays.
+    """
+    raw = os.environ.get("LLM_MOVE_ON_DOWN", "true").strip().lower()
+    return raw not in {"0", "false", "no", "off"}
+
+
+def _self_hosted(url: str) -> bool:
+    """Private path only: loopback, RFC1918, Tailscale, and the named private domains.
+
+    _bearer_transport_ok returns true for every https URL, which would treat a
+    paid host as local. Rewriting the scheme to http asks the private-path
+    test alone. Busy local work must not move to a paid backend.
+    """
+    parts = urllib.parse.urlsplit(url)
+    if not parts.netloc:
+        return False
+    probe = urllib.parse.urlunsplit(("http", parts.netloc, parts.path or "", "", ""))
+    return _bearer_transport_ok(probe, False)
+
+
+def _backend_label(url: str) -> str:
+    """Escalation name with credentials and control characters removed."""
+    model = LLM_BACKEND_MODELS.get(url)
+    raw = str(model) if model else str(url)
+    cleaned = "".join(ch for ch in raw if ch.isprintable())
+    return scrub_url_credentials(cleaned)
+
+
+def _redact_secrets(text: str) -> str:
+    """Strip provider keys and URL userinfo before a log or specimen."""
+    if not text:
+        return ""
+    out = scrub_url_credentials(text)
+    for token in LLM_BACKEND_TOKENS.values():
+        if token and token in out:
+            out = out.replace(str(token), "[redacted]")
+    return out
+
+
+def _cut_fault_label(text: str) -> str:
+    """Cut after redaction. A fragment of a key must not survive the cap."""
+    if len(text) <= _ERROR_TYPE_LABEL_CAP:
+        return text
+    return text[:_ERROR_TYPE_LABEL_CAP] + "…[truncated]"
+
+
+def _llm_fault_label(label: str | None) -> str | None:
+    """Redact and drop controls before the cut. An exact insufficient_quota match still classifies."""
+    if label is None:
+        return None
+    text = "".join(ch for ch in str(label) if ch.isprintable())
+    if not text:
+        return None
+    return _cut_fault_label(_redact_secrets(text))
+
+
+def _encoder_fault_label(body: bytes) -> str | None:
+    """Scrub URL credentials, controls, and encoder keys before the cut."""
+    label = _raw_upstream_error_label(body)
+    if label is None:
+        return None
+    text = "".join(ch for ch in label if ch.isprintable())
+    if not text:
+        return None
+    text = scrub_url_credentials(text)
+    for name in ("EMBEDDER_API_KEY", "RERANKER_API_KEY"):
+        token = get_secret(name)
+        token = "" if token is None else str(token).strip()
+        if token and token in text:
+            text = text.replace(token, "[redacted]")
+    return _cut_fault_label(text) if text else None
+
+
+def _specimen_tail(text: str) -> str:
+    """Last REM_TRUNCATION_SPECIMEN_CHARS of a cut-off or loop.
+
+    Redact before the cut, so a key that straddles the cut cannot survive as
+    a fragment. Non-positive returns empty, so a zero bound cannot log the
+    whole body.
+    """
+    try:
+        n = int(os.environ.get("REM_TRUNCATION_SPECIMEN_CHARS", "500"))
+    except (TypeError, ValueError):
+        n = 500
+    if n <= 0 or not text:
+        return ""
+    redacted = _redact_secrets(text)
+    tail = " ".join(redacted[-n:].split())
+    return "".join(ch if ch.isprintable() else " " for ch in tail)
+
+
+def _pool_descriptor_rows() -> list[dict]:
+    rows = []
+    for url in sorted(LLM_POOL):
+        rows.append({
+            "url": scrub_url_credentials(url),
+            "model": LLM_BACKEND_MODELS.get(url),
+            "n_ctx": LLM_BACKEND_NCTX.get(url),
+            "max_output_tokens": LLM_BACKEND_MAX_OUTPUT.get(url),
+            "extra_body": LLM_BACKEND_EXTRAS.get(url),
+        })
+    return rows
+
+
+def llm_pool_id() -> str:
+    """sha256 of the sorted active pool, including each extra_body.
+
+    An excluded backend is absent, so filling its key changes the id at the
+    next restart. Key order inside extra_body does not change the hash.
+    """
+    blob = json.dumps(_pool_descriptor_rows(), sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
+def llm_largest_ctx() -> int:
+    vals = [int(LLM_BACKEND_NCTX.get(url) or 0) for url in LLM_POOL]
+    return max(vals) if vals else 0
+
+
+def llm_largest_reply() -> int:
+    """Largest min(max_output_tokens, n_ctx times (1 - margin)) in the pool.
+
+    No prompt estimate. Same margin as reply_room.
+    """
+    best = 0
+    for url in LLM_POOL:
+        cap = request_sizing.reply_room(
+            LLM_BACKEND_NCTX.get(url), LLM_BACKEND_MAX_OUTPUT.get(url), 0.0)
+        if cap is not None:
+            best = max(best, int(cap))
+    return best
+
+
+def _at_cap(backend: str) -> bool:
+    cap = LLM_BACKEND_MAX_INFLIGHT.get(backend)
+    return cap is not None and _llm_inflight.get(backend, 0) >= cap
+
+
+def _cooled(backend: str) -> bool:
+    return _llm_unhealthy_until.get(backend, 0.0) > time.monotonic()
+
+
+def _note_affinity(affinity_key: str | None, backend: str) -> None:
+    """Remember which backend finished this prefix. The next tie breaks toward it."""
+    global _llm_affinity_hits, _llm_affinity_misses
+    if not affinity_key:
+        return
+    now = time.monotonic()
+    ent = _llm_affinity.get(affinity_key)
+    if ent and ent[0] == backend and now - ent[1] <= AFFINITY_TTL:
+        _llm_affinity_hits += 1
+        _llm_affinity[affinity_key] = [backend, now, int(ent[2]) + 1]
+        return
+    _llm_affinity_misses += 1
+    _llm_affinity[affinity_key] = [backend, now, 1]
+
+
+def _order_backends(est: float, affinity_key: str | None) -> list[str]:
+    """priority, then n_ctx, then self-hosted, then least in flight.
+
+    Cache affinity is the last tie-break.
+    """
+    now = time.monotonic()
+    ent = _llm_affinity.get(affinity_key) if affinity_key else None
+
+    def _key(url: str):
+        try:
+            priority = int(LLM_BACKEND_PRIORITY.get(url, 1))
+        except (TypeError, ValueError):
+            priority = 1
+        n_ctx = int(LLM_BACKEND_NCTX.get(url) or 0)
+        hosted = 0 if _self_hosted(url) else 1
+        inflight = _llm_inflight.get(url, 0)
+        warm = 0 if ent and ent[0] == url and now - ent[1] <= AFFINITY_TTL else 1
+        return (priority, n_ctx, hosted, inflight, warm)
+
+    qualifying = [
+        url for url in LLM_POOL
+        if request_sizing.qualifies(
+            request_sizing.context_room(LLM_BACKEND_NCTX.get(url), est), est)
+    ]
+    return sorted(qualifying, key=_key)
+
+
+def _reply_room_of(url: str, est: float) -> float:
+    room = request_sizing.reply_room(
+        LLM_BACKEND_NCTX.get(url), LLM_BACKEND_MAX_OUTPUT.get(url), est)
+    return float(room) if room is not None else 0.0
+
+
+def _n_ctx_of(url: str) -> int:
+    try:
+        return int(LLM_BACKEND_NCTX.get(url) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _meets_floors(url: str, est: float, floor_n, floor_room, strict_n: bool, strict_room: bool) -> bool:
+    """A later try is never smaller than the failed try.
+
+    The dimension that failed is strict.
+    """
+    n_ctx = _n_ctx_of(url)
+    room = _reply_room_of(url, est)
+    if floor_n is not None:
+        if strict_n and n_ctx <= floor_n:
+            return False
+        if not strict_n and n_ctx < floor_n:
+            return False
+    if floor_room is not None:
+        if strict_room and room <= floor_room:
+            return False
+        if not strict_room and room < floor_room:
+            return False
+    return True
+
+
+def _llm_payload(body_obj, backend: str, est: float) -> dict:
+    """Force stream off and write max_tokens last, after extra_body.
+
+    extra_body cannot set max_tokens or max_completion_tokens. Both are
+    removed after the merge, then max_tokens is written as an int.
+    """
+    payload = dict(body_obj) if isinstance(body_obj, dict) else {}
+    extra = LLM_BACKEND_EXTRAS.get(backend)
+    model = LLM_BACKEND_MODELS.get(backend)
+    if extra:
+        payload.update(extra)
+    if model and "model" in payload:
+        payload["model"] = model
+    payload.pop("stream", None)
+    payload.pop("max_tokens", None)
+    payload.pop("max_completion_tokens", None)
+    payload["stream"] = False
+    room = _reply_room_of(backend, est)
+    payload["max_tokens"] = int(room)
+    return payload
+
+
+def _context_error_text(raw: bytes) -> str:
+    """Text of the provider error fields only.
+
+    A validation body that echoes the prompt is not this text. A non-JSON
+    body has no error field.
+    """
+    try:
+        obj = json.loads(raw)
+    except Exception:
+        return ""
+    if not isinstance(obj, dict):
+        return ""
+    err = obj.get("error")
+    parts: list[str] = []
+    if isinstance(err, dict):
+        parts.append(str(err.get("type") or ""))
+        parts.append(str(err.get("message") or ""))
+        parts.append(str(err.get("code") or ""))
+    elif isinstance(err, str):
+        parts.append(err)
+    else:
+        return ""
+    return " ".join(parts).lower()
+
+
+def _context_refusal(status: int, raw: bytes) -> bool:
+    """A 400 whose error type is exceed_context_size_error, measured on
+    llama.cpp, or whose error text names context length.
+
+    The OpenAI-shaped phrases are unmeasured. A 400 that misses both queues
+    and spends nothing further. The prompt body is not searched.
+    """
+    if status != 400 or not raw:
+        return False
+    text = _context_error_text(raw)
+    if "exceed_context_size_error" in text:
+        return True
+    return "maximum context length" in text or "context length" in text
+
+
+def _html_media(content_type: str | None) -> bool:
+    """True when the media type, before ';', is text/html in any case."""
+    if not content_type:
+        return False
+    media = str(content_type).split(";", 1)[0].strip().lower()
+    return media == "text/html"
+
+
+def _header_value(headers, name: str) -> str | None:
+    if not headers:
+        return None
+    try:
+        direct = headers.get(name)
+    except Exception:
+        direct = None
+    if direct:
+        return direct
+    wanted = name.lower()
+    try:
+        items = headers.items()
+    except Exception:
+        return None
+    for key, value in items:
+        if str(key).lower() == wanted and value:
+            return value
+    return None
+
+
+def _numeric_usage(usage):
+    """Numeric leaves only. None stays None, and a recursion error becomes {} so the reply stays paid."""
+    if usage is None:
+        return None
+    try:
+        return _numeric_usage_walk(usage)
+    except RecursionError:
+        return {}
+
+
+def _numeric_usage_walk(usage):
+    if not isinstance(usage, dict):
+        return {}
+    out = {}
+    for key, value in usage.items():
+        if isinstance(value, dict):
+            nested = _numeric_usage_walk(value)
+            if nested:
+                out[key] = nested
+        elif isinstance(value, bool) or not isinstance(value, (int, float)):
+            continue
+        else:
+            out[key] = value
+    return out
+
+
+def _usage_of(obj):
+    """The usage value when the key is present and not null. It is not walked."""
+    if isinstance(obj, dict) and "usage" in obj and obj.get("usage") is not None:
+        return obj["usage"]
+    return None
+
+
+def _first_choice(obj) -> dict | None:
+    """First choice when choices is a non-empty list of objects.
+
+    An object, a string, or an empty list is not a choice. Callers treat
+    that as unparseable. The shape is checked here so a bad body cannot
+    raise and become a 500.
+    """
+    if not isinstance(obj, dict):
+        return None
+    choices = obj.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return None
+    first = choices[0]
+    if not isinstance(first, dict):
+        return None
+    return first
+
+
+def _present_model(obj: dict) -> None:
+    """A non-string model is absent. A string is redacted, and rewritten only when that changes it."""
+    if "model" not in obj:
+        return
+    model = obj.get("model")
+    if not isinstance(model, str):
+        obj.pop("model", None)
+        return
+    redacted = _redact_secrets(model)
+    if redacted != model:
+        obj["model"] = redacted
+
+
+def _completion_content(obj) -> str | None:
+    choice = _first_choice(obj)
+    if choice is None:
+        return None
+    message = choice.get("message")
+    if not isinstance(message, dict):
+        return None
+    content = message.get("content")
+    return content if isinstance(content, str) else None
+
+
+def _finish_reason_of(obj) -> str | None:
+    choice = _first_choice(obj)
+    if choice is None:
+        return None
+    reason = choice.get("finish_reason")
+    return reason if isinstance(reason, str) else None
+
+
+def _log_move(kind: str, current: str, nxt: str) -> None:
+    cur = _backend_label(current)
+    dest = _backend_label(nxt)
+    if kind == "context":
+        log.warning(
+            "Escalating to model %s due to context length exceeded at model %s",
+            dest, cur)
+    elif kind == "cut_off":
+        log.warning(
+            "Escalating to model %s due to truncated reply at model %s",
+            dest, cur)
+    elif kind == "rate":
+        log.warning(
+            "Moving to model %s because model %s is rate limited", dest, cur)
+    else:
+        log.warning(
+            "Moving to model %s because model %s is down", dest, cur)
+
+
+def _log_backlogged() -> None:
+    log.warning("No model has enough context -- backlogged")
+
+
+def _log_fit_detail(est: float) -> None:
+    """Second line after a no_context backlog, so the ratio can be retuned.
+
+    The fixed wording above stays unchanged. Numbers live only here.
+    """
+    rooms = []
+    for url in LLM_POOL:
+        room = request_sizing.context_room(LLM_BACKEND_NCTX.get(url), est)
+        if room is not None:
+            rooms.append(float(room))
+    largest = max(rooms) if rooms else 0
+    log.warning(
+        "prompt estimate %s largest room %s retune LLM_CHARS_PER_TOKEN_RATIO FIT_MARGIN",
+        est, largest)
+
+
+def _log_queued(backend: str, status: int) -> None:
+    log.error(
+        "Upstream reply queued status=%s backend=%s",
+        status, _backend_label(backend))
+
+
+def _acquire_llm_slot(backend: str) -> float:
+    _llm_inflight[backend] = _llm_inflight.get(backend, 0) + 1
+    started = time.monotonic()
+    _llm_inflight_started.setdefault(backend, []).append(started)
+    _llm_routed[backend] = _llm_routed.get(backend, 0) + 1
+    return started
+
+
+def _release_llm_slot(backend: str, started: float, failed: bool, record: bool = True) -> None:
+    _llm_inflight[backend] = max(0, _llm_inflight.get(backend, 0) - 1)
+    starts = _llm_inflight_started.get(backend)
+    if starts:
+        starts.remove(min(starts))
+    # A client abort is not a service time. Skip the sample. The slot still drops.
+    if record:
+        _record_llm_latency(backend, time.monotonic() - started, failed)
+
+
+def _paid_reply(status: int, usage, *, json_body: bool = False) -> bool:
+    """Paid when any usage is present or the 2xx body is JSON. A non-JSON 2xx is free only for text/html."""
+    if usage is not None:
+        return True
+    try:
+        code = int(status)
+    except (TypeError, ValueError):
+        code = 0
+    return 200 <= code < 300 and json_body
+
+
+def _gateway_headers(backend: str | None = None) -> dict:
+    headers = {"X-SM-Fault-Origin": "gateway"}
+    if backend is not None:
+        headers["X-SM-LLM-Backend"] = scrub_url_credentials(backend)
+    return headers
+
+
+def _backlog_response(reason: str, backend: str | None, specimen: str | None,
+                      usage=None) -> web.Response:
+    body = {"error": "backlog", "reason": reason, "specimen": specimen or ""}
+    if usage is not None:
+        body["usage"] = usage
+    return web.json_response(body, status=422, headers=_gateway_headers(backend))
+
+
+def _upstream_fault_response(status: int, error_type: str, backend: str) -> web.Response:
+    return web.json_response(
+        {"error": "upstream_fault", "status": status, "type": error_type},
+        status=status,
+        headers={
+            "X-SM-Fault-Origin": "upstream",
+            "X-SM-LLM-Backend": scrub_url_credentials(backend),
+        },
+    )
+
+
+def _queued_down_response(backend: str | None, status: int = 503) -> web.Response:
+    if status == 504:
+        return web.json_response(
+            {"error": "Upstream connect timeout"}, status=504,
+            headers=_gateway_headers(backend))
+    return web.json_response(
+        {"error": "Backend unreachable: ClientConnectorError"}, status=503,
+        headers=_gateway_headers(backend))
+
+
+def _queued_free_response(backend: str, status: int) -> web.Response:
+    """A free fault the daemon queues. A 2xx is answered 503 so the daemon
+    does not parse a body that is not a completion.
+    """
+    code = status if status < 200 or status >= 300 else 503
+    return web.json_response(
+        {"error": "upstream_fault", "status": status, "type": "queued"},
+        status=code,
+        headers={
+            "X-SM-Fault-Origin": "upstream",
+            "X-SM-LLM-Backend": scrub_url_credentials(backend),
+        },
+    )
+
+
+def _client_gone(request) -> bool:
+    """True when the daemon transport has already closed."""
+    return request is not None and getattr(request, "transport", False) is None
+
+
+async def _wait_until_under_cap(backend: str, request=None) -> bool:
+    """Wait while this backend is at max_inflight. A transport that closes as the slot frees ends the wait before a call."""
+    if not _at_cap(backend):
+        return False
+    log.warning("Waiting for model %s: at capacity", _backend_label(backend))
+    while _at_cap(backend):
+        if _client_gone(request):
+            return True
+        await asyncio.sleep(LLM_MAX_INFLIGHT_POLL_S)
+    return _client_gone(request)
+
+
+def _free_self_hosted_peer(ordered: list[str], index: int, est: float,
+                           floor_n, floor_room, strict_n: bool, strict_room: bool) -> int | None:
+    """A later self-hosted backend at the same priority that is free.
+
+    Paid backends in between are not a destination.
+    """
+    current = ordered[index]
+    try:
+        priority = int(LLM_BACKEND_PRIORITY.get(current, 1))
+    except (TypeError, ValueError):
+        priority = 1
+    for j in range(index + 1, len(ordered)):
+        url = ordered[j]
+        try:
+            other = int(LLM_BACKEND_PRIORITY.get(url, 1))
+        except (TypeError, ValueError):
+            other = 1
+        if other != priority or not _self_hosted(url):
+            continue
+        if _at_cap(url) or _cooled(url):
+            continue
+        if not _meets_floors(url, est, floor_n, floor_room, strict_n, strict_room):
+            continue
+        return j
+    return None
+
+
+def _next_index(ordered: list[str], index: int, est: float,
+                floor_n, floor_room, strict_n: bool, strict_room: bool) -> int | None:
+    for j in range(index + 1, len(ordered)):
+        if _meets_floors(ordered[j], est, floor_n, floor_room, strict_n, strict_room):
+            return j
+    return None
+
+
 # Proxy
 class AsyncHiveMindProxy:
     def __init__(self):
         self.session: ClientSession | None = None
+        self.llm_session: ClientSession | None = None
 
     async def start_session(self) -> None:
         connector = TCPConnector(
             limit=200,                  # total concurrent connections across all upstreams
             limit_per_host=80,          # prevents embedding bursts from starving LLM backend
             ttl_dns_cache=300,
-            enable_cleanup_closed=True, # evicts half-open sockets immediately; prevents pool leaks
         )
-        # connect=5s, total=None (never cut a generation), auto_decompress=False (keep Content-Encoding with the bytes).
-        timeout = ClientTimeout(total=None, connect=5.0)
+        # Encoders keep connect=5s. total=None never cuts a generation.
+        # auto_decompress=False keeps Content-Encoding with the bytes.
+        encoder_timeout = ClientTimeout(total=None, connect=5.0)
         self.session = ClientSession(
             connector=connector,
-            timeout=timeout,
+            timeout=encoder_timeout,
             auto_decompress=False,
             # already aiohttp's default; stated so .netrc credentials are never injected and the posture is visible in code
+            trust_env=False,
+        )
+        # The LLM walk opens a fresh connection per call so a stale pooled socket cannot
+        # look like a lost connection. No connect limit: the operating system decides.
+        self.llm_session = ClientSession(
+            connector=TCPConnector(force_close=True),
+            timeout=ClientTimeout(total=None),
+            auto_decompress=False,
             trust_env=False,
         )
         log.info("Connection pool ready (limit=200, limit_per_host=80)")
 
     async def cleanup(self) -> None:
+        if self.llm_session and not self.llm_session.closed:
+            await self.llm_session.close()
         if self.session and not self.session.closed:
             await self.session.close()
             log.info("Upstream client session closed.")
@@ -896,51 +1378,408 @@ class AsyncHiveMindProxy:
             )
         llm_body = await request.read() if request.can_read_body else b""
         body_obj = _parse_json_body(llm_body)
-        affinity_key = _affinity_key_from_obj(body_obj)
-        est_prompt_tokens = request_sizing.estimate_prompt_tokens(len(llm_body))
-        effective_max_tokens = request_sizing.effective_max_tokens(body_obj)
-        eligible_pre = _eligible_backends(est_prompt_tokens, effective_max_tokens)
-        if not eligible_pre:
-            constraint = _classify_no_eligible_constraint(est_prompt_tokens, effective_max_tokens)
-            _record_no_eligible_backend(constraint)
-            refusal_body = {"error": "no_eligible_backend", "constraint": constraint}
-            if constraint == "fit":
-                refusal_body["est_prompt_tokens"] = int(est_prompt_tokens)
-                refusal_body["effective_max_tokens"] = int(effective_max_tokens)
-                log.warning(
-                    "fit-rejected: est_prompt_tokens=%d + max_tokens=%d fits no declared n_ctx "
-                    "— retune LLM_CHARS_PER_TOKEN_RATIO / FIT_MARGIN or raise the backend's n_ctx.",
-                    int(est_prompt_tokens), int(effective_max_tokens),
-                )
+        return await self._walk_llm(request, llm_body, body_obj)
+
+    async def _walk_llm(self, request: web.Request, llm_body: bytes, body_obj) -> web.StreamResponse:
+        """Try each qualifying backend once, forward only.
+
+        Never return a cut-off body.
+
+        A reply the daemon must not store becomes a 422 backlog. A down or
+        rate-limit before any paid reply stays queued for the next cycle.
+        A non-JSON 2xx queues free only when its media type is text/html.
+        Any other non-JSON 2xx is unparseable. A body that carries usage is
+        paid even when it is this try. A paid ending that would have queued
+        is connection_lost, or the paid try would repeat.
+        """
+        affinity_key = _affinity_key_from_obj(body_obj if isinstance(body_obj, dict) else None)
+        est = request_sizing.estimate_prompt_tokens(len(llm_body))
+        if not LLM_POOL:
+            _record_no_eligible_backend("no_backend")
             return web.json_response(
-                refusal_body, status=422, headers={"X-SM-Fault-Origin": "gateway"},
+                {"error": "no_eligible_backend", "constraint": "no_backend"},
+                status=422, headers={"X-SM-Fault-Origin": "gateway"},
             )
-        llm_backend = _select_llm_backend(affinity_key, est_prompt_tokens, effective_max_tokens)
-        if llm_backend is None:
-            llm_backend = await _wait_for_capacity_slot(
-                affinity_key, est_prompt_tokens, effective_max_tokens)
-        if llm_backend is None:
-            _record_backend_at_capacity()
-            return web.json_response(
-                {"error": "backend_at_capacity"}, status=503,
-                headers={"X-SM-Fault-Origin": "gateway"},
-            )
-        backend_model = LLM_BACKEND_MODELS.get(llm_backend)
-        if LLM_BACKEND_TOKENS.get(llm_backend) is not None and backend_model and isinstance(body_obj, dict):
-            caller_model = body_obj.get("model")
-            if caller_model and caller_model not in (backend_model, "local-model"):
-                return web.json_response(
-                    {"error": "model_mismatch",
-                     "detail": f"credentialed backend requires model '{backend_model}', but request specified '{caller_model}'"},
-                    status=400, headers={"X-SM-Fault-Origin": "gateway"},
-                )
-        llm_body = _apply_backend_body_overrides(
-            llm_body, LLM_BACKEND_MODELS.get(llm_backend),
-            LLM_BACKEND_EXTRAS.get(llm_backend), _body_obj=body_obj)
-        return await self._forward_upstream(
-            request, target_base=llm_backend, llm_backend=llm_backend,
-            llm_body=llm_body, body_obj=body_obj,
-        )
+        ordered = _order_backends(est, affinity_key)
+        if not ordered:
+            _record_no_eligible_backend("fit")
+            _log_backlogged()
+            _log_fit_detail(est)
+            return _backlog_response("no_context", None, "", None)
+
+        floor_n = None
+        floor_room = None
+        strict_n = False
+        strict_room = False
+        saw_reply = False
+        last_usage = None
+        last_specimen = ""
+        index = 0
+        while index < len(ordered):
+            backend = ordered[index]
+            if _cooled(backend):
+                if not _move_on_down():
+                    return self._after_reply_or_queue(
+                        saw_reply, backend, 503, last_usage, last_specimen)
+                nxt = _next_index(ordered, index, est, floor_n, floor_room, strict_n, strict_room)
+                if nxt is None:
+                    return self._after_reply_or_queue(
+                        saw_reply, backend, 503, last_usage, last_specimen)
+                last = (_llm_last_call.get(backend) or {}).get("status")
+                _log_move("rate" if last == 429 else "down", backend, ordered[nxt])
+                index = nxt
+                continue
+            if _at_cap(backend):
+                peer = _free_self_hosted_peer(
+                    ordered, index, est, floor_n, floor_room, strict_n, strict_room)
+                if peer is not None:
+                    index = peer
+                    continue
+                # The client is already gone. Nothing reads this status.
+                if await _wait_until_under_cap(backend, request):
+                    return web.Response(status=499)
+            outcome = await self._one_llm_try(request, backend, body_obj, est)
+            kind = outcome["kind"]
+            if outcome.get("usage") is not None:
+                last_usage = outcome.get("usage")
+            if outcome.get("specimen"):
+                last_specimen = outcome["specimen"]
+            if outcome.get("accepted"):
+                saw_reply = True
+            if kind == "proxy_error":
+                if saw_reply:
+                    return _backlog_response(
+                        "connection_lost", backend, last_specimen, last_usage)
+                return outcome["response"]
+            if kind == "complete":
+                _note_affinity(affinity_key, backend)
+                return outcome["response"]
+            if kind in ("down", "rate"):
+                if not _move_on_down():
+                    return self._after_reply_or_queue(
+                        saw_reply, backend, outcome["status"], last_usage, last_specimen)
+                nxt = _next_index(ordered, index, est, floor_n, floor_room, strict_n, strict_room)
+                if nxt is None:
+                    return self._after_reply_or_queue(
+                        saw_reply, backend, outcome["status"], last_usage, last_specimen)
+                _log_move(kind, backend, ordered[nxt])
+                index = nxt
+                continue
+            if kind == "lost":
+                return _backlog_response(
+                    "connection_lost", backend, last_specimen, last_usage)
+            if kind in ("auth", "server"):
+                if saw_reply:
+                    return _backlog_response(
+                        "connection_lost", backend, last_specimen, last_usage)
+                return outcome["response"]
+            if kind == "queued":
+                if saw_reply:
+                    return _backlog_response(
+                        "connection_lost", backend, last_specimen, last_usage)
+                _log_queued(backend, int(outcome.get("status") or 0))
+                return outcome["response"]
+            if kind == "context":
+                floor_n = _n_ctx_of(backend)
+                strict_n = True
+                floor_room = _reply_room_of(backend, est)
+                strict_room = False
+                nxt = _next_index(ordered, index, est, floor_n, floor_room, strict_n, strict_room)
+                if nxt is None:
+                    _log_backlogged()
+                    _log_fit_detail(est)
+                    return _backlog_response(
+                        "no_context", backend, last_specimen, last_usage)
+                _log_move("context", backend, ordered[nxt])
+                index = nxt
+                continue
+            if kind == "loop":
+                return _backlog_response(
+                    "loop", backend, last_specimen, last_usage)
+            if kind == "cut_off":
+                floor_room = _reply_room_of(backend, est)
+                strict_room = True
+                floor_n = _n_ctx_of(backend)
+                strict_n = False
+                if last_specimen:
+                    log.warning("truncation specimen: %s", last_specimen)
+                nxt = _next_index(ordered, index, est, floor_n, floor_room, strict_n, strict_room)
+                if nxt is None:
+                    _log_backlogged()
+                    return _backlog_response(
+                        "cut_off", backend, last_specimen, last_usage)
+                _log_move("cut_off", backend, ordered[nxt])
+                index = nxt
+                continue
+            return _backlog_response(
+                "unparseable", backend, last_specimen, last_usage)
+
+    def _after_reply_or_queue(self, saw_reply: bool, backend: str, status: int,
+                              usage=None, specimen: str = "") -> web.Response:
+        if saw_reply:
+            return _backlog_response("connection_lost", backend, specimen, usage)
+        return _queued_down_response(backend, status)
+
+    async def _one_llm_try(self, request, backend: str, body_obj, est: float) -> dict:
+        """One fresh call. The slot is released before a move or a wait."""
+        session = self.llm_session
+        if session is None:
+            return {"kind": "down", "status": 503}
+        payload = _llm_payload(body_obj, backend, est)
+        data = json.dumps(payload).encode("utf-8")
+        target_url = _upstream_url(backend, request.rel_url)
+        scrubbed = scrub_url_credentials(target_url)
+        upstream_headers = self._filter_headers(_strip_llm_steering_headers(request.headers))
+        # aiohttp puts its own Accept-Encoding back when the header is absent.
+        upstream_headers["Accept-Encoding"] = "identity"
+        token = LLM_BACKEND_TOKENS.get(backend)
+        if token:
+            refusal = _credentialed_route_refusal(request, backend)
+            if refusal is not None:
+                return {"kind": "proxy_error", "response": refusal}
+            upstream_headers["Authorization"] = f"Bearer {token}"
+        try:
+            request["backend"] = backend
+            if token:
+                request["key_attached"] = True
+            else:
+                try:
+                    del request["key_attached"]
+                except (TypeError, AttributeError, KeyError):
+                    pass
+        except (TypeError, AttributeError):
+            pass
+        started = _acquire_llm_slot(backend)
+        failed = True
+        record = True
+        try:
+            log.debug("→ %s %s", request.method, scrubbed)
+            async with session.request(
+                method=request.method,
+                url=target_url,
+                headers=upstream_headers,
+                data=data,
+                allow_redirects=False,
+            ) as upstream:
+                raw = await upstream.content.read()
+                status = upstream.status
+                encoding = _header_value(upstream.headers, "Content-Encoding")
+                content_type = _header_value(upstream.headers, "Content-Type")
+            # identity, any case, is no encoding. A proxy may echo Accept-Encoding.
+            enc = (encoding or "").strip().lower()
+            if enc == "identity":
+                enc = ""
+            # A failed decompress of a 2xx is unparseable. Any other status is
+            # answered on that status with an empty body, so a free fault still queues.
+            dropped_compressed = False
+            if enc:
+                if len(raw) > LLM_USAGE_CAPTURE_CAP_BYTES:
+                    raw = b""
+                    dropped_compressed = True
+                else:
+                    try:
+                        raw = _decompress_full_for_usage(raw, enc)
+                    except Exception:
+                        raw = b""
+                        dropped_compressed = True
+            if dropped_compressed and 200 <= status < 300:
+                _record_last_call(backend, status)
+                return {"kind": "unparseable", "usage": None, "accepted": True}
+            outcome = self._interpret_llm_reply(backend, status, raw, content_type)
+            failed = outcome.get("kind") != "complete"
+            if status >= 400:
+                # Same recorder as the encoder path. A 429 body is classified after
+                # decompress, even when the daemon is answered 503. The label is
+                # redacted before the fault record and the credential audit.
+                error_type = None
+                try:
+                    if raw:
+                        error_type = _llm_fault_label(_raw_upstream_error_label(raw))
+                except Exception:
+                    error_type = None
+                try:
+                    record_llm_upstream_fault(
+                        backend, status, error_type,
+                        credentialed=bool(token),
+                        request_id=_safe_request_id(request),
+                    )
+                except Exception as exc:
+                    log.warning(
+                        "credential-fault classification failed for %s: %s",
+                        scrubbed, type(exc).__name__)
+            return outcome
+        except ConnectionTimeoutError:
+            _llm_mark_fail(backend)
+            _record_last_call(backend, 504, origin="gateway")
+            record_llm_gateway_fault(
+                backend, "ConnectionTimeoutError", credentialed=bool(token),
+                request_id=_safe_request_id(request))
+            log.error("Upstream connect timeout %s", scrubbed)
+            return {"kind": "down", "status": 504, "accepted": False}
+        except ClientConnectorError as ce:
+            _llm_mark_fail(backend)
+            _record_last_call(backend, 503, origin="gateway")
+            record_llm_gateway_fault(
+                backend, type(ce).__name__, credentialed=bool(token),
+                request_id=_safe_request_id(request))
+            log.error("Upstream unreachable %s: %s", scrubbed,
+                      _short(_redact_secrets(str(ce))))
+            return {"kind": "down", "status": 503, "accepted": False}
+        except (ClientConnectionResetError, ServerDisconnectedError, ConnectionResetError):
+            # A reset after the request was sent is a lost connection. It does not cool
+            # the backend and does not move.
+            _record_last_call(backend, 503, origin="gateway")
+            return {"kind": "lost", "accepted": False}
+        except (ClientError, asyncio.TimeoutError) as exc:
+            _record_last_call(backend, 503, origin="gateway")
+            log.error("Upstream unreachable %s: %s", scrubbed,
+                      _short(_redact_secrets(str(exc))))
+            return {"kind": "lost", "accepted": True}
+        except asyncio.CancelledError:
+            record = False
+            raise
+        except Exception as exc:
+            scrubbed_msg = _short(_redact_secrets(str(exc)))
+            log.error("Unexpected proxy error for %s: %s", scrubbed, scrubbed_msg)
+            _record_last_call(backend, 500, origin="gateway")
+            record_llm_gateway_fault(
+                backend, type(exc).__name__, credentialed=bool(token),
+                request_id=_safe_request_id(request))
+            return {
+                "kind": "proxy_error",
+                "response": web.json_response(
+                    {"error": f"Proxy error: {type(exc).__name__}"}, status=500,
+                    headers=_gateway_headers(backend),
+                ),
+            }
+        finally:
+            _release_llm_slot(backend, started, failed, record=record)
+
+    def _interpret_llm_reply(self, backend: str, status: int, raw: bytes,
+                             content_type: str | None = None) -> dict:
+        """Classify one full body from its status. A non-JSON 2xx queues free only for text/html; any other, including empty or 204, is unparseable."""
+        is_json = False
+        parsed = None
+        if raw:
+            try:
+                parsed = json.loads(raw)
+                is_json = True
+            except Exception:
+                is_json = False
+        obj = parsed if isinstance(parsed, dict) else None
+        raw_usage = _usage_of(obj)
+        usage = _numeric_usage(raw_usage)
+        if isinstance(usage, dict) and usage:
+            _record_backend_token_usage(backend, usage)
+        if isinstance(obj, dict) and raw_usage is not None:
+            obj["usage"] = usage
+        _record_last_call(backend, status)
+        paid = _paid_reply(status, raw_usage, json_body=is_json)
+        if 200 <= status < 300 and obj is None:
+            _llm_mark_ok(backend)
+            if not is_json and raw_usage is None and _html_media(content_type):
+                return {
+                    "kind": "queued",
+                    "usage": None,
+                    "accepted": False,
+                    "status": status,
+                    "response": _queued_free_response(backend, status),
+                }
+            return {"kind": "unparseable", "usage": usage, "accepted": True}
+        if _context_refusal(status, raw):
+            _llm_mark_ok(backend)
+            return {"kind": "context", "usage": usage, "accepted": paid}
+        if status in (401, 403):
+            _llm_mark_ok(backend)
+            error_type = "auth"
+            try:
+                error_type = _llm_fault_label(_raw_upstream_error_label(raw)) or "auth"
+            except Exception:
+                error_type = "auth"
+            return {
+                "kind": "auth",
+                "usage": usage,
+                "accepted": paid,
+                "response": _upstream_fault_response(status, error_type, backend),
+            }
+        # 502 and 504 move. A 503 moves unless the backend is self-hosted,
+        # which queues for the next cycle. Every other 5xx stays and does
+        # not cool: cooling a 500 would move the next request. A refused
+        # connection is ClientConnectorError, not this status.
+        if status in (502, 504) or (status == 503 and not _self_hosted(backend)):
+            return {
+                "kind": "down",
+                "status": status,
+                "usage": usage,
+                "accepted": paid,
+            }
+        if status >= 500:
+            error_type = "transient"
+            try:
+                error_type = _llm_fault_label(_raw_upstream_error_label(raw)) or "transient"
+            except Exception:
+                error_type = "transient"
+            return {
+                "kind": "server",
+                "status": status,
+                "usage": usage,
+                "accepted": paid,
+                "response": _upstream_fault_response(status, error_type, backend),
+            }
+        if status == 429:
+            _llm_mark_fail(backend, threshold=LLM_HTTP_FAIL_THRESHOLD)
+            return {
+                "kind": "rate",
+                "status": status,
+                "usage": usage,
+                "accepted": paid,
+            }
+        if status >= 400 or not (200 <= status < 300):
+            _llm_mark_ok(backend)
+            error_type = "transient"
+            try:
+                if raw:
+                    error_type = _llm_fault_label(_raw_upstream_error_label(raw)) or "transient"
+            except Exception:
+                error_type = "transient"
+            if raw_usage is not None:
+                return {
+                    "kind": "queued",
+                    "usage": usage,
+                    "accepted": True,
+                    "status": status,
+                    "response": _upstream_fault_response(status, error_type, backend),
+                }
+            return {
+                "kind": "queued",
+                "usage": None,
+                "accepted": False,
+                "status": status,
+                "response": _upstream_fault_response(status, error_type, backend),
+            }
+        _llm_mark_ok(backend)
+        if _first_choice(obj) is None:
+            return {"kind": "unparseable", "usage": usage, "accepted": paid}
+        finish = _finish_reason_of(obj)
+        if finish == "stop":
+            if _completion_content(obj) is None:
+                return {"kind": "unparseable", "usage": usage, "accepted": paid}
+            _present_model(obj)
+            return {
+                "kind": "complete",
+                "accepted": paid,
+                "response": web.json_response(
+                    obj, status=200,
+                    headers={"X-SM-LLM-Backend": scrub_url_credentials(backend)}),
+            }
+        text = _completion_content(obj) or ""
+        if finish == "length":
+            specimen = _specimen_tail(text)
+            if request_sizing.reply_is_loop(text):
+                log.warning("truncation specimen: %s", specimen)
+                return {"kind": "loop", "specimen": specimen, "usage": usage, "accepted": paid}
+            return {"kind": "cut_off", "specimen": specimen, "usage": usage, "accepted": paid}
+        return {"kind": "unparseable", "usage": usage, "accepted": paid}
 
     async def handle_encoder(self, request: web.Request) -> web.StreamResponse:
         """Exact POST /v1/embeddings and /v1/reranking. An encoded spelling is 404 here.
@@ -1016,37 +1855,23 @@ class AsyncHiveMindProxy:
         request: web.Request,
         *,
         target_base: str,
-        llm_backend: "str | None" = None,
         llm_body: "bytes | None" = None,
-        body_obj: "dict | None" = None,
         encoder_kind: "str | None" = None,
     ) -> web.StreamResponse:
-        """Forward request upstream, relaying streamed or buffered responses.
-        Handles header filtering, optional backend credentials, retries, and
-        telemetry accounting."""
+        """Forward an encoder request. The chat walk does not use this.
+
+        Handles header filtering, encoder credentials, and one stale-socket
+        retry of a buffered body.
+        """
         target_url = _upstream_url(target_base, request.rel_url)
         scrubbed_target_url = scrub_url_credentials(target_url)
         log.debug("→ %s %s", request.method, scrubbed_target_url)
 
         # Strip X-SM-LLM-* before the upstream forward for every caller (provider never sees routing metadata).
         upstream_headers = self._filter_headers(_strip_llm_steering_headers(request.headers))
-        # Authorization was stripped above. Put it back only for a backend that has its own configured credential.
-        backend_token = None
-        if llm_backend is not None:
-            backend_token = LLM_BACKEND_TOKENS.get(llm_backend)
-            if backend_token:
-                refusal = _credentialed_route_refusal(request, llm_backend)
-                if refusal is not None:
-                    return refusal
-                upstream_headers["Authorization"] = f"Bearer {backend_token}"
-            # Stash backend and key_attached for the audit line auth_middleware reads after return. The request may be a test double with no mapping interface.
-            try:
-                request["backend"] = llm_backend
-                if backend_token:
-                    request["key_attached"] = True
-            except (TypeError, AttributeError):
-                pass
-        elif encoder_kind is not None:
+        # Authorization was stripped above. Put it back only for an encoder that has its
+        # own configured credential.
+        if encoder_kind is not None:
             encoder_headers = encoder_auth_headers(encoder_kind, target_base)
             if encoder_headers:
                 refusal = _credentialed_route_refusal(request, target_base)
@@ -1079,18 +1904,6 @@ class AsyncHiveMindProxy:
         max_attempts = 2 if have_buffered_body else 1
 
         try:
-            # Reserve the inflight slot inside the try (one slot covers retries) so a pre-try cancel cannot leak it forever.
-            if llm_backend is not None:
-                _llm_inflight[llm_backend] = _llm_inflight.get(llm_backend, 0) + 1
-                _llm_inflight_started.setdefault(llm_backend, []).append(time.monotonic())
-                _llm_routed[llm_backend] = _llm_routed.get(llm_backend, 0) + 1
-
-            # LLM latency timer spans retries as one request; _llm_req_failed flips False only on the success return.
-            _llm_req_start_mono = time.monotonic() if llm_backend is not None else None
-            _llm_req_failed = True
-            # Client abort is the caller's event: no backend ok/fail mark, skip latency record.
-            _client_aborted = False
-
             for attempt in range(max_attempts):
                 try:
                     async with self.session.request(
@@ -1105,10 +1918,6 @@ class AsyncHiveMindProxy:
                             status=upstream.status,
                             headers=self._filter_headers(upstream.headers, strip_gateway_namespace=True),
                         )
-                        # Stamp serving backend via scrub_url_credentials (query-less keys round-trip; query-bearing attribution degrades).
-                        if llm_backend is not None:
-                            proxy_resp.headers["X-SM-LLM-Backend"] = scrub_url_credentials(llm_backend)
-                            _record_last_call(llm_backend, upstream.status)
                         # Any upstream status >= 400 is an upstream-origin fault. Replace the provider body with a typed refusal; the fault-origin header is not set on success.
                         if upstream.status >= 400:
                             # Read only a prefix of a >=400 body. Classification does not need the rest, and an oversized body must not be buffered.
@@ -1118,42 +1927,24 @@ class AsyncHiveMindProxy:
                             except Exception:
                                 body_bytes = b""
                             try:
-                                error_type = _parse_upstream_error_type(
+                                error_type = _encoder_fault_label(
                                     _decompress_prefix_for_parse(body_bytes, content_encoding))
                             except Exception:
                                 error_type = "transient"
 
-                            if llm_backend is not None:
-                                try:
-                                    record_llm_upstream_fault(
-                                        llm_backend, upstream.status, error_type,
-                                        credentialed=bool(backend_token),
-                                        request_id=_safe_request_id(request),
-                                    )
-                                except Exception as exc:
-                                    log.warning(
-                                        "credential-fault classification failed for %s: %s",
-                                        scrubbed_target_url, type(exc).__name__)
-
-                            # A 429 or 5xx is the only failure signal a hosted provider gives: it reports its faults as HTTP status, never as a dropped connection, so without this the fail streak stays clean forever and the backend is never taken out of rotation.
-                            # Worse than merely staying in: a fast error returns its inflight slot at once, so least-in-flight selection then PREFERS the failing backend over a healthy one mid-generation.
-                            if llm_backend is not None and _http_status_faults_backend(upstream.status):
-                                _llm_mark_fail(llm_backend, threshold=LLM_HTTP_FAIL_THRESHOLD)
-
                             headers = {"X-SM-Fault-Origin": "upstream"}
-                            if llm_backend is not None:
-                                headers["X-SM-LLM-Backend"] = scrub_url_credentials(llm_backend)
 
                             payload = {
                                 "error": "upstream_fault",
                                 "status": upstream.status,
                                 "type": error_type,
                             }
-                            # decision:2583: embed 400/413 becomes a structured overflow for get_embedding, never the provider body. Not used for the LLM pool, rerank, or 5xx.
+                            # decision:2583: embed 400/413 becomes a structured overflow
+                            # for get_embedding, never the provider body. Not used for
+                            # rerank or 5xx.
                             path_safe = getattr(request.rel_url, "path_safe", "") or ""
                             if (
-                                llm_backend is None
-                                and path_safe == "/v1/embeddings"
+                                path_safe == "/v1/embeddings"
                                 and upstream.status in (400, 413)
                             ):
                                 from encoder_window import (
@@ -1178,33 +1969,12 @@ class AsyncHiveMindProxy:
                                 "Client disconnected before response headers "
                                 "could be sent: %s — %s", scrubbed_target_url, e)
                             record_llm_client_disconnect()
-                            _client_aborted = True
                             return proxy_resp
-
-                        # auto_decompress is false, so a compressed body arrives as framing bytes. Read Content-Encoding once so usage capture can decompress it.
-                        content_encoding = upstream.headers.get("Content-Encoding")
-
-                        # Best-effort usage parse after the loop (gzip/deflate/br, cap-bounded; skip SSE) (decision:1357).
-                        _capture_encoding_ok = (
-                            not content_encoding
-                            or content_encoding.strip().lower() in SUPPORTED_CONTENT_ENCODINGS
-                        )
-                        capture_usage = (llm_backend is not None and upstream.status < 400
-                                        and _capture_encoding_ok
-                                        and not (body_obj or {}).get("stream"))
-                        usage_chunks: "list[bytes] | None" = [] if capture_usage else None
-                        usage_bytes = 0
 
                         # write_eof() lives inside the same try as the chunk loop so that
                         # an EOF-time disconnect is handled by the same except clauses.
                         try:
                             async for chunk in upstream.content.iter_any():
-                                if usage_chunks is not None:
-                                    usage_bytes += len(chunk)
-                                    if usage_bytes > LLM_USAGE_CAPTURE_CAP_BYTES:
-                                        usage_chunks = None   # abandon — too big to hold
-                                    else:
-                                        usage_chunks.append(chunk)
                                 await proxy_resp.write(chunk)
                             await proxy_resp.write_eof()
 
@@ -1215,36 +1985,15 @@ class AsyncHiveMindProxy:
 
                         except UPSTREAM_DISCONNECT as e:
                             # Upstream dropped the connection after headers were sent. Log and return the partial response; a new reply is no longer possible.
-                            # Headers already recorded upstream.status, often 200. The drop is this process's event, so last_call must not stay green.
-                            if llm_backend is not None:
-                                _record_last_call(llm_backend, 500, origin="gateway")
                             log.warning("Upstream dropped connection mid-stream: %s — %s", scrubbed_target_url, e)
 
                         except (ConnectionResetError, IOError) as e:
                             # Downstream client reset: log and return; nothing more can be sent.
                             log.warning("Client disconnected mid-stream: %s — %s", scrubbed_target_url, e)
                             record_llm_client_disconnect()
-                            _client_aborted = True
 
-                        if usage_chunks:
-                            try:
-                                usage_body = b"".join(usage_chunks)
-                                if content_encoding:
-                                    # Whole-body decompress for trailing usage (gzip/deflate/br); failure abandons capture.
-                                    usage_body = _decompress_full_for_usage(usage_body, content_encoding)
-                                resp_payload = json.loads(usage_body)
-                                usage = (resp_payload.get("usage")
-                                        if isinstance(resp_payload, dict) else None)
-                                if isinstance(usage, dict):
-                                    _record_backend_token_usage(llm_backend, usage)
-                            except Exception:
-                                pass   # not a single-object JSON body (e.g. SSE) — skip, never breaks the proxy path
-
-                        # A client abort mid-stream is the caller's event, not a verdict on this backend. Do not mark it ok or failed.
-                        if llm_backend is not None and not _client_aborted:
-                            _llm_mark_ok(llm_backend)   # connected + served — clear fail streak
-                        # This return is the <400 stream path; >=400 already returned a typed S-08 JSON above.
-                        _llm_req_failed = upstream.status >= 400
+                        # This return is the <400 stream path; >=400 already returned a
+                        # typed JSON above.
                         return proxy_resp
 
                 except (ClientConnectionResetError, ServerDisconnectedError) as e:
@@ -1265,15 +2014,6 @@ class AsyncHiveMindProxy:
             # Upstream is down or refused the connection: 503, the proxy itself is fine. Log scrubbed text only; a ClientError string can contain the URL and a credential. The client sees the exception class, not that text.
             log.error("Upstream unreachable %s: %s", scrubbed_target_url,
                       _short(_scrub_url_credentials(str(ce))))
-            if llm_backend is not None:
-                _llm_mark_fail(llm_backend)
-                if not (proxy_resp and proxy_resp.prepared):
-                    # No upstream status arrived. Record the 503 this gateway returns, or a previous 200 stays green.
-                    _record_last_call(llm_backend, 503, origin="gateway")
-                # This connect failure is a gateway-origin fault, not something the upstream said. Count it in the gateway group, and only when the call was credentialed.
-                record_llm_gateway_fault(llm_backend, type(ce).__name__,
-                                          credentialed=bool(backend_token),
-                                          request_id=_safe_request_id(request))
             if proxy_resp and proxy_resp.prepared:
                 return proxy_resp
             return web.json_response({"error": f"Backend unreachable: {type(ce).__name__}"}, status=503,
@@ -1282,13 +2022,6 @@ class AsyncHiveMindProxy:
         except asyncio.TimeoutError:
             # Connect timeout to upstream — correct status is 504, not 500.
             log.warning("Upstream connect timeout: %s", scrubbed_target_url)
-            if llm_backend is not None:
-                _llm_mark_fail(llm_backend)
-                if not (proxy_resp and proxy_resp.prepared):
-                    _record_last_call(llm_backend, 504, origin="gateway")
-                record_llm_gateway_fault(llm_backend, "TimeoutError",
-                                          credentialed=bool(backend_token),
-                                          request_id=_safe_request_id(request))
             if proxy_resp and proxy_resp.prepared:
                 return proxy_resp
             return web.json_response({"error": "Upstream connect timeout"}, status=504,
@@ -1303,30 +2036,10 @@ class AsyncHiveMindProxy:
                 scrubbed_exc = RuntimeError(scrubbed_msg)  # exotic __init__ signature — fall back
             log.error("Unexpected proxy error for %s: %s", scrubbed_target_url, scrubbed_msg,
                       exc_info=(type(scrubbed_exc), scrubbed_exc, e.__traceback__))
-            if llm_backend is not None:
-                if not (proxy_resp and proxy_resp.prepared):
-                    # No upstream status arrived. Record the 500 this gateway returns, or a previous 200 stays green.
-                    _record_last_call(llm_backend, 500, origin="gateway")
-                record_llm_gateway_fault(llm_backend, type(e).__name__,
-                                          credentialed=bool(backend_token),
-                                          request_id=_safe_request_id(request))
             if proxy_resp and proxy_resp.prepared:
                 return proxy_resp
             return web.json_response({"error": f"Proxy error: {type(e).__name__}"}, status=500,
                                       headers={"X-SM-Fault-Origin": "gateway"})
-
-        finally:
-            # Release the inflight slot on every outcome so least-busy selection stays honest.
-            # A client timeout can leave the backend generating; oldest-inflight age and suspect_wedged exist for that gap.
-            if llm_backend is not None:
-                _llm_inflight[llm_backend] = max(0, _llm_inflight.get(llm_backend, 0) - 1)
-                starts = _llm_inflight_started.get(llm_backend)
-                if starts:
-                    starts.remove(min(starts))
-                # Record pool-routed LLM latency on every exit except a client abort (abort duration is not a service time).
-                if _llm_req_start_mono is not None and not _client_aborted:
-                    _record_llm_latency(
-                        llm_backend, time.monotonic() - _llm_req_start_mono, _llm_req_failed)
 
 
 # Daemon token helpers
@@ -1381,6 +2094,12 @@ def _daemon_env_and_token_fd(agent_name: str) -> "tuple[dict, int | None]":
         _revoke_daemon_token(agent_name)
         raise
     env["AGENT_TOKEN_FD"] = str(read_fd)
+    # The active pool changes only at a restart, which is when these daemons are
+    # respawned. No new route.
+    env["SM_LLM_POOL_ID"] = llm_pool_id()
+    env["SM_LLM_LARGEST_CTX"] = str(llm_largest_ctx())
+    env["SM_LLM_LARGEST_REPLY"] = str(llm_largest_reply())
+    env["SM_GATEWAY_BOOT_ID"] = _GATEWAY_BOOT_ID
     return env, read_fd
 
 
@@ -1478,6 +2197,32 @@ async def _start_rem_daemon() -> "asyncio.subprocess.Process | None":
     return proc
 
 
+async def _probe_llm_backlog() -> bool:
+    """True when llm_backlog can be read on the coordinator pool. A miss, including a pool that is not up yet, keeps both daemons stopped.
+    """
+    global _LLM_BACKLOG_UNREADABLE
+    try:
+        coord = _backlog_coordinator
+        if coord is None or getattr(coord, "_pool", None) is None:
+            raise RuntimeError("pool not up")
+        # Same SELECT as the telemetry count. The keys are not the gate.
+        await coord._rem_backlog_pg_ids()
+    except Exception as exc:
+        _LLM_BACKLOG_UNREADABLE = True
+        log.warning("llm_backlog unreadable (%s)", type(exc).__name__)
+        return False
+    _LLM_BACKLOG_UNREADABLE = False
+    return True
+
+
+async def _wait_backlog_or_stop(stop_event: asyncio.Event) -> None:
+    """Pause while the backlog table cannot be read. stop_event ends the wait."""
+    try:
+        await asyncio.wait_for(stop_event.wait(), timeout=_DAEMON_MAX_BACKOFF_SEC)
+    except asyncio.TimeoutError:
+        pass
+
+
 async def _watchdog_rem_daemon(stop_event: asyncio.Event) -> None:
     """Run and supervise the REM daemon with exponential backoff and circuit-breaking.
     Revokes the ephemeral daemon token on every exit path in finally."""
@@ -1488,6 +2233,10 @@ async def _watchdog_rem_daemon(stop_event: asyncio.Event) -> None:
         backoff = 1.0
 
         while not stop_event.is_set():
+            if not await _probe_llm_backlog():
+                _rem_healthy = False
+                await _wait_backlog_or_stop(stop_event)
+                continue
             proc = await _start_rem_daemon()
             if proc is None:
                 _rem_healthy = False
@@ -1554,6 +2303,10 @@ async def _watchdog_daemon(stop_event: asyncio.Event) -> None:
         backoff = 1.0
 
         while not stop_event.is_set():
+            if not await _probe_llm_backlog():
+                _daemon_healthy = False
+                await _wait_backlog_or_stop(stop_event)
+                continue
             proc = await _start_daemon()
             if proc is None:
                 _daemon_healthy = False
@@ -2555,8 +3308,16 @@ def _outbox_dependency(census: object, age_limit_s: int) -> dict:
     return _dep(_STATE_OK)
 
 
-def _rem_dependency(process_running: bool, dead_lettered: object) -> dict:
-    """REM process liveness and dead letters. An empty reasoning pool is llm_pool's reason, not this one."""
+def _rem_dependency(process_running: bool, dead_lettered: object,
+                    backlog_unreadable: bool = False) -> dict:
+    """REM process liveness. dead_letters:N counts pending records with a backlog row.
+
+    A withheld record is degraded, by design. An unreadable llm_backlog is
+    down, and that reason wins over process not running. An empty reasoning
+    pool is llm_pool's reason, not this one.
+    """
+    if backlog_unreadable:
+        return _dep(_STATE_DOWN, "llm_backlog unreadable")
     if not process_running:
         return _dep(_STATE_DOWN, "process not running")
     if isinstance(dead_lettered, int) and dead_lettered > 0:
@@ -2779,7 +3540,8 @@ def _llm_runtime_snapshot(backend_status: dict | None = None, *, for_telemetry: 
         "backends": _scrub_backend_keyed_dict(dict(backend_status or {}),
                                               context="_llm_runtime_snapshot.backends"),
         "reserved": sorted(scrub_url_credentials(b) for b in _llm_reserved),
-        # Per-backend weight, inflight, routed, fails, and cooldown, so the realised split can be checked against the weights.
+        # Per-backend weight, inflight, routed, fails, and cooldown.
+        # weight does not route.
         "pool": _scrub_backend_keyed_dict(pool, context="_llm_runtime_snapshot.pool"),
         # Affinity hit rate and which backend holds each hot prefix, so a KV-cache win is visible.
         "affinity": {
@@ -3126,7 +3888,13 @@ async def _build_health_checks(proxy: "AsyncHiveMindProxy", coordinator) -> dict
         "rem_daemon": _rem_dependency(
             _rem_healthy,
             (dep_snap.get("rem") or {}).get("dead_lettered")
-            if isinstance(dep_snap.get("rem"), dict) else None),
+            if isinstance(dep_snap.get("rem"), dict)
+            and isinstance((dep_snap.get("rem") or {}).get("dead_lettered"), int)
+            else None,
+            backlog_unreadable=_LLM_BACKLOG_UNREADABLE or (
+                isinstance(dep_snap.get("rem"), dict)
+                and bool(dep_snap["rem"].get("unreadable"))),
+        ),
         "nrem_daemon": _nrem_dependency(_daemon_healthy, consolidation,
                                         NREM_FOLD_ATTEMPT_WARN),
         "outbox": _outbox_dependency(outbox_census, OUTBOX_AGE_WARN_S),
@@ -3159,7 +3927,8 @@ async def _build_health_checks(proxy: "AsyncHiveMindProxy", coordinator) -> dict
             warnings.append(_warning("outbox_oldest_pending_age_s",
                                      OUTBOX_AGE_WARN_S, int(age), "s"))
     rem_block = dep_snap.get("rem")
-    if isinstance(rem_block, dict) and (rem_block.get("dead_lettered") or 0) > 0:
+    rem_dead = rem_block.get("dead_lettered") if isinstance(rem_block, dict) else None
+    if isinstance(rem_dead, int) and rem_dead > 0:
         warnings.append(_warning("rem_dead_lettered", 0,
                                  rem_block["dead_lettered"], "records"))
     # Call _gateway_shed_rate once. It moves its own watermark, so a second call measures the gap between the calls and reports observed 0 (fact:1309).
@@ -3423,6 +4192,8 @@ async def main() -> None:
 
     coordinator = MemoryCoordinator()
     await coordinator.start()
+    global _backlog_coordinator
+    _backlog_coordinator = coordinator
 
     # The 50 MB ceiling applies to bodies read via request.read(). The streaming path uses request.content and bypasses it.
     app = web.Application(client_max_size=50 * 1024 * 1024, middlewares=[auth_middleware])
@@ -3506,6 +4277,7 @@ async def main() -> None:
         (capability_task, token_lifecycle_task, llm_probe_task))
     # Shutdown sum is a direct synchronous write, so it runs here rather than inside proxy.cleanup or coordinator.stop.
     _emit_token_lifecycle_sums("shutdown")
+    _backlog_coordinator = None
     await coordinator.stop()
     await proxy.cleanup()
     log.info("Clean shutdown complete.")

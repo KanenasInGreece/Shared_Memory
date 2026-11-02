@@ -122,6 +122,7 @@ def test_inflight_slot_released_when_dispatch_raises(monkeypatch):
 
     proxy = g.AsyncHiveMindProxy()
     proxy.session = _BoomSession()
+    proxy.llm_session = proxy.session
     asyncio.run(proxy.handle_proxy(_FakeReq()))
 
     assert g._llm_inflight["http://a:5000"] == 0          # released, not leaked
@@ -137,6 +138,7 @@ def test_inflight_not_reserved_when_request_never_dispatches(monkeypatch):
 
     proxy = g.AsyncHiveMindProxy()
     proxy.session = _BoomSession()
+    proxy.llm_session = proxy.session
     monkeypatch.setattr(proxy, "_filter_headers",
                         lambda h: (_ for _ in ()).throw(RuntimeError("header boom")))
     try:
@@ -185,10 +187,12 @@ def test_retries_once_on_client_connection_reset(monkeypatch):
     proxy = g.AsyncHiveMindProxy()
     session = _ResetOnceThenBoomSession(g.ClientConnectionResetError, g.ClientError)
     proxy.session = session
+    proxy.llm_session = proxy.session
     resp = asyncio.run(proxy.handle_proxy(_FakeReq()))
 
-    assert session.calls == 2                    # retried exactly once, not zero, not looped
-    assert resp.status == 503                     # then failed normally, like before the fix
+    assert session.calls == 1                    # the LLM path does not replay a stale socket
+    body = json.loads(resp.body.decode())
+    assert resp.status == 422 and body["reason"] == "connection_lost"
     assert g._llm_inflight["http://a:5000"] == 0   # slot still released, not leaked
 
 
@@ -218,6 +222,7 @@ def test_embed_body_buffered_under_cap_is_retry_eligible(monkeypatch):
     proxy = g.AsyncHiveMindProxy()
     session = _ResetOnceThenBoomSession(g.ClientConnectionResetError, g.ClientError)
     proxy.session = session
+    proxy.llm_session = proxy.session
     # R-A (HYG round): the encoder path is served by its OWN handler now, so
     # the retry pin follows it there — driving it through handle_proxy would
     # exercise the LLM pool, not the embedder.

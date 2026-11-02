@@ -542,7 +542,7 @@ async def test_record_cycle_crash_is_recorded_and_reraised(monkeypatch):
 
     assert finished["args"][1] == "crashed"
     assert finished["args"][5] == "TypeError"          # error_class
-    assert "projects" in finished["args"][6]           # error_msg
+    assert finished["args"][6] == "TypeError"          # error_msg is the type name
 
 
 @pytest.mark.asyncio

@@ -435,7 +435,7 @@ def _capture_nrem(monkeypatch, reply="SLOT 1: rationale.\nPRINCIPLE: p."):
             status_code = 200
             headers = {}
             def json(self):
-                return {"choices": [{"message": {"content": reply}}]}
+                return {"choices": [{"finish_reason": "stop", "message": {"content": reply}}]}
         return R()
     monkeypatch.setattr(cl, "_post_nrem", fake_post)
     return captured
@@ -453,33 +453,28 @@ async def test_generate_insight_slots_single_call_when_first_pass_complete(monke
 
 
 @pytest.mark.asyncio
-async def test_generate_insight_slots_missing_slot_gets_one_bounded_retry(monkeypatch):
-    """(d) missing-slot → bounded retry → success once the retry supplies it."""
+async def test_generate_insight_slots_missing_slot_is_one_try(monkeypatch):
+    """A missing slot fails the fold. There is no second call."""
     monkeypatch.delenv("MOCK_LLM", raising=False)
     daemon, _ = daemon_with_fake_graph()
-    replies = iter([
-        "SLOT 1: rationale one.\nPRINCIPLE: the principle.",   # slot 2 missing
-        "SLOT 2: rationale two.",                               # retry supplies it
-    ])
     captured = {"prompts": []}
     async def fake_post(client, payload, ceiling_s=None, prompt_chars=None):
         captured["prompts"].append(payload["messages"][1]["content"])
-        reply = next(replies)
         class R:
             status_code = 200
             headers = {}
             def json(self):
-                return {"choices": [{"message": {"content": reply}}]}
+                return {"choices": [{"finish_reason": "stop", "message": {
+                    "content": "SLOT 1: rationale one.\nPRINCIPLE: the principle."}}]}
         return R()
     monkeypatch.setattr(cl, "_post_nrem", fake_post)
     rows = [(1, "Decision A\n\nra", "p", "decision", {}),
             (2, "Decision B\n\nrb", "p", "decision", {})]
     slots = await daemon.generate_insight_slots("E", rows)
-    assert slots == {1: "rationale one.", 2: "rationale two.",
-                     "PRINCIPLE": "the principle."}
-    assert len(captured["prompts"]) == 2
-    assert "pg_id=2" in captured["prompts"][1]
-    assert "pg_id=1" not in captured["prompts"][1]
+    assert slots is None
+    assert daemon._last_llm_missing_slots is True
+    assert daemon._last_backlog_reason == "unparseable"
+    assert len(captured["prompts"]) == 1
 
 
 @pytest.mark.asyncio
@@ -560,8 +555,6 @@ def _thematic_conn_script(insert_id=90):
         # with NO query (its own `if not pg_ids` guard). drop_out_of_scan_
         # refold_rows (C3.1 F1) has no such guard — it always runs, closing
         # 0 rows in this fixture (pg_ids_all is fully in-scan by construction).
-        {"rowcount": 0, "rows": []},
-        # 3. fold dead-letter counts (own-conn SELECT; empty → no dead-lettering)
         {"rowcount": 0, "rows": []},
         # 3b. fetch_active_thematic_rows (output-identity partition,
         #     operator ruling 2026-08-11) — no active summary for the key,
@@ -687,78 +680,23 @@ async def test_thematic_fold_embedding_failure_requeues(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_fact_cycle_dead_lettered_cluster_excluded_from_eligible_census(monkeypatch):
-    """D1 (fact:1189, decision:1121/I7): rec.eligible_clusters/extra used to
-    be computed over ALL density-gated work_items BEFORE the dead-letter
-    filter, so a permanently dead-lettered cluster counted as eligible
-    backlog forever and _consolidation_stall_verdict (coordinator.py) could
-    never clear. Two (project, domain) groups gate this pass ("ops": pg_ids
-    1,2 and "infra": pg_ids 3,4); "infra" is dead-lettered
-    (NREM_FOLD_FAIL_CAP reached). eligible_clusters must report 1 (only
-    "ops"), and the exclusion is visible separately as
-    dead_lettered_clusters=1 — a NEW key, not folded into eligible_clusters'
-    own meaning."""
-    monkeypatch.setattr(cl, "DENSITY_THRESHOLD", 2)
-    monkeypatch.setattr(cl, "NREM_FOLD_FAIL_CAP", 1)
-    monkeypatch.delenv("MOCK_LLM", raising=False)
-    d = datetime.date(2026, 7, 11)
-    rows = [
-        {"pg_id": 1, "content": "fact one", "project": "general", "domain": "ops"},
-        {"pg_id": 2, "content": "fact two", "project": "general", "domain": "ops"},
-        {"pg_id": 3, "content": "fact three", "project": "general", "domain": "infra"},
-        {"pg_id": 4, "content": "fact four", "project": "general", "domain": "infra"},
-    ]
-    # The "infra" group's own content-derived dead-letter identity (decision
-    # 882) — computed the same way the code does, so the fixture is exactly
-    # what a real ledger row would key on.
-    dead_key = cl._fold_identity("fact", [3, 4])
+async def test_thematic_fold_ignores_a_backlog_key(monkeypatch):
+    """Thematic folds make no LLM call and have no backlog rows.
 
+    A blocked key must not drop the group. Re-introducing that filter skips the insert.
+    """
+    monkeypatch.delenv("MOCK_LLM", raising=False)
+    monkeypatch.setattr(cl.llm_backlog, "blocked_keys", lambda kind: {"withheld"})
     daemon, session = daemon_with_fake_graph()
-    conn = StubConn(script=[
-        # 1. _fetch_records — all 4 facts.
-        {"rowcount": 4, "rows": [
-            (1, "general", "fact", None, d, {}),
-            (2, "general", "fact", None, d, {}),
-            (3, "general", "fact", None, d, {}),
-            (4, "general", "fact", None, d, {}),
-        ]},
-        # 2. fold dead-letter counts (D1 — moved BEFORE the census): "infra"
-        # is at cap, "ops" is not mentioned (defaults to 0).
-        {"rowcount": 1, "rows": [(dead_key, 1)]},
-        # 2b. fetch_active_thematic_rows (output-identity partition) — no
-        # active summaries, so nothing is skipped as unchanged.
-        {"rowcount": 0, "rows": []},
-        # 3. coverage census (_fetch_outbox_created_at) — over the ELIGIBLE
-        # ("ops") group's members only; content irrelevant here.
-        {"rowcount": 0, "rows": []},
-        # 4. drop_out_of_scan_refold_rows — always runs.
-        {"rowcount": 0, "rows": []},
-        # 5. INSERT community_summaries — the surviving "ops" group only.
-        {"rowcount": 1, "rows": [(90,)]},
-        # 6. outbox flip UPDATE
-        {"rowcount": 2, "rows": []},
-        # 7. supersession SELECT — no old rows to retire.
-        {"rowcount": 0, "rows": []},
-        # 8. close_ledger_rows DELETE — empty so its purge sub-query never runs.
-        {"rowcount": 0, "rows": []},
-    ])
+    conn = StubConn(script=_thematic_conn_script())
     finish = {}
     _wire_thematic(monkeypatch, daemon, conn, finish)
-    # _wire_thematic already set DENSITY_THRESHOLD=2; re-assert the cap here
-    # is redundant but harmless — keep the fixture self-contained regardless
-    # of call order.
 
-    await daemon._consolidate_clusters(rows)
+    await daemon._consolidate_clusters(_ROWS)
 
-    # Only ONE fold attempted — "infra" was skipped before it ever reached
-    # the fold loop.
-    assert finish["args"][2:5] == (1, 1, 0)          # attempted, succeeded, failed
     assert finish["kwargs"]["eligible_clusters"] == 1
-    assert finish["kwargs"]["extra"]["dead_lettered_clusters"] == 1
-    # Both clusters' members DID meet density — dead-lettering is not a
-    # below_density drop, so no refold_ledger row should be touched as such.
-    assert not any(
-        "below_density" in s for s, _ in conn.executed if "UPDATE refold_ledger" in s)
+    assert finish["kwargs"]["extra"]["dead_lettered_clusters"] == 0
+    assert any(s.startswith("INSERT INTO community_summaries") for s, _ in conn.executed)
 
 
 @pytest.mark.asyncio
@@ -821,7 +759,7 @@ async def test_fold_insight_missing_slots_after_retry_fails_no_write(monkeypatch
     # fold's own judgement ids ([245, 267]), both typed 'decision' here.
     assert cyc.slot_failed == ["decision:245,decision:267"]
     assert cyc.truncation_failed == []
-    assert any("incomplete after retry" in m for m in caplog.messages)
+    assert any("incomplete" in m for m in caplog.messages)
 
 
 # ── MOCK_LLM end-to-end writes honestly (insight path) ────────────────────────
@@ -977,59 +915,22 @@ async def test_insight_truncated_never_reaches_assembly_not_written(monkeypatch)
 
 # ── Fold dead-letter query: truncation_failed ONLY (decision:1205) ────────────
 
-def test_fold_dead_letter_query_unions_truncation_and_slot_never_preservation(monkeypatch):
-    """(e) — operator ruling (same PR as decision:1205): the query must union
-    BOTH live failure classes — truncation_failed (capacity) AND slot_failed
-    (protocol) — and must NEVER read preservation_failed (retired gate,
-    historical rows only). Two independent mutation checks:
-      * re-add `preservation_failed` to the union -> `preservation_failed
-        not in sql` dies.
-      * drop `slot_failed` back out of the union -> `slot_failed" in sql and
-        "||" ... ` dies (a slot_failed row would then never dead-letter,
-        which is exactly what the operator ruled must not happen)."""
-    conn = StubConn(script=[{"rowcount": 0, "rows": []}])
-    monkeypatch.setattr(cl.psycopg2, "connect", lambda *a, **k: conn)
+def test_backlog_retry_rules():
+    """no_context moves only when the largest context grew. cut_off moves only when the reply cap grew.
 
-    cl.fetch_fold_dead_letter_counts()
-
-    sql, params = conn.executed[0]
-    assert "preservation_failed" not in sql
-    assert "truncation_failed" in sql
-    assert "slot_failed" in sql
-    assert "embed_failed" in sql
-    # The three live classes are one union the GROUP BY sees together.
-    assert re.search(
-        r"COALESCE\(extra->'truncation_failed'.*?\)\s*\|\|\s*"
-        r"COALESCE\(extra->'slot_failed'.*?\)\s*\|\|\s*"
-        r"COALESCE\(extra->'embed_failed'.*?\)", sql)
-
-
-def test_fold_dead_letter_counts_reads_whatever_the_unioned_query_returns(monkeypatch):
-    """Positive path — once Postgres has unioned the two live columns, a key
-    that came from ONLY `slot_failed` (e.g. `bravo`) counts identically to
-    one that came from ONLY `truncation_failed` (`alpha`) — the return dict
-    carries no provenance, by design (both are equally live failure
-    classes; the split is for diagnosis via the `extra` JSONB itself, not
-    for which one this gauge honours). A key that only ever appeared under
-    the retired `preservation_failed` (never migrated into either live
-    column) never reaches this dict at all — simulated here by its simple
-    absence from the stubbed row set, since the narrowed query would never
-    select it."""
-    conn = StubConn(script=[
-        {"rowcount": 2, "rows": [
-            ("decision:245,decision:267", 2),   # e.g. sourced from truncation_failed
-            ("decision:345,decision:367", 3),   # e.g. sourced from slot_failed
-        ]},
-    ])
-    monkeypatch.setattr(cl.psycopg2, "connect", lambda *a, **k: conn)
-
-    counts = cl.fetch_fold_dead_letter_counts()
-
-    assert counts == {
-        "decision:245,decision:267": 2,
-        "decision:345,decision:367": 3,
-    }
-    assert "decision:not,seeded" not in counts
+    A pool-id change retries a loop and does not retry no_context or cut_off.
+    """
+    import llm_backlog
+    same = {"pool_id": "p", "largest_ctx": 8192, "largest_reply": 4000, "boot_id": "b"}
+    assert llm_backlog.eligible("no_context", 8192, 4000, "p", "b", same) is False
+    assert llm_backlog.eligible("no_context", 4096, 4000, "other", "b", same) is True
+    assert llm_backlog.eligible("cut_off", 8192, 4000, "other", "b", same) is False
+    bigger_reply = dict(same, largest_reply=8000)
+    assert llm_backlog.eligible("cut_off", 8192, 4000, "p", "b", bigger_reply) is True
+    assert llm_backlog.eligible("loop", 8192, 4000, "p", "b", same) is False
+    assert llm_backlog.eligible("loop", 8192, 4000, "other", "b", same) is True
+    assert llm_backlog.eligible("connection_lost", 8192, 4000, "other", "b", same) is False
+    assert llm_backlog.eligible("connection_lost", 1, 1, "p", "new", same) is True
 
 
 # ── Fold dead-letter identity is content-derived, not label-derived (882) ────

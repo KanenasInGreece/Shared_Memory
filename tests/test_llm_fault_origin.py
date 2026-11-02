@@ -244,6 +244,7 @@ def test_upstream_fault_gets_upstream_origin_header_and_typed_refusal(monkeypatc
     body = b'{"error":{"message":"bad key","type":"invalid_request_error","code":"invalid_api_key"}}'
     proxy = g.AsyncHiveMindProxy()
     proxy.session = _StatusBodySession(401, body)
+    proxy.llm_session = proxy.session
     resp = asyncio.run(proxy.handle_proxy(_FakeReq()))
 
     assert resp.status == 401
@@ -270,11 +271,13 @@ def test_successful_response_never_gets_fault_origin_header(monkeypatch):
     written = _patch_stream_response(monkeypatch)
 
     proxy = g.AsyncHiveMindProxy()
-    proxy.session = _StatusBodySession(200, b'{"choices":[]}')
+    proxy.session = _StatusBodySession(
+        200, b'{"choices":[{"finish_reason":"stop","message":{"content":"ok"}}]}')
+    proxy.llm_session = proxy.session
     resp = asyncio.run(proxy.handle_proxy(_FakeReq()))
 
     assert resp.status == 200
-    assert "X-SM-Fault-Origin" not in written["headers"]
+    assert "X-SM-Fault-Origin" not in resp.headers
 
 
 LIVE_VLLM_EMBED_400 = (
@@ -310,6 +313,7 @@ def test_embedding_400_attaches_overflow_without_provider_text(monkeypatch):
 
     proxy = g.AsyncHiveMindProxy()
     proxy.session = _StatusBodySession(400, LIVE_VLLM_EMBED_400)
+    proxy.llm_session = proxy.session
     resp = asyncio.run(proxy.handle_encoder(_EmbedReq()))
 
     assert resp.status == 400
@@ -351,6 +355,7 @@ def test_reranking_400_has_no_overflow_key(monkeypatch):
 
     proxy = g.AsyncHiveMindProxy()
     proxy.session = _StatusBodySession(400, LIVE_VLLM_EMBED_400)
+    proxy.llm_session = proxy.session
     resp = asyncio.run(proxy.handle_encoder(_RerankReq()))
 
     assert resp.status == 400
@@ -387,6 +392,7 @@ def test_embedding_route_fault_also_gets_upstream_origin_header(monkeypatch):
 
     proxy = g.AsyncHiveMindProxy()
     proxy.session = _StatusBodySession(500, b'{"error":"embedder down"}')
+    proxy.llm_session = proxy.session
     # R-A (HYG round): the encoder path has its own handler now.
     resp = asyncio.run(proxy.handle_encoder(_EmbedReq()))
 
@@ -406,10 +412,13 @@ def test_gateway_origin_error_gets_gateway_fault_origin_header(monkeypatch):
 
     proxy = g.AsyncHiveMindProxy()
     proxy.session = _FailSession(g.ClientError("connection refused"))
+    proxy.llm_session = proxy.session
     resp = asyncio.run(proxy.handle_proxy(_FakeReq()))
 
-    assert resp.status == 503
+    # A generic ClientError after send is a lost connection, not a down move.
+    assert resp.status == 422
     assert resp.headers.get("X-SM-Fault-Origin") == "gateway"
+    assert json.loads(resp.body.decode())["reason"] == "connection_lost"
 
 
 def test_gateway_timeout_gets_gateway_fault_origin_header(monkeypatch):
@@ -420,7 +429,8 @@ def test_gateway_timeout_gets_gateway_fault_origin_header(monkeypatch):
     importlib.reload(g)
 
     proxy = g.AsyncHiveMindProxy()
-    proxy.session = _FailSession(asyncio.TimeoutError())
+    proxy.session = _FailSession(g.ConnectionTimeoutError())
+    proxy.llm_session = proxy.session
     resp = asyncio.run(proxy.handle_proxy(_FakeReq()))
 
     assert resp.status == 504
@@ -436,6 +446,7 @@ def test_gateway_generic_exception_gets_gateway_fault_origin_header(monkeypatch)
 
     proxy = g.AsyncHiveMindProxy()
     proxy.session = _FailSession(RuntimeError("boom"))
+    proxy.llm_session = proxy.session
     resp = asyncio.run(proxy.handle_proxy(_FakeReq()))
 
     assert resp.status == 500
@@ -457,6 +468,7 @@ def test_credentialed_401_records_upstream_credential_fault(monkeypatch, tmp_pat
     body = b'{"error":{"code":"invalid_api_key","type":"invalid_request_error"}}'
     proxy = g.AsyncHiveMindProxy()
     proxy.session = _StatusBodySession(401, body)
+    proxy.llm_session = proxy.session
     resp = asyncio.run(proxy.handle_proxy(_FakeReq()))
 
     assert resp.status == 401
@@ -489,6 +501,7 @@ def test_uncredentialed_401_still_counted_but_not_logged(monkeypatch, tmp_path):
 
     proxy = g.AsyncHiveMindProxy()
     proxy.session = _StatusBodySession(401, b'{"error":{"code":"invalid_api_key"}}')
+    proxy.llm_session = proxy.session
     asyncio.run(proxy.handle_proxy(_FakeReq()))
 
     assert coordinator._llm_fault_counters["http://a:5000"]["llm"]["credential"]["count"] == 1
@@ -506,12 +519,15 @@ def test_gateway_connect_failure_on_credentialed_call_records_gateway_fault(monk
     importlib.reload(g)
 
     proxy = g.AsyncHiveMindProxy()
-    proxy.session = _FailSession(g.ClientError("connection refused"))
+    from aiohttp.client_reqrep import ConnectionKey
+    key = ConnectionKey("127.0.0.1", 9, False, False, None, None, None)
+    proxy.session = _FailSession(g.ClientConnectorError(key, OSError(111, "refused")))
+    proxy.llm_session = proxy.session
     asyncio.run(proxy.handle_proxy(_FakeReq()))
 
     entry = coordinator._llm_fault_counters["http://a:5000"]["gateway"]
     assert entry["count"] == 1
-    assert entry["last"]["class"] == "ClientError"
+    assert entry["last"]["class"] == "ClientConnectorError"
     asyncio.run(coordinator._credential_audit_writer.flush())
     line = json.loads(log_path.read_text().strip())
     assert line["event"] == "gateway_fault"
@@ -530,6 +546,7 @@ def test_empty_body_fault_response_still_classified(monkeypatch):
 
     proxy = g.AsyncHiveMindProxy()
     proxy.session = _StatusBodySession(403, b"")   # empty body -> iter_any yields nothing
+    proxy.llm_session = proxy.session
     resp = asyncio.run(proxy.handle_proxy(_FakeReq()))
 
     assert resp.status == 403
@@ -545,6 +562,7 @@ def test_backend_and_key_attached_stashed_when_credentialed(monkeypatch):
 
     proxy = g.AsyncHiveMindProxy()
     proxy.session = _FailSession(RuntimeError("stop before any real call"))
+    proxy.llm_session = proxy.session
     req = _DictReq()
     asyncio.run(proxy.handle_proxy(req))
 
@@ -561,6 +579,7 @@ def test_key_attached_not_stashed_when_backend_has_no_token(monkeypatch):
 
     proxy = g.AsyncHiveMindProxy()
     proxy.session = _FailSession(RuntimeError("stop before any real call"))
+    proxy.llm_session = proxy.session
     req = _DictReq()
     asyncio.run(proxy.handle_proxy(req))
 
@@ -578,6 +597,7 @@ def test_backend_stash_is_best_effort_on_a_mapping_less_request(monkeypatch):
 
     proxy = g.AsyncHiveMindProxy()
     proxy.session = _FailSession(RuntimeError("stop before any real call"))
+    proxy.llm_session = proxy.session
     resp = asyncio.run(proxy.handle_proxy(_FakeReq()))   # _FakeReq has no __setitem__
     assert resp.status == 500   # reached the generic-exception branch, did not raise TypeError
 
@@ -601,20 +621,20 @@ def test_upstream_success_cannot_spoof_fault_origin_header(monkeypatch):
     written = _patch_stream_response(monkeypatch)
 
     proxy = g.AsyncHiveMindProxy()
-    proxy.session = _StatusBodySession(200, b'{"choices":[]}', headers={
+    proxy.session = _StatusBodySession(200, b'{"choices":[{"finish_reason":"stop","message":{"content":"ok"}}]}', headers={
         "Content-Type": "application/json",
         "X-SM-Fault-Origin": "gateway",
         "X-SM-LLM-Backend": "http://attacker-controlled:9999",
         "WWW-Authenticate": 'Bearer realm="provider"',
     })
+    proxy.llm_session = proxy.session
     resp = asyncio.run(proxy.handle_proxy(_FakeReq()))
 
     assert resp.status == 200
-    assert "X-SM-Fault-Origin" not in written["headers"]
-    assert "WWW-Authenticate" not in written["headers"]
-    # The gateway's OWN assignment (observability, not spoofable via this
-    # path since it's set unconditionally right after the strip) still wins:
-    assert written["headers"]["X-SM-LLM-Backend"] == "http://a:5000"
+    assert "X-SM-Fault-Origin" not in resp.headers
+    assert "WWW-Authenticate" not in resp.headers
+    # The gateway writes its own backend label. The upstream's header is not copied.
+    assert resp.headers["X-SM-LLM-Backend"] == "http://a:5000"
 
 
 def test_upstream_fault_cannot_spoof_a_different_backend_label(monkeypatch):
@@ -633,6 +653,7 @@ def test_upstream_fault_cannot_spoof_a_different_backend_label(monkeypatch):
         "Content-Type": "application/json",
         "X-SM-Fault-Origin": "gateway",  # upstream tries to claim it's the gateway
     })
+    proxy.llm_session = proxy.session
     resp = asyncio.run(proxy.handle_proxy(_FakeReq()))
 
     assert resp.headers.get("X-SM-Fault-Origin") == "upstream"
@@ -673,6 +694,7 @@ def test_classification_exception_never_breaks_the_typed_refusal(monkeypatch):
     body = b'{"error":{"code":"invalid_api_key"}}'
     proxy = g.AsyncHiveMindProxy()
     proxy.session = _StatusBodySession(401, body)
+    proxy.llm_session = proxy.session
     resp = asyncio.run(proxy.handle_proxy(_FakeReq()))
 
     assert resp.status == 401
@@ -697,6 +719,7 @@ def test_classification_exception_on_empty_body_never_breaks_the_response(monkey
 
     proxy = g.AsyncHiveMindProxy()
     proxy.session = _StatusBodySession(403, b"")
+    proxy.llm_session = proxy.session
     resp = asyncio.run(proxy.handle_proxy(_FakeReq()))
 
     assert resp.status == 403  # did not raise out to the generic exception handler
@@ -727,9 +750,11 @@ def test_gzip_compressed_429_body_classifies_as_credential_end_to_end(monkeypatc
     proxy.session = _StatusBodySession(429, compressed, headers={
         "Content-Type": "application/json", "Content-Encoding": "gzip",
     })
+    proxy.llm_session = proxy.session
     resp = asyncio.run(proxy.handle_proxy(_FakeReq()))
 
-    assert resp.status == 429
+    # A lone 429 is queued as 503. Classification still reads the decompressed body.
+    assert resp.status == 503
     entry = coordinator._llm_fault_counters["http://a:5000"]["llm"]
     assert entry["credential"]["count"] == 1
     assert entry["transient"]["count"] == 0
@@ -753,12 +778,14 @@ def test_typed_refusal_never_passes_through_the_compressed_body(monkeypatch):
     proxy.session = _StatusBodySession(429, compressed, headers={
         "Content-Type": "application/json", "Content-Encoding": "gzip",
     })
+    proxy.llm_session = proxy.session
     resp = asyncio.run(proxy.handle_proxy(_FakeReq()))
 
-    assert resp.status == 429
+    # The daemon is not shown the provider body. A lone 429 is the queued 503.
+    assert resp.status == 503
     parsed = json.loads(resp.body.decode())
-    assert parsed["error"] == "upstream_fault"
-    assert parsed["type"] == "insufficient_quota"
+    assert parsed["error"] == "Backend unreachable: ClientConnectorError"
+    assert "insufficient_quota" not in resp.body.decode()
     assert "Content-Encoding" not in resp.headers
     assert not resp.body.startswith(b"\x1f\x8b")  # never gzip framing bytes
 
@@ -790,13 +817,16 @@ def test_client_error_body_never_echoes_exception_text(monkeypatch):
     credentialed_url = "https://user:sk-provider-secret-abc123@evil.example.com/v1/x?key=sk-query-secret-xyz789"
     proxy = g.AsyncHiveMindProxy()
     proxy.session = _InvalidURLLikeSession(g.ClientError, credentialed_url)
+    proxy.llm_session = proxy.session
     resp = asyncio.run(proxy.handle_proxy(_FakeReq()))
 
-    assert resp.status == 503
+    assert resp.status == 422
     body = json.loads(resp.body.decode())
-    assert body["error"] == "Backend unreachable: ClientError"
-    assert "sk-provider-secret-abc123" not in body["error"]
-    assert "sk-query-secret-xyz789" not in body["error"]
+    assert body["error"] == "backlog"
+    assert body["reason"] == "connection_lost"
+    dumped = resp.body.decode()
+    assert "sk-provider-secret-abc123" not in dumped
+    assert "sk-query-secret-xyz789" not in dumped
 
 
 def test_client_error_log_line_scrubs_url_credentials(monkeypatch, caplog):
@@ -815,6 +845,7 @@ def test_client_error_log_line_scrubs_url_credentials(monkeypatch, caplog):
     credentialed_url = "https://user:sk-provider-secret-abc123@evil.example.com/v1/x?key=sk-query-secret-xyz789"
     proxy = g.AsyncHiveMindProxy()
     proxy.session = _InvalidURLLikeSession(g.ClientError, credentialed_url)
+    proxy.llm_session = proxy.session
     with caplog.at_level(logging.ERROR):
         asyncio.run(proxy.handle_proxy(_FakeReq()))
 
@@ -834,6 +865,7 @@ def test_generic_exception_body_and_log_never_echo_text(monkeypatch, caplog):
     credentialed_url = "https://user:sk-provider-secret-abc123@evil.example.com/v1/x?key=sk-query-secret-xyz789"
     proxy = g.AsyncHiveMindProxy()
     proxy.session = _InvalidURLLikeSession(RuntimeError, credentialed_url)
+    proxy.llm_session = proxy.session
     with caplog.at_level(logging.ERROR):
         resp = asyncio.run(proxy.handle_proxy(_FakeReq()))
 

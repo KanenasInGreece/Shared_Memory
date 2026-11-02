@@ -161,6 +161,29 @@ _ALLOWLIST: list[tuple[str, str]] = [
         "someone else's.",
     ),
     (
+        "SM_LLM_POOL_ID",
+        "an internal gateway-to-daemon handoff, same class as AGENT_TOKEN_FD: "
+        "hive_mind_proxy.py sets it when it spawns REM and NREM. It is the hash "
+        "of the active pool at that restart. Templating it would freeze a value "
+        "the next boot is supposed to recompute.",
+    ),
+    (
+        "SM_LLM_LARGEST_CTX",
+        "an internal gateway-to-daemon handoff. The gateway writes the largest "
+        "active n_ctx at spawn. An operator value in .env.example would not be "
+        "the pool the process actually has.",
+    ),
+    (
+        "SM_LLM_LARGEST_REPLY",
+        "an internal gateway-to-daemon handoff. The gateway writes the largest "
+        "empty-prompt reply cap at spawn. Templating it would not follow the pool.",
+    ),
+    (
+        "SM_GATEWAY_BOOT_ID",
+        "an internal gateway-to-daemon handoff. One random value per gateway "
+        "process. A file value would let connection_lost rows retry without a restart.",
+    ),
+    (
         "AGENT_ID",
         "round 3 correction (C4): this is NOT a test/internal variable — "
         "mcp/system-prompt.md:158 documents it as legitimate, operator-facing "

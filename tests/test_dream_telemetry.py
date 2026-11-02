@@ -59,52 +59,12 @@ def test_failure_record_never_raises_on_none(monkeypatch):
     assert rec["tok_s"] is None
 
 
-def test_adaptive_ceiling_floor_and_scaling(monkeypatch):
+def test_ceiling_s_none_records_null_and_not_hit(monkeypatch):
+    """The chat call has no daemon timeout. The metric keys stay, null and false."""
     dt = _fresh(monkeypatch)
-    # small prompt → floor
-    assert dt.adaptive_ceiling(1000, 0) == 600.0
-    # large prompt dominates: 80_000 chars / 100 = 800
-    assert dt.adaptive_ceiling(80_000, 0) == 800.0
-    # unit count dominates: 79 facts * 15 = 1185
-    assert dt.adaptive_ceiling(4400, 79) == 1185.0
-
-
-def test_adaptive_ceiling_output_bound_dominates(monkeypatch):
-    """Decode time tracks the OUTPUT bound, so max_tokens must be able to win.
-
-    The input-only ceiling was blind to it: a widened NREM retry at 16384 tokens
-    needs ~1638s at the shipped 10 tok/s floor but got the 600s floor, so the
-    generation the retry exists to allow was killed by its own timeout — and a
-    timeout is not counted as a truncation, so the capacity failure went unseen.
-    """
-    dt = _fresh(monkeypatch)
-    # 16384 / 10 tok/s = 1638.4s, beating the 600s floor and both input terms
-    assert dt.adaptive_ceiling(1000, 0, max_tokens=16384) == 1638.4
-    # a small bound must NOT drag the ceiling below the floor
-    assert dt.adaptive_ceiling(1000, 0, max_tokens=250) == 600.0
-    # input terms still win when they are the larger cost
-    assert dt.adaptive_ceiling(400_000, 0, max_tokens=8192) == 4000.0
-
-
-def test_adaptive_ceiling_omitting_max_tokens_is_unchanged(monkeypatch):
-    """The new parameter is additive — every pre-existing call site keeps its
-    exact previous ceiling, so REM is untouched by this change."""
-    dt = _fresh(monkeypatch)
-    for prompt_chars, units in ((1000, 0), (80_000, 0), (4400, 79)):
-        assert (dt.adaptive_ceiling(prompt_chars, units)
-                == dt.adaptive_ceiling(prompt_chars, units, max_tokens=0))
-
-
-def test_llm_min_tok_s_is_env_tunable(monkeypatch):
-    """Throughput is purely a property of the operator's hardware — a slower rig
-    must be able to buy more wall-clock without editing code."""
-    monkeypatch.setenv("LLM_MIN_TOK_S", "5")
-    dt = _fresh(monkeypatch)
-    assert dt.adaptive_ceiling(1000, 0, max_tokens=16384) == 3276.8
-    # a zero/absurd setting must not raise ZeroDivisionError, just disable the term
-    monkeypatch.setenv("LLM_MIN_TOK_S", "0")
-    dt = _fresh(monkeypatch)
-    assert dt.adaptive_ceiling(1000, 0, max_tokens=16384) == 600.0
+    rec = dt.record_llm_call("REM", {"usage": {"prompt_tokens": 3}}, ceiling_s=None, wall_s=12.0)
+    assert rec["ceiling_s"] is None
+    assert rec["ceiling_hit"] is False
 
 
 def test_record_grounding_mint_rate(monkeypatch):
@@ -351,8 +311,4 @@ def test_embed_ceiling_degrades_safely_on_nonsense_config(monkeypatch):
     assert dt.embed_ceiling(50_000) == dt.EMBED_TIMEOUT_FLOOR_S
 
 
-def test_adaptive_ceiling_llm_side_is_untouched(monkeypatch):
-    """The embedder work must not have moved the LLM ceiling — its timings stay
-    exactly as configured, no safety factor applied."""
-    dt = _fresh(monkeypatch)
-    assert dt.adaptive_ceiling(1000, 0, max_tokens=16384) == 16384 / dt.LLM_MIN_TOK_S
+

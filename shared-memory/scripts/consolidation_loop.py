@@ -1,11 +1,12 @@
 """NREM daemon: fold (project, domain) clusters into community summaries and assemble insights from parsed slots (decision:1205).
 
-Truncated or empty-slot drafts are discarded, not stored. Dead-letter keys are the cluster's member refs. When the LLM pool is busy, NREM waits on an advisory lock instead of stealing a mid-call slot. Historical preservation_failed extras are ignored.
+Truncated or empty-slot drafts are discarded, not stored. A withheld fold is keyed by its member records. When the LLM pool is busy, NREM waits on an advisory lock instead of stealing a mid-call slot. Historical preservation_failed extras are ignored.
 """
 import sys
 import os
 import re
 import json
+import hashlib
 import gzip
 import contextlib
 import psycopg2
@@ -27,8 +28,9 @@ from nrem_gate import eligible_domain_level_clusters, project_domain_maps, groun
 from nrem_gate import count_domain_level_cycles  # noqa: F401 — re-exported from nrem_gate; importing this file pulls psycopg2, which telemetry does not ship
 from domain_axis import resolve_domains
 from pool_status import pool_roster_state
-from dream_telemetry import (record_llm_call, adaptive_ceiling, embed_ceiling,
+from dream_telemetry import (record_llm_call, embed_ceiling,
                              EMBED_MAX_CHARS, EMBED_MAX_CONTEXT_TOKENS)
+import llm_backlog
 from record_ref import make_ref
 from secure_env import (
     load_split_env, get_secret, require_db_credentials, read_daemon_token_from_fd,
@@ -69,16 +71,13 @@ NREM_ELIGIBILITY_RECHECK_SEC = int(os.environ.get("NREM_ELIGIBILITY_RECHECK_SEC"
 # Probe the LLM pool this often. The idle clock must see REM holding the slot, or quiet-time is measured while the pool is busy.
 NREM_POOL_PROBE_SEC = int(os.environ.get("NREM_POOL_PROBE_SEC", "15"))
 
-# A truncated insight draft is never stored; its output bounds and their reasons live in request_sizing.nrem_insight_bounds (decision:1205). The thematic fold makes no LLM call.
+# A truncated insight draft is never stored. The gateway sizes the reply; this daemon
+# sends no max_tokens. The thematic fold makes no LLM call.
 request_sizing.validate_nrem()
 
-# After one SLOT/PRINCIPLE call, a still-empty slot gets one hardcoded retry for only the missing slots (decision:1205).
-
-# Skip a cluster after this many truncation, slot, or embed failures in the window.
-NREM_FOLD_FAIL_WINDOW = int(os.environ.get("NREM_FOLD_FAIL_WINDOW", "7"))   # days
-NREM_FOLD_FAIL_CAP    = int(os.environ.get("NREM_FOLD_FAIL_CAP", "3"))
-
-# Wait this long for a free LLM slot. 1800s outlasts a ~1000s REM unit; a 300s queue expired mid-generation and NREM deferred forever.
+# Wait this long for a free LLM slot. 1800s outlasts a ~1000s REM unit; a 300s queue
+# expired mid-generation and NREM deferred forever. A reply can outlast this wait; the
+# wait is on the slot, not on the call.
 NREM_FORCED_SLOT_WAIT = float(os.environ.get("NREM_FORCED_SLOT_WAIT", "1800"))
 NREM_FORCED_SLOT_POLL = 10.0
 
@@ -148,7 +147,8 @@ SWEEP_INTERVAL_SEC = int(os.environ.get("NREM_SWEEP_INTERVAL_SEC", "3600"))
 
 # 0.6 suits Gemma; set NREM_TEMPERATURE=0.1 or DREAM_TEMPERATURE for Qwen. This overrides the LM Studio preset.
 NREM_TEMPERATURE = float(os.environ.get("NREM_TEMPERATURE", os.environ.get("DREAM_TEMPERATURE", "0.6")))
-# No fixed NREM_LLM_TIMEOUT. adaptive_ceiling must size on the widest retry bound, or the widened truncation retry is killed by its own timeout.
+# No daemon timeout on the chat call. timeout=None. The operating system
+# decides the connect. A busy backend is waited for, with no deadline.
 
 # One consolidation_runs row per cycle so a silent crash is queryable. The table write can no-op, so every outcome is also logged, and rows past retention are pruned at startup.
 CONSOLIDATION_RUNS_RETENTION_DAYS = int(os.environ.get("CONSOLIDATION_RUNS_RETENTION_DAYS", "30"))
@@ -173,7 +173,7 @@ def _crun_start(cycle_type):
         finally:
             c.close()
     except Exception as e:
-        logger.warning("consolidation_runs: could not open run row (%s) — uninstrumented this cycle", e)
+        logger.warning("consolidation_runs: could not open run row (%s) — uninstrumented this cycle", type(e).__name__)
         return None
 
 
@@ -204,7 +204,7 @@ def _crun_finish(run_id, outcome, attempted=0, succeeded=0, failed=0,
         finally:
             c.close()
     except Exception as e:
-        logger.warning("consolidation_runs: could not finalize run %s (%s)", run_id, e)
+        logger.warning("consolidation_runs: could not finalize run %s (%s)", run_id, type(e).__name__)
 
 
 def _crun_record_terminal(cycle_type, outcome, extra=None, eligible_clusters=None):
@@ -233,7 +233,7 @@ def _crun_record_terminal(cycle_type, outcome, extra=None, eligible_clusters=Non
         finally:
             c.close()
     except Exception as e:
-        logger.warning("consolidation_runs: could not record %s (%s)", outcome, e)
+        logger.warning("consolidation_runs: could not record %s (%s)", outcome, type(e).__name__)
 
 
 def _crun_record_deferred(cycle_type, reason):
@@ -282,37 +282,24 @@ def _crun_recover_and_prune():
         finally:
             c.close()
     except Exception as e:
-        logger.warning("consolidation_runs: startup recovery/prune failed (%s)", e)
+        logger.warning("consolidation_runs: startup recovery/prune failed (%s)", type(e).__name__)
 
 
-def fetch_fold_dead_letter_counts():
-    """Count truncation_failed, slot_failed, and embed_failed hits per member-ref key in the window. Ignore retired preservation_failed (decision:1205). Fail open to {} on DB error."""
-    try:
-        c = psycopg2.connect(PG_CONN, connect_timeout=5)
-        try:
-            with c.cursor() as cur:
-                cur.execute(
-                    "SELECT k, count(*) FROM consolidation_runs,"
-                    " LATERAL jsonb_array_elements_text("
-                    "   COALESCE(extra->'truncation_failed', '[]'::jsonb)"
-                    "   || COALESCE(extra->'slot_failed', '[]'::jsonb)"
-                    "   || COALESCE(extra->'embed_failed', '[]'::jsonb)) AS k"
-                    " WHERE started_at > now() - make_interval(days => %s)"
-                    " GROUP BY k",
-                    (NREM_FOLD_FAIL_WINDOW,))
-                return {r[0]: int(r[1]) for r in cur.fetchall()}
-        finally:
-            c.close()
-    except Exception as e:
-        logger.warning("fold dead-letter: ledger fetch failed (%s) — no dead-lettering this pass", e)
-        return {}
+def _fold_backlog_key(judgement_ids) -> str:
+    """sha256 of the sorted judgement pg_ids.
+
+    Label and metadata type are not part of the key. The raw list can
+    exceed a btree index limit.
+    """
+    ids = ",".join(str(i) for i in sorted({int(x) for x in judgement_ids}))
+    return hashlib.sha256(ids.encode("utf-8")).hexdigest()
 
 
 def _fold_identity(record_type, ids):
-    """Dead-letter identity of a fold candidate (decision:882: key on the member records,
-    never on a display label): the sorted qualified refs of its members, so the key changes
-    whenever membership changes and a new candidate never inherits another's failure
-    history. Duplicates and order in ``ids`` are normalised."""
+    """Identity of a fold candidate: the sorted qualified refs of its members,
+    so the key changes whenever membership changes and a new candidate never
+    inherits another's failure history. Duplicates and order in ``ids`` are
+    normalised. A display label is not the key."""
     return ",".join(sorted(make_ref(record_type, i) for i in {int(x) for x in ids}))
 
 
@@ -334,23 +321,6 @@ def _judgement_fold_identity(judgement_ids, types) -> str:
     ))
 
 
-def fetch_judgement_types(conn, judgement_ids):
-    """``{pg_id: 'decision' | 'retrospective'}`` for a batch of judgement
-    ids — the one extra round-trip ``run_insight_cycle`` needs to compute a
-    correct ``_judgement_fold_identity`` BEFORE calling ``_fold_insight``
-    (which recomputes its own copy post-fetch, from the same source, so the
-    two keys always agree). Missing ids are silently omitted."""
-    if not judgement_ids:
-        return {}
-    with conn.cursor() as cur:
-        cur.execute(
-            "SELECT id, COALESCE(metadata->>'type', 'decision')"
-            "  FROM technical_docs WHERE id = ANY(%s)",
-            (list({int(i) for i in judgement_ids}),),
-        )
-        return {r[0]: r[1] for r in cur.fetchall()}
-
-
 def _fetch_outbox_created_at(pg_ids):
     """pg_id → neo4j_outbox.created_at: the durable write-time index over the
     un-consolidated working set (ADR-018). The outbox is self-cleaning, so a
@@ -370,7 +340,7 @@ def _fetch_outbox_created_at(pg_ids):
         finally:
             c.close()
     except Exception as e:
-        logger.warning("consolidation_runs: outbox timestamp fetch failed (%s)", e)
+        logger.warning("consolidation_runs: outbox timestamp fetch failed (%s)", type(e).__name__)
         return {}
 
 
@@ -402,14 +372,20 @@ class _CycleRec:
     __slots__ = ("attempted", "succeeded", "failed",
                  "eligible_clusters", "eligible_oldest_age",
                  "dead_lettered_clusters", "run_id",
-                 # decision:1205 retired preservation_* with the anchor gate. truncation_* is finish_reason=length; slot_* is a SLOT/PRINCIPLE still missing after one retry; fold_dead_letter is keys the cap skipped.
+                 # truncation_* is finish_reason=length. slot_* is a SLOT or
+                 # PRINCIPLE still missing after the one call. fold_dead_letter
+                 # is folds withheld by a backlog row.
                  "truncation_failures", "truncation_failed",
                  "slot_failures", "slot_failed", "fold_dead_letter",
                  "embed_failures", "embed_failed",
                  "insight_gate_skips",
-                 # Re-fold would rewrite the active summary byte-identically, so nothing is embedded. Excluded from eligible_clusters and counted on its own.
+                 # Re-fold would rewrite the active summary byte-identically,
+                 # so nothing is embedded. Excluded from eligible_clusters
+                 # and counted on its own.
                  "unchanged_clusters",
-                 # decision:1121: judgement reach of exactly 1 cannot fold an insight, so it is excluded from eligible_clusters and counted on its own.
+                 # decision:1121: judgement reach of exactly 1 cannot fold an
+                 # insight, so it is excluded from eligible_clusters and
+                 # counted on its own.
                  "singleton_clusters")
 
     def __init__(self):
@@ -417,7 +393,8 @@ class _CycleRec:
         # Captured after the gate and before folding, so a mid-fold crash still records what was eligible. None until set.
         self.eligible_clusters = None
         self.eligible_oldest_age = None
-        # fact:1189, decision:1121: clusters the fail cap excluded this pass. Separate from eligible_clusters; 0 once a census has run.
+        # Folds excluded this cycle because a backlog row withheld them,
+        # including a refold. Separate from eligible_clusters.
         self.dead_lettered_clusters = 0
         # This cycle's consolidation_runs id, stamped on each summary it writes.
         self.run_id = None
@@ -470,7 +447,8 @@ class _CycleRec:
             return None
         out = {
             "truncation_failures": self.truncation_failures,
-            # decision:1205: a missing SLOT/PRINCIPLE after one retry is a protocol failure, not a capacity failure.
+            # A missing SLOT or PRINCIPLE after the one call is unparseable. It is not a
+            # capacity failure.
             "slot_failures": self.slot_failures,
             "embed_failures": self.embed_failures,
             # fact:1189, decision:1121: clusters the census excluded. Not an alias for eligible_clusters.
@@ -515,15 +493,25 @@ def _auth_headers() -> dict:
     return {}
 
 
+def _response_usage(resp):
+    """Non-null usage on a JSON object. A non-JSON body has none."""
+    try:
+        body = resp.json()
+    except Exception:
+        return None
+    if isinstance(body, dict) and body.get("usage") is not None:
+        return body["usage"]
+    return None
+
+
 def _routing_refusal(resp) -> dict | None:
-    """Recognize a gateway routing refusal — 422 ``no_eligible_backend`` or 503
-    ``backend_at_capacity`` (Model_Attributes_Routing_Plan_2026-08-18 F-1/F-2),
-    both stamped ``X-SM-Fault-Origin: gateway``. Keys on the STRUCTURED BODY +
-    that header, never on status alone — a real provider 422/503 passed
-    through the proxy must never be misread as the gateway declining to place
-    the job. Returns ``{"error", "constraint", "role"}`` or None. (Mirrors
-    rem_loop.py's helper of the same name — no shared module is owned by
-    Unit 2's file list, so this is intentionally duplicated, not imported.)"""
+    """Gateway refusal: no_eligible_backend, backend_at_capacity, or backlog.
+
+    Keys on the body and X-SM-Fault-Origin: gateway. A provider 422
+    passed through must not look like the gateway declining. Duplicated
+    from rem_loop on purpose: the two daemons do not import each other.
+    A backlog reason is the daemon's to store.
+    """
     if resp.status_code not in (422, 503):
         return None
     if resp.headers.get("X-SM-Fault-Origin") != "gateway":
@@ -532,7 +520,20 @@ def _routing_refusal(resp) -> dict | None:
         body = resp.json()
     except Exception:
         return None
-    error = body.get("error") if isinstance(body, dict) else None
+    if not isinstance(body, dict):
+        return None
+    error = body.get("error")
+    if error == "backlog":
+        raw_usage = body.get("usage")
+        usage = raw_usage if raw_usage is not None else None
+        reason = body.get("reason") or "unrecognised"
+        return {
+            "error": "backlog",
+            "reason": reason,
+            "constraint": reason,
+            "specimen": body.get("specimen") or "",
+            "usage": usage,
+        }
     if error not in ("no_eligible_backend", "backend_at_capacity"):
         return None
     return {"error": error, "constraint": body.get("constraint")}
@@ -542,6 +543,14 @@ logging.basicConfig(level=logging.INFO)
 # This process's root logger is INFO, which would journal every httpx call. WARNING keeps real client failures.
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger("ConsolidationDaemon")
+
+
+class _ReplyUnusable(Exception):
+    """The HTTP call returned and then handling the body failed.
+
+    A connect failure is not this. The caller backlogs unparseable only
+    once a reply exists, so a dark gateway stays queued.
+    """
 
 
 async def _post_nrem(client: httpx.AsyncClient, payload: dict,
@@ -566,18 +575,45 @@ async def _post_nrem(client: httpx.AsyncClient, payload: dict,
     )
     ok = resp.status_code == 200
     rj = None
-    if ok:
+    note = None
+    specimen = None
+    refusal = _routing_refusal(resp)
+    if refusal and refusal.get("error") == "backlog":
+        ok = False
+        note = f"backlog_{refusal.get('reason')}"
+        specimen = refusal.get("specimen") or None
+        if refusal.get("usage"):
+            rj = {"usage": refusal["usage"]}
+    elif ok:
         try:
             rj = resp.json()
         except Exception:
             rj = None
-    note = None
-    if not ok:
-        refusal = _routing_refusal(resp)
+            ok = False
+            note = "unparseable"
+    else:
         note = f"routing_refused_{refusal['error']}" if refusal else f"http_{resp.status_code}"
-    record_llm_call("NREM", rj, backend=resp.headers.get("X-SM-LLM-Backend"),
-                    wall_s=time.monotonic() - _start, ceiling_s=ceiling_s,
-                    ok=ok, note=note, prompt_chars=prompt_chars)
+    if ok and _truncated(rj):
+        try:
+            text = (rj.get("choices") or [{}])[0].get("message", {}).get("content") or ""
+        except (AttributeError, IndexError, TypeError):
+            text = ""
+        text = text if isinstance(text, str) else ""
+        n = 500
+        try:
+            n = int(os.environ.get("REM_TRUNCATION_SPECIMEN_CHARS", "500"))
+        except (TypeError, ValueError):
+            n = 500
+        specimen = " ".join(text[-n:].split()) if n > 0 else ""
+        note = "loop" if request_sizing.reply_is_loop(text) else "cut_off"
+        ok = False
+    try:
+        record_llm_call("NREM", rj, backend=resp.headers.get("X-SM-LLM-Backend"),
+                        wall_s=time.monotonic() - _start, ceiling_s=ceiling_s,
+                        ok=ok, note=note, specimen=specimen, prompt_chars=prompt_chars)
+    except Exception as exc:
+        logger.error("NREM: telemetry failed (%s)", type(exc).__name__)
+        raise _ReplyUnusable() from exc
     return resp
 
 
@@ -2341,10 +2377,17 @@ class ConsolidationDaemon:
         )
         self.is_running = True
         self.last_log_merge_date = None
-        # Set around generate_insight_slots so the caller can tell finish_reason=length from an ordinary failure without changing the return tests mock.
+        # The caller tells a cut-off from a transport failure. The return
+        # stays None either way.
         self._last_llm_truncated = False
-        # decision:1205: a SLOT or PRINCIPLE still missing after its one retry. Reset and read like _last_llm_truncated; the two flags are mutually exclusive per call.
+        # A missing SLOT or PRINCIPLE after the one call. Mutually exclusive
+        # with a cut-off.
         self._last_llm_missing_slots = False
+        self._last_backlog_reason = None
+        self._last_backlog_specimen = ""
+        self._last_backlog_paid = True
+        # Paid folds whose backlog row could not be written. A respawn drops it.
+        self._withheld_folds: set[str] = set()
         # datetime.min so the first idle tick sweeps immediately and drains clusters that became eligible while down.
         self.last_sweep_time = datetime.min
         # One unanchored graph sweep per process, for facts with no outbox row. Later sweeps use the ledger.
@@ -2457,12 +2500,13 @@ class ConsolidationDaemon:
             yield rec
         except Exception as e:
             logger.error(
-                "Consolidation run [%s] CRASHED after %d/%d folds: %s: %s (run_id=%s)",
+                "Consolidation run [%s] CRASHED after %d/%d folds: %s (run_id=%s)",
                 cycle_type, rec.succeeded, rec.attempted,
-                type(e).__name__, str(e)[:200], run_id)
+                type(e).__name__, run_id)
+            err_name = type(e).__name__
             await loop.run_in_executor(None, lambda: _crun_finish(
                 run_id, "crashed", rec.attempted, rec.succeeded, rec.failed,
-                type(e).__name__, str(e),
+                err_name, err_name,
                 eligible_clusters=rec.eligible_clusters,
                 eligible_oldest_age=rec.eligible_oldest_age,
                 extra=rec.extra()))
@@ -2602,31 +2646,23 @@ class ConsolidationDaemon:
             return None
         return None
 
-    # The thematic fold makes no LLM call. decision:1205: insight text is assembled from bounded distillates, not written whole by the LLM.
+    # The thematic fold makes no LLM call. decision:1205: insight text
+    # is assembled from bounded distillates, not written whole by the LLM.
 
     async def _call_insight_llm(self, prompt, entity, units, items=None,
                                 only_ids=None, need_principle=True):
-        """One truncation-bounded LLM call for the insight-slot protocol
-        (decision:1205) — widen-once-then-fail: one retry at a wider token
-        bound before the fold fails. Returns the raw
-        response text, or None. On persistent truncation
-        self._last_llm_truncated is set True; on a non-200 status or a
-        network/parse exception it stays False — a GENERIC call failure,
-        distinct from a capacity failure (see _fold_insight's three-way
-        branch on a falsy ``generate_insight_slots`` return).
+        """One LLM call for the insight-slot protocol.
 
-        Under MOCK_LLM=1 (multi-role review F2): fabricates a well-formed
-        raw SLOT/PRINCIPLE protocol TEXT for exactly the judgements THIS
-        prompt asked for (``_select_insight_items`` mirrors
-        ``_build_insight_prompt``'s own ``only_ids``/``need_principle``
-        selection, so a mocked reply matches a real one's shape) and
-        returns it WITHOUT touching the network. This is the ONLY place
-        MOCK_LLM is checked on the insight-fold path — the caller
-        (``generate_insight_slots``) runs its REAL parse/missing-slot-retry/
-        assembly logic on the result exactly as it would on a live
-        response, so a mocked cycle exercises the identical code path
-        (never a shortcut around ``parse_insight_slots`` or the retry
-        logic)."""
+        Returns the raw text, or None. The daemon sends no max_tokens.
+        A cut-off or loop sets _last_llm_truncated and a backlog reason;
+        it is not parsed. MOCK_LLM=1 returns protocol text and does not
+        touch the network, so the caller still runs the real parser.
+        Titles and ids are not taken from the model.
+        """
+        self._last_backlog_reason = None
+        self._last_backlog_specimen = ""
+        self._last_backlog_paid = False
+        resp = None
         if os.getenv("MOCK_LLM") == "1":
             selected = _select_insight_items(items or [], only_ids)
             lines = [f"SLOT {it['pg_id']}: Mocked distillate for {it['pg_id']} ({it['type']})."
@@ -2635,57 +2671,96 @@ class ConsolidationDaemon:
                 lines.append(f"PRINCIPLE: Mocked principle for {entity} "
                              f"over {len(selected)} judgement(s).")
             return "\n".join(lines)
-        bounds = request_sizing.nrem_insight_bounds()
-        _ceiling = adaptive_ceiling(len(prompt), units=units, max_tokens=bounds[-1])
         try:
-            async with httpx.AsyncClient(timeout=_ceiling, trust_env=False) as client:
-                for i, max_tokens in enumerate(bounds):
-                    resp = await _post_nrem(client, {
-                        "model": LLM_MODEL,
-                        "messages": [
-                            {"role": "system", "content": "You are a technical knowledge curator. Write your response directly — no reasoning steps, no thinking tokens, no internal deliberation before the answer. Output ONLY the requested SLOT/PRINCIPLE lines, nothing else."},
-                            {"role": "user", "content": prompt},
-                        ],
-                        "temperature": NREM_TEMPERATURE,
-                        "max_tokens": max_tokens,
-                    }, ceiling_s=_ceiling, prompt_chars=len(prompt))
-                    refusal = _routing_refusal(resp)
-                    if refusal:
-                        # A gateway routing refusal is a config gap. Do not set the truncation or slot flags, and do not retry the wider bound; the ledger stays open.
+            async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
+                resp = await _post_nrem(client, {
+                    "model": LLM_MODEL,
+                    "messages": [
+                        {"role": "system", "content": "You are a technical knowledge curator. Write your response directly — no reasoning steps, no thinking tokens, no internal deliberation before the answer. Output ONLY the requested SLOT/PRINCIPLE lines, nothing else."},
+                        {"role": "user", "content": prompt},
+                    ],
+                    "temperature": NREM_TEMPERATURE,
+                }, ceiling_s=None, prompt_chars=len(prompt))
+                refusal = _routing_refusal(resp)
+                if refusal and refusal["error"] == "backlog":
+                    reason = refusal["reason"]
+                    specimen = refusal.get("specimen") or ""
+                    self._last_backlog_reason = reason
+                    self._last_backlog_specimen = specimen
+                    self._last_backlog_paid = not (
+                        reason == "no_context" and refusal.get("usage") is None)
+                    if reason in ("cut_off", "loop"):
+                        self._last_llm_truncated = True
+                    if specimen:
                         logger.warning(
-                            "NREM: insight fold for '%s' REFUSED by gateway "
-                            "routing (constraint=%s) — fold skipped, "
-                            "ledger rows stay open for the next sweep",
-                            entity, refusal["constraint"],
-                        )
+                            "NREM: insight fold for '%s' %s specimen: %s",
+                            entity, reason, specimen)
+                    return None
+                if refusal:
+                    logger.warning(
+                        "NREM: insight fold for '%s' REFUSED by gateway "
+                        "routing (constraint=%s) — fold stays queued",
+                        entity, refusal.get("constraint"),
+                    )
+                    return None
+                if resp.status_code != 200:
+                    usage = _response_usage(resp)
+                    if usage is not None:
+                        self._last_backlog_reason = "connection_lost"
+                        self._last_backlog_paid = True
                         return None
-                    if resp.status_code != 200:
-                        logger.error(f"Insight slot synthesis failed with status {resp.status_code}: {resp.text}")
-                        return None
+                    logger.error(
+                        "Insight slot synthesis failed with status %s",
+                        resp.status_code)
+                    return None
+                try:
                     rj = resp.json()
-                    if not _truncated(rj):
-                        return rj["choices"][0]["message"]["content"]
-                    if i == 0:
-                        logger.warning(
-                            "NREM: insight slots for '%s' TRUNCATED at max_tokens=%d — "
-                            "retrying ONCE at %d before failing the fold",
-                            entity, max_tokens, bounds[1])
-                # A truncated draft never reaches the parser.
-                self._last_llm_truncated = True
-                logger.error(
-                    "NREM: insight slots for '%s' TRUNCATED again at max_tokens=%d "
-                    "(finish_reason=length) — draft discarded (capacity failure). "
-                    "Raise NREM_MAX_TOKENS_INSIGHT if this cluster is legitimately large.",
-                    entity, bounds[-1])
-                return None
+                except Exception:
+                    logger.error(
+                        "Insight slot synthesis was not JSON (status=%s)",
+                        resp.status_code)
+                    return None
+                if _truncated(rj):
+                    try:
+                        text = (rj.get("choices") or [{}])[0].get("message", {}).get("content") or ""
+                    except (AttributeError, IndexError, TypeError):
+                        text = ""
+                    text = text if isinstance(text, str) else ""
+                    reason = "loop" if request_sizing.reply_is_loop(text) else "cut_off"
+                    self._last_llm_truncated = True
+                    self._last_backlog_reason = reason
+                    self._last_backlog_specimen = ""
+                    self._last_backlog_paid = True
+                    logger.warning("NREM: insight fold for '%s' %s — draft discarded", entity, reason)
+                    return None
+                if _finish_reason(rj) != "stop":
+                    self._last_backlog_reason = "unparseable"
+                    self._last_backlog_paid = True
+                    return None
+                choice = (rj.get("choices") or [None])[0]
+                message = choice.get("message") if isinstance(choice, dict) else None
+                content = message.get("content") if isinstance(message, dict) else None
+                if not isinstance(content, str):
+                    self._last_backlog_reason = "unparseable"
+                    self._last_backlog_paid = True
+                    return None
+                return content
+        except _ReplyUnusable:
+            self._last_backlog_reason = "unparseable"
+            self._last_backlog_paid = True
+            return None
         except Exception as e:
-            logger.error(f"Insight slot synthesis error for {entity}: {type(e).__name__}: {str(e)}")
+            if resp is not None and self._last_backlog_reason is None:
+                self._last_backlog_reason = "unparseable"
+                self._last_backlog_paid = True
+            logger.error(
+                "Insight slot synthesis error for %s: %s", entity, type(e).__name__)
             return None
 
     async def generate_insight_slots(self, entity, rows, previous_insight=None,
                                      reversal_lines=None):
-        """§3.2 (decision:1205, v0.8.71) — ONE LLM call filling every
-        per-judgement SLOT distillate plus the closing PRINCIPLE paragraph,
+        """One LLM call filling every per-judgement SLOT distillate plus the
+        closing PRINCIPLE paragraph,
         via the strictly-parsed SLOT/PRINCIPLE protocol
         (``_build_insight_prompt`` / ``parse_insight_slots``). The insight's
         assembled ``content`` is built BY CODE from these slots
@@ -2693,59 +2768,45 @@ class ConsolidationDaemon:
         the caller writes straight to Tier 3; it returns only the bounded
         distillates.
 
-        A SLOT or PRINCIPLE still empty after the first parse gets ONE
-        bounded retry asking only for what is missing; still missing after
-        that FAILS THE UNIT — returns None with
-        self._last_llm_missing_slots=True (self._last_llm_truncated names
-        the OTHER failure mode, real truncation off ``_call_insight_llm``;
-        the two are mutually exclusive per call). Returns
-        ``{pg_id: text, "PRINCIPLE": text}`` on success. ``rows`` is
-        ``_fold_insight``'s own fetch shape (pg_id, content, project, rtype,
-        meta), ascending pg_id."""
+        A SLOT or PRINCIPLE still empty after the one call fails the
+        fold. No partial insight is written. Returns
+        ``{pg_id: text, "PRINCIPLE": text}`` on success.
+        """
         self._last_llm_truncated = False
         self._last_llm_missing_slots = False
+        self._last_backlog_reason = None
+        self._last_backlog_specimen = ""
         items = _insight_slot_items(rows, request_sizing.nrem_insight_item_chars())
         expected_ids = {it["pg_id"] for it in items}
 
-        # MOCK_LLM is handled only inside _call_insight_llm, so a mocked cycle still runs this parser and the one retry.
+        # MOCK_LLM is handled only inside _call_insight_llm, so a mocked cycle still
+        # runs this parser.
         prompt = _build_insight_prompt(entity, items, previous_insight=previous_insight,
                                        reversal_lines=reversal_lines)
         text = await self._call_insight_llm(prompt, entity, units=max(1, len(items)),
                                             items=items)
         if text is None:
             return None
-        slots, principle = parse_insight_slots(text)
+        try:
+            slots, principle = parse_insight_slots(text)
+        except Exception as exc:
+            logger.error(
+                "NREM: insight slots for '%s' unparseable (%s)",
+                entity, type(exc).__name__)
+            self._last_backlog_reason = "unparseable"
+            self._last_backlog_paid = True
+            self._last_llm_missing_slots = True
+            return None
 
         missing_ids = sorted(expected_ids - slots.keys())
         missing_principle = principle is None
         if missing_ids or missing_principle:
-            logger.warning(
-                "NREM: insight slots for '%s' missing pg_id(s) %s%s after "
-                "first pass — one bounded retry.",
-                entity, missing_ids, " + PRINCIPLE" if missing_principle else "")
-            retry_prompt = _build_insight_prompt(
-                entity, items, previous_insight=previous_insight,
-                reversal_lines=reversal_lines,
-                only_ids=set(missing_ids), need_principle=missing_principle)
-            retry_text = await self._call_insight_llm(
-                retry_prompt, entity, units=max(1, len(missing_ids)),
-                items=items, only_ids=set(missing_ids), need_principle=missing_principle)
-            if retry_text is None:
-                return None
-            r_slots, r_principle = parse_insight_slots(retry_text)
-            for pg_id in missing_ids:
-                if pg_id in r_slots:
-                    slots[pg_id] = r_slots[pg_id]
-            if missing_principle and r_principle is not None:
-                principle = r_principle
-            missing_ids = sorted(expected_ids - slots.keys())
-            missing_principle = principle is None
-
-        if missing_ids or missing_principle:
             self._last_llm_missing_slots = True
+            self._last_backlog_reason = "unparseable"
+            self._last_backlog_paid = True
             logger.error(
-                "NREM: insight slots for '%s' still missing after retry — "
-                "pg_id(s) %s%s — fold fails (no partial insight ever written).",
+                "NREM: insight slots for '%s' missing pg_id(s) %s%s — "
+                "fold fails (no partial insight ever written).",
                 entity, missing_ids, " + PRINCIPLE" if missing_principle else "")
             return None
 
@@ -2794,7 +2855,7 @@ class ConsolidationDaemon:
 
         except Exception as e:
             # Nothing to re-queue: the entry points are still on the durable ledger.
-            logger.error(f"Consolidation cycle failed: {str(e)}")
+            logger.error("Consolidation cycle failed (%s)", type(e).__name__)
 
     async def _find_grounded_fact_groups(self):
         """✅ THE v2 FACT GATE'S DISCOVERY STEP (plan §2.1, §4.2 NREM Path A).
@@ -2866,7 +2927,9 @@ class ConsolidationDaemon:
                 None, lambda: psycopg2.connect(PG_CONN, connect_timeout=5)
             )
         except Exception as e:
-            logger.error(f"Lineage invalidation [{context}]: Postgres unavailable: {str(e)}")
+            logger.error(
+                "Lineage invalidation [%s]: Postgres unavailable (%s)",
+                context, type(e).__name__)
             return
         try:
             retired, opened = await loop.run_in_executor(
@@ -2981,7 +3044,7 @@ class ConsolidationDaemon:
 
         except Exception as e:
             # Nothing to re-queue: the ledger is durable and the next sweep retries.
-            logger.error(f"Ledger sweep failed: {str(e)}")
+            logger.error("Ledger sweep failed (%s)", type(e).__name__)
 
     async def run_global_sweep(self):
         """Unanchored global density sweep — the SAME (project, domain) gate as
@@ -3014,7 +3077,7 @@ class ConsolidationDaemon:
 
         except Exception as e:
             # Nothing to re-queue: the next sweep re-evaluates the whole graph.
-            logger.error(f"Global sweep failed: {str(e)}")
+            logger.error("Global sweep failed (%s)", type(e).__name__)
 
     async def _consolidate_clusters(self, rows):
         """Shared consolidation body: (project, domain) re-gating, the
@@ -3133,26 +3196,17 @@ class ConsolidationDaemon:
                 )
             ]
 
-            # Fetch the fail cap before the census so a capped cluster is not counted as backlog (fact:1189).
-            dead_letter = await loop.run_in_executor(None, fetch_fold_dead_letter_counts)
-
-            # Partition before the census: label is display-only and fold_key is the member-ref identity (decision 882). An old dead-letter row can still skip a cluster until the window ages out.
-            eligible_work_items = []
+            # Thematic folds make no LLM call and have no backlog rows. The read still
+            # runs so a dark backlog skips the cycle.
+            try:
+                await loop.run_in_executor(None, lambda: llm_backlog.blocked_keys("fold"))
+            except Exception as exc:
+                logger.warning(
+                    "NREM: backlog read failed (%s) — skipping the cycle",
+                    type(exc).__name__)
+                return
+            eligible_work_items = list(work_items)
             dead_lettered_count = 0
-            for project, section, contents, pg_ids in work_items:
-                label = f"domain:{project}/{section or SECTION_NONE}"
-                fold_key = _fold_identity("fact", pg_ids)
-                if dead_letter.get(fold_key, 0) >= NREM_FOLD_FAIL_CAP:
-                    dead_lettered_count += 1
-                    rec.fold_dead_letter.append(label)
-                    logger.error(
-                        "NREM fold dead-letter: '%s' hit the truncation, slot, or embed "
-                        "cap %d time(s) within %dd (cap %d) — SKIPPING this cluster. "
-                        "Operator reset = window expiry or consolidation_runs cleanup.",
-                        label, dead_letter[fold_key], NREM_FOLD_FAIL_WINDOW,
-                        NREM_FOLD_FAIL_CAP)
-                    continue
-                eligible_work_items.append((project, section, contents, pg_ids))
 
             # Compare the fold's rendered text to the active row before embedding — lines are in ascending pg_id order, so the text is deterministic and a byte-identical rewrite is skipped (decision:1242: deterministic fold skip).
             active_rows = await loop.run_in_executor(
@@ -3181,7 +3235,9 @@ class ConsolidationDaemon:
                     "be byte-identical, skipped without embedding or write "
                     "(unchanged_clusters).", rec.unchanged_clusters)
 
-            # Census after the gate, after dead-letter exclusion, and after the unchanged skip. Those two counts stay separate from eligible_clusters.
+            # Census after the gate, after withheld folds are excluded, and
+            # after the unchanged skip. Those two counts stay separate from
+            # eligible_clusters.
             member_id_lists = [list(w[3]) for w in fold_work_items]
             all_member_ids = [pid for ids in member_id_lists for pid in ids]
             ts_map = await loop.run_in_executor(
@@ -3255,7 +3311,7 @@ class ConsolidationDaemon:
                     logger.error(
                         "Graph sync failed for no-successor retired summaries %s — "
                         "Postgres retirement is committed; ledger sweep reconciliation will retry: %s",
-                        retired_ids, e,
+                        retired_ids, type(e).__name__,
                     )
 
             # Every item folds at domain level with an empty entity. These are constants, not per-item fields.
@@ -3420,7 +3476,7 @@ class ConsolidationDaemon:
                     )
                 except Exception as e:
                     await loop.run_in_executor(None, conn.rollback)
-                    logger.error("Database write error for %s: %s", label, e)
+                    logger.error("Database write error for %s (%s)", label, type(e).__name__)
                     rec.fold(False)
                     self._requeue(pg_ids)
                     continue
@@ -3442,7 +3498,7 @@ class ConsolidationDaemon:
                     logger.error(
                         "Graph sync failed for %s — summary %s is committed; "
                         "ledger reconciliation will retry: %s",
-                        label, summary_pg_id, e,
+                        label, summary_pg_id, type(e).__name__,
                     )
 
             # decision:2778: drop below-density and out-of-scan refold rows after the fold loop so non-gating rows are retired first
@@ -3462,11 +3518,12 @@ class ConsolidationDaemon:
         except Exception as e:
             # Record crashed, then re-raise so the caller's handler still runs.
             logger.error(
-                "Consolidation run [fact_consolidation] CRASHED after %d/%d folds: %s: %s (run_id=%s)",
-                rec.succeeded, rec.attempted, type(e).__name__, str(e)[:200], run_id)
+                "Consolidation run [fact_consolidation] CRASHED after %d/%d folds: %s (run_id=%s)",
+                rec.succeeded, rec.attempted, type(e).__name__, run_id)
+            err_name = type(e).__name__
             await loop.run_in_executor(None, lambda: _crun_finish(
                 run_id, "crashed", rec.attempted, rec.succeeded, rec.failed,
-                type(e).__name__, str(e), extra=rec.extra(),
+                err_name, err_name, extra=rec.extra(),
                 eligible_clusters=rec.eligible_clusters,
                 eligible_oldest_age=rec.eligible_oldest_age))
             raise
@@ -3587,8 +3644,8 @@ class ConsolidationDaemon:
                                fact:1189) — never a gate predicate (I1: "no
                                gate predicate reads an entity name" is about
                                GATING, not this string's value; traced every
-                               reader before this changed — dead-letter
-                               identity keys on `_judgement_fold_identity`,
+                               reader before this changed — the backlog row
+                               keys on `_fold_backlog_key`,
                                never on `entity`, decision 882's fold-key/
                                display-label split — and the insight write
                                is always-INSERT with no upsert key at all,
@@ -3613,10 +3670,9 @@ class ConsolidationDaemon:
                                so a Retrospective pg_id is correctly marked
                                `consolidated`.
           ``judgement_types`` -- ``{pg_id: 'Decision'|'Retrospective'}`` for
-                               this component (from the walk's own `labels`)
-                               — lets a caller build a per-id dead-letter key
-                               (`_judgement_fold_identity`) without a second
-                               Postgres round-trip.
+                               this component (from the walk's own `labels`).
+                               The backlog row does not use this map. Its key
+                               is `_fold_backlog_key`.
           ``has_retrospective`` -- whether this SPECIFIC component contains a
                                Retrospective (G2 is evaluated on the GROUP's
                                full reach, not per component — a lone
@@ -3681,7 +3737,9 @@ class ConsolidationDaemon:
         self._insight_gate_skips = gate_skips
         return clusters
 
-    # Insight text is each judgement's title and rationale; edge detail stays in insight_cypher_query, and _fold_insight does not open a Neo4j session.
+    # Insight text is each judgement's title and rationale. Edge detail
+    # stays in insight_cypher_query, and _fold_insight does not open a
+    # Neo4j session.
 
     async def run_insight_cycle(self):
         """Insight consolidation pass — ledger-driven like run_ledger_sweep
@@ -3692,16 +3750,16 @@ class ConsolidationDaemon:
         genuinely new/grown set, APPENDING a reference on an exact 'same'
         match — criterion G), then fold what remains. Failures need no
         re-queue — the ledger is durable and the next sweep retries.
-        A failing component is attempted once per pass: it counts one failure
-        per pass so NREM_FOLD_FAIL_CAP counts sweeps, not the groups that reach
-        it, and attempted/failed counts exclude same-pass repeats."""
+        A failing component is attempted once per pass. A backlogged
+        fold is excluded before the census, or the stall verdict fires.
+        """
         loop = asyncio.get_running_loop()
         try:
             conn = await loop.run_in_executor(
                 None, lambda: psycopg2.connect(PG_CONN, connect_timeout=5)
             )
         except Exception as e:
-            logger.error(f"Insight cycle: Postgres unavailable: {str(e)}")
+            logger.error("Insight cycle: Postgres unavailable (%s)", type(e).__name__)
             return
         try:
             async with self._record_cycle("insight") as rec:
@@ -3710,7 +3768,9 @@ class ConsolidationDaemon:
                     stuck = await loop.run_in_executor(None, lambda: fetch_unreconciled_insights(conn))
                 except Exception as e:
                     # A failed reconciliation query leaves nothing to reconcile this pass.
-                    logger.warning(f"Insight cycle: reconciliation query failed: {str(e)}")
+                    logger.warning(
+                        "Insight cycle: reconciliation query failed (%s)",
+                        type(e).__name__)
                     stuck = []
                 for summary_id, entity, src_ids in stuck:
                     logger.info(
@@ -3728,31 +3788,35 @@ class ConsolidationDaemon:
                 refolds = await loop.run_in_executor(
                     None, lambda: fetch_refold_insights(conn, retro_ids)
                 )
-                # The dead-letter cap is checked here so _fold_insight's query order stays unchanged.
-                dead_letter = await loop.run_in_executor(None, fetch_fold_dead_letter_counts)
+                # Read before any fold, including refolds. A read error skips the cycle.
+                try:
+                    blocked_folds = await loop.run_in_executor(
+                        None, lambda: llm_backlog.blocked_keys("fold"))
+                except Exception as exc:
+                    logger.warning(
+                        "NREM: backlog read failed (%s) — skipping the cycle",
+                        type(exc).__name__)
+                    return
 
-                def _dead_lettered(entity, judgement_ids, types):
-                    # label is for logs. The dead-letter key must match what _fold_insight computes from the same ids and metadata type.
+                def _dead_lettered(entity, judgement_ids):
+                    # The stored key is the sha256 of the sorted judgement pg_ids.
                     label = f"insight/{entity}"
-                    key = _judgement_fold_identity(judgement_ids, types)
-                    if dead_letter.get(key, 0) >= NREM_FOLD_FAIL_CAP:
+                    key = _fold_backlog_key(judgement_ids)
+                    if key in blocked_folds or key in self._withheld_folds:
                         rec.fold_dead_letter.append(label)
                         logger.error(
-                            "NREM fold dead-letter: '%s' hit the truncation, slot, or embed "
-                            "cap %d time(s) within %dd (cap %d) — SKIPPING. "
-                            "Operator reset = window expiry or consolidation_runs cleanup.",
-                            label, dead_letter[key], NREM_FOLD_FAIL_WINDOW,
-                            NREM_FOLD_FAIL_CAP)
+                            "NREM fold backlog: '%s' is withheld — skipped this cycle.",
+                            label)
                         return True
                     return False
 
                 # Only ids that actually folded. An aborted fold must not hide a fresh cluster that shares them.
                 folded: set = set()
+                refold_withheld = 0
                 for old_id, entity, src_ids, prev_content, prev_metadata in refolds:
                     prev_metadata = prev_metadata or {}
-                    types = await loop.run_in_executor(
-                        None, lambda ids=src_ids: fetch_judgement_types(conn, ids))
-                    if _dead_lettered(entity, src_ids, types):
+                    if _dead_lettered(entity, src_ids):
+                        refold_withheld += 1
                         continue
                     logger.info(
                         "Insight cycle: re-folding insight %d ('%s') — new retrospective(s) on %s.",
@@ -3816,12 +3880,12 @@ class ConsolidationDaemon:
                     )
                 clusters = surviving
 
-                # fact:1189, decision:1121: drop dead-lettered clusters before the census and count them separately, so a capped cluster cannot look like backlog forever.
+                # Excluded here so a withheld fold cannot trip the stall verdict.
                 eligible_clusters = []
                 dead_lettered_now = 0
                 for c in clusters:
                     ids = c["ids"]
-                    if ids and _dead_lettered(c["entity"], ids, c.get("judgement_types") or {}):
+                    if ids and _dead_lettered(c["entity"], ids):
                         dead_lettered_now += 1
                         continue
                     eligible_clusters.append(c)
@@ -3853,7 +3917,7 @@ class ConsolidationDaemon:
                 rec.eligible_clusters = len(clusters)
                 rec.eligible_oldest_age = _kth_oldest_age_seconds(
                     cluster_id_lists, ts_map, INSIGHT_AGE_CENSUS_K)
-                rec.dead_lettered_clusters = dead_lettered_now
+                rec.dead_lettered_clusters = dead_lettered_now + refold_withheld
                 rec.singleton_clusters = singleton_now
                 attempted: set[frozenset[int]] = set()
                 for c in clusters:
@@ -3888,7 +3952,7 @@ class ConsolidationDaemon:
                 await loop.run_in_executor(
                     None, lambda: close_refold_ledger_rows(conn, context="insight"))
         except Exception as e:
-            logger.error(f"Insight cycle failed: {str(e)}")
+            logger.error("Insight cycle failed (%s)", type(e).__name__)
         finally:
             await loop.run_in_executor(None, conn.close)
 
@@ -3947,7 +4011,8 @@ class ConsolidationDaemon:
             )
             return False
 
-        # Dead-letter key from these rows, so it matches the caller's pre-check on the same metadata type.
+        # Telemetry key for truncation and slot failures. The backlog row is
+        # the sorted judgement pg_ids, not this identity.
         types = {int(r[0]): (r[3] or "decision") for r in rows}
         fold_key = _judgement_fold_identity(src_ids, types)
 
@@ -3995,26 +4060,38 @@ class ConsolidationDaemon:
         slots = await self.generate_insight_slots(
             entity, rows, previous_insight=previous_insight,
             reversal_lines=reversal_lines)
+        backlog_key = _fold_backlog_key(src_ids)
         if not slots:
-            if self._last_llm_truncated:
-                # Truncation never reaches the parser. Open ledger rows requeue; the fail cap dead-letters repeats.
+            reason = getattr(self, "_last_backlog_reason", None)
+            if self._last_llm_truncated or reason in ("cut_off", "loop"):
                 cyc.truncation_failures += 1
                 cyc.truncation_failed.append(fold_key)
                 logger.error(
                     "Truncation failure for insight '%s' — fold fails (no "
-                    "assembly, nothing persisted); ledger rows stay open. "
-                    "(truncation_failures=%d)", entity, cyc.truncation_failures)
-            elif self._last_llm_missing_slots:
-                # decision:1205: a SLOT/PRINCIPLE still missing after one retry fails the fold, counted as slot_failures, not truncation_failures.
+                    "assembly, nothing persisted). (truncation_failures=%d)",
+                    entity, cyc.truncation_failures)
+            elif self._last_llm_missing_slots or reason == "unparseable":
                 cyc.slot_failures += 1
                 cyc.slot_failed.append(fold_key)
                 logger.error(
-                    "Insight slot generation for '%s' incomplete after retry "
-                    "— fold fails (no partial insight ever written); ledger "
-                    "rows stay open. (slot_failures=%d)",
+                    "Insight slot generation for '%s' incomplete — fold fails "
+                    "(no partial insight ever written). (slot_failures=%d)",
                     entity, cyc.slot_failures)
+            if reason:
+                try:
+                    llm_backlog.upsert(
+                        "fold", backlog_key, reason,
+                        getattr(self, "_last_backlog_specimen", "") or None)
+                except Exception as exc:
+                    logger.error(
+                        "NREM: backlog write failed for '%s' (%s)",
+                        entity, type(exc).__name__)
+                    if self._last_backlog_paid:
+                        self._withheld_folds.add(backlog_key)
             else:
-                logger.error(f"Failed to synthesise insight for '{entity}' — ledger rows stay open; next sweep retries.")
+                logger.error(
+                    "Failed to synthesise insight for '%s' — queued, no backlog row.",
+                    entity)
             return False
 
         # decision:1205: content is assembled from the slots. Titles and pg_ids are copied verbatim, so no preservation gate remains.
@@ -4025,10 +4102,17 @@ class ConsolidationDaemon:
             cyc.embed_failures += 1
             cyc.embed_failed.append(fold_key)
             logger.error(
-                "Failed to vectorise insight for '%s' — ledger rows stay open; "
-                "the embed failure counts toward the fold cap (embed_failures=%d).",
+                "Failed to vectorise insight for '%s' — backlogged write_failed "
+                "(embed_failures=%d).",
                 entity, cyc.embed_failures,
             )
+            try:
+                llm_backlog.upsert("fold", backlog_key, "write_failed", None)
+            except Exception as exc:
+                logger.error(
+                    "NREM: backlog write failed for '%s' (%s)",
+                    entity, type(exc).__name__)
+                self._withheld_folds.add(backlog_key)
             return False
 
         metadata_json = json.dumps({
@@ -4063,8 +4147,20 @@ class ConsolidationDaemon:
                 + " Syncing to Graph..."
             )
         except Exception as e:
-            await loop.run_in_executor(None, conn.rollback)
-            logger.error(f"Insight write error for '{entity}': {str(e)}")
+            logger.error("Insight write error for '%s': %s", entity, type(e).__name__)
+            try:
+                await loop.run_in_executor(None, conn.rollback)
+            except Exception:
+                pass
+            try:
+                await loop.run_in_executor(
+                    None, lambda: llm_backlog.upsert(
+                        "fold", backlog_key, "write_failed", None))
+            except Exception as exc:
+                logger.error(
+                    "NREM: backlog write failed for '%s' (%s)",
+                    entity, type(exc).__name__)
+                self._withheld_folds.add(backlog_key)
             return False
 
         # Postgres is already committed. A graph failure leaves rows at consolidated for reconciliation to re-apply.
@@ -4079,9 +4175,16 @@ class ConsolidationDaemon:
             )
         except Exception as e:
             logger.error(
-                f"Graph sync failed for insight {summary_id} ('{entity}') — committed; "
-                f"reconciliation will retry: {str(e)}"
+                "Graph sync failed for insight %s ('%s') — committed; "
+                "reconciliation will retry: %s",
+                summary_id, entity, type(e).__name__,
             )
+        try:
+            llm_backlog.delete("fold", backlog_key)
+        except Exception as exc:
+            logger.warning(
+                "NREM: backlog delete failed for '%s' (%s)",
+                entity, type(exc).__name__)
         return True
 
     async def _mark_insight_in_graph(self, judgement_ids, summary_pg_id, entity,

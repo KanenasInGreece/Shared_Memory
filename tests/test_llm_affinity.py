@@ -36,33 +36,37 @@ def test_affinity_key_prefix_stable(monkeypatch):
 
 
 def test_rem_pins_to_one_warm_card(monkeypatch):
+    """Equal keys stay in declaration order until a finished call warms one."""
     g = _fresh(monkeypatch)
     k = g._affinity_key(_body("G" * 7000, " f1"))
-    r1 = g._select_llm_backend(k)
-    g._llm_inflight[r1] = 0            # request completed
-    r2 = g._select_llm_backend(k)  # same prefix → cache hit → same card
-    assert r1 == r2
+    first = g._order_backends(0.0, k)[0]
+    g._note_affinity(k, first)
+    second = g._order_backends(0.0, k)[0]
+    assert first == second == "http://a:5000"
+    # The first note is a miss. The second request is the hit.
+    g._note_affinity(k, first)
     assert g._llm_affinity_hits >= 1
 
 
-def test_nrem_avoids_protected_rem_card(monkeypatch):
+def test_a_different_prefix_does_not_avoid_the_warm_card(monkeypatch):
+    """Affinity is only a tie-break for the same prefix. It does not protect a card."""
     g = _fresh(monkeypatch)
     krem = g._affinity_key(_body("G" * 7000, " f1"))
-    rem = g._select_llm_backend(krem)
-    g._llm_inflight[rem] = 0
-    g._select_llm_backend(krem)    # 2nd route → hits>=2 → rem card protected
-    g._llm_inflight[rem] = 0
+    rem = g._order_backends(0.0, krem)[0]
+    g._note_affinity(krem, rem)
+    g._note_affinity(krem, rem)
     knrem = g._affinity_key(_body("N" * 7000, " cluster"))
-    nrem = g._select_llm_backend(knrem)
-    assert nrem != rem                 # NREM routed to the other card, protecting the warm cache
+    nrem = g._order_backends(0.0, knrem)[0]
+    assert nrem == rem
 
 
-def test_unhealthy_affine_backend_falls_back(monkeypatch):
+def test_unhealthy_affine_backend_stays_first_in_the_order(monkeypatch):
+    """Cooldown is not an order key. The walk skips a cooled backend when it tries."""
     g = _fresh(monkeypatch)
     import time
     k = g._affinity_key(_body("G" * 7000, " f1"))
-    first = g._select_llm_backend(k)
-    g._llm_unhealthy_until[first] = time.monotonic() + 300   # affine card in cooldown
-    g._llm_inflight[first] = 0
-    second = g._select_llm_backend(k)
-    assert second != first             # falls back to a healthy card
+    first = g._order_backends(0.0, k)[0]
+    g._note_affinity(k, first)
+    g._llm_unhealthy_until[first] = time.monotonic() + 300
+    second = g._order_backends(0.0, k)[0]
+    assert second == first

@@ -105,6 +105,9 @@ class _OneShotAsyncIter:
     def iter_any(self):
         return self._agen()
 
+    async def read(self):
+        return self._body
+
     async def _agen(self):
         if self._body:
             yield self._body
@@ -224,7 +227,7 @@ def _fresh(monkeypatch, backends="http://a:5000"):
 
 def _usage_body(prompt=100, completion=50):
     return json.dumps({
-        "choices": [{"message": {"role": "assistant", "content": "hi"}}],
+        "choices": [{"finish_reason": "stop", "message": {"role": "assistant", "content": "hi"}}],
         "usage": {"prompt_tokens": prompt, "completion_tokens": completion},
     }).encode()
 
@@ -246,6 +249,7 @@ def test_gzip_usage_capture_end_to_end(monkeypatch):
     proxy.session = _StatusBodySession(200, compressed, headers={
         "Content-Type": "application/json", "Content-Encoding": "gzip",
     })
+    proxy.llm_session = proxy.session
     resp = asyncio.run(proxy.handle_proxy(_FakeReq()))
 
     assert resp.status == 200
@@ -263,6 +267,7 @@ def test_identity_uncompressed_usage_capture_still_works(monkeypatch):
     body = _usage_body(prompt=10, completion=5)
     proxy = g.AsyncHiveMindProxy()
     proxy.session = _StatusBodySession(200, body)
+    proxy.llm_session = proxy.session
     resp = asyncio.run(proxy.handle_proxy(_FakeReq()))
 
     assert resp.status == 200
@@ -271,20 +276,22 @@ def test_identity_uncompressed_usage_capture_still_works(monkeypatch):
 
 
 def test_gzip_passthrough_stays_compressed_bytes(monkeypatch):
-    """The decompression is for the internal usage PARSE only — the client
-    must still receive the original compressed bytes, unchanged."""
+    """The walk reads the whole reply and answers the daemon with the parsed JSON. Compressed bytes are not forwarded."""
     g = _fresh(monkeypatch)
-    written = _patch_stream_response(monkeypatch)
 
     compressed = gzip.compress(_usage_body())
     proxy = g.AsyncHiveMindProxy()
     proxy.session = _StatusBodySession(200, compressed, headers={
         "Content-Type": "application/json", "Content-Encoding": "gzip",
     })
-    asyncio.run(proxy.handle_proxy(_FakeReq()))
+    proxy.llm_session = proxy.session
+    resp = asyncio.run(proxy.handle_proxy(_FakeReq()))
 
-    assert b"".join(written["chunks"]) == compressed
-    assert written["headers"]["Content-Encoding"] == "gzip"
+    assert resp.status == 200
+    parsed = json.loads(resp.body.decode())
+    assert parsed["choices"][0]["message"]["content"] == "hi"
+    assert "Content-Encoding" not in resp.headers
+    assert not resp.body.startswith(b"\x1f\x8b")
 
 
 def test_over_cap_compressed_body_abandons_capture_without_error(monkeypatch):
@@ -301,31 +308,31 @@ def test_over_cap_compressed_body_abandons_capture_without_error(monkeypatch):
     proxy.session = _StatusBodySession(200, compressed, headers={
         "Content-Type": "application/json", "Content-Encoding": "gzip",
     })
+    proxy.llm_session = proxy.session
     resp = asyncio.run(proxy.handle_proxy(_FakeReq()))
 
-    assert resp.status == 200
+    # An abandoned body is not a complete reply. Tokens stay 0.
+    assert resp.status == 422
     assert g._llm_tokens_prompt_total["http://a:5000"] == 0
     assert g._llm_tokens_completion_total["http://a:5000"] == 0
     assert g._llm_tokens_last_ts["http://a:5000"] is None
 
 
 def test_sse_stream_still_skipped_for_gzip(monkeypatch):
-    """stream:true is an SSE response — the accumulated bytes never parse as
-    a single JSON object, so capture must be skipped up front for a
-    compressed response exactly as for an uncompressed one."""
+    """A stream key is forced false. A JSON body is metered; the daemon is not handed a stream."""
     g = _fresh(monkeypatch)
-    _patch_stream_response(monkeypatch)
 
     compressed = gzip.compress(_usage_body())
     proxy = g.AsyncHiveMindProxy()
     proxy.session = _StatusBodySession(200, compressed, headers={
         "Content-Type": "application/json", "Content-Encoding": "gzip",
     })
+    proxy.llm_session = proxy.session
     resp = asyncio.run(proxy.handle_proxy(_StreamReq()))
 
     assert resp.status == 200
-    assert g._llm_tokens_prompt_total["http://a:5000"] == 0
-    assert g._llm_tokens_last_ts["http://a:5000"] is None
+    assert g._llm_tokens_prompt_total["http://a:5000"] == 100
+    assert g._llm_tokens_completion_total["http://a:5000"] == 50
 
 
 def test_decompress_bomb_abandons_capture_without_error(monkeypatch):
@@ -353,9 +360,10 @@ def test_decompress_bomb_abandons_capture_without_error(monkeypatch):
     proxy.session = _StatusBodySession(200, compressed, headers={
         "Content-Type": "application/json", "Content-Encoding": "gzip",
     })
+    proxy.llm_session = proxy.session
     resp = asyncio.run(proxy.handle_proxy(_FakeReq()))
 
-    assert resp.status == 200
+    assert resp.status == 422
     assert g._llm_tokens_prompt_total["http://a:5000"] == 0
     assert g._llm_tokens_completion_total["http://a:5000"] == 0
     assert g._llm_tokens_last_ts["http://a:5000"] is None
@@ -395,6 +403,7 @@ def test_single_backend_health_sections_present(monkeypatch):
     g = _fresh(monkeypatch, backends="http://a:5000")
     proxy = g.AsyncHiveMindProxy()
     proxy.session = _FixedStatusSession(200)
+    proxy.llm_session = proxy.session
 
     async def _run():
         stop = asyncio.Event()
@@ -424,6 +433,7 @@ def test_zero_backends_health_sections_absent(monkeypatch):
     monkeypatch.setattr(g, "LLM_BACKENDS", [])
     proxy = g.AsyncHiveMindProxy()
     proxy.session = _FixedStatusSession(200)
+    proxy.llm_session = proxy.session
 
     checks = asyncio.run(g._build_health_checks(proxy, None))
 
@@ -448,10 +458,12 @@ def test_latency_counters_ok_and_failing_request(monkeypatch):
 
     proxy = g.AsyncHiveMindProxy()
     proxy.session = _StatusBodySession(200, _usage_body())
+    proxy.llm_session = proxy.session
     resp1 = asyncio.run(proxy.handle_proxy(_FakeReq()))
     assert resp1.status == 200
 
     proxy.session = _StatusBodySession(500, b'{"error":"boom"}')
+    proxy.llm_session = proxy.session
     resp2 = asyncio.run(proxy.handle_proxy(_FakeReq()))
     assert resp2.status == 500
 
@@ -471,9 +483,11 @@ def test_latency_counters_on_gateway_connection_failure(monkeypatch):
     b = "http://a:5000"
     proxy = g.AsyncHiveMindProxy()
     proxy.session = _FailSession(g.ClientError("connection refused"))
+    proxy.llm_session = proxy.session
 
     resp = asyncio.run(proxy.handle_proxy(_FakeReq()))
-    assert resp.status == 503
+    # ClientError is a lost connection, still a failed request.
+    assert resp.status == 422
 
     assert g._llm_requests_total[b] == 1
     assert g._llm_requests_failed_total[b] == 1
@@ -497,6 +511,7 @@ def test_non_pool_route_records_no_latency(monkeypatch):
 
     proxy = g.AsyncHiveMindProxy()
     proxy.session = _StatusBodySession(200, b'{"result":"ok"}')
+    proxy.llm_session = proxy.session
     resp = asyncio.run(proxy.handle_encoder(_EmbedReq()))
 
     assert resp.status == 200
@@ -515,8 +530,10 @@ def test_llm_latency_health_section_shape(monkeypatch):
 
     proxy = g.AsyncHiveMindProxy()
     proxy.session = _StatusBodySession(200, _usage_body())
+    proxy.llm_session = proxy.session
     asyncio.run(proxy.handle_proxy(_FakeReq()))
     proxy.session = _FixedStatusSession(200)
+    proxy.llm_session = proxy.session
 
     checks = asyncio.run(g._build_health_checks(proxy, None))
 

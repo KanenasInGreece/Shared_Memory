@@ -456,6 +456,21 @@ CREATE TABLE IF NOT EXISTS entity_vocabulary (
 CREATE UNIQUE INDEX IF NOT EXISTS entity_vocabulary_normalized_key_unique ON public.entity_vocabulary USING btree (normalized_key);
 CREATE INDEX IF NOT EXISTS idx_entity_vocabulary_created_at ON public.entity_vocabulary USING btree (created_at);
 
+-- ─── llm_backlog ────────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS llm_backlog (
+    item_kind        TEXT NOT NULL,
+    item_key         TEXT NOT NULL,
+    reason           TEXT NOT NULL,
+    largest_ctx      INTEGER,
+    largest_reply    INTEGER,
+    pool_id          TEXT,
+    boot_id          TEXT,
+    specimen         TEXT,
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT llm_backlog_pkey PRIMARY KEY (item_kind, item_key)
+);
+
 -- ─── neo4j_outbox ───────────────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS neo4j_outbox (
     id               BIGSERIAL PRIMARY KEY,

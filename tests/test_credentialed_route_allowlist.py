@@ -117,6 +117,7 @@ def test_post_chat_completions_to_credentialed_backend_passes(monkeypatch):
     proxy = g.AsyncHiveMindProxy()
     session = _HeaderCaptureSession()
     proxy.session = session
+    proxy.llm_session = proxy.session
     # The caller sends the backend's declared model, so S5's refuse-not-rewrite
     # check passes and the call reaches the upstream (this test is about the
     # S-04 allowlist, not S5).
@@ -145,6 +146,7 @@ def test_get_to_credentialed_backend_403s_before_any_upstream_call(monkeypatch):
     importlib.reload(coordinator)
     proxy = g.AsyncHiveMindProxy()
     proxy.session = _MustNotCallSession()
+    proxy.llm_session = proxy.session
     app = web.Application(middlewares=[coordinator.auth_middleware])
     app["proxy"] = proxy
     app.router.add_post("/v1/chat/completions", proxy.handle_proxy)
@@ -167,27 +169,19 @@ def test_get_to_credentialed_backend_403s_before_any_upstream_call(monkeypatch):
     assert b"deepseek" not in body.lower()
 
 
-def test_s5_model_mismatch_is_refused_before_any_upstream_call(monkeypatch):
-    """S5 (v0.9.97): a credentialed backend serves only its declared `model`
-    (refuse, not rewrite). A caller sending a different model gets 400
-    model_mismatch before any upstream call — the mismatch is named, the key
-    is never consumed, and no capacity slot is taken.
-
-    The mismatch value is a genuinely different model id ("other-model"), NOT
-    the framework's own "local-model" placeholder — that one is exempt since
-    v0.9.98 (see test_s5_local_model_default_reaches_a_credentialed_backend)."""
+def test_s5_caller_model_is_overridden(monkeypatch):
+    """Only daemons reach this route, and the backend's model replaces the caller's."""
     g = _load_credentialed_gateway(monkeypatch)   # declares model "deepseek-chat"
     proxy = g.AsyncHiveMindProxy()
-    proxy.session = _MustNotCallSession()
+    session = _HeaderCaptureSession()
+    proxy.session = session
+    proxy.llm_session = proxy.session
     resp = asyncio.run(proxy.handle_proxy(
         _req("POST", "/v1/chat/completions", model="other-model")))
-    assert resp.status == 400
-    body = json.loads(resp.body.decode())
-    assert body["error"] == "model_mismatch"
-    assert "deepseek-chat" in body["detail"]
-    assert "other-model" in body["detail"]
-    assert resp.headers.get("X-SM-Fault-Origin") == "gateway"
-    assert "sk-allowlist-test" not in json.dumps(body)
+    assert resp.status == 500
+    assert session.captured_body is not None
+    sent = json.loads(session.captured_body.decode())
+    assert sent["model"] == "deepseek-chat"
 
 
 def test_s5_local_model_default_reaches_a_credentialed_backend(monkeypatch):
@@ -205,6 +199,7 @@ def test_s5_local_model_default_reaches_a_credentialed_backend(monkeypatch):
     proxy = g.AsyncHiveMindProxy()
     session = _HeaderCaptureSession()
     proxy.session = session
+    proxy.llm_session = proxy.session
     resp = asyncio.run(proxy.handle_proxy(
         _req("POST", "/v1/chat/completions", model="local-model")))
     # Reaching the capture session (which raises after recording) proves the
@@ -222,6 +217,7 @@ def test_arbitrary_path_to_credentialed_backend_403s(monkeypatch):
     g = _load_credentialed_gateway(monkeypatch)
     proxy = g.AsyncHiveMindProxy()
     proxy.session = _MustNotCallSession()
+    proxy.llm_session = proxy.session
     resp = asyncio.run(proxy.handle_proxy(_req("POST", "/v1/admin/delete-everything")))
     assert resp.status == 403
 
@@ -235,6 +231,7 @@ def test_uncredentialed_backend_refuses_an_arbitrary_path(monkeypatch):
 
     proxy = g.AsyncHiveMindProxy()
     proxy.session = _MustNotCallSession()
+    proxy.llm_session = proxy.session
     _forbid_selection(monkeypatch, g)
     resp = asyncio.run(proxy.handle_proxy(_req("GET", "/some/arbitrary/path")))
     assert resp.status == 403
@@ -257,6 +254,7 @@ def test_bad_spelling_without_a_provider_key_does_not_bump_the_counter(monkeypat
     importlib.reload(g)
     proxy = g.AsyncHiveMindProxy()
     proxy.session = _MustNotCallSession()
+    proxy.llm_session = proxy.session
     resp = asyncio.run(proxy.handle_proxy(_req("POST", "/v1/chat/completions?x=1")))
     assert resp.status == 403
     assert coordinator._credential_counters["credentialed_route_denied"] == 0
@@ -278,6 +276,7 @@ def test_denied_route_bumps_credential_counter_and_writes_audit_line(monkeypatch
 
     proxy = g.AsyncHiveMindProxy()
     proxy.session = _MustNotCallSession()
+    proxy.llm_session = proxy.session
     resp = asyncio.run(proxy.handle_proxy(_req("DELETE", "/v1/models")))
     assert resp.status == 403
 
@@ -320,7 +319,7 @@ def _forbid_selection(monkeypatch, g):
     def _never(*a, **k):
         raise AssertionError(
             "R-4 (pre-dispatch) must deny before backend selection is reached")
-    monkeypatch.setattr(g, "_select_llm_backend", _never)
+    monkeypatch.setattr(g, "_order_backends", _never)
 
 @pytest.mark.parametrize("spelling", [
     "/v1%2fchat/completions",       # encoded slash, leading segment
@@ -348,6 +347,7 @@ def test_r4_denies_a_percent_encoded_spelling_of_an_allowed_route(monkeypatch, s
     _forbid_selection(monkeypatch, g)
     proxy = g.AsyncHiveMindProxy()
     proxy.session = _MustNotCallSession()
+    proxy.llm_session = proxy.session
     resp = asyncio.run(proxy.handle_proxy(_req("POST", spelling)))
     assert resp.status == 403, (
         "R-4 (pre-dispatch) must deny the percent-encoded spelling — it is "
@@ -368,6 +368,7 @@ def test_r4_denies_a_trailing_slash_spelling_of_an_allowed_route(monkeypatch):
     _forbid_selection(monkeypatch, g)
     proxy = g.AsyncHiveMindProxy()
     proxy.session = _MustNotCallSession()
+    proxy.llm_session = proxy.session
     resp = asyncio.run(proxy.handle_proxy(_req("POST", "/v1/chat/completions/")))
     assert resp.status == 403, (
         "R-4 (pre-dispatch) must deny the trailing-slash spelling — it is not "
@@ -383,6 +384,7 @@ def test_r4_denies_a_query_string_on_an_allowed_credentialed_route(monkeypatch):
     _forbid_selection(monkeypatch, g)
     proxy = g.AsyncHiveMindProxy()
     proxy.session = _MustNotCallSession()
+    proxy.llm_session = proxy.session
     resp = asyncio.run(proxy.handle_proxy(_req("POST", "/v1/chat/completions?x=y")))
     assert resp.status == 403, "R-4 (pre-dispatch) must deny a query on a credentialed route"
 
@@ -395,6 +397,7 @@ def test_r4_still_allows_the_plain_spelling(monkeypatch):
     proxy = g.AsyncHiveMindProxy()
     session = _HeaderCaptureSession()
     proxy.session = session
+    proxy.llm_session = proxy.session
     resp = asyncio.run(proxy.handle_proxy(_req("POST", "/v1/chat/completions", model="deepseek-chat")))
     assert resp.status != 403
     assert session.captured_headers["Authorization"] == "Bearer sk-allowlist-test"
@@ -406,26 +409,21 @@ _CREDENTIALED_URL = "https://api.deepseek.com/v1"
 
 
 def _load_mixed_fleet(monkeypatch):
-    """One uncredentialed local backend + one credentialed cloud backend, with
-    SELECTION FORCED onto the credentialed member.
+    """One uncredentialed local backend + one credentialed cloud backend.
 
-    R-4's `all(...)` is False on this fleet, so it falls through; the forced
-    selection is what makes S-04 — and only S-04 — the gate that answers.
-    `_select_llm_backend` is monkeypatched rather than left to least-busy
-    ordering so the test cannot pass for the wrong reason on a different
-    iteration order."""
+    The walk orders by priority ascending and does not consult `_select_llm_backend`. The credentialed member keeps the default priority 1; the local member is 2, so the credentialed call is the one that runs. Priority 0 is a fatal declaration and would empty the pool.
+    """
     monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-allowlist-test")
     monkeypatch.delenv("LLM_BACKENDS", raising=False)
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
-        {"url": "http://local:5000", "private_ok": True, "n_ctx": 8192, "max_output_tokens": 2048},
+        {"url": "http://local:5000", "private_ok": True, "priority": 2,
+         "n_ctx": 8192, "max_output_tokens": 2048},
         {"url": _CREDENTIALED_URL, "token_env": "DEEPSEEK_API_KEY",
          "model": "deepseek-chat", "private_ok": True,
          "n_ctx": 8192, "max_output_tokens": 2048},
     ]))
     import hive_mind_proxy as g
     importlib.reload(g)
-    monkeypatch.setattr(g, "_select_llm_backend",
-                        lambda *a, **k: _CREDENTIALED_URL)
     return g
 
 
@@ -438,6 +436,7 @@ def test_mixed_fleet_sanity_r4_does_not_fire(monkeypatch):
     proxy = g.AsyncHiveMindProxy()
     session = _HeaderCaptureSession()
     proxy.session = session
+    proxy.llm_session = proxy.session
     resp = asyncio.run(proxy.handle_proxy(_req("POST", "/v1/chat/completions", model="deepseek-chat")))
     assert resp.status != 403
     assert session.captured_headers["Authorization"] == "Bearer sk-allowlist-test"
@@ -455,6 +454,7 @@ def test_s04_denies_a_percent_encoded_spelling_of_an_allowed_route(monkeypatch, 
     g = _load_mixed_fleet(monkeypatch)
     proxy = g.AsyncHiveMindProxy()
     proxy.session = _MustNotCallSession()
+    proxy.llm_session = proxy.session
     resp = asyncio.run(proxy.handle_proxy(_req("POST", spelling)))
     assert resp.status == 403, (
         "S-04 (post-selection) must deny the percent-encoded spelling — on a "
@@ -467,6 +467,7 @@ def test_s04_denies_a_trailing_slash_spelling_of_an_allowed_route(monkeypatch):
     g = _load_mixed_fleet(monkeypatch)
     proxy = g.AsyncHiveMindProxy()
     proxy.session = _MustNotCallSession()
+    proxy.llm_session = proxy.session
     resp = asyncio.run(proxy.handle_proxy(_req("POST", "/v1/chat/completions/")))
     assert resp.status == 403, (
         "S-04 (post-selection) must deny the trailing-slash spelling — on a "
@@ -477,6 +478,7 @@ def test_s04_denies_a_query_string_on_an_allowed_credentialed_route(monkeypatch)
     g = _load_mixed_fleet(monkeypatch)
     proxy = g.AsyncHiveMindProxy()
     proxy.session = _MustNotCallSession()
+    proxy.llm_session = proxy.session
     resp = asyncio.run(proxy.handle_proxy(_req("POST", "/v1/chat/completions?x=y")))
     assert resp.status == 403, (
         "S-04 (post-selection) must deny a query on a credentialed route")
@@ -492,6 +494,7 @@ def test_an_uncredentialed_backend_refuses_a_query(monkeypatch):
 
     proxy = g.AsyncHiveMindProxy()
     proxy.session = _MustNotCallSession()
+    proxy.llm_session = proxy.session
     _forbid_selection(monkeypatch, g)
     resp = asyncio.run(proxy.handle_proxy(_req("POST", "/v1/chat/completions?x=y")))
     assert resp.status == 403
@@ -533,6 +536,7 @@ def test_r4_audit_line_carries_the_raw_spelling_never_the_decoded_route_or_the_q
     _forbid_selection(monkeypatch, g)
     proxy = g.AsyncHiveMindProxy()
     proxy.session = _MustNotCallSession()
+    proxy.llm_session = proxy.session
     resp = asyncio.run(proxy.handle_proxy(_req("POST", spelling)))
     assert resp.status == 403
     content = _audit_lines(log_path)
@@ -553,6 +557,7 @@ def test_s04_audit_line_carries_the_raw_spelling_never_the_decoded_route_or_the_
     g = _load_mixed_fleet(monkeypatch)
     proxy = g.AsyncHiveMindProxy()
     proxy.session = _MustNotCallSession()
+    proxy.llm_session = proxy.session
     resp = asyncio.run(proxy.handle_proxy(_req("POST", spelling)))
     assert resp.status == 403
     content = _audit_lines(log_path)

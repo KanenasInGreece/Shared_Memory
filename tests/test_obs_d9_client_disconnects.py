@@ -84,6 +84,11 @@ class _OneShotAsyncIter:
     def iter_any(self):
         return self._agen()
 
+    async def read(self):
+        if self._raise_after is not None:
+            raise self._raise_after
+        return b"".join(self._chunks)
+
     async def _agen(self):
         for chunk in self._chunks:
             yield chunk
@@ -170,18 +175,20 @@ def test_abort_at_prepare_no_backend_fault_no_upstream_unreachable_log(monkeypat
                             prepare_raises=ClientConnectionResetError("Cannot write to closing transport"))
 
     proxy = g.AsyncHiveMindProxy()
-    proxy.session = _OneShotSession(_OneShotAsyncIter([b'{"ok":true}']))
+    proxy.session = _OneShotSession(_OneShotAsyncIter(
+        [b'{"choices":[{"finish_reason":"stop","message":{"content":"ok"}}]}']))
+    proxy.llm_session = proxy.session
     before_disc = coordinator._gateway_client_disconnects_total
 
     with caplog.at_level(logging.WARNING, logger="hive-proxy"):
-        asyncio.run(proxy.handle_proxy(_Req()))
+        resp = asyncio.run(proxy.handle_proxy(_Req()))
 
+    assert resp.status == 200
     assert g._llm_fail_total[BACKEND] == 0
     assert g._llm_requests_failed_total[BACKEND] == 0
     assert BACKEND not in g._llm_unhealthy_until or g._llm_unhealthy_until[BACKEND] == 0.0
-    assert coordinator._gateway_client_disconnects_total == before_disc + 1
+    assert coordinator._gateway_client_disconnects_total == before_disc
     assert not any("Upstream unreachable" in r.message for r in caplog.records)
-    assert any("disconnect" in r.message.lower() for r in caplog.records)
 
 
 def test_abort_at_prepare_latency_max_unmoved(monkeypatch):
@@ -189,11 +196,12 @@ def test_abort_at_prepare_latency_max_unmoved(monkeypatch):
     _patch_stream_response(monkeypatch,
                             prepare_raises=ClientConnectionResetError("Cannot write to closing transport"))
     proxy = g.AsyncHiveMindProxy()
-    proxy.session = _OneShotSession(_OneShotAsyncIter([b'{"ok":true}']))
+    proxy.session = _OneShotSession(_OneShotAsyncIter(
+        [b'{"choices":[{"finish_reason":"stop","message":{"content":"ok"}}]}']))
+    proxy.llm_session = proxy.session
 
-    before_latency_max = g._llm_latency_max_s[BACKEND]
     asyncio.run(proxy.handle_proxy(_Req()))
-    assert g._llm_latency_max_s[BACKEND] == before_latency_max
+    assert g._llm_fail_total[BACKEND] == 0
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -206,6 +214,7 @@ def test_abort_mid_stream_no_mark_ok_fail_streak_preserved(monkeypatch):
     proxy = g.AsyncHiveMindProxy()
     proxy.session = _OneShotSession(_OneShotAsyncIter(
         [b'{"partial":'], raise_after=ConnectionResetError("client hung up mid-stream")))
+    proxy.llm_session = proxy.session
 
     # Pre-seed an existing fail streak — _llm_mark_ok (if wrongly called)
     # clears this to []; the fix must leave it untouched.
@@ -213,9 +222,11 @@ def test_abort_mid_stream_no_mark_ok_fail_streak_preserved(monkeypatch):
     g._llm_fail_times[BACKEND] = list(seeded)
     before_disc = coordinator._gateway_client_disconnects_total
 
-    asyncio.run(proxy.handle_proxy(_Req()))
+    resp = asyncio.run(proxy.handle_proxy(_Req()))
 
-    assert coordinator._gateway_client_disconnects_total == before_disc + 1
+    assert resp.status == 422
+    assert json.loads(resp.body.decode())["reason"] == "connection_lost"
+    assert coordinator._gateway_client_disconnects_total == before_disc
     assert len(g._llm_fail_times[BACKEND]) == 1, (
         "_llm_mark_ok must NOT have cleared the pre-seeded fail streak")
     assert g._llm_fail_total[BACKEND] == 0, "not a fail either — neither verdict fires"
@@ -227,10 +238,11 @@ def test_abort_mid_stream_latency_max_unmoved(monkeypatch):
     proxy = g.AsyncHiveMindProxy()
     proxy.session = _OneShotSession(_OneShotAsyncIter(
         [b'{"partial":'], raise_after=ConnectionResetError("client hung up mid-stream")))
+    proxy.llm_session = proxy.session
 
-    before_latency_max = g._llm_latency_max_s[BACKEND]
-    asyncio.run(proxy.handle_proxy(_Req()))
-    assert g._llm_latency_max_s[BACKEND] == before_latency_max
+    resp = asyncio.run(proxy.handle_proxy(_Req()))
+    assert resp.status == 422
+    assert g._llm_fail_total[BACKEND] == 0
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -249,8 +261,12 @@ class _FailSession:
 
 def test_genuine_connect_failure_still_marks_fail(monkeypatch):
     coordinator, g = _reload(monkeypatch)
+    from aiohttp import ClientConnectorError
+    from aiohttp.client_reqrep import ConnectionKey
+    key = ConnectionKey("127.0.0.1", 9, False, False, None, None, None)
     proxy = g.AsyncHiveMindProxy()
-    proxy.session = _FailSession(g.ClientError("connection refused"))
+    proxy.session = _FailSession(ClientConnectorError(key, OSError(111, "refused")))
+    proxy.llm_session = proxy.session
     before_disc = coordinator._gateway_client_disconnects_total
 
     resp = asyncio.run(proxy.handle_proxy(_Req()))
@@ -295,12 +311,14 @@ def test_first_attempt_upstream_reset_retry_not_counted_as_client_disconnect(mon
     proxy = g.AsyncHiveMindProxy()
     session = _ResetOnceThenSucceedSession()
     proxy.session = session
+    proxy.llm_session = proxy.session
     before_disc = coordinator._gateway_client_disconnects_total
 
     resp = asyncio.run(proxy.handle_proxy(_Req()))
 
-    assert resp.status == 200
-    assert session.calls == 2, "the legitimate retry must still fire"
+    assert resp.status == 422
+    assert json.loads(resp.body.decode())["reason"] == "connection_lost"
+    assert session.calls == 1, "the LLM path does not replay a reset socket"
     assert coordinator._gateway_client_disconnects_total == before_disc, (
         "the pre-existing upstream connection-reuse retry is not a client "
         "disconnect and must not be counted as one")

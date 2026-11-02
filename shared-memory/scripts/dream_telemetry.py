@@ -2,8 +2,8 @@
 pair-prefix helpers this module also owns. Telemetry logs a structured line
 always (and JSONL to ``DREAM_METRICS_PATH`` when set) from llama.cpp's
 ``timings`` and the gateway's backend header — observability only, nothing
-here aborts or reroutes. The ceilings scale each request's timeout to its
-clamped payload size, so a big job is never killed for being big.
+here aborts or reroutes. Embed and rerank ceilings scale with payload size.
+The chat call has no daemon timeout: ceiling_s stays null.
 """
 from __future__ import annotations
 
@@ -18,18 +18,25 @@ from log_hygiene import append_secure
 
 logger = logging.getLogger("DreamTelemetry")
 
+
+def _finite_number(value):
+    """A finite int or float, or None for bool, overflow, NaN, and Infinity."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        if not math.isfinite(value):
+            return None
+    except (OverflowError, ValueError):
+        return None
+    return value
+
+
+def _model_name(resp: dict):
+    """The reply model when it is a string. Anything else is absent."""
+    model = resp.get("model")
+    return model if isinstance(model, str) else None
+
 DREAM_METRICS_PATH = os.environ.get("DREAM_METRICS_PATH", "").strip() or None
-
-# Adaptive hard-ceiling floor (seconds). The fixed *_LLM_TIMEOUT magic numbers are
-# replaced by adaptive_ceiling() below; only this floor remains, because a tiny
-# prompt should still be allowed a slow cold-start generation. Advisor-validated
-# shape: max(floor, prompt_chars/100, units*15, max_tokens/LLM_MIN_TOK_S) — scales
-# with prompt size, unit count (NREM cluster facts), and the output bound, so a
-# big job is never killed for being big.
-CEILING_FLOOR_S = float(os.environ.get("LLM_CEILING_FLOOR", "600"))
-
-# Decode follows the output bound, so a ceiling sized only on the input turns a longer narrative into an uncounted timeout. 10 sits under a measured floor of 11.29 tok/s; a long fold must also stay inside the slot-arbiter budget or the daemons fight.
-LLM_MIN_TOK_S = float(os.environ.get("LLM_MIN_TOK_S", "10"))
 
 # Throughput falls as the input grows, so a constant timeout kills the large calls and looks fine on small ones. Anchor this floor on the slowest observation, not the mean.
 EMBED_MIN_TOK_S = float(os.environ.get("EMBED_MIN_TOK_S", "100"))
@@ -141,18 +148,6 @@ def rerank_ceiling(docs) -> float:
                total / RERANK_MIN_CHARS_S * RERANK_SAFETY_FACTOR)
 
 
-def adaptive_ceiling(prompt_chars: int, units: int = 0,
-                     max_tokens: int = 0) -> float:
-    """Per-call hard ceiling in seconds, scaled to the work. `prompt_chars` = len
-    of the prompt sent; `units` = count of work items (NREM cluster size; 0 for REM
-    per-fact); `max_tokens` = the OUTPUT bound requested, which dominates decode
-    time — pass the WIDEST bound a call site may retry at, not the first one it
-    tries. Omitting it keeps the pre-existing input-only behaviour exactly.
-    Replaces the fixed timeout so valid long generations are not killed."""
-    return max(CEILING_FLOOR_S, prompt_chars / 100.0, units * 15.0,
-               max_tokens / LLM_MIN_TOK_S if LLM_MIN_TOK_S > 0 else 0.0)
-
-
 def record_grounding(grounding_n: int, referenced: int, matched: int,
                      minted: int, *, pg_id: int | None = None,
                      shown: int | None = None, mode: str | None = None) -> dict:
@@ -223,32 +218,51 @@ def call_timing_summary(
     completion_tokens accepts int or float usage.completion_tokens (some providers send a float);
     bool is explicitly rejected (bool is a subclass of int in Python — True/False are not token
     counts); NaN/±inf are also rejected (math.isfinite) rather than raising out of int()."""
-    t = (resp_json or {}).get("timings") or {}
+    resp = resp_json if isinstance(resp_json, dict) else {}
+    t = resp.get("timings")
+    t = t if isinstance(t, dict) else {}
     pm, dm = t.get("prompt_ms"), t.get("predicted_ms")
-    service_ms = (round(pm + dm, 1)
-                  if isinstance(pm, (int, float)) and isinstance(dm, (int, float)) else None)
-    wall_ms = round(wall_s * 1000.0, 1) if wall_s is not None else None
+    pm_n, dm_n = _finite_number(pm), _finite_number(dm)
+    service_ms = None
+    if pm_n is not None and dm_n is not None:
+        try:
+            total = float(pm_n) + float(dm_n)
+        except (OverflowError, ValueError):
+            total = None
+        if total is not None and math.isfinite(total):
+            service_ms = round(total, 1)
+    wall_num = _finite_number(wall_s)
+    wall_ms = None
+    if wall_num is not None:
+        try:
+            scaled = float(wall_num) * 1000.0
+            if math.isfinite(scaled):
+                wall_ms = round(scaled, 1)
+        except (OverflowError, ValueError):
+            wall_ms = None
     contention_ms = (round(max(0.0, wall_ms - service_ms), 1)
                      if wall_ms is not None and service_ms is not None else None)
-    usage = (resp_json or {}).get("usage") or {}
-    ct = usage.get("completion_tokens")
-    # json.loads accepts bare NaN/Infinity (a non-standard but real JSON extension
-    # some providers emit) — int(float('nan')) raises ValueError and int(float('inf'))
-    # raises OverflowError, either of which would violate this function's "never
-    # raises" contract and let a good LLM batch get discarded by the caller's
-    # try/except. math.isfinite() rejects both before int() ever sees them.
-    completion_tokens = (int(ct) if isinstance(ct, (int, float)) and not isinstance(ct, bool)
-                          and math.isfinite(ct) else None)
-    tok_s_wall = (round(completion_tokens / wall_s, 2)
-                  if isinstance(completion_tokens, int) and completion_tokens > 0
-                  and isinstance(wall_s, (int, float)) and not isinstance(wall_s, bool)
-                  and wall_s > 0 else None)
+    usage = resp.get("usage")
+    usage = usage if isinstance(usage, dict) else {}
+    ct_n = _finite_number(usage.get("completion_tokens"))
+    # Overflow and NaN are absent, so a good batch is not discarded and JSON stays strict.
+    try:
+        completion_tokens = int(ct_n) if ct_n is not None else None
+    except (OverflowError, ValueError):
+        completion_tokens = None
+    wall_for_rate = _finite_number(wall_s)
+    try:
+        tok_s_wall = (round(completion_tokens / wall_for_rate, 2)
+                      if isinstance(completion_tokens, int) and completion_tokens > 0
+                      and wall_for_rate is not None and wall_for_rate > 0 else None)
+    except (OverflowError, ValueError):
+        tok_s_wall = None
     return {
         "service_ms": service_ms,
         "wall_ms": wall_ms,
         "contention_ms": contention_ms,
         "poll_ms": None,               # per-fact; filled by the caller from created_at
-        "model": (resp_json or {}).get("model"),
+        "model": _model_name(resp),
         "backend": backend,
         "batch_size": batch_size,
         "prompt_chars": prompt_chars,
@@ -284,23 +298,39 @@ def record_llm_call(
     `prompt_chars` is the caller's own char-count of the prompt it built, additive
     and optional — it pairs with `prompt_n` so chars/token can be re-measured from
     history."""
-    t = (resp_json or {}).get("timings") or {}
-    usage = (resp_json or {}).get("usage") or {}
-    tok_s = t.get("predicted_per_second")
+    resp = resp_json if isinstance(resp_json, dict) else {}
+    raw_timings = resp.get("timings")
+    t = raw_timings if isinstance(raw_timings, dict) else {}
+    raw_usage = resp.get("usage")
+    usage = raw_usage if isinstance(raw_usage, dict) else {}
+
+    def _num(value):
+        # A bool is an int in Python. Overflow, NaN, and Infinity are absent.
+        return _finite_number(value)
+
+    tok_s = _num(t.get("predicted_per_second"))
+    prompt_raw = t.get("prompt_n")
+    if prompt_raw is None:
+        prompt_raw = usage.get("prompt_tokens")
+    predicted_raw = t.get("predicted_n")
+    if predicted_raw is None:
+        predicted_raw = usage.get("completion_tokens")
+    wall_num = _num(wall_s)
+    ceiling_num = _num(ceiling_s)
     rec = {
         "ts": round(time.time(), 3),
         "phase": phase,
         "backend": backend,
-        "model": (resp_json or {}).get("model"),
-        "prompt_n": t.get("prompt_n") if t.get("prompt_n") is not None else usage.get("prompt_tokens"),
-        "predicted_n": t.get("predicted_n") if t.get("predicted_n") is not None else usage.get("completion_tokens"),
-        "tok_s": round(tok_s, 2) if isinstance(tok_s, (int, float)) else None,
-        "prompt_ms": t.get("prompt_ms"),
-        "predicted_ms": t.get("predicted_ms"),
-        "wall_s": round(wall_s, 1) if wall_s is not None else None,
-        "ceiling_s": round(ceiling_s, 1) if ceiling_s is not None else None,
+        "model": _model_name(resp),
+        "prompt_n": _num(prompt_raw),
+        "predicted_n": _num(predicted_raw),
+        "tok_s": round(tok_s, 2) if tok_s is not None else None,
+        "prompt_ms": _num(t.get("prompt_ms")),
+        "predicted_ms": _num(t.get("predicted_ms")),
+        "wall_s": round(wall_num, 1) if wall_num is not None else None,
+        "ceiling_s": round(ceiling_num, 1) if ceiling_num is not None else None,
         "ceiling_hit": bool(
-            wall_s is not None and ceiling_s is not None and wall_s >= ceiling_s
+            wall_num is not None and ceiling_num is not None and wall_num >= ceiling_num
         ),
         "ok": ok,
         "note": note,

@@ -116,28 +116,67 @@ def test_c1_pool_status_free_slots_nonzero_for_all_declared_fleet(monkeypatch):
 
 # ── R-1: 503 backend_at_capacity gets its own counter ───────────────────────
 
-def test_r1_capacity_503_increments_counter_and_last_ts(monkeypatch):
+def test_r1_waiter_proceeds_and_leaves_the_counter(monkeypatch):
+    """A waiter behind a full backend gets the slot when it frees.
+
+    The capacity counter stays. This walk does not increment it.
+    """
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
         {"url": "http://a:5000", "max_inflight": 1, "private_ok": True, "n_ctx": 8192, "max_output_tokens": 2048},
     ]))
-    monkeypatch.setenv("LLM_MAX_INFLIGHT_WAIT_S", "0.05")
+    monkeypatch.setenv("LLM_MAX_INFLIGHT_POLL_S", "0.01")
     g = _fresh(monkeypatch)
-    g._llm_inflight["http://a:5000"] = 1   # at cap
+    g._llm_inflight["http://a:5000"] = 1
     before = g._routing_backend_at_capacity_count
     proxy = g.AsyncHiveMindProxy()
-    proxy.session = _RaisingSession()
-    resp = asyncio.run(proxy.handle_proxy(_req({}, _body())))
-    assert resp.status == 503
-    assert json.loads(resp.body.decode())["error"] == "backend_at_capacity"
-    assert g._routing_backend_at_capacity_count == before + 1
-    assert g._routing_backend_at_capacity_last_ts is not None
+
+    class _Ok:
+        status = 200
+        headers = {}
+        content = None
+
+        def __init__(self):
+            self.content = self
+
+        async def read(self, n=-1):
+            return json.dumps({
+                "choices": [{"finish_reason": "stop", "message": {"content": "ok"}}],
+            }).encode()
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+    class _Sess:
+        def request(self, *a, **k):
+            return _Ok()
+
+    proxy.session = _Sess()
+    proxy.llm_session = proxy.session
+
+    async def _free():
+        await asyncio.sleep(0.03)
+        g._llm_inflight["http://a:5000"] = 0
+
+    async def _run():
+        task = asyncio.create_task(_free())
+        resp = await proxy.handle_proxy(_req({}, _body()))
+        await task
+        return resp
+
+    resp = asyncio.run(_run())
+    assert resp.status == 200
+    assert g._routing_backend_at_capacity_count == before
+    assert g._llm_inflight["http://a:5000"] == 0
 
 
 def test_r1_counter_surfaced_on_health(monkeypatch):
     """The llm_routing health section must carry the capacity pair (I-7
     shape: counter + paired last-ts). Pinned against the source because a
-    full _build_health_checks needs a live session; the handle_proxy test
-    above proves the counter itself moves."""
+    full _build_health_checks needs a live session. The walk no longer
+    increments the counter."""
     g = _fresh(monkeypatch)
     src = open(g.__file__).read()
     assert '"routing_backend_at_capacity": _routing_backend_at_capacity_count' in src
@@ -202,38 +241,110 @@ def test_r3_empty_roles_on_a_credentialed_backend_loads(monkeypatch):
 
 # ── R-4: waiter cap + doomed-route pre-wait denial ──────────────────────────
 
-def test_r4_waiter_cap_immediate_503_beyond_cap(monkeypatch):
+def test_r4_waiter_gets_the_slot_when_it_frees(monkeypatch):
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
         {"url": "http://a:5000", "max_inflight": 1, "private_ok": True, "n_ctx": 8192, "max_output_tokens": 2048},
     ]))
-    monkeypatch.setenv("LLM_MAX_INFLIGHT_WAIT_S", "5")
+    monkeypatch.setenv("LLM_MAX_INFLIGHT_POLL_S", "0.01")
     g = _fresh(monkeypatch)
-    g._llm_inflight["http://a:5000"] = 1          # at cap
-    g._capacity_waiters = g.LLM_MAX_CAPACITY_WAITERS   # queue full
+    g._llm_inflight["http://a:5000"] = 1
 
-    async def _boom_sleep(*a, **kw):
-        raise AssertionError("beyond the waiter cap the request must NOT wait")
-    monkeypatch.setattr(g.asyncio, "sleep", _boom_sleep)
+    class _Ok:
+        status = 200
+        headers = {}
+        content = None
+
+        def __init__(self):
+            self.content = self
+
+        async def read(self, n=-1):
+            return json.dumps({
+                "choices": [{"finish_reason": "stop", "message": {"content": "ok"}}],
+            }).encode()
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+    class _Sess:
+        def __init__(self):
+            self.calls = 0
+
+        def request(self, *a, **k):
+            self.calls += 1
+            return _Ok()
+
+    session = _Sess()
     proxy = g.AsyncHiveMindProxy()
-    proxy.session = _RaisingSession()
-    resp = asyncio.run(proxy.handle_proxy(_req({}, _body())))
-    assert resp.status == 503
-    assert json.loads(resp.body.decode())["error"] == "backend_at_capacity"
-    assert g._capacity_waiters == g.LLM_MAX_CAPACITY_WAITERS   # untouched
+    proxy.session = session
+    proxy.llm_session = session
+
+    async def _free():
+        await asyncio.sleep(0.03)
+        assert g._llm_inflight["http://a:5000"] == 1
+        g._llm_inflight["http://a:5000"] = 0
+
+    async def _run():
+        task = asyncio.create_task(_free())
+        resp = await proxy.handle_proxy(_req({}, _body()))
+        await task
+        return resp
+
+    resp = asyncio.run(_run())
+    assert resp.status == 200
+    assert session.calls == 1
+    assert g._llm_inflight["http://a:5000"] == 0
 
 
 def test_r4_waiter_count_released_after_wait(monkeypatch):
+    """The slot taken for the try is released when the reply returns."""
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
         {"url": "http://a:5000", "max_inflight": 1, "private_ok": True, "n_ctx": 8192, "max_output_tokens": 2048},
     ]))
-    monkeypatch.setenv("LLM_MAX_INFLIGHT_WAIT_S", "0.05")
+    monkeypatch.setenv("LLM_MAX_INFLIGHT_POLL_S", "0.01")
     g = _fresh(monkeypatch)
     g._llm_inflight["http://a:5000"] = 1
+
+    class _Ok:
+        status = 200
+        headers = {}
+        content = None
+
+        def __init__(self):
+            self.content = self
+
+        async def read(self, n=-1):
+            return b'{"choices":[{"finish_reason":"stop","message":{"content":"ok"}}]}'
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+    class _Sess:
+        def request(self, *a, **k):
+            return _Ok()
+
     proxy = g.AsyncHiveMindProxy()
-    proxy.session = _RaisingSession()
-    resp = asyncio.run(proxy.handle_proxy(_req({}, _body())))
-    assert resp.status == 503
-    assert g._capacity_waiters == 0   # increment released on exit (I-8b discipline)
+    proxy.session = _Sess()
+    proxy.llm_session = proxy.session
+
+    async def _free():
+        await asyncio.sleep(0.03)
+        g._llm_inflight["http://a:5000"] = 0
+
+    async def _run():
+        task = asyncio.create_task(_free())
+        resp = await proxy.handle_proxy(_req({}, _body()))
+        await task
+        return resp
+
+    resp = asyncio.run(_run())
+    assert resp.status == 200
+    assert g._llm_inflight["http://a:5000"] == 0
 
 
 def test_r4_doomed_route_denied_before_any_wait(monkeypatch):
@@ -245,7 +356,6 @@ def test_r4_doomed_route_denied_before_any_wait(monkeypatch):
         {"url": "https://api.example.com/v1", "token_env": "SM_TEST_PROVIDER_KEY",
          "private_ok": True, "max_inflight": 1},
     ]))
-    monkeypatch.setenv("LLM_MAX_INFLIGHT_WAIT_S", "60")
     g = _fresh(monkeypatch)
     g._llm_inflight["https://api.example.com/v1"] = 1   # at cap: old code would wait
 
@@ -254,6 +364,7 @@ def test_r4_doomed_route_denied_before_any_wait(monkeypatch):
     monkeypatch.setattr(g.asyncio, "sleep", _boom_sleep)
     proxy = g.AsyncHiveMindProxy()
     proxy.session = _RaisingSession()
+    proxy.llm_session = proxy.session
     resp = asyncio.run(proxy.handle_proxy(
         _req({}, _body(), method="GET", path="/v1/models")))
     assert resp.status == 403
@@ -278,6 +389,7 @@ def test_r4_mixed_fleet_still_refuses_a_non_chat_path(monkeypatch):
             raise AssertionError("a non-chat path must not reach upstream")
     proxy = g.AsyncHiveMindProxy()
     proxy.session = _S()
+    proxy.llm_session = proxy.session
     resp = asyncio.run(proxy.handle_proxy(
         _req({}, _body(), method="GET", path="/v1/models")))
     assert resp.status == 403
@@ -294,17 +406,14 @@ def test_r5_fit_422_names_the_estimate(monkeypatch):
     g = _fresh(monkeypatch)
     proxy = g.AsyncHiveMindProxy()
     proxy.session = _RaisingSession()
+    proxy.llm_session = proxy.session
     huge = _body(**{"messages": [{"role": "user", "content": "x" * 5000}],
                     "max_tokens": 64})
     resp = asyncio.run(proxy.handle_proxy(_req({}, huge)))
     assert resp.status == 422
     body = json.loads(resp.body.decode())
-    assert body["constraint"] == "fit"
-    # concrete VALUES, not mere presence: est = body_chars / 1.2, and the
-    # caller's own max_tokens
-    assert body["effective_max_tokens"] == 64
-    assert body["est_prompt_tokens"] == int(request_sizing.estimate_prompt_tokens(len(huge)))
-    assert body["est_prompt_tokens"] > 100   # sanity: bigger than n_ctx
+    assert body["error"] == "backlog"
+    assert body["reason"] == "no_context"
 
 
 def test_r5_a_role_header_does_not_refuse(monkeypatch):
@@ -323,6 +432,7 @@ def test_r5_a_role_header_does_not_refuse(monkeypatch):
             raise RuntimeError("capture only")
     proxy = g.AsyncHiveMindProxy()
     proxy.session = _S()
+    proxy.llm_session = proxy.session
     resp = asyncio.run(proxy.handle_proxy(_req({"X-SM-LLM-Role": "judge"}, _body())))
     body = json.loads(resp.body.decode())
     assert resp.status != 422

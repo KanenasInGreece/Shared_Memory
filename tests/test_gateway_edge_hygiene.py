@@ -154,6 +154,7 @@ def _probe_with(monkeypatch, session, method, spelling, *, backends=None, header
     c, g = _load_gateway(monkeypatch, backends=backends)
     proxy = g.AsyncHiveMindProxy()
     proxy.session = session
+    proxy.llm_session = proxy.session
     app = _build_app_like_main(c, g, proxy)
     return _run(_probe(app, method, spelling, headers=headers)), g
 
@@ -312,6 +313,7 @@ def test_a_raw_traversal_spelling_of_an_encoder_path_is_404(monkeypatch):
     c, g = _load_gateway(monkeypatch)
     proxy = g.AsyncHiveMindProxy()
     proxy.session = _MustNotCallSession()
+    proxy.llm_session = proxy.session
     app = _build_app_like_main(c, g, proxy)
     raw = _run(_raw_probe(app, "POST", "/v1/embeddings/../x"))
     assert raw.startswith(b"HTTP/1.1 404"), raw[:200]

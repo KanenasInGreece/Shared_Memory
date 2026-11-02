@@ -3,7 +3,6 @@
 # ⚠ NOT ON THE SPAWN PATH. This is the hashed audit artefact and the source of
 # truth for the three versions (fastmcp, httpx, certifi) mcp/vector-skill.py pins in its own PEP 723 inline
 # block; the documented spawn line is `uv run --no-project <the connector>`.
-# Re-apply these three lines after every regeneration — uv rewrites this file.
 aiofile==3.12.3 \
     --hash=sha256:5c1bcc9e929c50834608e8cc1a4cc1d7503eb60c15a535b779fd39e2f372c017 \
     --hash=sha256:caa6aa746b5e47e2165f7abd741b6415e49cf4d44fddc0f61844612cc3924d41
@@ -326,9 +325,9 @@ jeepney==0.9.0 \
     # via
     #   keyring
     #   secretstorage
-joserfc==1.7.5 \
-    --hash=sha256:add2c2c84e8373b084d526a8b53daba5d7a513a118cd2dcd9fc9f979d0922159 \
-    --hash=sha256:d5ff536e658e17664f8c1b1ab60dc4aa62aa973fcef1edd33cc44bda45d6f5ea
+joserfc==1.7.6 \
+    --hash=sha256:e2d72e3fa937ed8ddd42ad8c1cc337a43e7ffd02efa572a2aa15e2764a05b506 \
+    --hash=sha256:fb1cf6d2977318bef976c2ed2ef2167cc5f8ade8fc96f034e38f7abd656907c4
     # via
     #   authlib
     #   fastmcp-slim

@@ -155,7 +155,7 @@ def test_write_marks_rem_processed_in_the_last_statement(kind):
                                         original_content=LONG))
     cyphers = [c.args[0] for c in session.run.call_args_list]
     assert "rem_processed" in cyphers[-1]
-    assert "rem_attempts = 0" in cyphers[-1]
+    assert "rem_attempts" not in cyphers[-1]
 
 
 # ── One call per record — and none at all when nothing is asked ───────────────

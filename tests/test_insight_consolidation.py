@@ -47,7 +47,6 @@ from consolidation_loop import (
     fetch_active_insight_rows,
     fetch_active_thematic_summary_id,
     fetch_insight_outbox_rows,
-    fetch_judgement_types,
     fetch_open_retro_record_ids,
     fetch_refold_insights,
     fetch_reversal_context,
@@ -203,19 +202,6 @@ def test_consumable_rows_snapshot_by_id_decision_and_retro_types():
 def test_consumable_rows_empty_pg_ids_runs_no_query():
     conn = StubConn()
     assert fetch_insight_outbox_rows(conn, []) == []
-    assert conn.executed == []
-
-
-# ── fetch_judgement_types (C4 — per-id type for dead-letter key parity) ───────
-
-def test_fetch_judgement_types_maps_ids_to_declared_type():
-    conn = StubConn(script=[{"rowcount": 2, "rows": [(245, "decision"), (900, "retrospective")]}])
-    assert fetch_judgement_types(conn, [245, 900]) == {245: "decision", 900: "retrospective"}
-
-
-def test_fetch_judgement_types_empty_runs_no_query():
-    conn = StubConn()
-    assert fetch_judgement_types(conn, []) == {}
     assert conn.executed == []
 
 
@@ -993,7 +979,7 @@ async def test_run_insight_cycle_dead_lettered_cluster_excluded_from_eligible_ce
     must report 1 (not 2), and the exclusion is visible separately as
     dead_lettered_clusters=1 — a NEW key, not folded into eligible_clusters'
     own meaning."""
-    monkeypatch.setattr(cl, "NREM_FOLD_FAIL_CAP", 1)
+    monkeypatch.setattr(cl.llm_backlog, "blocked_keys", lambda kind: set())
 
     class _Conn(StubConn):
         def close(self):
@@ -1010,8 +996,8 @@ async def test_run_insight_cycle_dead_lettered_cluster_excluded_from_eligible_ce
     dead_types = {345: "Decision", 367: "Decision"}
     # The dead-lettered cluster's own content-derived identity (C4's
     # per-judgement-type key — decision 882's fold-key/label split).
-    dead_key = cl._judgement_fold_identity(dead_ids, dead_types)
-    monkeypatch.setattr(cl, "fetch_fold_dead_letter_counts", lambda: {dead_key: 1})
+    dead_key = cl._fold_backlog_key(dead_ids)
+    monkeypatch.setattr(cl.llm_backlog, "blocked_keys", lambda kind: {dead_key})
 
     daemon, _ = daemon_with_fake_graph()
     daemon._find_fresh_insight_clusters = AsyncMock(return_value=[
@@ -1158,8 +1144,7 @@ async def test_t8_run_insight_cycle_v2_retro_folds_once_with_superset(monkeypatc
             else []
         ),
     )
-    monkeypatch.setattr(cl, "fetch_judgement_types", lambda c, ids: {i: "Decision" for i in ids})
-    monkeypatch.setattr(cl, "fetch_fold_dead_letter_counts", lambda: {})
+    monkeypatch.setattr(cl.llm_backlog, "blocked_keys", lambda kind: set())
     monkeypatch.setattr(
         cl, "fetch_active_insight_rows",
         lambda c: [(70, {245, 267}, {})],

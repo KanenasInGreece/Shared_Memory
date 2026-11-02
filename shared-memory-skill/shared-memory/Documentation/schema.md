@@ -128,6 +128,27 @@ The consolidation daemon sets `A.superseded = true` in Postgres and writes `(B)-
 
 ---
 
+### `llm_backlog` — dream items the gateway or a daemon will not store
+
+One row per withheld REM record or insight fold (migration 045). The daemon reads it before a call and deletes the row when the item is stored. An operator deletes a row to retry it; there is no reset command.
+
+| Column | Type | Notes |
+|---|---|---|
+| `item_kind` | `TEXT NOT NULL` | `rem` or `fold`. Part of the primary key. |
+| `item_key` | `TEXT NOT NULL` | The pg_id, or the sha256 of the fold's judgement identity. Part of the primary key. |
+| `reason` | `TEXT NOT NULL` | `no_context`, `cut_off`, `loop`, `unparseable`, `unrecognised`, `connection_lost`, or `write_failed`. |
+| `largest_ctx` | `INTEGER` | Largest active `n_ctx` when the row was written. `no_context` retries only when the spawn value is higher. |
+| `largest_reply` | `INTEGER` | Largest `min(max_output_tokens, n_ctx × (1 − FIT_MARGIN))` when the row was written. `cut_off` retries only when the spawn value is higher. |
+| `pool_id` | `TEXT` | Hash of the active pool, including each `extra_body`. `loop`, `unparseable`, and `unrecognised` retry only when it differs. |
+| `boot_id` | `TEXT` | Random token minted for the gateway process. `connection_lost` and `write_failed` retry only when it differs. |
+| `specimen` | `TEXT` | Tail of a cut-off or loop reply. |
+| `created_at` | `TIMESTAMPTZ NOT NULL DEFAULT now()` | First time this item was withheld. |
+| `updated_at` | `TIMESTAMPTZ NOT NULL DEFAULT now()` | Replaced on every later withhold of the same item. |
+
+Primary key: `(item_kind, item_key)`.
+
+---
+
 ### `neo4j_outbox` — Coordinator outbox + dream-cycle ledger
 
 Written by the coordinator on every save, in the same Postgres transaction as `technical_docs`. Applied asynchronously to Neo4j by the outbox worker. Survives crashes and Neo4j outages — pending rows are replayed on restart. For **fact rows** the table doubles as the dream-cycle ledger: a row's presence means "this artifact has not finished dreaming", and its deletion is the conclusive record that both stores are synced.

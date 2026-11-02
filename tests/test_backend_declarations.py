@@ -167,7 +167,7 @@ def test_f2b_whole_fleet_excluded_is_no_backend_and_llm_agrees(monkeypatch, tmp_
     import secure_env
     secure_env._secrets.pop("AGENT_TOKENS", None)
     g = _reload(monkeypatch, json.dumps([{**GOOD, "token_env": "DEEPSEEK_API_KEY"}]))
-    assert g._classify_no_eligible_constraint(0, 0) == "no_backend"
+    assert not g.LLM_BACKENDS
     dep = g._llm_pool_dependency({})
     assert dep["state"] == "degraded"
     assert "fit" not in dep["reason"]
@@ -194,7 +194,7 @@ def test_f5_leftover_keys_still_serve_and_warn_once(monkeypatch, caplog):
         caplog.clear()
         g = _reload(monkeypatch, json.dumps([entry]))
         assert g.LLM_BACKENDS == ["http://a:5000"]
-        assert g._select_llm_backend(None) == "http://a:5000"
+        assert g._order_backends(0.0, None) == ["http://a:5000"]
         serves = [r.message for r in caplog.records if "now serves both daemons" in r.message]
         assert len(serves) == 1
         assert "not trusted is not declared" in serves[0]

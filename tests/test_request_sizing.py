@@ -26,18 +26,22 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "shared-memory"
 
 import request_sizing
 
-SIZING_VARS = [
+# Names this module still reads. The removed bounds must not be read at all.
+LIVE_SIZING_VARS = [
+    "NREM_INSIGHT_SLOT_INPUT_CHARS",
+    "LLM_CHARS_PER_TOKEN_RATIO",
+    "FIT_MARGIN",
+]
+REMOVED_SIZING_VARS = [
     "REM_MAX_TOKENS_SOLO",
     "REM_MAX_TOKENS_PER_FACT",
     "REM_MAX_TOKENS_PER_SUMMARY",
     "REM_TRUNCATION_RETRY_FACTOR",
     "NREM_MAX_TOKENS_INSIGHT",
     "NREM_TRUNCATION_RETRY_FACTOR",
-    "NREM_INSIGHT_SLOT_INPUT_CHARS",
-    "LLM_CHARS_PER_TOKEN_RATIO",
-    "FIT_MARGIN",
     "FIT_DEFAULT_OUTPUT_TOKENS",
 ]
+SIZING_VARS = LIVE_SIZING_VARS + REMOVED_SIZING_VARS
 
 
 @pytest.fixture(autouse=True)
@@ -54,74 +58,40 @@ def test_1_value_pins_and_edges(monkeypatch):
     for v in SIZING_VARS:
         monkeypatch.delenv(v, raising=False)
 
-    # Defaults
-    assert request_sizing.rem_solo_max_tokens() == 1500
-    assert request_sizing.rem_retry_bound(1500, degenerate=True) == 1500
-    assert request_sizing.rem_retry_bound(1500, degenerate=False) == 3000
-    assert request_sizing.rem_batch_max_tokens(5) == 3250
-    assert request_sizing.nrem_insight_bounds() == [8192, 16384]
+    # Defaults. fact:3394: the ratio is 2.7, the lowest real record.
     assert request_sizing.nrem_insight_item_chars() == 2000
-    assert request_sizing.estimate_prompt_tokens(1200) == 1000.0
-    assert request_sizing.fits(10000, 7000, 2000) is True
-    assert request_sizing.fits(10000, 7000, 2001) is False
-    assert request_sizing.fits(None, 10**9, 10**9) is True
-    assert request_sizing.fits(0, 10**9, 10**9) is True
-    assert request_sizing.effective_max_tokens({"max_tokens": 64}) == 64.0
-    assert request_sizing.effective_max_tokens({}) == 2048.0
+    assert request_sizing.estimate_prompt_tokens(270) == 100.0
+    assert request_sizing.context_room(10000, 1000) == 8000.0
+    assert request_sizing.qualifies(8000.0, 1000) is True
+    assert request_sizing.qualifies(8000.0, 8001) is False
+    assert request_sizing.context_room(None, 1) is None
+    assert request_sizing.context_room(0, 1) is None
+    assert request_sizing.qualifies(None, 0) is False
+    # Spend cap is min(max_output, context room). It does not decide qualifies.
+    assert request_sizing.reply_room(10000, 500, 1000) == 500.0
+    assert request_sizing.reply_room(10000, 9000, 1000) == 8000.0
+    assert request_sizing.reply_room(1000, 500, 0.0) == 500.0
+    assert request_sizing.reply_room(None, 500, 1) is None
+    assert request_sizing.reply_room(1000, 0, 1) is None
 
-    # Backend argument ignored but accepted
-    assert request_sizing.rem_solo_max_tokens(backend="local") == 1500
-    assert request_sizing.rem_retry_bound(1500, degenerate=True, backend="local") == 1500
-    assert request_sizing.rem_retry_bound(1500, degenerate=False, backend="local") == 3000
-    assert request_sizing.rem_batch_max_tokens(5, backend="local") == 3250
-    assert request_sizing.nrem_insight_bounds(backend="local") == [8192, 16384]
-    assert request_sizing.nrem_insight_item_chars(backend="local") == 2000
-    assert request_sizing.estimate_prompt_tokens(1200, backend="local") == 1000.0
-    assert request_sizing.fits(10000, 7000, 2000, backend="local") is True
-    assert request_sizing.effective_max_tokens({"max_tokens": 64}, backend="local") == 64.0
-
-    # effective_max_tokens edge pins (A2, A13)
-    assert request_sizing.effective_max_tokens({"max_tokens": True}) == 1.0
-    assert request_sizing.effective_max_tokens({"max_tokens": 0}) == 2048.0
-    assert request_sizing.effective_max_tokens({"max_tokens": -1}) == 2048.0
-    assert request_sizing.effective_max_tokens({"max_tokens": "64"}) == 2048.0
-    assert request_sizing.effective_max_tokens(None) == 2048.0
-    assert request_sizing.effective_max_tokens([]) == 2048.0
-    assert request_sizing.effective_max_tokens({"max_tokens": 64.5}) == 64.5
-    assert request_sizing.effective_max_tokens({"max_tokens": float("nan")}) == 2048.0
-
-    # estimate_prompt_tokens edge pins
+    # A ratio that is not greater than 0 gives 0.0.
     monkeypatch.setenv("LLM_CHARS_PER_TOKEN_RATIO", "0")
     assert request_sizing.estimate_prompt_tokens(1200) == 0.0
     monkeypatch.setenv("LLM_CHARS_PER_TOKEN_RATIO", "-1")
     assert request_sizing.estimate_prompt_tokens(1200) == 0.0
     monkeypatch.delenv("LLM_CHARS_PER_TOKEN_RATIO", raising=False)
 
-    # fits() evaluation order with malformed margin: undeclared/zero n_ctx returns True without reading margin (V2)
+    # A bad margin stops a real context. A missing context does not read it into a qualify.
     monkeypatch.setenv("FIT_MARGIN", "x")
-    assert request_sizing.fits(None, 1, 1) is True
-    assert request_sizing.fits(0, 1, 1) is True
+    assert request_sizing.context_room(None, 1) is None
     with pytest.raises(ValueError):
-        request_sizing.fits(1, 0.0, 0.0)
+        request_sizing.context_room(1, 0.0)
     monkeypatch.delenv("FIT_MARGIN", raising=False)
 
 
 # ── Test 2: Env override still works & validation ──────────────────────────────
 
 def test_2_env_overrides_and_validation(monkeypatch):
-    monkeypatch.setenv("REM_MAX_TOKENS_SOLO", "1700")
-    assert request_sizing.rem_solo_max_tokens() == 1700
-
-    monkeypatch.setenv("NREM_MAX_TOKENS_INSIGHT", "4096")
-    assert request_sizing.nrem_insight_bounds() == [4096, 8192]
-
-    monkeypatch.setenv("REM_TRUNCATION_RETRY_FACTOR", "3.0")
-    assert request_sizing.rem_retry_bound(1000, degenerate=False) == 3000
-
-    monkeypatch.setenv("REM_MAX_TOKENS_PER_FACT", "500")
-    monkeypatch.setenv("REM_MAX_TOKENS_PER_SUMMARY", "300")
-    assert request_sizing.rem_batch_max_tokens(2) == 1600
-
     monkeypatch.setenv("NREM_INSIGHT_SLOT_INPUT_CHARS", "1500")
     assert request_sizing.nrem_insight_item_chars() == 1500
 
@@ -129,57 +99,33 @@ def test_2_env_overrides_and_validation(monkeypatch):
     assert request_sizing.estimate_prompt_tokens(1000) == 500.0
 
     monkeypatch.setenv("FIT_MARGIN", "0.20")
-    assert request_sizing.fits(1000, 700, 100) is True   # 800 <= 800
-    assert request_sizing.fits(1000, 700, 101) is False  # 801 > 800
+    # n_ctx 1000 holds back 0.20, so room is 800. Qualifies when room >= estimate.
+    assert request_sizing.qualifies(request_sizing.context_room(1000, 400), 400) is True
+    assert request_sizing.qualifies(request_sizing.context_room(1000, 401), 401) is False
 
-    monkeypatch.setenv("FIT_DEFAULT_OUTPUT_TOKENS", "1024")
-    assert request_sizing.effective_max_tokens({}) == 1024.0
+    monkeypatch.setenv("NREM_INSIGHT_SLOT_INPUT_CHARS", "x")
+    with pytest.raises(ValueError):
+        request_sizing.validate_nrem()
+    monkeypatch.delenv("NREM_INSIGHT_SLOT_INPUT_CHARS", raising=False)
+    monkeypatch.setenv("NREM_MAX_TOKENS_INSIGHT", "x")
+    request_sizing.validate_nrem()
+    monkeypatch.delenv("NREM_MAX_TOKENS_INSIGHT", raising=False)
 
-    # Scoped validators (V1)
-    # 1. validate_rem() raises ValueError on its own variables
-    for var in ("REM_MAX_TOKENS_SOLO", "REM_MAX_TOKENS_PER_FACT", "REM_MAX_TOKENS_PER_SUMMARY", "REM_TRUNCATION_RETRY_FACTOR"):
-        monkeypatch.setenv(var, "x")
-        with pytest.raises(ValueError):
-            request_sizing.validate_rem()
-        monkeypatch.delenv(var, raising=False)
-
-    # 2. validate_nrem() raises ValueError on its own variables
-    for var in ("NREM_MAX_TOKENS_INSIGHT", "NREM_INSIGHT_SLOT_INPUT_CHARS", "NREM_TRUNCATION_RETRY_FACTOR"):
-        monkeypatch.setenv(var, "x")
-        with pytest.raises(ValueError):
-            request_sizing.validate_nrem()
-        monkeypatch.delenv(var, raising=False)
-
-    # 3. validate_fit() raises ValueError on its own variables
-    for var in ("LLM_CHARS_PER_TOKEN_RATIO", "FIT_MARGIN", "FIT_DEFAULT_OUTPUT_TOKENS"):
+    for var in ("LLM_CHARS_PER_TOKEN_RATIO", "FIT_MARGIN"):
         monkeypatch.setenv(var, "x")
         with pytest.raises(ValueError):
             request_sizing.validate_fit()
         monkeypatch.delenv(var, raising=False)
 
-    # FIT_DEFAULT_OUTPUT_TOKENS float string raises ValueError (A13)
     monkeypatch.setenv("FIT_DEFAULT_OUTPUT_TOKENS", "2048.5")
-    with pytest.raises(ValueError):
-        request_sizing.effective_max_tokens({})
-    with pytest.raises(ValueError):
-        request_sizing.validate_fit()
+    request_sizing.validate_fit()
     monkeypatch.delenv("FIT_DEFAULT_OUTPUT_TOKENS", raising=False)
 
-    # 4. validate_fit() does NOT raise with REM_MAX_TOKENS_SOLO=x or NREM_MAX_TOKENS_INSIGHT=x
     monkeypatch.setenv("REM_MAX_TOKENS_SOLO", "x")
     monkeypatch.setenv("NREM_MAX_TOKENS_INSIGHT", "x")
     request_sizing.validate_fit()
     monkeypatch.delenv("REM_MAX_TOKENS_SOLO", raising=False)
     monkeypatch.delenv("NREM_MAX_TOKENS_INSIGHT", raising=False)
-
-    # 5. validate_rem() and validate_nrem() do NOT raise with inf / nan respectively
-    monkeypatch.setenv("REM_TRUNCATION_RETRY_FACTOR", "inf")
-    request_sizing.validate_rem()
-    monkeypatch.delenv("REM_TRUNCATION_RETRY_FACTOR", raising=False)
-
-    monkeypatch.setenv("NREM_TRUNCATION_RETRY_FACTOR", "nan")
-    request_sizing.validate_nrem()
-    monkeypatch.delenv("NREM_TRUNCATION_RETRY_FACTOR", raising=False)
 
 
 def test_2b_gateway_import_refuses_a_malformed_sizing_value(monkeypatch):
@@ -199,29 +145,33 @@ def test_2b_gateway_import_refuses_a_malformed_sizing_value(monkeypatch):
         if "hive_mind_proxy" in sys.modules:
             importlib.reload(sys.modules["hive_mind_proxy"])
 
-    # 2. Daemon (rem_loop) refuses at import with malformed REM_MAX_TOKENS_SOLO
+    # 2. REM ignores a leftover token bound. The daemon still imports.
     monkeypatch.setenv("REM_MAX_TOKENS_SOLO", "x")
     try:
-        with pytest.raises(ValueError):
-            if "rem_loop" in sys.modules:
-                importlib.reload(sys.modules["rem_loop"])
-            else:
-                importlib.import_module("rem_loop")
+        if "rem_loop" in sys.modules:
+            importlib.reload(sys.modules["rem_loop"])
+        else:
+            importlib.import_module("rem_loop")
     finally:
         monkeypatch.delenv("REM_MAX_TOKENS_SOLO", raising=False)
         if "rem_loop" in sys.modules:
             importlib.reload(sys.modules["rem_loop"])
 
-    # 3. Daemon (consolidation_loop) refuses at import with malformed NREM_MAX_TOKENS_INSIGHT
+    # 3. NREM ignores a leftover output bound. A bad body cap still refuses.
     monkeypatch.setenv("NREM_MAX_TOKENS_INSIGHT", "x")
     try:
-        with pytest.raises(ValueError):
-            if "consolidation_loop" in sys.modules:
-                importlib.reload(sys.modules["consolidation_loop"])
-            else:
-                importlib.import_module("consolidation_loop")
+        if "consolidation_loop" in sys.modules:
+            importlib.reload(sys.modules["consolidation_loop"])
+        else:
+            importlib.import_module("consolidation_loop")
     finally:
         monkeypatch.delenv("NREM_MAX_TOKENS_INSIGHT", raising=False)
+    monkeypatch.setenv("NREM_INSIGHT_SLOT_INPUT_CHARS", "x")
+    try:
+        with pytest.raises(ValueError):
+            importlib.reload(sys.modules["consolidation_loop"])
+    finally:
+        monkeypatch.delenv("NREM_INSIGHT_SLOT_INPUT_CHARS", raising=False)
         if "consolidation_loop" in sys.modules:
             importlib.reload(sys.modules["consolidation_loop"])
 
@@ -308,13 +258,17 @@ def test_3_single_source_ast_scan():
                       and call.func.attr.startswith("validate")):
                     validate_lineno = node.lineno
         assert load_env_lineno is not None, f"{fname} must call load_split_env at top-level"
+        # REM no longer sizes its own reply. The gateway validates the fit settings.
+        if fname == "rem_loop.py":
+            assert validate_lineno is None
+            continue
         assert validate_lineno is not None, f"{fname} must call request_sizing.validate_* at top-level"
         assert validate_lineno > load_env_lineno, (
             f"{fname}: request_sizing.validate_* (line {validate_lineno}) must appear "
             f"after load_split_env (line {load_env_lineno})"
         )
 
-    # 4. request_sizing.py reads each of the 10 env names with literal os.environ.get exactly once
+    # 4. request_sizing.py reads each live name once. A removed bound is not read.
     rs_path = os.path.join(scripts_dir, "request_sizing.py")
     with open(rs_path, encoding="utf-8") as f:
         rs_tree = ast.parse(f.read(), filename=rs_path)
@@ -327,8 +281,10 @@ def test_3_single_source_ast_scan():
                 if val in counts:
                     counts[val] += 1
 
-    for v, c in counts.items():
-        assert c == 1, f"request_sizing.py must read {v} exactly once; found {c}"
+    for v in LIVE_SIZING_VARS:
+        assert counts[v] == 1, f"request_sizing.py must read {v} exactly once; found {counts[v]}"
+    for v in REMOVED_SIZING_VARS:
+        assert counts[v] == 0, f"request_sizing.py still reads removed {v}"
 
     # 5. NREM_MAX_TOKENS_SUMMARY appears nowhere in shared-memory/scripts/ or .env.example
     scripts_glob = glob.glob(os.path.join(scripts_dir, "*.py"))
@@ -389,81 +345,48 @@ def _make_rem_daemon():
 
 
 @pytest.mark.asyncio
-async def test_4_wiring_rem_solo_and_retry(monkeypatch):
+async def test_4_wiring_rem_sends_no_max_tokens_and_does_not_retry(monkeypatch):
+    """The daemon sends one call and no max_tokens. A cut-off is not parsed and not retried."""
     import rem_loop
 
     daemon, _ = _make_rem_daemon()
     monkeypatch.delenv("MOCK_LLM", raising=False)
-
-    # a) rem_solo_max_tokens wiring
-    monkeypatch.setattr(request_sizing, "rem_solo_max_tokens", lambda **kw: 333)
-    captured_bounds = []
+    calls = []
 
     async def _mock_post(self, url, **kwargs):
-        captured_bounds.append(kwargs.get("json", {}).get("max_tokens"))
-        return _MockResp({"choices": [{"finish_reason": "stop", "message": {"content": '{"summary":"s","relationships":[]}'}}]})
+        body = kwargs.get("json", {})
+        calls.append(body)
+        if len(calls) == 1:
+            return _MockResp({"choices": [{"finish_reason": "stop", "message": {"content": '{"summary":"s","relationships":[]}'}}]})
+        return _MockResp({"choices": [{"finish_reason": "length", "message": {"content": '{"summary":"cut"'}}]})
 
     monkeypatch.setattr("httpx.AsyncClient.post", _mock_post)
     long_content = "x" * (rem_loop.REM_SUMMARY_THRESHOLD + 1)
-    await daemon._llm_process(long_content, rem_loop.KIND_FACT, pg_id=1)
-    assert captured_bounds == [333]
+    parsed, _model = await daemon._llm_process(long_content, rem_loop.KIND_FACT, pg_id=1)
+    assert parsed["summary"] == "s"
+    assert "max_tokens" not in calls[0]
 
-    # b) rem_retry_bound wiring (honest and degenerate)
-    recorded_retry_calls = []
+    calls.clear()
 
-    def _mock_retry_bound(first, *, degenerate, backend=None):
-        recorded_retry_calls.append((first, degenerate))
-        return first + 7
+    async def _mock_length(self, url, **kwargs):
+        calls.append(kwargs.get("json", {}))
+        return _MockResp({"choices": [{"finish_reason": "length", "message": {"content": '{"summary":"cut"'}}]})
 
-    monkeypatch.setattr(request_sizing, "rem_retry_bound", _mock_retry_bound)
-
-    # Honest retry: first truncated, second stop
-    captured_bounds.clear()
-    recorded_retry_calls.clear()
-
-    async def _mock_honest_post(self, url, **kwargs):
-        captured_bounds.append(kwargs.get("json", {}).get("max_tokens"))
-        if len(captured_bounds) == 1:
-            return _MockResp({"choices": [{"finish_reason": "length", "message": {"content": '{"summary":"truncated'}}]})
-        return _MockResp({"choices": [{"finish_reason": "stop", "message": {"content": '{"summary":"ok","relationships":[]}'}}]})
-
-    monkeypatch.setattr("httpx.AsyncClient.post", _mock_honest_post)
-    await daemon._llm_process(long_content, rem_loop.KIND_FACT, pg_id=2)
-    assert captured_bounds == [333, 340]
-    assert recorded_retry_calls == [(333, False)]
-
-    # Degenerate retry: first truncated with repeated flat objects
-    captured_bounds.clear()
-    recorded_retry_calls.clear()
-    degen_body = '[{"name":"A","rel_type":"M"},{"name":"A","rel_type":"M"},{"name":"A","rel_type":"M"}]'
-
-    async def _mock_degen_post(self, url, **kwargs):
-        captured_bounds.append(kwargs.get("json", {}).get("max_tokens"))
-        if len(captured_bounds) == 1:
-            return _MockResp({"choices": [{"finish_reason": "length", "message": {"content": degen_body}}]})
-        return _MockResp({"choices": [{"finish_reason": "stop", "message": {"content": '{"summary":"ok","relationships":[]}'}}]})
-
-    monkeypatch.setattr("httpx.AsyncClient.post", _mock_degen_post)
-    await daemon._llm_process(long_content, rem_loop.KIND_FACT, pg_id=3)
-    assert captured_bounds == [333, 340]
-    assert recorded_retry_calls == [(333, True)]
+    monkeypatch.setattr("httpx.AsyncClient.post", _mock_length)
+    with patch.object(rem_loop, "_parse_llm_json") as parse:
+        result, _model = await daemon._llm_process(long_content, rem_loop.KIND_FACT, pg_id=2)
+    assert result is None
+    assert len(calls) == 1
+    assert "max_tokens" not in calls[0]
+    parse.assert_not_called()
 
 
 @pytest.mark.asyncio
-async def test_4_wiring_rem_batch(monkeypatch):
+async def test_4_wiring_rem_batch_sends_no_max_tokens(monkeypatch):
     import rem_loop
 
     daemon, _ = _make_rem_daemon()
     monkeypatch.delenv("MOCK_LLM", raising=False)
-
-    batch_calls = []
-
-    def _mock_batch_tokens(n_facts, **kw):
-        batch_calls.append(n_facts)
-        return 4444
-
-    monkeypatch.setattr(request_sizing, "rem_batch_max_tokens", _mock_batch_tokens)
-
     captured = {}
 
     async def _mock_post(self, url, **kwargs):
@@ -474,8 +397,7 @@ async def test_4_wiring_rem_batch(monkeypatch):
     long_content = "x" * (rem_loop.REM_SUMMARY_THRESHOLD + 1)
     items = [{"pg_id": 1, "content": long_content}, {"pg_id": 2, "content": long_content}]
     await daemon._llm_process_batch(items)
-    assert batch_calls == [2]
-    assert captured["max_tokens"] == 4444
+    assert "max_tokens" not in captured
 
 
 @pytest.mark.asyncio
@@ -484,34 +406,19 @@ async def test_4_wiring_nrem_insight(monkeypatch):
 
     daemon = cl.ConsolidationDaemon()
     monkeypatch.delenv("MOCK_LLM", raising=False)
-
-    # d) nrem_insight_bounds wired into _call_insight_llm and adaptive_ceiling
-    monkeypatch.setattr(request_sizing, "nrem_insight_bounds", lambda **kw: [111, 222])
-
-    ceiling_max_tokens = []
-    real_adaptive_ceiling = cl.adaptive_ceiling
-
-    def _mock_adaptive_ceiling(*args, **kwargs):
-        ceiling_max_tokens.append(kwargs.get("max_tokens"))
-        return real_adaptive_ceiling(*args, **kwargs)
-
-    monkeypatch.setattr(cl, "adaptive_ceiling", _mock_adaptive_ceiling)
-
-    sent_bounds = []
+    sent = []
 
     async def _fake_post_nrem(client, json_payload, ceiling_s=None, prompt_chars=0):
-        sent_bounds.append(json_payload.get("max_tokens"))
+        sent.append(json_payload)
         return _MockResp({"choices": [{"finish_reason": "stop", "message": {"content": "SLOT 1: a.\nPRINCIPLE: p."}}]})
 
     monkeypatch.setattr(cl, "_post_nrem", _fake_post_nrem)
-
     items = [{"pg_id": 1, "type": "decision", "title": "T", "body": "B"}]
     res = await daemon._call_insight_llm("prompt text", "EntityA", units=1, items=items)
     assert res is not None
-    assert sent_bounds == [111]
-    assert ceiling_max_tokens == [222]
+    assert len(sent) == 1
+    assert "max_tokens" not in sent[0]
 
-    # e) nrem_insight_item_chars wired into generate_insight_slots fold path
     monkeypatch.setattr(request_sizing, "nrem_insight_item_chars", lambda **kw: 5)
     captured_prompt = []
     captured_items = []
@@ -525,7 +432,7 @@ async def test_4_wiring_nrem_insight(monkeypatch):
     rows = [(10, "Title Line\nFull long body exceeding five characters", "proj", "decision", {})]
     res_slots = await daemon.generate_insight_slots("EntityA", rows)
     assert res_slots is not None
-    assert captured_items[0][0]["body"] == "Full "  # cut at 5 characters
+    assert captured_items[0][0]["body"] == "Full "
     assert "Body: Full " in captured_prompt[0]
     assert "Full long body" not in captured_prompt[0]
 
@@ -545,14 +452,7 @@ async def test_4_wiring_gateway_fit_greek(monkeypatch):
     import hive_mind_proxy as g
     importlib.reload(g)
 
-    fits_args = []
-
-    def _mock_fits(n_ctx, est_prompt_tokens, effective_max_tokens, **kw):
-        fits_args.append((n_ctx, est_prompt_tokens, effective_max_tokens))
-        return False  # force 422 fit refusal
-
-    monkeypatch.setattr(request_sizing, "fits", _mock_fits)
-    monkeypatch.setattr(request_sizing, "effective_max_tokens", lambda *a, **kw: 129.0)
+    monkeypatch.setattr(request_sizing, "qualifies", lambda room, est: False)
 
     recorded_prompt_lens = []
     real_estimate = request_sizing.estimate_prompt_tokens
@@ -570,6 +470,7 @@ async def test_4_wiring_gateway_fit_greek(monkeypatch):
             raise AssertionError("upstream must not be called")
 
     proxy.session = _RaisingSession()
+    proxy.llm_session = proxy.session
 
     greek_text = "Καλημέρα κόσμε! Αυτό είναι ένα δοκιμαστικό σώμα στα ελληνικά."
     payload = {
@@ -593,19 +494,13 @@ async def test_4_wiring_gateway_fit_greek(monkeypatch):
     resp = await proxy.handle_proxy(_MockReq())
     assert resp.status == 422
     body = json.loads(resp.body.decode())
-    assert body["constraint"] == "fit"
+    assert body["error"] == "backlog"
+    assert body["reason"] == "no_context"
 
     assert len(recorded_prompt_lens) >= 1
     char_count = len(raw_bytes.decode("utf-8"))
     assert recorded_prompt_lens[0] == len(raw_bytes)
     assert recorded_prompt_lens[0] != char_count
-
-    assert len(fits_args) >= 1
-    passed_n_ctx, passed_est_tokens, passed_eff_tokens = fits_args[0]
-    assert passed_n_ctx == 4096
-    expected_est = real_estimate(len(raw_bytes))
-    assert passed_est_tokens == expected_est
-    assert passed_eff_tokens == 129.0
 
 
 # ── Test 5: Standard library only import check ─────────────────────────────────
