@@ -307,7 +307,7 @@ class _OkSession:
     closed = False
 
     def request(self, *a, **kw):
-        return _OkCm(b'{"choices":[]}')
+        return _OkCm(b'{"choices":[{"finish_reason":"stop","message":{"content":"ok"}}]}')
 
 
 def _patch_stream_response(monkeypatch):
@@ -340,9 +340,10 @@ def test_x_sm_llm_backend_header_clean_mixed_case_byte_identical(monkeypatch):
 
     proxy = g.AsyncHiveMindProxy()
     proxy.session = _OkSession()
-    asyncio.run(proxy.handle_proxy(_FakeReq()))
+    proxy.llm_session = proxy.session
+    resp = asyncio.run(proxy.handle_proxy(_FakeReq()))
 
-    assert written["headers"]["X-SM-LLM-Backend"] == "http://MyHost:8000"
+    assert resp.headers["X-SM-LLM-Backend"] == "http://MyHost:8000"
 
 
 def test_x_sm_llm_backend_header_clean_ipv6_byte_identical(monkeypatch):
@@ -355,9 +356,10 @@ def test_x_sm_llm_backend_header_clean_ipv6_byte_identical(monkeypatch):
 
     proxy = g.AsyncHiveMindProxy()
     proxy.session = _OkSession()
-    asyncio.run(proxy.handle_proxy(_FakeReq()))
+    proxy.llm_session = proxy.session
+    resp = asyncio.run(proxy.handle_proxy(_FakeReq()))
 
-    assert written["headers"]["X-SM-LLM-Backend"] == "http://[fd00::1]:9443"
+    assert resp.headers["X-SM-LLM-Backend"] == "http://[fd00::1]:9443"
 
 
 def test_x_sm_llm_backend_header_scrubs_a_directly_seeded_credentialed_backend(monkeypatch):
@@ -380,9 +382,9 @@ def test_x_sm_llm_backend_header_scrubs_a_directly_seeded_credentialed_backend(m
     g.LLM_BACKEND_EXTRAS.clear()
     g.LLM_BACKEND_EXTRAS[cred_url] = None
     g.LLM_BACKEND_NCTX.clear()
-    g.LLM_BACKEND_NCTX[cred_url] = None
+    g.LLM_BACKEND_NCTX[cred_url] = 8192
     g.LLM_BACKEND_MAX_OUTPUT.clear()
-    g.LLM_BACKEND_MAX_OUTPUT[cred_url] = None
+    g.LLM_BACKEND_MAX_OUTPUT[cred_url] = 2048
     g.LLM_BACKEND_MAX_INFLIGHT.clear()
     g.LLM_BACKEND_MAX_INFLIGHT[cred_url] = None
     g.LLM_BACKEND_PRICE_IN.clear()
@@ -394,12 +396,12 @@ def test_x_sm_llm_backend_header_scrubs_a_directly_seeded_credentialed_backend(m
     g._llm_inflight_started.clear()
     g._llm_inflight_started[cred_url] = []
 
-    written = _patch_stream_response(monkeypatch)
     proxy = g.AsyncHiveMindProxy()
     proxy.session = _OkSession()
-    asyncio.run(proxy.handle_proxy(_FakeReq()))
+    proxy.llm_session = proxy.session
+    resp = asyncio.run(proxy.handle_proxy(_FakeReq()))
 
-    header = written["headers"].get("X-SM-LLM-Backend")
+    header = resp.headers.get("X-SM-LLM-Backend")
     assert header is not None
     assert SECRET not in header
     assert header == "https://backend.example.test/v1"
@@ -476,6 +478,7 @@ def test_request_path_debug_log_scrubs_target_url(monkeypatch, caplog):
     _patch_stream_response(monkeypatch)
     proxy = g.AsyncHiveMindProxy()
     proxy.session = _OkSession()
+    proxy.llm_session = proxy.session
 
     with caplog.at_level(logging.DEBUG, logger="hive-proxy"):
         asyncio.run(proxy.handle_proxy(_FakeReq()))
@@ -503,6 +506,7 @@ def test_request_path_upstream_unreachable_error_log_scrubs_target_url(monkeypat
 
     proxy = g.AsyncHiveMindProxy()
     proxy.session = _ErrSession()
+    proxy.llm_session = proxy.session
 
     with caplog.at_level(logging.ERROR, logger="hive-proxy"):
         asyncio.run(proxy.handle_proxy(_FakeReq()))
@@ -529,6 +533,7 @@ def test_request_path_connect_timeout_log_scrubs_target_url(monkeypatch, caplog)
 
     proxy = g.AsyncHiveMindProxy()
     proxy.session = _TimeoutSession()
+    proxy.llm_session = proxy.session
 
     with caplog.at_level(logging.WARNING, logger="hive-proxy"):
         asyncio.run(proxy.handle_proxy(_FakeReq()))

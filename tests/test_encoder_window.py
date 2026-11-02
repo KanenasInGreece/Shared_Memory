@@ -313,6 +313,7 @@ def test_handle_encoder_clamps_array_per_element():
     session = _CaptureSession()
     proxy = g.AsyncHiveMindProxy()
     proxy.session = session
+    proxy.llm_session = proxy.session
     resp = asyncio.run(proxy.handle_encoder(req))
     assert resp.status == 200
     assert session.sent_data is not None
@@ -334,6 +335,7 @@ def test_handle_encoder_declared_cl_over_cap_413s_without_payload_pull(monkeypat
     session = _CaptureSession()
     proxy = g.AsyncHiveMindProxy()
     proxy.session = session
+    proxy.llm_session = proxy.session
     resp = asyncio.run(proxy.handle_encoder(req))
     assert resp.status == 413
     assert resp.headers.get("X-SM-Fault-Origin") == "gateway"
@@ -358,6 +360,7 @@ def test_handle_encoder_chunked_under_cap_clamps_embeddings_input():
     session = _CaptureSession()
     proxy = g.AsyncHiveMindProxy()
     proxy.session = session
+    proxy.llm_session = proxy.session
     resp = asyncio.run(proxy.handle_encoder(req))
     assert resp.status == 200
     expected = encoder_window.clamp_encoder_payload(raw)
@@ -382,6 +385,7 @@ def test_handle_encoder_chunked_over_cap_stops_after_first_oversize_pull(monkeyp
     session = _CaptureSession()
     proxy = g.AsyncHiveMindProxy()
     proxy.session = session
+    proxy.llm_session = proxy.session
     resp = asyncio.run(proxy.handle_encoder(req))
     assert resp.status == 413
     assert resp.headers.get("X-SM-Fault-Origin") == "gateway"
@@ -414,6 +418,7 @@ def test_handle_encoder_chunked_under_cap_two_fills_clamps_embeddings_input():
     session = _CaptureSession()
     proxy = g.AsyncHiveMindProxy()
     proxy.session = session
+    proxy.llm_session = proxy.session
     resp = asyncio.run(proxy.handle_encoder(req))
     assert resp.status == 200
     assert stream.pulls == 3
@@ -437,6 +442,7 @@ def test_handle_encoder_chunked_sum_past_cap_two_fills_aborts_at_cap(monkeypatch
     session = _CaptureSession()
     proxy = g.AsyncHiveMindProxy()
     proxy.session = session
+    proxy.llm_session = proxy.session
     resp = asyncio.run(proxy.handle_encoder(req))
     assert resp.status == 413
     assert resp.headers.get("X-SM-Fault-Origin") == "gateway"
@@ -466,6 +472,7 @@ def test_handle_encoder_lying_cl_still_capped_by_helper(monkeypatch):
     session = _CaptureSession()
     proxy = g.AsyncHiveMindProxy()
     proxy.session = session
+    proxy.llm_session = proxy.session
     resp = asyncio.run(proxy.handle_encoder(req))
     assert resp.status == 413
     assert resp.headers.get("X-SM-Fault-Origin") == "gateway"
@@ -496,6 +503,7 @@ def test_handle_encoder_chunked_under_cap_prefixes_rerank():
     session = _CaptureSession()
     proxy = g.AsyncHiveMindProxy()
     proxy.session = session
+    proxy.llm_session = proxy.session
     resp = asyncio.run(proxy.handle_encoder(req))
     assert resp.status == 200
     assert session.sent_data != raw
@@ -515,6 +523,7 @@ def test_handle_encoder_empty_chunked_sets_llm_body_empty_bytes():
     session = _CaptureSession()
     proxy = g.AsyncHiveMindProxy()
     proxy.session = session
+    proxy.llm_session = proxy.session
     resp = asyncio.run(proxy.handle_encoder(req))
     assert resp.status == 200
     assert session.sent_data == b""
@@ -555,14 +564,30 @@ def test_handle_proxy_does_not_413_on_encoder_buffer_cap(monkeypatch):
 
     proxy = g.AsyncHiveMindProxy()
     session = _CaptureSession()
+
+    def _complete(method, url, headers=None, data=None, allow_redirects=False):
+        resp = _CaptureSession.request(
+            session, method, url, headers, data, allow_redirects)
+        resp.content = _UpstreamBody(json.dumps({
+            "choices": [{
+                "finish_reason": "stop",
+                "message": {"content": "ok"},
+            }],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+        }).encode())
+        return resp
+
+    session.request = _complete
     proxy.session = session
+    proxy.llm_session = proxy.session
     resp = asyncio.run(proxy.handle_proxy(_ChatReq()))
-    assert 200 <= resp.status < 300
     assert resp.status != 413
     assert resp.status != 500
+    assert 200 <= resp.status < 300
     assert len(session.calls) == 1
-    assert session.calls[0]["data"] == chat_body
-    assert session.sent_data == chat_body
+    sent = json.loads(session.calls[0]["data"])
+    assert sent["messages"][0]["content"] == "hi"
+    assert isinstance(sent["max_tokens"], int)
 
 
 

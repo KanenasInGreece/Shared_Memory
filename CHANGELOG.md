@@ -7,7 +7,23 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
-## [1.0.43] - 2026-11-01
+## [1.0.44] - 2026-11-02
+
+A dream request now goes to the cheapest backend that can hold it, moves up only on fixed signals, is tried once per backend, and never stores a cut-off reply. A paid reply that cannot be used ends in a row instead of being bought again.
+
+- **Routing.** Order is priority, then `n_ctx`, then self-hosted, then least in flight, then cache affinity. The gateway sets `max_tokens` per try: the smaller of `max_output_tokens` and `n_ctx × 0.9` minus the prompt estimate. A backend qualifies only if that room is at least the estimate. Moves go forward only: a context refusal to a larger `n_ctx`, a cut-off to more room, and 429, 502, 504, a paid 503 or a refused connection to the next backend when `LLM_MOVE_ON_DOWN` is true (the default). A busy backend gives way to a free self-hosted backend at the same priority, otherwise it waits. The default `LLM_CHARS_PER_TOKEN_RATIO` is now 2.7, the lowest measured.
+- **New table `llm_backlog` (migration 045).** Run `apply.py` before restarting. If the table is missing or unreadable the gateway stays up, both daemons stay stopped, and `/health` says `llm_backlog unreadable`; they start when the table appears. Each reason waits for its own change: `no_context` for a larger context, `cut_off` for a larger reply cap, `loop` and `unparseable` for a changed pool, `connection_lost` and `write_failed` for a gateway restart. `shared-memory/ops/README.md` shows how to release rows by hand.
+- **Free faults queue.** A 4xx with no usage other than a context refusal, a 3xx with no usage, and a 2xx declared `text/html` log an error, write no row, and come back next cycle. After such a 4xx on a REM batch, its facts go alone from the next cycle.
+- **No timers on the LLM path.** The daemons' chat timeout, the capacity wait deadline and waiter cap, and the 5-second connect limit are gone. A backend that accepts and never answers stalls its daemon. It also holds the backup lock, which stops backups and thematic folds until the backend answers or the daemon restarts; busy signals in the next release address this. Each wait logs one line.
+- **Settings removed:** `REM_MAX_TOKENS_SOLO`, `REM_MAX_TOKENS_PER_FACT`, `REM_MAX_TOKENS_PER_SUMMARY`, `NREM_MAX_TOKENS_INSIGHT`, `REM_TRUNCATION_RETRY_FACTOR`, `NREM_TRUNCATION_RETRY_FACTOR`, `FIT_DEFAULT_OUTPUT_TOKENS`, `LLM_CEILING_FLOOR`, `LLM_MIN_TOK_S`, `REM_MAX_ATTEMPTS`, `NREM_FOLD_FAIL_CAP`, `NREM_FOLD_FAIL_WINDOW`, `LLM_MAX_INFLIGHT_WAIT_S`, `LLM_MAX_CAPACITY_WAITERS`.
+- **Monitor contract.** `rem.dead_lettered`, `neo4j.rem_dead_lettered`, `rem.failing`, `rem.max_attempts`, `dead_lettered_clusters` and `dependencies.rem_daemon.reason` change meaning; see `MEANING_CHANGES`. Shapes do not change.
+- **Security.** Provider error labels are redacted before they are cut, on the LLM and encoder paths. Retained usage keeps only numbers, and a reply's `model` is redacted.
+
+### Dependency sweep, 2026-11-02
+
+joserfc moves to 1.7.6 in `requirements.lock` and `requirements-mcp.lock` for GHSA-9pg5-8c7x-5hfx and GHSA-jpxq-7h8p-2q76; the fix passed the 14-day floor. Not moved: fastmcp GHSA-7xgj-8392-5q4r and GHSA-vqqp-x5qm-5qp4 in `requirements.lock` and the MCP connector, whose fixes are 13 days old. None is in `requirements-gateway.lock`, which is clean.
+
+
 
 A second clean-up pass on the files 1.0.42 touched. No behaviour changes: requests, statuses and messages are as in 1.0.42, proved by the same end-to-end run.
 

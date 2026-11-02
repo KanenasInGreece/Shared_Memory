@@ -149,6 +149,7 @@ def test_wrong_method_on_a_post_only_memory_route_405(monkeypatch):
     g = _fresh_gateway(monkeypatch)
     app, proxy = _build_proxy_with_known_routes(g)
     proxy.session = _CapturingSession()
+    proxy.llm_session = proxy.session
     status, headers, _body = asyncio.run(_probe_app(app, "GET", "/memory/save"))
     assert status == 405
     assert headers.get("Allow") == "POST"
@@ -161,6 +162,7 @@ def test_unknown_path_under_memory_prefix_404(monkeypatch, method):
     g = _fresh_gateway(monkeypatch)
     app, proxy = _build_proxy_with_known_routes(g)
     proxy.session = _CapturingSession()
+    proxy.llm_session = proxy.session
     status, headers, _body = asyncio.run(_probe_app(app, method, "/memory/no-such-route"))
     assert status == 404
     assert headers.get("X-SM-Fault-Origin") == "gateway"
@@ -171,6 +173,7 @@ def test_unknown_path_under_admin_prefix_404(monkeypatch):
     g = _fresh_gateway(monkeypatch)
     app, proxy = _build_proxy_with_known_routes(g)
     proxy.session = _CapturingSession()
+    proxy.llm_session = proxy.session
     status, headers, _body = asyncio.run(_probe_app(app, "POST", "/admin/no-such-route"))
     assert status == 404
     assert headers.get("X-SM-Fault-Origin") == "gateway"
@@ -181,6 +184,7 @@ def test_wrong_method_on_health_405(monkeypatch):
     g = _fresh_gateway(monkeypatch)
     app, proxy = _build_proxy_with_known_routes(g)
     proxy.session = _CapturingSession()
+    proxy.llm_session = proxy.session
     status, headers, _body = asyncio.run(_probe_app(app, "POST", "/health"))
     assert status == 405
     assert headers.get("Allow") == "GET, HEAD"
@@ -192,6 +196,7 @@ def test_wrong_method_on_memory_telemetry_405(monkeypatch):
     g = _fresh_gateway(monkeypatch)
     app, proxy = _build_proxy_with_known_routes(g)
     proxy.session = _CapturingSession()
+    proxy.llm_session = proxy.session
     status, headers, _body = asyncio.run(_probe_app(app, "POST", "/memory/telemetry"))
     assert status == 405
     assert headers.get("Allow") == "GET, HEAD"
@@ -202,6 +207,7 @@ def test_dynamic_status_route_wrong_method_405(monkeypatch):
     g = _fresh_gateway(monkeypatch)
     app, proxy = _build_proxy_with_known_routes(g)
     proxy.session = _CapturingSession()
+    proxy.llm_session = proxy.session
     status, headers, _body = asyncio.run(_probe_app(app, "POST", "/memory/status/42"))
     assert status == 405
     assert headers.get("Allow") == "GET, HEAD"
@@ -236,6 +242,7 @@ def test_v1_embeddings_still_dispatches_unchanged(monkeypatch):
     _, proxy = _build_proxy_with_known_routes(g)
     session = _CapturingSession()
     proxy.session = session
+    proxy.llm_session = proxy.session
     resp = asyncio.run(proxy.handle_encoder(_req("POST", "/v1/embeddings")))
     assert session.captured is not None, "the encoder handler never dispatched"
     assert session.captured[1].startswith(g.EMBEDDER_URL)
@@ -248,6 +255,7 @@ def test_v1_chat_completions_still_dispatches_unchanged(monkeypatch):
     _, proxy = _build_proxy_with_known_routes(g)
     session = _CapturingSession()
     proxy.session = session
+    proxy.llm_session = proxy.session
     body = json.dumps({"messages": [{"role": "user", "content": "hi"}],
                         "model": "local-model"}).encode()
     req = _req("POST", "/v1/chat/completions", body=body)
@@ -268,6 +276,7 @@ def test_route_view_derived_from_router_not_hand_written(monkeypatch):
     app.router.add_put("/some/new/framework/route", _stub_handler)
     proxy = g.AsyncHiveMindProxy()
     proxy.session = _CapturingSession()
+    proxy.llm_session = proxy.session
     status, headers, _body = asyncio.run(_probe_app(app, "GET", "/some/new/framework/route"))
     assert status == 405
     assert headers.get("Allow") == "PUT"

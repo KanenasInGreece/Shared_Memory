@@ -41,6 +41,7 @@ Two independent guards, either one sufficient to catch a regression:
 import builtins
 import importlib
 import os
+import subprocess
 import sys
 
 import pytest
@@ -198,3 +199,39 @@ def test_gateway_lock_carries_no_blocked_module():
         assert not offenders, (
             f"requirements-gateway.lock must not carry {blocked}: {offenders}"
         )
+
+
+def test_hive_mind_proxy_imports_when_psycopg2_is_blocked():
+    """A meta-path finder blocks psycopg2, then a fresh process imports the gateway.
+
+    The shipped unit has no psycopg2. A top-level import of llm_backlog dies here.
+    """
+    script = (
+        "import sys\n"
+        "class _Finder:\n"
+        "    def find_spec(self, fullname, path, target=None):\n"
+        "        if fullname == 'psycopg2' or fullname.startswith('psycopg2.'):\n"
+        "            raise ImportError('blocked for this test: ' + fullname)\n"
+        "        return None\n"
+        "sys.meta_path.insert(0, _Finder())\n"
+        "for _name in list(sys.modules):\n"
+        "    if _name == 'psycopg2' or _name.startswith('psycopg2.'):\n"
+        "        del sys.modules[_name]\n"
+        "import secure_env\n"
+        "import request_sizing\n"
+        "import dream_telemetry\n"
+        "import coordinator\n"
+        "import hive_mind_proxy\n"
+    )
+    env = os.environ.copy()
+    env["SECURE_ENV_FILE"] = ""
+    env["COORDINATOR_UDS"] = ""
+    env["PYTHONPATH"] = os.path.abspath(SCRIPTS_DIR) + os.pathsep + env.get("PYTHONPATH", "")
+    proc = subprocess.run(
+        [sys.executable, "-c", script],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert proc.returncode == 0, proc.stderr

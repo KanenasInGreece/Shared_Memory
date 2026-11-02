@@ -396,7 +396,16 @@ def render_column(cur, table: str, col: dict, pk_cols: set[str]) -> str:
 def render_table(cur, table: str) -> str:
     cols = fetch_columns(cur, table)
     pk_cols = fetch_pk_columns(cur, table)
-    col_lines = [render_column(cur, table, col, pk_cols) for col in cols]
+    # A composite primary key stamped on every column is invalid SQL. One
+    # table constraint keeps a fresh install able to apply this file.
+    composite = len(pk_cols) > 1
+    stamp = set() if composite else pk_cols
+    col_lines = [render_column(cur, table, col, stamp) for col in cols]
+    if composite:
+        ordered = [c["column_name"] for c in cols if c["column_name"] in pk_cols]
+        col_lines.append(
+            f"    CONSTRAINT {table}_pkey PRIMARY KEY ({', '.join(ordered)})"
+        )
     col_lines += [f"    {c}" for c in fetch_table_constraints(cur, table)]
     body = ",\n".join(col_lines)
     return f"CREATE TABLE IF NOT EXISTS {table} (\n{body}\n);"

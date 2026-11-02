@@ -92,6 +92,7 @@ def test_client_steering_header_stripped_before_forwarding(monkeypatch):
     proxy = g.AsyncHiveMindProxy()
     session = _RoleCaptureSession()
     proxy.session = session
+    proxy.llm_session = proxy.session
     req = _req({"X-SM-LLM-Role": "judge"})
     req["authenticated_agent"] = "claude"
     asyncio.run(proxy.handle_proxy(req))
@@ -121,6 +122,7 @@ def test_auth_off_install_keeps_backward_compatible_pass_through(monkeypatch):
     proxy = g.AsyncHiveMindProxy()
     session = _RoleCaptureSession()
     proxy.session = session
+    proxy.llm_session = proxy.session
     req = _req({"X-SM-LLM-Role": "judge"})
     asyncio.run(proxy.handle_proxy(req))
     assert "X-SM-LLM-Role" not in session.captured_headers
@@ -148,6 +150,7 @@ def test_daemon_identity_keeps_steering_header(monkeypatch):
     proxy = g.AsyncHiveMindProxy()
     session = _RoleCaptureSession()
     proxy.session = session
+    proxy.llm_session = proxy.session
     req = _req({"X-SM-LLM-Role": "judge"})
     req["authenticated_agent"] = "consolidation"
     asyncio.run(proxy.handle_proxy(req))
@@ -166,6 +169,7 @@ def test_full_role_client_identity_gets_header_stripped_even_with_auth_on(monkey
     proxy = g.AsyncHiveMindProxy()
     session = _RoleCaptureSession()
     proxy.session = session
+    proxy.llm_session = proxy.session
     req = _req({"X-SM-LLM-Role": "judge"})
     req["authenticated_agent"] = "claude"
     asyncio.run(proxy.handle_proxy(req))
@@ -183,6 +187,7 @@ def test_rem_daemon_identity_also_keeps_steering_header(monkeypatch):
     proxy = g.AsyncHiveMindProxy()
     session = _RoleCaptureSession()
     proxy.session = session
+    proxy.llm_session = proxy.session
     req = _req({"X-SM-LLM-Role": "judge"})
     req["authenticated_agent"] = "rem_daemon"
     asyncio.run(proxy.handle_proxy(req))
@@ -197,6 +202,7 @@ def test_non_llm_headers_pass_through_unaffected(monkeypatch):
     proxy = g.AsyncHiveMindProxy()
     session = _RoleCaptureSession()
     proxy.session = session
+    proxy.llm_session = proxy.session
     req = _req({"X-SM-LLM-Role": "judge", "X-Custom-Header": "keep-me"})
     req["authenticated_agent"] = "claude"
     asyncio.run(proxy.handle_proxy(req))

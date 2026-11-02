@@ -75,6 +75,7 @@ def test_anonymous_chat_is_refused_without_the_identity_fixture(monkeypatch):
     _c, g = _reload(monkeypatch)
     proxy = g.AsyncHiveMindProxy()
     proxy.session = _Session()
+    proxy.llm_session = proxy.session
     resp = asyncio.run(proxy.handle_proxy(_req(g, "POST", "/v1/chat/completions")))
     assert resp.status == 403
     assert json.loads(resp.body)["error"] == "framework_only"
@@ -89,6 +90,7 @@ def test_f3_non_daemon_is_refused_and_a_daemon_is_forwarded(monkeypatch):
         _register(c, "daemon-tok", "consolidation")
         proxy = g.AsyncHiveMindProxy()
         proxy.session = _Session()
+        proxy.llm_session = proxy.session
         resp = asyncio.run(proxy.handle_proxy(_req(g, "POST", "/v1/chat/completions", token="outsider")))
         assert resp.status == 403
         assert json.loads(resp.body)["error"] == "framework_only"
@@ -96,6 +98,7 @@ def test_f3_non_daemon_is_refused_and_a_daemon_is_forwarded(monkeypatch):
         assert proxy.session.calls == []
 
         proxy.session = _Session()
+        proxy.llm_session = proxy.session
         forwarded = asyncio.run(proxy.handle_proxy(_req(g, "POST", "/v1/chat/completions", token="daemon-tok")))
         assert proxy.session.calls
         assert forwarded.status == 500
@@ -110,6 +113,7 @@ def test_f3_unknown_path_is_404_for_a_write_token_and_401_without_one(monkeypatc
         _register(c, "writer", "claude")
         proxy = g.AsyncHiveMindProxy()
         proxy.session = _Session()
+        proxy.llm_session = proxy.session
         app = web.Application(middlewares=[c.auth_middleware])
         g.attach_coordinator(app, __import__("unittest").mock.AsyncMock())
         app.router.add_post("/v1/chat/completions", proxy.handle_proxy)
@@ -147,6 +151,7 @@ def test_f3_encoded_and_query_spellings_are_refused_before_upstream(monkeypatch,
         _register(c, "daemon-tok", "consolidation")
         proxy = g.AsyncHiveMindProxy()
         proxy.session = _Session()
+        proxy.llm_session = proxy.session
         resp = asyncio.run(proxy.handle_proxy(_req(g, "POST", spelling, token="daemon-tok")))
         assert resp.status == 403
         assert proxy.session.calls == []
@@ -178,11 +183,13 @@ def test_f4_and_f10_auth_off_only_a_spawned_daemon_passes(monkeypatch):
 
         proxy = g.AsyncHiveMindProxy()
         proxy.session = _Session()
+        proxy.llm_session = proxy.session
         forwarded = asyncio.run(proxy.handle_proxy(_req(g, "POST", "/v1/chat/completions", token=held)))
         assert proxy.session.calls
         assert forwarded.status == 500
 
         proxy.session = _Session()
+        proxy.llm_session = proxy.session
         anon = asyncio.run(proxy.handle_proxy(_req(g, "POST", "/v1/chat/completions")))
         assert anon.status == 403
         assert json.loads(anon.body)["error"] == "framework_only"
@@ -190,6 +197,7 @@ def test_f4_and_f10_auth_off_only_a_spawned_daemon_passes(monkeypatch):
 
         _register(c, "manual-tok", "manual")
         proxy.session = _Session()
+        proxy.llm_session = proxy.session
         manual = asyncio.run(proxy.handle_proxy(_req(g, "POST", "/v1/chat/completions", token="manual-tok")))
         assert manual.status == 403
         assert proxy.session.calls == []

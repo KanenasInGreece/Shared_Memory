@@ -1,19 +1,18 @@
 """REM daemon: summarises long Fact/Decision/Retrospective records into rem_summary,
 expands a Fact's 200-char first-write snippet in the graph to its text (up to 2000
-chars), and records its own retry counters, rem_timing and the outbox status; writes
-no edges or labels (decision:1664 — entities and axes are human-only).
+chars), and records rem_timing and the outbox status; writes no edges or labels
+(decision:1664 — entities and axes are human-only).
 
-Does not add edges or labels. Short records skip the LLM. MOCK_LLM=1 returns a stub summary. Transport failures do not increment rem_attempts.
+Does not add edges or labels. Short records skip the LLM. MOCK_LLM=1
+returns a stub summary. A failed call is backlogged or left queued.
 """
 
 import asyncio
 import json
 import logging
 import os
-import re
 import sys
 import time
-from collections import Counter
 from datetime import datetime, timezone
 
 import httpx
@@ -25,14 +24,15 @@ sys.path.insert(0, os.path.dirname(__file__))
 from ontology import ONT
 from record_ref import doc_record_type
 from pool_status import pool_roster_state
-from log_hygiene import append_secure
+from log_hygiene import append_secure, scrub_url_credentials
 from dream_telemetry import (
-    record_llm_call, adaptive_ceiling, call_timing_summary,
+    record_llm_call, call_timing_summary,
 )
 from secure_env import (
     load_split_env, get_secret, require_db_credentials, read_daemon_token_from_fd,
     require_llm_backends_json_parses, pg_dsn,
 )
+import llm_backlog
 import request_sizing
 
 
@@ -68,13 +68,24 @@ def _auth_headers() -> dict:
     return {}
 
 
+def _response_usage(resp):
+    """Non-null usage on a JSON object. A non-JSON body has none."""
+    try:
+        body = resp.json()
+    except Exception:
+        return None
+    if isinstance(body, dict) and body.get("usage") is not None:
+        return body["usage"]
+    return None
+
+
 def _routing_refusal(resp) -> dict | None:
-    """Recognize a gateway routing refusal (422 ``no_eligible_backend`` or 503
-    ``backend_at_capacity``) via body and ``X-SM-Fault-Origin: gateway`` header.
-    Keys on the structured body AND that header, never on the status alone: a
-    real provider 422 or 503 passed through the proxy must not be misread as
-    the gateway declining to place the job.
-    Returns ``{"error", "constraint", "role"}`` or None.
+    """Gateway refusal: no_eligible_backend, backend_at_capacity, or backlog.
+
+    Keys on the body and X-SM-Fault-Origin: gateway. A provider 422
+    passed through must not look like the gateway declining. A backlog
+    reason is written by the daemon; the gateway already decided it
+    (a cut-off reply is never stored).
     """
     if resp.status_code not in (422, 503):
         return None
@@ -84,10 +95,37 @@ def _routing_refusal(resp) -> dict | None:
         body = resp.json()
     except Exception:
         return None
-    error = body.get("error") if isinstance(body, dict) else None
+    if not isinstance(body, dict):
+        return None
+    error = body.get("error")
+    if error == "backlog":
+        raw_usage = body.get("usage")
+        usage = raw_usage if raw_usage is not None else None
+        reason = body.get("reason") or "unrecognised"
+        return {
+            "error": "backlog",
+            "reason": reason,
+            "constraint": reason,
+            "specimen": body.get("specimen") or "",
+            "usage": usage,
+        }
     if error not in ("no_eligible_backend", "backend_at_capacity"):
         return None
     return {"error": error, "constraint": body.get("constraint")}
+
+
+def _upstream_free_4xx(resp) -> bool:
+    """True for an upstream 4xx that is not a gateway routing refusal."""
+    headers = getattr(resp, "headers", None)
+    if headers is None or headers.get("X-SM-Fault-Origin") != "upstream":
+        return False
+    try:
+        code = int(resp.status_code)
+    except (TypeError, ValueError):
+        return False
+    if code < 400 or code >= 500:
+        return False
+    return _routing_refusal(resp) is None
 
 
 def _require_db_credentials() -> None:
@@ -113,7 +151,8 @@ def adaptive_poll_sleep(idle_streak: int) -> float:
     return max(MIN_POLL_SEC,
                min(MAX_POLL_SEC, BASE_POLL_SEC * (2 ** min(idle_streak - 1, 8))))
 BATCH_SIZE         = 5     # facts per cycle (LLM calls are the latency bottleneck)
-# Per-call timeout is adaptive_ceiling(len(prompt)); only the floor stays tunable, so a long prompt is not killed for length.
+# The chat call uses timeout=None. The gateway reads the whole reply. A daemon
+# timer would discard a paid reply.
 WRITE_QUIESCE_SEC  = int(os.environ.get("WRITE_QUIESCE_SEC", "30"))  # yield to active writes
 # A summary is requested only past this length; shorter text already fits the node, and a summary would only drift it.
 REM_SUMMARY_THRESHOLD = int(os.environ.get("REM_SUMMARY_THRESHOLD", "2000"))
@@ -165,27 +204,23 @@ def _nrem_is_queuing(conn) -> bool:
 # 0.6 because Gemma degrades when colder; set REM_TEMPERATURE=0.1 for Qwen. DREAM_TEMPERATURE sets both daemons, and the request overrides the LM Studio preset.
 REM_TEMPERATURE = float(os.environ.get("REM_TEMPERATURE", os.environ.get("DREAM_TEMPERATURE", "0.6")))
 
-# finish_reason='length' fails the unit: a truncated summary is never repaired, stored, or passed downstream. Its bounds live in request_sizing.
-request_sizing.validate_rem()
+# finish_reason='length' is a cut-off. It is never repaired, stored, or passed
+# downstream.
 
 # Truncated body excerpt for logs only; never persisted.
 REM_TRUNCATION_SPECIMEN_CHARS = int(os.environ.get("REM_TRUNCATION_SPECIMEN_CHARS", "500"))
 
-# After this many chargeable failures the record is skipped until rem_attempts is reset; transport is not charged.
-REM_MAX_ATTEMPTS = int(os.environ.get("REM_MAX_ATTEMPTS", "5"))
-
-# A solo record skipped this often by the NREM yield is drained first, with no yield check (decision 890). It is a rescue valve, not the normal path.
+# A solo record skipped this often by the NREM yield is drained first,
+# with no yield check. Rescue valve, not the normal path (decision 890:
+# only a pickup resets the skip count).
 REM_STARVED_THRESHOLD = int(os.environ.get("REM_STARVED_THRESHOLD", "3"))
 
 # LLM failure classes recorded on REMDaemon._last_llm_failure.
-LLM_FAIL_TRANSPORT = "transport"   # HTTP non-200 / connection / gateway-shape — NOT chargeable
-LLM_FAIL_CLIENT    = "client"      # deterministic HTTP 4xx (400, 404, 422) — CHARGEABLE
-LLM_FAIL_TRUNCATED = "truncated"   # length after the retry: widened once if honest, same bound if a loop
+LLM_FAIL_TRANSPORT = "transport"   # connection or a status the gateway left queued
+LLM_FAIL_CLIENT    = "client"      # a free 4xx queues and writes no backlog row
+LLM_FAIL_TRUNCATED = "truncated"   # finish_reason length: cut_off or loop, never stored
 LLM_FAIL_PARSE     = "parse"       # response arrived but its content is unusable
-LLM_FAIL_ROUTING_REFUSED = "routing_refused"   # gateway refused to place the job; a config gap, not chargeable
-
-# Failure classes that may count toward a record's dead-letter cap.
-LLM_FAIL_CHARGEABLE = frozenset({LLM_FAIL_TRUNCATED, LLM_FAIL_PARSE, LLM_FAIL_CLIENT})
+LLM_FAIL_ROUTING_REFUSED = "routing_refused"   # gateway left the item queued, or named a backlog reason
 
 
 logging.basicConfig(level=logging.INFO)
@@ -219,67 +254,30 @@ def _completion_text(resp_json) -> str:
         content = (resp_json.get("choices") or [{}])[0].get("message", {}).get("content")
     except (AttributeError, IndexError, TypeError):
         return ""
-    # A non-string body would abort the solo classifier, which runs outside any try (fact:1347).
+    # A non-string body is empty so the loop check does not raise.
     return content if isinstance(content, str) else ""
 
 
-# Innermost `{...}` only, and never parsed: a repetition loop's flat objects in a truncated body.
-_FLAT_OBJECT_RE = re.compile(r"\{[^{}]*\}")
-# Decision extras and summaries are strings, so objects alone would miss a sentence loop; 30 chars skips schema tokens.
-_LONG_STRING_RE = re.compile(r'"([^"]{30,})"')
-
-
-def truncation_is_degenerate(body: str) -> bool:
-    """Detects loop repetition in truncated completions when a flat `{...}` object
-    appears >=3 times (probe-2 measured 120 of 123 repeated objects duplicate 22
-    distinct ones, worst x12) or a quoted string >=30 chars repeats >=3 times, failing
-    open on non-JSON text. Distinguishes loops from exhaustion (fact:1329 — diagnosis
-    that release-trace facts dead-lettered at rem_attempts >= 5 from degenerate loops;
-    decision:1330 — REM_MAX_TOKENS_SOLO stays 1500 as dream ceiling), with thresholds
-    unmeasured per fact:1338 — an unmeasured default must say that it is unmeasured.
-    """
-    if not body or not body.strip():
-        return False
-
-    objects = _FLAT_OBJECT_RE.findall(body)
-    if objects:
-        normalised = (" ".join(o.split()) for o in objects)
-        if max(Counter(normalised).values()) >= 3:
-            return True
-
-    strings = _LONG_STRING_RE.findall(body)
-    if strings:
-        if max(Counter(strings).values()) >= 3:
-            return True
-
-    return False
+def _redact_for_log(text: str) -> str:
+    """URL userinfo and this daemon's own token, before a specimen is cut."""
+    out = scrub_url_credentials(text or "")
+    token = _AGENT_TOKEN
+    if token and token in out:
+        out = out.replace(token, "[redacted]")
+    return out
 
 
 def _truncation_specimen(body: str) -> str:
-    """Returns the sanitized, single-line tail of the last
-    REM_TRUNCATION_SPECIMEN_CHARS characters of a truncated body for logging,
-    replacing non-printables to prevent terminal escape injection. Non-positive
-    values return empty string to avoid `[-0:]` logging the full body (fact:1347 —
-    security review finding that specimen bounds could overexpose; logged 44,000
-    chars at CHARS=0).
+    """Sanitized single-line tail of a truncated body, for a log line.
+
+    Redact before the cut. Non-positive returns empty, so a zero bound cannot
+    log the whole body.
     """
     n = REM_TRUNCATION_SPECIMEN_CHARS
     if n <= 0:
         return ""
-    tail = " ".join((body or "")[-n:].split())
+    tail = " ".join(_redact_for_log(body or "")[-n:].split())
     return "".join(ch if ch.isprintable() else " " for ch in tail)
-
-
-def _drop_final_nonempty_line(raw: str) -> str:
-    """Drop the final non-empty line of a truncated JSONL response to avoid
-    silently accepting an incomplete record cut by max_tokens.
-    """
-    lines = raw.splitlines()
-    for i in range(len(lines) - 1, -1, -1):
-        if lines[i].strip():
-            del lines[i]
-            break
-    return "\n".join(lines)
 
 
 def _parse_llm_json(candidate: str):
@@ -338,8 +336,20 @@ class REMDaemon:
             connection_acquisition_timeout=NEO4J_ACQUIRE_TIMEOUT,
         )
         self.is_running = True
-        # Chargeable class of the last call. Serial within a cycle, so it lives here instead of on every return.
+        # Class of the last call, and the backlog row it should write. Serial within a
+        # cycle.
         self._last_llm_failure: str | None = None
+        self._last_backlog: tuple[str, str, bool] | None = None
+        # Batch outcome: None complete, "solo" one try each, "backlog" a row each,
+        # "queue" leave them.
+        self._batch_action: str | None = None
+        self._batch_reason: str | None = None
+        self._batch_specimen: str = ""
+        self._batch_paid: bool = True
+        # Paid batch facts that did not finish. Memory only. A respawn drops it.
+        self._solo_only: set[int] = set()
+        # Paid items whose backlog row could not be written. A respawn drops it.
+        self._withheld: set[int] = set()
 
     # ── Postgres connection factory ───────────────────────────────────────────
 
@@ -354,54 +364,53 @@ class REMDaemon:
 
     # ── Neo4j reads ───────────────────────────────────────────────────────────
 
+    async def _blocked_rem_ids(self) -> list[int]:
+        """pg_ids the backlog says not to send.
+
+        A read error skips the cycle. Filtering after LIMIT 5 would starve
+        the queue.
+        """
+        loop = asyncio.get_running_loop()
+        blocked = await loop.run_in_executor(None, lambda: llm_backlog.blocked_keys("rem"))
+        ids: list[int] = []
+        for key in blocked:
+            try:
+                ids.append(int(key))
+            except (TypeError, ValueError):
+                continue
+        return ids
+
     async def _fetch_non_rem_batch(
         self,
-    ) -> tuple[list[int], dict[int, int], dict[int, str], dict[int, int]]:
-        """Fetch non-REM candidate pg_ids ordered by ``rem_pickups`` (fair queue
-        rotation), ``rem_attempts`` (chargeable retirement capped at REM_MAX_ATTEMPTS;
-        reset via `SET n.rem_attempts = 0`), and ``pg_id`` (oldest-first). Returns
-        ``(pg_ids, attempts, sel_labels, passed_over)`` to drive batch-to-solo
-        demotion, node-to-Postgres label validation, and starvation promotion.
+    ) -> tuple[list[int], dict[int, str], dict[int, int]]:
+        """Fetch non-REM candidate pg_ids ordered by rem_pickups, then pg_id.
+
+        Ineligible backlog rows are excluded in the Cypher, before LIMIT.
+        Returns (pg_ids, sel_labels, passed_over).
         """
+        blocked = await self._blocked_rem_ids()
+        blocked = list(set(blocked) | self._withheld)
         base = (
             f"MATCH (n)"
             f" WHERE (n:{ONT.fact} OR n:{ONT.decision} OR n:{ONT.retrospective})"
             f"   AND coalesce(n.rem_processed, false) = false"
             f"   AND coalesce(n.superseded, false) = false"
             f"   AND n.pg_id IS NOT NULL"
+            f"   AND NOT n.pg_id IN $blocked"
         )
         async with self.driver.session() as session:
             result = await session.run(
                 base +
-                f"   AND coalesce(n.rem_attempts, 0) < $max_attempts"
                 f"   AND coalesce(n.rem_invalid, false) = false"
                 f" RETURN n.pg_id AS pg_id,"
-                f"        coalesce(n.rem_attempts, 0) AS rem_attempts,"
                 f"        coalesce(n.rem_passed_over, 0) AS rem_passed_over,"
                 f"        labels(n) AS labels"
-                f" ORDER BY coalesce(n.rem_pickups, 0) ASC,"
-                f"          coalesce(n.rem_attempts, 0) ASC, n.pg_id ASC"
+                f" ORDER BY coalesce(n.rem_pickups, 0) ASC, n.pg_id ASC"
                 f" LIMIT $limit",
-                limit=BATCH_SIZE, max_attempts=REM_MAX_ATTEMPTS,
+                limit=BATCH_SIZE, blocked=blocked,
             )
             rows = await result.data()
-            dead_result = await session.run(
-                base +
-                f"   AND coalesce(n.rem_attempts, 0) >= $max_attempts"
-                f"   AND coalesce(n.rem_invalid, false) = false"
-                f" RETURN count(n) AS dead",
-                max_attempts=REM_MAX_ATTEMPTS,
-            )
-            dead_rows = await dead_result.data()
-        dead = (dead_rows[0].get("dead") if dead_rows else 0) or 0
-        if dead:
-            logger.warning(
-                "REM: %d poison record(s) dead-lettered at rem_attempts >= %d — "
-                "excluded from the queue (operator reset: SET n.rem_attempts = 0)",
-                dead, REM_MAX_ATTEMPTS,
-            )
         pg_ids: list[int] = []
-        attempts: dict[int, int] = {}
         passed_over: dict[int, int] = {}
         sel_labels: dict[int, str] = {}
         record_labels = {ONT.fact, ONT.decision, ONT.retrospective}
@@ -409,12 +418,11 @@ class REMDaemon:
             if r.get("pg_id") is None:
                 continue
             pg_ids.append(r["pg_id"])
-            attempts[r["pg_id"]] = int(r.get("rem_attempts") or 0)
             passed_over[r["pg_id"]] = int(r.get("rem_passed_over") or 0)
             # First matching record label, sorted, so a node with extra labels still checks the same one each cycle.
             matched = sorted(set(r.get("labels") or []) & record_labels)
             sel_labels[r["pg_id"]] = matched[0] if matched else ""
-        return pg_ids, attempts, sel_labels, passed_over
+        return pg_ids, sel_labels, passed_over
 
     async def _set_on_records(self, pg_ids: list[int], set_clause: str, what: str) -> None:
         """Best-effort SET across all record labels for these pg_ids; a failed
@@ -433,14 +441,9 @@ class REMDaemon:
         except Exception as exc:
             logger.warning("REM: %s bump failed for %s: %s", what, pg_ids, exc)
 
-    async def _bump_rem_attempts(self, pg_ids: list[int]) -> None:
-        """Increment rem_attempts for these pg_ids; callers pass only truncated/parse/client failures, never transport or routing refusal."""
-        await self._set_on_records(
-            pg_ids, "n.rem_attempts = coalesce(n.rem_attempts, 0) + 1", "rem_attempts")
-
     async def _bump_rem_pickups(self, pg_ids: list[int]) -> None:
         """Increment monotonic ``rem_pickups`` (and reset ``rem_passed_over``) prior
-        to processing to ensure fair queue rotation without affecting dead-letter caps.
+        to processing so the queue rotates by how often a record was picked.
         Bumps batches in bulk and solo records individually AFTER the yield checks,
         never at selection time: a solo record the arbiter's yield never reaches was
         not picked up, and rotating it anyway would hide the tail this counter
@@ -463,8 +466,8 @@ class REMDaemon:
 
     async def _mark_node_invalid(self, pg_id: int, label: str, reason: str) -> None:
         """Retire a structurally invalid node (missing Postgres row or label mismatch)
-        by setting ``rem_invalid=true`` and ``rem_processed=true`` without charging
-        an attempt. Uses a label-qualified MATCH to avoid retiring a healthy twin
+        by setting ``rem_invalid=true`` and ``rem_processed=true``. Uses a
+        label-qualified MATCH to avoid retiring a healthy twin
         sharing the same pg_id.
         """
         if not label:
@@ -485,8 +488,8 @@ class REMDaemon:
                 )
             logger.warning(
                 "REM: pg_id=%d retired an INVALID :%s node from the queue (%s) — "
-                "graph integrity defect, not a record failure; node kept for audit, "
-                "no attempt charged", pg_id, label, reason,
+                "graph integrity defect, not a record failure; node kept for audit",
+                pg_id, label, reason,
             )
         except Exception as exc:
             logger.error(
@@ -495,23 +498,22 @@ class REMDaemon:
             )
 
     async def _revert_rem_mark(self, pg_id: int, kind: str) -> None:
-        """Revert ``rem_processed=false`` and increment ``rem_attempts`` when a
-        post-write consistency or outbox failure occurs. Ensures the record re-enters
-        the queue under the attempt cap rather than stranding in limbo.
+        """Set rem_processed false after a write that did not stick.
+
+        The backlog row is what withholds the record.
         """
         anchor = _anchor_label(kind)
         try:
             async with self.driver.session() as session:
                 await session.run(
                     f"MATCH (n:{anchor} {{pg_id: $pg_id}})"
-                    f" SET n.rem_processed = false,"
-                    f"     n.rem_attempts = coalesce(n.rem_attempts, 0) + 1",
+                    f" SET n.rem_processed = false",
                     pg_id=pg_id,
                 )
         except Exception as exc:
             logger.error(
-                "REM: pg_id=%d revert of rem_processed failed (%s) — record may "
-                "be stranded until manual reset", pg_id, exc,
+                "REM: pg_id=%d revert of rem_processed failed (%s)",
+                pg_id, type(exc).__name__,
             )
 
     async def _fact_is_consistent(self, pg_id: int, expected_content: str) -> bool:
@@ -745,37 +747,61 @@ class REMDaemon:
         anchor = _anchor_label(kind)
 
         async with self.driver.session() as session:
-            # Facts rewrite original content; rem_summary is stored only if produced, and success clears rem_attempts.
+            # Facts rewrite original content. rem_summary is stored only if produced.
             if kind in (KIND_DECISION, KIND_RETRO):
                 if summary:
                     await session.run(
                         f"MATCH (a:{anchor} {{pg_id: $pg_id}})"
-                        f" SET a.rem_summary = $summary, a.rem_processed = true,"
-                        f"     a.rem_attempts = 0",
+                        f" SET a.rem_summary = $summary, a.rem_processed = true",
                         pg_id=pg_id, summary=summary[:2000],
                     )
                 else:
                     await session.run(
                         f"MATCH (a:{anchor} {{pg_id: $pg_id}})"
-                        f" SET a.rem_processed = true, a.rem_attempts = 0",
+                        f" SET a.rem_processed = true",
                         pg_id=pg_id,
                     )
             elif len(original_content) > REM_SUMMARY_THRESHOLD and summary:
                 await session.run(
                     f"MATCH (f:{ONT.fact} {{pg_id: $pg_id}})"
                     f" SET f.content = $orig, f.rem_summary = $summary,"
-                    f"     f.rem_processed = true, f.rem_attempts = 0",
+                    f"     f.rem_processed = true",
                     pg_id=pg_id, orig=original_content[:2000], summary=summary[:2000],
                 )
             else:
                 await session.run(
                     f"MATCH (f:{ONT.fact} {{pg_id: $pg_id}})"
-                    f" SET f.content = $orig, f.rem_processed = true,"
-                    f"     f.rem_attempts = 0",
+                    f" SET f.content = $orig, f.rem_processed = true",
                     pg_id=pg_id, orig=original_content[:2000],
                 )
 
     # ── LLM calls ─────────────────────────────────────────────────────────────
+
+    async def _write_backlog(self, pg_id: int, reason: str, specimen: str, loop,
+                             paid: bool = True) -> None:
+        """One autocommit row. A failed write of a paid reply withholds the item."""
+        try:
+            await loop.run_in_executor(
+                None, lambda: llm_backlog.upsert("rem", pg_id, reason, specimen or None))
+        except Exception as exc:
+            logger.error(
+                "REM: pg_id=%s backlog write failed (%s)",
+                pg_id, type(exc).__name__)
+            if paid:
+                self._withheld.add(int(pg_id))
+
+    async def _clear_backlog(self, pg_id: int, loop) -> None:
+        """Drop the row after the record is stored. A missing row is fine."""
+        try:
+            await loop.run_in_executor(None, lambda: llm_backlog.delete("rem", pg_id))
+        except Exception as exc:
+            logger.warning(
+                "REM: pg_id=%s backlog delete failed (%s)", pg_id, type(exc).__name__)
+            # The row stays eligible on this boot, so the next release would pay again.
+            self._withheld.add(int(pg_id))
+
+    def _note_backlog(self, reason: str, specimen: str = "", paid: bool = True) -> None:
+        self._last_backlog = (reason, specimen or "", bool(paid))
 
     async def _llm_process(
         self,
@@ -783,184 +809,172 @@ class REMDaemon:
         kind: str,
         pg_id: int | None = None,
     ) -> tuple[dict | None, str]:
-        """Execute summarisation round-trip for one record over REM_SUMMARY_THRESHOLD
-        (decision:1664 — REM only summarises); returns (result_dict, model_name)."""
+        """One summarisation call for a record over REM_SUMMARY_THRESHOLD.
+
+        The daemon sends no max_tokens. A cut-off, loop, or unusable body
+        is a backlog reason and is not parsed. REM only summarises.
+        """
+        self._last_backlog = None
         if len(content) <= REM_SUMMARY_THRESHOLD:
-            # Under the threshold REM asks for nothing, so {} is the whole answer and still gets marked processed (decision:1664).
+            # Under the threshold REM asks for nothing, so {} is the whole
+            # answer and is still marked processed.
             return {}, "no-call"
         if os.getenv("MOCK_LLM") == "1":
             return {"summary": f"REM summary (mock): {content[:100]}"}, "mock"
 
         prompt = build_single_prompt(content, kind)
-
-        _ceiling = adaptive_ceiling(len(prompt))
         model = "local-model"
-
-        async def _attempt(max_tokens: int):
-            """Execute one round-trip, returning (resp_json, model, failure,
-            degenerate) with degenerate status classified on raw text without parsing.
-            """
-            nonlocal model
-            _start = time.monotonic()
-            try:
-                async with httpx.AsyncClient(timeout=_ceiling, trust_env=False) as client:
-                    resp = await client.post(
-                        REASONER_URL,
-                        headers=_auth_headers(),
-                        json={
-                            "model": LLM_MODEL,
-                            "messages": [
-                                {"role": "system", "content": "You are a technical knowledge curator. Output only the requested JSON — no reasoning steps, no thinking tokens, no prose outside the JSON object."},
-                                {"role": "user", "content": prompt},
-                            ],
-                            "temperature": REM_TEMPERATURE,
-                            "max_tokens": max_tokens,
-                        },
-                    )
-            except Exception as exc:
-                # httpx errors stringify to empty; the type name is the only way to tell timeout from reset.
-                logger.error("LLM error: %s: %s", type(exc).__name__, exc)
-                return None, model, LLM_FAIL_TRANSPORT, False
-            _backend = resp.headers.get("X-SM-LLM-Backend")
-            model = _backend or "local-model"
-            refusal = _routing_refusal(resp)
-            if refusal:
-                # A routing refusal is a config gap, not evidence about this record, so the attempt is not charged.
-                logger.warning(
-                    "REM: pg_id=%s solo enrichment call REFUSED by gateway "
-                    "routing (constraint=%s) — skipping WITHOUT "
-                    "charging rem_attempts; record stays eligible next cycle",
-                    pg_id, refusal["constraint"],
-                )
-                record_llm_call("REM", None, backend=_backend,
-                                wall_s=time.monotonic() - _start, ceiling_s=_ceiling,
-                                ok=False, note=f"routing_refused_{refusal['error']}",
-                                prompt_chars=len(prompt))
-                return None, model, LLM_FAIL_ROUTING_REFUSED, False
-            if resp.status_code != 200:
-                record_llm_call("REM", None, backend=_backend,
-                                wall_s=time.monotonic() - _start, ceiling_s=_ceiling,
-                                ok=False, note=f"http_{resp.status_code}",
-                                prompt_chars=len(prompt))
-                logger.error("LLM returned %d: %s", resp.status_code, resp.text[:200])
-                fail_class = (
-                    LLM_FAIL_CLIENT
-                    if resp.status_code in (400, 404, 422)
-                    else LLM_FAIL_TRANSPORT
-                )
-                return None, model, fail_class, False
-            try:
-                resp_json = resp.json()
-            except Exception as exc:
-                logger.error("LLM response was not JSON (%s): %s", exc, resp.text[:200])
-                return None, model, LLM_FAIL_TRANSPORT, False
-            if _truncated(resp_json):
-                body = _completion_text(resp_json)
-                degenerate = truncation_is_degenerate(body)
-                specimen = _truncation_specimen(body)
-                note = "degenerate" if degenerate else "truncated_honest"
-                logger.warning(
-                    "REM: pg_id=%s solo LLM call TRUNCATED at max_tokens=%d "
-                    "(%s) — specimen(last %d chars): %s",
-                    pg_id, max_tokens, note, REM_TRUNCATION_SPECIMEN_CHARS, specimen,
-                )
-                record_llm_call("REM", resp_json, backend=_backend,
-                                wall_s=time.monotonic() - _start, ceiling_s=_ceiling,
-                                note=note, specimen=specimen, prompt_chars=len(prompt))
-                return None, model, LLM_FAIL_TRUNCATED, degenerate
-            record_llm_call("REM", resp_json, backend=_backend,
-                            wall_s=time.monotonic() - _start, ceiling_s=_ceiling,
-                            prompt_chars=len(prompt))
-            return resp_json, model, None, False
-
-        first_bound = request_sizing.rem_solo_max_tokens()
-        resp_json, model, failure, degenerate = await _attempt(first_bound)
-
-        # An honest truncation widens the bound once; a repetition loop retries at the same bound, because a larger budget only feeds the loop (fact:1329/1330).
-        # Either way a second truncation fails the unit.
-        if failure == LLM_FAIL_TRUNCATED:
-            retry_bound = request_sizing.rem_retry_bound(first_bound, degenerate=degenerate)
-            if degenerate:
-                logger.warning(
-                    "REM: pg_id=%s solo enrichment TRUNCATED (degenerate) at "
-                    "max_tokens=%d — retrying ONCE at the SAME bound before "
-                    "failing the unit",
-                    pg_id, first_bound,
-                )
-            else:
-                logger.warning(
-                    "REM: pg_id=%s solo enrichment TRUNCATED at max_tokens=%d — "
-                    "retrying ONCE at %d before failing the unit",
-                    pg_id, first_bound, retry_bound,
-                )
-            resp_json, model, failure, degenerate = await _attempt(retry_bound)
-            if failure == LLM_FAIL_TRUNCATED:
-                if degenerate:
-                    logger.error(
-                        "REM: pg_id=%s solo enrichment TRUNCATED again "
-                        "(degenerate) at max_tokens=%d — failing the unit; "
-                        "no parse, no repair. Raising REM_MAX_TOKENS_SOLO "
-                        "does not fix a repetition loop (fact:1329/1330); if "
-                        "this record dead-letters with DIFFERING specimens "
-                        "each attempt, suspect a classifier false positive "
-                        "instead.",
-                        pg_id, retry_bound,
-                    )
-                else:
-                    logger.error(
-                        "REM: pg_id=%s solo enrichment TRUNCATED again at "
-                        "max_tokens=%d (finish_reason=length) — failing the "
-                        "unit; no parse, no repair. It will retry on a later "
-                        "pick-up (rem_attempts +1; dead-letters at "
-                        "REM_MAX_ATTEMPTS). If that later pick-up completes "
-                        "well UNDER the bound, both truncations were a "
-                        "repetition loop the classifier could not see — do "
-                        "NOT raise REM_MAX_TOKENS_SOLO (decision:1330). Raise "
-                        "it only if EVERY pick-up truncates with a "
-                        "differing, non-repeating tail.",
-                        pg_id, retry_bound,
-                    )
-
-        if failure is not None:
-            # An incomplete body is never repaired into a dict that could be stored.
-            self._last_llm_failure = failure
-            return None, model
-
+        _start = time.monotonic()
         try:
-            content = resp_json["choices"][0]["message"]["content"]
-            if not isinstance(content, str):
-                raise TypeError(f"content is {type(content).__name__}, expected str")
-            raw = content.strip()
-        except (KeyError, IndexError, TypeError) as exc:
-            logger.error(
-                "LLM response schema unexpected (%s) — possible gateway error",
-                exc,
-            )
-            # A malformed envelope is the GATEWAY's fault, not the record's.
+            async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
+                resp = await client.post(
+                    REASONER_URL,
+                    headers=_auth_headers(),
+                    json={
+                        "model": LLM_MODEL,
+                        "messages": [
+                            {"role": "system", "content": "You are a technical knowledge curator. Output only the requested JSON — no reasoning steps, no thinking tokens, no prose outside the JSON object."},
+                            {"role": "user", "content": prompt},
+                        ],
+                        "temperature": REM_TEMPERATURE,
+                    },
+                )
+        except Exception as exc:
+            # A daemon that cannot reach the gateway leaves the item queued. That is not
+            # a paid reply.
+            logger.error("LLM error: %s: %s", type(exc).__name__, exc)
             self._last_llm_failure = LLM_FAIL_TRANSPORT
             return None, model
-        # Extract JSON robustly even if the model wraps it in prose/fences.
-        start = raw.find("{")
-        end   = raw.rfind("}") + 1
-        if start == -1 or end == 0:
-            logger.error("LLM returned no JSON object: %s", raw[:300])
+        _backend = resp.headers.get("X-SM-LLM-Backend")
+        model = _backend or "local-model"
+        try:
+            refusal = _routing_refusal(resp)
+            if refusal and refusal["error"] == "backlog":
+                reason = refusal["reason"]
+                specimen = refusal.get("specimen") or ""
+                usage = refusal.get("usage")
+                resp_json = {"usage": usage} if usage else None
+                if specimen:
+                    logger.warning(
+                        "REM: pg_id=%s backlog %s specimen: %s", pg_id, reason, specimen)
+                record_llm_call(
+                    "REM", resp_json, backend=_backend,
+                    wall_s=time.monotonic() - _start, ceiling_s=None,
+                    ok=False, note=f"backlog_{reason}", specimen=specimen or None,
+                    prompt_chars=len(prompt))
+                paid = not (reason == "no_context" and usage is None)
+                self._note_backlog(reason, specimen, paid)
+                self._last_llm_failure = (
+                    LLM_FAIL_TRUNCATED if reason in ("cut_off", "loop") else LLM_FAIL_PARSE)
+                return None, model
+            if refusal:
+                logger.warning(
+                    "REM: pg_id=%s solo enrichment call REFUSED by gateway "
+                    "routing (constraint=%s) — record stays queued",
+                    pg_id, refusal.get("constraint"),
+                )
+                record_llm_call(
+                    "REM", None, backend=_backend,
+                    wall_s=time.monotonic() - _start, ceiling_s=None,
+                    ok=False, note=f"routing_refused_{refusal['error']}",
+                    prompt_chars=len(prompt))
+                self._last_llm_failure = LLM_FAIL_ROUTING_REFUSED
+                return None, model
+            if resp.status_code != 200:
+                usage = _response_usage(resp)
+                record_llm_call(
+                    "REM", {"usage": usage} if isinstance(usage, dict) else None,
+                    backend=_backend,
+                    wall_s=time.monotonic() - _start, ceiling_s=None,
+                    ok=False, note=f"http_{resp.status_code}",
+                    prompt_chars=len(prompt))
+                if usage is not None:
+                    self._note_backlog("connection_lost", "", True)
+                    self._last_llm_failure = LLM_FAIL_PARSE
+                    return None, model
+                logger.error("LLM returned %d", resp.status_code)
+                self._last_llm_failure = LLM_FAIL_TRANSPORT
+                return None, model
+            try:
+                resp_json = resp.json()
+            except Exception:
+                logger.error("LLM response was not JSON (status=%s)", resp.status_code)
+                record_llm_call(
+                    "REM", None, backend=_backend,
+                    wall_s=time.monotonic() - _start, ceiling_s=None,
+                    ok=False, note="queued", prompt_chars=len(prompt))
+                self._last_llm_failure = LLM_FAIL_TRANSPORT
+                return None, model
+            if _truncated(resp_json):
+                body = _completion_text(resp_json)
+                specimen = _truncation_specimen(body)
+                reason = "loop" if request_sizing.reply_is_loop(body) else "cut_off"
+                logger.warning("REM: pg_id=%s %s specimen: %s", pg_id, reason, specimen)
+                record_llm_call(
+                    "REM", resp_json, backend=_backend,
+                    wall_s=time.monotonic() - _start, ceiling_s=None,
+                    note=reason, specimen=specimen, prompt_chars=len(prompt))
+                self._note_backlog(reason, specimen)
+                self._last_llm_failure = LLM_FAIL_TRUNCATED
+                return None, model
+            if _finish_reason(resp_json) != "stop":
+                record_llm_call(
+                    "REM", resp_json, backend=_backend,
+                    wall_s=time.monotonic() - _start, ceiling_s=None,
+                    ok=False, note="unparseable", prompt_chars=len(prompt))
+                self._note_backlog("unparseable", "")
+                self._last_llm_failure = LLM_FAIL_PARSE
+                return None, model
+            record_llm_call(
+                "REM", resp_json, backend=_backend,
+                wall_s=time.monotonic() - _start, ceiling_s=None,
+                prompt_chars=len(prompt))
+            try:
+                content_text = resp_json["choices"][0]["message"]["content"]
+                if not isinstance(content_text, str):
+                    raise TypeError(f"content is {type(content_text).__name__}, expected str")
+                raw = content_text.strip()
+            except (KeyError, IndexError, TypeError) as exc:
+                logger.error("LLM response schema unexpected (%s) — possible gateway error", exc)
+                self._note_backlog("unparseable", "")
+                self._last_llm_failure = LLM_FAIL_PARSE
+                return None, model
+            start = raw.find("{")
+            end = raw.rfind("}") + 1
+            if start == -1 or end == 0:
+                specimen = _truncation_specimen(raw)
+                if specimen:
+                    logger.error("LLM returned no JSON object: %s", specimen)
+                self._note_backlog("unparseable", specimen)
+                self._last_llm_failure = LLM_FAIL_PARSE
+                return None, model
+            parsed = _parse_llm_json(raw[start:end])
+            if parsed is None:
+                self._note_backlog("unparseable", "")
+                self._last_llm_failure = LLM_FAIL_PARSE
+                return None, model
+            self._last_llm_failure = None
+            return parsed, model
+        except Exception as exc:
+            logger.error(
+                "REM: pg_id=%s reply handling failed (%s)",
+                pg_id, type(exc).__name__)
+            self._note_backlog("unparseable", "")
             self._last_llm_failure = LLM_FAIL_PARSE
             return None, model
-        # Strict parse first; salvage Gemma-4 JSON slips via json_repair (decision 491).
-        parsed = _parse_llm_json(raw[start:end])
-        # None is the parse failure; {} parsed and simply has no summary, which the summary gate charges later.
-        self._last_llm_failure = None if parsed is not None else LLM_FAIL_PARSE
-        return parsed, model
+
 
     # ── Batched LLM call (one call for N facts) ─────────────────────────────────
 
     async def _llm_process_batch(
         self, items: list[dict],
     ) -> tuple[dict[int, dict] | None, dict | None, str]:
-        """Summarise multiple facts exceeding REM_SUMMARY_THRESHOLD in one JSONL call,
-        returning ``({pg_id: result}, call_timing, model)``. Sub-threshold facts return
-        ``{}`` without LLM calls (decision:1664 — REM only summarises); call-level
-        failures return None without charging attempts.
+        """One JSONL call for facts over REM_SUMMARY_THRESHOLD.
+
+        Returns ``({pg_id: result}, call_timing, model)``. A fact at or under
+        the threshold is ``{}`` and is not sent (decision:1664 — REM only
+        summarises). A call-level failure leaves ``_batch_action`` set so
+        the caller queues or backlogs each sent fact.
         """
         if not items:
             return {}, None, "local-model"
@@ -980,88 +994,142 @@ class REMDaemon:
         idx_to_pg = {i: it["pg_id"] for i, it in enumerate(sent)}
         require_summary = set(idx_to_pg)
         prompt = self._build_batch_prompt(sent)
-        # Budget scales with count: one JSONL line plus summary allowance per fact sent.
-        _max_tokens = request_sizing.rem_batch_max_tokens(len(sent))
-        _ceiling = adaptive_ceiling(len(prompt), units=len(sent))
+        self._batch_action = None
+        self._batch_reason = None
+        self._batch_specimen = ""
         _start = time.monotonic()
         model = "local-model"
+        resp = None
+
+        def _usage_json(usage):
+            return {"usage": usage} if isinstance(usage, dict) else None
+
         try:
-            async with httpx.AsyncClient(timeout=_ceiling, trust_env=False) as client:
+            async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
                 resp = await client.post(
                     REASONER_URL, headers=_auth_headers(),
                     json={"model": LLM_MODEL,
                           "messages": [
                               {"role": "system", "content": "You are a technical knowledge curator. Output only JSONL — one JSON object per line, no prose, no markdown fences, no thinking."},
                               {"role": "user", "content": prompt}],
-                          "temperature": REM_TEMPERATURE,
-                          "max_tokens": _max_tokens},
+                          "temperature": REM_TEMPERATURE},
                 )
                 _backend = resp.headers.get("X-SM-LLM-Backend")
                 model = _backend or "local-model"
                 refusal = _routing_refusal(resp)
+                if refusal and refusal["error"] == "backlog":
+                    reason = refusal["reason"]
+                    specimen = refusal.get("specimen") or ""
+                    record_llm_call(
+                        "REM", _usage_json(refusal.get("usage")), backend=_backend,
+                        wall_s=time.monotonic() - _start, ceiling_s=None,
+                        ok=False, note=f"batch_backlog_{reason}",
+                        specimen=specimen or None, prompt_chars=len(prompt))
+                    if specimen:
+                        logger.warning("REM batch: %s specimen: %s", reason, specimen)
+                    # A cut-off, a loop, or no context sends each sent fact to one solo
+                    # try. Anything else is a row per fact.
+                    if reason in ("cut_off", "loop", "no_context"):
+                        self._batch_action = "solo"
+                    else:
+                        self._batch_action = "backlog"
+                    self._batch_reason = reason
+                    self._batch_specimen = specimen
+                    self._last_llm_failure = LLM_FAIL_TRUNCATED if reason in ("cut_off", "loop") else LLM_FAIL_PARSE
+                    return out, None, model
                 if refusal:
-                    # A routing refusal says nothing about these records, so none of them is charged.
                     logger.warning(
                         "REM batch: call (%d facts) REFUSED by gateway "
-                        "routing (constraint=%s) — skipping WITHOUT "
-                        "charging any attempt; all %d fact(s) retry next cycle",
-                        len(sent), refusal["constraint"], len(sent),
+                        "routing (constraint=%s) — all stay queued",
+                        len(sent), refusal.get("constraint"),
                     )
-                    record_llm_call("REM", None, backend=_backend,
-                                    wall_s=time.monotonic() - _start, ceiling_s=_ceiling,
-                                    ok=False, note=f"batch_routing_refused_{refusal['error']}",
-                                    prompt_chars=len(prompt))
+                    record_llm_call(
+                        "REM", None, backend=_backend,
+                        wall_s=time.monotonic() - _start, ceiling_s=None,
+                        ok=False, note=f"batch_routing_refused_{refusal['error']}",
+                        prompt_chars=len(prompt))
+                    self._batch_action = "queue"
                     self._last_llm_failure = LLM_FAIL_ROUTING_REFUSED
-                    return None, None, model
+                    return out, None, model
                 if resp.status_code != 200:
-                    record_llm_call("REM", None, backend=_backend,
-                                    wall_s=time.monotonic() - _start, ceiling_s=_ceiling,
-                                    ok=False, note=f"batch_http_{resp.status_code}",
-                                    prompt_chars=len(prompt))
-                    logger.error("REM batch LLM returned %d: %s", resp.status_code, resp.text[:200])
-                    if resp.status_code in (400, 404, 422):
-                        self._last_llm_failure = LLM_FAIL_CLIENT
+                    usage = _response_usage(resp)
+                    record_llm_call(
+                        "REM", {"usage": usage} if isinstance(usage, dict) else None,
+                        backend=_backend,
+                        wall_s=time.monotonic() - _start, ceiling_s=None,
+                        ok=False, note=f"batch_http_{resp.status_code}",
+                        prompt_chars=len(prompt))
+                    if usage is not None:
+                        self._batch_action = "backlog"
+                        self._batch_reason = "connection_lost"
+                        self._batch_paid = True
+                        self._last_llm_failure = LLM_FAIL_PARSE
                     else:
+                        logger.error("REM batch LLM returned %d", resp.status_code)
+                        self._batch_action = "queue"
                         self._last_llm_failure = LLM_FAIL_TRANSPORT
-                    return None, None, model
-                resp_json = resp.json()
+                        # Upstream 4xx only; a 5xx or an outage stays one batch.
+                        if len(sent) >= 2 and _upstream_free_4xx(resp):
+                            self._solo_only.update(int(it["pg_id"]) for it in sent)
+                    return out, None, model
+                try:
+                    resp_json = resp.json()
+                except Exception:
+                    logger.error(
+                        "REM batch response was not JSON (status=%s)", resp.status_code)
+                    record_llm_call(
+                        "REM", None, backend=_backend,
+                        wall_s=time.monotonic() - _start, ceiling_s=None,
+                        ok=False, note="queued", prompt_chars=len(prompt))
+                    self._batch_action = "queue"
+                    self._last_llm_failure = LLM_FAIL_TRANSPORT
+                    return out, None, model
                 _wall_s = time.monotonic() - _start
                 call_timing = call_timing_summary(
                     resp_json, _wall_s, backend=_backend,
                     batch_size=len(sent), prompt_chars=len(prompt))
-                truncated = _truncated(resp_json)
-                raw = resp_json["choices"][0]["message"]["content"]
-                if not isinstance(raw, str):
-                    raise TypeError(f"content is {type(raw).__name__}, expected str")
-                # Batch truncation is logged, not retried: the solo retry policy does not apply, and the specimen is only for re-measurement.
-                if truncated:
-                    degenerate = truncation_is_degenerate(raw)
+                raw = _completion_text(resp_json)
+                if _truncated(resp_json):
                     specimen = _truncation_specimen(raw)
-                    _note = "degenerate" if degenerate else "truncated_honest"
-                    logger.warning(
-                        "REM batch: response TRUNCATED at max_tokens=%d "
-                        "(batch=%d, %s) — specimen(last %d chars): %s — "
-                        "salvaging strictly-parsed complete lines only (no "
-                        "json_repair), final line dropped; missing facts retry",
-                        _max_tokens, len(sent), _note,
-                        REM_TRUNCATION_SPECIMEN_CHARS, specimen,
-                    )
-                    record_llm_call("REM", resp_json, backend=_backend,
-                                    wall_s=_wall_s, ceiling_s=_ceiling,
-                                    note=_note, specimen=specimen, prompt_chars=len(prompt))
-                else:
-                    record_llm_call("REM", resp_json, backend=_backend,
-                                    wall_s=_wall_s, ceiling_s=_ceiling,
-                                    note=f"batch={len(sent)}", prompt_chars=len(prompt))
+                    reason = "loop" if request_sizing.reply_is_loop(raw) else "cut_off"
+                    logger.warning("REM batch: %s specimen: %s", reason, specimen)
+                    record_llm_call(
+                        "REM", resp_json, backend=_backend,
+                        wall_s=_wall_s, ceiling_s=None,
+                        note=reason, specimen=specimen, prompt_chars=len(prompt))
+                    self._batch_action = "solo"
+                    self._batch_reason = reason
+                    self._batch_specimen = specimen
+                    self._last_llm_failure = LLM_FAIL_TRUNCATED
+                    return out, call_timing, model
+                if _finish_reason(resp_json) != "stop" or not isinstance(raw, str) or not raw:
+                    record_llm_call(
+                        "REM", resp_json, backend=_backend,
+                        wall_s=_wall_s, ceiling_s=None,
+                        ok=False, note="unparseable", prompt_chars=len(prompt))
+                    self._batch_action = "backlog"
+                    self._batch_reason = "unparseable"
+                    self._last_llm_failure = LLM_FAIL_PARSE
+                    return out, call_timing, model
+                record_llm_call(
+                    "REM", resp_json, backend=_backend,
+                    wall_s=_wall_s, ceiling_s=None,
+                    note=f"batch={len(sent)}", prompt_chars=len(prompt))
+                parsed_lines = self._parse_jsonl_batch(raw, idx_to_pg, require_summary)
         except Exception as exc:
-            logger.error("REM batch LLM error: %s: %s", type(exc).__name__, exc)
-            self._last_llm_failure = LLM_FAIL_TRANSPORT
-            return None, None, model
-        self._last_llm_failure = LLM_FAIL_TRUNCATED if truncated else None
-        # `out` already holds the empty answer for every fact that was not sent.
-        out.update(self._parse_jsonl_batch(raw, idx_to_pg, require_summary,
-                                           truncated=truncated))
+            logger.error("REM batch LLM error: %s", type(exc).__name__)
+            if resp is not None and self._batch_action is None:
+                self._batch_action = "backlog"
+                self._batch_reason = "unparseable"
+                self._last_llm_failure = LLM_FAIL_PARSE
+            elif self._batch_action is None:
+                self._batch_action = "queue"
+                self._last_llm_failure = LLM_FAIL_TRANSPORT
+            return out, None, model
+        self._last_llm_failure = None
+        out.update(parsed_lines)
         return out, call_timing, model
+
 
     def _build_batch_prompt(self, items: list[dict]) -> str:
         """JSONL batch prompt: each fact's content, and nothing asked of the
@@ -1092,41 +1160,39 @@ class REMDaemon:
         raw: str,
         idx_to_pg: dict[int, int],
         require_summary: set[int] = frozenset(),
-        truncated: bool = False,
     ) -> dict[int, dict]:
-        """Parse JSONL responses by echoed idx, dropping facts missing required
-        summaries for solo retry. On truncation, drops the cut final line and parses
-        remaining lines strictly without json_repair to avoid salvaging partial records.
+        """Parse a complete JSONL reply by echoed idx.
+
+        A missing fact is left for one solo try. A cut-off body never reaches
+        here.
         """
-        if truncated:
-            raw = _drop_final_nonempty_line(raw)
         out: dict[int, dict] = {}
         for line in raw.splitlines():
             line = line.strip()
             if not line or "{" not in line:
                 continue
             candidate = line[line.find("{"):line.rfind("}") + 1]
-            if truncated:
-                try:
-                    obj = json.loads(candidate)   # strict only — never repair
-                except json.JSONDecodeError:
-                    continue
-            else:
-                obj = _parse_llm_json(candidate)
+            obj = _parse_llm_json(candidate)
             if not isinstance(obj, dict):
                 continue
             try:
                 idx = int(obj.get("idx"))
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
                 continue
             if idx not in idx_to_pg or idx_to_pg[idx] in out:
                 continue
-            if idx in require_summary and not str(obj.get("summary") or "").strip():
-                continue  # summary was required but missing → retry solo
+            summary = obj.get("summary")
+            if idx in require_summary and not isinstance(summary, str):
+                # Kept in the map so the caller backlogs this fact. Dropping
+                # it would pay for a solo retry of a body that already arrived.
+                out[idx_to_pg[idx]] = obj
+                continue
+            if idx in require_summary and not summary.strip():
+                continue
             out[idx_to_pg[idx]] = obj
         if len(out) < len(idx_to_pg):
             done = {i for i, pg in idx_to_pg.items() if pg in out}
-            logger.info("REM batch: %d/%d facts parsed; missing idx=%s (retry next cycle)",
+            logger.info("REM batch: %d/%d facts parsed; missing idx=%s (one solo try this cycle)",
                         len(out), len(idx_to_pg), sorted(set(idx_to_pg) - done))
         return out
 
@@ -1140,25 +1206,35 @@ class REMDaemon:
         conn,
         loop: asyncio.AbstractEventLoop,
     ) -> bool:
-        """Run full REM pipeline for a record; charges rem_attempts only on
-        record-chargeable failures, returning True on success.
+        """One try for this record. A backlog reason is written here.
+
+        A queued failure writes nothing.
         """
         self._last_llm_failure = None
+        self._last_backlog = None
         result, _model = await self._llm_process(content, kind, pg_id=pg_id)
-        # None is the failure; {} means the record was under the threshold and asked for nothing (decision:1664).
+        # None is the failure. {} means the record was under the threshold
+        # and asked for nothing.
         if result is None:
             failure = self._last_llm_failure or LLM_FAIL_TRANSPORT
-            chargeable = failure in LLM_FAIL_CHARGEABLE
-            logger.warning(
-                "REM: pg_id=%d LLM failed (%s) — skipping%s",
-                pg_id, failure,
-                "" if chargeable else f" ({failure} — attempt NOT charged)",
-            )
-            if chargeable:
-                await self._bump_rem_attempts([pg_id])
+            if self._last_backlog:
+                reason, specimen, paid = self._last_backlog
+                logger.warning("REM: pg_id=%d backlogged (%s)", pg_id, reason)
+                await self._write_backlog(pg_id, reason, specimen, loop, paid=paid)
+            else:
+                logger.warning(
+                    "REM: pg_id=%d LLM failed (%s) — queued, no backlog row",
+                    pg_id, failure,
+                )
             return False
-        return await self._apply_fact_result(
-            pg_id, kind, result, conn, loop, original_content=content)
+        try:
+            return await self._apply_fact_result(
+                pg_id, kind, result, conn, loop, original_content=content)
+        except Exception as exc:
+            logger.error(
+                "REM: pg_id=%d apply failed (%s)", pg_id, type(exc).__name__)
+            await self._write_backlog(pg_id, "unparseable", "", loop)
+            return False
 
     async def _apply_fact_result(
         self,
@@ -1173,18 +1249,26 @@ class REMDaemon:
         update, and NREM notification; returns True on success.
         """
         want_summary = len(original_content) > REM_SUMMARY_THRESHOLD
-        summary = (result.get("summary") or "").strip()
+        raw_summary = result.get("summary") if isinstance(result, dict) else None
+        if want_summary and not isinstance(raw_summary, str):
+            logger.warning(
+                "REM: pg_id=%d summary is %s — backlogged unparseable",
+                pg_id, type(raw_summary).__name__)
+            await self._write_backlog(pg_id, "unparseable", "", loop)
+            return False
+        summary = raw_summary.strip() if isinstance(raw_summary, str) else ""
         if want_summary and not summary:
             logger.warning("REM: pg_id=%d summary required (content > %d) but missing "
-                           "— skipping", pg_id, REM_SUMMARY_THRESHOLD)
-            await self._bump_rem_attempts([pg_id])
+                           "— backlogged unparseable", pg_id, REM_SUMMARY_THRESHOLD)
+            await self._write_backlog(pg_id, "unparseable", "", loop)
             return False
         if not want_summary:
             summary = ""   # never store a summary that was not requested
-        # A Fact with no original would be written blank and fail the consistency check forever; charge the attempt so it dead-letters.
+        # A Fact with no original would be written blank and fail the consistency check
+        # forever. Withhold it.
         if kind == KIND_FACT and not original_content:
-            logger.error("REM: pg_id=%d called without original_content — skipping", pg_id)
-            await self._bump_rem_attempts([pg_id])
+            logger.error("REM: pg_id=%d called without original_content — backlogged unparseable", pg_id)
+            await self._write_backlog(pg_id, "unparseable", "", loop)
             return False
 
         # Single Neo4j session: no edges, no labels; rem_processed=true last.
@@ -1193,8 +1277,8 @@ class REMDaemon:
                 pg_id, summary, kind=kind, original_content=original_content,
             )
         except Exception as exc:
-            logger.error("REM: pg_id=%d Neo4j write failed: %s", pg_id, exc)
-            await self._bump_rem_attempts([pg_id])
+            logger.error("REM: pg_id=%d Neo4j write failed (%s)", pg_id, type(exc).__name__)
+            await self._write_backlog(pg_id, "write_failed", "", loop)
             return False
 
         # Full-string check against the original that was written. Only Facts have their content replaced.
@@ -1202,18 +1286,19 @@ class REMDaemon:
             try:
                 consistent = await self._fact_is_consistent(pg_id, original_content)
             except Exception as exc:
-                logger.warning("REM: pg_id=%d consistency check error: %s", pg_id, exc)
+                logger.warning("REM: pg_id=%d consistency check error (%s)", pg_id, type(exc).__name__)
                 consistent = False
 
             if not consistent:
-                # A mismatch left marked processed would vanish from both worklists; revert it and count the attempt.
+                # A mismatch left marked processed would vanish from both
+                # worklists. Revert the mark.
                 logger.error(
-                    "REM: discrepancy — pg_id=%d Fact content mismatch after write; "
-                    "reverting rem_processed (+1 attempt) so the record re-enters "
-                    "the queue under the attempt cap",
+                    "REM: discrepancy — pg_id=%d Fact content mismatch after "
+                    "write; reverting rem_processed and backlogging write_failed",
                     pg_id,
                 )
                 await self._revert_rem_mark(pg_id, kind)
+                await self._write_backlog(pg_id, "write_failed", "", loop)
                 return False
 
         # Audit log (optional) → then mark rem_reviewed.
@@ -1225,13 +1310,15 @@ class REMDaemon:
             await self._mark_outbox_rem_reviewed(pg_id, conn, loop, kind=kind)
             outbox_marked = True
         except Exception as exc:
-            # Same stranding as a consistency miss: revert the mark and count the attempt so the idempotent write can retry.
+            # Same stranding as a consistency miss: revert the mark so the
+            # idempotent write can retry.
             logger.error(
-                "REM: pg_id=%d outbox mark failed (%s) — reverting rem_processed "
-                "(+1 attempt); record re-enters the queue under the attempt cap",
-                pg_id, exc,
+                "REM: pg_id=%d outbox mark failed (%s) — reverting "
+                "rem_processed and backlogging write_failed",
+                pg_id, type(exc).__name__,
             )
             await self._revert_rem_mark(pg_id, kind)
+            await self._write_backlog(pg_id, "write_failed", "", loop)
             return False
 
         # The node is already marked, so a missed notify is tolerable: the ledger sweep re-evaluates the cluster.
@@ -1240,6 +1327,7 @@ class REMDaemon:
         except Exception as exc:
             logger.warning("REM: pg_id=%d NREM notify failed: %s", pg_id, exc)
 
+        await self._clear_backlog(pg_id, loop)
         logger.info(
             "REM: pg_id=%d done (kind=%s, summary=%s, outbox_marked=%s)",
             pg_id, kind, bool(summary), outbox_marked,
@@ -1248,11 +1336,50 @@ class REMDaemon:
 
     # ── Batch cycle ───────────────────────────────────────────────────────────
 
+    async def _release_eligible_write_failed(self) -> None:
+        """Clear rem_processed when a write_failed row may be tried again.
+
+        A Postgres read error propagates and skips the cycle. A graph error
+        is logged and the cycle continues.
+        """
+        loop = asyncio.get_running_loop()
+        keys = await loop.run_in_executor(
+            None, lambda: llm_backlog.eligible_write_failed("rem"))
+        ids: list[int] = []
+        for key in keys:
+            try:
+                ids.append(int(key))
+            except (TypeError, ValueError):
+                continue
+        ids = [i for i in ids if i not in self._withheld]
+        if not ids:
+            return
+        try:
+            async with self.driver.session() as session:
+                await session.run(
+                    f"MATCH (n)"
+                    f" WHERE (n:{ONT.fact} OR n:{ONT.decision}"
+                    f"        OR n:{ONT.retrospective})"
+                    f"   AND n.pg_id IN $ids"
+                    f" SET n.rem_processed = false",
+                    ids=ids,
+                )
+        except Exception as exc:
+            logger.error(
+                "REM: clear rem_processed failed (%s)", type(exc).__name__)
+
     async def run_cycle(self) -> tuple[int, int]:
         """Execute one REM scan cycle, returning ``(processed, attempted)`` counts so
         the caller can distinguish idleness (backing off) from failures (keeping BASE).
         """
-        candidates, attempts_map, label_map, passed_over_map = await self._fetch_non_rem_batch()
+        try:
+            await self._release_eligible_write_failed()
+            candidates, label_map, passed_over_map = await self._fetch_non_rem_batch()
+        except Exception as exc:
+            # A dark backlog must not send the item again. Other read errors fail the
+            # same way.
+            logger.warning("REM: backlog read failed (%s) — skipping the cycle", type(exc).__name__)
+            return 0, 0
         if not candidates:
             return 0, 0
 
@@ -1306,9 +1433,10 @@ class REMDaemon:
 
             processed = 0
             attempted = 0
-            # Facts batch; decisions, retrospectives, and previously-failed facts run solo.
+            # Facts batch unless this process already paid for them once.
+            # Decisions and retrospectives stay solo.
             fact_items: list[dict] = []
-            solo_ids: list[tuple[int, str]] = []   # (pg_id, kind) — decisions/retros + demoted facts
+            solo_ids: list[tuple[int, str]] = []
             for pg_id in pg_ids:
                 row = content_map.get(pg_id)
                 if not row or not row.get("content"):
@@ -1323,48 +1451,59 @@ class REMDaemon:
                     await self._mark_node_invalid(
                         pg_id, selected, f"label_mismatch:{selected}!={expected}")
                     continue
-                if row["kind"] == KIND_FACT and attempts_map.get(pg_id, 0) == 0:
+                if row["kind"] == KIND_FACT and pg_id not in self._solo_only:
                     fact_items.append({"pg_id": pg_id, "content": row["content"]})
                 else:
-                    if row["kind"] == KIND_FACT:
-                        logger.info(
-                            "REM: pg_id=%d demoted batch→solo (rem_attempts=%d)",
-                            pg_id, attempts_map.get(pg_id, 0))
                     solo_ids.append((pg_id, row["kind"]))
 
             if len(fact_items) > 1:
                 attempted += len(fact_items)
-                # Every member is in this call, and pickups only rotate the queue, so a bulk bump cannot dead-letter the batch.
                 await self._bump_rem_pickups([it["pg_id"] for it in fact_items])
                 self._last_llm_failure = None
+                self._batch_action = None
                 results, call_timing, _model = await self._llm_process_batch(
                     fact_items)
                 if results is None:
-                    if self._last_llm_failure in LLM_FAIL_CHARGEABLE:
-                        logger.warning(
-                            "REM batch: call failed (%s) — %d fact(s) charged an attempt",
-                            self._last_llm_failure, len(fact_items),
-                        )
-                        await self._bump_rem_attempts([it["pg_id"] for it in fact_items])
-                    else:
-                        # The call failed, not the facts, so no attempt is charged and they stay batched next cycle.
-                        logger.warning(
-                            "REM batch: call failed (%s) — %d fact(s) retry next cycle; "
-                            "no attempt charged (not attributable to any record)",
-                            self._last_llm_failure or LLM_FAIL_TRANSPORT, len(fact_items),
-                        )
                     results = {}
-                else:
-                    # A missing line is that record's fault, so count it. {} is complete for a fact under the threshold, not a miss (decision:1664).
-                    missing = [it["pg_id"] for it in fact_items
-                               if results.get(it["pg_id"]) is None]
-                    if missing:
-                        await self._bump_rem_attempts(missing)
+                sent = [it for it in fact_items if len(it["content"]) > REM_SUMMARY_THRESHOLD]
+                if self._batch_action == "backlog":
+                    for it in sent:
+                        await self._write_backlog(
+                            it["pg_id"], self._batch_reason or "unrecognised",
+                            self._batch_specimen, loop, paid=self._batch_paid)
+                elif self._batch_action == "solo":
+                    # Cut-off, loop, or no context. Each sent fact gets one
+                    # solo try. Nothing is stored. They stay out of later batches.
+                    for it in sent:
+                        self._solo_only.add(it["pg_id"])
+                        if await self._process_fact(
+                                it["pg_id"], it["content"], KIND_FACT, conn, loop):
+                            processed += 1
+                elif self._batch_action is None:
+                    # A fact missing from a complete paid reply gets one solo
+                    # try and does not re-enter a batch.
+                    for it in sent:
+                        if results.get(it["pg_id"]) is not None:
+                            continue
+                        self._solo_only.add(it["pg_id"])
+                        if await self._process_fact(
+                                it["pg_id"], it["content"], KIND_FACT, conn, loop):
+                            processed += 1
                 for it in fact_items:
                     res = results.get(it["pg_id"])
-                    if res is not None and await self._apply_fact_result(
+                    if res is None:
+                        continue
+                    try:
+                        applied = await self._apply_fact_result(
                             it["pg_id"], KIND_FACT, res, conn, loop,
-                            original_content=it["content"]):
+                            original_content=it["content"])
+                    except Exception as exc:
+                        logger.error(
+                            "REM: pg_id=%d apply failed (%s)",
+                            it["pg_id"], type(exc).__name__)
+                        await self._write_backlog(it["pg_id"], "unparseable", "", loop)
+                        applied = False
+                    if applied:
                         processed += 1
                         # Timing is written after the review commits, so a timing failure cannot lose it (decision 570).
                         if call_timing:
@@ -1434,8 +1573,8 @@ class REMDaemon:
                 elif count == 0:
                     logger.warning(
                         "REM: %d candidate(s) attempted, ALL failed — keeping "
-                        "BASE cadence (failure is not idleness; the attempt cap "
-                        "dead-letters persistent offenders)", attempted)
+                        "BASE cadence (a failed cycle is not idle)",
+                        attempted)
             except Exception as exc:
                 logger.error("REM cycle error: %s", exc, exc_info=True)
             # Idle backs off; a cycle that tried and failed stays at BASE, or a poison loop looks like a quiet system.

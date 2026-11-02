@@ -3,7 +3,7 @@
 
 # The Telemetry Contract
 
-Contract version **1.0.43**. Every key the gateway emits on `GET /health` and `GET /memory/telemetry`, what it means, what it is measured in, when it arrived, and where it is going.
+Contract version **1.0.44**. Every key the gateway emits on `GET /health` and `GET /memory/telemetry`, what it means, what it is measured in, when it arrived, and where it is going.
 
 ## The roles
 
@@ -38,6 +38,12 @@ A key whose **value** changed meaning while its **name** stayed. Enumerated beca
 
 | endpoint | key | version | was | now | what to do |
 |---|---|---|---|---|---|
+| health | `rem.dead_lettered` | 1.0.44 | records past the REM attempt cap | pending records holding a row in llm_backlog | read llm_backlog reasons in ops/README.md to release them |
+| health | `neo4j.rem_dead_lettered` | 1.0.44 | records past the REM attempt cap | pending records holding a row in llm_backlog | same as rem.dead_lettered |
+| health | `rem.failing` | 1.0.44 | records with some failed REM attempts | always 0: there are no attempts, one try per item | stop reading it; the monitor drops it with the v1.0.45 contract change |
+| health | `rem.max_attempts` | 1.0.44 | the REM attempt cap | always 0: the cap is gone | stop reading it; the monitor drops it with the v1.0.45 contract change |
+| telemetry | `dead_lettered_clusters` | 1.0.44 | folds past the fold failure cap | folds excluded this cycle by an llm_backlog row | read llm_backlog reasons in ops/README.md to release them |
+| health | `dependencies.rem_daemon.reason` | 1.0.44 | named dead letters or a missing dream slot | also llm_backlog unreadable, with state down and both daemons held stopped | apply the migration; the daemons start with no restart |
 | health | `dependencies.embedder` | 1.0.42 | down meant only that the liveness probe failed | down also means a configured key was refused on a real route, reason auth_failed. A refused reranker key is degraded with the same reason | read reason to tell a refused key from a dead encoder |
 | telemetry | `breakdown.domains` | 0.9.74 | the PROJECT distribution (it was built from PROJECT_SQL) | the DOMAIN distribution, from metadata->'domains' | read breakdown.projects for the old value |
 | health | `role` | 0.9.74 | two-valued: read | write — an admin token reported `write` | three-valued: read | write | admin | a consumer testing `role == 'write'` for may-I-save now correctly excludes an admin token, which cannot save |
@@ -257,7 +263,7 @@ Paths are relative to the response object.
 | `dependencies.registry.reason` | str/null | — | 0.9.74 | — | — | — | — |
 | `dependencies.registry.state` | str | — | 0.9.74 | — | — | `health.registry` | ok \| degraded \| unknown — unknown before the first registry census; degraded iff a read failure or a census failure has been counted. Never down: an unreadable registry degrades axis resolution, it does not take the gateway down |
 | `dependencies.rem_daemon.reason` | str/null | — | 0.9.74 | — | — | — | — |
-| `dependencies.rem_daemon.state` | str | — | 0.9.74 | — | — | `health.rem_daemon` | ok \| degraded \| down. down iff the REM process is not running. degraded: dead-letters > 0, OR no backend counts toward dream slots (W2, decision:1832 — REM structurally cannot run against this fleet) — both reasons appear together when both apply |
+| `dependencies.rem_daemon.state` | str | — | 0.9.74 | — | — | `health.rem_daemon` | ok \| degraded \| down. down when the REM process is not running, or when llm_backlog cannot be read (reason: llm_backlog unreadable; the daemons stay stopped). degraded: dead_letters:N counts pending records with a backlog row, OR no backend counts toward dream slots (REM structurally cannot run against this fleet) — both reasons appear together when both apply |
 | `dependencies.reranker.reason` | str/null | — | 0.9.74 | — | — | — | — |
 | `dependencies.reranker.state` | str | — | 0.9.74 | — | — | `health.reranker` | ok \| degraded \| down. down when the liveness probe failed for a reason other than a refused key. A configured key the reranker refuses (probe or capability auth_failed, including /health 401 or 403) is degraded, not down. Any other probe failure is still down. |
 
@@ -536,7 +542,7 @@ The envelope is `{"status": "success", "telemetry": {…}}`; paths below are rel
 | `config.llm_backends[].n_ctx` | int/null | — | 0.9.74 | — | — | — | — |
 | `config.llm_backends[].price_per_mtok_in` | float/null | — | 0.9.74 | — | — | — | — |
 | `config.llm_backends[].price_per_mtok_out` | float/null | — | 0.9.74 | — | — | — | — |
-| `config.llm_backends[].priority` | int | — | 1.0.41 | — | — | — | stored and shown |
+| `config.llm_backends[].priority` | int | — | 1.0.41 | — | — | — | lower is tried first |
 | `config.llm_backends[].url` | str | — | 0.9.74 | — | — | — | — |
 | `config.llm_backends[].weight` | float | — | 0.9.74 | — | — | — | — |
 | `config.llm_pool_tuning.cooldown_s` | float/int | _s | 0.9.74 | — | — | — | — |
@@ -577,7 +583,7 @@ The envelope is `{"status": "success", "telemetry": {…}}`; paths below are rel
 | `llm.pool.*.last_call.origin` | str/null | — | 1.0.41 | — | — | — | upstream when the backend answered, gateway when this process recorded the status because no upstream status arrived, null before any call |
 | `llm.pool.*.last_call.status` | int/null | — | 1.0.41 | — | — | — | HTTP status of that call, or null when this process has not forwarded one. A 2xx is upstream. 500, 503 and 504 may be gateway-made; origin distinguishes them. |
 | `llm.pool.*.last_call.ts` | str/null | — | 1.0.41 | — | — | — | UTC time of the last chat status, or null when this process has not forwarded one. 503 and 504 can be the status this gateway returned when no upstream status arrived; last_call.origin says which. |
-| `llm.pool.*.priority` | int | — | 1.0.41 | — | — | — | stored and shown |
+| `llm.pool.*.priority` | int | — | 1.0.41 | — | — | — | lower is tried first |
 | `llm.pool.*.reserved` | bool | — | 0.9.74 | — | — | — | — |
 | `llm.pool.*.routed` | int | — | 0.9.74 | — | — | — | — |
 | `llm.pool.*.routed_pct` | float | _pct | 0.9.74 | — | — | — | — |
@@ -617,11 +623,11 @@ The envelope is `{"status": "success", "telemetry": {…}}`; paths below are rel
 | `latency.rem_ms.note` | str | — | <=0.9.73 | — | — | — | — |
 | `neo4j.decisions_rem_pending` | int | — | <=0.9.73 | — | — | — | — |
 | `neo4j.facts_rem_pending` | int | — | <=0.9.73 | — | — | — | — |
-| `rem.dead_lettered` | int | — | 0.9.74 | — | — | `health.rem_daemon` | — |
-| `rem.degeneration_firings` | int/null | — | 0.9.74 | — | — | — | ⚠ ALWAYS NULL AT 0.9.74, and null is the honest value. REM runs in a SEPARATE PROCESS (rem_loop.py); its anti-degeneration detector writes a log line and nothing durable, so the gateway cannot see it. Reporting 0 would claim it never fired. A durable counter is owed. |
+| `rem.dead_lettered` | int | — | 0.9.74 | — | — | `health.rem_daemon` | pending records that have a backlog row; a superseded record is excluded. A withheld record shows degraded. |
+| `rem.degeneration_firings` | int/null | — | 0.9.74 | — | — | — | Null. The loop check runs in the gateway on a cut-off reply and writes a log line. This key does not count those lines. Reporting 0 would say the check never fired. |
 | `rem.error` | str | — | 0.9.74 | — | — | — | present only when this section's own query failed |
-| `rem.failing` | int | — | 0.9.74 | — | — | — | — |
-| `rem.max_attempts` | int | — | 0.9.74 | — | — | — | REM_MAX_ATTEMPTS — the limit dead_lettered counts arrivals at |
+| `rem.failing` | int | — | 0.9.74 | — | — | — | always 0. |
+| `rem.max_attempts` | int | — | 0.9.74 | — | — | — | always 0. |
 | `rem.passed_over` | int | — | 0.9.74 | — | — | — | — |
 | `rem.starved_pending` | int | — | 0.9.74 | — | — | — | — |
 | `rem.throughput_per_hour` | float/null | — | 0.9.74 | — | — | — | records REM stamped in the last hour, from the durable technical_docs.rem_timing clock |
@@ -637,7 +643,7 @@ The envelope is `{"status": "success", "telemetry": {…}}`; paths below are rel
 | `consolidation.*.backlog` | int | — | <=0.9.73 | — | — | — | — |
 | `consolidation.*.consecutive_failures` | int | — | <=0.9.73 | — | — | — | — |
 | `consolidation.*.cycle_seconds_avg` | float/null | _seconds | <=0.9.73 | — | — | — | — |
-| `consolidation.*.dead_lettered_clusters` | int | — | <=0.9.73 | — | — | — | — |
+| `consolidation.*.dead_lettered_clusters` | int | — | <=0.9.73 | — | — | — | folds excluded this cycle, including a refold withheld by a backlog row |
 | `consolidation.*.deferred_24h` | int | — | <=0.9.73 | — | — | — | — |
 | `consolidation.*.eligible_clusters` | int | — | <=0.9.73 | — | — | — | — |
 | `consolidation.*.eligible_oldest_age_seconds` | int/null | _seconds | <=0.9.73 | — | — | — | — |

@@ -754,13 +754,13 @@ _PG_PLAN = {
             _FakeRow(status="dropped", closed_reason="out_of_scan", n=37)]),
         ("GROUP BY trigger_kind", [_FakeRow(trigger_kind="technical_docs", n=43)]),
         ("status = 'open' AND summary_kind = 'insight'", []),
+        ("FROM llm_backlog WHERE item_kind", []),
     ],
 }
 
 _NEO4J_PLAN = [
-    ("AND coalesce(n.rem_attempts,0) >= $cap", [{"n": 0}]),
-    ("RETURN coalesce(n.rem_attempts,0) AS a", [
-        {"a": 0, "p": 0, "n": 40}, {"a": 5, "p": 0, "n": 0}]),
+    ("RETURN coalesce(n.rem_passed_over,0) AS p", [
+        {"p": 0, "n": 40}]),
     ("MATCH (f:Fact) WHERE f.pg_id IS NOT NULL", [
         {"rem": True, "con": True, "superseded": False, "n": 900}]),
     ("MATCH (d:Decision) RETURN coalesce(d.rem_processed,false)", [

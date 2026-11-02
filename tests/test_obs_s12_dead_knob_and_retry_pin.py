@@ -243,17 +243,16 @@ def test_first_attempt_reset_retries_same_target_single_provider_authorization(m
     proxy = g.AsyncHiveMindProxy()
     session = _ResetOnceThenSucceedSession()
     proxy.session = session
+    proxy.llm_session = proxy.session
 
     resp = asyncio.run(proxy.handle_proxy(_Req()))
 
-    assert resp.status == 200
-    assert len(session.calls) == 2, (
-        "expected exactly one retry after the first-attempt reset with no "
-        "response ever read")
+    body = json.loads(resp.body.decode())
+    assert resp.status == 422 and body["reason"] == "connection_lost"
+    assert len(session.calls) == 1, (
+        "the LLM path opens a fresh connection and does not replay the same backend")
     urls = {c["url"] for c in session.calls}
-    assert len(urls) == 1, (
-        "the retry must hit the SAME backend — this pool has no cross-"
-        "backend failover, dead knob or not")
+    assert len(urls) == 1
     assert next(iter(urls)).startswith("http://a:5000"), urls
     for call in session.calls:
         keys_lower = [k.lower() for k in call["headers"]]

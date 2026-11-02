@@ -37,7 +37,7 @@ from typing import Any
 
 import httpx
 
-VERSION = "1.0.43"
+VERSION = "1.0.44"
 # Must match GET /health api_version; v4 refuses unregistered project on fact save.
 API_VERSION = 4
 
@@ -1267,15 +1267,12 @@ def format_status(payload: dict, health: dict | None = None) -> str:
     if "error" in rem:
         lines.append(f"  rem: ERROR {rem['error']}")
     else:
-        # A record at the attempt cap still counts as REM pending but has left the queue, so a
-        # dead-lettered backlog needs its own line.
+        # dead_lettered counts pending records a backlog row is withholding.
+        # The operator releases one by deleting the row.
         _dead = rem.get("dead_lettered", 0) or 0
-        _failing = rem.get("failing", 0) or 0
-        if _dead or _failing:
-            _warn = "  ⚠ operator reset needed" if _dead else ""
-            lines.append(f"  REM enrichment: {_failing} retrying | "
-                         f"{_dead} DEAD-LETTERED at {rem.get('max_attempts','?')} "
-                         f"attempts{_warn}")
+        if _dead:
+            lines.append(
+                f"  REM enrichment: {_dead} withheld by a backlog row")
         # Printed only once passed-over or starved is above zero (decision 894: a solo record skipped often enough is promoted and drained ahead of the batch).
         _passed_over = rem.get("passed_over", 0) or 0
         _starved = rem.get("starved_pending", 0) or 0

@@ -143,7 +143,7 @@ def _wire_common(monkeypatch):
     monkeypatch.setattr(cl, "fetch_refold_insights", lambda conn, ids: [])
     monkeypatch.setattr(cl, "fetch_active_insight_rows", lambda conn: [])
     monkeypatch.setattr(cl, "fetch_active_thematic_summary_id", lambda conn, p, d: None)
-    monkeypatch.setattr(cl, "fetch_fold_dead_letter_counts", lambda: {})
+    monkeypatch.setattr(cl.llm_backlog, "blocked_keys", lambda kind: set())
     monkeypatch.setattr(cl, "_crun_start", lambda ct: 42)
 
 

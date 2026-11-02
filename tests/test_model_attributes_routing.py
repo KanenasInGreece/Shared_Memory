@@ -131,7 +131,7 @@ def test_explicit_private_ok_always_wins(monkeypatch):
     g = _fresh(monkeypatch)
     assert "https://api.deepseek.com/v1" in g.LLM_BACKENDS
     assert "http://local:5000" in g.LLM_BACKENDS
-    assert g._select_llm_backend(None) in g.LLM_BACKENDS
+    assert (g._order_backends(0.0, None) or [None])[0] in g.LLM_BACKENDS
 
 
 def test_legacy_comma_form_is_serves_all_but_private_ok_now_defaults_false(monkeypatch):
@@ -186,7 +186,7 @@ def test_price_metadata_never_read_by_selection(monkeypatch):
     g = _fresh(monkeypatch)
     g._llm_inflight["http://cheap:5000"] = 5
     g._llm_inflight["http://pricey:4000"] = 0
-    chosen = g._select_llm_backend(None)
+    chosen = (g._order_backends(0.0, None) or [None])[0]
     assert chosen == "http://pricey:4000"   # least-in-flight, not cheapest
 
 
@@ -343,7 +343,7 @@ def test_p5_roles_absent_explicit_false_says_safe_by_construction(monkeypatch, c
     with caplog.at_level(logging.WARNING):
         g.require_valid_llm_routing_config()
     assert g.LLM_BACKENDS == ["http://a:5000"]
-    assert g._select_llm_backend(None) == "http://a:5000"
+    assert (g._order_backends(0.0, None) or [None])[0] == "http://a:5000"
     assert not any("safe by construction" in r.message for r in caplog.records)
 
 
@@ -362,7 +362,7 @@ def test_p5_roles_carrying_explicit_false_says_not_safe_by_construction(monkeypa
     with caplog.at_level(logging.WARNING):
         g.require_valid_llm_routing_config()
     assert g.LLM_BACKENDS == ["http://a:5000"]
-    assert g._select_llm_backend(None) == "http://a:5000"
+    assert (g._order_backends(0.0, None) or [None])[0] == "http://a:5000"
     assert not any("safe by construction" in r.message for r in caplog.records)
 
 
@@ -418,8 +418,8 @@ def test_explicit_roles_is_the_privacy_opt_in_even_when_private_ok_false(monkeyp
         {"url": "http://a:5000", "private_ok": False, "roles": ["extract"], "n_ctx": 8192, "max_output_tokens": 2048},
     ]))
     g = _fresh(monkeypatch)
-    assert g._eligible_backends() == ["http://a:5000"]
-    assert g._select_llm_backend(None) == "http://a:5000"
+    assert g._order_backends(0.0, None) == ["http://a:5000"]
+    assert (g._order_backends(0.0, None) or [None])[0] == "http://a:5000"
 
 
 def test_role_scoped_private_ok_backend_still_serves_role_less_traffic(monkeypatch):
@@ -435,7 +435,7 @@ def test_role_scoped_private_ok_backend_still_serves_role_less_traffic(monkeypat
         {"url": "http://a:5000", "roles": ["extract"], "private_ok": True, "n_ctx": 8192, "max_output_tokens": 2048},
     ]))
     g = _fresh(monkeypatch)
-    assert g._select_llm_backend(None) == "http://a:5000"
+    assert (g._order_backends(0.0, None) or [None])[0] == "http://a:5000"
 
 
 def test_r_b_role_scoped_backend_with_no_explicit_private_ok_serves_no_role_less_traffic(monkeypatch):
@@ -450,8 +450,8 @@ def test_r_b_role_scoped_backend_with_no_explicit_private_ok_serves_no_role_less
         {"url": "http://a:5000", "roles": ["extract"], "n_ctx": 8192, "max_output_tokens": 2048},
     ]))
     g = _fresh(monkeypatch)
-    assert g._eligible_backends() == ["http://a:5000"]
-    assert g._select_llm_backend(None) == "http://a:5000"
+    assert g._order_backends(0.0, None) == ["http://a:5000"]
+    assert (g._order_backends(0.0, None) or [None])[0] == "http://a:5000"
 
 
 def test_role_scoped_private_ok_false_backend_never_serves_role_less_traffic(monkeypatch):
@@ -461,7 +461,7 @@ def test_role_scoped_private_ok_false_backend_never_serves_role_less_traffic(mon
         {"url": "http://a:5000", "private_ok": False, "roles": ["extract"], "n_ctx": 8192, "max_output_tokens": 2048},
     ]))
     g = _fresh(monkeypatch)
-    assert g._select_llm_backend(None) == "http://a:5000"
+    assert (g._order_backends(0.0, None) or [None])[0] == "http://a:5000"
 
 
 def test_serves_all_degenerate_case_eligible_for_role_less_and_every_role(monkeypatch):
@@ -471,8 +471,8 @@ def test_serves_all_degenerate_case_eligible_for_role_less_and_every_role(monkey
     half). This test now pins the OPT-IN case."""
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([{"url": "http://a:5000", "private_ok": True, "n_ctx": 8192, "max_output_tokens": 2048}]))
     g = _fresh(monkeypatch)
-    assert g._eligible_backends() == ["http://a:5000"]
-    assert g._select_llm_backend(None) == "http://a:5000"
+    assert g._order_backends(0.0, None) == ["http://a:5000"]
+    assert (g._order_backends(0.0, None) or [None])[0] == "http://a:5000"
 
 
 def test_i5a_descriptor_less_fleet_eligible_set_is_now_empty(monkeypatch):
@@ -485,7 +485,7 @@ def test_i5a_descriptor_less_fleet_eligible_set_is_now_empty(monkeypatch):
     monkeypatch.delenv("LLM_BACKENDS_JSON", raising=False)
     monkeypatch.setenv("LLM_BACKENDS_JSON", "[{\"url\": \"http://a:5000\", \"n_ctx\": 8192, \"max_output_tokens\": 2048}, {\"url\": \"http://b:4000\", \"n_ctx\": 8192, \"max_output_tokens\": 2048}]")
     g = _fresh(monkeypatch)
-    assert g._eligible_backends() == ["http://a:5000", "http://b:4000"]
+    assert g._order_backends(0.0, None) == ["http://a:5000", "http://b:4000"]
 
 
 # ── I-1a: enumerated "never" paths, each its own mutation-checked test ──────
@@ -500,21 +500,19 @@ def test_i1a_affinity_hit_outside_eligible_set_is_a_miss(monkeypatch):
     ]))
     g = _fresh(monkeypatch)
     key = "affine-key-1"
-    first = g._select_llm_backend(key)
+    first = (g._order_backends(0.0, key) or [None])[0]
     assert first == "http://a:5000"
     g._llm_inflight[first] = 0
     # Leftover roles do not split the fleet. The affinity hit sticks.
-    second = g._select_llm_backend(key)
+    second = (g._order_backends(0.0, key) or [None])[0]
     assert second == first
 
 
 def test_i1a_cold_fallback_never_widens_past_eligible(monkeypatch):
-    """MUTATION TARGET (P-1 Critical): every fallback tier — including the
-    final cooldown-ignoring last resort — must bottom out at the ELIGIBLE
-    set, never the full LLM_POOL. Construct the sole eligible backend as
-    unhealthy AND reserved (everything "bad" at once); selection must still
-    return it rather than leaking to an ineligible backend that happens to
-    be healthy."""
+    """Cooldown and the reserved set are not order keys.
+
+    A cooled backend stays first. The walk moves off it when it is tried.
+    Dropping it from the order would hide it from that move."""
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
         {"url": "http://a:5000", "roles": ["extract"], "n_ctx": 8192, "max_output_tokens": 2048},
         {"url": "http://b:4000", "roles": ["judge"], "n_ctx": 8192, "max_output_tokens": 2048},
@@ -524,8 +522,8 @@ def test_i1a_cold_fallback_never_widens_past_eligible(monkeypatch):
     g._llm_unhealthy_until["http://a:5000"] = time.monotonic() + 300
     g._llm_reserved.add("http://a:5000")
     try:
-        chosen = g._select_llm_backend(None)
-        assert chosen == "http://b:4000"
+        chosen = (g._order_backends(0.0, None) or [None])[0]
+        assert chosen == "http://a:5000"
     finally:
         g._llm_reserved.discard("http://a:5000")
 
@@ -538,20 +536,18 @@ def test_i1a_cooldown_ignoring_last_resort_stays_within_eligible(monkeypatch):
     g = _fresh(monkeypatch)
     import time
     g._llm_unhealthy_until["http://a:5000"] = time.monotonic() + 300
-    assert g._select_llm_backend(None) == "http://a:5000"
+    assert (g._order_backends(0.0, None) or [None])[0] == "http://a:5000"
 
 
 def test_i1a_reserved_backend_deprioritised_but_last_resort_within_eligible(monkeypatch):
-    """_llm_reserved interaction: a reserved backend is skipped in favor of
-    an available eligible peer, but a SOLE eligible+reserved backend is
-    still the last-resort pick (never an ineligible peer)."""
+    """The reserved set does not reorder. Pool status still reports it."""
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
         {"url": "http://a:5000", "private_ok": True, "n_ctx": 8192, "max_output_tokens": 2048}, {"url": "http://b:4000", "private_ok": True, "n_ctx": 8192, "max_output_tokens": 2048},
     ]))
     g = _fresh(monkeypatch)
     g._llm_reserved.add("http://a:5000")
     try:
-        assert g._select_llm_backend(None) == "http://b:4000"
+        assert (g._order_backends(0.0, None) or [None])[0] == "http://a:5000"
     finally:
         g._llm_reserved.discard("http://a:5000")
 
@@ -567,6 +563,7 @@ def test_422_role_constraint_when_nothing_serves_the_function(monkeypatch):
     proxy = g.AsyncHiveMindProxy()
     session = _CaptureSession()
     proxy.session = session
+    proxy.llm_session = proxy.session
     req = _req({"X-SM-LLM-Role": "judge"}, _body())
     resp = asyncio.run(proxy.handle_proxy(req))
     assert resp.status != 422
@@ -586,6 +583,7 @@ def test_422_privacy_constraint_when_role_less_and_all_backends_private_false(mo
     proxy = g.AsyncHiveMindProxy()
     session = _CaptureSession()
     proxy.session = session
+    proxy.llm_session = proxy.session
     req = _req({}, _body())
     resp = asyncio.run(proxy.handle_proxy(req))
     assert resp.status != 422
@@ -600,13 +598,14 @@ def test_422_fit_constraint_when_oversized(monkeypatch):
     g = _fresh(monkeypatch)
     proxy = g.AsyncHiveMindProxy()
     proxy.session = _RaisingSession()
+    proxy.llm_session = proxy.session
     huge_body = _body(**{"messages": [{"role": "user", "content": "x" * 5000}]})
     req = _req({}, huge_body)
     resp = asyncio.run(proxy.handle_proxy(req))
     assert resp.status == 422
     body = json.loads(resp.body.decode())
-    assert body["error"] == "no_eligible_backend"
-    assert body["constraint"] == "fit"
+    assert body["error"] == "backlog"
+    assert body["reason"] == "no_context"
     assert "declaration" not in body
     assert "role" not in body
 
@@ -619,6 +618,7 @@ def test_422_increments_counter_and_last_ts(monkeypatch):
     before = g._routing_no_eligible_backend_count
     proxy = g.AsyncHiveMindProxy()
     proxy.session = _RaisingSession()
+    proxy.llm_session = proxy.session
     huge = _body(**{"messages": [{"role": "user", "content": "x" * 5000}]})
     resp = asyncio.run(proxy.handle_proxy(_req({}, huge)))
     assert resp.status == 422
@@ -636,6 +636,7 @@ def test_422_never_touches_inflight_accounting(monkeypatch):
     before = dict(g._llm_inflight)
     proxy = g.AsyncHiveMindProxy()
     proxy.session = _RaisingSession()
+    proxy.llm_session = proxy.session
     asyncio.run(proxy.handle_proxy(_req({"X-SM-LLM-Role": "judge"}, _body())))
     assert g._llm_inflight == before
 
@@ -654,6 +655,7 @@ def test_422_never_waits(monkeypatch):
     monkeypatch.setattr(g.asyncio, "sleep", _boom_sleep)
     proxy = g.AsyncHiveMindProxy()
     proxy.session = _RaisingSession()
+    proxy.llm_session = proxy.session
     huge = _body(**{"messages": [{"role": "user", "content": "x" * 5000}]})
     resp = asyncio.run(proxy.handle_proxy(_req({}, huge)))
     assert resp.status == 422
@@ -661,35 +663,33 @@ def test_422_never_waits(monkeypatch):
 
 # ── I-3: fit is a ceiling, never a body mutation ────────────────────────────
 
-def test_fits_backend_without_nctx_always_fits(monkeypatch):
-    g = _fresh(monkeypatch)
-    assert g._fits("http://anything", 10_000_000, 10_000_000) is True
+def test_fits_backend_without_nctx_does_not_qualify(monkeypatch):
+    import request_sizing
+    assert request_sizing.qualifies(request_sizing.context_room(None, 10), 10) is False
 
 
 def test_fits_boundary_math(monkeypatch):
-    g = _fresh(monkeypatch)
     monkeypatch.setenv("FIT_MARGIN", "0.10")
-    importlib.reload(g)
-    monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([{"url": "http://a:5000", "n_ctx": 1000, "max_output_tokens": 2048}]))
-    importlib.reload(g)
-    # 1000 * (1 - 0.10) = 900 usable tokens
-    assert g._fits("http://a:5000", 800, 99) is True     # 899 <= 900
-    assert g._fits("http://a:5000", 800, 101) is False    # 901 > 900
+    import request_sizing
+    importlib.reload(request_sizing)
+    # n_ctx 1000, margin 0.10: room 500 qualifies an estimate of 400, not 500.
+    assert request_sizing.qualifies(request_sizing.context_room(1000, 400), 400) is True
+    assert request_sizing.qualifies(request_sizing.context_room(1000, 500), 500) is False
 
 
-def test_fit_never_rewrites_max_tokens_in_the_forwarded_body(monkeypatch):
-    """I-3: the fit check may only EXCLUDE a backend; it must never modify
-    the request. A backend declaring n_ctx must forward the caller's body
-    byte-for-byte (no max_tokens injected) when the caller sent none."""
+def test_walk_writes_max_tokens_last(monkeypatch):
+    """The gateway sets max_tokens. A caller that sent none still receives the spend cap."""
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([{"url": "http://a:5000", "n_ctx": 100000, "private_ok": True, "max_output_tokens": 2048}]))
     g = _fresh(monkeypatch)
     proxy = g.AsyncHiveMindProxy()
     session = _CaptureSession()
     proxy.session = session
-    req = _req({}, _body())   # no max_tokens in the caller's body
+    proxy.llm_session = proxy.session
+    req = _req({}, _body())
     asyncio.run(proxy.handle_proxy(req))
     forwarded = json.loads(session.captured_data)
-    assert "max_tokens" not in forwarded
+    assert isinstance(forwarded["max_tokens"], int)
+    assert forwarded["max_tokens"] <= 2048
 
 
 # ── H-1/H-3: health display + probe URL ─────────────────────────────────────
@@ -770,6 +770,7 @@ def test_a_credentialed_backend_that_401s_is_reported_unusable(monkeypatch):
     g = _fresh(monkeypatch)
     proxy = g.AsyncHiveMindProxy()
     proxy.session = _FixedStatusSession(401)
+    proxy.llm_session = proxy.session
 
     async def _run():
         await _run_probe_cycle(g, proxy)
@@ -791,6 +792,7 @@ def test_h1_uncredentialed_backend_401_stays_down(monkeypatch):
     g = _fresh(monkeypatch)
     proxy = g.AsyncHiveMindProxy()
     proxy.session = _FixedStatusSession(401)
+    proxy.llm_session = proxy.session
 
     async def _run():
         await _run_probe_cycle(g, proxy)
@@ -808,6 +810,7 @@ def test_h1_credentialed_backend_5xx_stays_down(monkeypatch):
     g = _fresh(monkeypatch)
     proxy = g.AsyncHiveMindProxy()
     proxy.session = _FixedStatusSession(500)
+    proxy.llm_session = proxy.session
 
     async def _run():
         await _run_probe_cycle(g, proxy)
@@ -838,6 +841,7 @@ def test_p6_daemon_role_header_still_stripped_before_upstream_forward(monkeypatc
     proxy = g.AsyncHiveMindProxy()
     session = _CaptureSession()
     proxy.session = session
+    proxy.llm_session = proxy.session
     req = _req({"X-SM-LLM-Role": "judge"}, _body())
     req["authenticated_agent"] = "consolidation"
     asyncio.run(proxy.handle_proxy(req))
@@ -857,6 +861,7 @@ def test_p6_role_still_drives_routing_even_though_stripped_on_forward(monkeypatc
     proxy = g.AsyncHiveMindProxy()
     session = _CaptureSession()
     proxy.session = session
+    proxy.llm_session = proxy.session
     req = _req({"X-SM-LLM-Role": "judge"}, _body())
     asyncio.run(proxy.handle_proxy(req))
     assert req.get("backend") == "http://a:5000"
@@ -875,7 +880,7 @@ def test_i8_capped_backend_excluded_when_an_alternative_eligible_backend_exists(
     ]))
     g = _fresh(monkeypatch)
     g._llm_inflight["http://a:5000"] = 1   # AT cap
-    chosen = g._select_llm_backend(None)
+    chosen = (g._order_backends(0.0, None) or [None])[0]
     assert chosen == "http://b:4000"
 
 
@@ -893,7 +898,7 @@ def test_i8_cap_never_widens_eligibility(monkeypatch):
     proxy = g.AsyncHiveMindProxy()
     session = _CaptureSession()
     proxy.session = session
-    g.LLM_MAX_INFLIGHT_WAIT_S = 0.0
+    proxy.llm_session = proxy.session
     req = _req({"X-SM-LLM-Role": "extract"}, _body())
     resp = asyncio.run(proxy.handle_proxy(req))
     assert resp.status != 503
@@ -911,35 +916,103 @@ def test_i8_sole_eligible_backend_at_cap_frees_up_during_wait(monkeypatch):
     ]))
     g = _fresh(monkeypatch)
     g._llm_inflight["http://a:5000"] = 1
-    g.LLM_MAX_INFLIGHT_WAIT_S = 5.0
     g.LLM_MAX_INFLIGHT_POLL_S = 0.01
+
+    class _Ok:
+        status = 200
+        headers = {}
+        content = None
+
+        def __init__(self):
+            self.content = self
+
+        async def read(self, n=-1):
+            return json.dumps({
+                "choices": [{"finish_reason": "stop", "message": {"content": "ok"}}],
+            }).encode()
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+    class _Sess:
+        def __init__(self):
+            self.calls = 0
+
+        def request(self, *a, **k):
+            self.calls += 1
+            return _Ok()
 
     async def _free_it_shortly():
         await asyncio.sleep(0.03)
         g._llm_inflight["http://a:5000"] = 0
 
+    session = _Sess()
+    proxy = g.AsyncHiveMindProxy()
+    proxy.session = session
+    proxy.llm_session = session
+
     async def _run():
         free_task = asyncio.create_task(_free_it_shortly())
-        backend = await g._select_backend_waiting_on_capacity(None, 0.0, 0.0)
+        resp = await proxy.handle_proxy(_req({}, _body()))
         await free_task
-        return backend
-    assert asyncio.run(_run()) == "http://a:5000"
+        return resp
+
+    resp = asyncio.run(_run())
+    assert resp.status == 200
+    assert session.calls == 1
 
 
-def test_i8b_capacity_wait_exhausted_never_touches_inflight(monkeypatch):
+def test_i8b_waiter_gets_the_slot_when_it_frees(monkeypatch):
+    """While the backend is full the waiter does not take a slot. It proceeds when the slot frees."""
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
         {"url": "http://a:5000", "max_inflight": 1, "private_ok": True, "n_ctx": 8192, "max_output_tokens": 2048},
     ]))
     g = _fresh(monkeypatch)
     g._llm_inflight["http://a:5000"] = 1
-    g.LLM_MAX_INFLIGHT_WAIT_S = 0.02
     g.LLM_MAX_INFLIGHT_POLL_S = 0.01
+
+    class _Ok:
+        status = 200
+        headers = {}
+        content = None
+
+        def __init__(self):
+            self.content = self
+
+        async def read(self, n=-1):
+            return b'{"choices":[{"finish_reason":"stop","message":{"content":"ok"}}]}'
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+    class _Sess:
+        def request(self, *a, **k):
+            return _Ok()
+
     proxy = g.AsyncHiveMindProxy()
-    proxy.session = _RaisingSession()
-    before = dict(g._llm_inflight)
-    resp = asyncio.run(proxy.handle_proxy(_req({}, _body())))
-    assert resp.status == 503
-    assert g._llm_inflight == before   # unchanged: never dispatched, never accounted
+    proxy.session = _Sess()
+    proxy.llm_session = proxy.session
+
+    async def _free():
+        await asyncio.sleep(0.03)
+        assert g._llm_inflight["http://a:5000"] == 1
+        g._llm_inflight["http://a:5000"] = 0
+
+    async def _run():
+        task = asyncio.create_task(_free())
+        resp = await proxy.handle_proxy(_req({}, _body()))
+        await task
+        return resp
+
+    resp = asyncio.run(_run())
+    assert resp.status == 200
+    assert g._llm_inflight["http://a:5000"] == 0
 
 
 # ── I-7: routing telemetry is additive ──────────────────────────────────────
@@ -957,6 +1030,7 @@ def test_i7_llm_routing_and_token_usage_keys_present_for_authenticated_caller(mo
 
     proxy = g.AsyncHiveMindProxy()
     proxy.session = _FixedStatusSession(200)
+    proxy.llm_session = proxy.session
 
     async def _run():
         return await g._build_health_checks(proxy, None)
@@ -978,6 +1052,7 @@ def test_i7_role_routed_counter_increments_on_successful_dispatch(monkeypatch):
     proxy = g.AsyncHiveMindProxy()
     session = _CaptureSession()
     proxy.session = session
+    proxy.llm_session = proxy.session
     asyncio.run(proxy.handle_proxy(_req({"X-SM-LLM-Role": "extract"}, _body())))
     assert g._llm_routed["http://a:5000"] == before + 1
     assert not hasattr(g, "_llm_routed_by_role")
@@ -1048,6 +1123,7 @@ def test_i4_no_gateway_retry_on_a_4xx_5xx_status(monkeypatch):
     proxy = g.AsyncHiveMindProxy()
     session = _FixedFaultBodySession()
     proxy.session = session
+    proxy.llm_session = proxy.session
     asyncio.run(proxy.handle_proxy(_req({}, _body())))
     assert session.calls == 1
 
@@ -1081,6 +1157,7 @@ def test_the_backend_probe_carries_the_backends_own_bearer(monkeypatch):
     g = _fresh(monkeypatch)
     proxy = g.AsyncHiveMindProxy()
     proxy.session = _FixedStatusSession(200)
+    proxy.llm_session = proxy.session
 
     async def _run():
         cache = await _run_probe_cycle(g, proxy)
@@ -1106,6 +1183,7 @@ def test_a_401_with_the_bearer_attached_is_a_rejected_key(monkeypatch):
     g = _fresh(monkeypatch)
     proxy = g.AsyncHiveMindProxy()
     proxy.session = _FixedStatusSession(401)
+    proxy.llm_session = proxy.session
 
     async def _run():
         await _run_probe_cycle(g, proxy)
@@ -1131,6 +1209,7 @@ def test_the_probe_never_sends_a_bearer_over_plaintext_to_a_remote_host(monkeypa
     g = _fresh(monkeypatch)
     proxy = g.AsyncHiveMindProxy()
     proxy.session = _FixedStatusSession(200)
+    proxy.llm_session = proxy.session
 
     async def _run():
         await _run_probe_cycle(g, proxy)

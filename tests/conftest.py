@@ -71,9 +71,7 @@ def _arm_chat_identity(module) -> None:
 def chat_caller_is_consolidation(monkeypatch):
     """Opt in when a chat call with no bearer must be forwarded as consolidation.
 
-    importlib.reload stays the real function. This fixture patches it only
-    for the test that requests the fixture, and puts the original handler
-    back afterwards. A test that does not request it can see an anonymous forward refused.
+    This wraps reload, calls through whatever was already installed, and re-arms the chat identity. A test that does not request it still sees an anonymous forward refused.
     """
     import importlib
     real_reload = importlib.reload
@@ -101,6 +99,44 @@ def chat_caller_is_consolidation(monkeypatch):
             current = live.AsyncHiveMindProxy.handle_proxy
             if getattr(current, "_v1041_armed", False):
                 live.AsyncHiveMindProxy.handle_proxy = current._original
+
+
+@pytest.fixture(autouse=True)
+def _llm_backlog_stays_off_postgres(monkeypatch):
+    """Cycle tests must not open a live backlog connection. A reloaded gateway gets a readable pool stand-in, and a test that cares patches that read again."""
+    import importlib
+    import sys
+
+    try:
+        import llm_backlog
+    except Exception:
+        llm_backlog = None
+    if llm_backlog is not None:
+        monkeypatch.setattr(llm_backlog, "blocked_keys", lambda kind: set())
+        monkeypatch.setattr(llm_backlog, "upsert", lambda *a, **k: None)
+        monkeypatch.setattr(llm_backlog, "delete", lambda *a, **k: None)
+        monkeypatch.setattr(llm_backlog, "eligible_write_failed", lambda kind: [])
+
+    def _arm(mod):
+        class _Coord:
+            _pool = object()
+
+            async def _rem_backlog_pg_ids(self):
+                return []
+
+        monkeypatch.setattr(mod, "_backlog_coordinator", _Coord(), raising=False)
+
+    real_reload = importlib.reload
+
+    def _reload(module):
+        loaded = real_reload(module)
+        if getattr(loaded, "__name__", "") == "hive_mind_proxy":
+            _arm(loaded)
+        return loaded
+
+    monkeypatch.setattr(importlib, "reload", _reload)
+    if "hive_mind_proxy" in sys.modules:
+        _arm(sys.modules["hive_mind_proxy"])
 
 
 @pytest.fixture(autouse=True)

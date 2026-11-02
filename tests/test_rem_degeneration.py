@@ -33,7 +33,7 @@ sys.path.insert(0, os.path.dirname(__file__))   # tests/ itself, for test_rem_lo
 from test_rem_loop import rem_mod, _make_daemon, _length_resp, _ok_resp
 import request_sizing
 
-truncation_is_degenerate = rem_mod.truncation_is_degenerate
+reply_is_loop = request_sizing.reply_is_loop
 _truncation_specimen = rem_mod._truncation_specimen
 REM_TRUNCATION_SPECIMEN_CHARS = rem_mod.REM_TRUNCATION_SPECIMEN_CHARS
 
@@ -59,7 +59,7 @@ def test_object_rule_fires_on_three_exact_repeats():
         '{"name": "WidgetCo", "rel_type": "MENTIONS"}, '
         '{"name": "WidgetCo", "rel_type": "MENTIONS"}]'
     )
-    assert truncation_is_degenerate(body) is True
+    assert reply_is_loop(body) is True
 
 
 def test_long_string_rule_fires_on_three_exact_repeats():
@@ -69,7 +69,7 @@ def test_long_string_rule_fires_on_three_exact_repeats():
     body = '{"rejected": ["%s", "%s", "%s"' % (
         (_REPEATED_SENTENCE,) * 3
     )
-    assert truncation_is_degenerate(body) is True
+    assert reply_is_loop(body) is True
 
 
 def test_honest_truncation_with_unique_elements_is_not_degenerate():
@@ -81,7 +81,7 @@ def test_honest_truncation_with_unique_elements_is_not_degenerate():
         '{"name": "GammaCorp", "rel_type": "USES"}], '
         '"summary": "This record describes a distinct rollout across three vend'
     )
-    assert truncation_is_degenerate(body) is False
+    assert reply_is_loop(body) is False
 
 
 def test_honest_output_with_repeated_short_tokens_is_not_degenerate():
@@ -94,7 +94,7 @@ def test_honest_output_with_repeated_short_tokens_is_not_degenerate():
         '{"name": "BetaCorp", "rel_type": "MENTIONS"}, '
         '{"name": "GammaCorp", "rel_type": "MENTIONS"}]'
     )
-    assert truncation_is_degenerate(body) is False
+    assert reply_is_loop(body) is False
 
 
 def test_f7_prose_quoting_a_braced_snippet_thrice_is_accepted_residual_fp():
@@ -108,7 +108,7 @@ def test_f7_prose_quoting_a_braced_snippet_thrice_is_accepted_residual_fp():
         'again reference {"key": "value"} to show consistency. Finally '
         '{"key": "value"} appears a third time in the doc'
     )
-    assert truncation_is_degenerate(body) is True
+    assert reply_is_loop(body) is True
 
 
 @pytest.mark.parametrize("body", ["", "   ", None,
@@ -117,15 +117,14 @@ def test_empty_garbage_non_json_fails_open(body):
     """Fail-open: empty/whitespace/None/no-JSON-shape text is never
     classified degenerate — the classifier only shortcuts an ALREADY-
     truncated call, it never blocks one on ambiguous input."""
-    assert truncation_is_degenerate(body) is False
+    assert reply_is_loop(body) is False
 
 
 # ── 2. Policy: solo retry bound by class (N2, F4 pinned) ───────────────────────
 
 @pytest.mark.asyncio
-async def test_degenerate_truncation_retries_at_the_same_bound(monkeypatch):
-    """A degenerate first truncation must retry at REM_MAX_TOKENS_SOLO again
-    — never the widened (x2) bound."""
+async def test_loop_cut_off_is_not_parsed_and_is_not_retried(monkeypatch):
+    """A loop is one try. The body is not parsed and there is no second call."""
     daemon, _ = _make_daemon()
     monkeypatch.delenv("MOCK_LLM", raising=False)
     degenerate_body = (
@@ -133,66 +132,10 @@ async def test_degenerate_truncation_retries_at_the_same_bound(monkeypatch):
         '{"name": "WidgetCo", "rel_type": "MENTIONS"}, '
         '{"name": "WidgetCo", "rel_type": "MENTIONS"}'
     )
-    bounds = []
+    calls = []
 
     async def _fake_post(self, url, **kwargs):
-        bounds.append(kwargs.get("json", {})["max_tokens"])
-        if len(bounds) == 1:
-            return _length_resp(degenerate_body)
-        return _ok_resp('{"summary":"complete","relationships":[]}')
-    monkeypatch.setattr("httpx.AsyncClient.post", _fake_post)
-
-    with patch.object(rem_mod, "_parse_llm_json",
-                      wraps=rem_mod._parse_llm_json) as parse:
-        result, _model = await daemon._llm_process(
-            _LONG, rem_mod.KIND_FACT, pg_id=1)
-
-    expected_first = request_sizing.rem_solo_max_tokens()
-    assert bounds == [expected_first, expected_first]
-    assert result == {"summary": "complete", "relationships": []}
-    # N3: only the final SUCCESSFUL body reaches the parser — the truncated,
-    # degenerate first attempt's body never does.
-    assert parse.call_count == 1
-
-
-@pytest.mark.asyncio
-async def test_honest_truncation_still_gets_the_widened_retry(monkeypatch):
-    """F4 pinned: an honest (non-repeating) truncation must still get the
-    x2-widened retry, unaffected by the degenerate branch."""
-    daemon, _ = _make_daemon()
-    monkeypatch.delenv("MOCK_LLM", raising=False)
-    honest_body = '{"summary":"cut","relationships":[{"name":"AlphaCorp","rel_type":"MENTIONS"}'
-    bounds = []
-
-    async def _fake_post(self, url, **kwargs):
-        bounds.append(kwargs.get("json", {})["max_tokens"])
-        if len(bounds) == 1:
-            return _length_resp(honest_body)
-        return _ok_resp('{"summary":"complete","relationships":[]}')
-    monkeypatch.setattr("httpx.AsyncClient.post", _fake_post)
-
-    result, _model = await daemon._llm_process(
-        _LONG, rem_mod.KIND_FACT, pg_id=1)
-
-    expected_first = request_sizing.rem_solo_max_tokens()
-    expected_retry = request_sizing.rem_retry_bound(expected_first, degenerate=False)
-    assert bounds == [expected_first, expected_retry]
-    assert result == {"summary": "complete", "relationships": []}
-
-
-@pytest.mark.asyncio
-async def test_second_truncation_of_either_class_fails_the_unit(monkeypatch):
-    """Two truncations in a row — degenerate both times — still fail the
-    unit exactly as an honest double-truncation does today."""
-    daemon, _ = _make_daemon()
-    monkeypatch.delenv("MOCK_LLM", raising=False)
-    degenerate_body = (
-        '[{"name": "WidgetCo", "rel_type": "MENTIONS"}, '
-        '{"name": "WidgetCo", "rel_type": "MENTIONS"}, '
-        '{"name": "WidgetCo", "rel_type": "MENTIONS"}'
-    )
-
-    async def _fake_post(self, url, **kwargs):
+        calls.append(kwargs.get("json", {}))
         return _length_resp(degenerate_body)
     monkeypatch.setattr("httpx.AsyncClient.post", _fake_post)
 
@@ -200,24 +143,39 @@ async def test_second_truncation_of_either_class_fails_the_unit(monkeypatch):
         result, _model = await daemon._llm_process(
             _LONG, rem_mod.KIND_FACT, pg_id=1)
 
+    assert len(calls) == 1
+    assert "max_tokens" not in calls[0]
     assert result is None
-    assert daemon._last_llm_failure == rem_mod.LLM_FAIL_TRUNCATED
-    parse.assert_not_called()  # N3: never parsed, even on final failure
+    assert daemon._last_backlog[0] == "loop"
+    parse.assert_not_called()
 
 
 @pytest.mark.asyncio
-async def test_honest_double_truncation_error_advises_retry_not_bump(monkeypatch, caplog):
-    """v0.9.62 (fact:1609 + a live 2026-08-26 incident): an HONEST double
-    truncation (not classified degenerate either time) used to end its ERROR
-    line with "Raise REM_MAX_TOKENS_SOLO if this record is legitimately
-    large" — exactly the bump decision:1330 measured and rejected (a
-    repetition loop consumes ANY budget; the next pick-up completed the same
-    record in far fewer tokens). The line must now say the unit retries on a
-    later pick-up and must NOT advise the bump.
+async def test_honest_cut_off_is_not_stored(monkeypatch):
+    """An honest cut-off is not parsed and is not retried at a wider bound."""
+    daemon, _ = _make_daemon()
+    monkeypatch.delenv("MOCK_LLM", raising=False)
+    honest_body = '{"summary":"cut","relationships":[{"name":"AlphaCorp","rel_type":"MENTIONS"}'
+    calls = []
 
-    Mutation check: restoring the old "Raise REM_MAX_TOKENS_SOLO if this
-    record is legitimately large." wording on a scratch copy must fail this
-    test."""
+    async def _fake_post(self, url, **kwargs):
+        calls.append(1)
+        return _length_resp(honest_body)
+    monkeypatch.setattr("httpx.AsyncClient.post", _fake_post)
+
+    with patch.object(rem_mod, "_parse_llm_json") as parse:
+        result, _model = await daemon._llm_process(
+            _LONG, rem_mod.KIND_FACT, pg_id=1)
+
+    assert calls == [1]
+    assert result is None
+    assert daemon._last_backlog[0] == "cut_off"
+    parse.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_cut_off_log_does_not_advise_raising_a_token_bound(monkeypatch, caplog):
+    """The old line told the operator to raise REM_MAX_TOKENS_SOLO. That bound is gone."""
     daemon, _ = _make_daemon()
     monkeypatch.delenv("MOCK_LLM", raising=False)
     honest_body = '{"summary":"cut","relationships":[{"name":"AlphaCorp","rel_type":"MENTIONS"}'
@@ -226,16 +184,14 @@ async def test_honest_double_truncation_error_advises_retry_not_bump(monkeypatch
         return _length_resp(honest_body)
     monkeypatch.setattr("httpx.AsyncClient.post", _fake_post)
 
-    with caplog.at_level("ERROR"):
+    with caplog.at_level("WARNING"):
         result, _model = await daemon._llm_process(
             _LONG, rem_mod.KIND_FACT, pg_id=1)
 
     assert result is None
-    error_lines = [r.message for r in caplog.records if r.levelname == "ERROR"]
-    joined = "\n".join(error_lines)
-    assert "decision:1330" in joined
+    joined = "\n".join(r.message for r in caplog.records)
     assert "Raise REM_MAX_TOKENS_SOLO if" not in joined
-    assert "retry" in joined.lower() and "rem_attempts" in joined
+    assert "cut_off" in joined
 
 
 # ── 3. Logging: bounded specimen (N1) ───────────────────────────────────────────
@@ -301,7 +257,7 @@ async def test_truncated_call_warns_with_the_specimen(monkeypatch, caplog):
     with caplog.at_level("WARNING"):
         await daemon._llm_process(_LONG, rem_mod.KIND_FACT, pg_id=99)
 
-    specimen_lines = [r.message for r in caplog.records if "specimen(last" in r.message]
+    specimen_lines = [r.message for r in caplog.records if "specimen" in r.message]
     assert specimen_lines, "expected a WARN carrying the bounded specimen"
     assert any(long_unique_tail in line for line in specimen_lines)
 
@@ -326,8 +282,8 @@ async def test_degenerate_metrics_row_carries_note_and_specimen(monkeypatch):
         await daemon._llm_process(_LONG, rem_mod.KIND_FACT, pg_id=1)
 
     degenerate_calls = [c for c in rec.call_args_list
-                        if c.kwargs.get("note") == "degenerate"]
-    assert degenerate_calls, "expected at least one metrics row stamped note='degenerate'"
+                        if c.kwargs.get("note") == "loop"]
+    assert degenerate_calls, "expected at least one metrics row stamped note='loop'"
     for c in degenerate_calls:
         assert c.kwargs.get("specimen")
         assert len(c.kwargs["specimen"]) <= REM_TRUNCATION_SPECIMEN_CHARS
@@ -350,7 +306,7 @@ async def test_honest_truncated_metrics_row_carries_note(monkeypatch):
         await daemon._llm_process(_LONG, rem_mod.KIND_FACT, pg_id=1)
 
     honest_calls = [c for c in rec.call_args_list
-                    if c.kwargs.get("note") == "truncated_honest"]
-    assert honest_calls, "expected at least one metrics row stamped note='truncated_honest'"
+                    if c.kwargs.get("note") == "cut_off"]
+    assert honest_calls, "expected at least one metrics row stamped note='cut_off'"
     for c in honest_calls:
         assert c.kwargs.get("ok", True) is True

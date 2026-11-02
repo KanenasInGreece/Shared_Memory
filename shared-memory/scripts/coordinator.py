@@ -130,7 +130,7 @@ def _short(value: Any, cap: int = 200) -> str:
 
 
 # FRAMEWORK_VERSION is the build string and may drift. API_VERSION is the wire contract with memory_bridge.py; bump it only when shape, auth, or routes break older clients.
-FRAMEWORK_VERSION = "1.0.43"
+FRAMEWORK_VERSION = "1.0.44"
 # API v2: retrospective is a full record. v4: unregistered project is 400 (proposal / new_project / sentinel).
 API_VERSION = 4
 CLIENT_VERSION_HEADER = "X-SM-Api-Version"
@@ -1280,8 +1280,6 @@ def require_distinct_advisory_lock_keys() -> None:
             f"BACKUP_ADVISORY_LOCK_KEY ({BACKUP_ADVISORY_LOCK_KEY}). "
             "Fact supersession locking must not collide with backup quiesce."
         )
-# Mirror of rem_loop.REM_MAX_ATTEMPTS for the give-up count. The gateway does not enforce it, so the default must match the daemon.
-REM_MAX_ATTEMPTS            = _env_int("REM_MAX_ATTEMPTS", 5)
 # Mirror of rem_loop.REM_STARVED_THRESHOLD (decision 890). The gateway only reports how many pending rows are at the promotion point, so the default must match the daemon.
 REM_STARVED_THRESHOLD        = _env_int("REM_STARVED_THRESHOLD", 3)
 # Dead-man timer default (decision:334: gateway-coordinated quiesce; a crashed backup cannot wedge writes): auto-resume if a backup script dies without calling resume, so a
@@ -1471,6 +1469,23 @@ def _bounded_error_label(value: Any) -> str | None:
     return text if len(text) <= _ERROR_TYPE_LABEL_CAP else text[:_ERROR_TYPE_LABEL_CAP] + "…[truncated]"
 
 
+def _raw_upstream_error_label(body: bytes) -> str | None:
+    """The error code or type before the 120-character cut. None for any other shape."""
+    if not body or len(body) > _ERROR_BODY_PARSE_CAP:
+        return None
+    try:
+        payload = json.loads(body)
+    except Exception:
+        return None
+    err = payload.get("error") if isinstance(payload, dict) else None
+    if not isinstance(err, dict):
+        return None
+    value = err.get("code") or err.get("type")
+    if not isinstance(value, (str, int, float)):
+        return None
+    return str(value)
+
+
 def _parse_upstream_error_type(body: bytes) -> str | None:
     """Best-effort extraction of the upstream error's own type/code label
     (OpenAI-compatible {"error": {"code"|"type": ...}} shape) — used for
@@ -1551,13 +1566,15 @@ def _decompress_full_for_usage(body: bytes, content_encoding: str) -> bytes:
 
     Unlike `_decompress_prefix_for_parse`, this RAISES on any failure
     (unsupported encoding, corrupt/truncated body, over-cap decompressed
-    output, `brotli` not installed) instead of returning the input
-    unchanged — the caller's usage capture is best-effort and abandons on
-    any exception, so a silent pass-through here would hand compressed
-    bytes to `json.loads` instead of just failing cleanly at the point the
-    trouble actually occurred.
+    output, `brotli` not installed). The chat walk drops that body. The
+    daemon is not handed the bytes. A 2xx then backlogs as unparseable.
+    A failed decompress of another status is that status, not unparseable.
+    A pass-through would hand compressed bytes to json.loads.
     """
     enc = content_encoding.strip().lower()
+    # identity is no encoding. A proxy may echo Accept-Encoding: identity.
+    if enc == "identity":
+        return body
     cap = LLM_USAGE_DECOMPRESS_CAP_BYTES
     if enc == "gzip":
         import io
@@ -9882,18 +9899,17 @@ class MemoryCoordinator:
                     f"        coalesce(d.superseded,false) AS superseded, count(*) AS n"
                 )
                 decisions = await dres.data()
-                # A record at the attempt cap is still rem_pending. Without this gauge that looks like waiting, not given up.
+                # passed_over and starved are read from the node.
                 ares = await session.run(
                     f"MATCH (n) WHERE (n:{ONT.fact} OR n:{ONT.decision}"
                     f"                 OR n:{ONT.retrospective})"
                     f"   AND coalesce(n.rem_processed,false) = false"
                     f"   AND coalesce(n.superseded,false) = false"
                     f"   AND n.pg_id IS NOT NULL"
-                    f" RETURN coalesce(n.rem_attempts,0) AS a,"
-                    f"        coalesce(n.rem_passed_over,0) AS p, count(*) AS n"
+                    f" RETURN coalesce(n.rem_passed_over,0) AS p, count(*) AS n"
                 )
                 attempts = await ares.data()
-            _cap = REM_MAX_ATTEMPTS
+            rem_count = await self._rem_dead_letter_count()
             snap["neo4j"] = {
                 "facts_total":          sum(r["n"] for r in facts),
                 # Superseded rows are excluded from REM's candidacy query, so counting them here inflates a backlog nothing can clear.
@@ -9901,11 +9917,8 @@ class MemoryCoordinator:
                 "facts_unconsolidated": sum(r["n"] for r in facts if r["rem"] and not r["con"]),
                 "decisions_total":      sum(r["n"] for r in decisions),
                 "decisions_rem_pending": sum(r["n"] for r in decisions if not r["rem"] and not r["superseded"]),
-                # Excluded from REM's queue until n.rem_attempts is reset. Non-zero means enrichment is dropping records.
-                "rem_dead_lettered":    sum(r["n"] for r in attempts if r["a"] >= _cap),
-                # Pending records carrying at least one failed attempt.
-                "rem_failing":          sum(r["n"] for r in attempts if 0 < r["a"] < _cap),
-                "rem_max_attempts":     _cap,
+                "rem_failing":          0,
+                "rem_max_attempts":     0,
                 # decision 890: fairness gauge for the batch-versus-solo yield. It reads 0 until a solo backlog re-exercises that path.
                 "rem_passed_over_total": sum(r["n"] * r["p"] for r in attempts),
                 "rem_starved_pending":  sum(r["n"] for r in attempts
@@ -9916,6 +9929,10 @@ class MemoryCoordinator:
                 "cypher_rejected_total": self._cypher_rejected_total,
                 "tx_failures_total": self._neo4j_tx_failures_total,
             }
+            if isinstance(rem_count.get("dead_lettered"), int):
+                # Pending records that have a backlog row. A superseded record
+                # is not in this count.
+                snap["neo4j"]["rem_dead_lettered"] = rem_count["dead_lettered"]
         except Exception as exc:
             snap["neo4j"] = {"error": str(exc)}
 
@@ -10242,7 +10259,8 @@ class MemoryCoordinator:
         # contract for all six: a NEW key, never an alias for eligible_clusters;
         # None means no cycle has recorded it yet, not zero.
         _LATEST_EXTRA_KEYS = (
-            # Dead-lettered at NREM_FOLD_FAIL_CAP, so excluded from eligible_clusters (fact:1189).
+            # Folds withheld this cycle by a backlog row, so excluded from
+            # eligible_clusters.
             "dead_lettered_clusters",
             # The re-fold matched the active summary byte for byte.
             "unchanged_clusters",
@@ -10341,7 +10359,7 @@ class MemoryCoordinator:
                   FILTER (WHERE outcome = 'deferred' AND extra ? 'reason'))[1] AS last_deferred_reason,
               -- D1 (fact:1189, decision:1121/I7) — the latest count of
               -- clusters this cycle EXCLUDED from eligible_clusters because
-              -- NREM_FOLD_FAIL_CAP dead-lettered them. Written to
+              -- a backlog row withholds them. Written to
               -- consolidation_runs.extra by the daemon (_CycleRec.extra()).
               -- A NEW key — never an alias for eligible_clusters.
               (array_agg((extra->>'dead_lettered_clusters')::int ORDER BY started_at DESC)
@@ -10803,14 +10821,30 @@ class MemoryCoordinator:
             log.info("health.registry: census recovered")
         self._registry_census_ok = True
 
-    async def _rem_dead_letter_count(self) -> dict:
-        """How many records REM has GIVEN UP on. One cheap Neo4j aggregate.
+    async def _rem_backlog_pg_ids(self) -> list[int]:
+        """item_key values stored as rem backlog rows.
 
-        Deliberately narrower than `_rem_telemetry`: /health needs a VERDICT
-        ("is REM losing records"), and the rule of thumb puts the numbers on
-        telemetry. Computing the whole REM section here to answer one boolean
-        would drag a Postgres query into the health refresher for nothing.
+        A missing table raises; the caller fails the section.
         """
+        async with self._acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT item_key FROM llm_backlog WHERE item_kind = 'rem'")
+        ids: list[int] = []
+        for row in rows:
+            try:
+                ids.append(int(row["item_key"]))
+            except (TypeError, ValueError):
+                continue
+        return ids
+
+    async def _rem_pending_backlog_count(self, rows: list[int]) -> int:
+        """Pending, not-superseded records whose pg_id is in the rem backlog.
+
+        An empty list is 0 and is not sent as IN []. A Neo4j failure raises;
+        the caller names that store itself.
+        """
+        if not rows:
+            return 0
         async with self._neo4j.session(default_access_mode="READ") as session:
             rec = await (await session.run(
                 f"MATCH (n) WHERE (n:{ONT.fact} OR n:{ONT.decision}"
@@ -10818,10 +10852,28 @@ class MemoryCoordinator:
                 f"   AND coalesce(n.rem_processed,false) = false"
                 f"   AND coalesce(n.superseded,false) = false"
                 f"   AND n.pg_id IS NOT NULL"
-                f"   AND coalesce(n.rem_attempts,0) >= $cap"
-                f" RETURN count(*) AS n", cap=REM_MAX_ATTEMPTS
+                f"   AND n.pg_id IN $rows"
+                f" RETURN count(*) AS n", rows=rows
             )).single()
-        return {"dead_lettered": (rec["n"] if rec else 0) or 0}
+        return (rec["n"] if rec else 0) or 0
+
+    async def _rem_dead_letter_count(self) -> dict:
+        """Pending records withheld by a backlog row. /health reads this count.
+
+        An unreadable table returns unreadable and no zero. A zero would say
+        nothing is withheld. A Neo4j failure is not that: the table was read,
+        so the section is omitted rather than reported as a dark backlog.
+        """
+        try:
+            rows = await self._rem_backlog_pg_ids()
+        except Exception as exc:
+            log.warning("llm_backlog unreadable (%s)", type(exc).__name__)
+            return {"unreadable": True}
+        try:
+            return {"dead_lettered": await self._rem_pending_backlog_count(rows)}
+        except Exception as exc:
+            log.warning("neo4j rem backlog count failed (%s)", type(exc).__name__)
+            return {}
 
     def dependency_snapshot(self) -> dict:
         """The cached, DB-FREE inputs /health derives its dependency enums from.
@@ -10900,10 +10952,7 @@ class MemoryCoordinator:
                 except Exception:
                     outbox = None
                 await self._refresh_registry_census()
-                try:
-                    rem = await self._rem_dead_letter_count()
-                except Exception:
-                    rem = None
+                rem = await self._rem_dead_letter_count()
                 try:
                     # Off the request path. The insight walk is unbounded sequential Neo4j hops and grows with the corpus, so it is cached with as_of.
                     nrem = await self._nrem_cycle_counts()
@@ -11072,12 +11121,9 @@ class MemoryCoordinator:
         carries a `ts` (unix epoch seconds, see dream_telemetry.call_timing_
         summary), so the rate is a count over that column.
 
-        ⚠ `degeneration_firings` IS NULL AND WILL BE UNTIL SOMETHING DURABLE
-        RECORDS IT. REM runs in a SEPARATE PROCESS (rem_loop.py, spawned by the
-        gateway), and its anti-degeneration detector writes only a log line — no
-        column, no counter this process can see. Reporting 0 would say "it never
-        fired", which is a claim this gateway cannot make. Null says what is
-        true: not observable from here.
+        `degeneration_firings` stays null. The loop check runs in the gateway
+        on a cut-off reply and writes a log line. This section does not count
+        those lines. Reporting 0 would say the check never fired.
         """
         async with self._acquire() as conn:
             row = await conn.fetchrow(
@@ -11089,6 +11135,7 @@ class MemoryCoordinator:
                 "       >= EXTRACT(EPOCH FROM now()) - 3600"
             )
             attempts = None
+        rem_count = await self._rem_dead_letter_count()
         async with self._neo4j.session(default_access_mode="READ") as session:
             ares = await (await session.run(
                 f"MATCH (n) WHERE (n:{ONT.fact} OR n:{ONT.decision}"
@@ -11096,20 +11143,21 @@ class MemoryCoordinator:
                 f"   AND coalesce(n.rem_processed,false) = false"
                 f"   AND coalesce(n.superseded,false) = false"
                 f"   AND n.pg_id IS NOT NULL"
-                f" RETURN coalesce(n.rem_attempts,0) AS a,"
-                f"        coalesce(n.rem_passed_over,0) AS p, count(*) AS n"
+                f" RETURN coalesce(n.rem_passed_over,0) AS p, count(*) AS n"
             )).data()
             attempts = ares
-        return {
-            "dead_lettered": sum(r["n"] for r in attempts if r["a"] >= REM_MAX_ATTEMPTS),
-            "failing": sum(r["n"] for r in attempts if 0 < r["a"] < REM_MAX_ATTEMPTS),
+        out = {
+            "failing": 0,
             "passed_over": sum(r["n"] * r["p"] for r in attempts),
             "starved_pending": sum(r["n"] for r in attempts
                                    if r["p"] >= REM_STARVED_THRESHOLD),
-            "max_attempts": REM_MAX_ATTEMPTS,
+            "max_attempts": 0,
             "throughput_per_hour": float(row["n"]),
             "degeneration_firings": None,
         }
+        if isinstance(rem_count.get("dead_lettered"), int):
+            out["dead_lettered"] = rem_count["dead_lettered"]
+        return out
 
     def _registry_telemetry(self) -> dict:
         """Registry row counts + ingress refusal counters (0.9.74).

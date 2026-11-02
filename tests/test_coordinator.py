@@ -1950,9 +1950,12 @@ async def test_resolve_typed_grounding_retrospective_keeps_operator_role():
 async def test_handle_telemetry_rolls_up_postgres_and_neo4j():
     """handle_telemetry returns a combined Postgres + Neo4j operational snapshot."""
     c, mock_conn, mock_session = _coordinator_with_mocks()
-    mock_conn.fetch = AsyncMock(return_value=[
-        {"status": "applied", "n": 10}, {"status": "rem_reviewed", "n": 3},
-    ])
+    async def _fetch(sql, *args, **kwargs):
+        if "llm_backlog" in sql:
+            return []
+        return [{"status": "applied", "n": 10}, {"status": "rem_reviewed", "n": 3}]
+
+    mock_conn.fetch = AsyncMock(side_effect=_fetch)
     mock_conn.fetchval = AsyncMock(return_value=171)
     mock_conn.fetchrow = AsyncMock(side_effect=[
         {"total": 171, "superseded": 4},                  # technical_docs rollup
@@ -1999,13 +2002,50 @@ async def test_handle_telemetry_rolls_up_postgres_and_neo4j():
     assert built["postgres"]["outbox"] == {"applied": 10, "rem_reviewed": 3}
     # F5: records REM has given up on are visible, not just silently absent
     # from its queue while still counted as "pending".
-    assert built["neo4j"]["rem_dead_lettered"] == 3
-    assert built["neo4j"]["rem_failing"] == 9
-    assert built["neo4j"]["rem_max_attempts"] == 5
+    # Pending-with-a-backlog-row. The backlog query returns no rows, so the count is 0.
+    assert built["neo4j"]["rem_dead_lettered"] == 0
+    assert built["neo4j"]["rem_failing"] == 0
+    assert built["neo4j"]["rem_max_attempts"] == 0
     # STEP 3 (decision 890) — fairness gauge: total = sum(n*p), starved = rows
     # at/above REM_STARVED_THRESHOLD (default 3).
     assert built["neo4j"]["rem_passed_over_total"] == 60 * 0 + 9 * 1 + 3 * 3
     assert built["neo4j"]["rem_starved_pending"] == 3
+
+
+@pytest.mark.asyncio
+async def test_rem_dead_letter_count_uses_the_pending_cypher():
+    """A positive count goes through n.pg_id IN $rows. A Neo4j miss is not unreadable."""
+    c, mock_conn, mock_session = _coordinator_with_mocks()
+    seen = {}
+
+    async def _fetch(sql, *args, **kwargs):
+        if "llm_backlog" in sql:
+            return [{"item_key": "7"}, {"item_key": "9"}, {"item_key": "nope"}]
+        return []
+
+    mock_conn.fetch = AsyncMock(side_effect=_fetch)
+
+    class _Cursor:
+        async def single(self):
+            return {"n": 2}
+
+    async def _run(cypher, **kwargs):
+        seen["cypher"] = cypher
+        seen["rows"] = kwargs.get("rows")
+        return _Cursor()
+
+    mock_session.run = _run
+    assert await c._rem_dead_letter_count() == {"dead_lettered": 2}
+    assert "n.pg_id IN $rows" in seen["cypher"]
+    assert seen["rows"] == [7, 9]
+
+    async def _neo_down(*args, **kwargs):
+        raise RuntimeError("bolt down")
+
+    mock_session.run = _neo_down
+    missed = await c._rem_dead_letter_count()
+    assert missed == {}
+    assert "unreadable" not in missed
 
 
 @pytest.mark.asyncio

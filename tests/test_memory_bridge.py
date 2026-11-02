@@ -382,8 +382,9 @@ def test_format_status_renders_the_rem_section_from_its_own_home():
         },
     })
     assert "neo4j: ERROR connection refused" in out
-    assert "9 retrying | 3 DEAD-LETTERED at 5 attempts" in out
-    assert "operator reset needed" in out
+    assert "3 withheld by a backlog row" in out
+    assert "operator reset needed" not in out
+    assert "attempts" not in out
     assert "REM fairness: 12 passed-over event(s) | 3 record(s)" in out
 
 

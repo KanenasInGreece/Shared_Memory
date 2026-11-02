@@ -190,13 +190,13 @@ paid cloud API. Each entry is a URL plus an optional `token_env` — the
 | `url` | string | *(required)* | The backend's API base. Trailing `/` is stripped; a base ending in `/v1` is probed without doubling it. The JSON key is `url`, not OpenAI SDK's `base_url` — that alias is ignored and the entry is excluded (logged). |
 | `token_env` | string | none | **Name** of the env var holding the API key — never the key itself. Resolved once at startup, sent as `Authorization` only to this backend. An unresolvable name excludes the backend (logged). |
 | `model` | string | none | Model id rewritten into every request body routed here — a cloud endpoint needs its real id, not the `local-model` clients send. |
-| `extra_body` | object | none | Merged into every chat payload routed here, overriding the caller's fields — provider-specific switches (e.g. disabling hybrid-model thinking) or as a spend ceiling (e.g. `{"max_tokens": 500}`). A non-object excludes the backend. |
-| `weight` | float | `1.0` | ⚠ Currently affects **no** live routing decision — dispatch is cache-affinity then least-in-flight. Stored and displayed only. |
+| `extra_body` | object | none | Merged into every chat payload routed here. It cannot set `max_tokens` or `max_completion_tokens`: the gateway writes `max_tokens` after the merge. It is part of the pool id. A non-object is FATAL: the gateway exits 78. |
+| `weight` | float | `1.0` | Affects no routing decision. Order is priority, then `n_ctx`, then self-hosted, then least in flight, then cache affinity. Stored and displayed only. |
 | `n_ctx` | int ≥ 1 | *(required)* | The model's usable context. A request that cannot fit is not sent here. A missing or invalid value stops the gateway (exit 78) and names the field. |
-| `max_output_tokens` | int ≥ 1 | *(required)* | Output budget the fit check reserves. A bool or a non-positive value stops the gateway and names the field. |
-| `priority` | int ≥ 1 | `1` | Parsed and shown. |
+| `max_output_tokens` | int ≥ 1 | *(required)* | Spending cap on the reply: `max_tokens` is the minimum of this and the context room. It does not decide whether the backend qualifies. A bool or a non-positive value stops the gateway and names the field. |
+| `priority` | int ≥ 1 | `1` | First sort key. Lower is tried first. |
 | `plaintext_ok` | bool | `false` | **Transport assertion.** A credentialed entry is accepted over `https`, or over plaintext `http` to a private path (loopback, RFC1918, Tailscale CGNAT, link-local, ULA, an unqualified name, `.local`/`.lan`/`.internal`/`.home`/`.ts.net`). Over plaintext to a **public** address or FQDN it is **excluded at startup** unless you set this `true` — you asserting the path is private (VPN, reverse tunnel). The gateway never sends a provider key in the clear across the internet; the `/health` probe follows the same rule. |
-| `max_inflight` | int ≥ 1 | absent = unbounded | Per-backend concurrency ceiling. At cap the backend counts busy; a sole-eligible capped backend makes requests wait (bounded), never overrides the cap. A declared backend serves both daemons. A leftover `roles` or `private_ok` key is ignored, with a deprecation warning. The warning that a restricted entry now serves both daemons fires only for `private_ok: false` or a `roles` list that omits extract or judge. An omitted `private_ok` does not warn: declaring means trusting. |
+| `max_inflight` | int ≥ 1 | absent = unbounded | Per-backend concurrency ceiling. At cap the backend counts busy; a sole-eligible capped backend makes requests wait, never overrides the cap. A declared backend serves both daemons. A leftover `roles` or `private_ok` key is ignored, with a deprecation warning. The warning that a restricted entry now serves both daemons fires only for `private_ok: false` or a `roles` list that omits extract or judge. An omitted `private_ok` does not warn: declaring means trusting. |
 | `price_per_mtok_in` / `price_per_mtok_out` | float | none | Operator-maintained prices surfaced on the authenticated `/health` for a dashboard to multiply against the per-backend token counters. Never read by routing. |
 
 ### Installing a provider API key, start to finish
@@ -244,33 +244,41 @@ the framework's own files never hold the key either way.
 
 ### Routing and sizing knobs (the long version of `.env.example`'s one-liners)
 
-**Dispatch** is cache-affinity first (a request whose large prompt prefix is
-already warm on a backend's KV cache goes back there), then least-in-flight
-among eligible backends, protecting warm cards from eviction. `weight` plays
-no part (see the table).
+**Dispatch** walks one order: `priority` ascending (default 1), then `n_ctx`
+ascending, then self-hosted before paid, then least in flight, then cache
+affinity as the last tie-break. A try moves only forward. `weight` plays no
+part (see the table).
 
-**Fit check** (`LLM_CHARS_PER_TOKEN_RATIO`, `FIT_MARGIN`,
-`FIT_DEFAULT_OUTPUT_TOKENS`) — only active for backends declaring `n_ctx`.
-The estimate is the request body's UTF-8 byte length divided by `RATIO`, so
-non-ASCII text such as Greek counts two or more per character, which adds
-caution. The shipped `1.2` is the **most conservative measured ratio** from
-20 live `/tokenize` comparisons (v0.9.13 build, Qwen3 tokenizer,
-prose/JSON/code/SQL/Greek samples ranging 1.205–6.905 chars per token); a live
-chat-completion check showed this floor already overestimates real
-chat-template prompt tokens by 83–525%, so the ratio — not the margin — does
-the protective work. Re-measure for a materially different tokenizer (denser
-tokenization needs a lower ratio). `FIT_MARGIN` (0.10) and
-`FIT_DEFAULT_OUTPUT_TOKENS` (2048) are deliberately flagged **unmeasured**
-conservative buffers. A fit rejection is a structured `422` naming the
-estimate, and a gateway journal line says which knob to retune.
+**Fit check** (`LLM_CHARS_PER_TOKEN_RATIO`, `FIT_MARGIN`) — a backend qualifies
+only when `n_ctx` is declared and `n_ctx × (1 − FIT_MARGIN) − estimate` is at
+least the estimate. The estimate is the request body's byte length divided by
+the ratio. The shipped `2.7` is the lowest real record measured. A ratio that
+is not greater than 0 makes the estimate 0. `max_output_tokens` caps what the
+reply may spend; it does not decide whether the backend qualifies. No backend
+qualifies as `422` backlog `no_context`. `LLM_MOVE_ON_DOWN` (default true)
+moves on a refused connection, a connect timeout, a 429, a 502, a 504, or a
+503 from a backend that is not self-hosted. A self-hosted 503 queues for the
+next cycle and does not move. Every other 5xx, including 500, 501 and 520–524,
+stays and queues. `false` stays put on those moves too. A reply that carries
+usage is paid even when it is the only reply: a 500, a 503 or a 429 with usage
+is backlogged `connection_lost`. After any other paid reply, a later ending
+that would have queued is `connection_lost` as well. A free 429, a free 503,
+or a context refusal with no usage does not count as paid.
 
-**Capacity wait** (`LLM_MAX_INFLIGHT_WAIT_S`, `LLM_MAX_INFLIGHT_POLL_S`,
-`LLM_MAX_CAPACITY_WAITERS`) — when every eligible backend sits at its
-`max_inflight` cap, a request waits (bounded) rather than overriding the cap
-or widening eligibility; waiting requests are themselves capped because each
-one holds an admitted request slot for up to the full window — beyond the
-waiter cap the gateway answers `503 backend_at_capacity` immediately. The
-waiter bound is shape-chosen, not measured.
+**Capacity wait** (`LLM_MAX_INFLIGHT_POLL_S`) — a busy backend is waited for.
+A free self-hosted backend at the same priority is used instead of waiting.
+Busy work does not move to a paid backend while that peer is free. A busy
+paid backend gives way to that peer too, and otherwise waits. There is no
+deadline and no waiter cap. The poll interval is the pause between checks.
+Entering a wait logs `Waiting for model X: at capacity` once. A backend that
+never answers holds the daemon's backup lock for the whole cycle, so backups
+and thematic folds wait with it, until busy signals ship as v1.0.45.
+
+**Framework chat callers** (`LLM_FRAMEWORK_AGENT_NAMES`) — with auth on, a
+name in this list is admitted to the chat route in addition to the spawned
+daemons. A listed non-daemon identity is not held to one request at a time.
+Because a capacity wait has no deadline and no waiter cap, that caller's
+concurrent requests can hold unlimited waiters.
 
 **Token accounting** (`LLM_USAGE_CAPTURE_CAP_BYTES`,
 `TOKEN_LIFECYCLE_SUM_INTERVAL_S`) — always on: per-backend prompt/completion
@@ -279,8 +287,25 @@ counters with paired last-event timestamps on the authenticated `/health`.
 restart-aware via the timestamps. One summable lifecycle line per backend is
 written to the journal (and the gateway audit JSONL, if configured) on
 graceful shutdown; a nonzero interval adds periodic lines for bounded loss
-on a hard kill. The byte cap bounds how much of a response body is buffered
-for the `usage` parse; compressed and streaming responses skip capture.
+on a hard kill. The chat path reads the whole reply and forces a
+non-streaming body. A compressed reply is decompressed under the caps. The
+byte cap applies to compressed bodies only. A plain reply has no limit. A
+compressed body over the cap is dropped and backlogged.
+
+**Releasing a withheld item.** The row is deleted when the item succeeds.
+An operator releases rows of one reason with:
+
+```sql
+DELETE FROM llm_backlog WHERE reason = 'no_context';
+```
+
+Left in place, a row waits for one change: `no_context` waits until
+`SM_LLM_LARGEST_CTX` grows; `cut_off` waits until `SM_LLM_LARGEST_REPLY`
+grows; `loop`, `unparseable` and `unrecognised` wait until `SM_LLM_POOL_ID`
+changes; `connection_lost` and `write_failed` wait until
+`SM_GATEWAY_BOOT_ID` changes, which a gateway restart does. A withhold that
+never got a row lives only in that daemon process and is gone when the
+process exits.
 
 ```json
 LLM_BACKENDS_JSON=[{"url":"http://localhost:5000","n_ctx":8192,"max_output_tokens":2048},
@@ -291,11 +316,14 @@ LLM_BACKENDS_JSON=[{"url":"http://localhost:5000","n_ctx":8192,"max_output_token
 The second entry is an example. Check your provider's published limits.
 
 An optional `extra_body` object is merged into every chat payload routed to
-that backend, overriding the caller's fields — the place for provider-specific
-request switches the daemons don't know to send, such as disabling a hybrid
-reasoning model's thinking mode. A non-object `extra_body` excludes the
-backend from the pool (logged): for a metered backend, being reached without
-its configured overrides is exactly the misconfiguration to prevent.
+that backend, overriding the caller's fields except `stream`, `max_tokens`
+and `max_completion_tokens`, which the gateway always sets — the place for
+provider-specific request switches the daemons don't know to send, such as
+disabling a hybrid reasoning model's thinking mode. A non-object
+`extra_body` is FATAL: the gateway exits 78. For a metered backend, being
+reached without its configured overrides is exactly the misconfiguration to
+prevent. A key belongs in `token_env`. A literal key in `extra_body` reaches
+the daemon environments, the pool hash, and specimens, and it is not redacted.
 
 `n_ctx`, `max_output_tokens`, `max_inflight` and the price fields are in the table above. `priority` is shown.
 

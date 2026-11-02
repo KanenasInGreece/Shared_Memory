@@ -349,8 +349,8 @@ def test_census_aiohttp_clientsession_trust_env():
     """`hive_mind_proxy.py` imports `ClientSession` bare (`from aiohttp import
     ..., ClientSession, ...`, line 17) — NOT as `aiohttp.ClientSession` — so
     the matching AST shape is `ast.Call(func=ast.Name('ClientSession'))`,
-    not an attribute call. Exactly one such call must exist, and it must
-    carry `trust_env=Constant(False)`.
+    not an attribute call. Two such calls exist: the shared encoder pool and the
+    force-close LLM session. Each must carry `trust_env=Constant(False)`.
 
     Mutation: removing `trust_env=False` from the `ClientSession(...)` call
     at `hive_mind_proxy.py:1845` kills this test and
@@ -361,15 +361,16 @@ def test_census_aiohttp_clientsession_trust_env():
     calls = [n for n in ast.walk(_parse(path))
              if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
              and n.func.id == "ClientSession"]
-    assert len(calls) == 1, (
-        f"expected exactly one bare ClientSession(...) call in hive_mind_proxy.py, "
+    assert len(calls) == 2, (
+        f"expected the pooled session and the force-close LLM session, "
         f"found {len(calls)} at lines {[c.lineno for c in calls]}"
     )
-    kw = {k.arg: k.value for k in calls[0].keywords if k.arg}
-    assert "trust_env" in kw, "hive_mind_proxy.py's ClientSession(...) has no trust_env keyword"
-    assert isinstance(kw["trust_env"], ast.Constant) and kw["trust_env"].value is False, (
-        f"trust_env is not literally False (got {ast.dump(kw['trust_env'])})"
-    )
+    for call in calls:
+        kw = {k.arg: k.value for k in call.keywords if k.arg}
+        assert "trust_env" in kw, "hive_mind_proxy.py's ClientSession(...) has no trust_env keyword"
+        assert isinstance(kw["trust_env"], ast.Constant) and kw["trust_env"].value is False, (
+            f"trust_env is not literally False (got {ast.dump(kw['trust_env'])})"
+        )
 
     # QA F-2: the bare-name match above is shape-specific. Guard the two ways a
     # second, unhardened session could slip past it: the attribute spelling

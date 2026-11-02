@@ -72,7 +72,7 @@ def _idiom_for(key: str) -> str:
 # A non-finite EMBED_CHARS_PER_TOKEN (nan, inf, 1e309) counts too: it is the only float fed to
 # the derived int((ctx - reserve) * ratio) and int(reserve * ratio), which raise on it.
 _DREAM_TELEMETRY_PARSES = (
-    ("LLM_CEILING_FLOOR", float), ("LLM_MIN_TOK_S", float), ("EMBED_MIN_TOK_S", float),
+    ("EMBED_MIN_TOK_S", float),
     ("EMBED_MAX_CONTEXT_TOKENS", int), ("EMBED_CHARS_PER_TOKEN", float),
     ("EMBED_MAX_CHARS", int), ("EMBED_SAFETY_FACTOR", float),
     ("EMBED_TIMEOUT_FLOOR_S", float), ("RERANK_MIN_CHARS_S", float),

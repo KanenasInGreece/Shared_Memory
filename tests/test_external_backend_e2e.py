@@ -70,11 +70,13 @@ class StubProvider:
             await asyncio.sleep(self.slow_seconds)
         elif self.chat_mode == "http_500":
             return web.json_response({"error": {"type": "server_error"}}, status=500)
+        elif self.chat_mode == "http_502":
+            return web.json_response({"error": {"type": "bad_gateway"}}, status=502)
         elif self.chat_mode == "http_429":
             return web.json_response({"error": {"type": "rate_limit"}}, status=429)
         return web.json_response(
             {"id": "c1", "model": "stub-model",
-             "choices": [{"message": {"role": "assistant", "content": "ok"}}],
+             "choices": [{"finish_reason": "stop", "message": {"role": "assistant", "content": "ok"}}],
              "usage": {"prompt_tokens": 3, "completion_tokens": 1}})
 
     async def _models(self, request):
@@ -270,10 +272,12 @@ def test_e2e_a_declared_multi_slot_backend_stays_available_while_busy(monkeypatc
 # ══════════════════════════════════════════════════════════════════════════
 
 def test_e2e_an_http_erroring_backend_is_cooled_down_and_traffic_moves_off_it(monkeypatch):
-    """F2 and F3 through real sockets. The failing upstream answers 500
-    instantly, so it always looks least-busy; without the fix it would be
-    PREFERRED over a healthy backend. Drive it past the threshold, then assert
-    the next request is served by the healthy backend instead."""
+    """A 502 moves and does not cool. A 429 cools, past the HTTP threshold.
+
+    Five 502s with nowhere else to go queue as 503 and leave the backend in
+    rotation. The next request, with a healthy peer, is served there. Five
+    429s cool the failing backend, and the request after that is served by
+    the healthy one."""
     obs = {}
 
     async def scenario():
@@ -295,17 +299,32 @@ def test_e2e_an_http_erroring_backend_is_cooled_down_and_traffic_moves_off_it(mo
         client = TestClient(TestServer(app))
         await client.start_server()
         try:
-            bad.chat_mode = "http_500"
-            # Pin every request to the failing backend until it is cooled.
+            bad.chat_mode = "http_502"
             g.LLM_POOL[:] = [bad_url]
             statuses = []
             for _ in range(g.LLM_HTTP_FAIL_THRESHOLD):
                 r = await _chat(client)
                 statuses.append(r.status)
-            obs["statuses_from_failing_backend"] = statuses
+            obs["statuses_from_502"] = statuses
+            obs["cooldown_after_502"] = round(
+                max(0.0, g._llm_unhealthy_until.get(bad_url, 0.0) - time.monotonic()), 1)
+            healthy_after_502 = good.hits["chat"]
+            g.LLM_POOL[:] = [bad_url, good_url]
+            r = await _chat(client)
+            obs["status_after_502"] = r.status
+            obs["healthy_hits_after_502"] = good.hits["chat"] - healthy_after_502
+
+            bad.chat_mode = "http_429"
+            g._llm_fail_times[bad_url] = []
+            g._llm_unhealthy_until[bad_url] = 0.0
+            g.LLM_POOL[:] = [bad_url]
+            rate_statuses = []
+            for _ in range(g.LLM_HTTP_FAIL_THRESHOLD):
+                r = await _chat(client)
+                rate_statuses.append(r.status)
+            obs["statuses_from_429"] = rate_statuses
             obs["cooldown_s"] = round(
                 max(0.0, g._llm_unhealthy_until.get(bad_url, 0.0) - time.monotonic()), 1)
-            # Now offer both: a cooled backend must not win least-in-flight.
             g.LLM_POOL[:] = [bad_url, good_url]
             r = await _chat(client)
             obs["status_after_cooldown"] = r.status
@@ -320,16 +339,22 @@ def test_e2e_an_http_erroring_backend_is_cooled_down_and_traffic_moves_off_it(mo
     asyncio.run(scenario())
     path = _write_artifact("e2e_s2_http_fault_cooldown", obs)
 
-    assert all(s == 500 for s in obs["statuses_from_failing_backend"]), (
-        f"the failing upstream did not actually fail; artifact {path}")
+    assert all(s == 503 for s in obs["statuses_from_502"]), (
+        f"a lone 502 queues as 503 and is not stored; artifact {path}")
+    assert obs["cooldown_after_502"] == 0, (
+        f"a 502 must not cool the backend; artifact {path}")
+    assert obs["healthy_hits_after_502"] == 1, (
+        f"a 502 must move to the healthy backend; artifact {path}")
+    assert obs["status_after_502"] == 200, (
+        f"the moved request did not complete; artifact {path}")
+    assert all(s == 503 for s in obs["statuses_from_429"]), (
+        f"a lone 429 queues as 503; artifact {path}")
     assert obs["cooldown_s"] > 0, (
-        f"an all-500 backend never entered cooldown, so HTTP faults are invisible "
-        f"to routing; artifact {path}")
+        f"429s never entered cooldown; artifact {path}")
     assert obs["status_after_cooldown"] == 200, (
         f"traffic did not move to the healthy backend; artifact {path}")
-    assert obs["upstream_hits"]["healthy"]["chat"] == 1, (
-        f"the healthy backend served nothing — the cooled one was still preferred; "
-        f"artifact {path}")
+    assert obs["upstream_hits"]["healthy"]["chat"] == 2, (
+        f"the healthy backend served neither the moved 502 nor the cooled 429; artifact {path}")
 
 
 # ══════════════════════════════════════════════════════════════════════════

@@ -83,7 +83,7 @@ __all__ = [
 ]
 
 #: Not a free-running today: this is the fifth version pin, so a missed bump is visible (decision:1832).
-VERSION = "1.0.43"
+VERSION = "1.0.44"
 
 
 def _version_tuple(v: str) -> tuple:
@@ -165,6 +165,7 @@ INTRODUCED_1_0_7 = "1.0.7"
 INTRODUCED_1_0_41 = "1.0.41"
 #: Encoder key flags and the auth_failed value.
 INTRODUCED_1_0_42 = "1.0.42"
+INTRODUCED_1_0_44 = "1.0.44"
 #: A lone consolidation stall stopped degrading the top /health status (fact:2996 ruling 3).
 INTRODUCED_1_0_17 = "1.0.17"
 #: Quiesce sheds writes on auth-off installs and counts every write in flight (fact:2996 ruling 1: the container check).
@@ -247,10 +248,12 @@ HEALTH: dict[str, dict] = {
     "dependencies.llm_pool.reason": _k("str|null", "dependencies", since=INTRODUCED_0_9_74),
     "dependencies.rem_daemon.state": _k("str", "dependencies", since=INTRODUCED_0_9_74,
                                         log="health.rem_daemon", note=(
-        "ok | degraded | down. down iff the REM process is not running. "
-        "degraded: dead-letters > 0, OR no backend counts toward dream slots "
-        "(W2, decision:1832 — REM structurally cannot run against this "
-        "fleet) — both reasons appear together when both apply")),
+        "ok | degraded | down. down when the REM process is not running, or "
+        "when llm_backlog cannot be read (reason: llm_backlog unreadable; "
+        "the daemons stay stopped). degraded: dead_letters:N counts pending "
+        "records with a backlog row, OR no backend counts toward dream slots "
+        "(REM structurally cannot run against this fleet) — both reasons "
+        "appear together when both apply")),
     "dependencies.rem_daemon.reason": _k("str|null", "dependencies", since=INTRODUCED_0_9_74),
     "dependencies.nrem_daemon.state": _k("str", "dependencies", since=INTRODUCED_0_9_74,
                                          log="health.nrem_daemon", note=(
@@ -851,20 +854,24 @@ TELEMETRY: dict[str, dict] = {
                       note="present only when this section's own query failed"),
 
     # ── rem (NEW section, 0.9.74) ───────────────────────────────────────────
-    "rem.dead_lettered": _k("int", "rem", since=INTRODUCED_0_9_74, log="health.rem_daemon"),
-    "rem.failing": _k("int", "rem", since=INTRODUCED_0_9_74),
+    "rem.dead_lettered": _k("int", "rem", since=INTRODUCED_0_9_74, log="health.rem_daemon",
+                            note=(
+                                "pending records that have a backlog row; a "
+                                "superseded record is excluded. A withheld "
+                                "record shows degraded.")),
+    "rem.failing": _k("int", "rem", since=INTRODUCED_0_9_74,
+                      note="always 0."),
     "rem.passed_over": _k("int", "rem", since=INTRODUCED_0_9_74),
     "rem.starved_pending": _k("int", "rem", since=INTRODUCED_0_9_74),
     "rem.max_attempts": _k("int", "rem", since=INTRODUCED_0_9_74,
-                           note="REM_MAX_ATTEMPTS — the limit dead_lettered counts arrivals at"),
+                           note="always 0."),
     "rem.throughput_per_hour": _k("float|null", "rem", since=INTRODUCED_0_9_74, note=(
         "records REM stamped in the last hour, from the durable "
         "technical_docs.rem_timing clock")),
     "rem.degeneration_firings": _k("int|null", "rem", since=INTRODUCED_0_9_74, note=(
-        "⚠ ALWAYS NULL AT 0.9.74, and null is the honest value. REM runs in a "
-        "SEPARATE PROCESS (rem_loop.py); its anti-degeneration detector writes a "
-        "log line and nothing durable, so the gateway cannot see it. Reporting 0 "
-        "would claim it never fired. A durable counter is owed.")),
+        "Null. The loop check runs in the gateway on a cut-off reply and "
+        "writes a log line. This key does not count those lines. Reporting 0 "
+        "would say the check never fired.")),
     "rem.error": _k("str", "rem", since=INTRODUCED_0_9_74,
                     note="present only when this section's own query failed"),
 
@@ -948,7 +955,7 @@ TELEMETRY: dict[str, dict] = {
     "llm.pool.*.fails": _k("int", "llm", since=INTRODUCED_0_9_74),
     "llm.pool.*.cooldown": _k("float", "llm", unit="_s", since=INTRODUCED_0_9_74),
     "llm.pool.*.reserved": _k("bool", "llm", since=INTRODUCED_0_9_74),
-    "llm.pool.*.priority": _k("int", "llm", since=INTRODUCED_1_0_41, note="stored and shown"),
+    "llm.pool.*.priority": _k("int", "llm", since=INTRODUCED_1_0_41, note="lower is tried first"),
     "llm.pool.*.last_call.ts": _k("str|null", "llm", since=INTRODUCED_1_0_41, note="UTC time of the last chat status, or null when this process has not forwarded one. 503 and 504 can be the status this gateway returned when no upstream status arrived; last_call.origin says which."),
     "llm.pool.*.last_call.status": _k("int|null", "llm", since=INTRODUCED_1_0_41, note="HTTP status of that call, or null when this process has not forwarded one. A 2xx is upstream. 500, 503 and 504 may be gateway-made; origin distinguishes them."),
     "llm.pool.*.last_call.origin": _k("str|null", "llm", since=INTRODUCED_1_0_41, note="upstream when the backend answered, gateway when this process recorded the status because no upstream status arrived, null before any call"),
@@ -1055,7 +1062,7 @@ TELEMETRY: dict[str, dict] = {
     "config.llm_backends[].model": _k("str|null", "llm", since=INTRODUCED_0_9_74),
     "config.llm_backends[].n_ctx": _k("int|null", "llm", since=INTRODUCED_0_9_74),
     "config.llm_backends[].max_output_tokens": _k("int|null", "llm", since=INTRODUCED_1_0_41, note="declared ceiling"),
-    "config.llm_backends[].priority": _k("int", "llm", since=INTRODUCED_1_0_41, note="stored and shown"),
+    "config.llm_backends[].priority": _k("int", "llm", since=INTRODUCED_1_0_41, note="lower is tried first"),
     "config.llm_backends[].max_inflight": _k("int|null", "llm", since=INTRODUCED_0_9_74),
     "config.llm_backends[].price_per_mtok_in": _k("float|null", "llm", since=INTRODUCED_0_9_74),
     "config.llm_backends[].price_per_mtok_out": _k("float|null", "llm", since=INTRODUCED_0_9_74),
@@ -1230,7 +1237,9 @@ TELEMETRY: dict[str, dict] = {
     "consolidation.*.eligible_oldest_age_seconds": _k("int|null",
                                                       "nrem/consolidation",
                                                       unit="_seconds"),
-    "consolidation.*.dead_lettered_clusters": _k("int", "nrem/consolidation"),
+    "consolidation.*.dead_lettered_clusters": _k(
+        "int", "nrem/consolidation",
+        note="folds excluded this cycle, including a refold withheld by a backlog row"),
     "consolidation.*.unchanged_clusters": _k("int", "nrem/consolidation"),
     "consolidation.*.singleton_clusters": _k("int", "nrem/consolidation"),
     "consolidation.*.insight_gate_skips": _k(
@@ -1349,6 +1358,60 @@ TELEMETRY: dict[str, dict] = {
 
 # A key whose value changes meaning while its name stays is listed here, or a consumer of the key list sees nothing wrong (fact:1626).
 MEANING_CHANGES: tuple[dict, ...] = (
+    {
+        "endpoint": "health",
+        "path": "rem.dead_lettered",
+        "in_version": INTRODUCED_1_0_44,
+        "was": "records past the REM attempt cap",
+        "now": "pending records holding a row in llm_backlog",
+        "action": "read llm_backlog reasons in ops/README.md to release them",
+        "shape_changed": False,
+    },
+    {
+        "endpoint": "health",
+        "path": "neo4j.rem_dead_lettered",
+        "in_version": INTRODUCED_1_0_44,
+        "was": "records past the REM attempt cap",
+        "now": "pending records holding a row in llm_backlog",
+        "action": "same as rem.dead_lettered",
+        "shape_changed": False,
+    },
+    {
+        "endpoint": "health",
+        "path": "rem.failing",
+        "in_version": INTRODUCED_1_0_44,
+        "was": "records with some failed REM attempts",
+        "now": "always 0: there are no attempts, one try per item",
+        "action": "stop reading it; the monitor drops it with the v1.0.45 contract change",
+        "shape_changed": False,
+    },
+    {
+        "endpoint": "health",
+        "path": "rem.max_attempts",
+        "in_version": INTRODUCED_1_0_44,
+        "was": "the REM attempt cap",
+        "now": "always 0: the cap is gone",
+        "action": "stop reading it; the monitor drops it with the v1.0.45 contract change",
+        "shape_changed": False,
+    },
+    {
+        "endpoint": "telemetry",
+        "path": "dead_lettered_clusters",
+        "in_version": INTRODUCED_1_0_44,
+        "was": "folds past the fold failure cap",
+        "now": "folds excluded this cycle by an llm_backlog row",
+        "action": "read llm_backlog reasons in ops/README.md to release them",
+        "shape_changed": False,
+    },
+    {
+        "endpoint": "health",
+        "path": "dependencies.rem_daemon.reason",
+        "in_version": INTRODUCED_1_0_44,
+        "was": "named dead letters or a missing dream slot",
+        "now": "also llm_backlog unreadable, with state down and both daemons held stopped",
+        "action": "apply the migration; the daemons start with no restart",
+        "shape_changed": False,
+    },
     {
         "endpoint": "health",
         "path": "dependencies.embedder",

@@ -222,14 +222,12 @@ async def test_rem_solo_routing_refusal_does_not_charge_an_attempt(monkeypatch):
         return _RefusalResp(constraint="role", role="extract")
     monkeypatch.setattr("httpx.AsyncClient.post", _fake_post)
 
-    with patch.object(daemon, "_bump_rem_attempts", new=AsyncMock()) as bump:
-        ok = await daemon._process_fact(7, _REM_LONG, rem_mod.KIND_FACT,
-                                        None, asyncio.get_running_loop())
+    ok = await daemon._process_fact(7, _REM_LONG, rem_mod.KIND_FACT,
+                                    None, asyncio.get_running_loop())
 
     assert ok is False
-    bump.assert_not_awaited()
     assert daemon._last_llm_failure == rem_mod.LLM_FAIL_ROUTING_REFUSED
-    assert rem_mod.LLM_FAIL_ROUTING_REFUSED not in rem_mod.LLM_FAIL_CHARGEABLE
+    assert daemon._last_backlog is None
 
 
 @pytest.mark.asyncio
@@ -240,12 +238,13 @@ async def test_rem_solo_refusal_never_retries_the_widened_bound(monkeypatch):
     monkeypatch.delenv("MOCK_LLM", raising=False)
     bounds = []
     async def _fake_post(self, url, **kwargs):
-        bounds.append(kwargs.get("json", {})["max_tokens"])
+        bounds.append(kwargs.get("json", {}))
         return _RefusalResp()
     monkeypatch.setattr("httpx.AsyncClient.post", _fake_post)
     result, _model = await daemon._llm_process(_REM_LONG, rem_mod.KIND_FACT, pg_id=1)
     assert result is None
-    assert len(bounds) == 1, "a routing refusal must not trigger the widen-once retry ladder"
+    assert len(bounds) == 1
+    assert "max_tokens" not in bounds[0]
 
 
 @pytest.mark.asyncio
@@ -259,7 +258,8 @@ async def test_rem_batch_routing_refusal_charges_no_record(monkeypatch):
     monkeypatch.setattr("httpx.AsyncClient.post", _fake_post)
     items = [{"pg_id": i, "content": _REM_LONG} for i in (1, 2, 3)]
     results, timing, _model = await daemon._llm_process_batch(items)
-    assert results is None, "a refused CALL must be distinguishable from empty results"
+    assert results == {}
+    assert daemon._batch_action == "queue"
     assert timing is None
     assert daemon._last_llm_failure == rem_mod.LLM_FAIL_ROUTING_REFUSED
 
@@ -275,11 +275,9 @@ async def test_rem_backend_at_capacity_gets_the_same_no_charge_treatment(monkeyp
         return _RefusalResp(error="backend_at_capacity", constraint=None,
                             role="extract", status_code=503)
     monkeypatch.setattr("httpx.AsyncClient.post", _fake_post)
-    with patch.object(daemon, "_bump_rem_attempts", new=AsyncMock()) as bump:
-        ok = await daemon._process_fact(7, _REM_LONG, rem_mod.KIND_FACT,
-                                        None, asyncio.get_running_loop())
+    ok = await daemon._process_fact(7, _REM_LONG, rem_mod.KIND_FACT,
+                                    None, asyncio.get_running_loop())
     assert ok is False
-    bump.assert_not_awaited()
     assert daemon._last_llm_failure == rem_mod.LLM_FAIL_ROUTING_REFUSED
 
 
