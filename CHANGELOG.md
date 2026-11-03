@@ -7,6 +7,21 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.0.46] - 2026-11-03
+
+NREM now folds only what REM has processed. Until now a fold could take a record REM had not reached yet; that never happened in practice only because REM was always ahead. It is now a rule, and a fold that has to wait says why.
+
+- **Thematic seed.** A grounding fact counts toward a (project, domain) group only once REM has processed it. A superseded fact never needs REM and is still left out of the seed, as before.
+- **Insight readiness, checked twice per cycle.** An insight is folded only when every non-superseded record its prompt carries is REM-processed. The check runs once before the refolds and once after the walk, in today's order; check 1 runs even when there is nothing to refold. A failed check stops every later fold that cycle. A set that waits is logged once per cycle with the ids that block it, and is folded on a later sweep once REM has reached them. There is no timer and no cap.
+- **Superseded and pass-through records never hold a fold back.** Supersession is read from the graph's own flag, as the walk already does. More than one graph node for one record id holds that id back with an ERROR; none exists today.
+- **The reversal context is read once per distinct set** and passed into the fold, so a reversing retrospective is checked like every other carried record.
+- **REM can no longer leave a node it marked invalid unprocessed.** The two paths that reset `rem_processed` skip invalid nodes, and `rem_daemon` on `/health` reports `degraded invalid_nodes:N` when any exist.
+- **Telemetry (additive, `API_VERSION` stays 5).** `consolidation.insight.rem_pending_clusters` (int or null) counts the sets the latest finished insight cycle held back; `consolidation.insight.rem_pending_incomplete` (bool or null) is true when that cycle stopped before checking every set, so the count is a lower bound. Both are null when the first readiness check could not be read. The notes on `nrem.fact_cycles`, `nrem.decision_cycles` and `consolidation.*.eligible_clusters` now say they count REM-processed seeds only; `nrem.decision_cycles` does not run the readiness check, so it can count a set that is waiting. **Monitor:** show null as "readiness not read", and a count with the flag true as "at least N".
+
+### Dependency sweep, 2026-11-03
+
+No pin moved. OSV over the 100 pinned (package, version) pairs in the locks and the connector block: 0 with advisories. pip-audit over `requirements.lock`, `requirements-gateway.lock` and `requirements-mcp.lock`: no known vulnerabilities.
+
 ## [1.0.45] - 2026-11-03
 
 A backup no longer waits for an LLM call, and its manifest says truthfully whether the daemons were fenced for the whole dump. `API_VERSION` is 5: the telemetry contract drops keys, so the monitor must be updated first.
