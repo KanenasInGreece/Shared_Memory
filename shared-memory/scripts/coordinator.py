@@ -131,7 +131,7 @@ def _short(value: Any, cap: int = 200) -> str:
 
 
 # FRAMEWORK_VERSION is the build string and may drift.
-FRAMEWORK_VERSION = "1.0.45"
+FRAMEWORK_VERSION = "1.0.46"
 # API_VERSION is the wire contract; bump only when shape, auth, routes, or a monitor
 # contract change breaks older clients. v5: telemetry contract key removal.
 API_VERSION = 5
@@ -10266,8 +10266,10 @@ class MemoryCoordinator:
         gate fired"."""
         # consolidation_runs.extra keys surfaced below as "the latest recorded
         # value" (one array_agg/FILTER column per key in the SQL). Shared
-        # contract for all six: a NEW key, never an alias for eligible_clusters;
+        # contract for each: a NEW key, never an alias for eligible_clusters;
         # None means no cycle has recorded it yet, not zero.
+        # rem_pending_incomplete is not in this tuple: the output line below
+        # converts every value with int(), which would serve false as 0.
         _LATEST_EXTRA_KEYS = (
             # Folds withheld this cycle by a backlog row, so excluded from
             # eligible_clusters.
@@ -10281,6 +10283,8 @@ class MemoryCoordinator:
             "truncation_failures",
             # A protocol miss, not only a capacity one.
             "slot_failures",
+            # Distinct judgement sets the latest finished insight cycle deferred.
+            "rem_pending_clusters",
         )
         query = """
             WITH ranked AS (
@@ -10404,7 +10408,15 @@ class MemoryCoordinator:
               -- Groups the insight gate skipped. Same NULL-until-recorded
               -- contract. Not backlog, so it does not move the stall verdict.
               (array_agg((extra->>'insight_gate_skips')::int ORDER BY started_at DESC)
-                  FILTER (WHERE extra ? 'insight_gate_skips'))[1] AS insight_gate_skips
+                  FILTER (WHERE extra ? 'insight_gate_skips'))[1] AS insight_gate_skips,
+              -- Latest finished insight cycle, not the latest row that happens
+              -- to contain the key. A cycle whose first readiness check failed
+              -- has outcome completed or crashed and no key, so both read null.
+              -- The same FILTER and ORDER BY take both values from one row.
+              (array_agg((extra->>'rem_pending_clusters')::int ORDER BY started_at DESC)
+                  FILTER (WHERE outcome IN ('completed','crashed')))[1] AS rem_pending_clusters,
+              (array_agg((extra->>'rem_pending_incomplete')::boolean ORDER BY started_at DESC)
+                  FILTER (WHERE outcome IN ('completed','crashed')))[1] AS rem_pending_incomplete
             FROM ranked GROUP BY cycle_type
         """
         async with self._acquire() as conn:
@@ -10454,6 +10466,10 @@ class MemoryCoordinator:
                 # _LATEST_EXTRA_KEYS: None means no census has recorded the key yet, not zero.
                 **{k: (int(r[k]) if r and r[k] is not None else None)
                    for k in _LATEST_EXTRA_KEYS},
+                # Kept off the int() line above: false must stay a JSON boolean.
+                "rem_pending_incomplete": (
+                    bool(r["rem_pending_incomplete"])
+                    if r and r["rem_pending_incomplete"] is not None else None),
                 # Why the most-recent deferral happened (None if never deferred);
                 # only meaningful when last_outcome == "deferred".
                 "last_deferred_reason": (r["last_deferred_reason"] if r else None),
@@ -11037,7 +11053,11 @@ class MemoryCoordinator:
         dead-lettered, still counts (overcount); a one-judgement component that
         matches an existing insight exactly ('same') still does an identity append
         in `run_insight_cycle` but is not counted (undercount; a legacy case,
-        since `_fold_insight` never creates a one-member insight). ⛔ Never import
+        since `_fold_insight` never creates a one-member insight).
+        `decision_cycles` is a candidate-group gauge seeded by REM-processed
+        facts. It does not run the insight readiness check, so it overcounts a
+        component whose fold is waiting on an unprocessed carried record.
+        ⛔ Never import
         `consolidation_loop` here: it imports psycopg2 at the top and the gateway
         does not carry it.
         """

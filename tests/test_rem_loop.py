@@ -310,31 +310,22 @@ cons_mod = load_consolidation()
 ConsolidationDaemon = cons_mod.ConsolidationDaemon
 
 
-def test_nrem_fact_gate_is_grounded_non_superseded_not_rem_processed():
-    """⛔ SUPERSEDES the pre-v2 rule this test used to assert (raw,
-    non-REM-processed facts could never be consolidated directly, enforced by
-    an entity-hub Cypher's `rem_processed=true` filter). That gate is REMOVED
-    (Dreaming Cycle Plan to v2, C1): the v2 FACT GATE's membership rule
-    (§2.1) is "the grounded, non-superseded facts in the group" — full stop,
-    no REM-processing precondition. This is deliberate, not an oversight:
-    REM's `rem_summary` is optional prep (§4.1.2) the fold PREFERS when
-    present and falls back to raw `content` otherwise
-    (`coalesce(f.rem_summary, f.content)` in `_find_grounded_fact_groups`) —
-    a fact freshly GROUNDED_IN by a Decision before REM ever reaches it is a
-    legitimate group member.
-
-    So the invariant this test protects is now the OPPOSITE shape: the
-    discovery Cypher must still gate on GROUNDED_IN + non-superseded, and
-    must NOT reintroduce a rem_processed precondition."""
-    import inspect
+def test_nrem_fact_gate_counts_only_rem_processed_facts():
+    """N1. A grounding fact counts in a thematic group only when its node
+    says rem_processed. decision:3453: Postgres holds every record's full
+    text; the graph holds traversal, provenance and lineage; only a
+    REM-processed node gates NREM. This reverses the element of fact:1149
+    that treated a REM summary as optional prep and let an unprocessed fact
+    count. Dies when the predicate leaves either form of the seed query."""
     from nrem_gate import grounded_fact_groups_cypher
-    source = grounded_fact_groups_cypher(with_content=True)
-    assert "GROUNDED_IN" in source, "the v2 fact gate must require a GROUNDED_IN edge"
-    assert "superseded" in source, "the v2 fact gate must exclude superseded facts"
-    assert "rem_processed" not in source, (
-        "the v2 fact gate must not reintroduce a rem_processed precondition — "
-        "membership is grounded + non-superseded only (plan Dreaming_Cycle_Plan_to_v2 §2.1)"
-    )
+    predicate = "coalesce(f.rem_processed, false) = true"
+    for with_content in (False, True):
+        source = grounded_fact_groups_cypher(with_content=with_content)
+        assert "GROUNDED_IN" in source
+        assert "coalesce(f.superseded, false) = false" in source
+        assert predicate in source, (
+            "both forms of the seed query must require rem_processed"
+        )
 
 
 # ── Coordinator search supersession filter ────────────────────────────────────

@@ -3,7 +3,7 @@
 
 # The Telemetry Contract
 
-Contract version **1.0.45**. Every key the gateway emits on `GET /health` and `GET /memory/telemetry`, what it means, what it is measured in, when it arrived, and where it is going.
+Contract version **1.0.46**. Every key the gateway emits on `GET /health` and `GET /memory/telemetry`, what it means, what it is measured in, when it arrived, and where it is going.
 
 ## The roles
 
@@ -652,7 +652,7 @@ The envelope is `{"status": "success", "telemetry": {…}}`; paths below are rel
 | `consolidation.*.cycle_seconds_avg` | float/null | _seconds | <=0.9.73 | — | — | — | — |
 | `consolidation.*.dead_lettered_clusters` | int | — | <=0.9.73 | — | — | — | folds excluded this cycle, including a refold withheld by a backlog row |
 | `consolidation.*.deferred_24h` | int | — | <=0.9.73 | — | — | — | — |
-| `consolidation.*.eligible_clusters` | int | — | <=0.9.73 | — | — | — | — |
+| `consolidation.*.eligible_clusters` | int | — | <=0.9.73 | — | — | — | groups seeded by REM-processed facts; an insight census also excludes sets deferred because a carried record is not REM-processed |
 | `consolidation.*.eligible_oldest_age_seconds` | int/null | _seconds | <=0.9.73 | — | — | — | — |
 | `consolidation.*.folds_attempted_24h` | int | — | <=0.9.73 | — | — | `health.nrem_daemon` | — |
 | `consolidation.*.folds_succeeded_24h` | int | — | <=0.9.73 | — | — | `health.nrem_daemon` | — |
@@ -668,6 +668,8 @@ The envelope is `{"status": "success", "telemetry": {…}}`; paths below are rel
 | `consolidation.*.last_outcome` | str/null | — | <=0.9.73 | — | — | — | per cycle type — `insight` and `fact_consolidation` today |
 | `consolidation.*.last_started` | str/null | — | <=0.9.73 | — | — | — | — |
 | `consolidation.*.last_success_age_seconds` | int/null | _seconds | <=0.9.73 | — | — | — | — |
+| `consolidation.*.rem_pending_clusters` | int/null | — | 1.0.46 | — | — | — | insight only: distinct judgement sets the latest finished insight cycle deferred because a carried record is not REM-processed. Null on fact cycles, before 1.0.46, and when that cycle's first readiness check failed. When rem_pending_incomplete is true the cycle stopped before it had checked every set, so this is the count observed until then: at least this many, possibly more. |
+| `consolidation.*.rem_pending_incomplete` | bool/null | — | 1.0.46 | — | — | — | insight only: true when the latest finished insight cycle stopped after its first readiness check and before checking every candidate set, so rem_pending_clusters is a lower bound; false when every set was checked; null exactly when rem_pending_clusters is null. |
 | `consolidation.*.runs_24h` | int | — | <=0.9.73 | — | — | — | — |
 | `consolidation.*.singleton_clusters` | int | — | <=0.9.73 | — | — | — | — |
 | `consolidation.*.slot_failures` | int | — | <=0.9.73 | — | — | — | — |
@@ -694,7 +696,7 @@ The envelope is `{"status": "success", "telemetry": {…}}`; paths below are rel
 | `neo4j.facts_unconsolidated` | int | — | <=0.9.73 | — | — | — | — |
 | `nrem.as_of` | str/null | — | 0.9.74 | — | — | — | when the 60 s refresher last computed this section. MEASURED 2026-08-28 on this corpus: the insight walk is 149 SEQUENTIAL Neo4j round-trips (8 gating groups x 9-26 BFS layers each, unbounded by construction — the walk has no hop cap), so it moved out of the request path. |
 | `nrem.error` | str | — | <=0.9.73 | — | — | — | present only when the refresher's last pass failed |
-| `nrem.fact_cycles` | int | — | <=0.9.73 | — | — | — | — |
+| `nrem.fact_cycles` | int | — | <=0.9.73 | — | — | — | groups seeded by REM-processed facts only |
 | `nrem.fact_threshold` | int | — | <=0.9.73 | — | — | — | ONT.density_threshold |
 | `nrem.total_cycles` | int | — | <=0.9.73 | — | — | — | — |
 
@@ -702,7 +704,7 @@ The envelope is `{"status": "success", "telemetry": {…}}`; paths below are rel
 
 | key | type | unit | since | moved to | removed in | log twin | notes |
 |---|---|---|---|---|---|---|---|
-| `nrem.decision_cycles` | int | — | <=0.9.73 | — | — | — | — |
+| `nrem.decision_cycles` | int | — | <=0.9.73 | — | — | — | candidate-group gauge seeded by REM-processed facts; it does not run the insight readiness check, so it overcounts a deferred component |
 | `postgres.community_summaries.insight` | int | — | <=0.9.73 | — | — | — | — |
 | `refold_ledger.by_status_reason[]` | list | — | <=0.9.73 | — | — | — | — |
 | `refold_ledger.by_status_reason[].closed_reason` | str/null | — | <=0.9.73 | — | — | — | — |

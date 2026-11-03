@@ -127,6 +127,15 @@ class FakeSession:
         self._results = list(results or [])
     async def run(self, query, **params):
         self.calls.append((" ".join(query.split()), params))
+        # The insight cycle reads carried-record readiness before any fold.
+        # Answer every id as processed without consuming a scripted result.
+        if "AS rem_invalid" in query:
+            ids = list(params.get("ids") or [])
+            return FakeResult([
+                {"pg_id": i, "rem_processed": True, "superseded": False,
+                 "rem_invalid": False}
+                for i in ids
+            ])
         return self._results.pop(0) if self._results else FakeResult()
 
 
@@ -630,15 +639,18 @@ async def test_fold_insight_mock_mode_reversal_lines_land_in_assembled_content(m
             (245, "Decision A\n\nrationale A", "shared-memory-GitHub", "decision", {}),
             (267, "Decision B\n\nrationale B", "shared-memory-GitHub", "decision", {}),
         ]},
-        {"rowcount": 1, "rows": [(199,)]},                                     # reversal leg 1
-        {"rowcount": 1, "rows": [(199, "Old title", 900, "it failed")]},        # reversal leg 2
         {"rowcount": 2, "rows": [(101,), (102,)]},
         {"rowcount": 1, "rows": [(77,)]},
         {"rowcount": 2, "rows": []},
         {"rowcount": 0, "rows": []},
         {"rowcount": 2, "rows": [(101, 245), (102, 267)]},
     ])
-    assert await daemon._fold_insight(conn, "OutboxPattern", [245, 267]) is True
+    assert await daemon._fold_insight(
+        conn, "OutboxPattern", [245, 267],
+        reversals=[{
+            "decision_id": 199, "decision_title": "Old title",
+            "retro_id": 900, "retro_content": "it failed",
+        }]) is True
     insert = next(p for s, p in conn.executed
                   if s.startswith("INSERT INTO community_summaries"))
     content = insert[0]
@@ -656,9 +668,7 @@ def _fold_script():
              {"entities": ["OutboxPattern"]}),
             (267, "Decision B\n\nrationale B", "shared-memory-GitHub", "decision", {}),
         ]},
-        # 2. fetch_reversal_context leg 1 (open ledger rows) — none
-        {"rowcount": 0, "rows": []},
-        # 3. fetch_insight_outbox_rows snapshot
+        # 2. fetch_insight_outbox_rows snapshot
         {"rowcount": 2, "rows": [(101,), (102,)]},
         # 4. write_insight_summary INSERT
         {"rowcount": 1, "rows": [(77,)]},
@@ -689,7 +699,7 @@ async def test_fold_insight_full_path(monkeypatch):
     insert = next(s for s in sqls if s.startswith("INSERT INTO community_summaries"))
     assert "ON CONFLICT" not in insert
     # metadata carries the §3.2 contract
-    meta = json.loads(conn.executed[3][1][1])
+    meta = json.loads(conn.executed[2][1][1])
     assert meta["kind"] == "insight"
     assert meta["project"] == "shared-memory-GitHub"           # singular, per §3.2
     assert "projects" not in meta                                # old field is GONE
@@ -757,7 +767,6 @@ async def test_fold_insight_retrospective_rendered_under_decision_no_title(monke
             (900, "held under load", "shared-memory-GitHub", "retrospective",
              {"rating": "validated", "target_pg_id": 245}),
         ]},
-        {"rowcount": 0, "rows": []},                       # reversal leg 1
         {"rowcount": 2, "rows": [(101,), (102,)]},
         {"rowcount": 1, "rows": [(77,)]},
         {"rowcount": 2, "rows": []},
@@ -791,7 +800,6 @@ async def test_fold_insight_domains_and_entities_union_across_judgements(monkeyp
             (267, "Decision B", "shared-memory-GitHub", "decision",
              {"domain": "infrastructure", "entities": ["GPUPool"]}),
         ]},
-        {"rowcount": 0, "rows": []},
         {"rowcount": 2, "rows": [(101,), (102,)]},
         {"rowcount": 1, "rows": [(77,)]},
         {"rowcount": 2, "rows": []},
@@ -800,7 +808,7 @@ async def test_fold_insight_domains_and_entities_union_across_judgements(monkeyp
     ])
 
     assert await daemon._fold_insight(conn, "OutboxPattern", [245, 267]) is True
-    meta = json.loads(conn.executed[3][1][1])
+    meta = json.loads(conn.executed[2][1][1])
     assert meta["domains"] == ["architecture", "infrastructure"]
     assert meta["entities"] == ["GPUPool", "OutboxPattern"]
 
@@ -817,7 +825,7 @@ async def test_fold_insight_summary_ids_never_mixed_with_source_pg_ids(monkeypat
     conn = StubConn(script=_fold_script())
 
     await daemon._fold_insight(conn, "OutboxPattern", [245, 267], summary_ids=[173])
-    meta = json.loads(conn.executed[3][1][1])
+    meta = json.loads(conn.executed[2][1][1])
     assert 173 not in meta["source_pg_ids"]
     assert meta["source_pg_ids"] == [245, 267]
     assert meta["summary_ids"] == [173]
@@ -846,9 +854,6 @@ async def test_fold_insight_reversal_note_reaches_slot_generation_and_assembly(m
             (245, "Decision A\n\nrationale A", "shared-memory-GitHub", "decision", {}),
             (267, "Decision B\n\nrationale B", "shared-memory-GitHub", "decision", {}),
         ]},
-        {"rowcount": 1, "rows": [(199,)]},                                     # reversal leg 1
-        {"rowcount": 1, "rows": [(199, "Old decision title", 900,
-                                  "it failed under load")]},                  # reversal leg 2
         {"rowcount": 2, "rows": [(101,), (102,)]},
         {"rowcount": 1, "rows": [(77,)]},
         {"rowcount": 2, "rows": []},
@@ -856,7 +861,12 @@ async def test_fold_insight_reversal_note_reaches_slot_generation_and_assembly(m
         {"rowcount": 2, "rows": [(101, 245), (102, 267)]},
     ])
 
-    assert await daemon._fold_insight(conn, "OutboxPattern", [245, 267]) is True
+    assert await daemon._fold_insight(
+        conn, "OutboxPattern", [245, 267],
+        reversals=[{
+            "decision_id": 199, "decision_title": "Old decision title",
+            "retro_id": 900, "retro_content": "it failed under load",
+        }]) is True
     assert captured["reversal_lines"]
     assert "199" in captured["reversal_lines"][0]
     assert "Old decision title" in captured["reversal_lines"][0]
@@ -881,8 +891,8 @@ async def test_fold_insight_aborts_when_llm_fails(monkeypatch):
 
     assert not any(s.startswith("INSERT INTO community_summaries")
                    for s, _ in conn.executed)
-    # judgement fetch + reversal-context leg1 + outbox snapshot ran; the
-    # read-transaction commit is the only commit before the LLM aborted.
+    # judgement fetch and the outbox snapshot ran; the read-transaction
+    # commit is the only commit before the LLM aborted.
     assert conn.commits == 1
 
 
@@ -913,7 +923,6 @@ async def test_fold_insight_project_falls_back_to_mode_of_judgement_rows(monkeyp
             (245, "Decision A", "shared-memory-GitHub", "decision", {}),
             (267, "Decision B", "shared-memory-GitHub", "decision", {}),
         ]},
-        {"rowcount": 0, "rows": []},
         {"rowcount": 2, "rows": [(101,), (102,)]},
         {"rowcount": 1, "rows": [(77,)]},
         {"rowcount": 2, "rows": []},
@@ -921,7 +930,7 @@ async def test_fold_insight_project_falls_back_to_mode_of_judgement_rows(monkeyp
         {"rowcount": 2, "rows": [(101, 245), (102, 267)]},
     ])
     await daemon._fold_insight(conn, "OutboxPattern", [245, 267])
-    meta = json.loads(conn.executed[3][1][1])
+    meta = json.loads(conn.executed[2][1][1])
     assert meta["project"] == "shared-memory-GitHub"
 
 
@@ -1058,6 +1067,7 @@ async def test_run_insight_cycle_same_identity_appends_reference_not_a_new_fold(
     monkeypatch.setattr(cl, "fetch_active_insight_rows",
                         lambda c: [(70, {245, 267}, {"summary_ids": [], "domains": []})])
     monkeypatch.setattr(cl, "fetch_active_thematic_summary_id", lambda c, p, d: 44)
+    monkeypatch.setattr(cl, "fetch_reversal_context", lambda c, ids: [])
 
     daemon, _ = daemon_with_fake_graph()
     daemon._find_fresh_insight_clusters = AsyncMock(return_value=[
@@ -1208,6 +1218,7 @@ async def test_run_insight_cycle_same_wins_over_earlier_covering_row(monkeypatch
         (70, {245, 267}, {"summary_ids": [], "domains": []}),
     ])
     monkeypatch.setattr(cl, "fetch_active_thematic_summary_id", lambda c, p, d: 44)
+    monkeypatch.setattr(cl, "fetch_reversal_context", lambda c, ids: [])
 
     daemon, _ = daemon_with_fake_graph()
     daemon._find_fresh_insight_clusters = AsyncMock(return_value=[

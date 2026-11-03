@@ -607,6 +607,31 @@ async def test_i10_failed_reacquire_aborts_nrem_insight_cycle(monkeypatch):
 
     daemon._fold_insight = _mock_fold
 
+    class _Ready:
+        def session(self):
+            return self
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def run(self, query, **params):
+            ids = list(params.get("ids") or [])
+
+            class _R:
+                async def data(_self):
+                    return [
+                        {"pg_id": i, "rem_processed": True,
+                         "superseded": False, "rem_invalid": False}
+                        for i in ids
+                    ]
+            return _R()
+
+    daemon.driver = _Ready()
+    monkeypatch.setattr(consolidation_loop, "fetch_reversal_context", lambda c, ids: [])
+
     await daemon.run_insight_cycle()
 
     assert folds_called == ["entity_1"], (
@@ -670,6 +695,31 @@ async def test_i9_one_member_set_bought_at_most_once_across_refold_and_fresh(mon
         return False
 
     daemon._fold_insight = _mock_fold
+
+    class _Ready:
+        def session(self):
+            return self
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def run(self, query, **params):
+            ids = list(params.get("ids") or [])
+
+            class _R:
+                async def data(_self):
+                    return [
+                        {"pg_id": i, "rem_processed": True,
+                         "superseded": False, "rem_invalid": False}
+                        for i in ids
+                    ]
+            return _R()
+
+    daemon.driver = _Ready()
+    monkeypatch.setattr(consolidation_loop, "fetch_reversal_context", lambda c, ids: [])
 
     await daemon.run_insight_cycle()
 

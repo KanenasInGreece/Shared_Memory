@@ -3347,19 +3347,30 @@ def _outbox_dependency(census: object, age_limit_s: int) -> dict:
 
 
 def _rem_dependency(process_running: bool, dead_lettered: object,
-                    backlog_unreadable: bool = False) -> dict:
+                    backlog_unreadable: bool = False,
+                    invalid_nodes: object = None) -> dict:
     """REM process liveness. dead_letters:N counts pending records with a backlog row.
 
     A withheld record is degraded, by design. An unreadable llm_backlog is
     down, and that reason wins over process not running. An empty reasoning
     pool is llm_pool's reason, not this one.
+
+    invalid_nodes is the cached count of graph nodes REM retired as invalid
+    (decision:928: that verdict must be visible). None means the count was
+    not read, and it never degrades the dependency. A positive count is
+    degraded, named beside dead letters when both apply.
     """
     if backlog_unreadable:
         return _dep(_STATE_DOWN, "llm_backlog unreadable")
     if not process_running:
         return _dep(_STATE_DOWN, "process not running")
+    reasons = []
     if isinstance(dead_lettered, int) and dead_lettered > 0:
-        return _dep(_STATE_DEGRADED, f"dead_letters:{dead_lettered}")
+        reasons.append(f"dead_letters:{dead_lettered}")
+    if isinstance(invalid_nodes, int) and invalid_nodes > 0:
+        reasons.append(f"invalid_nodes:{invalid_nodes}")
+    if reasons:
+        return _dep(_STATE_DEGRADED, ", ".join(reasons))
     return _dep(_STATE_OK)
 
 
@@ -4060,6 +4071,7 @@ async def _build_health_checks(proxy: "AsyncHiveMindProxy", coordinator) -> dict
             backlog_unreadable=_LLM_BACKLOG_UNREADABLE or (
                 isinstance(dep_snap.get("rem"), dict)
                 and bool(dep_snap["rem"].get("unreadable"))),
+            invalid_nodes=checks.get("graph_invalid_nodes"),
         ),
         "nrem_daemon": _nrem_dependency(_daemon_healthy, consolidation,
                                         NREM_FOLD_ATTEMPT_WARN),

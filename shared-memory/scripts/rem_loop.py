@@ -600,6 +600,7 @@ class REMDaemon:
             async with self.driver.session() as session:
                 await session.run(
                     f"MATCH (n:{anchor} {{pg_id: $pg_id}})"
+                    f" WHERE coalesce(n.rem_invalid, false) = false"
                     f" SET n.rem_processed = false",
                     pg_id=pg_id,
                 )
@@ -1471,6 +1472,7 @@ class REMDaemon:
                     f" WHERE (n:{ONT.fact} OR n:{ONT.decision}"
                     f"        OR n:{ONT.retrospective})"
                     f"   AND n.pg_id IN $ids"
+                    f"   AND coalesce(n.rem_invalid, false) = false"
                     f" SET n.rem_processed = false",
                     ids=ids,
                 )

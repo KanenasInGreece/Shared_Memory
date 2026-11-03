@@ -84,7 +84,7 @@ __all__ = [
 ]
 
 #: Not a free-running today: this is the fifth version pin, so a missed bump is visible (decision:1832).
-VERSION = "1.0.45"
+VERSION = "1.0.46"
 
 
 def _version_tuple(v: str) -> tuple:
@@ -1114,8 +1114,13 @@ TELEMETRY: dict[str, dict] = {
                                note="null until the first refresher pass"),
 
     # ── nrem / consolidation ────────────────────────────────────────────────
-    "nrem.fact_cycles": _k("int", "nrem/consolidation"),
-    "nrem.decision_cycles": _k("int", "insight"),
+    "nrem.fact_cycles": _k(
+        "int", "nrem/consolidation",
+        note="groups seeded by REM-processed facts only"),
+    "nrem.decision_cycles": _k(
+        "int", "insight",
+        note=("candidate-group gauge seeded by REM-processed facts; it does not "
+              "run the insight readiness check, so it overcounts a deferred component")),
     "nrem.total_cycles": _k("int", "nrem/consolidation"),
     "nrem.fact_threshold": _k("int", "nrem/consolidation",
                               note="ONT.density_threshold"),
@@ -1244,7 +1249,10 @@ TELEMETRY: dict[str, dict] = {
     "consolidation.*.last_error.superseded": _k("bool", "nrem/consolidation"),
     "consolidation.*.last_error": _k("null", "nrem/consolidation",
                                      note="null when no error is on record"),
-    "consolidation.*.eligible_clusters": _k("int", "nrem/consolidation"),
+    "consolidation.*.eligible_clusters": _k(
+        "int", "nrem/consolidation",
+        note=("groups seeded by REM-processed facts; an insight census also "
+              "excludes sets deferred because a carried record is not REM-processed")),
     "consolidation.*.eligible_oldest_age_seconds": _k("int|null",
                                                       "nrem/consolidation",
                                                       unit="_seconds"),
@@ -1256,6 +1264,20 @@ TELEMETRY: dict[str, dict] = {
     "consolidation.*.insight_gate_skips": _k(
         "int|null", "nrem/consolidation", since=INTRODUCED_0_9_114,
         note="groups the insight gate skipped; null until a cycle records it; not backlog"),
+    "consolidation.*.rem_pending_clusters": _k(
+        "int|null", "nrem/consolidation", since="1.0.46",
+        note=("insight only: distinct judgement sets the latest finished insight "
+              "cycle deferred because a carried record is not REM-processed. "
+              "Null on fact cycles, before 1.0.46, and when that cycle's first "
+              "readiness check failed. When rem_pending_incomplete is true the "
+              "cycle stopped before it had checked every set, so this is the "
+              "count observed until then: at least this many, possibly more.")),
+    "consolidation.*.rem_pending_incomplete": _k(
+        "bool|null", "nrem/consolidation", since="1.0.46",
+        note=("insight only: true when the latest finished insight cycle stopped "
+              "after its first readiness check and before checking every candidate "
+              "set, so rem_pending_clusters is a lower bound; false when every set "
+              "was checked; null exactly when rem_pending_clusters is null.")),
     "consolidation.*.truncation_failures": _k("int", "nrem/consolidation"),
     "consolidation.*.slot_failures": _k("int", "nrem/consolidation"),
     "consolidation.*.last_deferred_reason": _k("str|null", "nrem/consolidation"),

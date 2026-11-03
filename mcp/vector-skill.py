@@ -216,7 +216,7 @@ AGENT_ID = os.environ.get("AGENT_ID", "vector_skill")
 # API_VERSION is the wire contract; bump only when shape, auth, routes, or a monitor
 # contract change breaks older clients. v5: telemetry contract key removal.
 API_VERSION = 5
-VERSION = "1.0.45"
+VERSION = "1.0.46"
 CLIENT_VERSION_HEADER = "X-SM-Api-Version"
 # Framework build, separate from api_version, so two clients on the same wire contract can still be counted apart in clients.versions_seen.
 CLIENT_BUILD_HEADER = "X-Shared-Memory-Client"

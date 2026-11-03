@@ -521,9 +521,7 @@ def _fold_script_two_decisions():
             (267, "Adopt listen notify triggers everywhere", "other-project",
              "decision", {}),
         ]},
-        # 2. fetch_reversal_context leg 1 (open ledger rows) — none
-        {"rowcount": 0, "rows": []},
-        # 3. fetch_insight_outbox_rows snapshot
+        # 2. fetch_insight_outbox_rows snapshot
         {"rowcount": 2, "rows": [(101,), (102,)]},
         # 4. insert  5. flip  6. supersession  7. close
         {"rowcount": 1, "rows": [(77,)]},

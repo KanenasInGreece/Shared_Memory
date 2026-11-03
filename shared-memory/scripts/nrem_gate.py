@@ -11,11 +11,19 @@ from project_axis import fold_eligible
 def grounded_fact_groups_cypher(with_content: bool) -> str:
     """The walk is GROUNDED_IN, then DOMAIN_OF, then PROJECT_OF, never MENTIONS, and
     an edge exists only for a registered section, so its presence proves registration.
-    ``with_content`` adds the fact text to the rows."""
+    ``with_content`` adds the fact text to the rows.
+
+    A grounding fact counts in a (project, domain) group only when its node
+    says rem_processed (decision:3453: Postgres holds every record's full
+    text; the graph holds traversal, provenance and lineage; only a
+    REM-processed node gates NREM). A fact REM retired as invalid still
+    counts: that retirement leaves rem_processed set.
+    """
     walk = (
         f"MATCH (j) WHERE j:{ONT.decision} OR j:{ONT.retrospective}"
         f" MATCH (j)-[:{ONT.grounded_in}]->(f:{ONT.fact})"
         f" WHERE coalesce(f.superseded, false) = false"
+        f"   AND coalesce(f.rem_processed, false) = true"
         f" MATCH (f)-[:{ONT.domain_of}]->(dom:{ONT.domain})"
         f"           -[:{ONT.project_of}]->(proj:{ONT.project})"
         f" WITH DISTINCT f, proj.name AS project, dom.name AS domain"
