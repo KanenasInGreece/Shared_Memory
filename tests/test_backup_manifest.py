@@ -30,7 +30,7 @@ against it. A NEW manifest with no recorded field at all (written by some
 future caller that dropped the key) is likewise "unknown", never coerced to
 a failure.
 
-Also added: `quiesced` (bool) / `quiesce_mode` ("full"|"timeout"|null) on the
+Also added: `quiesced` (bool) / `quiesce_mode` ("full"|"lost_during_dump"|"fence_unknown"|null) on the
 manifest -- previously nothing recorded whether client writes were shed and
 daemons drained when a backup was taken, even though restore.sh's own closing
 message already distinguishes "ran without full quiesce" as a normal case.
@@ -106,7 +106,13 @@ def _fake_docker(tmp_path):
 #: (v0.9.92) — the admin token is confined to /admin/*, so this is the ONLY
 #: route the backup token can poll for the drain count; the coordinator builds
 #: `pending` as census pending + in_progress.
-_OUTBOX_DRAINED = {"status": "success", "outbox": {"pending": 0}}
+_OUTBOX_DRAINED = {
+    "status": "success",
+    "quiesced": True,
+    "lock_held": True,
+    "quiesce_generation": 1,
+    "outbox": {"pending": 0},
+}
 
 #: The gateway's real 403 body for an admin token outside /admin/* (v0.9.92,
 #: coordinator.py `_error_body` via auth_middleware) -- this is what EVERY
@@ -138,6 +144,9 @@ class _QuiesceStubHandler(http.server.BaseHTTPRequestHandler):
     # escape sequences) without changing the default confinement text.
     confinement_body = _ADMIN_CONFINEMENT_BODY
 
+    quiesce_generation = 1
+    resume_status = 200
+
     def do_POST(self):
         length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(length)
@@ -146,11 +155,20 @@ class _QuiesceStubHandler(http.server.BaseHTTPRequestHandler):
             self.send_response(type(self).quiesce_status)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
-            self.wfile.write(json.dumps({"daemons": "drained"}).encode())
+            self.wfile.write(json.dumps({
+                "status": "success" if type(self).quiesce_status == 200 else "error",
+                "lock_held": type(self).quiesce_status == 200,
+                "quiesce_generation": getattr(type(self), "quiesce_generation", 1),
+                "daemons": "fenced" if type(self).quiesce_status == 200 else "not_fenced",
+            }).encode())
         else:
             type(self).resume_calls += 1
-            self.send_response(200)
+            status = getattr(type(self), "resume_status", 200)
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
             self.end_headers()
+            if status != 200:
+                self.wfile.write(b'{"status":"error","message":"resume failed"}')
 
     def do_GET(self):
         # BRANCH ON PATH (v0.9.92): the admin token this script carries can
@@ -176,13 +194,15 @@ class _QuiesceStubHandler(http.server.BaseHTTPRequestHandler):
 
 @contextlib.contextmanager
 def _stub_gateway(quiesce_status=200, outbox_body=None, confine_admin_outbox=False,
-                   confinement_body=None):
+                   confinement_body=None, quiesce_generation=1, resume_status=200):
     handler_cls = type("Handler", (_QuiesceStubHandler,), {
         "quiesce_status": quiesce_status, "resume_calls": 0,
+        "resume_status": resume_status,
         "outbox_body": _OUTBOX_DRAINED if outbox_body is None else outbox_body,
         "confine_admin_outbox": confine_admin_outbox,
         "seen_get_paths": [],
         "confinement_body": _ADMIN_CONFINEMENT_BODY if confinement_body is None else confinement_body,
+        "quiesce_generation": quiesce_generation,
     })
     server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler_cls)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -255,6 +275,28 @@ def test_manifest_records_quiesced_full_on_200(tmp_path):
     assert manifest["quiesced"] is True
     assert manifest["quiesce_mode"] == "full"
     assert handler_cls.resume_calls == 1  # released the fence
+
+
+def test_backup_sh_failing_resume_cleans_secrets_and_classifies_manifest(tmp_path):
+    """T8: backup.sh with a failing resume under the real script:
+    secrets dir cleaned and the manifest classified (does not abort under set -e)."""
+    tmp_secrets = tmp_path / "tmp_run"
+    tmp_secrets.mkdir()
+    with _fake_docker(tmp_path) as docker_path, _stub_gateway(200, resume_status=500) as (url, handler_cls):
+        result, backup_dir = _run_backup_sh(
+            tmp_path, docker_path,
+            {"BACKUP_ADMIN_TOKEN": "tok", "GATEWAY_URL": url,
+             "BACKUP_DRAIN_MAX_SECONDS": "2", "BACKUP_DRAIN_POLL_SECONDS": "1",
+             "TMPDIR": str(tmp_secrets)},
+        )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "failed to resume gateway" in result.stdout or "failed to resume gateway" in result.stderr
+    manifest = _latest_manifest(backup_dir)
+    assert manifest["quiesced"] is True
+    assert manifest["quiesce_mode"] == "full"
+    assert handler_cls.resume_calls >= 1
+    # Secrets directory created by mktemp -d must be removed by cleanup_secrets_dir
+    assert list(tmp_secrets.iterdir()) == []
 
 
 def test_drain_reports_drained_when_the_outbox_pending_key_says_zero(tmp_path):
@@ -388,8 +430,8 @@ def test_manifest_records_quiesced_timeout_on_202(tmp_path):
         )
     assert result.returncode == 0, result.stdout + result.stderr
     manifest = _latest_manifest(backup_dir)
-    assert manifest["quiesced"] is True
-    assert manifest["quiesce_mode"] == "timeout"
+    assert manifest["quiesced"] is False
+    assert manifest["quiesce_mode"] == "lost_during_dump"
 
 
 # ── do_verify: legacy zero-sentinel vs a real mismatch ───────────────────────

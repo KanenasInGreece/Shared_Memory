@@ -191,7 +191,7 @@ paid cloud API. Each entry is a URL plus an optional `token_env` — the
 | `token_env` | string | none | **Name** of the env var holding the API key — never the key itself. Resolved once at startup, sent as `Authorization` only to this backend. An unresolvable name excludes the backend (logged). |
 | `model` | string | none | Model id rewritten into every request body routed here — a cloud endpoint needs its real id, not the `local-model` clients send. |
 | `extra_body` | object | none | Merged into every chat payload routed here. It cannot set `max_tokens` or `max_completion_tokens`: the gateway writes `max_tokens` after the merge. It is part of the pool id. A non-object is FATAL: the gateway exits 78. |
-| `weight` | float | `1.0` | Affects no routing decision. Order is priority, then `n_ctx`, then self-hosted, then least in flight, then cache affinity. Stored and displayed only. |
+| `weight` | float | ignored | Deprecated and ignored with one warning. Affects no routing decision. Order is priority, then `n_ctx`, then self-hosted, then least in flight, then cache affinity. |
 | `n_ctx` | int ≥ 1 | *(required)* | The model's usable context. A request that cannot fit is not sent here. A missing or invalid value stops the gateway (exit 78) and names the field. |
 | `max_output_tokens` | int ≥ 1 | *(required)* | Spending cap on the reply: `max_tokens` is the minimum of this and the context room. It does not decide whether the backend qualifies. A bool or a non-positive value stops the gateway and names the field. |
 | `priority` | int ≥ 1 | `1` | First sort key. Lower is tried first. |
@@ -246,8 +246,8 @@ the framework's own files never hold the key either way.
 
 **Dispatch** walks one order: `priority` ascending (default 1), then `n_ctx`
 ascending, then self-hosted before paid, then least in flight, then cache
-affinity as the last tie-break. A try moves only forward. `weight` plays no
-part (see the table).
+affinity as the last tie-break. A try moves only forward. `weight` is now
+ignored with one warning.
 
 **Fit check** (`LLM_CHARS_PER_TOKEN_RATIO`, `FIT_MARGIN`) — a backend qualifies
 only when `n_ctx` is declared and `n_ctx × (1 − FIT_MARGIN) − estimate` is at
@@ -325,7 +325,7 @@ reached without its configured overrides is exactly the misconfiguration to
 prevent. A key belongs in `token_env`. A literal key in `extra_body` reaches
 the daemon environments, the pool hash, and specimens, and it is not redacted.
 
-`n_ctx`, `max_output_tokens`, `max_inflight` and the price fields are in the table above. `priority` is shown.
+`n_ctx`, `max_output_tokens`, `max_inflight` and the price fields are in the table above. `priority` is shown. `max_wait_s` is optional per backend (positive number, seconds from request dispatch to complete reply; absent = no limit). An expired request is logged with limit and elapsed, counted under `llm.pool.*.max_wait_expired`, and backlogged as `connection_lost` until gateway restart.
 
 The gateway resolves `token_env` once at startup from its **own process
 environment** and sends it as `Authorization` only to that backend — the
@@ -475,11 +475,43 @@ lock, and the outbox drains. The drain gate polls `GET /admin/outbox` with the
 same admin token, live, until `pending` is 0 or the timeout. A `trap` resumes
 on any exit; the gateway's TTL auto-resumes if the script dies.
 
+### Quiesce generation and fence verification
+
+`/admin/outbox` and `/admin/backup` return `quiesce_generation`, formatted on the wire as `<process-token>-<fence-acquisitions>`, where the process token is an 8-byte hex string (`secrets.token_hex(8)`) generated once per gateway process.
+`backup.sh` reads `quiesce_generation` and `lock_held` after the drain (before the re-arm) and again after the dumps.
+- **`mode: full` (`quiesced: true`)**: Literal `true` in both readings with one unbroken generation.
+- **`mode: lost_during_dump` (`quiesced: false`)**: Generation changed, lock lost, or re-arm returned non-200.
+- **`mode: fence_unknown` (`quiesced: false`)**: A reading was empty, missing, or failed.
+
+### Quiesce backend signal check
+
+When backup quiesce begins (at `POST /admin/backup` where `started_here` is true), the
+gateway launches one background check task to inspect self-hosted backends with requests
+in flight, logged under the fixed prefix `quiesce-backend-check`.
+
+The check reads the backend's signal once:
+- **llama.cpp**: `GET /slots` (counts slots with `is_processing: true`), base stripped of trailing `/v1`, with `_probe_headers`
+- **vLLM**: `GET /metrics` (reads running requests metric)
+- **Endpoint absent or refused**: logs `signal=no_signal`
+- **Paid backends**: logged as `signal=not_checked` with no network request made
+- **Idle backup** (no requests in flight): logs `quiesce-backend-check: no_request_in_flight`
+
+Each entry is logged under `quiesce-backend-check`:
+- Idle: `quiesce-backend-check: no_request_in_flight`
+- llama.cpp: `quiesce-backend-check backend=<url> model=<model> signal=slots reading=processing=<n>/<total> time_to_answer=<elapsed>s inflight=<cnt> oldest_age=<age>`
+- vLLM: `quiesce-backend-check backend=<url> model=<model> signal=metrics reading=running=<n> time_to_answer=<elapsed>s inflight=<cnt> oldest_age=<age>`
+- Absent / refused: `quiesce-backend-check backend=<url> model=<model> signal=no_signal time_to_answer=<elapsed>s inflight=<cnt> oldest_age=<age>`
+- Paid: `quiesce-backend-check backend=<url> model=<model> signal=not_checked inflight=<cnt> oldest_age=<age>`
+- Ended before answer: `quiesce-backend-check backend=<url> model=<model>: no answer before quiesce ended (elapsed=<elapsed>s)`
+
+The read uses `ClientTimeout(total=None, connect=None)` so it is bounded solely by the caller-chosen quiesce duration. If the quiesce ends before an upstream answers, the check task is cancelled, any open response is closed, and it logs `no answer before quiesce ended (elapsed=...)`. Nothing is ended or interrupted by this check, and its failure never affects the quiesce.
+
 ```bash
 bash shared-memory/ops/backup.sh             # full quiesced backup
 bash shared-memory/ops/backup.sh --dry-run   # sizes / space / retention, no writes
 bash shared-memory/ops/backup.sh --verify    # integrity-check the latest set
-bash shared-memory/ops/restore.sh --force    # ground-up restore (see README §20)
+systemctl --user stop hive-mind-gateway.service  # stop gateway before restore
+bash shared-memory/ops/restore.sh --force    # ground-up restore (see README §22)
 ```
 
 ### Schedule — cron or the timer (pick one)

@@ -2004,8 +2004,8 @@ async def test_handle_telemetry_rolls_up_postgres_and_neo4j():
     # from its queue while still counted as "pending".
     # Pending-with-a-backlog-row. The backlog query returns no rows, so the count is 0.
     assert built["neo4j"]["rem_dead_lettered"] == 0
-    assert built["neo4j"]["rem_failing"] == 0
-    assert built["neo4j"]["rem_max_attempts"] == 0
+    assert "rem_failing" not in built["neo4j"]
+    assert "rem_max_attempts" not in built["neo4j"]
     # STEP 3 (decision 890) — fairness gauge: total = sum(n*p), starved = rows
     # at/above REM_STARVED_THRESHOLD (default 3).
     assert built["neo4j"]["rem_passed_over_total"] == 60 * 0 + 9 * 1 + 3 * 3

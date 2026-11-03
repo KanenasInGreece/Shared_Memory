@@ -24,6 +24,7 @@ inherited pipe fd (read_daemon_token_from_fd).
 import ipaddress
 import json
 import logging
+import math
 import os
 import re
 import socket
@@ -491,6 +492,20 @@ def llm_declaration_errors(env: "dict | None" = None) -> "list[tuple[str, str]]"
                     errors.append((shown, field))
             if "priority" in entry and not _positive_int(entry.get("priority")):
                 errors.append((shown, "priority"))
+            if "max_wait_s" in entry:
+                val = entry.get("max_wait_s")
+                invalid = False
+                if isinstance(val, bool) or not isinstance(val, (int, float)):
+                    invalid = True
+                else:
+                    try:
+                        fval = float(val)
+                        if math.isnan(fval) or math.isinf(fval) or fval <= 0:
+                            invalid = True
+                    except (OverflowError, ValueError):
+                        invalid = True
+                if invalid:
+                    errors.append((shown, "max_wait_s"))
             for secret_field in _LITERAL_SECRET_FIELDS:
                 if entry.get(secret_field):
                     errors.append((shown, secret_field))

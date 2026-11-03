@@ -501,7 +501,7 @@ def test_consolidation_try_lock_returns_conn_when_free(monkeypatch):
     conn = _Conn()
     monkeypatch.setattr(cl.psycopg2, "connect", lambda *a, **k: conn)
     got = cl._try_backup_shared_lock()
-    assert got is conn
+    assert got.conn is conn
     assert conn.closed is False          # caller releases by closing later
 
 

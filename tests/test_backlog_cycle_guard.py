@@ -110,6 +110,18 @@ class _Neo:
         return _Result([])
 
 
+class _FakeCur:
+    def execute(self, *a, **k): pass
+    def fetchone(self): return (1,)
+    def fetchall(self): return []
+    def __enter__(self): return self
+    def __exit__(self, *a): return False
+
+class _FakeConn:
+    def cursor(self): return _FakeCur()
+    def close(self): pass
+
+
 @pytest.mark.asyncio
 async def test_rem_backlog_row_stops_the_second_call(monkeypatch):
     import rem_loop as rem
@@ -154,7 +166,7 @@ async def test_rem_backlog_row_stops_the_second_call(monkeypatch):
         return R()
 
     monkeypatch.setattr("httpx.AsyncClient.post", _post)
-    daemon._open_pg_conn = lambda: type("C", (), {"close": lambda self: None})()
+    daemon._open_pg_conn = lambda: _FakeConn()
     daemon._recent_write_happened = AsyncMock(return_value=False)
     daemon._filter_applied_in_outbox = AsyncMock(side_effect=lambda ids, *a: list(ids))
     daemon._batch_fetch_content = AsyncMock(return_value={
@@ -289,7 +301,7 @@ def _rem_ready(monkeypatch, pg_id, content, post):
     }])
     daemon.driver = type("D", (), {"session": lambda self: neo})()
     monkeypatch.setattr("httpx.AsyncClient.post", post)
-    daemon._open_pg_conn = lambda: type("C", (), {"close": lambda self: None})()
+    daemon._open_pg_conn = lambda: _FakeConn()
     daemon._recent_write_happened = AsyncMock(return_value=False)
     daemon._filter_applied_in_outbox = AsyncMock(side_effect=lambda ids, *a: list(ids))
     daemon._batch_fetch_content = AsyncMock(return_value={
@@ -394,7 +406,7 @@ async def test_overflow_idx_does_not_escape_the_cycle(monkeypatch):
     ])
     daemon.driver = type("D", (), {"session": lambda self: neo})()
     monkeypatch.setattr("httpx.AsyncClient.post", _post)
-    daemon._open_pg_conn = lambda: type("C", (), {"close": lambda self: None})()
+    daemon._open_pg_conn = lambda: _FakeConn()
     daemon._recent_write_happened = AsyncMock(return_value=False)
     daemon._filter_applied_in_outbox = AsyncMock(side_effect=lambda ids, *a: list(ids))
     daemon._batch_fetch_content = AsyncMock(return_value={
@@ -497,7 +509,7 @@ async def test_missing_batch_fact_is_solo_only(monkeypatch):
     ])
     daemon.driver = type("D", (), {"session": lambda self: neo})()
     monkeypatch.setattr("httpx.AsyncClient.post", _post)
-    daemon._open_pg_conn = lambda: type("C", (), {"close": lambda self: None})()
+    daemon._open_pg_conn = lambda: _FakeConn()
     daemon._recent_write_happened = AsyncMock(return_value=False)
     daemon._filter_applied_in_outbox = AsyncMock(side_effect=lambda ids, *a: list(ids))
     daemon._batch_fetch_content = AsyncMock(return_value={

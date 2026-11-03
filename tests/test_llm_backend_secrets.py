@@ -145,16 +145,20 @@ def test_literal_secret_field_rejected_not_silently_dropped(monkeypatch):
     assert "xai-oops-another-literal-secret" not in str(exc.value)
 
 
-def test_legacy_llm_backends_unaffected_when_json_unset(monkeypatch):
+def test_legacy_llm_backends_unaffected_when_json_unset(monkeypatch, caplog):
+    import logging
     monkeypatch.delenv("LLM_BACKENDS_JSON", raising=False)
     monkeypatch.setenv("LLM_BACKENDS_JSON", "[{\"url\": \"http://a:5000\", \"n_ctx\": 8192, \"max_output_tokens\": 2048, \"weight\": 2}, {\"url\": \"http://b:4000\", \"n_ctx\": 8192, \"max_output_tokens\": 2048}]")
     import hive_mind_proxy as g
-    importlib.reload(g)
+    with caplog.at_level(logging.WARNING, logger="hive-proxy"):
+        importlib.reload(g)
 
     assert set(g.LLM_BACKENDS) == {"http://a:5000", "http://b:4000"}
-    assert g.LLM_WEIGHTS["http://a:5000"] == 2.0
+    assert not hasattr(g, "LLM_WEIGHTS")
     assert g.LLM_BACKEND_TOKENS["http://a:5000"] is None
     assert g.LLM_BACKEND_MODELS["http://a:5000"] is None
+    assert any("ignores leftover key weight" in r.getMessage() for r in caplog.records)
+    assert not g.LLM_DECLARATION_ERRORS
 
 
 def test_backend_model_override_rewrites_request_body(monkeypatch):
@@ -671,17 +675,17 @@ def test_csv_weight_forms_are_ignored(monkeypatch):
     import hive_mind_proxy as g
     importlib.reload(g)
     assert g.LLM_BACKENDS == []
-    assert "url" not in g.LLM_WEIGHTS
-    assert "url2" not in g.LLM_WEIGHTS
+    assert not hasattr(g, "LLM_WEIGHTS")
 
 
-def test_json_weight_field_still_parses(monkeypatch):
+def test_json_weight_field_is_ignored_and_not_stored(monkeypatch):
+    """A weight field in LLM_BACKENDS_JSON is ignored, leaves LLM_WEIGHTS unset, and raises no declaration error."""
     monkeypatch.delenv("LLM_BACKENDS_JSON", raising=False)
     monkeypatch.setenv("LLM_BACKENDS_JSON", "[{\"url\": \"http://a:5000\", \"n_ctx\": 8192, \"max_output_tokens\": 2048, \"weight\": 2}, {\"url\": \"http://b:4000\", \"n_ctx\": 8192, \"max_output_tokens\": 2048}]")
     import hive_mind_proxy as g
     importlib.reload(g)
     assert set(g.LLM_BACKENDS) == {"http://a:5000", "http://b:4000"}
-    assert g.LLM_WEIGHTS["http://a:5000"] == 2.0
+    assert not hasattr(g, "LLM_WEIGHTS")
     assert not any(field == "url" for _entry, field in g.LLM_DECLARATION_ERRORS)
 
 
@@ -721,7 +725,7 @@ def test_json_weight_on_a_path_url_loads(monkeypatch):
     import hive_mind_proxy as g
     importlib.reload(g)
     assert "https://api.example.com/v1" in g.LLM_BACKENDS
-    assert g.LLM_WEIGHTS["https://api.example.com/v1"] == 2.0
+    assert not hasattr(g, "LLM_WEIGHTS")
     assert not any(field == "url" for _entry, field in g.LLM_DECLARATION_ERRORS)
 
 

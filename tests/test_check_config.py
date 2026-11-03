@@ -735,7 +735,6 @@ class _FakeProxyMissingGuardFunctions:
     """A stand-in 'hive_mind_proxy' module missing BOTH guard functions —
     everything else present, isolating that guard."""
     LLM_BACKENDS = []
-    LLM_WEIGHTS = {}
     LLM_BACKEND_MODELS = {}
     LLM_BACKEND_ROLES = {}
     LLM_BACKEND_EXTRAS = {}
@@ -1271,3 +1270,24 @@ def test_non_utf8_unit_environment_file_does_not_exit_0(tmp_path):
 
 def _show_as_printf(show):
     return " ".join("'" + line.replace("'", "'\\''") + "'" for line in show.splitlines())
+
+
+def test_phase_b_does_not_render_weight(tmp_path):
+    proc = _run(env_overrides={
+        "SECURE_ENV_FILE": "",
+        "LLM_BACKENDS_JSON": '[{"url":"http://a:5000","n_ctx":8192,"max_output_tokens":2048}]',
+    }, tmp_path=tmp_path)
+    text = proc.stdout + proc.stderr
+    assert proc.returncode == 0, text
+    assert "weight=" not in text
+
+
+def test_phase_b_ignores_leftover_weight_in_backend_json(tmp_path):
+    proc = _run(env_overrides={
+        "SECURE_ENV_FILE": "",
+        "LLM_BACKENDS_JSON": '[{"url":"http://a:5000","weight":2.5,"n_ctx":8192,"max_output_tokens":2048}]',
+    }, tmp_path=tmp_path)
+    text = proc.stdout + proc.stderr
+    assert proc.returncode == 0, text
+    assert "weight=" not in text
+    assert "ignores leftover key weight" in text

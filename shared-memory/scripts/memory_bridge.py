@@ -37,9 +37,10 @@ from typing import Any
 
 import httpx
 
-VERSION = "1.0.44"
-# Must match GET /health api_version; v4 refuses unregistered project on fact save.
-API_VERSION = 4
+VERSION = "1.0.45"
+# API_VERSION is the wire contract; bump only when shape, auth, routes, or a monitor
+# contract change breaks older clients. v5: telemetry contract key removal.
+API_VERSION = 5
 
 # Must mirror ontology.RETRO_RATINGS on the gateway; this client never imports server modules.
 # Outcome states, not valence: 'reversed' drives the supersession cascade; nuance goes in notes.

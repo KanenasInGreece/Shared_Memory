@@ -8,6 +8,7 @@ returns a stub summary. A failed call is backlogged or left queued.
 """
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -169,6 +170,97 @@ def _anchor_label(kind: str) -> str:
 
 # Shared with the gateway and NREM. REM takes it SHARED and skips if a backup holds it EXCLUSIVE, so enrichment never writes mid-dump. Must match the coordinator's key.
 BACKUP_ADVISORY_LOCK_KEY = int(os.environ.get("BACKUP_ADVISORY_LOCK_KEY", "8765309"))
+
+
+class LockReacquireFailed(Exception):
+    """Raised when reacquiring the shared backup advisory lock fails after a chat call."""
+
+
+class _ChatLockReleaseContext:
+    def __init__(self, holder):
+        self.holder = holder
+
+    async def __aenter__(self):
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, self.holder.release_lock)
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, self.holder.reacquire_lock_blocking)
+        return False
+
+
+class _BackupLockHolder:
+    """Owns the cycle's current connection holding the shared backup advisory lock.
+    Releases the lock during chat calls and reacquires it blocking on exit, reconnecting if needed.
+    """
+    def __init__(self, conn, open_conn_func=None):
+        self.conn = conn
+        self.open_conn = open_conn_func
+        self.lock_key = BACKUP_ADVISORY_LOCK_KEY
+
+    def close(self):
+        conn, self.conn = self.conn, None
+        if conn:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    def release_lock(self):
+        if self.conn and not getattr(self.conn, "closed", False):
+            try:
+                with self.conn.cursor() as cur:
+                    cur.execute("SELECT pg_advisory_unlock_shared(%s)", (self.lock_key,))
+            except Exception as exc:
+                logger.warning("REM: failed to release shared backup lock (%s) — closing connection", type(exc).__name__)
+                try:
+                    self.conn.close()
+                except Exception:
+                    pass
+                self.conn = None
+
+    def reacquire_lock_blocking(self):
+        if self.conn and not getattr(self.conn, "closed", False):
+            try:
+                with self.conn.cursor() as cur:
+                    cur.execute("SELECT pg_advisory_lock_shared(%s)", (self.lock_key,))
+                return
+            except Exception as exc:
+                logger.warning("REM: failed to reacquire backup lock on existing conn (%s) — reconnecting", type(exc).__name__)
+                try:
+                    self.conn.close()
+                except Exception:
+                    pass
+                self.conn = None
+
+        if not self.open_conn:
+            raise LockReacquireFailed("No connection factory to reconnect dead backup lock connection")
+
+        try:
+            new_conn = self.open_conn()
+        except Exception as exc:
+            raise LockReacquireFailed(f"Failed to reconnect backup lock connection: {type(exc).__name__}") from exc
+
+        try:
+            with new_conn.cursor() as cur:
+                cur.execute("SELECT pg_advisory_lock_shared(%s)", (self.lock_key,))
+            self.conn = new_conn
+        except Exception as exc:
+            try:
+                new_conn.close()
+            except Exception:
+                pass
+            raise LockReacquireFailed(f"Failed to reacquire backup shared lock on new connection: {type(exc).__name__}") from exc
+
+    def release_for_chat(self):
+        return _ChatLockReleaseContext(self)
+
+    def __getattr__(self, name):
+        if self.conn is None:
+            raise AttributeError(f"_BackupLockHolder connection is None; cannot get attribute {name!r}")
+        return getattr(self.conn, name)
 
 
 def _take_shared_backup_lock(conn) -> bool:
@@ -350,6 +442,7 @@ class REMDaemon:
         self._solo_only: set[int] = set()
         # Paid items whose backlog row could not be written. A respawn drops it.
         self._withheld: set[int] = set()
+        self._lock_holder: _BackupLockHolder | None = None
 
     # ── Postgres connection factory ───────────────────────────────────────────
 
@@ -824,21 +917,29 @@ class REMDaemon:
 
         prompt = build_single_prompt(content, kind)
         model = "local-model"
-        _start = time.monotonic()
+        holder = getattr(self, "_lock_holder", None)
+        cm = holder.release_for_chat() if holder else contextlib.nullcontext()
         try:
             async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
-                resp = await client.post(
-                    REASONER_URL,
-                    headers=_auth_headers(),
-                    json={
-                        "model": LLM_MODEL,
-                        "messages": [
-                            {"role": "system", "content": "You are a technical knowledge curator. Output only the requested JSON — no reasoning steps, no thinking tokens, no prose outside the JSON object."},
-                            {"role": "user", "content": prompt},
-                        ],
-                        "temperature": REM_TEMPERATURE,
-                    },
-                )
+                async with cm:
+                    _start = time.monotonic()
+                    resp = await client.post(
+                        REASONER_URL,
+                        headers=_auth_headers(),
+                        json={
+                            "model": LLM_MODEL,
+                            "messages": [
+                                {"role": "system", "content": "You are a technical knowledge curator. Output only the requested JSON — no reasoning steps, no thinking tokens, no prose outside the JSON object."},
+                                {"role": "user", "content": prompt},
+                            ],
+                            "temperature": REM_TEMPERATURE,
+                        },
+                    )
+                    _wall_s = time.monotonic() - _start
+        except LockReacquireFailed:
+            if pg_id is not None:
+                self._withheld.add(int(pg_id))
+            raise
         except Exception as exc:
             # A daemon that cannot reach the gateway leaves the item queued. That is not
             # a paid reply.
@@ -859,7 +960,7 @@ class REMDaemon:
                         "REM: pg_id=%s backlog %s specimen: %s", pg_id, reason, specimen)
                 record_llm_call(
                     "REM", resp_json, backend=_backend,
-                    wall_s=time.monotonic() - _start, ceiling_s=None,
+                    wall_s=_wall_s, ceiling_s=None,
                     ok=False, note=f"backlog_{reason}", specimen=specimen or None,
                     prompt_chars=len(prompt))
                 paid = not (reason == "no_context" and usage is None)
@@ -875,7 +976,7 @@ class REMDaemon:
                 )
                 record_llm_call(
                     "REM", None, backend=_backend,
-                    wall_s=time.monotonic() - _start, ceiling_s=None,
+                    wall_s=_wall_s, ceiling_s=None,
                     ok=False, note=f"routing_refused_{refusal['error']}",
                     prompt_chars=len(prompt))
                 self._last_llm_failure = LLM_FAIL_ROUTING_REFUSED
@@ -885,7 +986,7 @@ class REMDaemon:
                 record_llm_call(
                     "REM", {"usage": usage} if isinstance(usage, dict) else None,
                     backend=_backend,
-                    wall_s=time.monotonic() - _start, ceiling_s=None,
+                    wall_s=_wall_s, ceiling_s=None,
                     ok=False, note=f"http_{resp.status_code}",
                     prompt_chars=len(prompt))
                 if usage is not None:
@@ -901,7 +1002,7 @@ class REMDaemon:
                 logger.error("LLM response was not JSON (status=%s)", resp.status_code)
                 record_llm_call(
                     "REM", None, backend=_backend,
-                    wall_s=time.monotonic() - _start, ceiling_s=None,
+                    wall_s=_wall_s, ceiling_s=None,
                     ok=False, note="queued", prompt_chars=len(prompt))
                 self._last_llm_failure = LLM_FAIL_TRANSPORT
                 return None, model
@@ -912,7 +1013,7 @@ class REMDaemon:
                 logger.warning("REM: pg_id=%s %s specimen: %s", pg_id, reason, specimen)
                 record_llm_call(
                     "REM", resp_json, backend=_backend,
-                    wall_s=time.monotonic() - _start, ceiling_s=None,
+                    wall_s=_wall_s, ceiling_s=None,
                     note=reason, specimen=specimen, prompt_chars=len(prompt))
                 self._note_backlog(reason, specimen)
                 self._last_llm_failure = LLM_FAIL_TRUNCATED
@@ -920,14 +1021,14 @@ class REMDaemon:
             if _finish_reason(resp_json) != "stop":
                 record_llm_call(
                     "REM", resp_json, backend=_backend,
-                    wall_s=time.monotonic() - _start, ceiling_s=None,
+                    wall_s=_wall_s, ceiling_s=None,
                     ok=False, note="unparseable", prompt_chars=len(prompt))
                 self._note_backlog("unparseable", "")
                 self._last_llm_failure = LLM_FAIL_PARSE
                 return None, model
             record_llm_call(
                 "REM", resp_json, backend=_backend,
-                wall_s=time.monotonic() - _start, ceiling_s=None,
+                wall_s=_wall_s, ceiling_s=None,
                 prompt_chars=len(prompt))
             try:
                 content_text = resp_json["choices"][0]["message"]["content"]
@@ -997,23 +1098,27 @@ class REMDaemon:
         self._batch_action = None
         self._batch_reason = None
         self._batch_specimen = ""
-        _start = time.monotonic()
         model = "local-model"
         resp = None
 
         def _usage_json(usage):
             return {"usage": usage} if isinstance(usage, dict) else None
 
+        holder = getattr(self, "_lock_holder", None)
+        cm = holder.release_for_chat() if holder else contextlib.nullcontext()
         try:
             async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
-                resp = await client.post(
-                    REASONER_URL, headers=_auth_headers(),
-                    json={"model": LLM_MODEL,
-                          "messages": [
-                              {"role": "system", "content": "You are a technical knowledge curator. Output only JSONL — one JSON object per line, no prose, no markdown fences, no thinking."},
-                              {"role": "user", "content": prompt}],
-                          "temperature": REM_TEMPERATURE},
-                )
+                async with cm:
+                    _start = time.monotonic()
+                    resp = await client.post(
+                        REASONER_URL, headers=_auth_headers(),
+                        json={"model": LLM_MODEL,
+                              "messages": [
+                                  {"role": "system", "content": "You are a technical knowledge curator. Output only JSONL — one JSON object per line, no prose, no markdown fences, no thinking."},
+                                  {"role": "user", "content": prompt}],
+                              "temperature": REM_TEMPERATURE},
+                    )
+                    _wall_s = time.monotonic() - _start
                 _backend = resp.headers.get("X-SM-LLM-Backend")
                 model = _backend or "local-model"
                 refusal = _routing_refusal(resp)
@@ -1022,7 +1127,7 @@ class REMDaemon:
                     specimen = refusal.get("specimen") or ""
                     record_llm_call(
                         "REM", _usage_json(refusal.get("usage")), backend=_backend,
-                        wall_s=time.monotonic() - _start, ceiling_s=None,
+                        wall_s=_wall_s, ceiling_s=None,
                         ok=False, note=f"batch_backlog_{reason}",
                         specimen=specimen or None, prompt_chars=len(prompt))
                     if specimen:
@@ -1045,7 +1150,7 @@ class REMDaemon:
                     )
                     record_llm_call(
                         "REM", None, backend=_backend,
-                        wall_s=time.monotonic() - _start, ceiling_s=None,
+                        wall_s=_wall_s, ceiling_s=None,
                         ok=False, note=f"batch_routing_refused_{refusal['error']}",
                         prompt_chars=len(prompt))
                     self._batch_action = "queue"
@@ -1056,7 +1161,7 @@ class REMDaemon:
                     record_llm_call(
                         "REM", {"usage": usage} if isinstance(usage, dict) else None,
                         backend=_backend,
-                        wall_s=time.monotonic() - _start, ceiling_s=None,
+                        wall_s=_wall_s, ceiling_s=None,
                         ok=False, note=f"batch_http_{resp.status_code}",
                         prompt_chars=len(prompt))
                     if usage is not None:
@@ -1079,12 +1184,11 @@ class REMDaemon:
                         "REM batch response was not JSON (status=%s)", resp.status_code)
                     record_llm_call(
                         "REM", None, backend=_backend,
-                        wall_s=time.monotonic() - _start, ceiling_s=None,
+                        wall_s=_wall_s, ceiling_s=None,
                         ok=False, note="queued", prompt_chars=len(prompt))
                     self._batch_action = "queue"
                     self._last_llm_failure = LLM_FAIL_TRANSPORT
                     return out, None, model
-                _wall_s = time.monotonic() - _start
                 call_timing = call_timing_summary(
                     resp_json, _wall_s, backend=_backend,
                     batch_size=len(sent), prompt_chars=len(prompt))
@@ -1116,6 +1220,10 @@ class REMDaemon:
                     wall_s=_wall_s, ceiling_s=None,
                     note=f"batch={len(sent)}", prompt_chars=len(prompt))
                 parsed_lines = self._parse_jsonl_batch(raw, idx_to_pg, require_summary)
+        except LockReacquireFailed:
+            for it in sent:
+                self._withheld.add(int(it["pg_id"]))
+            raise
         except Exception as exc:
             logger.error("REM batch LLM error: %s", type(exc).__name__)
             if resp is not None and self._batch_action is None:
@@ -1229,7 +1337,8 @@ class REMDaemon:
             return False
         try:
             return await self._apply_fact_result(
-                pg_id, kind, result, conn, loop, original_content=content)
+                pg_id, kind, result, conn.conn if isinstance(conn, _BackupLockHolder) else conn,
+                loop, original_content=content)
         except Exception as exc:
             logger.error(
                 "REM: pg_id=%d apply failed (%s)", pg_id, type(exc).__name__)
@@ -1302,12 +1411,13 @@ class REMDaemon:
                 return False
 
         # Audit log (optional) → then mark rem_reviewed.
+        c = conn.conn if isinstance(conn, _BackupLockHolder) else conn
         try:
             if AUDIT_LOG_PATH:
-                row = await self._fetch_outbox_row(pg_id, conn, loop)
+                row = await self._fetch_outbox_row(pg_id, c, loop)
                 if row:
                     await self._write_audit_log(row, loop)
-            await self._mark_outbox_rem_reviewed(pg_id, conn, loop, kind=kind)
+            await self._mark_outbox_rem_reviewed(pg_id, c, loop, kind=kind)
             outbox_marked = True
         except Exception as exc:
             # Same stranding as a consistency miss: revert the mark so the
@@ -1323,7 +1433,7 @@ class REMDaemon:
 
         # The node is already marked, so a missed notify is tolerable: the ledger sweep re-evaluates the cluster.
         try:
-            await self._notify_nrem(pg_id, conn, loop)
+            await self._notify_nrem(pg_id, c, loop)
         except Exception as exc:
             logger.warning("REM: pg_id=%d NREM notify failed: %s", pg_id, exc)
 
@@ -1372,29 +1482,37 @@ class REMDaemon:
         """Execute one REM scan cycle, returning ``(processed, attempted)`` counts so
         the caller can distinguish idleness (backing off) from failures (keeping BASE).
         """
-        try:
-            await self._release_eligible_write_failed()
-            candidates, label_map, passed_over_map = await self._fetch_non_rem_batch()
-        except Exception as exc:
-            # A dark backlog must not send the item again. Other read errors fail the
-            # same way.
-            logger.warning("REM: backlog read failed (%s) — skipping the cycle", type(exc).__name__)
-            return 0, 0
-        if not candidates:
-            return 0, 0
-
+        processed = 0
+        attempted = 0
         loop = asyncio.get_running_loop()
 
-        # Single AUTOCOMMIT connection shared across all Postgres helpers in this cycle.
-        conn = await loop.run_in_executor(None, self._open_pg_conn)
+        # One lock holder per cycle owns the AUTOCOMMIT connection shared across all helpers.
+        try:
+            conn = await loop.run_in_executor(None, self._open_pg_conn)
+        except Exception as exc:
+            logger.warning("REM: backlog read failed (%s) — skipping the cycle", type(exc).__name__)
+            return 0, 0
+        holder = _BackupLockHolder(conn, self._open_pg_conn)
+        self._lock_holder = holder
         try:
             # Skip if a backup holds the lock EXCLUSIVE. The shared lock drops when conn closes.
-            if not await loop.run_in_executor(None, lambda: _take_shared_backup_lock(conn)):
+            if not await loop.run_in_executor(None, lambda: _take_shared_backup_lock(holder.conn)):
                 logger.info("REM: backup in progress — deferring enrichment cycle.")
                 return 0, 0
 
+            try:
+                await self._release_eligible_write_failed()
+                candidates, label_map, passed_over_map = await self._fetch_non_rem_batch()
+            except Exception as exc:
+                # A dark backlog must not send the item again. Other read errors fail the
+                # same way.
+                logger.warning("REM: backlog read failed (%s) — skipping the cycle", type(exc).__name__)
+                return 0, 0
+            if not candidates:
+                return 0, 0
+
             # Yield to active write sessions — don't enrich during a save burst.
-            if await self._recent_write_happened(conn, loop):
+            if await self._recent_write_happened(holder.conn, loop):
                 logger.debug(
                     "REM: write activity in last %ds — yielding to active writes",
                     WRITE_QUIESCE_SEC,
@@ -1402,7 +1520,7 @@ class REMDaemon:
                 return 0, 0
 
             # REM re-arms faster than NREM; without this yield consolidation never gets the slot.
-            if await loop.run_in_executor(None, lambda: _nrem_is_queuing(conn)):
+            if await loop.run_in_executor(None, lambda: _nrem_is_queuing(holder.conn)):
                 logger.info("REM: NREM is queuing for the LLM slot — yielding this cycle.")
                 return 0, 0
 
@@ -1415,7 +1533,7 @@ class REMDaemon:
                 logger.warning("REM: LLM pool has no free slot — deferring enrichment cycle")
                 return 0, 0
 
-            pg_ids = await self._filter_applied_in_outbox(candidates, conn, loop)
+            pg_ids = await self._filter_applied_in_outbox(candidates, holder.conn, loop)
             deferred = len(candidates) - len(pg_ids)
             if deferred:
                 logger.info(
@@ -1427,7 +1545,7 @@ class REMDaemon:
 
             logger.info("REM cycle: %d fact(s) to process (pg_ids=%s)", len(pg_ids), pg_ids)
 
-            content_map = await self._batch_fetch_content(pg_ids, conn, loop)
+            content_map = await self._batch_fetch_content(pg_ids, holder.conn, loop)
             # Pickup clock for poll_ms, taken once the batch is in hand and before the slow work.
             pickup_wall = time.time()
 
@@ -1477,7 +1595,7 @@ class REMDaemon:
                     for it in sent:
                         self._solo_only.add(it["pg_id"])
                         if await self._process_fact(
-                                it["pg_id"], it["content"], KIND_FACT, conn, loop):
+                                it["pg_id"], it["content"], KIND_FACT, holder, loop):
                             processed += 1
                 elif self._batch_action is None:
                     # A fact missing from a complete paid reply gets one solo
@@ -1487,7 +1605,7 @@ class REMDaemon:
                             continue
                         self._solo_only.add(it["pg_id"])
                         if await self._process_fact(
-                                it["pg_id"], it["content"], KIND_FACT, conn, loop):
+                                it["pg_id"], it["content"], KIND_FACT, holder, loop):
                             processed += 1
                 for it in fact_items:
                     res = results.get(it["pg_id"])
@@ -1495,7 +1613,7 @@ class REMDaemon:
                         continue
                     try:
                         applied = await self._apply_fact_result(
-                            it["pg_id"], KIND_FACT, res, conn, loop,
+                            it["pg_id"], KIND_FACT, res, holder, loop,
                             original_content=it["content"])
                     except Exception as exc:
                         logger.error(
@@ -1512,13 +1630,13 @@ class REMDaemon:
                                 it["pg_id"],
                                 {**call_timing,
                                  "poll_ms": self._poll_ms(pickup_wall, row.get("created_at"))},
-                                conn, loop)
+                                holder.conn, loop)
             elif fact_items:
                 it = fact_items[0]
                 attempted += 1
                 await self._bump_rem_pickups([it["pg_id"]])
                 if await self._process_fact(
-                        it["pg_id"], it["content"], KIND_FACT, conn, loop):
+                        it["pg_id"], it["content"], KIND_FACT, holder, loop):
                     processed += 1
 
             # Records skipped often enough are drained first, with no yield inside this loop, or a queuing NREM re-starves them (decision 890).
@@ -1531,12 +1649,12 @@ class REMDaemon:
                 attempted += 1
                 await self._bump_rem_pickups([pg_id])
                 if await self._process_fact(
-                        pg_id, content_map[pg_id]["content"], kind, conn, loop):
+                        pg_id, content_map[pg_id]["content"], kind, holder, loop):
                     processed += 1
 
             for solo_done, (pg_id, kind) in enumerate(remaining):
                 # Yield between solo records. A cycle-start check let REM hold the slot for the whole batch while NREM's queue expired.
-                if await loop.run_in_executor(None, lambda: _nrem_is_queuing(conn)):
+                if await loop.run_in_executor(None, lambda: _nrem_is_queuing(holder.conn)):
                     passed_ids = [pid for pid, _ in remaining[solo_done:]]
                     await self._bump_rem_passed_over(passed_ids)
                     logger.info(
@@ -1549,10 +1667,14 @@ class REMDaemon:
                 # Bump only after the yield. A record never reached was not picked up, and rotating it would hide the tail.
                 await self._bump_rem_pickups([pg_id])
                 if await self._process_fact(
-                        pg_id, content_map[pg_id]["content"], kind, conn, loop):
+                        pg_id, content_map[pg_id]["content"], kind, holder, loop):
                     processed += 1
+        except LockReacquireFailed as exc:
+            logger.error("REM: shared backup lock reacquire failed — aborting cycle: %s", exc)
+            return processed, attempted
         finally:
-            await loop.run_in_executor(None, conn.close)
+            await loop.run_in_executor(None, holder.close)
+            self._lock_holder = None
 
         return processed, attempted
 

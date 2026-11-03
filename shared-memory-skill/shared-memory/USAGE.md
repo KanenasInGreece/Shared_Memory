@@ -184,6 +184,6 @@ bash <skill-dir>/scripts/update_skill.sh
 
 The token is `AGENT_TOKEN` in `<skill-dir>/.env`, mode 600. Do not `.` the file, `cat` it, or paste it. The script never overwrites `.env`. It appends any example key the file does not already name. If the secret is under another name, that append adds the placeholder `AGENT_TOKEN` and the client sends it. Move the real value onto `AGENT_TOKEN` before the next call.
 
-While `doctor` says incompatible, `search` still works and `save`, `save_decision`, and `save_retrospective` stay paused.
+While `doctor` says incompatible, `search` still works; pause writes — do not `save`, `save_decision`, or `save_retrospective` until updated.
 
 After the update, compare `<!-- shared-memory:constitution-snippet vN -->` in the constitution with `<skill-dir>/CONSTITUTION_SNIPPET.md`. A newer marker: show the operator the new block and what changed. Do not overwrite it. No marker: ask before splicing one.

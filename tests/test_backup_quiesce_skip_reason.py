@@ -61,16 +61,16 @@ qcurl() {
   fi
   printf '%s\\n%s' "$FAKE_BODY" "$FAKE_HTTP_CODE"
 }
-grn() { :; }
-ylw() { :; }
+grn() { echo "$*"; }
+ylw() { echo "$*"; }
 json_get() { echo ""; }
 '''
 
 
 def _run(env_extra: dict) -> subprocess.CompletedProcess:
     """Run quiesce() standalone with the given extra shell vars exported,
-    then print rc/QUIESCED/QUIESCE_MODE/QUIESCE_SKIP_REASON so the test can
-    assert on them without needing the rest of backup.sh's machinery.
+    then print rc/QUIESCED/QUIESCE_SKIP_REASON so the test can assert on them
+    without needing the rest of backup.sh's machinery.
 
     L6 (PR #308 review): the composed harness runs under `set -uo pipefail`,
     matching backup.sh:28's own setting -- without it, an unset-variable
@@ -79,7 +79,6 @@ def _run(env_extra: dict) -> subprocess.CompletedProcess:
     source = _extract_quiesce_source()
     script = "set -uo pipefail\n" + _QCURL_STUB + "\n" + source + '''
 QUIESCED=0
-QUIESCE_MODE=""
 QUIESCE_SKIP_REASON=""
 GATEWAY_URL="${GATEWAY_URL:-http://gateway.example:8888}"
 BACKUP_QUIESCE_MAX_SECONDS="${BACKUP_QUIESCE_MAX_SECONDS:-120}"
@@ -88,7 +87,6 @@ quiesce
 rc=$?
 echo "RC=$rc"
 echo "QUIESCED=$QUIESCED"
-echo "QUIESCE_MODE=$QUIESCE_MODE"
 echo "QUIESCE_SKIP_REASON=$QUIESCE_SKIP_REASON"
 '''
     env = {"PATH": "/usr/bin:/bin", **env_extra}
@@ -162,7 +160,7 @@ def test_successful_quiesce_200_sets_full_and_no_skip_reason():
     })
     assert _field(proc.stdout, "RC") == "0"
     assert _field(proc.stdout, "QUIESCED") == "1"
-    assert _field(proc.stdout, "QUIESCE_MODE") == "full"
+    assert "client writes shed, daemons fenced" in proc.stdout
     assert _field(proc.stdout, "QUIESCE_SKIP_REASON") == ""
 
 
@@ -174,4 +172,4 @@ def test_drain_timeout_202_sets_timeout_mode():
     })
     assert _field(proc.stdout, "RC") == "0"
     assert _field(proc.stdout, "QUIESCED") == "1"
-    assert _field(proc.stdout, "QUIESCE_MODE") == "timeout"
+    assert "daemons not fenced" in proc.stdout
