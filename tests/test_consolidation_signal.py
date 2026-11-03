@@ -104,6 +104,8 @@ def _no_census_row(cycle_type):
         # NULL-until-recorded contract as dead_lettered_clusters.
         "singleton_clusters": None,
         "insight_gate_skips": None,
+        "rem_pending_clusters": None,
+        "rem_pending_incomplete": None,
     }
 
 

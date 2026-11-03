@@ -908,6 +908,29 @@ async def test_fold_stop_without_string_content_is_gateway_422(monkeypatch):
         monkeypatch.setattr(cl, "fetch_reversal_context", lambda conn, ids: [])
         monkeypatch.setattr(cl, "fetch_insight_outbox_rows", lambda conn, ids: [])
         daemon = cl.ConsolidationDaemon()
+
+        class _Ready:
+            def session(self):
+                return self
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return False
+
+            async def run(self, query, **params):
+                ids = list(params.get("ids") or [])
+                class _R:
+                    async def data(_self):
+                        return [
+                            {"pg_id": i, "rem_processed": True,
+                             "superseded": False, "rem_invalid": False}
+                            for i in ids
+                        ]
+                return _R()
+
+        daemon.driver = _Ready()
         daemon._find_fresh_insight_clusters = AsyncMock(
             return_value=[{
                 "entity": "OutboxPattern",

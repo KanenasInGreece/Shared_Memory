@@ -102,6 +102,13 @@ class _Neo:
         return False
 
     async def run(self, query, **params):
+        if "AS rem_invalid" in query:
+            ids = list(params.get("ids") or [])
+            return _Result([
+                {"pg_id": i, "rem_processed": True, "superseded": False,
+                 "rem_invalid": False}
+                for i in ids
+            ])
         if "NOT n.pg_id IN $blocked" in query:
             blocked = set(params.get("blocked") or [])
             self.blocked_seen.append(blocked)
@@ -248,7 +255,7 @@ async def test_fold_backlog_row_stops_the_second_call(monkeypatch, caplog):
     monkeypatch.setattr(cl, "fetch_insight_outbox_rows", lambda conn, ids: [])
 
     daemon = cl.ConsolidationDaemon()
-    daemon.driver = None
+    daemon.driver = _Neo([])
     daemon._find_fresh_insight_clusters = AsyncMock(return_value=[{
         "entity": "OutboxPattern",
         "decision_ids": ids,
@@ -645,6 +652,7 @@ def _fold_daemon(monkeypatch, slots_http):
         monkeypatch.delenv("MOCK_LLM", raising=False)
         monkeypatch.setattr("httpx.AsyncClient.post", slots_http)
     daemon = cl.ConsolidationDaemon()
+    daemon.driver = _Neo([])
     daemon._find_fresh_insight_clusters = AsyncMock(return_value=[{
         "entity": "OutboxPattern",
         "decision_ids": ids,
@@ -769,6 +777,7 @@ async def test_refold_withheld_counts_as_dead_lettered(monkeypatch):
     monkeypatch.setattr(cl, "_crun_finish", lambda *a, **k: finish.update(kwargs=k))
     monkeypatch.setattr(cl, "close_refold_ledger_rows", lambda conn, context: None)
     daemon = cl.ConsolidationDaemon()
+    daemon.driver = _Neo([])
     daemon._find_fresh_insight_clusters = AsyncMock(return_value=[])
     daemon._fold_insight = AsyncMock(return_value=True)
     await daemon.run_insight_cycle()

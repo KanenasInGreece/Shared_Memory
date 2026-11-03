@@ -684,6 +684,7 @@ _PER_TYPE_ROLLUP = {
     "eligible_clusters": 0, "eligible_oldest_age_seconds": None,
     "dead_lettered_clusters": 0, "unchanged_clusters": 0,
     "singleton_clusters": 0, "insight_gate_skips": 0,
+    "rem_pending_clusters": 0, "rem_pending_incomplete": False,
     "truncation_failures": 0, "slot_failures": 0,
     "last_deferred_reason": None, "cycle_seconds_avg": 1.0, "runs_24h": 1,
     "deferred_24h": 0, "idle_24h": 0, "folds_succeeded_24h": 1,

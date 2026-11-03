@@ -20,8 +20,9 @@ from datetime import datetime
 from neo4j import AsyncGraphDatabase
 from ontology import ONT, fact_kind_from_source_ref, origin_location
 from insight_gate import (
-    INSIGHT_AGE_CENSUS_K, CLOSED_RELATION_TYPES, walk_group_reached_set,
-    passes_insight_gate, order_components, match_existing_insight,
+    INSIGHT_AGE_CENSUS_K, CLOSED_RELATION_TYPES, CARRIED_READINESS_CYPHER,
+    walk_group_reached_set, passes_insight_gate, order_components,
+    match_existing_insight, unprocessed_carried,
 )
 from project_axis import PROJECT_SQL, fold_eligible
 from nrem_gate import eligible_domain_level_clusters, project_domain_maps, grounded_fact_groups_cypher
@@ -482,7 +483,13 @@ class _CycleRec:
                  # decision:1121: judgement reach of exactly 1 cannot fold an
                  # insight, so it is excluded from eligible_clusters and
                  # counted on its own.
-                 "singleton_clusters")
+                 "singleton_clusters",
+                 # Distinct judgement sets this insight cycle deferred because
+                 # a carried record is not REM-processed. None until check 1
+                 # succeeds. The flag is True from that moment until every
+                 # fresh set has been checked (fact:3459: a stop in between
+                 # leaves the count as a lower bound).
+                 "rem_pending_clusters", "rem_pending_incomplete")
 
     def __init__(self):
         self.attempted = self.succeeded = self.failed = 0
@@ -506,6 +513,10 @@ class _CycleRec:
         self.unchanged_clusters = 0
         # Singleton components (judgement reach of exactly 1) are partitioned out before the census. 0 once a census has run.
         self.singleton_clusters = 0
+        # Both stay None until the insight cycle's first readiness check
+        # succeeds, and a fact-consolidation row never sets them.
+        self.rem_pending_clusters = None
+        self.rem_pending_incomplete = None
 
     def fold(self, ok):
         self.attempted += 1
@@ -539,6 +550,7 @@ class _CycleRec:
             or self.dead_lettered_clusters
             or self.unchanged_clusters
             or self.singleton_clusters
+            or self.rem_pending_clusters is not None
         ):
             return None
         out = {
@@ -554,6 +566,9 @@ class _CycleRec:
             # decision:1121: judgement reach of exactly 1 cannot fold. Counting it as eligible backlog made every skip look like a stall.
             "singleton_clusters": self.singleton_clusters,
         }
+        if self.rem_pending_clusters is not None:
+            out["rem_pending_clusters"] = self.rem_pending_clusters
+            out["rem_pending_incomplete"] = self.rem_pending_incomplete
         if self.truncation_failed:
             out["truncation_failed"] = self.truncation_failed
         if self.slot_failed:
@@ -3019,8 +3034,10 @@ class ConsolidationDaemon:
                 -[:DOMAIN_OF]->(:Domain)-[:PROJECT_OF]->(:Project)
 
         A fact counts once it is the target of >=1 GROUNDED_IN edge from any
-        judgement (§0's "grounded fact") and is itself non-superseded — the
-        exact §2.1 MEMBERSHIP rule. A fact's own `consolidated` flag plays NO
+        judgement (§0's "grounded fact"), is itself non-superseded, and its
+        node says rem_processed (decision:3453: only a REM-processed node
+        gates NREM; this reverses the element of fact:1149 that treated a
+        REM summary as optional prep). A fact's own `consolidated` flag plays NO
         part here (also §2.1): a `community_summaries` row for a (project,
         domain) group is a single upserted key, so every re-fold must see the
         group's FULL current membership, never a delta — an already-folded
@@ -3891,6 +3908,17 @@ class ConsolidationDaemon:
     # stays in insight_cypher_query, and _fold_insight does not open a
     # Neo4j session.
 
+    async def _fetch_carried_readiness(self, ids) -> list:
+        """Read rem_processed, superseded and rem_invalid for these pg_ids.
+
+        Always issued, including an empty id list. Returning early on an
+        empty list would let a graph outage surface later, in the walk,
+        instead of at this check.
+        """
+        async with self.driver.session() as session:
+            result = await session.run(CARRIED_READINESS_CYPHER, ids=list(ids))
+            return await result.data()
+
     async def run_insight_cycle(self):
         """Insight consolidation pass — ledger-driven like run_ledger_sweep
         (decisions have no :Fact node, so the NOTIFY path is structurally deaf
@@ -3961,21 +3989,137 @@ class ConsolidationDaemon:
                     return False
 
                 # One attempted registry across both refold and fresh paths
+                # A deferred set never enters it.
                 attempted: set[frozenset[int]] = set()
                 # Only ids that actually folded. An aborted fold must not hide a fresh cluster that shares them.
                 folded: set = set()
+                # One entry per distinct judgement set deferred this cycle.
+                # Reversal ids are a function of those ids within the cycle,
+                # so the key is the judgement ids alone.
+                pending: set[frozenset[int]] = set()
+                # Duplicate pg_ids already named in an ERROR this cycle.
+                reported_duplicates: set[int] = set()
+                reversals_by_set: dict[frozenset[int], list] = {}
+                rem_withheld_ids = None
+
+                def _carried(judgement_ids, reversals):
+                    ids = {int(i) for i in judgement_ids}
+                    for row in reversals or []:
+                        retro_id = row.get("retro_id")
+                        if retro_id is not None:
+                            ids.add(int(retro_id))
+                    return ids
+
+                async def _reversals_for(key):
+                    if key not in reversals_by_set:
+                        reversals_by_set[key] = await loop.run_in_executor(
+                            None, lambda k=key: fetch_reversal_context(conn, list(k)))
+                    return reversals_by_set[key]
+
+                async def _rem_withheld():
+                    nonlocal rem_withheld_ids
+                    if rem_withheld_ids is not None:
+                        return rem_withheld_ids
+                    try:
+                        keys = await loop.run_in_executor(
+                            None, lambda: llm_backlog.blocked_keys("rem"))
+                    except Exception:
+                        rem_withheld_ids = False
+                        return rem_withheld_ids
+                    parsed = set()
+                    for key in keys:
+                        try:
+                            parsed.add(int(key))
+                        except (TypeError, ValueError):
+                            continue
+                    rem_withheld_ids = parsed
+                    return rem_withheld_ids
+
+                async def _register_pending(entity, judgement_ids, unprocessed, duplicated):
+                    key = frozenset(int(i) for i in judgement_ids)
+                    if not unprocessed:
+                        return
+                    if key not in pending:
+                        pending.add(key)
+                        rec.rem_pending_clusters = len(pending)
+                        withheld_src = await _rem_withheld()
+                        withheld = []
+                        if isinstance(withheld_src, set):
+                            withheld = sorted(withheld_src.intersection(unprocessed))
+                        blocked = ", ".join(str(i) for i in unprocessed)
+                        message = (
+                            f"NREM insight: '{entity}' ({len(list(judgement_ids))} judgements) "
+                            f"deferred — REM has not processed pg_id(s) [{blocked}]; "
+                            f"folds when REM finishes them"
+                        )
+                        if withheld:
+                            named = ", ".join(str(i) for i in withheld)
+                            message += f"; [{named}] withheld by a REM backlog row"
+                        message += "; see /health rem_daemon."
+                        if duplicated:
+                            named = ", ".join(str(i) for i in duplicated)
+                            message += (
+                                f"; graph-integrity defect: more than one node "
+                                f"for pg_id(s) [{named}]"
+                            )
+                        logger.warning(message)
+                    # A set already deferred this cycle is not counted or warned
+                    # again. A duplicate spine node is an ERROR of its own, so
+                    # that earlier deferral cannot hide it.
+                    fresh = []
+                    for raw in duplicated or []:
+                        try:
+                            pid = int(raw)
+                        except (TypeError, ValueError):
+                            continue
+                        if pid not in reported_duplicates:
+                            reported_duplicates.add(pid)
+                            fresh.append(pid)
+                    if fresh:
+                        logger.error(
+                            "NREM insight: graph-integrity defect: more than "
+                            "one node for pg_id(s) [%s]",
+                            ", ".join(str(i) for i in fresh),
+                        )
+
+                # Check 1 runs on every cycle. No refold means no reversal
+                # read, and the readiness read still goes out with an empty
+                # id list. A failure here folds nothing.
+                try:
+                    refold_carried = set()
+                    refold_plan = []
+                    for old_id, entity, src_ids, prev_content, prev_metadata in refolds:
+                        key = frozenset(int(i) for i in src_ids)
+                        reversals = await _reversals_for(key)
+                        refold_carried.update(_carried(src_ids, reversals))
+                        refold_plan.append(
+                            (old_id, entity, src_ids, prev_content,
+                             prev_metadata or {}, key, reversals))
+                    check1_rows = await self._fetch_carried_readiness(sorted(refold_carried))
+                except Exception as exc:
+                    logger.warning(
+                        "NREM insight: readiness check 1 (refolds) failed — "
+                        "no fold this cycle: %s", exc)
+                    return
+                rec.rem_pending_clusters = 0
+                rec.rem_pending_incomplete = True
+
                 refold_withheld = 0
-                for old_id, entity, src_ids, prev_content, prev_metadata in refolds:
-                    prev_metadata = prev_metadata or {}
+                for (old_id, entity, src_ids, prev_content, prev_metadata,
+                     f_ids, reversals) in refold_plan:
                     if _dead_lettered(entity, src_ids):
                         refold_withheld += 1
                         continue
-                    f_ids = frozenset(int(i) for i in src_ids)
                     if f_ids in attempted:
                         logger.debug(
                             "Insight cycle: component %s already attempted this pass — skipping.",
                             sorted(src_ids),
                         )
+                        continue
+                    carried = _carried(src_ids, reversals)
+                    unprocessed, duplicated = unprocessed_carried(carried, check1_rows)
+                    if unprocessed:
+                        await _register_pending(entity, src_ids, unprocessed, duplicated)
                         continue
                     attempted.add(f_ids)
                     logger.info(
@@ -3987,17 +4131,35 @@ class ConsolidationDaemon:
                         conn, entity, src_ids, previous_insight=prev_content,
                         summary_ids=prev_metadata.get("summary_ids"),
                         project=prev_metadata.get("project"),
-                        run_id=rec.run_id, cyc=rec)
+                        run_id=rec.run_id, cyc=rec, reversals=reversals)
                     rec.fold(ok)
                     if ok:
                         folded.update(src_ids)
 
                 clusters = await self._find_fresh_insight_clusters()
-                rec.insight_gate_skips = self._insight_gate_skips
                 # Normalise once per cluster: judgement_ids come from the walk's own label
                 # keys (ints, never None), so every later pass over `clusters` reads this.
                 for c in clusters:
                     c["ids"] = [int(i) for i in c["judgement_ids"] if i is not None]
+
+                # Check 2 is the cycle's second readiness read, issued even
+                # when no fresh cluster carries an id. A failure stops every
+                # fold still ahead. Refolds already done were checked by
+                # check 1, and the deferrals counted so far stay.
+                try:
+                    fresh_carried = set()
+                    for c in clusters:
+                        key = frozenset(c["ids"])
+                        reversals = await _reversals_for(key)
+                        c["reversals"] = reversals
+                        fresh_carried.update(_carried(c["ids"], reversals))
+                    check2_rows = await self._fetch_carried_readiness(sorted(fresh_carried))
+                except Exception as exc:
+                    logger.warning(
+                        "NREM insight: readiness check 2 (fresh clusters) failed — "
+                        "no further fold this cycle: %s", exc)
+                    return
+                rec.insight_gate_skips = self._insight_gate_skips
 
                 # Identity is the set of judgement pg_ids. 'same' appends onto the existing insight; 'covered' adds nothing; the other classes fold, and subset supersession resolves 'supersedes' at write time.
                 existing_insights = await loop.run_in_executor(
@@ -4069,6 +4231,23 @@ class ConsolidationDaemon:
                         singleton_now,
                     )
 
+                # Readiness is after the other partitions. A set that is not
+                # processed is logged once and leaves the census. The flag
+                # turns false only after every remaining fresh set is checked
+                # (fact:3459). A stop before this line leaves it true.
+                ready_clusters = []
+                for c in clusters:
+                    reversals = c.get("reversals") or []
+                    carried = _carried(c["ids"], reversals)
+                    unprocessed, _duplicated = unprocessed_carried(carried, check2_rows)
+                    if unprocessed:
+                        await _register_pending(
+                            c["entity"], c["ids"], unprocessed, _duplicated)
+                        continue
+                    ready_clusters.append(c)
+                clusters = ready_clusters
+                rec.rem_pending_incomplete = False
+
                 # Census before folding so a crash still records eligibility. Age uses the full judgement reach, including a component whose only new member is a retrospective.
                 cluster_id_lists = [c["ids"] for c in clusters]
                 all_member_ids = [i for ids in cluster_id_lists for i in ids]
@@ -4102,7 +4281,8 @@ class ConsolidationDaemon:
                     ok = await self._fold_insight(
                         conn, c["entity"], ids,
                         summary_ids=[thematic_id] if thematic_id is not None else [],
-                        project=proj, run_id=rec.run_id, cyc=rec)
+                        project=proj, run_id=rec.run_id, cyc=rec,
+                        reversals=c.get("reversals") or [])
                     rec.fold(ok)
                     if ok:
                         folded.update(ids)
@@ -4118,7 +4298,8 @@ class ConsolidationDaemon:
             await loop.run_in_executor(None, conn.close)
 
     async def _fold_insight(self, conn, entity, judgement_ids, previous_insight=None,
-                            summary_ids=None, project=None, run_id=None, cyc=None):
+                            summary_ids=None, project=None, run_id=None, cyc=None,
+                            reversals=None):
         """§3.2/§4.3 Path B — one insight fold: fetch each JUDGEMENT's own
         content from Postgres (strictly — nothing else; see
         `generate_insight_slots`) → ONE LLM call fills the per-judgement
@@ -4198,8 +4379,9 @@ class ConsolidationDaemon:
         summary_ids = sorted({int(s) for s in (summary_ids or []) if s is not None})
 
         # decision:1205: reversal lines are already machine-built and copied verbatim into the scaffold, so no preservation gate has to protect them.
-        reversals = await loop.run_in_executor(
-            None, lambda: fetch_reversal_context(conn, src_ids))
+        # The caller read these rows in this cycle's readiness check. Reading
+        # them again here could render a retrospective the check did not see.
+        reversals = list(reversals or [])
         reversal_lines = [
             f"Decision pg_id={r['decision_id']} "
             f"(\"{(r['decision_title'] or '').splitlines()[0][:80]}\") "

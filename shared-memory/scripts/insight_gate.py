@@ -80,6 +80,78 @@ def _walk_step_cypher() -> str:
 WALK_STEP_CYPHER: str = _walk_step_cypher()
 
 
+def carried_readiness_cypher() -> str:
+    """Rows for the ids one insight fold would put in its prompt.
+
+    The alias ``AS rem_invalid`` appears only here, so a rig can recognise
+    this read by its text. The caller issues it even when ``$ids`` is empty:
+    a graph outage must fail the readiness check, not a later walk.
+    """
+    return (
+        f"MATCH (n) WHERE (n:{ONT.fact} OR n:{ONT.decision} OR n:{ONT.retrospective})"
+        f" AND n.pg_id IN $ids"
+        f" RETURN n.pg_id AS pg_id,"
+        f" coalesce(n.rem_processed, false) AS rem_processed,"
+        f" coalesce(n.superseded, false) AS superseded,"
+        f" coalesce(n.rem_invalid, false) AS rem_invalid"
+    )
+
+
+CARRIED_READINESS_CYPHER: str = carried_readiness_cypher()
+
+
+def _flag(value) -> bool:
+    if value is True or value == 1:
+        return True
+    if isinstance(value, str) and value.strip().lower() == "true":
+        return True
+    return False
+
+
+def unprocessed_carried(carried_ids, rows) -> tuple[list[int], list[int]]:
+    """Return carried ids that are not ready to fold, and the subset with more than one spine node.
+
+    A missing node waits; one superseded row is exempt; any other id is ready
+    only when rem_processed is set, an invalid node included; a second spine
+    node is never exempted (fact:3458 measured no pg_id with two spine nodes);
+    both lists are ascending ints without repeats, and a row outside the
+    carried ids is ignored.
+    """
+    wanted: list[int] = []
+    seen: set[int] = set()
+    for raw in carried_ids:
+        try:
+            pid = int(raw)
+        except (TypeError, ValueError):
+            continue
+        if pid not in seen:
+            seen.add(pid)
+            wanted.append(pid)
+    by_id: dict[int, list] = {}
+    for row in rows:
+        try:
+            pid = int(row["pg_id"])
+        except (TypeError, ValueError, KeyError):
+            continue
+        if pid not in seen:
+            continue
+        by_id.setdefault(pid, []).append(row)
+    unprocessed: list[int] = []
+    duplicated: list[int] = []
+    for pid in sorted(wanted):
+        group = by_id.get(pid, [])
+        if len(group) == 0:
+            unprocessed.append(pid)
+        elif len(group) > 1:
+            unprocessed.append(pid)
+            duplicated.append(pid)
+        elif _flag(group[0].get("superseded")):
+            continue
+        elif not _flag(group[0].get("rem_processed")):
+            unprocessed.append(pid)
+    return unprocessed, duplicated
+
+
 class _UnionFind:
     """Disjoint-set over pg_ids — connectivity backbone for the components.
     Path-halving find, union by attach-to-other-root (no rank tracking

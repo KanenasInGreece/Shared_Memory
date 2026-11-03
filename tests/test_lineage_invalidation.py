@@ -239,7 +239,6 @@ async def test_lineage_leg3_disabled_using_the_real_summary_ids_c4s_fold_actuall
             (245, "Decision A\n\nrationale", "shared-memory-GitHub", "decision", {}),
             (267, "Decision B\n\nrationale", "shared-memory-GitHub", "decision", {}),
         ]},
-        {"rowcount": 0, "rows": []},                          # reversal leg 1
         {"rowcount": 2, "rows": [(101,), (102,)]},             # outbox snapshot
         {"rowcount": 1, "rows": [(77,)]},                      # INSERT
         {"rowcount": 2, "rows": []},                           # outbox flip
