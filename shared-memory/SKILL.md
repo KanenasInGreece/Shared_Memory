@@ -219,18 +219,18 @@ Graph expansion on a judgement hit returns `belonging`: `{project, domains}`. Th
 Worked contract. Anonymous `/health`, then `--version`:
 
 ```json
-{"status":"ok","version":"1.0.44","api_version":4}
+{"status":"ok","version":"1.0.45","api_version":5}
 ```
 
 ```json
-{"version": "1.0.44", "api_version": 4, "tool": "shared-memory-framework"}
+{"version": "1.0.45", "api_version": 5, "tool": "shared-memory-framework"}
 ```
 
 `doctor` compares this client's `api_version` with the gateway and names which side to upgrade.
 
 ## Self-repair
 
-Run `doctor`. If `compat` is not `ok`, run `bash <skill-dir>/scripts/update_skill.sh`. While incompatible, search is safe and writes pause (fact:870): do not `save`, `save_decision`, or `save_retrospective`. The script fetches every file named in `MANIFEST.txt`, now including `USAGE.md`, and never overwrites `.env`.
+Run `doctor`. If `compat` is not `ok`, run `bash <skill-dir>/scripts/update_skill.sh`. While incompatible, search is safe; pause writes (fact:870): do not `save`, `save_decision`, or `save_retrospective` until updated. The script fetches every file named in `MANIFEST.txt`, now including `USAGE.md`, and never overwrites `.env`.
 
 ## Load when needed
 

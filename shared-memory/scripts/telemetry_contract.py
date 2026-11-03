@@ -66,6 +66,7 @@ __all__ = [
     "INTRODUCED_0_9_88",
     "INTRODUCED_0_9_97",
     "INTRODUCED_0_9_104",
+    "INTRODUCED_1_0_45",
     "DUAL_EMIT_DROP_TARGET",
     "WARNING_KEYS",
     "CATEGORIES",
@@ -83,7 +84,7 @@ __all__ = [
 ]
 
 #: Not a free-running today: this is the fifth version pin, so a missed bump is visible (decision:1832).
-VERSION = "1.0.44"
+VERSION = "1.0.45"
 
 
 def _version_tuple(v: str) -> tuple:
@@ -166,6 +167,7 @@ INTRODUCED_1_0_41 = "1.0.41"
 #: Encoder key flags and the auth_failed value.
 INTRODUCED_1_0_42 = "1.0.42"
 INTRODUCED_1_0_44 = "1.0.44"
+INTRODUCED_1_0_45 = "1.0.45"
 #: A lone consolidation stall stopped degrading the top /health status (fact:2996 ruling 3).
 INTRODUCED_1_0_17 = "1.0.17"
 #: Quiesce sheds writes on auth-off installs and counts every write in flight (fact:2996 ruling 1: the container check).
@@ -431,7 +433,7 @@ HEALTH: dict[str, dict] = {
     "llm_suspect_wedged[]": _k("list", "llm",
                                moved_to="telemetry:llm.suspect_wedged",
                                removed_in=DUAL_EMIT_DROP_TARGET),
-    "llm_pool.*.weight": _k("float", "llm", moved_to="telemetry:llm.pool.*.weight",
+    "llm_pool.*.weight": _k("float", "llm", moved_to=None,
                             removed_in=DUAL_EMIT_DROP_TARGET),
     "llm_pool.*.inflight": _k("int", "llm", moved_to="telemetry:llm.pool.*.inflight",
                               removed_in=DUAL_EMIT_DROP_TARGET),
@@ -528,8 +530,7 @@ HEALTH: dict[str, dict] = {
     "config.llm_backends[].url": _k("str", "llm",
                                     moved_to="telemetry:config.llm_backends[].url",
                                     removed_in=DUAL_EMIT_DROP_TARGET),
-    "config.llm_backends[].weight": _k("float", "llm",
-                                       moved_to="telemetry:config.llm_backends[].weight",
+    "config.llm_backends[].weight": _k("float", "llm", moved_to=None,
                                        removed_in=DUAL_EMIT_DROP_TARGET),
     "config.llm_backends[].has_credential": _k(
         "bool", "credentials",
@@ -823,10 +824,12 @@ TELEMETRY: dict[str, dict] = {
     "neo4j.decisions_rem_pending": _k("int", "rem"),
     "neo4j.rem_dead_lettered": _k("int", "rem", moved_to="telemetry:rem.dead_lettered",
                                   removed_in=TELEMETRY_DUAL_EMIT_DROP_TARGET),
-    "neo4j.rem_failing": _k("int", "rem", moved_to="telemetry:rem.failing",
-                            removed_in=TELEMETRY_DUAL_EMIT_DROP_TARGET),
-    "neo4j.rem_max_attempts": _k("int", "rem", moved_to="telemetry:rem.max_attempts",
-                                 removed_in=TELEMETRY_DUAL_EMIT_DROP_TARGET),
+    "neo4j.rem_failing": _k("int", "rem", moved_to=None,
+                            removed_in=TELEMETRY_DUAL_EMIT_DROP_TARGET,
+                            note="the value was removed in 1.0.45"),
+    "neo4j.rem_max_attempts": _k("int", "rem", moved_to=None,
+                                 removed_in=TELEMETRY_DUAL_EMIT_DROP_TARGET,
+                                 note="the value was removed in 1.0.45"),
     "neo4j.rem_passed_over_total": _k("int", "rem", unit="_total",
                                       moved_to="telemetry:rem.passed_over",
                                       removed_in=TELEMETRY_DUAL_EMIT_DROP_TARGET),
@@ -860,11 +863,11 @@ TELEMETRY: dict[str, dict] = {
                                 "superseded record is excluded. A withheld "
                                 "record shows degraded.")),
     "rem.failing": _k("int", "rem", since=INTRODUCED_0_9_74,
-                      note="always 0."),
+                      removed_in=INTRODUCED_1_0_45, note="always 0."),
     "rem.passed_over": _k("int", "rem", since=INTRODUCED_0_9_74),
     "rem.starved_pending": _k("int", "rem", since=INTRODUCED_0_9_74),
     "rem.max_attempts": _k("int", "rem", since=INTRODUCED_0_9_74,
-                           note="always 0."),
+                           removed_in=INTRODUCED_1_0_45, note="always 0."),
     "rem.throughput_per_hour": _k("float|null", "rem", since=INTRODUCED_0_9_74, note=(
         "records REM stamped in the last hour, from the durable "
         "technical_docs.rem_timing clock")),
@@ -948,7 +951,8 @@ TELEMETRY: dict[str, dict] = {
     "llm.reserved[]": _k("list", "llm", since=INTRODUCED_0_9_74),
     "llm.oldest_inflight_age_s": _k("float|null", "llm", unit="_s", since=INTRODUCED_0_9_74),
     "llm.suspect_wedged[]": _k("list", "llm", since=INTRODUCED_0_9_74),
-    "llm.pool.*.weight": _k("float", "llm", since=INTRODUCED_0_9_74),
+    "llm.pool.*.weight": _k("float", "llm", since=INTRODUCED_0_9_74,
+                            removed_in=INTRODUCED_1_0_45),
     "llm.pool.*.inflight": _k("int", "llm", since=INTRODUCED_0_9_74),
     "llm.pool.*.routed": _k("int", "llm", since=INTRODUCED_0_9_74),
     "llm.pool.*.routed_pct": _k("float", "llm", unit="_pct", since=INTRODUCED_0_9_74),
@@ -959,6 +963,12 @@ TELEMETRY: dict[str, dict] = {
     "llm.pool.*.last_call.ts": _k("str|null", "llm", since=INTRODUCED_1_0_41, note="UTC time of the last chat status, or null when this process has not forwarded one. 503 and 504 can be the status this gateway returned when no upstream status arrived; last_call.origin says which."),
     "llm.pool.*.last_call.status": _k("int|null", "llm", since=INTRODUCED_1_0_41, note="HTTP status of that call, or null when this process has not forwarded one. A 2xx is upstream. 500, 503 and 504 may be gateway-made; origin distinguishes them."),
     "llm.pool.*.last_call.origin": _k("str|null", "llm", since=INTRODUCED_1_0_41, note="upstream when the backend answered, gateway when this process recorded the status because no upstream status arrived, null before any call"),
+    "llm.pool.*.max_wait_expired": _k(
+        "int", "llm", since=INTRODUCED_1_0_45,
+        note="cumulative count of requests that exceeded max_wait_s on this backend"),
+    "llm.pool.*.max_wait_expired_last_ts": _k(
+        "str|null", "llm", since=INTRODUCED_1_0_45,
+        note="UTC timestamp of the last max_wait_s expiration on this backend, or null if none"),
     "llm.affinity.hits": _k("int", "llm", since=INTRODUCED_0_9_74),
     "llm.affinity.misses": _k("int", "llm", since=INTRODUCED_0_9_74),
     "llm.affinity.hit_rate": _k("float|null", "llm", since=INTRODUCED_0_9_74),
@@ -1057,7 +1067,8 @@ TELEMETRY: dict[str, dict] = {
         "int|null", "capacity", unit="_bytes", since=INTRODUCED_0_9_74),
     "config.llm_backends[]": _k("list", "llm", since=INTRODUCED_0_9_74),
     "config.llm_backends[].url": _k("str", "llm", since=INTRODUCED_0_9_74),
-    "config.llm_backends[].weight": _k("float", "llm", since=INTRODUCED_0_9_74),
+    "config.llm_backends[].weight": _k("float", "llm", since=INTRODUCED_0_9_74,
+                                       removed_in=INTRODUCED_1_0_45),
     "config.llm_backends[].has_credential": _k("bool", "credentials", since=INTRODUCED_0_9_74),
     "config.llm_backends[].model": _k("str|null", "llm", since=INTRODUCED_0_9_74),
     "config.llm_backends[].n_ctx": _k("int|null", "llm", since=INTRODUCED_0_9_74),
@@ -1928,6 +1939,8 @@ CONDITIONAL: frozenset = frozenset({
     "telemetry:config.llm_backends[].has_credential",
     "telemetry:config.llm_backends[].model",
     "telemetry:config.llm_backends[].n_ctx",
+    "telemetry:config.llm_backends[].max_output_tokens",
+    "telemetry:config.llm_backends[].priority",
     "telemetry:config.llm_backends[].max_inflight",
     "telemetry:config.llm_backends[].price_per_mtok_in",
     "telemetry:config.llm_backends[].price_per_mtok_out",
@@ -2251,8 +2264,9 @@ def render_markdown() -> str:
         a("|---|---|---|")
         for endpoint, path, spec in stamped:
             if spec["removed_in"] == stamp:
+                target = f"`{spec['moved_to']}`" if spec["moved_to"] is not None else "removed, no replacement"
                 a(f"| `GET /{'health' if endpoint == 'health' else 'memory/telemetry'}` "
-                  f"| `{path}` | `{spec['moved_to']}` |")
+                  f"| `{path}` | {target} |")
         a("")
     a("## `GET /health`")
     a("")

@@ -17,6 +17,7 @@ import os
 import pwd
 import random
 import re
+import secrets
 import socket
 import struct
 import time
@@ -129,10 +130,11 @@ def _short(value: Any, cap: int = 200) -> str:
     return text[:cap] + "…[truncated]"
 
 
-# FRAMEWORK_VERSION is the build string and may drift. API_VERSION is the wire contract with memory_bridge.py; bump it only when shape, auth, or routes break older clients.
-FRAMEWORK_VERSION = "1.0.44"
-# API v2: retrospective is a full record. v4: unregistered project is 400 (proposal / new_project / sentinel).
-API_VERSION = 4
+# FRAMEWORK_VERSION is the build string and may drift.
+FRAMEWORK_VERSION = "1.0.45"
+# API_VERSION is the wire contract; bump only when shape, auth, routes, or a monitor
+# contract change breaks older clients. v5: telemetry contract key removal.
+API_VERSION = 5
 CLIENT_VERSION_HEADER = "X-SM-Api-Version"
 #: Client build, not API_VERSION. The same wire version can hide an older build, and a client that omits the header is not counted.
 CLIENT_BUILD_HEADER = "X-Shared-Memory-Client"
@@ -629,7 +631,7 @@ def threads_left_ungrounded(rows: list[dict], fact_id: int) -> list[dict]:
                 continue
             if g.get("superseded", False):
                 continue
-            # Role check (R1)
+            # Role check
             role = g.get("role")
             # Only based_on holds the decision up (decision:2802: refuse a supersession that removes a decision's last based-on fact until the operator answers). An explicit informed_by does not.
             if role is not None:
@@ -1255,8 +1257,18 @@ _backup_quiesce: bool = False
 # Clock seam for the backup quiesce lifecycle and write tracking.
 _now = time.monotonic
 
-# Quiesce generation, incremented at the start of every _end_quiesce.
+# Quiesce generation, incremented only at the start of _end_quiesce.
 _quiesce_generation: int = 0
+
+# Identifies the fence backup.sh compares across its dumps.
+_quiesce_process_token: str = secrets.token_hex(8)
+_quiesce_fence_acquisitions: int = 0
+
+
+def _wire_quiesce_generation() -> str:
+    """Wire value of quiesce_generation: <process token>-<_quiesce_fence_acquisitions>."""
+    return f"{_quiesce_process_token}-{_quiesce_fence_acquisitions}"
+
 
 # In-flight write tracking.
 _writes_in_flight: int = 0
@@ -9917,8 +9929,6 @@ class MemoryCoordinator:
                 "facts_unconsolidated": sum(r["n"] for r in facts if r["rem"] and not r["con"]),
                 "decisions_total":      sum(r["n"] for r in decisions),
                 "decisions_rem_pending": sum(r["n"] for r in decisions if not r["rem"] and not r["superseded"]),
-                "rem_failing":          0,
-                "rem_max_attempts":     0,
                 # decision 890: fairness gauge for the batch-versus-solo yield. It reads 0 until a solo backlog re-exercises that path.
                 "rem_passed_over_total": sum(r["n"] * r["p"] for r in attempts),
                 "rem_starved_pending":  sum(r["n"] for r in attempts
@@ -11147,11 +11157,9 @@ class MemoryCoordinator:
             )).data()
             attempts = ares
         out = {
-            "failing": 0,
             "passed_over": sum(r["n"] * r["p"] for r in attempts),
             "starved_pending": sum(r["n"] for r in attempts
                                    if r["p"] >= REM_STARVED_THRESHOLD),
-            "max_attempts": 0,
             "throughput_per_hour": float(row["n"]),
             "degeneration_firings": None,
         }
@@ -11521,6 +11529,7 @@ class MemoryCoordinator:
                         "quiesced": _backup_quiesce,
                         "daemons": "fenced" if lock_held else "not_fenced",
                         "lock_held": lock_held,
+                        "quiesce_generation": _wire_quiesce_generation(),
                         "writes_in_flight": _writes_in_flight,
                         "oldest_write_age_s": _oldest_write_age_s(),
                         "worker_batches_in_flight": _worker_batches_in_flight,
@@ -11546,6 +11555,7 @@ class MemoryCoordinator:
                 "quiesced": quiesced,
                 "daemons": daemons,
                 "lock_held": lock_held,
+                "quiesce_generation": _wire_quiesce_generation(),
                 "writes_in_flight": writes_in_flight,
                 "oldest_write_age_s": oldest_write_age_s,
                 "worker_batches_in_flight": worker_batches_in_flight,
@@ -11605,6 +11615,7 @@ class MemoryCoordinator:
             "status": "success",
             "quiesced": _backup_quiesce,
             "lock_held": self._lock_held(),
+            "quiesce_generation": _wire_quiesce_generation(),
             "writes_in_flight": _writes_in_flight,
             "oldest_write_age_s": _oldest_write_age_s(),
             "worker_batches_in_flight": _worker_batches_in_flight,
@@ -11768,7 +11779,7 @@ class MemoryCoordinator:
         - caller_gone → 409 (caller disconnected during wait)
         - max_seconds_invalid → 400 (caller passed an invalid max_seconds value)
         """
-        global _backup_quiesce
+        global _backup_quiesce, _quiesce_fence_acquisitions
         max_s = float(BACKUP_QUIESCE_MAX_SECONDS) if max_seconds is None else float(max_seconds)
         entry_gen = _quiesce_generation
         queue = asyncio.create_task(self._quiesce_lock.acquire())
@@ -11804,6 +11815,9 @@ class MemoryCoordinator:
             _backup_quiesce = True
             if started_here:
                 self._rearm_quiesce_timer(max_s)
+                hook = getattr(self, "quiesce_check_hook", None)
+                if callable(hook):
+                    self._quiesce_check_task = asyncio.create_task(hook())
 
             task = None
             try:
@@ -11887,6 +11901,7 @@ class MemoryCoordinator:
                 if self._quiesce_pending_conn is not None:
                     conn, self._quiesce_pending_conn = self._quiesce_pending_conn, None
                     self._quiesce_conn = conn
+                    _quiesce_fence_acquisitions += 1
 
                     def _on_quiesce_conn_terminated(dead_conn=None):
                         if self._quiesce_conn is conn:
@@ -11955,6 +11970,12 @@ class MemoryCoordinator:
                 conn.terminate()
             except Exception:
                 pass
+        check_task = getattr(self, "_quiesce_check_task", None)
+        if check_task is not None:
+            self._quiesce_check_task = None
+            if not check_task.done():
+                check_task.cancel()
+            check_task.add_done_callback(lambda t: t.exception() if not t.cancelled() else None)
         log.info("backup quiesce: released (ended_by=%s) — writes and daemons resumed", ended_by)
 
     async def _quiesce_ttl(self, max_seconds: float) -> None:

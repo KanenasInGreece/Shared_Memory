@@ -7,6 +7,23 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.0.45] - 2026-11-03
+
+A backup no longer waits for an LLM call, and its manifest says truthfully whether the daemons were fenced for the whole dump. `API_VERSION` is 5: the telemetry contract drops keys, so the monitor must be updated first.
+
+- **The daemons release the backup lock during a chat call.** REM and NREM give up the shared advisory lock just before each chat request and take it back, blocking, before any further store read or write. A reply that arrives during a dump waits for the dump to end. If the lock's connection died during the call, the daemon reconnects; if that fails it writes nothing and withholds the item in memory with no paid row. One lock holder per cycle owns the connection, so later helpers use the replacement. REM's recovery write for failed writes now runs under the lock. Chat wall time no longer includes the wait for a dump.
+- **Fence truth in `backup.sh`.** The script reads `lock_held` and a fence identity from `/admin/outbox` after the drain and after the dumps, and re-arms the dead-man timer before dumping. The manifest's `quiesce_mode` is `full` only when the same fence held throughout; `lost_during_dump` when it lapsed, was replaced or the re-arm was a new quiesce; `fence_unknown` when a reading failed. `--verify` prints the mode on the false branch. With `BACKUP_QUIESCE_REQUIRED=1` a failed set is not promoted, and only the newest failed pair is kept, as `sm-backup-failed-latest.*`. A failed resume no longer skips the clean-up of the token files. `/admin/outbox` and `/admin/backup` return `quiesce_generation`, a per-process token and an acquisition count.
+- **One logged backend check per backup.** At the start of a quiesce, each self-hosted backend with a request in flight is read once: `/slots` (llama.cpp) or `/metrics` (vLLM), and the log line `quiesce-backend-check` records the signal, the derived counts and the time to answer. Nothing is ended, no prompt text is logged, a paid backend is not contacted, and an idle backup logs `no_request_in_flight`. A busy real llama-server answered in 0.037 s.
+- **Optional `max_wait_s` per backend** in `LLM_BACKENDS_JSON`, in seconds from sending the request to the complete reply. Absent means no limit, the default. On expiry the call is backlogged as `connection_lost` and does not move to the next backend; `llm.pool.*.max_wait_expired` and its timestamp count it. It is unmeasured and meant for paid backends; a long local generation should not carry one. An invalid value stops the gateway (exit 78), and `check_config` and `migrate_env` refuse the same values.
+- **Removed:** the `weight` field (ignored with one warning if a config still has it, never refused; `install_llm_backends.sh` no longer asks for it), and the always-zero `rem.failing`, `rem.max_attempts`, `neo4j.rem_failing`, `neo4j.rem_max_attempts`. `llm.pool.*.weight` and `config.llm_backends[].weight` are dropped from both endpoints.
+- **`API_VERSION` 5.** A client still on 4 reads incompatible in `doctor` (exit 1); search and writes keep working and the gateway logs the skew. Update every client in one pass. The skill text now says pausing writes is an instruction to the agent, not a guard.
+- **A fold set is bought at most once per cycle** across the refold and fresh paths.
+- **Restore warns** with the PID and the stop command when this install's gateway or daemons are running. It does not refuse.
+
+### Dependency sweep, 2026-11-03
+
+fastmcp moves to 4.1.2 in `mcp/vector-skill.py`, `requirements-mcp.txt` and `requirements-mcp.lock`, and to 3.4.10 in `requirements.txt` and `requirements.lock`, for GHSA-7xgj-8392-5q4r and GHSA-vqqp-x5qm-5qp4; both fixes passed the 14-day floor today. openapi-pydantic follows to 0.6.0 in `requirements-mcp.lock`. The scan of 100 pinned pairs finds no advisory. `requirements-gateway.lock` is unchanged.
+
 ## [1.0.44] - 2026-11-02
 
 A dream request now goes to the cheapest backend that can hold it, moves up only on fixed signals, is tried once per backend, and never stores a cut-off reply. A paid reply that cannot be used ends in a row instead of being bought again.

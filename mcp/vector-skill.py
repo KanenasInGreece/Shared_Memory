@@ -1,6 +1,6 @@
 # /// script
 # requires-python = ">=3.10"
-# dependencies = ["fastmcp==4.0.3", "httpx==0.28.1", "certifi==2026.10.23"]
+# dependencies = ["fastmcp==4.1.2", "httpx==0.28.1", "certifi==2026.10.23"]
 # ///
 #
 # PEP 723 inline metadata: the connector declares its own dependencies, so the
@@ -213,11 +213,10 @@ mcp = FastMCP("Local_RAG_Orchestrator")
 COORDINATOR_BASE = os.environ.get("COORDINATOR_URL", "http://localhost:8888")
 AGENT_ID = os.environ.get("AGENT_ID", "vector_skill")
 
-# The wire contract, kept in step with coordinator.py and memory_bridge.py; on
-# v4 a fact save without a registered metadata.project is rejected 400 carrying
-# project_required or project_unknown plus near-match proposals.
-API_VERSION = 4
-VERSION = "1.0.44"
+# API_VERSION is the wire contract; bump only when shape, auth, routes, or a monitor
+# contract change breaks older clients. v5: telemetry contract key removal.
+API_VERSION = 5
+VERSION = "1.0.45"
 CLIENT_VERSION_HEADER = "X-SM-Api-Version"
 # Framework build, separate from api_version, so two clients on the same wire contract can still be counted apart in clients.versions_seen.
 CLIENT_BUILD_HEADER = "X-Shared-Memory-Client"

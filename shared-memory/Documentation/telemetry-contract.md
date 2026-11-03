@@ -3,7 +3,7 @@
 
 # The Telemetry Contract
 
-Contract version **1.0.44**. Every key the gateway emits on `GET /health` and `GET /memory/telemetry`, what it means, what it is measured in, when it arrived, and where it is going.
+Contract version **1.0.45**. Every key the gateway emits on `GET /health` and `GET /memory/telemetry`, what it means, what it is measured in, when it arrived, and where it is going.
 
 ## The roles
 
@@ -153,7 +153,7 @@ Each key below was moved to a new home and served from both places while consume
 | `GET /health` | `config.llm_backends[].private_ok` | `telemetry:config.llm_backends[].private_ok` |
 | `GET /health` | `config.llm_backends[].roles` | `telemetry:config.llm_backends[].roles` |
 | `GET /health` | `config.llm_backends[].url` | `telemetry:config.llm_backends[].url` |
-| `GET /health` | `config.llm_backends[].weight` | `telemetry:config.llm_backends[].weight` |
+| `GET /health` | `config.llm_backends[].weight` | removed, no replacement |
 | `GET /health` | `config.llm_pool_tuning.cooldown_s` | `telemetry:config.llm_pool_tuning.cooldown_s` |
 | `GET /health` | `config.llm_pool_tuning.fail_threshold` | `telemetry:config.llm_pool_tuning.fail_threshold` |
 | `GET /health` | `config.llm_pool_tuning.fail_window_s` | `telemetry:config.llm_pool_tuning.fail_window_s` |
@@ -187,7 +187,7 @@ Each key below was moved to a new home and served from both places while consume
 | `GET /health` | `llm_pool.*.reserved` | `telemetry:llm.pool.*.reserved` |
 | `GET /health` | `llm_pool.*.routed` | `telemetry:llm.pool.*.routed` |
 | `GET /health` | `llm_pool.*.routed_pct` | `telemetry:llm.pool.*.routed_pct` |
-| `GET /health` | `llm_pool.*.weight` | `telemetry:llm.pool.*.weight` |
+| `GET /health` | `llm_pool.*.weight` | removed, no replacement |
 | `GET /health` | `llm_reserved[]` | `telemetry:llm.reserved` |
 | `GET /health` | `llm_routing.routing_backend_at_capacity` | `telemetry:llm.routing.routing_backend_at_capacity` |
 | `GET /health` | `llm_routing.routing_backend_at_capacity_last_ts` | `telemetry:llm.routing.routing_backend_at_capacity_last_ts` |
@@ -221,13 +221,22 @@ Each key below was moved to a new home and served from both places while consume
 | `GET /memory/telemetry` | `llm_faults.*.llm.transient.count` | `telemetry:llm.faults.*.llm.transient.count` |
 | `GET /memory/telemetry` | `llm_faults.*.llm.transient.last` | `telemetry:llm.faults.*.llm.transient.last` |
 | `GET /memory/telemetry` | `neo4j.rem_dead_lettered` | `telemetry:rem.dead_lettered` |
-| `GET /memory/telemetry` | `neo4j.rem_failing` | `telemetry:rem.failing` |
-| `GET /memory/telemetry` | `neo4j.rem_max_attempts` | `telemetry:rem.max_attempts` |
+| `GET /memory/telemetry` | `neo4j.rem_failing` | removed, no replacement |
+| `GET /memory/telemetry` | `neo4j.rem_max_attempts` | removed, no replacement |
 | `GET /memory/telemetry` | `neo4j.rem_passed_over_total` | `telemetry:rem.passed_over` |
 | `GET /memory/telemetry` | `neo4j.rem_starved_pending` | `telemetry:rem.starved_pending` |
 | `GET /memory/telemetry` | `postgres.outbox` | `telemetry:outbox` |
 | `GET /memory/telemetry` | `postgres.outbox.*` | `telemetry:outbox` |
 | `GET /memory/telemetry` | `postgres.outbox_failed_oldest_age_seconds` | `telemetry:outbox.oldest_failed_age_s` |
+
+### Dropped in 1.0.45
+
+| endpoint | old key | read instead |
+|---|---|---|
+| `GET /memory/telemetry` | `config.llm_backends[].weight` | removed, no replacement |
+| `GET /memory/telemetry` | `llm.pool.*.weight` | removed, no replacement |
+| `GET /memory/telemetry` | `rem.failing` | removed, no replacement |
+| `GET /memory/telemetry` | `rem.max_attempts` | removed, no replacement |
 
 ## `GET /health`
 
@@ -544,7 +553,6 @@ The envelope is `{"status": "success", "telemetry": {…}}`; paths below are rel
 | `config.llm_backends[].price_per_mtok_out` | float/null | — | 0.9.74 | — | — | — | — |
 | `config.llm_backends[].priority` | int | — | 1.0.41 | — | — | — | lower is tried first |
 | `config.llm_backends[].url` | str | — | 0.9.74 | — | — | — | — |
-| `config.llm_backends[].weight` | float | — | 0.9.74 | — | — | — | — |
 | `config.llm_pool_tuning.cooldown_s` | float/int | _s | 0.9.74 | — | — | — | — |
 | `config.llm_pool_tuning.fail_threshold` | int | — | 0.9.74 | — | — | — | — |
 | `config.llm_pool_tuning.fail_window_s` | float/int | _s | 0.9.74 | — | — | — | — |
@@ -583,11 +591,12 @@ The envelope is `{"status": "success", "telemetry": {…}}`; paths below are rel
 | `llm.pool.*.last_call.origin` | str/null | — | 1.0.41 | — | — | — | upstream when the backend answered, gateway when this process recorded the status because no upstream status arrived, null before any call |
 | `llm.pool.*.last_call.status` | int/null | — | 1.0.41 | — | — | — | HTTP status of that call, or null when this process has not forwarded one. A 2xx is upstream. 500, 503 and 504 may be gateway-made; origin distinguishes them. |
 | `llm.pool.*.last_call.ts` | str/null | — | 1.0.41 | — | — | — | UTC time of the last chat status, or null when this process has not forwarded one. 503 and 504 can be the status this gateway returned when no upstream status arrived; last_call.origin says which. |
+| `llm.pool.*.max_wait_expired` | int | — | 1.0.45 | — | — | — | cumulative count of requests that exceeded max_wait_s on this backend |
+| `llm.pool.*.max_wait_expired_last_ts` | str/null | — | 1.0.45 | — | — | — | UTC timestamp of the last max_wait_s expiration on this backend, or null if none |
 | `llm.pool.*.priority` | int | — | 1.0.41 | — | — | — | lower is tried first |
 | `llm.pool.*.reserved` | bool | — | 0.9.74 | — | — | — | — |
 | `llm.pool.*.routed` | int | — | 0.9.74 | — | — | — | — |
 | `llm.pool.*.routed_pct` | float | _pct | 0.9.74 | — | — | — | — |
-| `llm.pool.*.weight` | float | — | 0.9.74 | — | — | — | — |
 | `llm.reserved[]` | list | — | 0.9.74 | — | — | — | — |
 | `llm.routing.routing_backend_at_capacity` | int | — | 0.9.74 | — | — | — | — |
 | `llm.routing.routing_backend_at_capacity_last_ts` | str/null | — | 0.9.74 | — | — | — | — |
@@ -626,8 +635,6 @@ The envelope is `{"status": "success", "telemetry": {…}}`; paths below are rel
 | `rem.dead_lettered` | int | — | 0.9.74 | — | — | `health.rem_daemon` | pending records that have a backlog row; a superseded record is excluded. A withheld record shows degraded. |
 | `rem.degeneration_firings` | int/null | — | 0.9.74 | — | — | — | Null. The loop check runs in the gateway on a cut-off reply and writes a log line. This key does not count those lines. Reporting 0 would say the check never fired. |
 | `rem.error` | str | — | 0.9.74 | — | — | — | present only when this section's own query failed |
-| `rem.failing` | int | — | 0.9.74 | — | — | — | always 0. |
-| `rem.max_attempts` | int | — | 0.9.74 | — | — | — | always 0. |
 | `rem.passed_over` | int | — | 0.9.74 | — | — | — | — |
 | `rem.starved_pending` | int | — | 0.9.74 | — | — | — | — |
 | `rem.throughput_per_hour` | float/null | — | 0.9.74 | — | — | — | records REM stamped in the last hour, from the durable technical_docs.rem_timing clock |
