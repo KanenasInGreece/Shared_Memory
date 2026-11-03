@@ -349,8 +349,8 @@ def test_census_aiohttp_clientsession_trust_env():
     """`hive_mind_proxy.py` imports `ClientSession` bare (`from aiohttp import
     ..., ClientSession, ...`, line 17) — NOT as `aiohttp.ClientSession` — so
     the matching AST shape is `ast.Call(func=ast.Name('ClientSession'))`,
-    not an attribute call. Two such calls exist: the shared encoder pool and the
-    force-close LLM session. Each must carry `trust_env=Constant(False)`.
+    not an attribute call. Three such calls exist: the shared encoder pool, the
+    force-close LLM session, and the quiesce backend check. Each must carry `trust_env=Constant(False)`.
 
     Mutation: removing `trust_env=False` from the `ClientSession(...)` call
     at `hive_mind_proxy.py:1845` kills this test and
@@ -361,8 +361,8 @@ def test_census_aiohttp_clientsession_trust_env():
     calls = [n for n in ast.walk(_parse(path))
              if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
              and n.func.id == "ClientSession"]
-    assert len(calls) == 2, (
-        f"expected the pooled session and the force-close LLM session, "
+    assert len(calls) == 3, (
+        f"expected the pooled session, the force-close LLM session, and the quiesce check session, "
         f"found {len(calls)} at lines {[c.lineno for c in calls]}"
     )
     for call in calls:

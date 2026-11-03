@@ -21,7 +21,7 @@
 # then re-apply the three-line note at the top of the lock (uv rewrites the
 # whole file) and re-check the inline block in mcp/vector-skill.py.
 
-fastmcp
+fastmcp>=4.1.2
 httpx
 # Transitive via httpx; floor drops the compromised emSign ECC Root CA - G3 (GHSA-6q48-6c7w-9gw2).
 certifi>=2026.10.19

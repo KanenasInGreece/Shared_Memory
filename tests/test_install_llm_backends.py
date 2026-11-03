@@ -36,8 +36,8 @@ def _extract_block() -> str:
 def _run(stdin_text: str, env_file: Path, *, token_env: str = "", curl: str | None = None,
          url: str = "http://backend.example:9/v1", extra_env: dict | None = None) -> subprocess.CompletedProcess:
     source = _extract_block()
-    invocation = "build_backend_entry {} {} {} {} {}".format(
-        shlex.quote(url), shlex.quote("1"), shlex.quote(""),
+    invocation = "build_backend_entry {} {} {} {}".format(
+        shlex.quote(url), shlex.quote(""),
         shlex.quote(token_env), shlex.quote(str(env_file)),
     )
     script = "set -euo pipefail\n" + source + "\n" + invocation
@@ -64,6 +64,7 @@ def test_markers_present_exactly_once():
     block = _extract_block()
     assert "ask_backend_roles" not in block
     assert "private_ok" not in block
+    assert "weight" not in block
     assert "ROLE_VOCABULARY" not in text
     assert "--max-time" not in block
     assert "-K -" in block
@@ -83,6 +84,7 @@ def test_advertised_context_is_offered_and_not_guessed(tmp_path):
     assert entry["n_ctx"] == 4096
     assert entry["max_output_tokens"] == 256
     assert "roles" not in entry and "private_ok" not in entry
+    assert "weight" not in entry
 
 
 def test_declining_the_advertised_context_asks(tmp_path):

@@ -100,7 +100,7 @@ _ask_positive_int() {
 }
 
 build_backend_entry() {
-    local url="$1" weight="$2" model="$3" token_env="$4" env_file="$5"
+    local url="$1" model="$2" token_env="$3" env_file="$4"
     local n_ctx="" max_out="" advertised="" answer=""
     if [[ -n "$token_env" ]] && ! grep -qE '^[[:space:]]*AGENT_TOKENS=[^[:space:]]' "$env_file" 2>/dev/null \
         && ! grep -qE '^[[:space:]]*ALLOW_UNAUTHENTICATED_PROVIDER_KEYS=(1|true|yes|on)' "$env_file" 2>/dev/null; then
@@ -126,9 +126,9 @@ build_backend_entry() {
         n_ctx="$(_ask_positive_int "  n_ctx (positive integer, no default): ")" || return 1
     fi
     max_out="$(_ask_positive_int "  max_output_tokens (positive integer, no default): ")" || return 1
-    jq -n --arg url "$url" --arg weight "$weight" --arg model "$model" --arg token_env "$token_env" \
+    jq -n --arg url "$url" --arg model "$model" --arg token_env "$token_env" \
         --argjson n_ctx "$n_ctx" --argjson max_out "$max_out" '
-        {url: $url, weight: ($weight | tonumber), n_ctx: $n_ctx, max_output_tokens: $max_out}
+        {url: $url, n_ctx: $n_ctx, max_output_tokens: $max_out}
         + (if $model != "" then {model: $model} else {} end)
         + (if $token_env != "" then {token_env: $token_env} else {} end)
     '
@@ -146,9 +146,6 @@ while true; do
     echo "── Backend $((${#entries[@]} + 1)) ──"
     url="$(ask_required "  URL (JSON field is url, not OpenAI SDK's base_url; e.g. http://localhost:5000 or https://api.deepseek.com/v1)")"
     url="${url%/}"
-
-    weight="$(ask "  Capacity weight (a faster/larger backend can take more load)" "1")"
-    [[ "$weight" =~ ^[0-9]+(\.[0-9]+)?$ ]] || { ylw "  Not a number — using 1."; weight="1"; }
 
     model=""
     if yesno "  Does this backend need a specific model id (a hosted/routing endpoint that validates it)?"; then
@@ -210,7 +207,7 @@ EOF
         grn "  ✓ Installed + started llm-backend-${label}.service"
     fi
 
-    if ! entry="$(build_backend_entry "$url" "$weight" "$model" "$token_env" "$ENV_FILE")"; then
+    if ! entry="$(build_backend_entry "$url" "$model" "$token_env" "$ENV_FILE")"; then
         red "✗ No LLM_BACKENDS_JSON entry was written for this backend — the access"
         red "  question above was left unanswered."
         if [[ -n "$systemd_unit_created" ]]; then

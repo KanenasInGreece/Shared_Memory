@@ -1814,3 +1814,66 @@ def test_each_latency_ring_can_be_sized_on_its_own(monkeypatch):
         for k in ("ENCODER_LATENCY_WINDOW", "POOL_WAIT_WINDOW", "NEO4J_LATENCY_WINDOW"):
             monkeypatch.delenv(k, raising=False)
         importlib.reload(co)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Part E (v1.0.45) — removal of weight and rem.failing / rem.max_attempts
+# ══════════════════════════════════════════════════════════════════════════════
+
+def test_part_e_neo4j_and_rem_do_not_emit_removed_failing_or_max_attempts(gateway):
+    """rem.failing, rem.max_attempts, neo4j.rem_failing, and neo4j.rem_max_attempts
+    are no longer emitted in telemetry."""
+    c = _stub_telemetry_coordinator(gateway)
+    payload = asyncio.run(c._build_telemetry())
+    assert "rem_failing" not in payload["neo4j"]
+    assert "rem_max_attempts" not in payload["neo4j"]
+    assert "failing" not in payload["rem"]
+    assert "max_attempts" not in payload["rem"]
+
+
+def test_part_e_llm_runtime_snapshot_and_config_do_not_emit_weight(gateway):
+    """weight is no longer emitted in llm.pool.* or config.llm_backends[]."""
+    snap = gateway._llm_runtime_snapshot()
+    for b_url, info in snap["pool"].items():
+        assert "weight" not in info, f"weight emitted for pool backend {b_url}"
+
+    for b_url in gateway.LLM_BACKENDS:
+        for for_telemetry in (False, True):
+            row = gateway._backend_config_row(b_url, for_telemetry=for_telemetry)
+            assert "weight" not in row, f"weight emitted in config row for {b_url}"
+
+
+def test_part_e_backend_config_with_weight_is_ignored_and_warns(monkeypatch, caplog):
+    """An LLM backend JSON config carrying weight is ignored and never refused,
+    logging one warning to prompt removal."""
+    import logging
+    monkeypatch.delenv("LLM_BACKENDS", raising=False)
+    monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
+        {"url": "http://localhost:5000", "weight": 3.0, "n_ctx": 8192, "max_output_tokens": 2048}
+    ]))
+    import hive_mind_proxy as g
+    with caplog.at_level(logging.WARNING):
+        importlib.reload(g)
+    assert "http://localhost:5000" in g.LLM_BACKENDS
+    assert not hasattr(g, "LLM_WEIGHTS")
+    warnings = [r.getMessage() for r in caplog.records if "ignores leftover key weight" in r.getMessage()]
+    assert len(warnings) == 1
+
+
+def test_part_e_telemetry_contract_lifecycle(monkeypatch):
+    """rem.failing, rem.max_attempts, llm.pool.*.weight, and config.llm_backends[].weight
+    are marked removed_in='1.0.45' and drop at that release."""
+    removed_keys = [
+        "rem.failing",
+        "rem.max_attempts",
+        "llm.pool.*.weight",
+        "config.llm_backends[].weight",
+    ]
+    monkeypatch.setattr(tc, "VERSION", "1.0.45")
+    for key in removed_keys:
+        assert tc.TELEMETRY[key]["removed_in"] == "1.0.45"
+        assert tc.is_dropped(tc.TELEMETRY[key]), f"{key} not dropped at 1.0.45"
+
+    monkeypatch.setattr(tc, "VERSION", "1.0.44")
+    for key in removed_keys:
+        assert not tc.is_dropped(tc.TELEMETRY[key]), f"{key} dropped prematurely at 1.0.44"

@@ -138,6 +138,11 @@ _CHAT_PATH = "/v1/chat/completions"
 
 # Operator plaintext_ok for a private http path (VPN or tunnel). The loader refuses a public plaintext backend; the health probe reads this map.
 LLM_BACKEND_PLAINTEXT_OK: dict[str, bool] = {}
+# Optional per-backend timeout in seconds from sending request to complete reply body.
+LLM_BACKEND_MAX_WAIT_S: dict[str, "float | None"] = {}
+# Expirations of max_wait_s paired with last-event ISO timestamp (fact:1314).
+_llm_max_wait_expired: dict[str, int] = {}
+_llm_max_wait_expired_last_ts: dict[str, "str | None"] = {}
 # (entry, field) pairs from llm_declaration_errors. Import stays non-raising so check_config can report a bad file (decision:1824 item 9).
 LLM_DECLARATION_ERRORS: list[tuple[str, str]] = []
 # Backends declared but not usable. url is scrubbed. reason is a name, never a secret.
@@ -152,8 +157,9 @@ def _legacy_declaration_warnings() -> None:
 
 
 def _empty_backend_tables() -> tuple:
+    LLM_BACKEND_MAX_WAIT_S.clear()
     return (
-        [], {}, {}, {}, {}, {}, {}, {}, {}, {}, {},
+        [], {}, {}, {}, {}, {}, {}, {}, {}, {},
         list(LLM_BACKENDS_EXCLUDED), list(LLM_DECLARATION_ERRORS),
     )
 
@@ -167,6 +173,7 @@ def _load_llm_backends() -> tuple:
     _legacy_declaration_warnings()
     LLM_DECLARATION_ERRORS = llm_declaration_errors()
     LLM_BACKENDS_EXCLUDED = []
+    LLM_BACKEND_MAX_WAIT_S.clear()
     json_errors = [pair for pair in LLM_DECLARATION_ERRORS if pair[1] != "agent"]
     raw_json = os.environ.get("LLM_BACKENDS_JSON", "").strip()
     if json_errors or not raw_json or raw_json == "[]":
@@ -178,7 +185,6 @@ def _load_llm_backends() -> tuple:
     if not isinstance(entries, list):
         return _empty_backend_tables()
     urls: list[str] = []
-    weights: dict[str, float] = {}
     tokens: dict[str, "str | None"] = {}
     models: dict[str, "str | None"] = {}
     extras: dict[str, "dict | None"] = {}
@@ -202,6 +208,11 @@ def _load_llm_backends() -> tuple:
                     "LLM backend %s ignores leftover key %s. A declared backend serves the daemons; remove the key.",
                     scrub_url_credentials(url), leftover,
                 )
+        if "weight" in entry:
+            log.warning(
+                "LLM backend %s ignores leftover key weight. Remove the key.",
+                scrub_url_credentials(url),
+            )
         roles = entry.get("roles")
         partial_roles = isinstance(roles, list) and not {"extract", "judge"}.issubset(
             {str(item).strip().lower() for item in roles})
@@ -224,12 +235,7 @@ def _load_llm_backends() -> tuple:
                 scrub_url_credentials(url),
             )
             continue
-        try:
-            weight = max(float(entry.get("weight", 1.0) or 1.0), 0.1)
-        except (TypeError, ValueError):
-            weight = 1.0
         urls.append(url)
-        weights[url] = weight
         tokens[url] = token if token else None
         LLM_BACKEND_PLAINTEXT_OK[url] = bool(entry.get("plaintext_ok"))
         models[url] = entry.get("model") or None
@@ -242,6 +248,10 @@ def _load_llm_backends() -> tuple:
         max_inflights[url] = max_inflight_raw if isinstance(max_inflight_raw, int) and not isinstance(max_inflight_raw, bool) else None
         price_ins[url] = entry.get("price_per_mtok_in")
         price_outs[url] = entry.get("price_per_mtok_out")
+        if "max_wait_s" in entry:
+            LLM_BACKEND_MAX_WAIT_S[url] = float(entry["max_wait_s"])
+        else:
+            LLM_BACKEND_MAX_WAIT_S[url] = None
         # One warning per restricted entry per process. Declaring means trusting, so an omitted private_ok does not warn.
         if restricted:
             log.warning(
@@ -250,14 +260,13 @@ def _load_llm_backends() -> tuple:
                 scrub_url_credentials(url),
             )
     return (
-        urls, weights, tokens, models, extras, n_ctxs, max_outs, priorities,
+        urls, tokens, models, extras, n_ctxs, max_outs, priorities,
         max_inflights, price_ins, price_outs,
         list(LLM_BACKENDS_EXCLUDED), list(LLM_DECLARATION_ERRORS),
     )
 
 
 LLM_BACKENDS: list[str]
-LLM_WEIGHTS: dict[str, float]
 LLM_BACKEND_TOKENS: dict[str, "str | None"]
 LLM_BACKEND_MODELS: dict[str, "str | None"]
 LLM_BACKEND_NCTX: dict[str, int]
@@ -266,7 +275,7 @@ LLM_BACKEND_PRIORITY: dict[str, int]
 LLM_BACKEND_MAX_INFLIGHT: dict[str, "int | None"]
 LLM_BACKEND_PRICE_IN: dict[str, "float | None"]
 LLM_BACKEND_PRICE_OUT: dict[str, "float | None"]
-(LLM_BACKENDS, LLM_WEIGHTS, LLM_BACKEND_TOKENS, LLM_BACKEND_MODELS, LLM_BACKEND_EXTRAS,
+(LLM_BACKENDS, LLM_BACKEND_TOKENS, LLM_BACKEND_MODELS, LLM_BACKEND_EXTRAS,
  LLM_BACKEND_NCTX, LLM_BACKEND_MAX_OUTPUT, LLM_BACKEND_PRIORITY,
  LLM_BACKEND_MAX_INFLIGHT, LLM_BACKEND_PRICE_IN, LLM_BACKEND_PRICE_OUT,
  LLM_BACKENDS_EXCLUDED, LLM_DECLARATION_ERRORS) = _load_llm_backends()
@@ -368,7 +377,7 @@ async def _probe_backend_alive(session, backend: str) -> bool:
     return False
 _llm_unhealthy_until: dict[str, float] = {b: 0.0 for b in LLM_BACKENDS}
 _llm_fail_times: dict[str, list] = {b: [] for b in LLM_BACKENDS}
-# Cumulative routed and fail counts. weight is stored with them and does not route.
+# Cumulative routed and fail counts.
 _llm_routed: dict[str, int] = {b: 0 for b in LLM_BACKENDS}
 _llm_fail_total: dict[str, int] = {b: 0 for b in LLM_BACKENDS}
 # A refusal counter paired with its own last-event timestamp.
@@ -463,6 +472,12 @@ def _record_last_call(backend: str, status: int, *, origin: str = "upstream") ->
         "status": int(status),
         "origin": origin,
     }
+
+
+def _record_max_wait_expired(backend: str) -> None:
+    """Count a max_wait_s timeout for backend, paired with its last timestamp (fact:1314)."""
+    _llm_max_wait_expired[backend] = _llm_max_wait_expired.get(backend, 0) + 1
+    _llm_max_wait_expired_last_ts[backend] = datetime.now(timezone.utc).isoformat()
 
 
 def _token_count(value):
@@ -1554,17 +1569,40 @@ class AsyncHiveMindProxy:
         record = True
         try:
             log.debug("→ %s %s", request.method, scrubbed)
-            async with session.request(
-                method=request.method,
-                url=target_url,
-                headers=upstream_headers,
-                data=data,
-                allow_redirects=False,
-            ) as upstream:
-                raw = await upstream.content.read()
-                status = upstream.status
-                encoding = _header_value(upstream.headers, "Content-Encoding")
-                content_type = _header_value(upstream.headers, "Content-Type")
+            max_wait_s = LLM_BACKEND_MAX_WAIT_S.get(backend)
+
+            async def _send_and_read():
+                async with session.request(
+                    method=request.method,
+                    url=target_url,
+                    headers=upstream_headers,
+                    data=data,
+                    allow_redirects=False,
+                ) as upstream:
+                    raw = await upstream.content.read()
+                    status = upstream.status
+                    encoding = _header_value(upstream.headers, "Content-Encoding")
+                    content_type = _header_value(upstream.headers, "Content-Type")
+                    return raw, status, encoding, content_type
+
+            if max_wait_s is not None:
+                try:
+                    async with asyncio.timeout(max_wait_s) as cm:
+                        raw, status, encoding, content_type = await _send_and_read()
+                except (TimeoutError, asyncio.TimeoutError):
+                    if cm.expired():
+                        elapsed = time.monotonic() - started
+                        _record_max_wait_expired(backend)
+                        _record_last_call(backend, 503, origin="gateway")
+                        model_str = LLM_BACKEND_MODELS.get(backend) or "unknown"
+                        log.error(
+                            "LLM backend %s (model %s) max_wait_s expired: limit=%s elapsed=%.1fs",
+                            scrubbed, model_str, max_wait_s, elapsed,
+                        )
+                        return {"kind": "lost", "reason": "connection_lost", "accepted": True}
+                    raise
+            else:
+                raw, status, encoding, content_type = await _send_and_read()
             # identity, any case, is no encoding. A proxy may echo Accept-Encoding.
             enc = (encoding or "").strip().lower()
             if enc == "identity":
@@ -3503,7 +3541,6 @@ def _llm_runtime_snapshot(backend_status: dict | None = None, *, for_telemetry: 
     aff_total = _llm_affinity_hits + _llm_affinity_misses
     pool = {
         b: {
-            "weight": LLM_WEIGHTS.get(b, 1.0),
             "inflight": _llm_inflight.get(b, 0),
             "routed": _llm_routed.get(b, 0),
             "routed_pct": round(100 * _llm_routed.get(b, 0) / total_routed, 1),
@@ -3518,6 +3555,8 @@ def _llm_runtime_snapshot(backend_status: dict | None = None, *, for_telemetry: 
         for b, row in pool.items():
             row["priority"] = LLM_BACKEND_PRIORITY.get(b, 1)
             row["last_call"] = dict(_llm_last_call.get(b) or {"ts": None, "status": None, "origin": None})
+            row["max_wait_expired"] = _llm_max_wait_expired.get(b, 0)
+            row["max_wait_expired_last_ts"] = _llm_max_wait_expired_last_ts.get(b)
     token_usage = {
         b: {
             "tokens_prompt_total": _llm_tokens_prompt_total.get(b, 0),
@@ -3540,8 +3579,7 @@ def _llm_runtime_snapshot(backend_status: dict | None = None, *, for_telemetry: 
         "backends": _scrub_backend_keyed_dict(dict(backend_status or {}),
                                               context="_llm_runtime_snapshot.backends"),
         "reserved": sorted(scrub_url_credentials(b) for b in _llm_reserved),
-        # Per-backend weight, inflight, routed, fails, and cooldown.
-        # weight does not route.
+        # Per-backend inflight, routed, fails, and cooldown.
         "pool": _scrub_backend_keyed_dict(pool, context="_llm_runtime_snapshot.pool"),
         # Affinity hit rate and which backend holds each hot prefix, so a KV-cache win is visible.
         "affinity": {
@@ -3572,7 +3610,7 @@ def _config_snapshot(*, for_telemetry: bool = False) -> dict:
     """Return effective non-secret configuration resolved from environment.
 
     ⛔ Secrets are never exposed: credentials appear only as booleans (fact:898 —
-    /health's config.llm_backends block reports url and weight and never exposes
+    /health's config.llm_backends block reports url and never exposes
     a backend token)."""
     import dream_telemetry
     cfg = {
@@ -3608,7 +3646,6 @@ def _backend_config_row(b: str, *, for_telemetry: bool) -> dict:
     """One backend's non-secret config. max_output_tokens and priority stay off /health: that endpoint never carried them."""
     row = {
         "url": scrub_url_credentials(b),
-        "weight": LLM_WEIGHTS.get(b, 1.0),
         "has_credential": LLM_BACKEND_TOKENS.get(b) is not None,
         "model": LLM_BACKEND_MODELS.get(b),
         "n_ctx": LLM_BACKEND_NCTX.get(b),
@@ -3746,6 +3783,135 @@ async def _llm_probe_daemon(proxy, stop_event) -> None:
             await asyncio.wait_for(stop_event.wait(), timeout=LLM_PROBE_INTERVAL_S)
         except asyncio.TimeoutError:
             pass
+
+
+async def _quiesce_backend_check() -> None:
+    """One logged backend check at quiesce start for self-hosted backends with requests in flight."""
+    inflight_backends = [b for b, cnt in _llm_inflight.items() if cnt > 0]
+    if not inflight_backends:
+        log.info("quiesce-backend-check: no_request_in_flight")
+        return
+
+    # Explicit ClientTimeout(total=None, connect=None): bounded only by quiesce duration
+    async with ClientSession(
+        timeout=ClientTimeout(total=None, connect=None),
+        auto_decompress=False,
+        trust_env=False,
+    ) as session:
+        async def _check_backend(b: str) -> None:
+            now = time.monotonic()
+            inflight = _llm_inflight.get(b, 0)
+            oldest_age = _oldest_inflight_age(b, now)
+            model = LLM_BACKEND_MODELS.get(b) or "unknown"
+            scrubbed = scrub_url_credentials(b)
+
+            if not _self_hosted(b):
+                log.info(
+                    "quiesce-backend-check backend=%s model=%s signal=not_checked inflight=%d oldest_age=%s",
+                    scrubbed, model, inflight, oldest_age,
+                )
+                return
+
+            base = b.rstrip("/")
+            if base.endswith("/v1"):
+                base = base[:-3]
+
+            headers = dict(_probe_headers(b))
+            headers["Accept-Encoding"] = "identity"
+            start_t = time.monotonic()
+            active_resp = None
+            try:
+                # 1. Try llama.cpp /slots
+                slots_url = f"{base}/slots"
+                try:
+                    async with session.get(slots_url, headers=headers, allow_redirects=False) as resp:
+                        active_resp = resp
+                        if resp.status == 200:
+                            body = await resp.read()
+                            elapsed = time.monotonic() - start_t
+                            active_resp = None
+                            try:
+                                data = json.loads(body.decode("utf-8"))
+                                slots_list = None
+                                if isinstance(data, list):
+                                    slots_list = data
+                                elif isinstance(data, dict) and "slots" in data and isinstance(data["slots"], list):
+                                    slots_list = data["slots"]
+                                if slots_list is not None:
+                                    processing = sum(
+                                        1 for s in slots_list
+                                        if isinstance(s, dict) and s.get("is_processing") is True
+                                    )
+                                    total = len(slots_list)
+                                    log.info(
+                                        "quiesce-backend-check backend=%s model=%s signal=slots reading=processing=%d/%d time_to_answer=%.3fs inflight=%d oldest_age=%s",
+                                        scrubbed, model, processing, total, elapsed, inflight, oldest_age,
+                                    )
+                                    return
+                            except Exception:
+                                pass
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    pass
+
+                # 2. Try vLLM /metrics
+                metrics_url = f"{base}/metrics"
+                try:
+                    async with session.get(metrics_url, headers=headers, allow_redirects=False) as resp:
+                        active_resp = resp
+                        if resp.status == 200:
+                            text = await resp.text()
+                            elapsed = time.monotonic() - start_t
+                            active_resp = None
+                            matched = False
+                            total_running = 0.0
+                            for line in text.splitlines():
+                                line = line.strip()
+                                if not line or line.startswith("#"):
+                                    continue
+                                m = re.match(
+                                    r'^(?:vllm:num_requests_running|vllm_num_requests_running|num_requests_running)\s*(?:\{[^}]*\})?\s+([0-9.]+)',
+                                    line,
+                                )
+                                if m:
+                                    matched = True
+                                    total_running += float(m.group(1))
+                            if matched:
+                                count = int(total_running)
+                                log.info(
+                                    "quiesce-backend-check backend=%s model=%s signal=metrics reading=running=%d time_to_answer=%.3fs inflight=%d oldest_age=%s",
+                                    scrubbed, model, count, elapsed, inflight, oldest_age,
+                                )
+                                return
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    pass
+
+                # 3. Endpoint absent or refused
+                elapsed = time.monotonic() - start_t
+                log.info(
+                    "quiesce-backend-check backend=%s model=%s signal=no_signal time_to_answer=%.3fs inflight=%d oldest_age=%s",
+                    scrubbed, model, elapsed, inflight, oldest_age,
+                )
+            except asyncio.CancelledError:
+                if active_resp is not None and not active_resp.closed:
+                    active_resp.close()
+                elapsed = time.monotonic() - start_t
+                log.info(
+                    "quiesce-backend-check backend=%s model=%s: no answer before quiesce ended (elapsed=%.3fs)",
+                    scrubbed, model, elapsed,
+                )
+                raise
+
+        try:
+            await asyncio.gather(*[_check_backend(b) for b in inflight_backends])
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.warning("quiesce-backend-check failed: %s", type(exc).__name__)
+
 
 async def _build_health_checks(proxy: "AsyncHiveMindProxy", coordinator) -> dict:
     """Full /health probe shape (S-10 disclosure is handle_health's job, applied after cache)."""
@@ -4201,6 +4367,7 @@ async def main() -> None:
     app["coordinator"] = coordinator  # health reads the cached consolidation snapshot
     # Telemetry for this module's state is a callback, not an import. coordinator cannot import this module. Set it before any request is served.
     coordinator.telemetry_extras_provider = telemetry_extras
+    coordinator.quiesce_check_hook = _quiesce_backend_check
     # One Server identity on every response, including proxied ones. Registered on the app so a new handler cannot forget it.
     app.on_response_prepare.append(_set_server_header)
 

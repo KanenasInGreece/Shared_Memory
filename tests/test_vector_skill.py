@@ -466,7 +466,7 @@ async def test_mcp_check_memory_health_asks_the_gateway():
     """Health is what the gateway reports — daemons, backends, consolidation
     liveness — not a row count from a database handle this client should not
     hold. It is also the only check that exercises the path the client uses."""
-    gw = {"status": "ok", "version": "0.7.7", "api_version": 4,
+    gw = {"status": "ok", "version": "0.7.7", "api_version": 5,
           "daemon": "running", "rem_daemon": "running", "embedder": "ok"}
     mock_response = MagicMock(status_code=200, json=lambda: gw)
     with patch("httpx.AsyncClient.get", return_value=mock_response) as mock_get:
@@ -512,7 +512,7 @@ async def test_mcp_check_memory_health_timeout_is_not_reported_as_down():
 
 @pytest.mark.asyncio
 async def test_mcp_check_memory_health_keeps_the_503_verdict():
-    body = {"status": "down", "version": "1.0.14", "api_version": 4, "role": "full",
+    body = {"status": "down", "version": "1.0.14", "api_version": 5, "role": "full",
             "dependencies": {"embedder": {"state": "down", "reason": "no vector"}}}
     resp = MagicMock(status_code=503, json=lambda: body)
     with patch("httpx.AsyncClient.get", return_value=resp):

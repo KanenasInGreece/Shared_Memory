@@ -104,6 +104,105 @@ neo4j_q() {
     cypher-shell -u "$NEO4J_USER" --format plain "$1" 2>/dev/null | tail -n1
 }
 
+# Warn if this install's daemons are running (option A: warns and continues; never refuses).
+# Matches exact python argv and /proc/PID/cwd or script path against this install ($REPO_ROOT).
+check_live_daemons() {
+  local procs=()
+  while IFS= read -r line; do
+    [[ -n "$line" ]] && procs+=("$line")
+  done < <(python3 - "$REPO_ROOT" <<'PYSCAN' 2>/dev/null
+import os, sys
+
+repo = os.path.realpath(sys.argv[1])
+targets = {
+    "hive_mind_proxy.py": os.path.realpath(os.path.join(repo, "shared-memory", "scripts", "hive_mind_proxy.py")),
+    "consolidation_loop.py": os.path.realpath(os.path.join(repo, "shared-memory", "scripts", "consolidation_loop.py")),
+    "rem_loop.py": os.path.realpath(os.path.join(repo, "shared-memory", "scripts", "rem_loop.py")),
+}
+
+# PROC_DIR is a test seam.
+proc_dir = os.environ.get("PROC_DIR", "/proc")
+if not os.path.isdir(proc_dir):
+    sys.exit(0)
+
+found = []
+for entry in os.listdir(proc_dir):
+    if not entry.isdigit():
+        continue
+    pid = entry
+    cmd_path = os.path.join(proc_dir, pid, "cmdline")
+    try:
+        with open(cmd_path, "rb") as f:
+            content = f.read()
+    except (OSError, IOError):
+        continue
+    if not content:
+        continue
+    args = [a.decode("utf-8", "replace") for a in content.split(b"\x00") if a]
+    if not args:
+        continue
+    argv0 = os.path.basename(args[0])
+    if not (argv0 == "python" or argv0.startswith("python3") or argv0.startswith("python2")):
+        continue
+    cwd_path = os.path.join(proc_dir, pid, "cwd")
+    try:
+        proc_cwd = os.path.realpath(cwd_path)
+    except (OSError, IOError):
+        proc_cwd = None
+
+    i = 1
+    script_arg = None
+    while i < len(args):
+        arg = args[i]
+        if arg == "--":
+            if i + 1 < len(args):
+                script_arg = args[i + 1]
+            break
+        if arg in ("-c", "-m") or (arg.startswith("-c") and len(arg) > 2) or (arg.startswith("-m") and len(arg) > 2):
+            # -c and -m stop the scan with no match
+            break
+        if arg in ("-W", "-X", "--check-hash-based-pycs"):
+            i += 2
+            continue
+        if arg.startswith("-W") or arg.startswith("-X") or arg.startswith("--check-hash-based-pycs="):
+            i += 1
+            continue
+        if arg.startswith("-"):
+            i += 1
+            continue
+        script_arg = arg
+        break
+
+    if script_arg:
+        resolved = None
+        if os.path.isabs(script_arg):
+            resolved = os.path.realpath(script_arg)
+        elif proc_cwd:
+            resolved = os.path.realpath(os.path.join(proc_cwd, script_arg))
+        if resolved:
+            for dname, dpath in targets.items():
+                if resolved == dpath:
+                    found.append((pid, dname))
+                    break
+
+for pid, name in sorted(found, key=lambda x: int(x[0])):
+    print(f"{pid} {name}")
+PYSCAN
+  )
+
+  if [[ ${#procs[@]} -gt 0 ]]; then
+    ylw "⚠ Live daemon processes detected for this install:"
+    for p in "${procs[@]}"; do
+      ylw "    PID $p"
+    done
+    ylw "  Stop the gateway before restoring to prevent concurrent writes:"
+    ylw "    systemctl --user stop hive-mind-gateway.service"
+    echo
+  fi
+}
+
+check_live_daemons
+
 # ── Locate the set ───────────────────────────────────────────────────────────
 if [[ -n "$TARGET" ]]; then
   MANIFEST="$BACKUP_DIR/${TARGET%.manifest.json}.manifest.json"

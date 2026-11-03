@@ -76,10 +76,12 @@ BACKUP_RETENTION_DAYS="${BACKUP_RETENTION_DAYS:-14}"
 BACKUP_INCLUDE_LOGS="${BACKUP_INCLUDE_LOGS:-1}"
 LOG_DIR="${SHARED_MEMORY_LOG_DIR:-$HOME/.shared-memory/logs}"
 BACKUP_LOCKFILE="${BACKUP_LOCKFILE:-$HOME/.shared-memory/backup.lock}"
-# Both the drain wait AND the quiesce TTL: /admin/backup blocks up to this long
-# waiting for the dream daemons to drain, then returns 202 and holds the fence for
-# the same span. Keep it well above the dump duration but low enough that a nightly
-# run cannot stall — and the client MUST out-wait it (see qcurl below).
+# Quiesce dead-man TTL: the gateway defaults to 900s if omitted in the body, but
+# backup.sh explicitly passes this value (default 120s) so an abandoned quiesce
+# resumes promptly. The fence is held across the drain, re-armed, and held through
+# the dumps until resume. Must stay above the dump duration so the fence does not
+# lapse before the re-arm or before dumps finish. A 202 comes only if the lock
+# connection failed.
 BACKUP_QUIESCE_MAX_SECONDS="${BACKUP_QUIESCE_MAX_SECONDS:-120}"
 BACKUP_DRAIN_MAX_SECONDS="${BACKUP_DRAIN_MAX_SECONDS:-120}"
 BACKUP_DRAIN_POLL_SECONDS="${BACKUP_DRAIN_POLL_SECONDS:-2}"
@@ -135,13 +137,11 @@ cleanup_secrets_dir() {
 
 # Defined before the trap. Under `set -u`, a signal in the gap would make resume() read an unbound QUIESCED and abort instead of releasing the fence.
 QUIESCED=0
-# "full" means the daemons drained; "timeout" means a daemon may have written during the dump. do_backup reads this before resume() clears QUIESCED.
-QUIESCE_MODE=""
 # Which of the three skip reasons happened. The old message folded "no token" and "unreachable" into one string. Defined here so `set -u` cannot trip the trap.
 QUIESCE_SKIP_REASON=""
 
 # One trap for the whole script. Both cleanups no-op if they never started, so --dry-run is safe too.
-on_exit() { resume; cleanup_secrets_dir; }
+on_exit() { resume || ylw "  ! failed to resume gateway in exit trap — quiesce will auto-resume on TTL"; cleanup_secrets_dir; }
 trap on_exit EXIT INT TERM
 
 # Three different failures, named in QUIESCE_SKIP_REASON: no token, curl failed, or 401/403 (token present but not admin).
@@ -160,8 +160,8 @@ quiesce() {
   fi
   code="$(tail -n1 <<<"$resp")"; body="$(sed '$d' <<<"$resp")"
   case "$code" in
-    200) QUIESCED=1; QUIESCE_MODE="full";    grn "  ✓ quiesced — client writes shed, daemons drained" ;;
-    202) QUIESCED=1; QUIESCE_MODE="timeout"; ylw "  ! quiesced — daemon drain TIMED OUT; a daemon may write during the dump ($(json_get daemons <<<"$body"))" ;;
+    200) QUIESCED=1; grn "  ✓ quiesced — client writes shed, daemons fenced" ;;
+    202) QUIESCED=1; ylw "  ! quiesced — lock connection failed; daemons not fenced ($(json_get reason <<<"$body"))" ;;
     401) QUIESCE_SKIP_REASON="BACKUP_ADMIN_TOKEN was rejected (HTTP 401 — invalid or expired); re-mint it with bootstrap_tokens.sh"; return 1 ;;
     403) QUIESCE_SKIP_REASON="BACKUP_ADMIN_TOKEN lacks the admin role (HTTP 403) — re-run bootstrap_tokens.sh --add with role=admin for this token"; return 1 ;;
     "")  QUIESCE_SKIP_REASON="gateway unreachable at $GATEWAY_URL (no HTTP response)"; return 1 ;;
@@ -172,10 +172,10 @@ quiesce() {
 # <<< QUIESCE_FN
 resume() {
   [[ "$QUIESCED" -eq 1 ]] || return 0
-  dcurl -X POST "$GATEWAY_URL/admin/backup" \
+  QUIESCED=0
+  dcurl --fail -X POST "$GATEWAY_URL/admin/backup" \
     -H "@$_AUTH_HEADER_FILE" -H 'Content-Type: application/json' \
     -d '{"state":"resume"}' >/dev/null 2>&1
-  QUIESCED=0
 }
 
 # Drain via GET /admin/outbox. The backup token is confined to /admin/*, so a telemetry poll is always 403 and can only time out. Do not default a missing outbox.pending to 0: that printed "drained" while Neo4j was still behind. A 403 body is printed once so a pre-0.9.92 gateway is not mistaken for a missing key.
@@ -330,7 +330,7 @@ do_verify() {
   quiesce_mode="$(json_get quiesce_mode < "$manifest")"
   case "$quiesced" in
     true)  grn "  i quiesced at backup time (${quiesce_mode:-full drain})" ;;
-    false) ylw "  i NOT quiesced at backup time — a daemon may have written during the dump" ;;
+    false) ylw "  i NOT quiesced at backup time (${quiesce_mode:-unquiesced}) — a daemon may have written during the dump" ;;
     *)     ylw "  i quiesce state unknown (manifest predates this field)" ;;
   esac
 
@@ -347,8 +347,37 @@ do_backup() {
   ts="$(date +%Y%m%d-%H%M%S)"; name="${PREFIX}-${ts}"; base="$BACKUP_DIR/$name"
   echo "Shared Memory — backup → $base.*"
 
+  local initial_quiesced=0
+  local gen_before="" held_before="" reading1_ok=0
+  local rearm_code="" rearm_gen="" rearm_ok=0
+  local gen_after="" held_after="" reading2_ok=0
+
   # Quiesce (best-effort unless required).
-  if quiesce; then drain_outbox
+  if quiesce; then
+    initial_quiesced="$QUIESCED"
+    drain_outbox
+    # Reading 1: after drain, before re-arm
+    local outbox_before
+    if outbox_before="$(dcurl "$GATEWAY_URL/admin/outbox" -H "@$_AUTH_HEADER_FILE" 2>/dev/null)"; then
+      held_before="$(json_get lock_held <<<"$outbox_before")"
+      gen_before="$(json_get quiesce_generation <<<"$outbox_before")"
+      if [[ -n "$held_before" && -n "$gen_before" ]]; then
+        reading1_ok=1
+      fi
+    fi
+
+    # Re-arm dead-man timer before dumps
+    local rearm_resp rearm_body
+    if rearm_resp="$(qcurl -w $'\n%{http_code}' -X POST "$GATEWAY_URL/admin/backup" \
+        -H "@$_AUTH_HEADER_FILE" -H 'Content-Type: application/json' \
+        -d "{\"state\":\"quiesce\",\"max_seconds\":$BACKUP_QUIESCE_MAX_SECONDS}" 2>/dev/null)"; then
+      rearm_code="$(tail -n1 <<<"$rearm_resp")"
+      rearm_body="$(sed '$d' <<<"$rearm_resp")"
+      rearm_gen="$(json_get quiesce_generation <<<"$rearm_body")"
+      if [[ "$rearm_code" == "200" && -n "$rearm_gen" && "$rearm_gen" == "$gen_before" ]]; then
+        rearm_ok=1
+      fi
+    fi
   else
     if [[ "$BACKUP_QUIESCE_REQUIRED" == "1" ]]; then die "quiesce required but unavailable: ${QUIESCE_SKIP_REASON:-reason unknown}"; fi
     ylw "  ! proceeding WITHOUT quiesce (${QUIESCE_SKIP_REASON:-reason unknown}) — online dumps, restore self-heals"
@@ -357,18 +386,55 @@ do_backup() {
   # Counts captured under quiesce for the manifest.
   local nodes rels; nodes="$(neo4j_count 'MATCH (n) RETURN count(n)')"; rels="$(neo4j_count 'MATCH ()-[r]->() RETURN count(r)')"
 
-  # Capture the quiesce state for the manifest BEFORE resume() zeroes QUIESCED
-  # (QUIESCE_MODE is untouched by resume(), but read it here too so both
-  # values are snapshotted together at the same point in the flow).
-  local was_quiesced="$QUIESCED" quiesce_mode="$QUIESCE_MODE"
-
   # Dump Postgres FIRST (source of truth + outbox), then Neo4j.
   dump_postgres "$base.pgdump"   || die "pg_dump failed"
   grn "  ✓ postgres dumped"
   dump_neo4j    "$base.cypher.gz" || die "neo4j APOC export failed (is NEO4J_apoc_export_file_enabled=true?)"
   grn "  ✓ neo4j dumped"
 
-  resume   # release the quiesce as early as possible — dumps are done
+  if [[ "$initial_quiesced" -eq 1 ]]; then
+    # Reading 2: after dumps, before resume
+    local outbox_after
+    if outbox_after="$(dcurl "$GATEWAY_URL/admin/outbox" -H "@$_AUTH_HEADER_FILE" 2>/dev/null)"; then
+      held_after="$(json_get lock_held <<<"$outbox_after")"
+      gen_after="$(json_get quiesce_generation <<<"$outbox_after")"
+      if [[ -n "$held_after" && -n "$gen_after" ]]; then
+        reading2_ok=1
+      fi
+    fi
+  fi
+
+  resume || ylw "  ! failed to resume gateway — quiesce will auto-resume on TTL"   # release the quiesce as early as possible — dumps are done
+
+  # Determine quiesced state and mode according to evidence
+  local was_quiesced=0 quiesce_mode=""
+  if [[ "$initial_quiesced" -eq 1 ]]; then
+    if [[ "$reading1_ok" -ne 1 || "$reading2_ok" -ne 1 ]]; then
+      was_quiesced=0
+      quiesce_mode="fence_unknown"
+      ylw "  ! fence unknown — /admin/outbox reading empty or failed; quiesce state cannot be verified"
+    elif [[ "$held_before" == "true" && "$held_after" == "true" && "$rearm_ok" -eq 1 && "$gen_before" == "$gen_after" ]]; then
+      was_quiesced=1
+      quiesce_mode="full"
+      grn "  ✓ quiesce fence held throughout dump (generation $gen_before)"
+    else
+      was_quiesced=0
+      quiesce_mode="lost_during_dump"
+      ylw "  ! fence lost during dump — lock lapsed or generation changed ($gen_before -> rearm:${rearm_gen:-?} -> $gen_after); daemons may have written during the dump (check BACKUP_QUIESCE_MAX_SECONDS)"
+    fi
+  fi
+
+  # With BACKUP_QUIESCE_REQUIRED=1, a false result is not promoted: only the newest failed pair is kept
+  if [[ "$BACKUP_QUIESCE_REQUIRED" == "1" && "$was_quiesced" -ne 1 ]]; then
+    local failed_pg="$BACKUP_DIR/${PREFIX}-failed-latest.pgdump"
+    local failed_neo="$BACKUP_DIR/${PREFIX}-failed-latest.cypher.gz"
+    rm -f "$failed_pg" "$failed_neo"
+    mv "$base.pgdump" "$failed_pg"
+    mv "$base.cypher.gz" "$failed_neo"
+    red "  ✗ quiesce required but fence failed (${quiesce_mode:-unquiesced}) — backup not promoted"
+    red "    newest failed pair kept at: $failed_pg and $failed_neo"
+    exit 1
+  fi
 
   # Manifest LAST — its presence marks the set complete (verify keys off it).
   local pg_sha neo_sha pg_toc

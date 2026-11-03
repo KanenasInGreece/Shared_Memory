@@ -680,7 +680,7 @@ def test_the_two_default_agent_ids_are_the_documented_ones(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_check_memory_health_on_success_returns_health_with_role_and_client(gateway):
-    health = {"status": "ok", "version": "1.0.14", "api_version": 4,
+    health = {"status": "ok", "version": "1.0.14", "api_version": 5,
               "agent": "a1", "dependencies": {"postgres": {"state": "ok"}},
               "warnings": []}
     gateway({"/health": (200, health)})

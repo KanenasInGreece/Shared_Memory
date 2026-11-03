@@ -101,20 +101,116 @@ def _truncated(resp_json):
 BACKUP_ADVISORY_LOCK_KEY = int(os.environ.get("BACKUP_ADVISORY_LOCK_KEY", "8765309"))
 
 
+class LockReacquireFailed(Exception):
+    """Raised when reacquiring the shared backup advisory lock fails after a chat call."""
+
+
+class _ChatLockReleaseContext:
+    def __init__(self, holder):
+        self.holder = holder
+
+    async def __aenter__(self):
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, self.holder.release_lock)
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, self.holder.reacquire_lock_blocking)
+        return False
+
+
+class _BackupLockHolder:
+    """Owns the cycle's current connection holding the shared backup advisory lock.
+    Releases the lock during chat calls and reacquires it blocking on exit, reconnecting if needed.
+    """
+    def __init__(self, conn, open_conn_func=None):
+        self.conn = conn
+        self.open_conn = open_conn_func
+        self.lock_key = BACKUP_ADVISORY_LOCK_KEY
+
+    def close(self):
+        conn, self.conn = self.conn, None
+        if conn:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    def release_lock(self):
+        if self.conn and not getattr(self.conn, "closed", False):
+            try:
+                with self.conn.cursor() as cur:
+                    cur.execute("SELECT pg_advisory_unlock_shared(%s)", (self.lock_key,))
+            except Exception as exc:
+                logger.warning("NREM: failed to release shared backup lock (%s) — closing connection", type(exc).__name__)
+                try:
+                    self.conn.close()
+                except Exception:
+                    pass
+                self.conn = None
+
+    def reacquire_lock_blocking(self):
+        if self.conn and not getattr(self.conn, "closed", False):
+            try:
+                with self.conn.cursor() as cur:
+                    cur.execute("SELECT pg_advisory_lock_shared(%s)", (self.lock_key,))
+                return
+            except Exception as exc:
+                logger.warning("NREM: failed to reacquire backup lock on existing conn (%s) — reconnecting", type(exc).__name__)
+                try:
+                    self.conn.close()
+                except Exception:
+                    pass
+                self.conn = None
+
+        if not self.open_conn:
+            raise LockReacquireFailed("No connection factory to reconnect dead backup lock connection")
+
+        try:
+            new_conn = self.open_conn()
+        except Exception as exc:
+            raise LockReacquireFailed(f"Failed to reconnect backup lock connection: {type(exc).__name__}") from exc
+
+        try:
+            with new_conn.cursor() as cur:
+                cur.execute("SELECT pg_advisory_lock_shared(%s)", (self.lock_key,))
+            self.conn = new_conn
+        except Exception as exc:
+            try:
+                new_conn.close()
+            except Exception:
+                pass
+            raise LockReacquireFailed(f"Failed to reacquire backup shared lock on new connection: {type(exc).__name__}") from exc
+
+    def release_for_chat(self):
+        return _ChatLockReleaseContext(self)
+
+    def __getattr__(self, name):
+        if self.conn is None:
+            raise AttributeError(f"_BackupLockHolder connection is None; cannot get attribute {name!r}")
+        return getattr(self.conn, name)
+
+
+def _open_backup_lock_conn():
+    conn = psycopg2.connect(PG_CONN, connect_timeout=5)
+    conn.set_isolation_level(psycopg2.extensions.ISOLATION_LEVEL_AUTOCOMMIT)
+    return conn
+
+
 def _try_backup_shared_lock():
     """Open a dedicated autocommit conn and take the SHARED backup advisory lock.
-    Returns the conn (caller MUST close it to release) if acquired, or None if the
+    Returns a _BackupLockHolder (caller MUST close it to release) if acquired, or None if the
     gateway holds the EXCLUSIVE lock (a backup is dumping) so the caller skips the
     cycle. Session-scoped — auto-releases on conn close or process death.
     """
-    conn = psycopg2.connect(PG_CONN, connect_timeout=5)
-    conn.set_isolation_level(psycopg2.extensions.ISOLATION_LEVEL_AUTOCOMMIT)
+    conn = _open_backup_lock_conn()
     with conn.cursor() as cur:
         cur.execute("SELECT pg_try_advisory_lock_shared(%s)", (BACKUP_ADVISORY_LOCK_KEY,))
         if not cur.fetchone()[0]:
             conn.close()
             return None
-    return conn
+    return _BackupLockHolder(conn, _open_backup_lock_conn)
 
 # REM can hold the only LLM slot for minutes, so NREM takes this exclusive lock only while queued, and it is session-scoped so a crash cannot wedge REM. Must match rem_loop.NREM_PRIORITY_ADVISORY_LOCK_KEY.
 NREM_PRIORITY_ADVISORY_LOCK_KEY = int(
@@ -267,7 +363,7 @@ def _crun_recover_and_prune():
                 cur.execute(
                     "UPDATE consolidation_runs SET finished_at=now(), outcome='crashed',"
                     " error_class='OrphanedRun',"
-                    " error_msg='daemon restarted while cycle was in-flight'"
+                    " error_msg='daemon restarted while cycle was in-flight or cycle was abandoned'"
                     " WHERE finished_at IS NULL RETURNING id")
                 orphans = [r[0] for r in cur.fetchall()]
                 cur.execute(
@@ -555,7 +651,8 @@ class _ReplyUnusable(Exception):
 
 async def _post_nrem(client: httpx.AsyncClient, payload: dict,
                      ceiling_s: float | None = None,
-                     prompt_chars: int | None = None) -> httpx.Response:
+                     prompt_chars: int | None = None,
+                     lock_holder=None) -> httpx.Response:
     """POST an NREM completion through the gateway and record per-call telemetry
     (timings + serving backend) for the adaptive-timer work. Telemetry is
     best-effort and never alters the call path — NREM stays agnostic to routing.
@@ -567,12 +664,15 @@ async def _post_nrem(client: httpx.AsyncClient, payload: dict,
     with a distinguishing note, same as any other non-200 — the LOUD,
     entity-scoped log and the no-retry decision belong to the caller
     (_call_insight_llm), which has the fold's own identity to name."""
-    _start = time.monotonic()
-    resp = await client.post(
-        REASONER_URL,
-        headers=_auth_headers(),
-        json=payload,
-    )
+    cm = lock_holder.release_for_chat() if lock_holder else contextlib.nullcontext()
+    async with cm:
+        _start = time.monotonic()
+        resp = await client.post(
+            REASONER_URL,
+            headers=_auth_headers(),
+            json=payload,
+        )
+        _wall_s = time.monotonic() - _start
     ok = resp.status_code == 200
     rj = None
     note = None
@@ -609,7 +709,7 @@ async def _post_nrem(client: httpx.AsyncClient, payload: dict,
         ok = False
     try:
         record_llm_call("NREM", rj, backend=resp.headers.get("X-SM-LLM-Backend"),
-                        wall_s=time.monotonic() - _start, ceiling_s=ceiling_s,
+                        wall_s=_wall_s, ceiling_s=ceiling_s,
                         ok=ok, note=note, specimen=specimen, prompt_chars=prompt_chars)
     except Exception as exc:
         logger.error("NREM: telemetry failed (%s)", type(exc).__name__)
@@ -2388,6 +2488,9 @@ class ConsolidationDaemon:
         self._last_backlog_paid = True
         # Paid folds whose backlog row could not be written. A respawn drops it.
         self._withheld_folds: set[str] = set()
+        self._lock_holder: _BackupLockHolder | None = None
+        # Unfinished runs whose lock reacquire failed mid-cycle, drained on next gated cycle.
+        self._abandoned_runs: list[dict] = []
         # datetime.min so the first idle tick sweeps immediately and drains clusters that became eligible while down.
         self.last_sweep_time = datetime.min
         # One unanchored graph sweep per process, for facts with no outbox row. Later sweeps use the ledger.
@@ -2483,6 +2586,27 @@ class ConsolidationDaemon:
         if await pool_roster_state(headers=_auth_headers()) == "busy":
             self.last_busy = now
 
+    async def _drain_abandoned_runs(self):
+        """Finalize runs abandoned due to LockReacquireFailed at the start of a cycle
+        that holds the shared backup lock. No write without the lock."""
+        if not self._abandoned_runs or self._lock_holder is None:
+            return
+        runs, self._abandoned_runs = self._abandoned_runs, []
+        loop = asyncio.get_running_loop()
+        for it in runs:
+            await loop.run_in_executor(None, lambda r=it: _crun_finish(
+                r["run_id"],
+                "crashed",
+                attempted=r.get("attempted", 0),
+                succeeded=r.get("succeeded", 0),
+                failed=r.get("failed", 0),
+                error_class="LockReacquireFailed",
+                error_msg="cycle aborted: backup lock reacquire failed",
+                eligible_clusters=r.get("eligible_clusters"),
+                eligible_oldest_age=r.get("eligible_oldest_age"),
+                extra=r.get("extra"),
+            ))
+
     @contextlib.asynccontextmanager
     async def _record_cycle(self, cycle_type):
         """Wrap a consolidation/insight cycle as one consolidation_runs row and
@@ -2498,6 +2622,22 @@ class ConsolidationDaemon:
         rec.run_id = run_id
         try:
             yield rec
+        except LockReacquireFailed as e:
+            logger.warning(
+                "Consolidation run [%s] aborted (withheld, not crashed) after %d/%d folds: %s (run_id=%s)",
+                cycle_type, rec.succeeded, rec.attempted,
+                type(e).__name__, run_id)
+            if run_id is not None:
+                self._abandoned_runs.append({
+                    "run_id": run_id,
+                    "attempted": rec.attempted,
+                    "succeeded": rec.succeeded,
+                    "failed": rec.failed,
+                    "eligible_clusters": rec.eligible_clusters,
+                    "eligible_oldest_age": rec.eligible_oldest_age,
+                    "extra": rec.extra(),
+                })
+            raise
         except Exception as e:
             logger.error(
                 "Consolidation run [%s] CRASHED after %d/%d folds: %s (run_id=%s)",
@@ -2673,14 +2813,22 @@ class ConsolidationDaemon:
             return "\n".join(lines)
         try:
             async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
-                resp = await _post_nrem(client, {
+                payload = {
                     "model": LLM_MODEL,
                     "messages": [
                         {"role": "system", "content": "You are a technical knowledge curator. Write your response directly — no reasoning steps, no thinking tokens, no internal deliberation before the answer. Output ONLY the requested SLOT/PRINCIPLE lines, nothing else."},
                         {"role": "user", "content": prompt},
                     ],
                     "temperature": NREM_TEMPERATURE,
-                }, ceiling_s=None, prompt_chars=len(prompt))
+                }
+                if self._lock_holder is not None:
+                    resp = await _post_nrem(
+                        client, payload, ceiling_s=None,
+                        prompt_chars=len(prompt), lock_holder=self._lock_holder)
+                else:
+                    resp = await _post_nrem(
+                        client, payload, ceiling_s=None,
+                        prompt_chars=len(prompt))
                 refusal = _routing_refusal(resp)
                 if refusal and refusal["error"] == "backlog":
                     reason = refusal["reason"]
@@ -2745,6 +2893,8 @@ class ConsolidationDaemon:
                     self._last_backlog_paid = True
                     return None
                 return content
+        except LockReacquireFailed:
+            raise
         except _ReplyUnusable:
             self._last_backlog_reason = "unparseable"
             self._last_backlog_paid = True
@@ -3810,6 +3960,8 @@ class ConsolidationDaemon:
                         return True
                     return False
 
+                # One attempted registry across both refold and fresh paths
+                attempted: set[frozenset[int]] = set()
                 # Only ids that actually folded. An aborted fold must not hide a fresh cluster that shares them.
                 folded: set = set()
                 refold_withheld = 0
@@ -3818,6 +3970,14 @@ class ConsolidationDaemon:
                     if _dead_lettered(entity, src_ids):
                         refold_withheld += 1
                         continue
+                    f_ids = frozenset(int(i) for i in src_ids)
+                    if f_ids in attempted:
+                        logger.debug(
+                            "Insight cycle: component %s already attempted this pass — skipping.",
+                            sorted(src_ids),
+                        )
+                        continue
+                    attempted.add(f_ids)
                     logger.info(
                         "Insight cycle: re-folding insight %d ('%s') — new retrospective(s) on %s.",
                         old_id, entity, sorted(set(src_ids) & set(retro_ids)),
@@ -3919,7 +4079,6 @@ class ConsolidationDaemon:
                     cluster_id_lists, ts_map, INSIGHT_AGE_CENSUS_K)
                 rec.dead_lettered_clusters = dead_lettered_now + refold_withheld
                 rec.singleton_clusters = singleton_now
-                attempted: set[frozenset[int]] = set()
                 for c in clusters:
                     ids = c["ids"]
                     if not ids or any(i in folded for i in ids):
@@ -3951,6 +4110,8 @@ class ConsolidationDaemon:
                 # Beside the outbox closes: refold_ledger rows this pass covered become refolded, for either kind.
                 await loop.run_in_executor(
                     None, lambda: close_refold_ledger_rows(conn, context="insight"))
+        except LockReacquireFailed:
+            logger.error("Insight cycle aborted: backup lock reacquire failed")
         except Exception as e:
             logger.error("Insight cycle failed (%s)", type(e).__name__)
         finally:
@@ -4057,10 +4218,14 @@ class ConsolidationDaemon:
             "Folding insight for '%s' (%d judgements)...",
             entity, len(rows),
         )
-        slots = await self.generate_insight_slots(
-            entity, rows, previous_insight=previous_insight,
-            reversal_lines=reversal_lines)
         backlog_key = _fold_backlog_key(src_ids)
+        try:
+            slots = await self.generate_insight_slots(
+                entity, rows, previous_insight=previous_insight,
+                reversal_lines=reversal_lines)
+        except LockReacquireFailed:
+            self._withheld_folds.add(backlog_key)
+            raise
         if not slots:
             reason = getattr(self, "_last_backlog_reason", None)
             if self._last_llm_truncated or reason in ("cut_off", "loop"):
@@ -4264,6 +4429,54 @@ class ConsolidationDaemon:
             return c, cur
         return await loop.run_in_executor(None, _sync_connect)
 
+    async def _run_guarded_consolidation(self, gate, backlog, forced, seconds_eligible):
+        """Run consolidation cycle guarded by shared backup lock, draining abandoned runs."""
+        loop = asyncio.get_running_loop()
+        self._lock_holder = gate
+        try:
+            await self._drain_abandoned_runs()
+            if forced:
+                logger.info(
+                    "Hard backstop reached (%.1fs eligible). Forcing "
+                    "consolidation (ignoring GPU activity).", seconds_eligible)
+            else:
+                logger.info("Idle threshold reached. Starting consolidation.")
+            await self.run_consolidation_cycle(backlog)
+        finally:
+            self._lock_holder = None
+            await loop.run_in_executor(None, gate.close)
+            # The backlog does not clear itself when a cycle folds nothing, so re-arm both clocks or the next tick fires again.
+            # Attending resets the backstop, which measures eligible and not yet attended.
+            after = datetime.now()
+            self.last_busy = after
+            await self._refresh_backlog(after, force=True)
+            if self._backlog_eligible_since is not None:
+                self._backlog_eligible_since = after
+
+    async def _run_guarded_sweep(self, gate):
+        """Run hygiene and insight sweep guarded by shared backup lock, draining abandoned runs."""
+        loop = asyncio.get_running_loop()
+        self._lock_holder = gate
+        try:
+            await self._drain_abandoned_runs()
+            # Run lineage invalidation before either fold, so a summary retired this tick is already gone when groups are re-derived.
+            await self.run_lineage_invalidation_pass()
+            if not self._startup_sweep_done:
+                # Once per process: the unanchored sweep covers facts with no outbox row, then the ledger sweep backfills.
+                logger.info("Startup sweep: global graph pass + ledger pass.")
+                await self.run_global_sweep()
+                await self.run_ledger_sweep()
+                self._startup_sweep_done = True
+            else:
+                logger.info("Sweep interval reached. Starting ledger sweep.")
+                await self.run_ledger_sweep()
+            # The insight pass is ledger-driven, so it runs on every sweep without waiting for a fact backlog.
+            await self.run_insight_cycle()
+            self.last_sweep_time = datetime.now()
+        finally:
+            self._lock_holder = None
+            await loop.run_in_executor(None, gate.close)
+
     async def listen_for_events(self):
         """Asynchronous LISTEN on Postgres with non-blocking poll and hard backstop."""
         loop = asyncio.get_running_loop()
@@ -4329,23 +4542,7 @@ class ConsolidationDaemon:
                                 logger.info("NREM: backup in progress — deferring consolidation; the durable backlog keeps it due.")
                                 await loop.run_in_executor(None, lambda: _crun_record_deferred("fact_consolidation", "backup_in_progress"))
                             else:
-                                try:
-                                    if forced:
-                                        logger.info(
-                                            "Hard backstop reached (%.1fs eligible). Forcing "
-                                            "consolidation (ignoring GPU activity).", seconds_eligible)
-                                    else:
-                                        logger.info("Idle threshold reached. Starting consolidation.")
-                                    await self.run_consolidation_cycle(backlog)
-                                finally:
-                                    await loop.run_in_executor(None, gate.close)
-                                    # The backlog does not clear itself when a cycle folds nothing, so re-arm both clocks or the next tick fires again.
-                                    # Attending resets the backstop, which measures eligible and not yet attended.
-                                    after = datetime.now()
-                                    self.last_busy = after
-                                    await self._refresh_backlog(after, force=True)
-                                    if self._backlog_eligible_since is not None:
-                                        self._backlog_eligible_since = after
+                                await self._run_guarded_consolidation(gate, backlog, forced, seconds_eligible)
                     elif (self._sweep_backoff_until is None
                           or now >= self._sweep_backoff_until) and \
                          sweep_due(now, self.last_sweep_time, self.last_activity,
@@ -4364,23 +4561,7 @@ class ConsolidationDaemon:
                                 logger.info("NREM: backup in progress — deferring sweep.")
                                 await loop.run_in_executor(None, lambda: _crun_record_deferred("insight", "backup_in_progress"))
                             else:
-                                try:
-                                    # Run lineage invalidation before either fold, so a summary retired this tick is already gone when groups are re-derived.
-                                    await self.run_lineage_invalidation_pass()
-                                    if not self._startup_sweep_done:
-                                        # Once per process: the unanchored sweep covers facts with no outbox row, then the ledger sweep backfills.
-                                        logger.info("Startup sweep: global graph pass + ledger pass.")
-                                        await self.run_global_sweep()
-                                        await self.run_ledger_sweep()
-                                        self._startup_sweep_done = True
-                                    else:
-                                        logger.info("Sweep interval reached. Starting ledger sweep.")
-                                        await self.run_ledger_sweep()
-                                    # The insight pass is ledger-driven, so it runs on every sweep without waiting for a fact backlog.
-                                    await self.run_insight_cycle()
-                                    self.last_sweep_time = datetime.now()
-                                finally:
-                                    await loop.run_in_executor(None, gate.close)
+                                await self._run_guarded_sweep(gate)
                 else:
                     try:
                         conn.poll()

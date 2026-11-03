@@ -106,9 +106,9 @@ uv run --no-project --with-requirements requirements-gateway.lock \
 #    The version/api_version below are illustrative (this repo's release at
 #    the time this file was last checked) — your own checkout reports its own.
 curl http://localhost:8888/health
-#    → {"status":"ok","api_version":4,"version":"0.9.94"}
+#    → {"status":"ok","api_version":5,"version":"1.0.45"}
 curl -H "Authorization: Bearer $AGENT_TOKEN" http://localhost:8888/health
-#    → {"status":"ok","api_version":4,"version":"0.9.94","daemon":"running",...}
+#    → {"status":"ok","api_version":5,"version":"1.0.45","daemon":"running",...}
 ```
 
 The proxy binds to `127.0.0.1:8888` by default. Set `PROXY_BIND=0.0.0.0` only over

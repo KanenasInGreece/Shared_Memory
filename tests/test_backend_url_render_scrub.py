@@ -107,7 +107,6 @@ def _seed_credentialed_backend(g, url):
     structures, monkeypatching, bypassing A')."""
     g.LLM_BACKENDS.append(url)
     g.LLM_POOL.append(url)
-    g.LLM_WEIGHTS[url] = 1.0
     g._llm_inflight[url] = 0
     g._llm_inflight_started[url] = []
 
@@ -373,8 +372,6 @@ def test_x_sm_llm_backend_header_scrubs_a_directly_seeded_credentialed_backend(m
     cred_url = f"https://leakuser:{SECRET}@backend.example.test/v1"
     g.LLM_BACKENDS[:] = [cred_url]
     g.LLM_POOL[:] = [cred_url]
-    g.LLM_WEIGHTS.clear()
-    g.LLM_WEIGHTS[cred_url] = 1.0
     g.LLM_BACKEND_TOKENS.clear()
     g.LLM_BACKEND_TOKENS[cred_url] = None
     g.LLM_BACKEND_MODELS.clear()

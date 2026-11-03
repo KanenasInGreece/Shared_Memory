@@ -275,7 +275,6 @@ def test_t7_check_config_in_process_fake_proxy(monkeypatch):
     class _FakeProxy:
         LLM_BACKENDS = []
         LLM_BACKENDS_EXCLUDED = [{"url": "http://a:5000", "reason": "token_missing"}]
-        LLM_WEIGHTS = {}
         LLM_BACKEND_MODELS = {}
         LLM_BACKEND_NCTX = {}
         LLM_BACKEND_MAX_OUTPUT = {}

@@ -570,7 +570,6 @@ def _phase_b_body(lines: list, proxy_logger, proxy_filter) -> "tuple[list[str], 
         lines.append("(no backends configured)")
     for url in proxy.LLM_BACKENDS:
         lines.append(f"  {scrub_url_credentials(url)}")
-        lines.append(f"    weight={proxy.LLM_WEIGHTS.get(url, 1.0)}")
         lines.append(f"    model={proxy.LLM_BACKEND_MODELS.get(url)}")
         lines.append(f"    n_ctx={proxy.LLM_BACKEND_NCTX.get(url)}")
         lines.append(f"    max_output_tokens={proxy.LLM_BACKEND_MAX_OUTPUT.get(url)}")

@@ -51,7 +51,7 @@ Embed and rerank go through the gateway on `:8888`. These four are the `CONTRIBU
 ## Ask first
 
 - New dependencies, lockfiles, public API, auth, CI, or compose image pins.
-- Migrations, `bootstrap_tokens.sh --force`, `ops/restore.sh`, data-dir deletion, `reconcile_stack.sh` (it recreates database containers), VERSION, CHANGELOG, or a release. The repository owner merges.
+- Migrations, `bootstrap_tokens.sh --force`, `ops/restore.sh` (stop gateway first: `systemctl --user stop hive-mind-gateway.service`), data-dir deletion, `reconcile_stack.sh` (it recreates database containers), VERSION, CHANGELOG, or a release. The repository owner merges.
 - Editing `README.md`. Setup commands stay aligned with Quick Start. Do not rewrite README from a coding task.
 
 ## Never

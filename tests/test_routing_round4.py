@@ -109,6 +109,17 @@ class _Graph:
         return _Result([])
 
 
+class _FakeCur:
+    def execute(self, *a, **k): pass
+    def fetchone(self): return (1,)
+    def fetchall(self): return []
+    def __enter__(self): return self
+    def __exit__(self, *a): return False
+
+class _FakeConn:
+    def cursor(self): return _FakeCur()
+    def close(self): pass
+
 def _rem(monkeypatch, contents, url):
     import rem_loop as rem
 
@@ -127,7 +138,7 @@ def _rem(monkeypatch, contents, url):
     daemon._batch_specimen = ""
     graph = _Graph(list(contents), rem.ONT.fact)
     daemon.driver = graph
-    daemon._open_pg_conn = lambda: type("C", (), {"close": lambda self: None})()
+    daemon._open_pg_conn = lambda: _FakeConn()
     daemon._recent_write_happened = AsyncMock(return_value=False)
     daemon._filter_applied_in_outbox = AsyncMock(side_effect=lambda ids, *a: list(ids))
     daemon._batch_fetch_content = AsyncMock(return_value={
