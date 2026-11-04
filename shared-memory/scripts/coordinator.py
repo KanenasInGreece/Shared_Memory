@@ -32,7 +32,7 @@ import httpx
 from aiohttp import web
 from neo4j import AsyncGraphDatabase
 from neo4j.exceptions import ClientError
-from neo4j.graph import Node
+from neo4j.graph import Node, Relationship, Path
 
 from log_hygiene import AsyncLineWriter, scrub_url_credentials
 from agent_roles import VALID_ROLES, effective_role, read_only_agents
@@ -2354,6 +2354,160 @@ def _eligible_graph_node_info(val: Any) -> tuple[str, int] | None:
     if ONT.community_summary in labels_set:
         return ("community_summaries", pg_id)
     return None
+
+
+# REM writes summary[:2000] in rem_loop.py:850,863; that length may be cut.
+REM_LEGACY_SUMMARY_CUT = 2000
+
+
+def redact_reference_ids(ids, readable):
+    """Keep readable identities in order; a predicate also accepts structured ids."""
+    allowed = readable if callable(readable) else lambda identity: identity in readable
+    return [identity for identity in ids if allowed(identity)]
+
+
+def render_record_entry(row, node_rem_summary, ref, marks, *, ranked=False,
+                        search_hit=False):
+    """None means no entry; row["readable"] distinguishes unreadable from ranked retirement.
+
+    ranked drops retired records; search_hit adds decision grounds and lifecycle.
+    Check visibility before retirement: dropping only superseded private neighbours
+    would reveal whether a private record is live.
+    """
+    if not row or not row.get("readable", False):
+        return None
+    if ranked and row.get("superseded"):
+        return None
+    kind = ref.split(":", 1)[0]
+    pid = int(ref.split(":", 1)[1])
+    meta = _row_metadata(row) or {}
+    content = row.get("content") or ""
+    out = {"ref": ref, "type": kind,
+           "full_record": {"ref": ref, "chars": row.get("content_chars", len(content)),
+                           "read_with": f"search --ref {ref}"}}
+    decision_meta = meta.get("decision")
+    rationale = decision_meta.get("rationale") if isinstance(decision_meta, dict) else None
+    if kind in ("summary", "insight"):
+        out["text_is"] = "pointer"
+    elif kind == "decision" and isinstance(rationale, str) and rationale.strip():
+        out.update(text=rationale, text_is="summary")
+    elif (kind in ("fact", "retrospective") and isinstance(node_rem_summary, str)
+          and node_rem_summary.strip() and len(node_rem_summary) < len(content)
+          and len(node_rem_summary) != REM_LEGACY_SUMMARY_CUT):
+        out.update(text=node_rem_summary, text_is="summary")
+    else:
+        out.update(text=content, text_is="full_record")
+    if kind in ("fact", "retrospective"):
+        source = meta.get("source_ref")
+        out.update(source_ref=source, fact_kind=fact_kind_from_source_ref(source))
+    rows = marks.get("rows", {})
+    def readable(identity):
+        return rows.get(("technical_docs", identity), {}).get("readable", False)
+    decision = marks.get("decisions", {}).get(pid, {}) if kind == "decision" else {}
+    # decision:1109: traverse lifecycle; latest is highest pg_id, never operator date.
+    outcomes = sorted((v for v in decision.get("outcomes", [])
+                       if readable(v["pg_id"])), key=lambda v: v["pg_id"])
+    if row.get("superseded"):
+        out["obsolete"] = "reversed" if kind == "decision" else "superseded"
+        if kind == "decision":
+            reversed_outcomes = [v for v in outcomes if v.get("rating") == "reversed"]
+            if reversed_outcomes:
+                out["superseded_by"] = f'retrospective:{reversed_outcomes[-1]["pg_id"]}'
+        elif row.get("successor_readable") and row.get("successor_ref"):
+            out["superseded_by"] = row["successor_ref"]
+    if kind == "retrospective":
+        retro = marks.get("retrospectives", {}).get(pid)
+        if retro:
+            siblings = [i for i in retro.get("siblings", []) if readable(i)]
+            if siblings and max(siblings) > pid:
+                out["latest_verdict"] = f"retrospective:{max(siblings)}"
+    if kind == "decision" and search_hit and not marks.get("failed"):
+        grounds = []
+        for ground in sorted(decision.get("grounds", []), key=lambda g: g["pg_id"]):
+            g = rows.get(("technical_docs", ground["pg_id"]))
+            if not g or not g.get("readable") or not g.get("superseded"):
+                continue
+            item = {"ref": f'fact:{ground["pg_id"]}', "relation": ground["relation"]}
+            if g.get("successor_readable") and g.get("successor_ref"):
+                item["superseded_by"] = g["successor_ref"]
+            grounds.append(item)
+        if grounds:
+            out["retired_grounds"] = grounds
+        if row.get("superseded") and not any(v.get("rating") == "reversed" for v in outcomes):
+            out["lifecycle"] = {"rating": "reversed"}
+        # The highest readable outcome alone chooses the lifecycle verdict.
+        elif outcomes and outcomes[-1].get("rating") is not None:
+            latest = outcomes[-1]
+            lifecycle = {"rating": latest["rating"], "ref": f'retrospective:{latest["pg_id"]}'}
+            if latest["rating"] in ("refined", "mixed", "reversed"):
+                lifecycle["text"] = rows[("technical_docs", latest["pg_id"])]["content"]
+            out["lifecycle"] = lifecycle
+    return out
+
+
+def render_relation(start, relation, end, props=None):
+    """Preserve stored direction and omit legacy retrospective text."""
+    return {"from": start, "relation": relation, "to": end,
+            "props": {k: v for k, v in (props or {}).items() if k != "notes"}}
+
+
+def walk_graph_value(value, rows, marks=None, collect=None):
+    """Walk driver values before Record.data loses nodes and relationship ends.
+
+    With collect set, gather every record key; otherwise render from hydrated rows.
+    """
+    marks = marks or {}
+    if isinstance(value, Node):
+        key = _eligible_graph_node_info(value)
+        label = next((v for v in (ONT.fact, ONT.decision, ONT.retrospective,
+                                  ONT.community_summary) if v in value.labels),
+                     next(iter(sorted(value.labels)), ""))
+        if key:
+            if collect is not None:
+                collect[key] = value
+                return None
+            row = rows.get(key)
+            entry = render_record_entry(row, value.get("rem_summary"),
+                                        row["ref"] if row else "fact:0", marks)
+            if entry is None:
+                return {"label": label}
+            result = {k: v for k, v in dict(value).items()
+                      if k not in {"content", "rem_summary", "rationale", "notes",
+                                   "snippet", "content_chars", "content_truncated", "adr_props"}}
+            result.update(entry)
+            result["superseded"] = bool(row.get("superseded"))
+            return result
+        if any(v in value.labels for v in (ONT.fact, ONT.decision,
+                                             ONT.retrospective, ONT.community_summary)):
+            return {"label": label}
+        return {"label": label, **{k: v for k, v in dict(value).items() if k != "snippet"}}
+    if isinstance(value, Relationship):
+        if collect is not None:
+            walk_graph_value(value.start_node, rows, marks, collect)
+            walk_graph_value(value.end_node, rows, marks, collect)
+            return None
+        def endpoint(node):
+            key = _eligible_graph_node_info(node)
+            if key:
+                row = rows.get(key)
+                return row["ref"] if row and row.get("readable") else None
+            if isinstance(node, Node) and any(
+                label in node.labels for label in
+                (ONT.fact, ONT.decision, ONT.retrospective, ONT.community_summary)
+            ):
+                return None
+            return walk_graph_value(node, rows, marks)
+        return render_relation(endpoint(value.start_node), value.type,
+                               endpoint(value.end_node), dict(value))
+    if isinstance(value, Path):
+        return {"nodes": [walk_graph_value(v, rows, marks, collect) for v in value.nodes],
+                "relationships": [walk_graph_value(v, rows, marks, collect)
+                                  for v in value.relationships]}
+    if isinstance(value, dict):
+        return {k: walk_graph_value(v, rows, marks, collect) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [walk_graph_value(v, rows, marks, collect) for v in value]
+    return value
 
 
 # Row cap on read-only Cypher queries submitted to /memory/graph. Rejects
@@ -7749,6 +7903,92 @@ class MemoryCoordinator:
                 len(wanted), exc,
             )
 
+    async def hydrate(self, ids, viewer, viewer_scope=None):
+        """Read each table once with viewer scope and successor visibility.
+
+        Return None on failure, distinct from an empty successful lookup.
+        """
+        if not ids:
+            return {}
+        out = {}
+        try:
+            async with self._acquire() as conn:
+                for table in ("technical_docs", "community_summaries"):
+                    requested = sorted({pid for tbl, pid in ids if tbl == table})
+                    if not requested:
+                        continue
+                    rows = await conn.fetch(
+                        f"SELECT t.id, t.content, length(t.content) AS content_chars, "
+                        "t.metadata, t.metadata->>'type' AS type, t.superseded, t.superseded_by, t.visibility, "
+                        "t.agent_id, t.scope, "
+                        "s.id AS successor_id, s.metadata AS successor_metadata, "
+                        "s.visibility AS successor_visibility, s.agent_id AS successor_agent_id, "
+                        "s.scope AS successor_scope "
+                        f"FROM {table} t LEFT JOIN {table} s ON s.id = t.superseded_by "
+                        "WHERE t.id = ANY($1::bigint[])", requested)
+                    for record in rows:
+                        row = dict(record)
+                        meta = _row_metadata(row) or {}
+                        row["metadata"] = meta
+                        kind = doc_record_type(meta or {"type": row.get("type")}) if table == "technical_docs" else summary_record_type(meta)
+                        row.update(type=kind, ref=make_ref(kind, row["id"]))
+                        row["readable"] = _is_doc_visible(
+                            row.get("visibility"), row.get("agent_id") or "",
+                            row.get("scope") or "global", viewer, viewer_scope)
+                        row["successor_readable"] = bool(row.get("successor_id")) and _is_doc_visible(
+                            row.get("successor_visibility"),
+                            row.get("successor_agent_id") or "",
+                            row.get("successor_scope") or "global", viewer, viewer_scope)
+                        if row.get("successor_id"):
+                            successor_meta = _row_metadata({"metadata": row.get("successor_metadata")}) or {}
+                            successor_kind = (doc_record_type(successor_meta) if table == "technical_docs"
+                                              else summary_record_type(successor_meta))
+                            row["successor_ref"] = make_ref(successor_kind, row["successor_id"])
+                        out[(table, row["id"])] = row
+        except Exception as exc:
+            log.warning("record hydration failed: %s", exc)
+            return None
+        return out
+
+    async def resolve_marks(self, session, decision_ids, retro_ids):
+        """Fetch all outcomes, grounding roles and sibling ids in one read."""
+        out = {"decisions": {}, "retrospectives": {}}
+        if not decision_ids and not retro_ids:
+            return out
+        try:
+            result = await session.run(
+                "CALL () { "
+                f"MATCH (d:{ONT.decision}) WHERE d.pg_id IN $decision_ids RETURN d "
+                "UNION "
+                f"MATCH (r:{ONT.retrospective}) WHERE r.pg_id IN $retro_ids "
+                f"MATCH (d:{ONT.decision})-[:{ONT.had_outcome}]->(r) RETURN d }} "
+                "CALL (d) { "
+                f"OPTIONAL MATCH (d)-[:{ONT.had_outcome}]->(r:{ONT.retrospective}) "
+                "RETURN collect(CASE WHEN r.pg_id IS NOT NULL THEN "
+                "{pg_id: r.pg_id, rating: r.rating} END) AS outcomes } "
+                "CALL (d) { "
+                f"OPTIONAL MATCH (d)-[g]->(f:{ONT.fact}) "
+                "WHERE type(g) IN $grounding_relations "
+                "RETURN collect(CASE WHEN f.pg_id IS NOT NULL THEN "
+                "{pg_id: f.pg_id, relation: type(g)} END) AS grounds } "
+                "RETURN d.pg_id AS decision_id, outcomes, grounds",
+                decision_ids=list(decision_ids), retro_ids=list(retro_ids),
+                grounding_relations=list(GROUNDING_RELATIONS))
+            async for record in result:
+                pid = record["decision_id"]
+                outcomes = [dict(v) for v in record["outcomes"] or []]
+                out["decisions"][pid] = {"outcomes": outcomes,
+                                          "grounds": [dict(v) for v in record["grounds"] or []]}
+                siblings = [v["pg_id"] for v in outcomes]
+                for rid in siblings:
+                    out["retrospectives"][rid] = {"decision_id": pid, "siblings": siblings}
+            for rid in set(retro_ids) - out["retrospectives"].keys():
+                log.debug("retrospective:%s has no HAD_OUTCOME decision", rid)
+        except Exception as exc:
+            log.warning("retired_grounds, latest_verdict and lifecycle unavailable: %s", exc)
+            return {"decisions": {}, "retrospectives": {}, "failed": True}
+        return out
+
     async def _record_text_index(self, conn, doc_ids, summary_ids) -> dict:
         """Fetch metadata, character count, and ref for records in technical_docs and community_summaries.
 
@@ -9355,96 +9595,41 @@ class MemoryCoordinator:
                 status=400,
             )
 
-        eligible_entries: list[tuple[tuple[int, Any, int | None], tuple[str, int]]] = []
-        try:
-            for row_idx, r in enumerate(records):
-                keys = r.keys() if hasattr(r, "keys") else (list(r.keys()) if isinstance(r, dict) else [])
-                for k in keys:
-                    try:
-                        val = r[k]
-                    except Exception:
-                        continue
-                    info = _eligible_graph_node_info(val)
-                    if info is not None:
-                        eligible_entries.append(((row_idx, k, None), info))
-                    elif isinstance(val, (list, tuple)):
-                        for list_idx, item in enumerate(val):
-                            item_info = _eligible_graph_node_info(item)
-                            if item_info is not None:
-                                eligible_entries.append(((row_idx, k, list_idx), item_info))
-        except Exception as exc:
-            log.warning("graph query node discovery failed: %s", exc)
-            eligible_entries = []
-
-        records = [
-            r.data() if callable(getattr(r, "data", None)) and not isinstance(r, dict) else dict(r)
-            for r in records
-        ]
-
-        if eligible_entries:
-            distinct_keys: list[tuple[str, int]] = []
-            seen_keys: set[tuple[str, int]] = set()
-            for pos, key in eligible_entries:
-                if key not in seen_keys:
-                    seen_keys.add(key)
-                    distinct_keys.append(key)
-
-            considered_keys = distinct_keys[:GRAPH_QUERY_ROW_CAP]
-            doc_ids = [kid for tbl, kid in considered_keys if tbl == "technical_docs"]
-            summary_ids = [kid for tbl, kid in considered_keys if tbl == "community_summaries"]
-
-            viewer = request.get("authenticated_agent")
-            updates_by_pos: dict[tuple[int, Any, int | None], dict] = {}
-            lookup_succeeded = False
-            index_map: dict = {}
-            readable_keys: set[tuple[str, int]] = set()
-
+        values = []
+        failed_cells = 0
+        for record in records:
+            row = {}
+            for key in record.keys():
+                try:
+                    row[key] = record[key]
+                except Exception:
+                    failed_cells += 1
+                    row[key] = None
+            values.append(row)
+        if failed_cells:
+            log.warning("graph query value unavailable: %s cells", failed_cells)
+        nodes = {}
+        walk_graph_value(values, {}, collect=nodes)
+        decision_ids = [key[1] for key, node in nodes.items() if ONT.decision in node.labels]
+        retro_ids = [key[1] for key, node in nodes.items() if ONT.retrospective in node.labels]
+        marks = {"decisions": {}, "retrospectives": {}}
+        if decision_ids or retro_ids:
             try:
-                async with self._acquire() as conn:
-                    index_map = await self._record_text_index(conn, doc_ids, summary_ids)
-                    for key in considered_keys:
-                        row = index_map.get(key)
-                        if not row:
-                            continue
-                        tbl, kid = key
-                        if tbl == "technical_docs":
-                            vis = row.get("visibility") or "global"
-                            owner = row.get("agent_id") or ""
-                            scope_val = row.get("scope") or "global"
-                            if not _is_doc_visible(vis, owner, scope_val, viewer, viewer_scope=None):
-                                continue
-                        readable_keys.add(key)
-                lookup_succeeded = True
+                async with self._neo4j.session(default_access_mode="READ") as session:
+                    marks = await self.resolve_marks(session, decision_ids, retro_ids)
             except Exception as exc:
-                log.warning("graph query text hydration failed: %s", exc)
-
-            try:
-                if lookup_succeeded:
-                    for pos, key in eligible_entries:
-                        if key in readable_keys:
-                            row = index_map[key]
-                            row_idx, k, list_idx = pos
-                            target_node = records[row_idx][k] if list_idx is None else records[row_idx][k][list_idx]
-                            existing_content = target_node.get("content") if isinstance(target_node, dict) else None
-                            node_content_len = len(existing_content) if isinstance(existing_content, str) else 0
-                            c_chars = row.get("content_chars") or 0
-                            upd = {
-                                "ref": row.get("ref"),
-                                "content_chars": c_chars,
-                                "content_truncated": c_chars > node_content_len,
-                            }
-                            tbl, _ = key
-                            if tbl == "community_summaries":
-                                upd["snippet"] = row.get("snippet")
-                            updates_by_pos[pos] = upd
-
-                for pos, update_dict in updates_by_pos.items():
-                    row_idx, k, list_idx = pos
-                    target_node = records[row_idx][k] if list_idx is None else records[row_idx][k][list_idx]
-                    if isinstance(target_node, dict):
-                        target_node.update(update_dict)
-            except Exception as exc:
-                log.warning("graph query node write-back failed: %s", exc)
+                log.warning("retired_grounds, latest_verdict and lifecycle unavailable: %s", exc)
+                marks["failed"] = True
+        ids = set(nodes)
+        for decision in marks.get("decisions", {}).values():
+            ids.update(("technical_docs", v["pg_id"]) for v in decision["outcomes"])
+            ids.update(("technical_docs", v["pg_id"]) for v in decision["grounds"])
+        # Step 2 surfaces read decision_id, at no extra query cost.
+        for retro in marks.get("retrospectives", {}).values():
+            ids.add(("technical_docs", retro["decision_id"]))
+        index = await self.hydrate(ids, request.get("authenticated_agent")) or {}
+        marks["rows"] = index
+        records = walk_graph_value(values, index, marks)
 
         # json.dumps TypeError/ValueError is our coercion bug, not a Neo4j tx failure.
         try:

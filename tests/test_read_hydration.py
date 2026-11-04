@@ -147,32 +147,21 @@ def _status_request(ref_str, agent=None):
 
 @pytest.mark.asyncio
 async def test_g1_graph_node_content_never_replaced_or_extended_by_postgres_text():
-    """G1: A graph node's content is replaced with, or extended by, Postgres text: the fixture's Postgres text differs from the node copy; the node copy comes back byte-identical and the Postgres string appears nowhere in the response."""
-    node_copy = "original graph node copy"
-    postgres_text = "DIFFERENT whole postgres text that must not appear in graph response"
-    n = _make_node(["Fact"], {"pg_id": 1, "content": node_copy}, element_id="1", id_=1)
-    c, mock_conn, _ = _coord_with_mocks([_FakeRecord({"n": n})])
-
-    mock_conn.fetch = AsyncMock(return_value=[
-        {"id": 1, "content_chars": 68, "content": postgres_text, "type": "fact",
-         "superseded": False, "visibility": "global", "agent_id": None, "scope": None},
-    ])
-
-    resp = await c.handle_graph(_graph_request())
-    assert resp.status == 200
-    body_text = resp.text
-    body = json.loads(body_text)
-    rec = body["records"][0]["n"]
-
-    assert rec["content"] == node_copy
-    assert postgres_text not in body_text
+    """F3, F4c: stored text is removed and the whole authoritative text is returned."""
+    n = _make_node(["Fact"], {"pg_id": 1, "content": "node copy"})
+    c, conn, _ = _coord_with_mocks([_FakeRecord({"n": n})])
+    conn.fetch = AsyncMock(return_value=[{"id": 1, "metadata": {}, "visibility": "global", "content": "whole Postgres", "content_chars": 14}])
+    response = await c.handle_graph(_graph_request())
+    result = json.loads(response.text)["records"][0]["n"]
+    assert result["text"] == "whole Postgres"
+    assert "content" not in result and "node copy" not in response.text
 
 
 # ── G2: Content truncated rules and index keys ─────────────────────────────────
 
 @pytest.mark.asyncio
 async def test_g2_readable_node_index_keys_and_content_truncated_flag_rules():
-    """G2: A readable node lacks ref, content_chars or content_truncated; or the flag is wrong for: copy shorter than the record -> True; copy equal -> False; copy LONGER than the record -> False; a Decision node with no content and content_chars 46 -> True."""
+    """F3, F4c: readable nodes carry whole text and no legacy text keys."""
     n_short = _make_node(["Fact"], {"pg_id": 1, "content": "short"}, element_id="1", id_=1)
     n_equal = _make_node(["Fact"], {"pg_id": 2, "content": "equal len"}, element_id="2", id_=2)
     n_long = _make_node(["Fact"], {"pg_id": 3, "content": "longer copy here"}, element_id="3", id_=3)
@@ -187,13 +176,13 @@ async def test_g2_readable_node_index_keys_and_content_truncated_flag_rules():
     c, mock_conn, _ = _coord_with_mocks(records)
 
     mock_conn.fetch = AsyncMock(return_value=[
-        {"id": 1, "content_chars": 100, "type": "fact", "superseded": False,
+        {"id": 1, "content_chars": 100, "type": "fact", "content": "whole Postgres", "superseded": False,
          "visibility": "global", "agent_id": None, "scope": None},
-        {"id": 2, "content_chars": 9, "type": "fact", "superseded": False,
+        {"id": 2, "content_chars": 9, "type": "fact", "content": "whole Postgres", "superseded": False,
          "visibility": "global", "agent_id": None, "scope": None},
-        {"id": 3, "content_chars": 5, "type": "fact", "superseded": False,
+        {"id": 3, "content_chars": 5, "type": "fact", "content": "whole Postgres", "superseded": False,
          "visibility": "global", "agent_id": None, "scope": None},
-        {"id": 4, "content_chars": 46, "type": "decision", "superseded": False,
+        {"id": 4, "content_chars": 46, "type": "decision", "content": "whole Postgres", "superseded": False,
          "visibility": "global", "agent_id": None, "scope": None},
     ])
 
@@ -206,20 +195,25 @@ async def test_g2_readable_node_index_keys_and_content_truncated_flag_rules():
     r4 = body["records"][3]["n"]
 
     assert r1["ref"] == "fact:1"
-    assert r1["content_chars"] == 100
-    assert r1["content_truncated"] is True
+    assert r1["full_record"]["chars"] == 100
+    assert r1["text_is"] == "full_record"
+    assert "content_truncated" not in r1
 
     assert r2["ref"] == "fact:2"
-    assert r2["content_chars"] == 9
-    assert r2["content_truncated"] is False
+    assert r2["full_record"]["chars"] == 9
+    assert r2["text_is"] == "full_record"
+    assert "content_truncated" not in r2
 
     assert r3["ref"] == "fact:3"
-    assert r3["content_chars"] == 5
-    assert r3["content_truncated"] is False
+    assert r3["full_record"]["chars"] == 5
+    assert r3["text_is"] == "full_record"
+    assert "content_truncated" not in r3
 
     assert r4["ref"] == "decision:4"
-    assert r4["content_chars"] == 46
-    assert r4["content_truncated"] is True
+    assert r4["full_record"]["chars"] == 46
+    assert r4["text_is"] == "full_record"
+    assert all(r["text"] == "whole Postgres" for r in (r1, r2, r3, r4))
+    assert "content_truncated" not in r4
 
 
 # ── G3: Summary and fact same ID do not swap ref/chars, insight ref ───────────
@@ -235,15 +229,15 @@ async def test_g3_summary_and_fact_nodes_with_same_id_do_not_swap_ref_or_chars_a
     c, mock_conn, _ = _coord_with_mocks(records)
 
     async def _fake_fetch(sql, ids):
-        if "technical_docs" in sql and "length(content)" in sql:
-            return [{"id": 42, "content_chars": 200, "type": "fact", "superseded": False,
+        if "technical_docs" in sql and "length(t.content)" in sql:
+            return [{"id": 42, "content_chars": 200, "type": "fact", "content": "whole Postgres", "superseded": False,
                      "visibility": "global", "agent_id": None, "scope": None}]
-        if "community_summaries" in sql and "length(content)" in sql:
+        if "community_summaries" in sql and "length(t.content)" in sql:
             return [
                 {"id": 42, "content_chars": 500, "snippet": "summary snippet 42",
-                 "superseded": False, "metadata": {}},
+                 "superseded": False, "visibility": "global", "metadata": {}},
                 {"id": 70, "content_chars": 700, "snippet": "insight snippet 70",
-                 "superseded": False, "metadata": {"kind": "insight"}},
+                 "superseded": False, "visibility": "global", "metadata": {"kind": "insight"}},
             ]
         return []
 
@@ -257,22 +251,25 @@ async def test_g3_summary_and_fact_nodes_with_same_id_do_not_swap_ref_or_chars_a
     r_ins = body["records"][2]["n"]
 
     assert r_fact["ref"] == "fact:42"
-    assert r_fact["content_chars"] == 200
+    assert r_fact["full_record"]["chars"] == 200
 
     assert r_sum["ref"] == "summary:42"
-    assert r_sum["content_chars"] == 500
-    assert r_sum["snippet"] == "summary snippet 42"
+    assert r_sum["full_record"]["chars"] == 500
+    assert r_sum["text_is"] == "pointer"
+    assert "text" not in r_sum and "snippet" not in r_sum
 
     assert r_ins["ref"] == "insight:70"
-    assert r_ins["content_chars"] == 700
-    assert r_ins["snippet"] == "insight snippet 70"
+    assert r_ins["full_record"]["chars"] == 700
+    assert r_ins["text_is"] == "pointer"
+    assert "text" not in r_ins and "snippet" not in r_ins
 
 
 # ── G4: Unreadable node gains no index keys, owner gets them ──────────────────
 
 @pytest.mark.asyncio
 async def test_g4_unreadable_node_gains_no_index_keys_and_owner_is_not_refused():
-    """G4: A node the caller cannot read (private non-owner; scope; unauthenticated caller) gains ref, content_chars, content_truncated or snippet; or a readable node beside it is also withheld; or the owner is refused them."""
+    """F19: an unreadable node gains ref, full_record, text_is or text; or a readable
+    node beside it is also withheld; or the owner is refused them."""
     n_priv = _make_node(["Fact"], {"pg_id": 1, "content": "private fact"}, element_id="1", id_=1)
     n_scope = _make_node(["Fact"], {"pg_id": 2, "content": "scope fact"}, element_id="2", id_=2)
     n_readable = _make_node(["Fact"], {"pg_id": 3, "content": "global fact"}, element_id="3", id_=3)
@@ -284,11 +281,11 @@ async def test_g4_unreadable_node_gains_no_index_keys_and_owner_is_not_refused()
     ])
 
     mock_conn.fetch = AsyncMock(return_value=[
-        {"id": 1, "content_chars": 100, "type": "fact", "superseded": False,
+        {"id": 1, "content_chars": 100, "type": "fact", "content": "whole Postgres", "superseded": False,
          "visibility": "private", "agent_id": "alice", "scope": "global"},
-        {"id": 2, "content_chars": 200, "type": "fact", "superseded": False,
+        {"id": 2, "content_chars": 200, "type": "fact", "content": "whole Postgres", "superseded": False,
          "visibility": "scope", "agent_id": "alice", "scope": "ops"},
-        {"id": 3, "content_chars": 300, "type": "fact", "superseded": False,
+        {"id": 3, "content_chars": 300, "type": "fact", "content": "whole Postgres", "superseded": False,
          "visibility": "global", "agent_id": None, "scope": None},
     ])
 
@@ -300,7 +297,7 @@ async def test_g4_unreadable_node_gains_no_index_keys_and_owner_is_not_refused()
         for k in ("ref", "content_chars", "content_truncated", "snippet", "content_source"):
             assert k not in b_anon[idx]["n"]
     assert b_anon[2]["n"]["ref"] == "fact:3"
-    assert b_anon[2]["n"]["content_chars"] == 300
+    assert b_anon[2]["n"]["full_record"]["chars"] == 300
 
     # Non-owner bob
     resp_bob = await c.handle_graph(_graph_request(agent="bob"))
@@ -310,15 +307,16 @@ async def test_g4_unreadable_node_gains_no_index_keys_and_owner_is_not_refused()
         for k in ("ref", "content_chars", "content_truncated", "snippet", "content_source"):
             assert k not in b_bob[idx]["n"]
     assert b_bob[2]["n"]["ref"] == "fact:3"
-    assert b_bob[2]["n"]["content_chars"] == 300
+    assert b_bob[2]["n"]["full_record"]["chars"] == 300
 
     # Owner alice: gets index keys for n_priv, n_scope withheld (viewer_scope is None on graph)
     resp_alice = await c.handle_graph(_graph_request(agent="alice"))
     assert resp_alice.status == 200
     b_alice = json.loads(resp_alice.text)["records"]
     assert b_alice[0]["n"]["ref"] == "fact:1"
-    assert b_alice[0]["n"]["content_chars"] == 100
-    assert b_alice[0]["n"]["content_truncated"] is True
+    assert b_alice[0]["n"]["full_record"]["chars"] == 100
+    assert b_alice[0]["n"]["text_is"] == "full_record"
+    assert "content_truncated" not in b_alice[0]["n"]
     for k in ("ref", "content_chars", "content_truncated", "snippet", "content_source"):
         assert k not in b_alice[1]["n"]
     assert b_alice[2]["n"]["ref"] == "fact:3"
@@ -327,52 +325,42 @@ async def test_g4_unreadable_node_gains_no_index_keys_and_owner_is_not_refused()
 # ── G5: Graph SQL never selects whole content ─────────────────────────────────
 
 @pytest.mark.asyncio
-async def test_g5_graph_sql_never_selects_whole_content():
-    """G5: A SQL statement sent by handle_graph selects content as a whole value rather than length(content) or left(content, 120)."""
-    n1 = _make_node(["Fact"], {"pg_id": 1, "content": "graph fact"}, element_id="1", id_=1)
-    n2 = _make_node(["CommunitySummary"], {"pg_id": 2}, element_id="2", id_=2)
-    c, mock_conn, _ = _coord_with_mocks([_FakeRecord({"n": n1}), _FakeRecord({"n": n2})])
-
-    mock_conn.fetch = AsyncMock(return_value=[])
-
-    resp = await c.handle_graph(_graph_request())
-    assert resp.status == 200
-
-    def _assert_no_whole_content(sql):
-        cleaned_sql = (
-            sql.replace("length(content)", "")
-            .replace("left(content, 120)", "")
-            .replace("content_chars", "")
-        )
-        assert "content" not in cleaned_sql.lower(), f"Unexpected whole content in query: {sql}"
-
-    for call in mock_conn.fetch.await_args_list:
-        _assert_no_whole_content(call.args[0])
-    for call in mock_conn.fetchrow.await_args_list:
-        _assert_no_whole_content(call.args[0])
+async def test_g5_graph_hydration_selects_whole_content_and_successors_once_per_table():
+    """F3, F17: hydration reads full text and self-joins successors once per table."""
+    nodes = [_make_node([label], {"pg_id": i}) for i, label in enumerate(["Fact", "CommunitySummary"], 1)]
+    c, conn, _ = _coord_with_mocks([_FakeRecord({"nodes": nodes})])
+    response = await c.handle_graph(_graph_request())
+    assert response.status == 200
+    assert conn.fetch.await_count == 2
+    for call in conn.fetch.await_args_list:
+        sql = call.args[0]
+        assert "t.content" in sql and "LEFT JOIN" in sql
+        assert "s.visibility" in sql and "t.visibility" in sql
+        assert "left(" not in sql.lower()
 
 
 # ── G6: CommunitySummary node on graph has snippet and no content key ─────────
 
 @pytest.mark.asyncio
 async def test_g6_community_summary_node_on_graph_has_snippet_and_no_content_key():
-    """G6: A CommunitySummary node returned on graph gains a content key (it must have snippet from Postgres and NO content)."""
+    """F5: graph summary nodes are pointers without stored text."""
     n = _make_node(["CommunitySummary"], {"pg_id": 10}, element_id="1", id_=1)
     c, mock_conn, _ = _coord_with_mocks([_FakeRecord({"n": n})])
 
     mock_conn.fetch = AsyncMock(return_value=[
         {"id": 10, "content_chars": 500, "snippet": "first 120 chars snippet",
-         "superseded": False, "metadata": {}},
+         "superseded": False, "visibility": "global", "metadata": {}},
     ])
 
     resp = await c.handle_graph(_graph_request())
     assert resp.status == 200
     rec = json.loads(resp.text)["records"][0]["n"]
     assert "content" not in rec
-    assert rec["snippet"] == "first 120 chars snippet"
+    assert rec["text_is"] == "pointer"
+    assert "text" not in rec and "snippet" not in rec
     assert rec["ref"] == "summary:10"
-    assert rec["content_chars"] == 500
-    assert rec["content_truncated"] is True
+    assert rec["full_record"]["chars"] == 500
+    assert "content_truncated" not in rec
 
 
 # ── G7: Deleted names absent from module, coordinator, and env.example ────────
@@ -795,15 +783,15 @@ async def test_l9_a_related_neighbour_with_no_postgres_row_is_left_out():
 
 @pytest.mark.asyncio
 async def test_f3_unchosen_node_preserves_content_and_gains_source_chars_ref():
-    """F3: A node keeps its graph content and gains ref, content_chars, content_truncated; content_source is never written."""
+    """F3: unchosen graph nodes still receive authoritative text."""
     n1 = _make_node(["Fact"], {"pg_id": 10, "content": "original graph content"}, element_id="1", id_=1)
     records = [_FakeRecord({"n": n1})]
 
     c, mock_conn, _ = _coord_with_mocks(records)
 
     async def _fake_fetch(sql, ids):
-        if "length(content)" in sql:
-            return [{"id": 10, "content_chars": 50000, "type": "fact", "superseded": False,
+        if "length(t.content)" in sql:
+            return [{"id": 10, "content_chars": 50000, "type": "fact", "content": "whole Postgres", "superseded": False,
                      "visibility": "global", "agent_id": None, "scope": None}]
         return []
 
@@ -813,9 +801,11 @@ async def test_f3_unchosen_node_preserves_content_and_gains_source_chars_ref():
     assert resp.status == 200
     body = json.loads(resp.text)
     rec = body["records"][0]["n"]
-    assert rec["content"] == "original graph content"
-    assert rec["content_chars"] == 50000
-    assert rec["content_truncated"] is True
+    assert rec["text"] == "whole Postgres"
+    assert "content" not in rec
+    assert rec["full_record"]["chars"] == 50000
+    assert rec["text_is"] == "full_record"
+    assert "content_truncated" not in rec
     assert rec["ref"] == "fact:10"
     assert "content_source" not in rec
 
@@ -863,8 +853,8 @@ async def test_f4_private_record_withheld_from_non_owner_on_lineage_and_graph():
     n_priv = _make_node(["Fact"], {"pg_id": 55, "content": "graph copy"}, element_id="1", id_=1)
     c_graph, mock_conn_g, _ = _coord_with_mocks([_FakeRecord({"n": n_priv})])
     async def _fake_fetch_priv(sql, ids):
-        if "length(content)" in sql:
-            return [{"id": 55, "content_chars": 28, "type": "fact", "superseded": False,
+        if "length(t.content)" in sql:
+            return [{"id": 55, "content_chars": 28, "type": "fact", "content": "whole Postgres", "superseded": False,
                      "visibility": "private", "agent_id": "alice", "scope": "global"}]
         return []
     mock_conn_g.fetch = AsyncMock(side_effect=_fake_fetch_priv)
@@ -872,7 +862,7 @@ async def test_f4_private_record_withheld_from_non_owner_on_lineage_and_graph():
     resp_g_bob = await c_graph.handle_graph(_graph_request(agent="bob"))
     assert resp_g_bob.status == 200
     rec_g_bob = json.loads(resp_g_bob.text)["records"][0]["n"]
-    assert rec_g_bob["content"] == "graph copy"
+    assert rec_g_bob == {"label": "Fact"}
     assert "content_source" not in rec_g_bob
     assert "content_chars" not in rec_g_bob
     assert "ref" not in rec_g_bob
@@ -883,19 +873,21 @@ async def test_f4_private_record_withheld_from_non_owner_on_lineage_and_graph():
     resp_g_alice = await c_graph.handle_graph(_graph_request(agent="alice"))
     assert resp_g_alice.status == 200
     rec_g_alice = json.loads(resp_g_alice.text)["records"][0]["n"]
-    assert rec_g_alice["content"] == "graph copy"
+    assert rec_g_alice["text"] == "whole Postgres"
+    assert "content" not in rec_g_alice
     assert "content_source" not in rec_g_alice
     assert rec_g_alice["ref"] == "fact:55"
-    assert rec_g_alice["content_chars"] == 28
-    assert rec_g_alice["content_truncated"] is True
-    assert private_text not in resp_g_alice.text
+    assert rec_g_alice["full_record"]["chars"] == 28
+    assert rec_g_alice["text_is"] == "full_record"
+    assert "content_truncated" not in rec_g_alice
+    assert "graph copy" not in resp_g_alice.text
 
 
 # ── F5: Fetch error or TimeoutError degrades gracefully ───────────────────────
 
 @pytest.mark.asyncio
 async def test_f5_fetch_error_or_timeout_degrades_gracefully_on_graph_and_search():
-    """F5: A fetch error, or asyncio.TimeoutError from _acquire, fails the graph read or the search instead of returning 200 with untouched nodes."""
+    """F4a: database failures redact nodes instead of exposing graph text."""
     n1 = _make_node(["Fact"], {"pg_id": 77, "content": "graph content intact"}, element_id="1", id_=1)
     c, mock_conn, _ = _coord_with_mocks([_FakeRecord({"n": n1})])
     c._acquire = MagicMock(side_effect=asyncio.TimeoutError("pool acquire timeout"))
@@ -904,7 +896,7 @@ async def test_f5_fetch_error_or_timeout_degrades_gracefully_on_graph_and_search
     assert resp.status == 200
     body = json.loads(resp.text)
     rec = body["records"][0]["n"]
-    assert rec["content"] == "graph content intact"
+    assert rec == {"label": "Fact"}
     assert "content_source" not in rec
     assert "ref" not in rec
     assert "content_chars" not in rec
@@ -913,7 +905,7 @@ async def test_f5_fetch_error_or_timeout_degrades_gracefully_on_graph_and_search
 
 @pytest.mark.asyncio
 async def test_f5_fetch_runtime_error_degrades_gracefully_with_warning(caplog):
-    """F5: When Postgres fetch raises RuntimeError, handle_graph returns 200, nodes untouched, exactly one warning logged."""
+    """F4a: database failures redact nodes and log one warning."""
     import logging
     n1 = _make_node(["Fact"], {"pg_id": 77, "content": "graph content intact"}, element_id="1", id_=1)
     c, mock_conn, _ = _coord_with_mocks([_FakeRecord({"n": n1})])
@@ -926,7 +918,7 @@ async def test_f5_fetch_runtime_error_degrades_gracefully_with_warning(caplog):
     assert resp.status == 200
     body = json.loads(resp.text)
     rec = body["records"][0]["n"]
-    assert rec["content"] == "graph content intact"
+    assert rec == {"label": "Fact"}
     assert "content_source" not in rec
     assert "ref" not in rec
     assert "content_chars" not in rec
@@ -934,7 +926,7 @@ async def test_f5_fetch_runtime_error_degrades_gracefully_with_warning(caplog):
 
     warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
     assert len(warnings) == 1
-    assert "graph query text hydration failed" in warnings[0].message
+    assert "record hydration failed" in warnings[0].message
 
     ctx_entries = [{"pg_id": 77, "label": ONT.fact, "snippet": "cypher snippet"}]
     c_search, _, _ = _coord_with_mocks()
@@ -950,77 +942,21 @@ async def test_f5_fetch_runtime_error_degrades_gracefully_with_warning(caplog):
 
 @pytest.mark.asyncio
 async def test_f6_scalar_projection_entity_node_untouched_and_list_hydrated():
-    """F6: A scalar projection, a Path, a relationship, a map value or an Entity node is altered; or a node in a top-level list is not hydrated."""
-    node_in_list = _make_node(["Fact"], {"pg_id": 7, "content": "graph 7"}, element_id="1", id_=1)
-    entity_node = _make_node(["Entity"], {"name": "Postgres"}, element_id="2", id_=2)
-    node_in_map = _make_node(["Fact"], {"pg_id": 99, "content": "map fact"}, element_id="3", id_=3)
-    fake_map = {"n": node_in_map}
-    scalar_proj = "scalar value"
-
-    n_start = _make_node(["Entity"], {"name": "StartNode"}, element_id="10", id_=10)
-    n_end = _make_node(["Entity"], {"name": "EndNode"}, element_id="11", id_=11)
-    rel = _make_rel("RELATES_TO", {"weight": 1.0}, n_start, n_end, element_id="r1", id_=1)
-    path = _make_path(n_start, rel)
-
-    rec = _FakeRecord({
-        "scalar": scalar_proj,
-        "ent": entity_node,
-        "m": fake_map,
-        "nlist": [node_in_list],
-        "rel": rel,
-        "path": path,
-    })
-    expected_data = rec.data()
-    c, mock_conn, _ = _coord_with_mocks([rec])
-
-    async def _fake_fetch(sql, ids):
-        if "length(content)" in sql:
-            return [{"id": 7, "content_chars": 22, "type": "fact", "superseded": False,
-                     "visibility": "global", "agent_id": None, "scope": None}]
-        return []
-
-    mock_conn.fetch = AsyncMock(side_effect=_fake_fetch)
-
-    resp = await c.handle_graph(_graph_request())
-    assert resp.status == 200
-    body = json.loads(resp.text)
-    row = body["records"][0]
-    assert row["scalar"] == expected_data["scalar"]
-    assert row["ent"] == expected_data["ent"]
-
-    start_props = {"name": "StartNode"}
-    end_props = {"name": "EndNode"}
-    node_props = {"pg_id": 99, "content": "map fact"}
-
-    assert expected_data["path"] == [start_props, "RELATES_TO", end_props]
-    assert expected_data["rel"] == (start_props, "RELATES_TO", end_props)
-    assert expected_data["m"] == {"n": node_props}
-
-    assert row["path"] == [start_props, "RELATES_TO", end_props]
-    assert row["rel"] == [start_props, "RELATES_TO", end_props]
-    assert row["m"] == {"n": node_props}
-
-    for d in (
-        row["ent"],
-        row["m"]["n"],
-        row["rel"][0],
-        row["rel"][2],
-        row["path"][0],
-        row["path"][2],
-        expected_data["ent"],
-        expected_data["m"]["n"],
-        expected_data["rel"][0],
-        expected_data["rel"][2],
-        expected_data["path"][0],
-        expected_data["path"][2],
-    ):
-        assert "content_source" not in d
-
-    assert row["nlist"][0]["content"] == "graph 7"
-    assert row["nlist"][0]["ref"] == "fact:7"
-    assert row["nlist"][0]["content_chars"] == 22
-    assert row["nlist"][0]["content_truncated"] is True
-    assert "content_source" not in row["nlist"][0]
+    """F19: projections stay intact while nodes in lists are hydrated."""
+    n = _make_node(["Fact"], {"pg_id": 7, "content": "node copy"})
+    entity = _make_node(["Entity"], {"name": "Postgres"})
+    rel = _make_rel("MENTIONS", {"weight": 1}, n, entity)
+    c, conn, _ = _coord_with_mocks([_FakeRecord({"scalar": "projected", "ent": entity,
+        "m": {"n": n}, "nlist": [n], "rel": rel, "path": _make_path(n, rel)})])
+    conn.fetch = AsyncMock(return_value=[{"id": 7, "metadata": {}, "visibility": "global", "content": "whole", "content_chars": 5}])
+    response = await c.handle_graph(_graph_request())
+    row = json.loads(response.text)["records"][0]
+    assert row["scalar"] == "projected"
+    assert row["ent"] == {"label": "Entity", "name": "Postgres"}
+    assert row["m"]["n"] == row["nlist"][0] == row["path"]["nodes"][0]
+    assert row["m"]["n"]["text"] == "whole" and "content" not in row["m"]["n"]
+    assert row["rel"] == {"from": "fact:7", "relation": "MENTIONS", "to": row["ent"], "props": {"weight": 1}}
+    assert row["path"]["relationships"] == [row["rel"]]
 
 
 # ── F8: Summary neighbour with null/missing/retired snippet handling ──────────
@@ -1182,13 +1118,13 @@ async def test_f9_lineage_refusal_and_missing_record_omit_text_keys():
 
 @pytest.mark.asyncio
 async def test_f11_same_node_in_multiple_rows_both_gain_index_keys():
-    """F11: The same record in two rows: both nodes keep the node copy, both get the same ref and the same content_chars."""
+    """F19: repeated node values are hydrated in every row."""
     node_a = _make_node(["Fact"], {"pg_id": 5, "content": "graph 5"}, element_id="1", id_=1)
     node_b = _make_node(["Fact"], {"pg_id": 5, "content": "graph 5"}, element_id="1", id_=1)
     c, mock_conn, _ = _coord_with_mocks([_FakeRecord({"n": node_a}), _FakeRecord({"n": node_b})])
 
     mock_conn.fetch = AsyncMock(return_value=[
-        {"id": 5, "content_chars": 10000, "type": "fact", "superseded": False,
+        {"id": 5, "content_chars": 10000, "type": "fact", "content": "whole Postgres", "superseded": False,
          "visibility": "global", "agent_id": None, "scope": None},
     ])
 
@@ -1199,58 +1135,69 @@ async def test_f11_same_node_in_multiple_rows_both_gain_index_keys():
     r1 = body["records"][1]["n"]
     assert "content_source" not in r0
     assert "content_source" not in r1
-    assert r0["content"] == "graph 5"
-    assert r1["content"] == "graph 5"
+    assert r0["text"] == "whole Postgres"
+    assert "content" not in r0
+    assert r1["text"] == "whole Postgres"
+    assert "content" not in r1
     assert r0["ref"] == "fact:5"
     assert r1["ref"] == "fact:5"
-    assert r0["content_chars"] == 10000
-    assert r1["content_chars"] == 10000
-    assert r0["content_truncated"] is True
-    assert r1["content_truncated"] is True
+    assert r0["full_record"]["chars"] == 10000
+    assert r1["full_record"]["chars"] == 10000
+    assert r0["text_is"] == "full_record"
+    assert "content_truncated" not in r0
+    assert r1["text_is"] == "full_record"
+    assert "content_truncated" not in r1
 
 
 # ── F14: Superseded nodes hydrated on graph ───────────────────────────────────
 
 @pytest.mark.asyncio
 async def test_f14_superseded_node_is_hydrated_on_graph():
-    """F14: A superseded Fact node keeps what it stores and gets index keys."""
+    """F4b: retired fact nodes remain readable and marked."""
     n = _make_node(["Fact"], {"pg_id": 9, "content": "graph copy"}, element_id="1", id_=1)
     c, mock_conn, _ = _coord_with_mocks([_FakeRecord({"n": n})])
 
     mock_conn.fetch = AsyncMock(return_value=[
-        {"id": 9, "content_chars": 30, "type": "fact", "superseded": True,
+        {"id": 9, "content_chars": 30, "type": "fact", "content": "whole Postgres", "superseded": True,
          "visibility": "global", "agent_id": None, "scope": None},
     ])
 
     resp = await c.handle_graph(_graph_request())
     assert resp.status == 200
     rec = json.loads(resp.text)["records"][0]["n"]
-    assert rec["content"] == "graph copy"
+    assert rec["text"] == "whole Postgres"
+    assert "content" not in rec
+    assert rec["obsolete"] == "superseded"
+    assert rec["superseded"] is True
     assert "content_source" not in rec
     assert rec["ref"] == "fact:9"
-    assert rec["content_chars"] == 30
-    assert rec["content_truncated"] is True
+    assert rec["full_record"]["chars"] == 30
+    assert rec["text_is"] == "full_record"
+    assert "content_truncated" not in rec
 
 
 @pytest.mark.asyncio
 async def test_f14_superseded_summary_node_is_hydrated_on_graph():
-    """F14: A superseded CommunitySummary node keeps what it stores and gets index keys and snippet."""
+    """F4b: retired summary nodes remain marked pointers."""
     n_sum = _make_node(["CommunitySummary"], {"pg_id": 99}, element_id="2", id_=2)
     c, mock_conn, _ = _coord_with_mocks([_FakeRecord({"n": n_sum})])
 
     mock_conn.fetch = AsyncMock(return_value=[
-        {"id": 99, "content_chars": 38, "snippet": "snip", "superseded": True, "metadata": {}},
+        {"id": 99, "content_chars": 38, "snippet": "snip", "superseded": True, "visibility": "global", "metadata": {}},
     ])
 
     resp = await c.handle_graph(_graph_request())
     assert resp.status == 200
     rec = json.loads(resp.text)["records"][0]["n"]
     assert "content" not in rec
+    assert rec["obsolete"] == "superseded"
+    assert rec["superseded"] is True
     assert "content_source" not in rec
     assert rec["ref"] == "summary:99"
-    assert rec["content_chars"] == 38
-    assert rec["content_truncated"] is True
-    assert rec["snippet"] == "snip"
+    assert rec["full_record"]["chars"] == 38
+    assert rec["text_is"] == "pointer"
+    assert "content_truncated" not in rec
+    assert "text" not in rec and "snippet" not in rec
 
 
 # ── F15: Scope visibility on lineage and graph ─────────────────────────────────
@@ -1287,14 +1234,14 @@ async def test_f15_scope_visibility_withheld_on_lineage_and_graph():
     n = _make_node(["Fact"], {"pg_id": 15, "content": "graph copy"}, element_id="1", id_=1)
     c_g, mock_conn_g, _ = _coord_with_mocks([_FakeRecord({"n": n})])
     mock_conn_g.fetch = AsyncMock(return_value=[
-        {"id": 15, "content_chars": len(scope_secret), "type": "fact", "superseded": False,
+        {"id": 15, "content_chars": len(scope_secret), "type": "fact", "content": "whole Postgres", "superseded": False,
          "visibility": "scope", "agent_id": "alice", "scope": "ops"},
     ])
 
     resp_g = await c_g.handle_graph(_graph_request(agent="alice"))
     assert resp_g.status == 200
     rec_g = json.loads(resp_g.text)["records"][0]["n"]
-    assert rec_g["content"] == "graph copy"
+    assert rec_g == {"label": "Fact"}
     assert "content_source" not in rec_g
     assert "content_chars" not in rec_g
     assert "ref" not in rec_g
@@ -1306,15 +1253,15 @@ async def test_f15_scope_visibility_withheld_on_lineage_and_graph():
 
 @pytest.mark.asyncio
 async def test_f16_private_unreadable_record_spends_no_budget():
-    """F16: A private record earlier in the walk gains nothing and its node copy is unchanged; the next readable node gets its index keys."""
+    """F19: private nodes cannot prevent readable nodes from hydrating."""
     n1 = _make_node(["Fact"], {"pg_id": 101, "content": "graph 101"}, element_id="1", id_=1)
     n2 = _make_node(["Fact"], {"pg_id": 102, "content": "graph 102"}, element_id="2", id_=2)
     c, mock_conn, _ = _coord_with_mocks([_FakeRecord({"n": n1}), _FakeRecord({"n": n2})])
 
     mock_conn.fetch = AsyncMock(return_value=[
-        {"id": 101, "content_chars": 15000, "type": "fact", "superseded": False,
+        {"id": 101, "content_chars": 15000, "type": "fact", "content": "whole Postgres", "superseded": False,
          "visibility": "private", "agent_id": "other_agent", "scope": "global"},
-        {"id": 102, "content_chars": 5000, "type": "fact", "superseded": False,
+        {"id": 102, "content_chars": 5000, "type": "fact", "content": "whole Postgres", "superseded": False,
          "visibility": "global", "agent_id": None, "scope": None},
     ])
 
@@ -1324,64 +1271,37 @@ async def test_f16_private_unreadable_record_spends_no_budget():
     r1 = body["records"][0]["n"]
     r2 = body["records"][1]["n"]
 
-    assert r1["content"] == "graph 101"
+    assert r1 == {"label": "Fact"}
     assert "content_source" not in r1
     assert "content_chars" not in r1
     assert "ref" not in r1
     assert "content_truncated" not in r1
 
-    assert r2["content"] == "graph 102"
+    assert r2["text"] == "whole Postgres"
+    assert "content" not in r2
     assert "content_source" not in r2
     assert r2["ref"] == "fact:102"
-    assert r2["content_chars"] == 5000
-    assert r2["content_truncated"] is True
+    assert r2["full_record"]["chars"] == 5000
+    assert r2["text_is"] == "full_record"
+    assert "content_truncated" not in r2
 
 
 # ── F19: Row cap bounds distinct keys sent to Postgres ────────────────────────
 
 @pytest.mark.asyncio
-async def test_f19_keys_past_cap_are_not_sent_to_postgres(monkeypatch):
-    """F19: Distinct eligible keys past GRAPH_QUERY_ROW_CAP are not sent to Postgres and gain nothing."""
-    nodes = [
-        _make_node(["Fact"], {"pg_id": i, "content": f"g {i}"}, element_id=str(i), id_=i)
-        for i in range(1, 13)
-    ]
-    records = [_FakeRecord({"nodes": nodes})]
-    c, mock_conn, _ = _coord_with_mocks(records)
-
+async def test_f19_keys_past_old_cut_are_all_hydrated(monkeypatch):
+    """F19: every distinct node is hydrated beyond the old key cut."""
     monkeypatch.setattr(coordinator_mod, "GRAPH_QUERY_ROW_CAP", 10)
-    mock_conn.fetch = AsyncMock(return_value=[
-        {"id": i, "content_chars": 10, "type": "fact", "superseded": False,
-         "visibility": "global", "agent_id": None, "scope": None} for i in range(1, 11)
-    ])
-    resp = await c.handle_graph(_graph_request())
-    assert resp.status == 200
-
-    first_call = mock_conn.fetch.await_args_list[0]
-    ids_sent = first_call.args[1]
-    assert ids_sent == list(range(1, 11))
-
-    body = json.loads(resp.text)
-    row_nodes = body["records"][0]["nodes"]
-    assert "content_source" not in row_nodes[0]
-    assert row_nodes[0]["content"] == "g 1"
-    assert row_nodes[0]["ref"] == "fact:1"
-    assert row_nodes[0]["content_chars"] == 10
-    assert row_nodes[0]["content_truncated"] is True
-
-    n11 = row_nodes[10]
-    n12 = row_nodes[11]
-    assert "content_source" not in n11
-    assert n11["content"] == "g 11"
-    assert "content_chars" not in n11
-    assert "ref" not in n11
-    assert "content_truncated" not in n11
-
-    assert "content_source" not in n12
-    assert n12["content"] == "g 12"
-    assert "content_chars" not in n12
-    assert "ref" not in n12
-    assert "content_truncated" not in n12
+    nodes = [_make_node(["Fact"], {"pg_id": i, "content": "cut"}) for i in range(1, 13)]
+    c, conn, _ = _coord_with_mocks([_FakeRecord({"nodes": nodes})])
+    conn.fetch = AsyncMock(return_value=[{"id": i, "metadata": {}, "visibility": "global", "content": f"whole {i}", "content_chars": 8} for i in range(1, 13)])
+    response = await c.handle_graph(_graph_request())
+    assert response.status == 200
+    assert conn.fetch.await_args.args[1] == list(range(1, 13))
+    result = json.loads(response.text)["records"][0]["nodes"]
+    assert [n["ref"] for n in result] == [f"fact:{i}" for i in range(1, 13)]
+    assert [n["text"] for n in result] == [f"whole {i}" for i in range(1, 13)]
+    assert all("content" not in n and "content_truncated" not in n for n in result)
 
 
 # ── F20: Private neighbour visibility for owner vs non-owner ──────────────────
@@ -1416,14 +1336,14 @@ async def test_f20_private_neighbor_visibility_in_expansion():
 
 @pytest.mark.asyncio
 async def test_graph_request_body_scope_is_ignored():
-    """A graph request whose JSON body carries 'scope' matching a scope-visibility record still gets graph copy and no content_chars."""
+    """F19: graph body scope cannot grant access to scoped nodes."""
     n = _make_node(["Fact"], {"pg_id": 15, "content": "graph copy"}, element_id="1", id_=1)
     c, mock_conn, _ = _coord_with_mocks([_FakeRecord({"n": n})])
 
     secret_text = "<secret scope string>"
     async def _fake_fetch(sql, ids):
-        if "length(content)" in sql:
-            return [{"id": 15, "content_chars": len(secret_text), "type": "fact", "superseded": False,
+        if "length(t.content)" in sql:
+            return [{"id": 15, "content_chars": len(secret_text), "type": "fact", "content": "whole Postgres", "superseded": False,
                      "visibility": "scope", "agent_id": "alice", "scope": "ops"}]
         return []
 
@@ -1433,7 +1353,8 @@ async def test_graph_request_body_scope_is_ignored():
     resp = await c.handle_graph(req)
     assert resp.status == 200
     rec = json.loads(resp.text)["records"][0]["n"]
-    assert rec["content"] == "graph copy"
+    assert rec == {"label": "Fact"}
+    assert "content" not in rec
     assert "content_source" not in rec
     assert "content_chars" not in rec
     assert "ref" not in rec
@@ -1444,30 +1365,22 @@ async def test_graph_request_body_scope_is_ignored():
 # ── Row value whose indexing raises ──────────────────────────────────────────
 
 @pytest.mark.asyncio
-async def test_graph_row_value_whose_indexing_raises_still_returns_200():
+@pytest.mark.parametrize('count', [1, 3])
+async def test_graph_row_value_whose_indexing_raises_still_returns_200(caplog, count):
     """A row value whose indexing raises still returns 200."""
     node = _make_node(["Fact"], {"pg_id": 1, "content": "graph 1"}, element_id="1", id_=1)
 
-    class _BrokenIndexSeq(list):
-        def __getitem__(self, idx):
+    class BrokenRecord(_FakeRecord):
+        def __getitem__(self, key):
             raise RuntimeError("broken indexing")
 
-    rec = _FakeRecord({"nodes": [node]})
-    c, mock_conn, _ = _coord_with_mocks([rec])
-    mock_conn.fetch = AsyncMock(return_value=[
-        {"id": 1, "content_chars": 10, "type": "fact", "superseded": False,
-         "visibility": "global", "agent_id": None, "scope": None},
-    ])
-
-    orig_data = rec.data
-    def _broken_data():
-        d = orig_data()
-        d["nodes"] = _BrokenIndexSeq([node])
-        return d
-    rec.data = _broken_data
-
-    resp = await c.handle_graph(_graph_request())
+    coord, _, _ = _coord_with_mocks([BrokenRecord({f'nodes{i}': [node] for i in range(count)})])
+    resp = await coord.handle_graph(_graph_request())
     assert resp.status == 200
+    assert json.loads(resp.text)['records'] == [{f'nodes{i}': None for i in range(count)}]
+    warnings = [r for r in caplog.records if 'graph query value unavailable' in r.message]
+    assert len(warnings) == 1
+    assert f'{count} cells' in warnings[0].message
 
 
 # ── outbox-only ids: the status reply never invents a type ───────────────────
