@@ -33,7 +33,23 @@ The gateway is `:8888`. Never call the embedder `:8070` or the reranker `:8071`.
 
 Named templates: `why-to-check` (`--title` required, optional `--project`), `who-decided` (`--title`, `--project`), `agent-decisions` (`--assisted-by`, `--project`), `retrospectives` (`--rating`). They call `POST /memory/graph`. They do not hit search or telemetry. `graph` and named CLI `query` templates require `full` or `admin`. `search`, `lineage`/`status`, and `telemetry` remain for `read`. `/health` is anonymous, not a read-role grant. When auth is configured, a bare curl is only `status`, `version`, and `api_version`. A full payload that includes `"auth_required": false` means auth is off.
 
-Reading is two steps. `search "<query>"` returns ranked records whole, each with `graph_context`. A `graph` node, a `graph_context` neighbour, or a `lineage` reply is an index entry, not the record: a short copy (`content` or `snippet`) and, when this caller can read it, `ref` and `content_chars`. Step two is `search --ref <ref>`: that record whole from Postgres, unranked, with its `graph_context`; `obsolete` on it means superseded or reversed, so follow `superseded_by` or `lifecycle.ref`. Never answer from the short copy. No `content_chars`, or `found: false`, means there is nothing to read. A projected value, a path, a map, or a named `query` is not that record.
+Reading is two steps. Step one ranks and expands. Step two is `search --ref`.
+Reading returns a record entry. `text_is` summary is a whole shorter summary
+of the record, including a decision's rationale. `text_is` full_record is the
+whole record. `text_is` pointer has no text; the ref is the only context, so
+expand it with `read_with`. `full_record` carries `ref`, `chars` and
+`read_with`. A `relation` names `from`, the relation and `to`, the stored
+edge direction, and `record` is the far end. A null end is a record this
+caller cannot read. Search never returns superseded or reversed records.
+Explicit reads show them with `obsolete` and `superseded_by`.
+`retired_grounds` on a decision hit means its evidence was retired: read the
+successor before relying on it. `latest_verdict` on a retrospective names the
+verdict that counts most. `lineage`, `search --ref` and a graph query are
+those reads. Any entry can be expanded by its ref, and a `pointer` entry must
+be. `read_with` is `search --ref <ref>`. `found: false` means there is nothing
+to read. On `/memory/graph`, nodes inside paths and maps are resolved like any
+node. Only a projected property is not the record. `grounded_in`,
+`consolidated_into` and a summary's `sources` are references and carry no text.
 
 `save` has no `--project` flag. The client derives the project, or you set `"project"` in the metadata JSON. An explicit value wins.
 
@@ -219,11 +235,11 @@ Graph expansion on a judgement hit returns `belonging`: `{project, domains}`. Th
 Worked contract. Anonymous `/health`, then `--version`:
 
 ```json
-{"status":"ok","version":"1.0.46","api_version":5}
+{"status":"ok","version":"1.0.46","api_version":6}
 ```
 
 ```json
-{"version": "1.0.46", "api_version": 5, "tool": "shared-memory-framework"}
+{"version": "1.0.46", "api_version": 6, "tool": "shared-memory-framework"}
 ```
 
 `doctor` compares this client's `api_version` with the gateway and names which side to upgrade.

@@ -39,8 +39,8 @@ import httpx
 
 VERSION = "1.0.46"
 # API_VERSION is the wire contract; bump only when shape, auth, routes, or a monitor
-# contract change breaks older clients. v5: telemetry contract key removal.
-API_VERSION = 5
+# contract change breaks older clients. v6: entries carry text, text_is, full_record.
+API_VERSION = 6
 
 # Must mirror ontology.RETRO_RATINGS on the gateway; this client never imports server modules.
 # Outcome states, not valence: 'reversed' drives the supersession cascade; nuance goes in notes.

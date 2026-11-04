@@ -157,10 +157,10 @@ async def test_g1_graph_node_content_never_replaced_or_extended_by_postgres_text
     assert "content" not in result and "node copy" not in response.text
 
 
-# ── G2: Content truncated rules and index keys ─────────────────────────────────
+# ── G2: Whole text, no legacy truncation keys ─────────────────────────────────
 
 @pytest.mark.asyncio
-async def test_g2_readable_node_index_keys_and_content_truncated_flag_rules():
+async def test_g2_readable_node_whole_text_without_legacy_keys():
     """F3, F4c: readable nodes carry whole text and no legacy text keys."""
     n_short = _make_node(["Fact"], {"pg_id": 1, "content": "short"}, element_id="1", id_=1)
     n_equal = _make_node(["Fact"], {"pg_id": 2, "content": "equal len"}, element_id="2", id_=2)
@@ -268,8 +268,7 @@ async def test_g3_summary_and_fact_nodes_with_same_id_do_not_swap_ref_or_chars_a
 
 @pytest.mark.asyncio
 async def test_g4_unreadable_node_gains_no_index_keys_and_owner_is_not_refused():
-    """F19: an unreadable node gains ref, full_record, text_is or text; or a readable
-    node beside it is also withheld; or the owner is refused them."""
+    """G4: A node the caller cannot read (private non-owner; scope; unauthenticated caller) gains ref, full_record, text_is or text; or a readable node beside it is also withheld; or the owner is refused them."""
     n_priv = _make_node(["Fact"], {"pg_id": 1, "content": "private fact"}, element_id="1", id_=1)
     n_scope = _make_node(["Fact"], {"pg_id": 2, "content": "scope fact"}, element_id="2", id_=2)
     n_readable = _make_node(["Fact"], {"pg_id": 3, "content": "global fact"}, element_id="3", id_=3)
@@ -322,7 +321,7 @@ async def test_g4_unreadable_node_gains_no_index_keys_and_owner_is_not_refused()
     assert b_alice[2]["n"]["ref"] == "fact:3"
 
 
-# ── G5: Graph SQL never selects whole content ─────────────────────────────────
+# ── G5: Graph hydration selects whole content and one successor join per table ─
 
 @pytest.mark.asyncio
 async def test_g5_graph_hydration_selects_whole_content_and_successors_once_per_table():
@@ -342,7 +341,7 @@ async def test_g5_graph_hydration_selects_whole_content_and_successors_once_per_
 # ── G6: CommunitySummary node on graph has snippet and no content key ─────────
 
 @pytest.mark.asyncio
-async def test_g6_community_summary_node_on_graph_has_snippet_and_no_content_key():
+async def test_g6_community_summary_node_on_graph_is_a_pointer_without_stored_text():
     """F5: graph summary nodes are pointers without stored text."""
     n = _make_node(["CommunitySummary"], {"pg_id": 10}, element_id="1", id_=1)
     c, mock_conn, _ = _coord_with_mocks([_FakeRecord({"n": n})])
@@ -379,6 +378,33 @@ def test_g7_deleted_names_absent_from_module_coordinator_and_env_example():
         assert name not in env_content, f"{name} is still in .env.example"
 
 
+@pytest.mark.asyncio
+async def test_resolve_marks_drops_a_partial_row_when_the_cursor_raises():
+    """A marks cursor that yields one decision and then raises must not keep that partial row."""
+
+    class _Boom:
+        def __init__(self):
+            self._n = 0
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            self._n += 1
+            if self._n == 1:
+                return {"decision_id": 1,
+                        "outcomes": [{"pg_id": 2, "rating": "validated"}],
+                        "grounds": []}
+            raise RuntimeError("cursor died")
+
+    c, _, session = _coord_with_mocks()
+    session.run = AsyncMock(return_value=_Boom())
+    marks = await c.resolve_marks(session, [1], [])
+    assert marks.get("failed") is True
+    assert marks["decisions"] == {}
+    assert marks["retrospectives"] == {}
+
+
 _LINEAGE_TEXT_KEYS = (
     "content", "alternatives", "confidence", "content_withheld", "content_truncated",
 )
@@ -387,6 +413,37 @@ _LONG_LINEAGE = (
     "A demo ledger keeps the names in sorted order so two agents cannot deadlock "
     "on the same pair of locks when they acquire them from opposite ends of the list."
 )
+
+
+def _live_edge(entry, anchor):
+    """Turn an older direction/label neighbour into a stored-direction edge.
+
+    Compose reads start and end, not direction. The anchor end keeps empty
+    labels so an unknown table still counts as this anchor.
+    """
+    labels = entry.get("labels") or ([entry["label"]] if entry.get("label") else [])
+    far = entry.get("pg_id")
+    inbound = entry.get("direction") == "in"
+    return {
+        "rel_type": entry["rel_type"],
+        "rel_props": entry.get("rel_props") or {},
+        "labels": labels,
+        "pg_id": far,
+        "start_pg_id": far if inbound else anchor,
+        "end_pg_id": anchor if inbound else far,
+        "start_labels": labels if inbound else [],
+        "end_labels": [] if inbound else labels,
+    }
+
+
+class _EmptyRows:
+    """An empty Neo4j result. Marks have nothing to read."""
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        raise StopAsyncIteration
 
 
 class _AsyncRows:
@@ -453,6 +510,22 @@ async def test_l1_lineage_replies_omit_record_text_keys():
     for ref, rows, summary in cases:
         c, mock_conn, _ = _coord_with_mocks()
         mock_conn.fetch = AsyncMock(return_value=[])
+        if ref == "summary:18":
+            async def _fetch_successor(sql, *args):
+                if "content_chars" in sql and "LEFT JOIN" in sql:
+                    return [{
+                        "id": 18, "content": _LONG_LINEAGE,
+                        "content_chars": len(_LONG_LINEAGE),
+                        "metadata": {"kind": "thematic"}, "superseded": True,
+                        "superseded_by": 20, "visibility": "global",
+                        "agent_id": "", "scope": "global",
+                        "successor_id": 20,
+                        "successor_metadata": {"kind": "thematic"},
+                        "successor_visibility": "global",
+                        "successor_agent_id": "", "successor_scope": "global",
+                    }]
+                return []
+            mock_conn.fetch = AsyncMock(side_effect=_fetch_successor)
         if summary:
             mock_conn.fetchrow = AsyncMock(return_value=rows[0])
         else:
@@ -497,57 +570,83 @@ async def test_l2_status_sql_selects_length_and_left_only():
 
 # ── L3: readable records carry snippet and content_chars; unreadable do not ─
 
+def _lineage_text_row(pid, text, **extra):
+    row = {
+        "id": pid, "content": text, "content_chars": len(text),
+        "metadata": {"type": "fact"}, "type": "fact", "superseded": False,
+        "visibility": "global", "agent_id": None, "scope": None,
+    }
+    row.update(extra)
+    return row
+
+
 @pytest.mark.asyncio
 async def test_l3_snippet_and_content_chars_follow_visibility():
-    """L3: A readable lineage lacks content_chars or snippet, or an unreadable record carries either."""
+    """L3: A readable lineage lacks the whole text, or an unreadable record is not the missing-record answer."""
     text = _LONG_LINEAGE
     assert len(text) > 120
-    snippet = text[:120]
+
+    def _fetch_for(pid, owner=None):
+        async def _fetch(sql, *args):
+            if "content_chars" in sql and "LEFT JOIN" in sql:
+                extra = {}
+                if owner:
+                    extra = {"visibility": "private", "agent_id": owner}
+                return [_lineage_text_row(pid, text, **extra)]
+            return []
+        return _fetch
 
     c, mock_conn, _ = _coord_with_mocks()
-    mock_conn.fetch = AsyncMock(return_value=[])
+    mock_conn.fetch = AsyncMock(side_effect=_fetch_for(21))
     mock_conn.fetchrow = AsyncMock(side_effect=[
         _doc_status_row(21, "fact", text), None,
     ])
     resp = await c.handle_status(_status_request("fact:21"))
     body = json.loads(resp.text)
-    assert body["content_chars"] == len(text)
-    assert body["snippet"] == snippet
-    keys = list(body.keys())
-    assert keys[keys.index("ref") + 1] == "content_chars"
-    assert keys[keys.index("ref") + 2] == "snippet"
+    assert body["text"] == text
+    assert body["text_is"] == "full_record"
+    assert body["full_record"]["chars"] == len(text)
+    assert body["full_record"]["read_with"] == "search --ref fact:21"
+    assert "snippet" not in body
+    assert "content_chars" not in body
 
     c_owner, conn_owner, _ = _coord_with_mocks()
-    conn_owner.fetch = AsyncMock(return_value=[])
+    conn_owner.fetch = AsyncMock(side_effect=_fetch_for(22, owner="alice"))
     conn_owner.fetchrow = AsyncMock(side_effect=[
         _doc_status_row(22, "fact", text, visibility="private", agent_id="alice"),
         None,
     ])
     owned = json.loads((await c_owner.handle_status(
         _status_request("fact:22", agent="alice"))).text)
-    assert owned["content_chars"] == len(text)
-    assert owned["snippet"] == snippet
+    assert owned["text"] == text
+    assert owned["text_is"] == "full_record"
+    assert "snippet" not in owned
 
     withheld = [
         ("fact:23", "bob", _doc_status_row(
-            23, "fact", text, visibility="private", agent_id="alice"), False),
+            23, "fact", text, visibility="private", agent_id="alice")),
         ("fact:24", "alice", _doc_status_row(
-            24, "fact", text, visibility="scope", agent_id="alice", scope="ops"), False),
+            24, "fact", text, visibility="scope", agent_id="alice", scope="ops")),
     ]
-    for ref, agent, row, _summary in withheld:
-        c_w, conn_w, _ = _coord_with_mocks()
+    for ref, agent, row in withheld:
+        c_w, conn_w, session_w = _coord_with_mocks()
         conn_w.fetch = AsyncMock(return_value=[])
         conn_w.fetchrow = AsyncMock(side_effect=[row, None])
-        hidden = json.loads((await c_w.handle_status(_status_request(ref, agent=agent))).text)
-        assert "content_chars" not in hidden, ref
-        assert "snippet" not in hidden, ref
+        resp_w = await c_w.handle_status(_status_request(ref, agent=agent))
+        hidden = json.loads(resp_w.text)
+        assert hidden == {
+            "pg_id": int(ref.split(":")[1]), "exists": False, "neo4j": "unknown"}
         assert text not in json.dumps(hidden)
+        assert session_w.run.await_count == 0
 
     c_sum, conn_sum, _ = _coord_with_mocks()
     conn_sum.fetchrow = AsyncMock(return_value=_summary_status_row(
         25, text, visibility="private", agent_id="alice"))
-    hidden_sum = json.loads((await c_sum.handle_status(
-        _status_request("summary:25", agent="bob"))).text)
+    resp_sum = await c_sum.handle_status(_status_request("summary:25", agent="bob"))
+    assert resp_sum.status == 404
+    hidden_sum = json.loads(resp_sum.text)
+    assert hidden_sum["exists"] is False
+    assert hidden_sum["record_type"] == "summary"
     assert "content_chars" not in hidden_sum
     assert "snippet" not in hidden_sum
     assert text not in json.dumps(hidden_sum)
@@ -557,7 +656,7 @@ async def test_l3_snippet_and_content_chars_follow_visibility():
 
 @pytest.mark.asyncio
 async def test_l5_related_direction_matches_who_points_at_whom():
-    """L5: related misses a direction or mislabels it."""
+    """L5: related reverses from/to, or still names direction with dir."""
     fact_snippet = "Names are sorted before the lock is taken in the demo ledger."
     decision_snippet = "Ship the sorted lock order for the demo ledger."
 
@@ -571,9 +670,9 @@ async def test_l5_related_direction_matches_who_points_at_whom():
         ])
 
         async def _fetch(sql, *args):
-            if "community_summaries" in sql:
+            if "community_summaries" in sql and "LEFT JOIN" not in sql:
                 return []
-            if "length(content)" in sql:
+            if "content_chars" in sql and "LEFT JOIN" in sql:
                 return index_rows
             return []
 
@@ -592,10 +691,12 @@ async def test_l5_related_direction_matches_who_points_at_whom():
         [{"id": 9, "content_chars": 48, "type": "decision", "superseded": False,
           "visibility": "global", "agent_id": None, "scope": None}],
     )
-    assert fact_body["related"] == [{
-        "ref": "decision:9", "rel": "GROUNDED_IN", "dir": "in",
-        "snippet": decision_snippet,
-    }]
+    assert fact_body["related"][0]["relation"]["from"] == "decision:9"
+    assert fact_body["related"][0]["relation"]["to"] == "fact:5"
+    assert fact_body["related"][0]["relation"]["relation"] == "GROUNDED_IN"
+    assert fact_body["related"][0]["record"]["ref"] == "decision:9"
+    assert "dir" not in fact_body["related"][0]
+    assert decision_snippet not in json.dumps(fact_body["related"])
 
     decision_body, _ = await _lineage(
         "decision:9",
@@ -606,17 +707,19 @@ async def test_l5_related_direction_matches_who_points_at_whom():
         [{"id": 5, "content_chars": 60, "type": "fact", "superseded": False,
           "visibility": "global", "agent_id": None, "scope": None}],
     )
-    assert decision_body["related"] == [{
-        "ref": "fact:5", "rel": "GROUNDED_IN", "dir": "out",
-        "snippet": fact_snippet,
-    }]
+    assert decision_body["related"][0]["relation"]["from"] == "decision:9"
+    assert decision_body["related"][0]["relation"]["to"] == "fact:5"
+    assert decision_body["related"][0]["relation"]["relation"] == "GROUNDED_IN"
+    assert decision_body["related"][0]["record"]["ref"] == "fact:5"
+    assert "dir" not in decision_body["related"][0]
+    assert fact_snippet not in json.dumps(decision_body["related"])
 
 
 # ── L6: related drops summaries, entities, and unreadable neighbours ─────────
 
 @pytest.mark.asyncio
 async def test_l6_related_omits_summaries_entities_and_unreadable_neighbours():
-    """L6: related contains a CommunitySummary, an Entity, an unreadable neighbour, or an extra key."""
+    """L6: related names a CommunitySummary, an Entity, or an unreadable neighbour, or drops that neighbour's relation."""
     secret = "SECRET-NEIGHBOUR-SNIPPET-must-not-leak"
     c, mock_conn, session = _coord_with_mocks()
     mock_conn.fetchrow = AsyncMock(side_effect=[
@@ -626,12 +729,16 @@ async def test_l6_related_omits_summaries_entities_and_unreadable_neighbours():
     async def _fetch(sql, *args):
         if "community_summaries" in sql and "source_pg_ids" in sql:
             return []
-        if "length(content)" in sql:
+        if "content_chars" in sql and "LEFT JOIN" in sql:
             return [
-                {"id": 9, "content_chars": 10, "type": "decision", "superseded": False,
-                 "visibility": "global", "agent_id": None, "scope": None},
-                {"id": 4, "content_chars": 10, "type": "fact", "superseded": False,
-                 "visibility": "private", "agent_id": "alice", "scope": "global"},
+                {"id": 9, "content": "visible decision", "content_chars": 16,
+                 "type": "decision", "metadata": {"type": "decision"},
+                 "superseded": False, "visibility": "global",
+                 "agent_id": None, "scope": None},
+                {"id": 4, "content": secret, "content_chars": len(secret),
+                 "type": "fact", "metadata": {"type": "fact"},
+                 "superseded": False, "visibility": "private",
+                 "agent_id": "alice", "scope": "global"},
             ]
         return []
 
@@ -648,17 +755,21 @@ async def test_l6_related_omits_summaries_entities_and_unreadable_neighbours():
     ]))
     resp = await c.handle_status(_status_request("fact:5", agent="bob"))
     body = json.loads(resp.text)
-    assert body["related"] == [{
-        "ref": "decision:9", "rel": "GROUNDED_IN", "dir": "in",
-        "snippet": "visible decision",
-    }]
+    named = [item for item in body["related"] if item.get("record")]
+    assert [item["record"]["ref"] for item in named] == ["decision:9"]
+    assert named[0]["relation"]["from"] == "decision:9"
+    assert named[0]["relation"]["to"] == "fact:5"
+    unnamed = [item for item in body["related"] if "record" not in item]
+    assert len(unnamed) == 1
+    assert unnamed[0]["relation"]["to"] is None
     assert secret not in resp.text
-    for item in body["related"]:
-        assert set(item) == {"ref", "rel", "dir", "snippet"}
-    cypher = session.run.await_args.args[0]
+    assert "fact:4" not in resp.text
+    cypher = next(
+        call.args[0] for call in session.run.await_args_list
+        if "OPTIONAL MATCH" in call.args[0])
     assert "CommunitySummary" in cypher
     assert "NOT m:" in cypher
-    assert "startNode(r) = n" in cypher
+    assert "startNode(r).pg_id" in cypher
     assert "ORDER BY" in cypher
     assert cypher.index("ORDER BY") < cypher.index("LIMIT")
 
@@ -673,7 +784,21 @@ async def test_l7_neo4j_down_keeps_the_postgres_lineage():
         _doc_status_row(5, "fact", _LONG_LINEAGE, superseded=True, superseded_by=9),
         None,
     ])
-    mock_conn.fetch = AsyncMock(return_value=[])
+
+    async def _fetch(sql, *args):
+        if "content_chars" in sql and "LEFT JOIN" in sql:
+            return [{
+                "id": 5, "content": _LONG_LINEAGE, "content_chars": len(_LONG_LINEAGE),
+                "metadata": {"type": "fact"}, "type": "fact", "superseded": True,
+                "superseded_by": 9, "visibility": "global", "agent_id": "",
+                "scope": "global", "successor_id": 9,
+                "successor_metadata": {"type": "fact"},
+                "successor_visibility": "global", "successor_agent_id": "",
+                "successor_scope": "global",
+            }]
+        return []
+
+    mock_conn.fetch = AsyncMock(side_effect=_fetch)
     c._neo4j.session = MagicMock(side_effect=RuntimeError("graph down"))
     resp = await c.handle_status(_status_request("fact:5"))
     assert resp.status == 200
@@ -682,9 +807,11 @@ async def test_l7_neo4j_down_keeps_the_postgres_lineage():
     assert body["ref"] == "fact:5"
     assert body["exists"] is True
     assert body["superseded"] is True
-    assert body["superseded_by"] == 9
-    assert body["content_chars"] == len(_LONG_LINEAGE)
-    assert body["snippet"] == _LONG_LINEAGE[:120]
+    assert body["superseded_by"] == "fact:9"
+    assert body["text"] == _LONG_LINEAGE
+    assert body["text_is"] == "full_record"
+    assert "snippet" not in body
+    assert "content_chars" not in body
     assert "related" not in body
     _assert_no_lineage_text_keys(body)
 
@@ -709,13 +836,16 @@ async def test_l8_related_cap_and_refusals_omit_related(monkeypatch):
     ])
 
     async def _fetch(sql, *args):
-        if "length(content)" in sql:
+        if "content_chars" in sql and "LEFT JOIN" in sql:
             return [
-                {"id": 11, "content_chars": 4, "type": "fact", "superseded": False,
+                {"id": 11, "content": "one", "content_chars": 3, "type": "fact",
+                 "metadata": {"type": "fact"}, "superseded": False,
                  "visibility": "global", "agent_id": None, "scope": None},
-                {"id": 12, "content_chars": 4, "type": "fact", "superseded": False,
+                {"id": 12, "content": "two", "content_chars": 3, "type": "fact",
+                 "metadata": {"type": "fact"}, "superseded": False,
                  "visibility": "global", "agent_id": None, "scope": None},
-                {"id": 13, "content_chars": 4, "type": "fact", "superseded": False,
+                {"id": 13, "content": "three", "content_chars": 5, "type": "fact",
+                 "metadata": {"type": "fact"}, "superseded": False,
                  "visibility": "global", "agent_id": None, "scope": None},
             ]
         return []
@@ -724,7 +854,7 @@ async def test_l8_related_cap_and_refusals_omit_related(monkeypatch):
     session.run = AsyncMock(return_value=_AsyncRows(neighbours))
     body = json.loads((await c.handle_status(_status_request("fact:5"))).text)
     assert body["related_more"] is True
-    assert [item["ref"] for item in body["related"]] == ["fact:11", "fact:12"]
+    assert [item["record"]["ref"] for item in body["related"]] == ["fact:11", "fact:12"]
 
     c_priv, conn_priv, session_priv = _coord_with_mocks()
     conn_priv.fetchrow = AsyncMock(side_effect=[
@@ -753,17 +883,19 @@ async def test_l8_related_cap_and_refusals_omit_related(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_l9_a_related_neighbour_with_no_postgres_row_is_left_out():
-    """L9: A graph neighbour with no technical_docs row is still named in related."""
+    """L9: A graph neighbour with no technical_docs row loses its relation, or the reply names that end."""
     c, mock_conn, session = _coord_with_mocks()
     mock_conn.fetchrow = AsyncMock(side_effect=[
         _doc_status_row(5, "fact", _LONG_LINEAGE), None,
     ])
 
     async def _fetch(sql, *args):
-        if "length(content)" in sql:
+        if "content_chars" in sql and "LEFT JOIN" in sql:
             return [
-                {"id": 9, "content_chars": 10, "type": "decision", "superseded": False,
-                 "visibility": "global", "agent_id": None, "scope": None},
+                {"id": 9, "content": "visible decision", "content_chars": 16,
+                 "type": "decision", "metadata": {"type": "decision"},
+                 "superseded": False, "visibility": "global",
+                 "agent_id": None, "scope": None},
             ]
         return []
 
@@ -775,7 +907,8 @@ async def test_l9_a_related_neighbour_with_no_postgres_row_is_left_out():
          "pg_id": 4, "snippet": "no postgres row"},
     ]))
     body = json.loads((await c.handle_status(_status_request("fact:5"))).text)
-    assert [item["ref"] for item in body["related"]] == ["decision:9"]
+    assert [item["record"]["ref"] for item in body["related"] if "record" in item] == ["decision:9"]
+    assert any(item["relation"]["to"] is None for item in body["related"])
     assert "fact:4" not in json.dumps(body["related"])
 
 
@@ -824,8 +957,17 @@ async def test_f4_private_record_withheld_from_non_owner_on_lineage_and_graph():
         "content_chars": len(private_text), "snippet": private_text[:120],
         "visibility": "private", "agent_id": "alice", "scope": "global",
     }
+    async def _fetch_owner(sql, *args):
+        if "content_chars" in sql and "LEFT JOIN" in sql:
+            return [{
+                "id": 55, "content": private_text, "content_chars": len(private_text),
+                "metadata": {"type": "fact"}, "type": "fact", "superseded": False,
+                "visibility": "private", "agent_id": "alice", "scope": "global",
+            }]
+        return []
+
     mock_conn.fetchrow = AsyncMock(side_effect=[rec_row, None])
-    mock_conn.fetch = AsyncMock(return_value=[])
+    mock_conn.fetch = AsyncMock(side_effect=_fetch_owner)
 
     # 1. Non-owner bob on lineage
     req_bob = _status_request("fact:55", agent="bob")
@@ -846,8 +988,11 @@ async def test_f4_private_record_withheld_from_non_owner_on_lineage_and_graph():
     assert resp_alice.status == 200
     b_alice = json.loads(resp_alice.text)
     assert "content" not in b_alice
-    assert b_alice["content_chars"] == len(private_text)
-    assert b_alice["snippet"] == private_text[:120]
+    assert b_alice["text"] == private_text
+    assert b_alice["text_is"] == "full_record"
+    assert b_alice["full_record"]["chars"] == len(private_text)
+    assert "snippet" not in b_alice
+    assert "content_chars" not in b_alice
 
     # 3. Non-owner bob on graph
     n_priv = _make_node(["Fact"], {"pg_id": 55, "content": "graph copy"}, element_id="1", id_=1)
@@ -928,14 +1073,18 @@ async def test_f5_fetch_runtime_error_degrades_gracefully_with_warning(caplog):
     assert len(warnings) == 1
     assert "record hydration failed" in warnings[0].message
 
-    ctx_entries = [{"pg_id": 77, "label": ONT.fact, "snippet": "cypher snippet"}]
+    ctx_entries = [{"pg_id": 77, "label": ONT.fact, "rel_type": "MENTIONS",
+                    "direction": "out", "snippet": "cypher snippet"}]
     c_search, _, _ = _coord_with_mocks()
     c_search._acquire = MagicMock(side_effect=asyncio.TimeoutError("timeout"))
-    anchor_map = {1: list(ctx_entries)}
-    await c_search._hydrate_and_filter_neighbors(anchor_map, viewer="agent")
-    assert anchor_map[1][0]["snippet"] == "cypher snippet"
-    assert "content_chars" not in anchor_map[1][0]
-    assert "content_source" not in anchor_map[1][0]
+    hit = {"pg_id": 1, "record_type": "fact", "ref": "fact:1", "metadata": {},
+           "graph_context": [_live_edge(ctx_entries[0], 1)]}
+    marks = MagicMock()
+    marks.run = AsyncMock(return_value=_EmptyRows())
+    await c_search._compose_search_hits(
+        [hit], ranked=True, viewer="agent", viewer_scope=None, session=marks)
+    assert hit["graph_context"] == []
+    assert "cypher snippet" not in json.dumps(hit)
 
 
 # ── F6: Non-eligible graph types untouched, list hydrated ─────────────────────
@@ -963,50 +1112,63 @@ async def test_f6_scalar_projection_entity_node_untouched_and_list_hydrated():
 
 @pytest.mark.asyncio
 async def test_f8_summary_neighbor_removal_and_snippet_replacement():
-    """F8: A summary neighbour is returned with a null snippet; a retired or missing one is returned; or removing one skips the entry after it."""
+    """F8: A missing summary stays a null end, a retired one is dropped on ranked search, and a live one is a pointer. The fact text is the Postgres row."""
     c, mock_conn, _ = _coord_with_mocks()
     entries = [
-        {"pg_id": 1, "label": ONT.community_summary, "snippet": None},
-        {"pg_id": 2, "label": ONT.community_summary, "snippet": "old Cypher snippet"},
-        {"pg_id": 3, "label": ONT.community_summary, "snippet": "old Cypher snippet"},
-        {"pg_id": 4, "label": ONT.fact, "snippet": "fact snippet"},
+        {"pg_id": 1, "label": ONT.community_summary, "rel_type": "SUMMARIZED_BY",
+         "direction": "out", "snippet": None},
+        {"pg_id": 2, "label": ONT.community_summary, "rel_type": "SUMMARIZED_BY",
+         "direction": "out", "snippet": "old Cypher snippet"},
+        {"pg_id": 3, "label": ONT.community_summary, "rel_type": "SUMMARIZED_BY",
+         "direction": "out", "snippet": "old Cypher snippet"},
+        {"pg_id": 4, "label": ONT.fact, "rel_type": "MENTIONS",
+         "direction": "out", "snippet": "fact snippet"},
     ]
     anchor_map = {100: entries}
 
     async def _fake_fetch(sql, ids):
         if "community_summaries" in sql:
             return [
-                {"id": 2, "content_chars": 80, "snippet": "retired snippet",
-                 "superseded": True, "metadata": {}},
-                {"id": 3, "content_chars": 120, "snippet": "authoritative Postgres snippet 3",
-                 "superseded": False, "metadata": {}},
+                {"id": 2, "content": "retired body", "content_chars": 80,
+                 "superseded": True, "metadata": {"kind": "thematic"},
+                 "visibility": "global", "agent_id": None, "scope": "global"},
+                {"id": 3, "content": "authoritative Postgres text 3", "content_chars": 120,
+                 "superseded": False, "metadata": {"kind": "thematic"},
+                 "visibility": "global", "agent_id": None, "scope": "global"},
             ]
         if "technical_docs" in sql:
             return [
-                {"id": 4, "content_chars": 95, "type": "fact", "superseded": False,
-                 "visibility": "global", "agent_id": None, "scope": None},
+                {"id": 4, "content": "postgres fact text", "content_chars": 95,
+                 "metadata": {"type": "fact"}, "superseded": False,
+                 "visibility": "global", "agent_id": None, "scope": "global"},
             ]
         return []
 
     mock_conn.fetch = AsyncMock(side_effect=_fake_fetch)
 
-    await c._hydrate_and_filter_neighbors(anchor_map, viewer="agent")
-    kept = anchor_map[100]
-    assert len(kept) == 2
-    assert kept[0]["pg_id"] == 3
-    assert kept[0]["snippet"] == "authoritative Postgres snippet 3"
-    assert kept[0]["ref"] == "summary:3"
-    assert kept[0]["content_chars"] == 120
-
-    assert kept[1]["pg_id"] == 4
-    assert kept[1]["snippet"] == "fact snippet"
-    assert kept[1]["ref"] == "fact:4"
-    assert kept[1]["content_chars"] == 95
+    hit = {"pg_id": 100, "record_type": "fact", "ref": "fact:100",
+           "metadata": {}, "graph_context": [_live_edge(e, 100) for e in entries]}
+    marks = MagicMock()
+    marks.run = AsyncMock(return_value=_EmptyRows())
+    await c._compose_search_hits(
+        [hit], ranked=True, viewer="agent", viewer_scope=None, session=marks)
+    kept = hit["graph_context"]
+    assert len(kept) == 3
+    assert kept[0]["relation"]["to"] is None
+    assert "record" not in kept[0]
+    assert kept[1]["record"]["ref"] == "summary:3"
+    assert kept[1]["record"]["text_is"] == "pointer"
+    assert "text" not in kept[1]["record"]
+    assert kept[1]["record"]["full_record"]["chars"] == 120
+    assert kept[2]["record"]["ref"] == "fact:4"
+    assert kept[2]["record"]["text"] == "postgres fact text"
+    assert "fact snippet" not in json.dumps(kept)
+    assert "old Cypher snippet" not in json.dumps(kept)
 
 
 @pytest.mark.asyncio
 async def test_f8_expand_graph_context_single_anchor_removes_retired_summary():
-    """F8: Single-anchor _expand_graph_context returns list with retired summary removed and subsequent entry intact."""
+    """F8: ranked compose drops a superseded summary neighbour and keeps the following fact."""
     c, mock_conn, _ = _coord_with_mocks()
 
     session = MagicMock()
@@ -1037,23 +1199,32 @@ async def test_f8_expand_graph_context_single_anchor_removes_retired_summary():
     async def _fake_fetch(sql, ids):
         if "community_summaries" in sql:
             return [
-                {"id": 2, "content_chars": 80, "snippet": "retired snippet",
-                 "superseded": True, "metadata": {}},
+                {"id": 2, "content": "retired body", "content_chars": 80,
+                 "superseded": True, "metadata": {"kind": "thematic"},
+                 "visibility": "global", "agent_id": None, "scope": "global"},
             ]
         if "technical_docs" in sql:
             return [
-                {"id": 4, "content_chars": 95, "type": "fact", "superseded": False,
-                 "visibility": "global", "agent_id": None, "scope": None},
+                {"id": 4, "content": "postgres fact text", "content_chars": 95,
+                 "metadata": {"type": "fact"}, "superseded": False,
+                 "visibility": "global", "agent_id": None, "scope": "global"},
             ]
         return []
 
     mock_conn.fetch = AsyncMock(side_effect=_fake_fetch)
 
-    res = await c._expand_graph_context(session, pg_id=100, anchor_labels=(ONT.fact,), viewer="agent")
+    hit = {"pg_id": 100, "record_type": "fact", "ref": "fact:100", "metadata": {},
+           "graph_context": [_live_edge(rec_sum, 100), _live_edge(rec_fact, 100)]}
+    marks = MagicMock()
+    marks.run = AsyncMock(return_value=_EmptyRows())
+    await c._compose_search_hits(
+        [hit], ranked=True, viewer="agent", viewer_scope=None, session=marks)
+    res = hit["graph_context"]
     assert len(res) == 1
-    assert res[0]["pg_id"] == 4
-    assert res[0]["ref"] == "fact:4"
-    assert res[0]["content_chars"] == 95
+    assert res[0]["record"]["ref"] == "fact:4"
+    assert res[0]["record"]["text"] == "postgres fact text"
+    assert res[0]["record"]["full_record"]["chars"] == 95
+    assert "old Cypher snippet" not in json.dumps(res)
 
 
 # ── F9: Wrong-type 404 or exists: false reply omits text keys ─────────────────
@@ -1286,7 +1457,7 @@ async def test_f16_private_unreadable_record_spends_no_budget():
     assert "content_truncated" not in r2
 
 
-# ── F19: Row cap bounds distinct keys sent to Postgres ────────────────────────
+# ── F19: Keys past the old distinct cut are hydrated ──────────────────────────
 
 @pytest.mark.asyncio
 async def test_f19_keys_past_old_cut_are_all_hydrated(monkeypatch):
@@ -1308,28 +1479,37 @@ async def test_f19_keys_past_old_cut_are_all_hydrated(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_f20_private_neighbor_visibility_in_expansion():
-    """F20: A neighbour of a private record gains ref/content_chars for a non-owner; or the owner does not get them."""
+    """F4: A private neighbour keeps a null end for a non-owner, and the owner receives the record. The node snippet is not shown."""
     c, mock_conn, _ = _coord_with_mocks()
 
     mock_conn.fetch = AsyncMock(return_value=[
-        {"id": 66, "content_chars": 28, "type": "fact", "superseded": False,
+        {"id": 66, "content": "private fact body!!", "content_chars": 28,
+         "metadata": {"type": "fact"}, "superseded": False,
          "visibility": "private", "agent_id": "owner_agent", "scope": "global"},
     ])
+    edge = {"pg_id": 66, "label": ONT.fact, "rel_type": "MENTIONS",
+            "direction": "out", "snippet": "private fact snip"}
 
-    # 1. Non-owner
-    anchor_map_bob = {1: [{"pg_id": 66, "label": ONT.fact, "snippet": "private fact snip"}]}
-    await c._hydrate_and_filter_neighbors(anchor_map_bob, viewer="other_agent")
-    entry_bob = anchor_map_bob[1][0]
-    assert entry_bob["snippet"] == "private fact snip"
-    assert "ref" not in entry_bob
-    assert "content_chars" not in entry_bob
+    hit_bob = {"pg_id": 1, "record_type": "fact", "ref": "fact:1", "metadata": {},
+               "graph_context": [_live_edge(dict(edge), 1)]}
+    marks = MagicMock()
+    marks.run = AsyncMock(return_value=_EmptyRows())
+    await c._compose_search_hits(
+        [hit_bob], ranked=True, viewer="other_agent", viewer_scope=None, session=marks)
+    entry_bob = hit_bob["graph_context"][0]
+    assert entry_bob["relation"]["to"] is None
+    assert "record" not in entry_bob
+    assert "private fact snip" not in json.dumps(entry_bob)
+    assert "fact:66" not in json.dumps(entry_bob)
 
-    # 2. Owner
-    anchor_map_alice = {1: [{"pg_id": 66, "label": ONT.fact, "snippet": "private fact snip"}]}
-    await c._hydrate_and_filter_neighbors(anchor_map_alice, viewer="owner_agent")
-    entry_alice = anchor_map_alice[1][0]
-    assert entry_alice["ref"] == "fact:66"
-    assert entry_alice["content_chars"] == 28
+    hit_alice = {"pg_id": 1, "record_type": "fact", "ref": "fact:1", "metadata": {},
+                 "graph_context": [_live_edge(dict(edge), 1)]}
+    await c._compose_search_hits(
+        [hit_alice], ranked=True, viewer="owner_agent", viewer_scope=None, session=marks)
+    record = hit_alice["graph_context"][0]["record"]
+    assert record["ref"] == "fact:66"
+    assert record["full_record"]["chars"] == 28
+    assert record["text"] == "private fact body!!"
 
 
 # ── Body scope is ignored on graph ───────────────────────────────────────────

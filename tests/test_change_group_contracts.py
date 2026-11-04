@@ -78,7 +78,7 @@ def test_all_five_version_pins_agree():
 # a wrong number and still pass (fact:1309 — an equality assertion between two
 # expressions is half a guard). Bumping it is a deliberate act that edits this
 # line, four API_VERSION pins, and every client at once.
-_WIRE_API_VERSION = 5
+_WIRE_API_VERSION = 6
 
 
 def test_the_gateway_and_both_clients_speak_the_same_wire_version():

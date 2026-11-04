@@ -1,5 +1,5 @@
 <!--
-Canonical constitution-file snippet for the Shared Memory Framework.
+Canonical constitution-file block for the Shared Memory Framework.
 
 This is the single source of truth. An installer proposes inserting the
 block below into the operator's constitution file (CLAUDE.md / GEMINI.md /
@@ -31,12 +31,14 @@ superseded_by to the current record and rewrite the index line, because an
 unrepaired index reproduces the same wrong answer at the next invocation.)
 (v5 -> v6: the block leads with the commands. The history trigger and the
 index repair are unchanged.)
+(v6 -> v7: one sentence, decision:3501: any entry can be expanded by its ref,
+and a pointer entry must be.)
 
 ALWAYS propose this block for the operator to confirm or adjust before
 writing it into their personal constitution file. Never write it silently.
 -->
 
-<!-- shared-memory:constitution-snippet v6 -->
+<!-- shared-memory:constitution-snippet v7 -->
 ## Shared Memory
 Before you answer a question about project direction, a prior decision, a claim that may have been superseded, or whether something was tested, tried, rejected or done:
 
@@ -50,4 +52,6 @@ The files can confirm an answer. They do not supply one. Local notes are scratch
 After a discussion that sets direction, propose the facts. Confirm with the operator before `save_decision`. Do not auto-decide. Record the outcome with `save_retrospective`.
 
 A `fact:N` in a constitution, an index, a resume, or a handoff is a pointer, not the record. `lineage fact:N` says whether it is superseded and by what. Follow `superseded_by` to the current record, or search the subject. Then rewrite the index line to the current id. An unrepaired index repeats the wrong answer. The store drops superseded records from search. The index does not.
+
+Any entry can be expanded by its ref, and a pointer entry must be.
 <!-- /shared-memory:constitution-snippet -->

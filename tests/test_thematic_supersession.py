@@ -738,18 +738,18 @@ async def test_ledger_sweep_reconciles_superseded_thematic_summaries_in_graph(mo
 # ── T9: coordinator graph expanders exclude superseded summaries ─────────────
 
 def test_t9_coordinator_expanders_exclude_superseded_community_summaries():
-    """T9: Both _expand_graph_context and _expand_graph_context_batch exclude
-    superseded CommunitySummary nodes.
-    Mutation killed: delete predicate from either -> fails.
+    """F4b: search expansion must not hide a summary on the graph superseded flag.
+
+    Postgres decides after hydration (brief 3.1 rule 2). Mutation: put
+    `coalesce(related.superseded,false)` back on either expander.
+    REFERENCES stays excluded (decision:3482: search stops following those edges).
     """
-    src_single = inspect.getsource(co.MemoryCoordinator._expand_graph_context)
     src_batch = inspect.getsource(co.MemoryCoordinator._expand_graph_context_batch)
 
-    expected_predicate = "coalesce(related.superseded,false)"
-    assert expected_predicate in src_single
-    assert "ONT.community_summary" in src_single or "CommunitySummary" in src_single
-    assert expected_predicate in src_batch
-    assert "ONT.community_summary" in src_batch or "CommunitySummary" in src_batch
+    for src in (src_batch,):
+        assert "coalesce(related.superseded,false)" not in src
+        assert "ONT.references" in src
+        assert "coalesce(m.superseded,false)" in src
 
 
 # ── T10: link_thematic_successor repointing ──────────────────────────────────
@@ -827,15 +827,31 @@ def test_t10_link_thematic_successor_repointing():
 
 # ── T12: _status_of_summary exposes superseded_by and retired_summaries ──────
 
+def _t12_hydrate_summary(pid, *, successor_id, successor_visibility, kind="thematic",
+                         superseded=True):
+    """Hydration row. successor_id is how the status SQL is recognised."""
+    return {
+        "id": pid, "content": "body", "metadata": {"kind": kind},
+        "superseded": superseded, "superseded_by": successor_id,
+        "visibility": "global", "agent_id": "", "scope": "global",
+        "successor_id": successor_id,
+        "successor_metadata": {"kind": "thematic"} if successor_id else None,
+        "successor_visibility": successor_visibility,
+        "successor_agent_id": "" if successor_visibility == "global" else "zoe",
+        "successor_scope": "global",
+    }
+
+
 @pytest.mark.asyncio
 async def test_t12_status_of_summary_superseded_by_and_retired_summaries():
     """T12: _status_of_summary returns qualified superseded_by and retired_summaries.
-    Mutation killed: drop the field -> fails.
+
+    F16: a private successor drops the key. An ordered fetch list that ignores
+    the hydration query (the SQL containing successor_id) returns the wrong row
+    and this assertion dies.
     """
     c = co.MemoryCoordinator()
     fake_conn = MagicMock()
-
-    # 1. Thematic summary 10 that was superseded by 11
     row_thematic = {
         "id": 10,
         "metadata": json.dumps({"kind": "thematic", "project": "proj", "domain": "ops"}),
@@ -847,19 +863,48 @@ async def test_t12_status_of_summary_superseded_by_and_retired_summaries():
         "run_id": 42,
         "content": "thematic summary content",
         "content_chars": 24,
+        "visibility": "global", "agent_id": "", "scope": "global",
     }
+    visible_successor = {"on": True}
+
+    async def fetch(sql, *args):
+        text = " ".join(sql.split())
+        if "successor_id" in text and "community_summaries" in text:
+            vis = "global" if visible_successor["on"] else "private"
+            return [_t12_hydrate_summary(10, successor_id=11, successor_visibility=vis)]
+        if "successor_id" in text:
+            return []
+        if "WITH decisions" in text:
+            return [{"decision_id": 100, "fact_ids": [], "visibility": "global",
+                     "agent_id": "", "scope": "global"}]
+        if "metadata->>'type'" in text:
+            return [{"id": 100, "type": "decision"}]
+        if "superseded_reason" in text:
+            return [{
+                "id": 10, "metadata": {"kind": "thematic"}, "superseded": True,
+                "superseded_reason": "lineage", "superseded_by": None,
+                "source_pg_ids": [], "visibility": "global", "agent_id": "",
+                "scope": "global",
+            }]
+        return []
+
     fake_conn.fetchrow = AsyncMock(return_value=row_thematic)
-    fake_conn.fetch = AsyncMock(return_value=[])
+    fake_conn.fetch = AsyncMock(side_effect=fetch)
     c._acquire = MagicMock(return_value=_AsyncCtx(fake_conn))
 
-    resp = await c._status_of_summary(10, "summary")
+    resp = await c._status_of_summary(10, "summary", viewer="alice")
     assert resp.status == 200
     data = json.loads(resp.text)
     assert data["superseded"] is True
     assert data["superseded_reason"] == "lineage"
     assert data["superseded_by"] == "summary:11"
 
-    # 2. Insight summary 20 citing retired summary 10
+    visible_successor["on"] = False
+    hidden = await c._status_of_summary(10, "summary", viewer="alice")
+    hidden_body = json.loads(hidden.text)
+    assert "superseded_by" not in hidden_body
+    assert "summary:11" not in hidden.text
+
     row_insight = {
         "id": 20,
         "metadata": json.dumps({"kind": "insight", "summary_ids": [10], "project": "proj"}),
@@ -871,18 +916,10 @@ async def test_t12_status_of_summary_superseded_by_and_retired_summaries():
         "run_id": 43,
         "content": "insight content",
         "content_chars": 15,
+        "visibility": "global", "agent_id": "", "scope": "global",
     }
     fake_conn.fetchrow = AsyncMock(return_value=row_insight)
-    # fetch calls for _status_of_summary:
-    # 1. doc types for source_pg_ids [100]
-    # 2. _annotate_retired_summaries: fetch for community_summaries WHERE id = ANY([10])
-    # 3. _annotate_retired_summaries: decisions query for doc [100]
-    fake_conn.fetch = AsyncMock(side_effect=[
-        [{"id": 100, "type": "decision"}],  # doc type
-        [{"id": 10, "superseded": True, "superseded_reason": "lineage", "superseded_by": None, "source_pg_ids": []}],
-        [{"decision_id": 100, "fact_ids": []}],  # decisions query
-    ])
-    resp_ins = await c._status_of_summary(20, "insight")
+    resp_ins = await c._status_of_summary(20, "insight", viewer="alice")
     assert resp_ins.status == 200
     data_ins = json.loads(resp_ins.text)
     assert data_ins["superseded"] is False
@@ -1136,7 +1173,8 @@ async def test_s5_read_time_unsupported_lists_d_f_and_f2():
         {"id": 3, "superseded": False, "superseded_by": None},
     ])
 
-    annotated = await c._annotate_retired_summaries(fake_conn, insights_data)
+    annotated = await c._annotate_retired_summaries(
+        fake_conn, insights_data, viewer="alice")
 
     # Insight 301 (kept): unsupported lists decision 501, superseded_facts=[1], superseding_facts=[3] (chain end)
     ins_301_retired = annotated[301]
@@ -1323,7 +1361,8 @@ async def test_read_time_whole_insight_two_kept_retired_rows_sharing_fact_neithe
         {"id": 2, "superseded": False, "superseded_by": None},
     ])
 
-    annotated = await c._annotate_retired_summaries(fake_conn, insights_data)
+    annotated = await c._annotate_retired_summaries(
+        fake_conn, insights_data, viewer="alice")
     ins_401 = annotated[401]
     assert len(ins_401) == 2
     # Both retired rows 10 and 20 list decision 100 in unsupported
@@ -1364,7 +1403,8 @@ async def test_read_time_coverage_retired_and_null_reason_rows_yield_no_unsuppor
           "superseded_by": None, "source_pg_ids": []}],
     ])
 
-    annotated = await c._annotate_retired_summaries(fake_conn, insights_data)
+    annotated = await c._annotate_retired_summaries(
+        fake_conn, insights_data, viewer="alice")
     ins_501 = annotated[501]
     assert len(ins_501) == 2
     assert ins_501[0]["summary_id"] == 10
@@ -1471,7 +1511,8 @@ async def test_f2_retracted_fact_yields_empty_superseding_facts():
         {"id": 11, "superseded": False, "superseded_reason": None, "superseded_by": None, "source_pg_ids": [2]},
     ])
 
-    annotated = await c._annotate_retired_summaries(fake_conn, insights_data)
+    annotated = await c._annotate_retired_summaries(
+        fake_conn, insights_data, viewer="alice")
     ins_601 = annotated[601]
     assert len(ins_601) == 1
     assert ins_601[0]["unsupported"] == [

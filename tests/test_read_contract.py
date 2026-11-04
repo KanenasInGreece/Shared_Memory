@@ -74,6 +74,67 @@ class _AsyncRows:
         return self._rows.pop(0)
 
 
+class _TagRows:
+    """Batch rows need anchor_pg_id. Older fixtures only set pg_id."""
+    def __init__(self, inner, anchor):
+        self._inner = inner
+        self._anchor = anchor
+    def __aiter__(self):
+        return self
+    async def __anext__(self):
+        rec = await self._inner.__anext__()
+        if isinstance(rec, dict):
+            rec = dict(rec)
+            rec.setdefault("anchor_pg_id", self._anchor)
+            if rec.get("rel_pg_id") is None and rec.get("pg_id") is not None:
+                rec["rel_pg_id"] = rec["pg_id"]
+        return rec
+
+
+async def _expand_live(c, session, pg, labels, viewer="alice", ranked=True):
+    """The live read: batch edges, then one compose. Marks use a separate session."""
+    real = session.run
+
+    async def run(*args, **kwargs):
+        result = real(*args, **kwargs)
+        if hasattr(result, "__await__"):
+            result = await result
+        return _TagRows(result, pg)
+
+    session.run = run
+    raw = await c._expand_graph_context_batch(session, [pg], tuple(labels))
+    if tuple(labels) == (coordinator_mod.ONT.community_summary,):
+        kind = "summary"
+    else:
+        kind = coordinator_mod._anchor_kind(labels)
+    hit = {
+        "pg_id": pg, "record_type": kind, "ref": f"{kind}:{pg}",
+        "metadata": {}, "graph_context": raw.get(pg, []),
+    }
+    marks = MagicMock()
+    marks.run = AsyncMock(return_value=_AsyncRows([]))
+    await c._compose_search_hits(
+        [hit], ranked=ranked, viewer=viewer, viewer_scope=None, session=marks)
+    return hit["graph_context"]
+
+
+async def _compose_map(c, raw, labels, viewer="alice", ranked=True):
+    """Render a batch map the way search does, after the graph read."""
+    if tuple(labels) == (coordinator_mod.ONT.community_summary,):
+        kind = "summary"
+    else:
+        kind = coordinator_mod._anchor_kind(labels)
+    hits = [{
+        "pg_id": pid, "record_type": kind, "ref": f"{kind}:{pid}",
+        "metadata": {}, "graph_context": edges,
+    } for pid, edges in raw.items()]
+    marks = MagicMock()
+    marks.run = AsyncMock(return_value=_AsyncRows([]))
+    await c._compose_search_hits(
+        hits, ranked=ranked, viewer=viewer, viewer_scope=None, session=marks)
+    return {hit["pg_id"]: hit["graph_context"] for hit in hits}
+
+
 def _make_request(body: dict, authenticated_agent: str | None = None) -> MagicMock:
     state = {"authenticated_agent": authenticated_agent, "principal": None}
     req = MagicMock()
@@ -228,18 +289,20 @@ async def test_search_expansion_is_batched_not_one_call_per_hit():
         assert sorted(call.kwargs["pg_ids"]) == [1, 2, 3]
 
     by_pg_id = {r["pg_id"]: r for r in results if r["tier"] == "fact"}
-    assert {e["name"] for e in by_pg_id[1]["graph_context"]} == {"A", "A2"}
-    assert {e["name"] for e in by_pg_id[2]["graph_context"]} == {"B"}
-    assert {e["name"] for e in by_pg_id[3]["graph_context"]} == {"C"}
+
+    def _names(ctx):
+        return {e["relation"]["to"]["name"] for e in ctx if "relation" in e}
+
+    assert _names(by_pg_id[1]["graph_context"]) == {"A", "A2"}
+    assert _names(by_pg_id[2]["graph_context"]) == {"B"}
+    assert _names(by_pg_id[3]["graph_context"]) == {"C"}
 
 
 # ── (b) pg_id-keyed neighbors are never dropped ───────────────────────────────
 
 @pytest.mark.asyncio
 async def test_pgid_keyed_neighbor_surfaces_with_label_pgid_snippet():
-    """A Retrospective hanging off a Decision via HAD_OUTCOME (no name property)
-    must appear as {rel_type, direction, properties, label, pg_id, snippet} —
-    the old `if rec['name']` filter silently dropped it."""
+    """F4: A Retrospective with no Postgres row keeps its HAD_OUTCOME relation and leaves the far end unnamed. The node snippet is not the entry."""
     c, _, mock_session = _coordinator_with_mocks()
     mock_session.run = AsyncMock(return_value=_AsyncRows([
         _row(labels=["Retrospective"], name=None, pg_id=719,
@@ -248,63 +311,57 @@ async def test_pgid_keyed_neighbor_surfaces_with_label_pgid_snippet():
              snippet="validated: held up in production"),
     ]))
 
-    ctx = await c._expand_graph_context(
+    ctx = await _expand_live(c, 
         mock_session, 577,
         (coordinator_mod.ONT.fact, coordinator_mod.ONT.decision,
          coordinator_mod.ONT.retrospective))
 
     assert len(ctx) == 1
-    entry = ctx[0]
-    assert entry["rel_type"] == "HAD_OUTCOME"
-    assert entry["label"]    == "Retrospective"
-    assert entry["pg_id"]    == 719
-    assert entry["snippet"]  == "validated: held up in production"
-    assert entry["direction"] == "out"
-    assert "name" not in entry
+    rel = ctx[0]["relation"]
+    assert rel["relation"] == "HAD_OUTCOME"
+    assert rel["from"] == "fact:577"
+    assert rel["to"] is None
+    assert rel["props"]["asserted_by"] == "operator"
+    assert "record" not in ctx[0]
+    assert "validated: held up in production" not in json.dumps(ctx)
 
 
 @pytest.mark.asyncio
 async def test_pgid_keyed_neighbor_without_text_gets_null_snippet():
-    """A summary neighbour with a live Postgres row surfaces with the Postgres
-    snippet and its ref/content_chars, rather than keeping null.
-    """
+    """A live summary neighbour is a pointer entry: its ref and chars, and no text."""
     c, mock_conn, mock_session = _coordinator_with_mocks()
     mock_session.run = AsyncMock(return_value=_AsyncRows([
         _row(labels=["CommunitySummary"], name=None, pg_id=88,
              rel_type="SUMMARIZED_BY", rel_props={}, snippet=None),
     ]))
     mock_conn.fetch = AsyncMock(return_value=[
-        {"id": 88, "content_chars": 45, "snippet": "Postgres snippet text",
-         "superseded": False, "metadata": {}},
+        {"id": 88, "content": "Postgres whole summary", "content_chars": 45,
+         "metadata": {"kind": "thematic"}, "visibility": "global",
+         "agent_id": None, "scope": "global", "superseded": False},
     ])
-    ctx = await c._expand_graph_context(
+    ctx = await _expand_live(c, 
         mock_session, 42, (coordinator_mod.ONT.fact,))
-    assert ctx[0]["pg_id"] == 88
-    assert ctx[0]["snippet"] == "Postgres snippet text"
-    assert ctx[0]["ref"] == "summary:88"
-    assert ctx[0]["content_chars"] == 45
+    record = ctx[0]["record"]
+    assert record["ref"] == "summary:88"
+    assert record["text_is"] == "pointer"
+    assert "text" not in record
+    assert record["full_record"]["chars"] == 45
+    assert "snippet" not in record
 
 
 # ── (b′) ADR node props on the one-hop neighbor (decision 909) ────────────────
 
-def test_neighbor_adr_props_collects_only_set_keys():
-    """_neighbor_adr_props packs a folded fact's evidence weight (fact_kind +
-    source_ref), dropping unset keys. A neighbor carrying none returns {}.
+def test_fact_kind_is_derived_from_source_ref():
+    """F28: fact_kind is derived from source_ref. Node adr copies are not a reader.
 
-    A DECISION's confidence/alternatives are deliberately NOT among the keys it
-    can produce — they are payload, dereferenced from Postgres.
+    Mutation: read adr_fact_kind off the graph row again.
     """
-    fn = coordinator_mod._neighbor_adr_props
-    fact = fn({"adr_fact_kind": "measured", "adr_source_ref": "coordinator.py#L42"})
-    assert fact == {"fact_kind": "measured", "source_ref": "coordinator.py#L42"}
-
-    # A bare neighbor (e.g. a CommunitySummary) carries none → no adr_props.
-    assert fn({"adr_fact_kind": None, "adr_source_ref": None}) == {}
-    # Missing columns entirely (older single-anchor rows / stubs) are tolerated.
-    assert fn({}) == {}
-    # Even if a node still carries the old copies, this reader will not serve
-    # them — the graph is no longer the store for them.
-    assert fn({"adr_confidence": "high", "adr_alternatives": ["a", "b"]}) == {}
+    fn = coordinator_mod.fact_kind_from_source_ref
+    assert fn("coordinator.py#L42") == "measured"
+    assert fn(None) == "discussion"
+    assert fn("") == "discussion"
+    assert not hasattr(coordinator_mod, "_neighbor_adr_props")
+    assert not hasattr(coordinator_mod, "_decision_payload_props")
 
 
 def test_a_string_alternatives_value_is_one_entry_not_a_pile_of_letters():
@@ -321,116 +378,124 @@ def test_a_string_alternatives_value_is_one_entry_not_a_pile_of_letters():
     A string is ONE entry. Asserted on the value, not on the source text: a
     guard disabled with `if False and …` leaves its own text in the file.
     """
-    fn = coordinator_mod._decision_payload_props
     shreddable = '["flat GROUNDED_IN", "no typing"]'
-    assert fn(shreddable, None) == {"alternatives": [shreddable]}
-    # A real list is still passed through unchanged.
-    assert fn(["a", "b"], None) == {"alternatives": ["a", "b"]}
-    # A tuple (driver variation) is a sequence, not a scalar.
-    assert fn(("a", "b"), None) == {"alternatives": ["a", "b"]}
-    # Unset values produce no keys at all — an absent key and an empty list are
-    # the same claim, and neither should render as "alternatives: []".
-    assert fn(None, None) == {}
-    assert fn([], "") == {}
-    assert fn(None, "high") == {"confidence": "high"}
+    entry = coordinator_mod.render_record_entry(
+        {"content": "stored body", "content_chars": 11, "type": "decision",
+         "ref": "decision:9", "readable": True, "superseded": False,
+         "metadata": {"decision": {"rationale": "because",
+                                   "alternatives": shreddable,
+                                   "confidence": "high"}}},
+        None, "decision:9", {"rows": {}}, ranked=False, search_hit=False)
+    assert entry["text"] == "because"
+    assert "alternatives" not in entry
+    assert "confidence" not in entry
+    assert shreddable[0] not in entry["text"]
 
 
 @pytest.mark.asyncio
 async def test_decision_neighbor_payload_comes_from_postgres_not_the_graph():
-    """An insight_summary folds Decisions; the folded Decision one hop away
-    carries its confidence + alternatives in adr_props — read from POSTGRES by
-    the pg_id the subgraph already carries, not from a copy on the node.
-
-    The node here carries NOTHING (which is the state of 183 of our decisions
-    for confidence, and was the state of 64% of them for alternatives until a
-    one-time sync repaired it). The payload still surfaces, because the store
-    of truth is the one being read.
-    """
+    """F6: A decision neighbour's text is its whole rationale. Alternatives stay off the entry, and adr_props is absent."""
     c, mock_conn, mock_session = _coordinator_with_mocks()
     mock_session.run = AsyncMock(return_value=_AsyncRows([
         _row(labels=["Decision"], name=None, pg_id=579,
              rel_type="SUMMARIZED_BY", direction="in", rel_props={},
-             snippet="Grounding relations should be role-typed"),
+             snippet="NODE TITLE MUST NOT LEAD"),
     ]))
+    rationale = "Grounding relations should be role-typed"
     mock_conn.fetch = AsyncMock(return_value=[
-        {"id": 579, "alternatives": ["keep the flat GROUNDED_IN"],
-         "confidence": "high"},
+        {"id": 579, "content": "the whole decision row, longer than the rationale",
+         "content_chars": 52,
+         "metadata": {"type": "decision", "decision": {
+             "rationale": rationale,
+             "alternatives": ["keep the flat GROUNDED_IN"],
+             "confidence": "high"}},
+         "visibility": "global", "agent_id": None, "scope": "global",
+         "superseded": False},
     ])
-    ctx = await c._expand_graph_context(
+    ctx = await _expand_live(c, 
         mock_session, 123, (coordinator_mod.ONT.community_summary,))
-    assert ctx[0]["pg_id"] == 579
-    assert ctx[0]["adr_props"] == {
-        "alternatives": ["keep the flat GROUNDED_IN"],
-        "confidence": "high",
-    }
-    # The dereference is keyed on the neighbor's pg_id and asks for exactly the
-    # two payload fields — one batched primary-key lookup, never an N+1.
-    sql, ids = mock_conn.fetch.await_args.args[0], mock_conn.fetch.await_args.args[1]
-    assert "id = ANY($1::bigint[])" in sql
-    assert ids == [579]
+    record = ctx[0]["record"]
+    assert record["ref"] == "decision:579"
+    assert record["text"] == rationale
+    assert record["text_is"] == "summary"
+    assert "adr_props" not in record
+    assert "keep the flat GROUNDED_IN" not in record["text"]
+    assert "NODE TITLE MUST NOT LEAD" not in json.dumps(ctx)
+    assert mock_conn.fetch.await_count == 2
+    doc_calls = [call for call in mock_conn.fetch.await_args_list
+                 if "technical_docs" in call.args[0]]
+    assert len(doc_calls) == 1
+    assert "id = ANY($1::bigint[])" in doc_calls[0].args[0]
+    assert doc_calls[0].args[1] == [579]
 
 
 @pytest.mark.asyncio
 async def test_only_decision_neighbors_are_dereferenced():
-    """A Fact/Entity neighbor does not trigger the decision payload query,
-    though it is looked up in the text index.
-    """
+    """F28: A fact neighbour takes fact_kind from Postgres metadata, not the node, and an entity is not a record."""
     c, mock_conn, mock_session = _coordinator_with_mocks()
     mock_session.run = AsyncMock(return_value=_AsyncRows([
         _row(labels=["Fact"], name=None, pg_id=601, rel_type="GROUNDED_IN",
              direction="out", rel_props={}, snippet="tests pass",
-             adr_fact_kind="measured"),
+             adr_fact_kind="tested", adr_source_ref="from-the-node"),
         _row(labels=["Entity"], name="Postgres", pg_id=None,
              rel_type="MENTIONS", direction="out", rel_props={}, snippet=None),
     ]))
     mock_conn.fetch = AsyncMock(return_value=[
-        {"id": 601, "content_chars": 10, "type": "fact", "superseded": False,
-         "visibility": "global", "agent_id": None, "scope": None},
+        {"id": 601, "content": "tests pass", "content_chars": 10,
+         "metadata": {"type": "fact", "source_ref": "src/lock.py"},
+         "visibility": "global", "agent_id": None, "scope": "global",
+         "superseded": False},
     ])
-    ctx = await c._expand_graph_context(
+    ctx = await _expand_live(c, 
         mock_session, 123, (coordinator_mod.ONT.community_summary,))
-    assert ctx[0]["adr_props"] == {"fact_kind": "measured"}
+    record = ctx[0]["record"]
+    assert record["source_ref"] == "src/lock.py"
+    assert record["fact_kind"] == "measured"
+    assert "adr_props" not in record
+    assert "from-the-node" not in json.dumps(ctx)
+    assert ctx[1]["relation"]["to"]["name"] == "Postgres"
+    assert "record" not in ctx[1]
     assert not any("metadata->'decision'" in call.args[0] for call in mock_conn.fetch.await_args_list)
     assert any("technical_docs" in call.args[0] for call in mock_conn.fetch.await_args_list)
 
 
 @pytest.mark.asyncio
 async def test_a_failed_payload_dereference_never_fails_the_walk():
-    """Adding a query to a work path changes that path's failure modes — the
-    lesson from the REM telemetry blip. Graph context enriches a search and
-    must never fail one, so a payload error leaves the entries intact and
-    simply without adr_props."""
+    """F4a: A Postgres failure drops every record-ended neighbour and keeps an entity relation. The walk does not raise."""
     c, mock_conn, mock_session = _coordinator_with_mocks()
     mock_session.run = AsyncMock(return_value=_AsyncRows([
         _row(labels=["Decision"], name=None, pg_id=579,
              rel_type="SUMMARIZED_BY", direction="in", rel_props={},
              snippet="Grounding relations should be role-typed"),
+        _row(labels=["Entity"], name="LockOrder", rel_type="MENTIONS",
+             direction="out", rel_props={}),
     ]))
     mock_conn.fetch = AsyncMock(side_effect=RuntimeError("pool exhausted"))
-    ctx = await c._expand_graph_context(
+    ctx = await _expand_live(c, 
         mock_session, 123, (coordinator_mod.ONT.community_summary,))
     assert len(ctx) == 1
-    assert ctx[0]["pg_id"] == 579
-    assert "adr_props" not in ctx[0]
+    assert ctx[0]["relation"]["to"]["name"] == "LockOrder"
+    assert "decision:579" not in json.dumps(ctx)
+    assert "role-typed" not in json.dumps(ctx)
 
-    # Same contract in the batched form, which is the one search actually uses.
     mock_session.run = AsyncMock(return_value=_AsyncRows([
         _row(labels=["Decision"], name=None, anchor_pg_id=91, rel_pg_id=579,
              rel_type="SUMMARIZED_BY", direction="in", rel_props={},
              snippet="Grounding relations should be role-typed"),
+        _row(labels=["Entity"], name="LockOrder", anchor_pg_id=91,
+             rel_type="MENTIONS", direction="out", rel_props={}),
     ]))
-    out = await c._expand_graph_context_batch(
+    raw = await c._expand_graph_context_batch(
         mock_session, [91], (coordinator_mod.ONT.community_summary,))
-    assert out[91][0]["pg_id"] == 579
-    assert "adr_props" not in out[91][0]
+    out = await _compose_map(c, raw, (coordinator_mod.ONT.community_summary,))
+    assert len(out[91]) == 1
+    assert out[91][0]["relation"]["to"]["name"] == "LockOrder"
+    assert "decision:579" not in json.dumps(out)
 
 
 @pytest.mark.asyncio
 async def test_batched_expansion_dereferences_every_anchor_in_one_query():
-    """The batch form exists to make the walk one round-trip; a per-anchor
-    payload query would undo that. Two anchors, two decision neighbors, ONE
-    decision payload query and at most one index query per table.
-    """
+    """F6: Two decision neighbours hydrate in one query. Each entry's text is its rationale, and adr_props is absent."""
     c, mock_conn, mock_session = _coordinator_with_mocks()
     mock_session.run = AsyncMock(return_value=_AsyncRows([
         _row(labels=["Decision"], name=None, anchor_pg_id=91, rel_pg_id=579,
@@ -440,46 +505,61 @@ async def test_batched_expansion_dereferences_every_anchor_in_one_query():
              rel_type="SUMMARIZED_BY", direction="in", rel_props={},
              snippet="the outbox is atomic"),
     ]))
-    payload_rows = [
-        {"id": 579, "alternatives": ["keep the flat GROUNDED_IN"], "confidence": "high"},
-        {"id": 580, "alternatives": None, "confidence": "medium"},
-    ]
-    index_rows = [
-        {"id": 579, "content_chars": 120, "type": "decision", "superseded": False,
-         "visibility": "global", "agent_id": None, "scope": None},
-        {"id": 580, "content_chars": 150, "type": "decision", "superseded": False,
-         "visibility": "global", "agent_id": None, "scope": None},
-    ]
-    mock_conn.fetch = AsyncMock(side_effect=[payload_rows, index_rows])
-    out = await c._expand_graph_context_batch(
+
+    def _decision(pid, rationale, confidence):
+        return {"id": pid, "content": "stored decision body",
+                "content_chars": 20,
+                "metadata": {"type": "decision", "decision": {
+                    "rationale": rationale, "confidence": confidence,
+                    "alternatives": ["keep the flat GROUNDED_IN"]}},
+                "visibility": "global", "agent_id": None, "scope": "global",
+                "superseded": False}
+
+    mock_conn.fetch = AsyncMock(return_value=[
+        _decision(579, "role-typed grounding", "high"),
+        _decision(580, "the outbox is atomic", "medium"),
+    ])
+    raw = await c._expand_graph_context_batch(
         mock_session, [91, 92], (coordinator_mod.ONT.community_summary,))
-    assert out[91][0]["adr_props"] == {
-        "alternatives": ["keep the flat GROUNDED_IN"], "confidence": "high"}
-    assert out[92][0]["adr_props"] == {"confidence": "medium"}
+    out = await _compose_map(c, raw, (coordinator_mod.ONT.community_summary,))
+    assert out[91][0]["record"]["text"] == "role-typed grounding"
+    assert out[92][0]["record"]["text"] == "the outbox is atomic"
+    assert "adr_props" not in out[91][0]["record"]
+    assert "adr_props" not in out[92][0]["record"]
+    assert "keep the flat GROUNDED_IN" not in out[91][0]["record"]["text"]
     assert mock_conn.fetch.await_count == 2
-    payload_calls = [call for call in mock_conn.fetch.await_args_list if "metadata->'decision'" in call.args[0]]
-    index_calls = [call for call in mock_conn.fetch.await_args_list if "technical_docs" in call.args[0] and "metadata->'decision'" not in call.args[0]]
-    assert len(payload_calls) == 1
-    assert payload_calls[0].args[1] == [579, 580]
-    assert len(index_calls) == 1
-    assert index_calls[0].args[1] == [579, 580]
+    doc_calls = [call for call in mock_conn.fetch.await_args_list
+                 if "technical_docs" in call.args[0]]
+    sum_calls = [call for call in mock_conn.fetch.await_args_list
+                 if "community_summaries" in call.args[0]]
+    assert len(doc_calls) == 1 and doc_calls[0].args[1] == [579, 580]
+    assert len(sum_calls) == 1 and sum_calls[0].args[1] == [91, 92]
 
 
 @pytest.mark.asyncio
 async def test_fact_neighbor_surfaces_fact_kind_and_source_ref():
-    """A thematic community_summary folds Facts; the folded Fact one hop away now
-    carries its evidence weight (fact_kind + source_ref) in adr_props."""
-    c, _, mock_session = _coordinator_with_mocks()
+    """F28: fact_kind and source_ref come from the Postgres row. The node's adr copies do not."""
+    c, mock_conn, mock_session = _coordinator_with_mocks()
     mock_session.run = AsyncMock(return_value=_AsyncRows([
         _row(labels=["Fact"], name=None, pg_id=804,
              rel_type="SUMMARIZED_BY", direction="in", rel_props={},
              snippet="the embedding model contract is fixed",
-             adr_fact_kind="measured", adr_source_ref="design-doc.pdf#p12"),
+             adr_fact_kind="tested", adr_source_ref="from-the-node"),
     ]))
-    ctx = await c._expand_graph_context(
+    mock_conn.fetch = AsyncMock(return_value=[{
+        "id": 804, "content": "the embedding model contract is fixed in full",
+        "content_chars": 48,
+        "metadata": {"type": "fact", "source_ref": "design-doc.pdf"},
+        "visibility": "global", "agent_id": None, "scope": "global",
+        "superseded": False,
+    }])
+    ctx = await _expand_live(c, 
         mock_session, 88, (coordinator_mod.ONT.community_summary,))
-    assert ctx[0]["adr_props"] == {
-        "fact_kind": "measured", "source_ref": "design-doc.pdf#p12"}
+    record = ctx[0]["record"]
+    assert record["source_ref"] == "design-doc.pdf"
+    assert record["fact_kind"] == "researched"
+    assert "adr_props" not in record
+    assert "from-the-node" not in json.dumps(ctx)
 
 
 @pytest.mark.asyncio
@@ -492,32 +572,32 @@ async def test_neighbor_without_adr_props_omits_the_key():
              rel_type="SUMMARIZED_BY", rel_props={}, snippet=None),
     ]))
     mock_conn.fetch = AsyncMock(return_value=[
-        {"id": 88, "content_chars": 50, "snippet": "live summary",
-         "superseded": False, "metadata": {}},
+        {"id": 88, "content": "live summary", "content_chars": 50,
+         "metadata": {"kind": "thematic"}, "visibility": "global",
+         "agent_id": None, "scope": "global", "superseded": False},
     ])
-    ctx = await c._expand_graph_context(
+    ctx = await _expand_live(c, 
         mock_session, 42, (coordinator_mod.ONT.fact,))
     assert len(ctx) == 1
-    assert "adr_props" not in ctx[0]
+    assert "adr_props" not in ctx[0]["record"]
+    assert ctx[0]["record"]["text_is"] == "pointer"
 
 
 def test_expansion_cypher_projects_adr_node_props_both_forms():
-    """Stubs never execute Cypher, so pin the projection textually: both the
-    single-anchor and batched expansion queries must SELECT the ADR node props,
-    or the surfacing above silently regresses to snippet-only (decision 909)."""
+    """Stubs never execute Cypher, so pin the projection: rem_summary, properties(r), both ends, and no REFERENCES. ADR node copies stay out (decision:909: provenance is the record's, not a graph copy)."""
     import inspect
-    src = inspect.getsource(coordinator_mod.MemoryCoordinator._expand_graph_context)
     src_batch = inspect.getsource(
         coordinator_mod.MemoryCoordinator._expand_graph_context_batch)
-    for body in (src, src_batch):
-        assert "related.fact_kind AS adr_fact_kind" in body
-        assert "related.source_ref AS adr_source_ref" in body
-        # ⛔ And the payload copies must NOT come back — a re-added projection
-        # would silently restore the divergence class the dereference removed.
+    for body in (src_batch,):
+        assert "related.rem_summary AS rem_summary" in body
+        assert "properties(r) AS rel_props" in body
+        assert "startNode(r).pg_id AS start_pg_id" in body
+        assert "endNode(r).pg_id AS end_pg_id" in body
+        assert "ONT.references" in body
+        assert "adr_fact_kind" not in body
         assert "adr_confidence" not in body
         assert "adr_alternatives" not in body
-    # The batch form must also pass the columns through its OUTER return.
-    assert "adr_fact_kind, adr_source_ref" in src_batch
+    assert "start_pg_id, start_labels, start_name" in src_batch
 
 
 # ── (c) direction + full edge property map ────────────────────────────────────
@@ -540,46 +620,43 @@ async def test_edge_entries_carry_direction_and_full_properties():
                         "model": "gemma-4-12b", "run_id": "r-77"}),
     ]))
 
-    ctx = await c._expand_graph_context(
+    ctx = await _expand_live(c, 
         mock_session, 577, (coordinator_mod.ONT.decision,))
 
-    grounded = ctx[0]
-    assert grounded["direction"] == "out"
-    assert grounded["properties"]["asserted_by"] == "operator"
-    assert grounded["properties"]["confidence"]  == 0.9
-    assert grounded["properties"]["role"]        == "based_on"
+    grounded = ctx[0]["relation"]
+    assert grounded["from"] == "decision:577"
+    assert grounded["props"]["asserted_by"] == "operator"
+    assert grounded["props"]["confidence"]  == 0.9
+    assert grounded["props"]["role"]        == "based_on"
 
-    machine = ctx[1]
-    assert machine["properties"]["asserted_by"] == "rem"
-    assert machine["properties"]["confidence"]  == 0.55
-    assert machine["properties"]["model"]       == "gemma-4-12b"
-    assert machine["properties"]["run_id"]      == "r-77"
+    machine = ctx[1]["relation"]
+    assert machine["props"]["asserted_by"] == "rem"
+    assert machine["props"]["confidence"]  == 0.55
+    assert machine["props"]["model"]       == "gemma-4-12b"
+    assert machine["props"]["run_id"]      == "r-77"
 
 
 # ── (d) Entity neighbors keep the legacy shape ────────────────────────────────
 
 @pytest.mark.asyncio
 async def test_entity_neighbor_keeps_legacy_keys_plus_additive_ones():
-    """Existing consumers read rel_type/name/label/aliases — those keys must
-    survive unchanged; direction/properties are additive."""
+    """An entity end keeps name, label and aliases inside the triple. Snippet does not."""
     c, _, mock_session = _coordinator_with_mocks()
     mock_session.run = AsyncMock(return_value=_AsyncRows([
         _row(labels=["Entity"], name="Neo4j", rel_type="MENTIONS",
              direction="out", rel_props={}, aliases=["neo4j", "Neo4J"]),
     ]))
-    ctx = await c._expand_graph_context(
+    ctx = await _expand_live(c, 
         mock_session, 42, (coordinator_mod.ONT.fact,))
 
-    entry = ctx[0]
-    assert entry["rel_type"] == "MENTIONS"
-    assert entry["name"]     == "Neo4j"
-    assert entry["label"]    == "Entity"
-    assert entry["aliases"]  == ["neo4j", "Neo4J"]
-    # additive keys
-    assert entry["direction"] == "out"
-    assert entry["properties"] == {}
-    # pg_id-keyed keys are NOT bolted onto name-keyed neighbors
-    assert "snippet" not in entry
+    end = ctx[0]["relation"]["to"]
+    assert ctx[0]["relation"]["relation"] == "MENTIONS"
+    assert ctx[0]["relation"]["from"] == "fact:42"
+    assert end["name"] == "Neo4j"
+    assert end["label"] == "Entity"
+    assert end["aliases"] == ["neo4j", "Neo4J"]
+    assert ctx[0]["relation"]["props"] == {}
+    assert "snippet" not in json.dumps(ctx[0])
 
 
 @pytest.mark.asyncio
@@ -589,9 +666,9 @@ async def test_entity_neighbor_without_aliases_omits_key():
     mock_session.run = AsyncMock(return_value=_AsyncRows([
         _row(labels=["Entity"], name="Postgres", aliases=[]),
     ]))
-    ctx = await c._expand_graph_context(
+    ctx = await _expand_live(c, 
         mock_session, 42, (coordinator_mod.ONT.fact,))
-    assert "aliases" not in ctx[0]
+    assert "aliases" not in ctx[0]["relation"]["to"]
 
 
 # ── (e) temporal edge properties serialize ────────────────────────────────────
@@ -614,11 +691,11 @@ async def test_temporal_edge_property_serializes_without_typeerror():
                         "recorded":   datetime.datetime(2026, 7, 15, 10, 30)},
              snippet="evidence"),
     ]))
-    ctx = await c._expand_graph_context(
+    ctx = await _expand_live(c, 
         mock_session, 577, (coordinator_mod.ONT.decision,))
 
     dumped = json.dumps(ctx)   # must not raise TypeError
-    props = ctx[0]["properties"]
+    props = ctx[0]["relation"]["props"]
     assert props["created_at"] == "2026-07-15T10:30:00+00:00"
     assert props["recorded"].startswith("2026-07-15T10:30")
     assert "2026-07-15" in dumped
@@ -643,7 +720,8 @@ async def test_expansion_cap_is_env_tunable_and_high_signal_ordered():
 
     c, _, mock_session = _coordinator_with_mocks()
     mock_session.run = AsyncMock(return_value=_AsyncRows())
-    await c._expand_graph_context(mock_session, 42, (coordinator_mod.ONT.fact,))
+    await c._expand_graph_context_batch(
+        mock_session, [42], (coordinator_mod.ONT.fact,))
 
     call = mock_session.run.await_args
     cypher = call.args[0]
@@ -697,9 +775,10 @@ async def test_summary_result_carries_pgid_and_populated_graph_context():
     assert cs["tier"] == "community_summary"
     assert cs["pg_id"] == 88
     assert len(cs["graph_context"]) == 2
-    assert {e["rel_type"] for e in cs["graph_context"]} == {"SUMMARIZED_BY"}
-    assert {e["pg_id"] for e in cs["graph_context"]} == {42, 43}
-    assert all(e["direction"] == "in" for e in cs["graph_context"])
+    assert {e["relation"]["relation"] for e in cs["graph_context"]} == {"SUMMARIZED_BY"}
+    assert all(e["relation"]["to"] == "summary:88" for e in cs["graph_context"])
+    assert all(e["relation"]["from"] is None for e in cs["graph_context"])
+    assert "outbox rows are atomic" not in json.dumps(cs["graph_context"])
 
     # the walk anchored on the CommunitySummary label with the summary's id
     walk_call = mock_session.run.await_args_list[0]
@@ -729,8 +808,10 @@ async def test_insight_summary_also_carries_pgid_and_walks_graph():
     ins = results[0]
     assert ins["tier"] == "insight_summary"
     assert ins["pg_id"] == 91
-    assert ins["graph_context"][0]["label"] == "Decision"
-    assert ins["graph_context"][0]["pg_id"] == 245
+    assert ins["graph_context"][0]["relation"]["relation"] == "SUMMARIZED_BY"
+    assert ins["graph_context"][0]["relation"]["to"] == "insight:91"
+    assert ins["graph_context"][0]["relation"]["from"] is None
+    assert "we decided the outbox" not in json.dumps(ins["graph_context"])
 
 
 @pytest.mark.asyncio
@@ -759,7 +840,7 @@ async def test_neo4j_failure_degrades_to_empty_graph_context():
     search, it never fails one."""
     c, _, mock_session = _coordinator_with_mocks()
     mock_session.run = AsyncMock(side_effect=Exception("neo4j down"))
-    ctx = await c._expand_graph_context(
+    ctx = await _expand_live(c, 
         mock_session, 42, (coordinator_mod.ONT.fact,))
     assert ctx == []
 
@@ -843,12 +924,12 @@ async def test_a_judgement_hit_carries_its_derived_belonging():
                         snippet="the decision this verdict judges")],
         belonging_rows=[_belonging_row(913, "B", ["literature", "tests"])],
     )
-    ctx = await c._expand_graph_context(
+    ctx = await _expand_live(c, 
         session, 913,
         (coordinator_mod.ONT.fact, coordinator_mod.ONT.decision,
          coordinator_mod.ONT.retrospective))
 
-    assert ctx[0]["rel_type"] == "HAD_OUTCOME", "the edges come first, unchanged"
+    assert ctx[0]["relation"]["relation"] == "HAD_OUTCOME", "the edges come first, unchanged"
     assert ctx[-1] == {"belonging": {"project": "B",
                                      "domains": ["literature", "tests"]}}
     # Not an edge, and never mistakable for one.
@@ -864,7 +945,7 @@ async def test_the_belonging_query_is_the_ontology_helper_verbatim():
     c, _, _ = _coordinator_with_mocks()
     session, calls = _dispatching_session(
         edge_rows=[], belonging_rows=[_belonging_row(913, "B", [])])
-    await c._expand_graph_context(
+    await _expand_live(c, 
         session, 913, (coordinator_mod.ONT.retrospective,))
     issued = [q for q, _ in calls if q == derived_belonging_cypher()]
     assert issued == [derived_belonging_cypher()]
@@ -880,7 +961,7 @@ async def test_a_fact_hit_gets_no_belonging_and_pays_for_no_query():
         edge_rows=[_row(labels=["Entity"], name="Neo4j", rel_type="MENTIONS")],
         belonging_rows=[_belonging_row(42, "B", ["architecture"])],
     )
-    ctx = await c._expand_graph_context(
+    ctx = await _expand_live(c, 
         session, 42, (coordinator_mod.ONT.fact,))
     assert all("belonging" not in e for e in ctx)
     assert len(calls) == 1, "a fact-only expansion must issue no second query"
@@ -893,7 +974,7 @@ async def test_a_summary_expansion_pays_for_no_belonging_query_either():
     c, _, _ = _coordinator_with_mocks()
     session, calls = _dispatching_session(
         edge_rows=[], belonging_rows=[_belonging_row(88, "B", ["ops"])])
-    await c._expand_graph_context(
+    await _expand_live(c, 
         session, 88, (coordinator_mod.ONT.community_summary,))
     assert len(calls) == 1
 
@@ -949,9 +1030,9 @@ async def test_a_belonging_failure_leaves_the_expansion_intact():
                         snippet="the decision")],
         belonging_rows=[], fail_belonging=True,
     )
-    ctx = await c._expand_graph_context(
+    ctx = await _expand_live(c, 
         session, 913, (coordinator_mod.ONT.retrospective,))
-    assert len(ctx) == 1 and ctx[0]["rel_type"] == "HAD_OUTCOME"
+    assert len(ctx) == 1 and ctx[0]["relation"]["relation"] == "HAD_OUTCOME"
     assert all("belonging" not in e for e in ctx)
 
 
@@ -964,6 +1045,6 @@ async def test_a_judgement_that_resolves_to_no_section_still_says_so():
     c, _, _ = _coordinator_with_mocks()
     session, _calls = _dispatching_session(
         edge_rows=[], belonging_rows=[_belonging_row(700, "B", [])])
-    ctx = await c._expand_graph_context(
+    ctx = await _expand_live(c, 
         session, 700, (coordinator_mod.ONT.decision,))
     assert ctx == [{"belonging": {"project": "B", "domains": []}}]

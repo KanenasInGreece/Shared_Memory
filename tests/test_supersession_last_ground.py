@@ -831,6 +831,27 @@ async def test_lineage_returns_supersession_ack():
         "agent_id": "demo-agent",
         "scope": "global",
     }
+    async def _fetch(sql, *params):
+        if "content_chars" in sql and "LEFT JOIN" in sql:
+            return [
+                {"id": 2672, "content": "grounding fact text", "content_chars": 20,
+                 "metadata": {"type": "fact"}, "type": "fact", "superseded": True,
+                 "superseded_by": 2680, "visibility": "global",
+                 "agent_id": "demo-agent", "scope": "global",
+                 "successor_id": 2680, "successor_metadata": {"type": "fact"},
+                 "successor_visibility": "global", "successor_agent_id": "demo-agent",
+                 "successor_scope": "global"},
+                {"id": 2522, "content": "the decision", "content_chars": 12,
+                 "metadata": {"type": "decision", "decision": {"rationale": "because"}},
+                 "type": "decision", "superseded": False, "visibility": "global",
+                 "agent_id": "demo-agent", "scope": "global"},
+                {"id": 2680, "content": "successor", "content_chars": 9,
+                 "metadata": {"type": "fact"}, "type": "fact", "superseded": False,
+                 "visibility": "global", "agent_id": "demo-agent", "scope": "global"},
+            ]
+        return []
+
+    conn.fetch = AsyncMock(side_effect=_fetch)
     conn.fetchrow = AsyncMock(side_effect=[rec_row, None])
 
     req = MagicMock()
@@ -844,7 +865,7 @@ async def test_lineage_returns_supersession_ack():
     assert body["pg_id"] == 2672
     assert body["record_type"] == "fact"
     assert body["superseded"] is True
-    assert body["superseded_by"] == 2680
+    assert body["superseded_by"] == "fact:2680"
     assert "supersession_ack" in body
     assert body["supersession_ack"] == {
         "decisions": [2522],

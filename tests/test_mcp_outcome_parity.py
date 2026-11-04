@@ -273,6 +273,51 @@ async def test_p4a_write_tools_return_the_object_the_cli_prints(
     assert isinstance(json.loads(returned), dict)
 
 
+def _blank_read_with(obj):
+    """Parity ignores exactly read_with. Every other field still has to match."""
+    if isinstance(obj, dict):
+        out = {}
+        for key, value in obj.items():
+            if key == "full_record" and isinstance(value, dict):
+                inner = _blank_read_with(value)
+                inner.pop("read_with", None)
+                out[key] = inner
+            else:
+                out[key] = _blank_read_with(value)
+        return out
+    if isinstance(obj, list):
+        return [_blank_read_with(item) for item in obj]
+    return obj
+
+
+def _read_withs(obj):
+    found = []
+    if isinstance(obj, dict):
+        full = obj.get("full_record")
+        if isinstance(full, dict) and "read_with" in full:
+            found.append(full["read_with"])
+        for value in obj.values():
+            found.extend(_read_withs(value))
+    elif isinstance(obj, list):
+        for item in obj:
+            found.extend(_read_withs(item))
+    return found
+
+
+def _assert_read_parity(printed, returned, cli_read_with, mcp_read_with):
+    """Same record either door. read_with is the field that names the caller
+    (decision:3001: parity is of outcome, not of bytes)."""
+    cli = json.loads(printed)
+    mcp = json.loads(returned)
+    assert _blank_read_with(mcp) == _blank_read_with(cli)
+    assert _read_withs(cli) == cli_read_with
+    assert _read_withs(mcp) == mcp_read_with
+
+
+_RANKED_FULL = {"ref": "fact:1", "chars": 1, "read_with": "search --ref fact:1"}
+_BY_REF_FULL = {"ref": "fact:1", "chars": 5, "read_with": "search --ref fact:1"}
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("reply", ["success", "domain_unknown", "unreachable"])
 async def test_p4b_ranked_search_returns_the_cli_record_list(
@@ -280,7 +325,8 @@ async def test_p4b_ranked_search_returns_the_cli_record_list(
     rows = [{"pg_id": 1, "ref": "fact:1", "record_type": "fact", "content": "a",
              "score": 0.9, "ranked": True, "graph_context": "X -> Y",
              "lifecycle": {"state": "current"}, "obsolete": None,
-             "stale_sources": [{"ref": "fact:9"}]}]
+             "stale_sources": [{"ref": "fact:9"}],
+             "full_record": dict(_RANKED_FULL)}]
     routes = {"success": (200, {"results": rows}),
               "domain_unknown": _REPLIES["domain_unknown"],
               "unreachable": _REPLIES["unreachable"]}
@@ -289,9 +335,13 @@ async def test_p4b_ranked_search_returns_the_cli_record_list(
                          "--project", "pj", "--domain", "ops", "--since", "2026-01-01")
     returned = await vs.hybrid_search_and_rerank(
         "the query", 3, project="pj", domains=["ops"], since="2026-01-01")
-    assert returned == printed
     if reply == "success":
-        assert json.loads(returned) == rows
+        _assert_read_parity(
+            printed, returned,
+            ["search --ref fact:1"],
+            ['hybrid_search_and_rerank(refs=["fact:1"])'])
+    else:
+        assert returned == printed
 
 
 @pytest.mark.asyncio
@@ -299,7 +349,7 @@ async def test_p4b_ranked_search_returns_the_cli_record_list(
 async def test_p4b_search_by_ref_returns_the_cli_record_list(
         reply, gateway, monkeypatch, capsys):
     rows = [{"ref": "fact:1", "by_ref": True, "content": "whole", "obsolete": "superseded",
-             "superseded_by": "fact:9"}]
+             "superseded_by": "fact:9", "full_record": dict(_BY_REF_FULL)}]
     routes = {"success": (200, {"results": rows}),
               "refs_invalid": (400, {"error": "refs_invalid", "invalid": ["widget:1"]}),
               "unreachable": _REPLIES["unreachable"]}
@@ -308,7 +358,13 @@ async def test_p4b_search_by_ref_returns_the_cli_record_list(
     cli_calls = list(gw.calls)
     gw.calls.clear()
     returned = await vs.hybrid_search_and_rerank(refs=["fact:1", "decision:2"])
-    assert returned == printed
+    if reply == "success":
+        _assert_read_parity(
+            printed, returned,
+            ["search --ref fact:1"],
+            ['hybrid_search_and_rerank(refs=["fact:1"])'])
+    else:
+        assert returned == printed
     assert gw.calls == cli_calls
     assert gw.calls[0][1] == {"refs": ["fact:1", "decision:2"]}
 
@@ -317,8 +373,16 @@ async def test_p4b_search_by_ref_returns_the_cli_record_list(
 @pytest.mark.parametrize("reply", ["success", "not_visible", "unreachable"])
 async def test_p4c_lineage_graph_and_telemetry_return_the_cli_object(
         reply, gateway, monkeypatch, capsys):
-    lineage = {"pg_id": 5, "exists": True, "related": [{"ref": "fact:6", "snippet": "s"}]}
-    graph = {"records": [{"n": {"ref": "fact:1"}}]}
+    lineage = {"pg_id": 5, "exists": True, "related": [{
+        "relation": {"from": "fact:5", "relation": "INFORMED_BY", "to": "fact:6",
+                     "props": {}},
+        "record": {"ref": "fact:6", "text": "whole", "text_is": "full_record",
+                   "full_record": {"ref": "fact:6", "chars": 5,
+                                   "read_with": "search --ref fact:6"}}}]}
+    graph = {"records": [{"n": {
+        "ref": "fact:1",
+        "full_record": {"ref": "fact:1", "chars": 3,
+                        "read_with": "search --ref fact:1"}}}]}
     telemetry = {"status": "success", "telemetry": {"postgres": {"technical_docs": 3}}}
     for_reply = {
         "success": {"/memory/status/fact:5": (200, lineage),
@@ -332,10 +396,24 @@ async def test_p4c_lineage_graph_and_telemetry_return_the_cli_object(
     printed = await _cli(monkeypatch, capsys, "lineage", "fact:5")
     # The CLI's lineage prints a transport failure on one line, without the
     # indent every other reply gets; the document is the same, so compare it.
-    assert json.loads(await vs.record_lineage("fact:5")) == json.loads(printed)
+    lineage_returned = await vs.record_lineage("fact:5")
+    if reply == "success":
+        _assert_read_parity(
+            printed, lineage_returned,
+            ["search --ref fact:6"],
+            ['hybrid_search_and_rerank(refs=["fact:6"])'])
+    else:
+        assert json.loads(lineage_returned) == json.loads(printed)
 
     printed = await _cli(monkeypatch, capsys, "graph", "MATCH (n) RETURN n")
-    assert await vs.graph_query("MATCH (n) RETURN n") == printed
+    graph_returned = await vs.graph_query("MATCH (n) RETURN n")
+    if reply == "success":
+        _assert_read_parity(
+            printed, graph_returned,
+            ["search --ref fact:1"],
+            ['hybrid_search_and_rerank(refs=["fact:1"])'])
+    else:
+        assert graph_returned == printed
 
     expected = json.dumps(mb.get_telemetry(), indent=2)
     assert await vs.memory_telemetry() == expected
@@ -680,7 +758,7 @@ def test_the_two_default_agent_ids_are_the_documented_ones(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_check_memory_health_on_success_returns_health_with_role_and_client(gateway):
-    health = {"status": "ok", "version": "1.0.14", "api_version": 5,
+    health = {"status": "ok", "version": "1.0.14", "api_version": vs.API_VERSION,
               "agent": "a1", "dependencies": {"postgres": {"state": "ok"}},
               "warnings": []}
     gateway({"/health": (200, health)})

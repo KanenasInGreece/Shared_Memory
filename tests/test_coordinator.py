@@ -1095,6 +1095,39 @@ async def test_search_response_community_summary_has_tier_field():
     assert results[0]["tier"] == "community_summary"
 
 
+def _is_record_hydration_sql(sql):
+    """The step-2 lookup, not a candidate query. It has no axis predicate."""
+    return "content_chars" in sql and "LEFT JOIN" in sql
+
+
+def _readable_hydration_rows(sql, params):
+    """Rows the viewer can read for every id the hydration query was given.
+
+    A candidate stub named id 1 leaves the cited ids out of the lookup result,
+    and redact then drops them (fact:3505 ruling 2: an id is named only when
+    its Postgres row is readable).
+    """
+    if not _is_record_hydration_sql(sql):
+        return None
+    requested = list(params[0] or []) if params else []
+    meta = ({"kind": "summary"} if "community_summaries" in sql
+            else {"type": "fact"})
+    return [{
+        "id": i, "content": "readable source", "metadata": dict(meta),
+        "visibility": "global", "agent_id": "", "scope": "global",
+        "superseded": False, "superseded_by": None,
+    } for i in requested]
+
+
+def _hydration_requested_ids(mock_conn, table_fragment):
+    found = []
+    for call in mock_conn.fetch.await_args_list:
+        sql = call.args[0] if call.args else ""
+        if _is_record_hydration_sql(sql) and table_fragment in sql and len(call.args) > 1:
+            found.extend(call.args[1] or [])
+    return found
+
+
 @pytest.mark.asyncio
 async def test_search_community_summary_surfaces_traceback_pointers():
     """The Tier-3 community summary result must surface source_pg_ids and metadata
@@ -1106,9 +1139,15 @@ async def test_search_community_summary_surfaces_traceback_pointers():
         "metadata": {"entity": "OutboxPattern", "domain": "shared-memory"},
         "source_pg_ids": [42, 43, 44],
     }])
-    mock_conn.fetch = AsyncMock(return_value=[
-        {"id": 1, "content": "fact", "metadata": {"entities": [], "source": "claude-code"}},
-    ])
+
+    async def _fetch(sql, *params):
+        hydrated = _readable_hydration_rows(sql, params)
+        if hydrated is not None:
+            return hydrated
+        return [{"id": 1, "content": "fact",
+                 "metadata": {"entities": [], "source": "claude-code"}}]
+
+    mock_conn.fetch = AsyncMock(side_effect=_fetch)
     mock_session.run = AsyncMock(return_value=_AsyncIter())
 
     mock_reranker = MagicMock()
@@ -1128,8 +1167,10 @@ async def test_search_community_summary_surfaces_traceback_pointers():
     assert resp.status == 200
     cs = json.loads(resp.text)["results"][0]
     assert cs["tier"] == "community_summary"
-    # Trace-back pointers are now present (previously dropped — metadata was None)
+    # Trace-back pointers survive when those sources are readable, and the
+    # ids were part of the one hydration lookup.
     assert cs["source_pg_ids"] == [42, 43, 44]
+    assert {42, 43, 44} <= set(_hydration_requested_ids(mock_conn, "technical_docs"))
     assert cs["metadata"]["entity"] == "OutboxPattern"
     assert cs["metadata"]["domain"] == "shared-memory"
 
@@ -1158,10 +1199,17 @@ async def test_search_insight_result_carries_retired_summaries_when_thematic_sup
         },
         None,   # no thematic summary
     ])
-    mock_conn.fetch = AsyncMock(side_effect=[
-        [{"id": 1, "content": "fact content", "metadata": {"entities": [], "source": "claude-code"}}],
-        [{"id": 501, "superseded": True, "superseded_reason": "lineage", "superseded_by": None, "source_pg_ids": []}],   # retired_summary_map
-    ])
+    async def _fetch(sql, *params):
+        hydrated = _readable_hydration_rows(sql, params)
+        if hydrated is not None:
+            return hydrated
+        if "community_summaries" in sql and "superseded_reason" in sql:
+            return [{"id": 501, "superseded": True, "superseded_reason": "lineage",
+                     "superseded_by": None, "source_pg_ids": []}]
+        return [{"id": 1, "content": "fact content",
+                 "metadata": {"entities": [], "source": "claude-code"}}]
+
+    mock_conn.fetch = AsyncMock(side_effect=_fetch)
     mock_session.run = AsyncMock(return_value=_AsyncIter())
 
     mock_reranker = MagicMock()
@@ -1188,9 +1236,12 @@ async def test_search_insight_result_carries_retired_summaries_when_thematic_sup
         {"summary_id": 501, "superseded_reason": "lineage", "superseded_by": None,
          "unsupported": [], "ref": "summary:501"}]
 
-    # The query that produced this MUST target community_summaries, NEVER technical_docs
-    retired_summary_call = mock_conn.fetch.call_args_list[1]
-    sql = retired_summary_call.args[0]
+    # The query that produced this MUST target community_summaries, NEVER technical_docs.
+    # Hydration is a different fetch and is not that query.
+    retired_calls = [c_ for c_ in mock_conn.fetch.call_args_list
+                     if "superseded_reason" in c_.args[0]]
+    assert retired_calls, "retired_summaries query never ran"
+    sql = retired_calls[0].args[0]
     assert "community_summaries" in sql
     assert "technical_docs" not in sql
     assert "superseded_by" in sql
@@ -1213,10 +1264,16 @@ async def test_search_insight_result_omits_retired_summaries_when_thematic_live(
         },
         None,
     ])
-    mock_conn.fetch = AsyncMock(side_effect=[
-        [{"id": 1, "content": "fact content", "metadata": {"entities": [], "source": "claude-code"}}],
-        [],   # retired_summary_map — summary 501 is NOT superseded
-    ])
+    async def _fetch(sql, *params):
+        hydrated = _readable_hydration_rows(sql, params)
+        if hydrated is not None:
+            return hydrated
+        if "community_summaries" in sql and "superseded_reason" in sql:
+            return []  # summary 501 is NOT superseded
+        return [{"id": 1, "content": "fact content",
+                 "metadata": {"entities": [], "source": "claude-code"}}]
+
+    mock_conn.fetch = AsyncMock(side_effect=_fetch)
     mock_session.run = AsyncMock(return_value=_AsyncIter())
 
     mock_reranker = MagicMock()
@@ -1264,11 +1321,23 @@ async def test_search_retired_summaries_never_reads_from_a_colliding_technical_d
         },
         None,
     ])
-    mock_conn.fetch = AsyncMock(side_effect=[
-        [{"id": 1, "content": "fact content", "metadata": {"entities": [], "source": "claude-code"}}],
-        [{"id": 501, "superseded_by": 900}],   # stale_map — technical_docs id 501 IS superseded
-        [],                                       # retired_summary_map — community_summaries id 501 is LIVE
-    ])
+    async def _fetch(sql, *params):
+        hydrated = _readable_hydration_rows(sql, params)
+        if hydrated is not None:
+            return hydrated
+        if ("technical_docs" in sql and "t.superseded" in sql
+                and "community_summaries" not in sql):
+            # stale_map — technical_docs id 501 IS superseded
+            return [{"id": 501, "superseded_by": 900, "visibility": "global",
+                     "agent_id": "", "scope": "global",
+                     "successor_visibility": "global",
+                     "successor_agent_id": "", "successor_scope": "global"}]
+        if "community_summaries" in sql and "superseded_reason" in sql:
+            return []  # community_summaries id 501 is LIVE
+        return [{"id": 1, "content": "fact content",
+                 "metadata": {"entities": [], "source": "claude-code"}}]
+
+    mock_conn.fetch = AsyncMock(side_effect=_fetch)
     mock_session.run = AsyncMock(return_value=_AsyncIter())
 
     mock_reranker = MagicMock()
@@ -1318,6 +1387,9 @@ async def test_search_retired_summaries_db_failure_degrades_with_a_logged_warnin
     ])
 
     async def _fetch_side_effect(sql, *params):
+        hydrated = _readable_hydration_rows(sql, params)
+        if hydrated is not None:
+            return hydrated
         if "community_summaries" in sql and "superseded_reason" in sql:
             raise RuntimeError("connection reset by peer")
         return [{"id": 1, "content": "fact content",
@@ -1377,9 +1449,14 @@ async def test_search_lineage_path_db_acquire_failure_omits_retired_summaries(ca
         },
         None,
     ])
-    mock_conn.fetch = AsyncMock(return_value=[
-        {"id": 1, "content": "fact content", "metadata": {"entities": [], "source": "claude-code"}}
-    ])
+    async def _fetch(sql, *params):
+        hydrated = _readable_hydration_rows(sql, params)
+        if hydrated is not None:
+            return hydrated
+        return [{"id": 1, "content": "fact content",
+                 "metadata": {"entities": [], "source": "claude-code"}}]
+
+    mock_conn.fetch = AsyncMock(side_effect=_fetch)
     mock_session.run = AsyncMock(return_value=_AsyncIter())
 
     mock_reranker = MagicMock()
@@ -1389,13 +1466,13 @@ async def test_search_lineage_path_db_acquire_failure_omits_retired_summaries(ca
                     {"index": 1, "relevance_score": 1.0}]
     })
 
-    # Stub pool.acquire: the first acquire is for the main search query (succeeds).
-    # The second acquire is on the lineage path for _annotate_retired_summaries (raises).
+    # The search query holds the first connection. Hydration holds the next.
+    # The retired-summaries annotation acquires after that, and that one fails.
     acquire_count = 0
     def failing_acquire(*args, **kwargs):
         nonlocal acquire_count
         acquire_count += 1
-        if acquire_count > 1:
+        if acquire_count > 2:
             raise RuntimeError("pool acquisition timed out on lineage path")
         return _async_ctx(mock_conn)
 
@@ -2108,9 +2185,14 @@ async def test_insight_and_thematic_are_ordered_by_merit_not_by_force():
             "source_pg_ids": [1, 2, 3],
         },
     ])
-    mock_conn.fetch = AsyncMock(return_value=[
-        {"id": 1, "content": "fact", "metadata": {"entities": [], "source": "claude-code"}},
-    ])
+    async def _fetch(sql, *params):
+        hydrated = _readable_hydration_rows(sql, params)
+        if hydrated is not None:
+            return hydrated
+        return [{"id": 1, "content": "fact",
+                 "metadata": {"entities": [], "source": "claude-code"}}]
+
+    mock_conn.fetch = AsyncMock(side_effect=_fetch)
     mock_session.run = AsyncMock(return_value=_AsyncIter())
 
     # The THEMATIC summary (index 1) scores highest, the insight (index 0) last.
@@ -2138,6 +2220,7 @@ async def test_insight_and_thematic_are_ordered_by_merit_not_by_force():
     # The insight kept its tier name and its decision-id provenance — only its
     # guaranteed POSITION is gone.
     assert results[2]["source_pg_ids"] == [245, 267]
+    assert {245, 267} <= set(_hydration_requested_ids(mock_conn, "technical_docs"))
     assert results[2]["score"] == -4.0
 
 

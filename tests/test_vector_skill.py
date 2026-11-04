@@ -466,7 +466,7 @@ async def test_mcp_check_memory_health_asks_the_gateway():
     """Health is what the gateway reports — daemons, backends, consolidation
     liveness — not a row count from a database handle this client should not
     hold. It is also the only check that exercises the path the client uses."""
-    gw = {"status": "ok", "version": "0.7.7", "api_version": 5,
+    gw = {"status": "ok", "version": "0.7.7", "api_version": vector_skill.API_VERSION,
           "daemon": "running", "rem_daemon": "running", "embedder": "ok"}
     mock_response = MagicMock(status_code=200, json=lambda: gw)
     with patch("httpx.AsyncClient.get", return_value=mock_response) as mock_get:
