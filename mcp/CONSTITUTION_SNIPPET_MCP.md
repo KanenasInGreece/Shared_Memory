@@ -1,9 +1,9 @@
 <!--
-Canonical constitution-file block for an AGENT HOST wired to the shared
+Canonical constitution-file snippet for an AGENT HOST wired to the shared
 memory through the MCP connector (`mcp/vector-skill.py`).
 
 This is the MCP twin of `shared-memory/CONSTITUTION_SNIPPET.md`, and the two are
-NOT interchangeable. The CLI block speaks of "the shared memory skill" — an
+NOT interchangeable. The CLI snippet speaks of "the shared memory skill" — an
 agent whose only interface is a set of MCP tools has no skill, cannot run
 `memory_bridge.py`, and is left to translate the instruction itself. This file
 says the same standing behaviour in the vocabulary that agent actually has:
@@ -27,13 +27,13 @@ config, never here.
 Marker-delimited and versioned (v2 below) so a later install/upgrade pass can
 find-and-replace this exact block instead of duplicating it, and can detect
 drift by comparing the installed block's version marker against this file's --
-exactly as AGENTS.md Phase 8b/8c already do for the CLI block.
+exactly as AGENTS.md Phase 8b/8c already do for the CLI snippet.
 (v1 -> v2: added an explicit trigger for history questions — "was X tested,
 tried, rejected or done" — because the v1 wording did not cover them and an
 agent answered one from a state instrument instead of the store, and that
 answer reached the public README.)
 (v3 -> v4: an indexed id is a pointer, not the record — added the
-index-pointer/index-repair rule below, matching the CLI block's own v4/v5.)
+index-pointer/index-repair rule below, matching the CLI snippet's own v4/v5.)
 (v4 -> v5: ported the corpus-poisoning warning from the CLI skill's
 `SKILL.md:257` — this MCP surface is the autonomous web-reading agent's own
 constitution block, and it carried no warning against saving crafted external

@@ -1,5 +1,5 @@
 <!--
-Canonical constitution-file block for the Shared Memory Framework.
+Canonical constitution-file snippet for the Shared Memory Framework.
 
 This is the single source of truth. An installer proposes inserting the
 block below into the operator's constitution file (CLAUDE.md / GEMINI.md /

@@ -953,20 +953,28 @@ async def hybrid_search_and_rerank(query: str = "", limit: int = 5, project: str
     Tier-1 facts for precision, expanded through the entity graph.
 
     Returns, as JSON text, the same list of record objects the CLI's `search`
-    prints. text_is summary is a whole shorter summary of the record, including
-    a decision's rationale. text_is full_record is the whole record. text_is
-    pointer has no text; the ref is the only context, so expand it with
-    read_with. full_record carries ref, chars and read_with. A relation names
-    from, the relation and to, the stored edge direction, and record is the
-    far end. A null end is a record this caller cannot read. Search never
-    returns superseded or reversed records. Explicit reads show them with
-    obsolete and superseded_by. retired_grounds on a decision hit means its
-    evidence was retired: read the successor before relying on it.
-    latest_verdict on a retrospective names the verdict that counts most.
+    prints. Every record entry on search `graph_context`, `lineage` and
+    `/memory/graph` is looked up in Postgres on each call and carries `text`
+    (never cut), `text_is` (`summary` = a whole shorter summary, REM's or a
+    decision's rationale; `full_record` = the whole record; `pointer` = no
+    text, the ref is the only context) and `full_record` `{ref, chars,
+    read_with}`. A decision's rationale is not the whole decision: `read_with`
+    gives its choice and alternatives. Any entry can be expanded by its ref,
+    and a `pointer` entry must be. Relations are triples `{relation: {from,
+    relation, to, props}, record}`; a null end is a record this caller cannot
+    read. A non-record far end is an object `{label, name}` and that item has
+    no `record` key. Search never returns superseded or reversed records.
+    Explicit reads show them with `obsolete` and `superseded_by` when the
+    successor is readable. `retired_grounds` on a decision hit means its
+    evidence was retired: read the successor before relying on it. Each
+    `retired_grounds` item names a relation, and `superseded_by` when that
+    successor is readable. `latest_verdict` on a retrospective names the
+    verdict that counts most. `found: false` means there is nothing to read.
     Reading is two steps. Step one ranks and expands. Step two is
-    hybrid_search_and_rerank(refs=["<ref>"]). Any entry can be expanded by
-    its ref, and a `pointer` entry must be. Lineage is record_lineage. A
-    graph read is graph_query. When the CLI would print a note on stderr
+    hybrid_search_and_rerank(refs=["<ref>"]). `read_with` names that call.
+    Those explicit reads are record_lineage,
+    hybrid_search_and_rerank(refs=["<ref>"]) and graph_query. When the CLI
+    would print a note on stderr
     for the same search (unranked rows, the keyword fallback served because
     the embedder is down, a stale cost projection), the reply is instead the
     object {"warnings": [<those exact texts>], "results": [<the list>]}.
@@ -1704,20 +1712,28 @@ async def memory_telemetry() -> str:
 
 @mcp.tool()
 async def record_lineage(ref: str) -> str:
-    """It says what happened to one record. text_is summary is a whole shorter
-    summary of the record, including a decision's rationale. text_is
-    full_record is the whole record. text_is pointer has no text; the ref is
-    the only context, so expand it with read_with. full_record carries ref,
-    chars and read_with. A relation names from, the relation and to, the stored
-    edge direction, and record is the far end. A null end is a record this
-    caller cannot read. Search never returns superseded or reversed records.
-    Explicit reads show them with obsolete and superseded_by. retired_grounds
-    on a decision hit means its evidence was retired: read the successor before
-    relying on it. latest_verdict on a retrospective names the verdict that
-    counts most. Reading is two steps. Step one ranks and expands. Step two is
-    hybrid_search_and_rerank(refs=["<ref>"]). Any entry can be expanded by its
-    ref, and a `pointer` entry must be. Lineage is record_lineage. A graph read
-    is graph_query. An unreadable record answers as a missing record.
+    """It says what happened to one record. Every record entry on search
+    `graph_context`, `lineage` and `/memory/graph` is looked up in Postgres on
+    each call and carries `text` (never cut), `text_is` (`summary` = a whole
+    shorter summary, REM's or a decision's rationale; `full_record` = the whole
+    record; `pointer` = no text, the ref is the only context) and `full_record`
+    `{ref, chars, read_with}`. A decision's rationale is not the whole
+    decision: `read_with` gives its choice and alternatives. Any entry can be
+    expanded by its ref, and a `pointer` entry must be. Relations are triples
+    `{relation: {from, relation, to, props}, record}`; a null end is a record
+    this caller cannot read. A non-record far end is an object `{label, name}`
+    and that item has no `record` key. Search never returns superseded or
+    reversed records. Explicit reads show them with `obsolete` and
+    `superseded_by` when the successor is readable. `retired_grounds` on a
+    decision hit means its evidence was retired: read the successor before
+    relying on it. Each `retired_grounds` item names a relation, and
+    `superseded_by` when that successor is readable. `latest_verdict` on a
+    retrospective names the verdict that counts most. `found: false` means
+    there is nothing to read. Reading is two steps. Step one ranks and
+    expands. Step two is hybrid_search_and_rerank(refs=["<ref>"]). `read_with`
+    names that call. Those explicit reads are record_lineage,
+    hybrid_search_and_rerank(refs=["<ref>"]) and graph_query. An unreadable
+    record answers as a missing record.
 
     Returns, as JSON text, the same object the CLI's `lineage` prints.
 
@@ -1754,21 +1770,30 @@ async def graph_query(cypher: str) -> str:
     Run a READ-ONLY Cypher query against the knowledge graph. Returns, as JSON
     text, the same records list the CLI's `graph` prints.
 
-    text_is summary is a whole shorter summary of the record, including a
-    decision's rationale. text_is full_record is the whole record. text_is
-    pointer has no text; the ref is the only context, so expand it with
-    read_with. full_record carries ref, chars and read_with. A relation names
-    from, the relation and to, the stored edge direction, and record is the
-    far end. A null end is a record this caller cannot read. Search never
-    returns superseded or reversed records. Explicit reads show them with
-    obsolete and superseded_by. retired_grounds on a decision hit means its
-    evidence was retired: read the successor before relying on it.
-    latest_verdict on a retrospective names the verdict that counts most.
+    Every record entry on search `graph_context`, `lineage` and `/memory/graph`
+    is looked up in Postgres on each call and carries `text` (never cut),
+    `text_is` (`summary` = a whole shorter summary, REM's or a decision's
+    rationale; `full_record` = the whole record; `pointer` = no text, the ref
+    is the only context) and `full_record` `{ref, chars, read_with}`. A
+    decision's rationale is not the whole decision: `read_with` gives its
+    choice and alternatives. Any entry can be expanded by its ref, and a
+    `pointer` entry must be. Relations are triples `{relation: {from, relation,
+    to, props}, record}`; a null end is a record this caller cannot read. A
+    non-record far end is an object `{label, name}` and that item has no
+    `record` key. Search never returns superseded or reversed records.
+    Explicit reads show them with `obsolete` and `superseded_by` when the
+    successor is readable. `retired_grounds` on a decision hit means its
+    evidence was retired: read the successor before relying on it. Each
+    `retired_grounds` item names a relation, and `superseded_by` when that
+    successor is readable. `latest_verdict` on a retrospective names the
+    verdict that counts most. `found: false` means there is nothing to read.
     Reading is two steps. Step one ranks and expands. Step two is
-    hybrid_search_and_rerank(refs=["<ref>"]). Any entry can be expanded by
-    its ref, and a `pointer` entry must be. Lineage is record_lineage. A
-    graph read is graph_query. A projected value is not the record. A node
-    this caller cannot read is label only.
+    hybrid_search_and_rerank(refs=["<ref>"]). `read_with` names that call.
+    Those explicit reads are record_lineage,
+    hybrid_search_and_rerank(refs=["<ref>"]) and graph_query. On
+    `/memory/graph`, nodes inside paths and maps are resolved like any node.
+    Only a projected property is not the record. A node this caller cannot
+    read is label only.
 
     Requires a token with full or admin role (read-only tokens receive 403).
     The gateway enforces read-only: CREATE, DELETE, DETACH DELETE, SET, MERGE,

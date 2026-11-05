@@ -320,19 +320,29 @@ async def test_item5_cypher_query_uses_unredacted_source_lists():
         "MATCH (n) WHERE n.pg_id IN [4, 5] RETURN SECRET-SRC",
         src_ids=[4, 5])
     src["source_pg_ids"] = [4]
+    # Private id 5 is only on the hit's source_pg_ids. metadata lists the
+    # readable id, so a check that ignores the top-level list would keep the query.
+    top_only = hit(
+        9, "insight", "insight", [4],
+        "MATCH (n) RETURN SECRET-TOP-ONLY")
+    top_only["source_pg_ids"] = [5]
     await c._compose_search_hits(
-        [thematic, insight, control, src], ranked=True, viewer="bob",
+        [thematic, insight, control, src, top_only], ranked=True, viewer="bob",
         viewer_scope=None, session=session)
-    raw = json.dumps([thematic, insight, control, src])
+    raw = json.dumps([thematic, insight, control, src, top_only])
     assert "SECRET-THEMATIC" not in raw
     assert "SECRET-INSIGHT" not in raw
     assert "SECRET-SRC" not in raw
+    assert "SECRET-TOP-ONLY" not in raw
     assert "5" not in raw
     assert "PUBLIC-CYPHER" in raw
     assert thematic["metadata"]["source_pg_ids"] == [4]
     assert insight["metadata"]["source_pg_ids"] == [4]
     assert "cypher_query" not in thematic["metadata"]
     assert "cypher_query" not in insight["metadata"]
+    assert "cypher_query" not in top_only["metadata"]
+    assert top_only["metadata"]["source_pg_ids"] == [4]
+    assert top_only["source_pg_ids"] == []
     assert control["metadata"]["cypher_query"].startswith("MATCH")
     assert src["metadata"]["src_ids"] == [4]
 

@@ -240,7 +240,7 @@ Facts and decisions saved by one agent (Claude Code, Antigravity CLI, Grok) are 
 ```
 hybrid_search_and_rerank("coordinator deadlock prevention", 5)
 → {"tier": "community_summary", "content": "The coordinator uses sorted per-entity locks..."}
-→ {"tier": "fact", "content": "...", "graph_context": [{"relation":{"relation":"WAS_ATTRIBUTED_TO","to":{"label":"Human","name":"Xenofon"}}}]}
+→ {"tier": "fact", "content": "...", "graph_context": [{"relation": {"from": "fact:1", "relation": "WAS_ATTRIBUTED_TO", "to": {"label": "Human", "name": "Xenofon"}, "props": {}}}]}
 ```
 
 The `graph_context` array on each Tier-1 result tells you who decided it, which AI assisted, and which project it belongs to — without a separate graph query.
@@ -249,10 +249,48 @@ The `graph_context` array on each Tier-1 result tells you who decided it, which 
 
 - **`memory_telemetry`** — pull the gateway's operational snapshot (`GET /memory/telemetry`): **the numbers**, each with the limit stated next to it. `encoders` (per-call embed/rerank latency — p50/p95/max, calls, errors), `gateway` (requests, status split, latency percentiles, in-flight, load-shed 503s), `outbox` (pending/applied/**`failed`, always present even at zero**, oldest ages, apply-latency percentiles, drain rate), `postgres` and `neo4j` (pool gauges, wait and query percentiles, `cypher_rejected_total` vs `tx_failures_total`), `rem` (dead-lettered, failing, passed-over, throughput), `nrem` (consolidation-cycle counts, served from the gateway's 60-second refresher with an `as_of` stamp because the insight walk is unbounded), `registry` (project/domain/alias row counts and the ingress refusal counters), `llm` (pool, affinity, routing, token usage, latency, faults), `clients.versions_seen`, plus `breakdown` (record types, agents, sources, `projects` and `domains`), `spine`, `consolidation`, `compliance` and the **`entity_graph`** section (`entities_total`, `singleton_entities` (mentioned by exactly one fact — a fragmentation proxy), `orphan_entities` (**truly dangling — degree-0, no edge of any kind**; an entity reached only by REM typed edges is *not* an orphan and is reported separately as `unmentioned_entities`), `genuinely_referenced_entities` and `top_hubs`). The **`inference_busy`** signal (tri-state `"busy"|"idle"|"unknown"`, also top-level on `GET /health`) is the `nvtop` GPU-busy check the daemons gate on, where `"unknown"` (nvtop absent / `SLOT_AWARE=0`, or the probe disabled itself after repeated hangs — see `gpu_probe`) is never reported as a false `"idle"`. `generated_at` is when the payload was built (it is briefly cached) and `timestamp` when it was served. Read-only; no direct DB access. The key-by-key contract is `Documentation/telemetry-contract.md`.
 - **`check_memory_health`** — **is it usable right now**: `status` (`ok` | `degraded` | `down`) derived from `dependencies` (a consolidation stall alone — `nrem_daemon` reason exactly `stalled:insight`, `stalled:fact_consolidation` or both — shows on that dependency only and does not degrade `status`) — one enum per dependency (postgres, neo4j, embedder, reranker, llm_pool, rem_daemon, nrem_daemon, outbox, registry), each with a `reason` when it is not `ok` — plus `warnings`, the list of limits that have been crossed as `{key, limit, observed, unit}`. The NUMBER behind a warning is on `memory_telemetry`. ⛔ **HTTP 503 means one thing: the embedder or the reranker is down**, so a save cannot produce a vector; every other verdict is served 200 with the enum in the body. `consolidation.stalled` means an eligible backlog exists but nothing has folded — investigate.
-- **`record_lineage`** — it says what happened to one record and names, in `related`, every record it directly affects or is affected by. Read the text with `hybrid_search_and_rerank(refs=["<ref>"])`. An unreadable record answers as a missing record. Any entry can be expanded by its ref, and a pointer entry must be. Pass a qualified `ref` (`fact:816`, `summary:87`): the record's state, its dream-cycle stamps (applied → rem_reviewed → consolidated), and which summary or insight it was folded into, with the latency. This is how you trace a narrative back to the facts it was synthesised from.
-- **`graph_query`** — read-only Cypher for multi-hop paths and provenance chains the automatic expansion did not reach. A record node returned as a row value or in a returned list carries `text`, `text_is` and `full_record`; read it with `hybrid_search_and_rerank(refs=["<ref>"])`. A projected value is not the record. A path and a map resolve. A node this caller cannot read is label only. This tool requires `full` or `admin` (`read` tokens receive 403). Reading stays open to a `read` role: `hybrid_search_and_rerank`, `record_lineage`, `check_memory_health`, `memory_telemetry`. The CLI's named `query` templates have no tool here — write the Cypher, or ask the operator. `CREATE`, `DELETE`, `DETACH DELETE`, `SET`, `REMOVE`, `MERGE`, `CALL`, `LOAD CSV`, `DROP` are blocked by the gateway keyword guard (write-Cypher is blocked for everyone). A query Neo4j itself rejects returns 400 `cypher_rejected` with the driver's message — read it and fix the Cypher; re-sending it unchanged will never succeed. A 500 `query failed` is the gateway or Neo4j, and retrying is reasonable.
+- **`record_lineage`** — it says what happened to one record and names, in
+  `related`, every record it directly affects or is affected by as
+  `{relation: {from, relation, to, props}, record}` (`record` is `null` when
+  this caller cannot read the far end; an unreadable target record answers as
+  missing). A non-record far end is an object `{label, name}` and that item
+  has no `record` key. Every record entry on `graph_context`, `record_lineage`
+  and `graph_query` is looked up in Postgres on each call and carries `text`
+  (never cut), `text_is` (`summary` = a whole shorter summary, REM's or a
+  decision's rationale; `full_record` = the whole record; `pointer` = no text,
+  the ref is the only context) and `full_record` `{ref, chars, read_with}`
+  (`read_with` is `hybrid_search_and_rerank(refs=["<ref>"])`). A decision's
+  rationale is not the whole decision: `read_with` gives its choice and
+  alternatives. Any entry can be expanded by its ref, and a pointer entry must
+  be. Search never returns superseded or reversed records. `retired_grounds`
+  on a decision hit means its evidence was retired: read the successor before
+  relying on it. Each `retired_grounds` item names a relation, and
+  `superseded_by` when that successor is readable. `latest_verdict` on a
+  retrospective names the verdict that counts most. `record_lineage`,
+  `hybrid_search_and_rerank(refs=[...])` and `graph_query` return them
+  marked `obsolete` with `superseded_by` when the successor is readable.
+  Pass a qualified `ref` (`fact:816`, `summary:87`):
+  the record's state, its dream-cycle stamps (applied → rem_reviewed →
+  consolidated), and which summary or insight it was folded into, with the
+  latency. This is how you trace a narrative back to the facts it was
+  synthesised from.
+- **`graph_query`** — read-only Cypher for multi-hop paths and provenance chains
+  the automatic expansion did not reach. A record node returned as a row value
+  or in a returned list carries `text`, `text_is` and `full_record`; expand it
+  with `hybrid_search_and_rerank(refs=["<ref>"])`. Nodes inside paths and maps
+  are resolved like any node; only a projected property is not the record. A
+  node this caller cannot read is label only. This tool requires `full` or
+  `admin` (`read` tokens receive 403). Reading stays open to a `read` role:
+  `hybrid_search_and_rerank`, `record_lineage`, `check_memory_health`,
+  `memory_telemetry`. The CLI's named `query` templates have no tool here —
+  write the Cypher, or ask the operator. `CREATE`, `DELETE`, `DETACH DELETE`,
+  `SET`, `REMOVE`, `MERGE`, `CALL`, `LOAD CSV`, `DROP` are blocked by the
+  gateway keyword guard (write-Cypher is blocked for everyone). A query Neo4j
+  itself rejects returns 400 `cypher_rejected` with the driver's message —
+  read it and fix the Cypher; re-sending it unchanged will never succeed. A
+  500 `query failed` is the gateway or Neo4j, and retrying is reasonable.
 
 Telemetry is built into the gateway, so any agent can read it. The optional **Shared Memory Monitor** dashboard is just a visual layer over `memory_telemetry`; it authenticates with a dedicated read-only token (`AGENT_ROLES=monitor:read`) and never writes.
 
 # OUTPUT
-Use scannable Markdown with hierarchical headings. Provide exact CLI commands, SQL and Cypher examples, and Docker configs. Direct and precise — no padding.
+Use scannable Markdown with hierarchical headings. Provide exact CLI commands, SQL/Cypher snippets, and Docker configs. Direct and precise — no padding.

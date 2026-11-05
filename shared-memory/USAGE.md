@@ -117,15 +117,12 @@ lineage summary:87
 review-hold --summary-id 12 --pg-id 42
 ```
 
-`stale_sources` and `retired_summaries`
-carry `superseded_by` only when the successor is readable.
-`stale_sources` is `[{"old": N}]`, plus `superseded_by` when that successor
-is readable. `old` may be a fact, a decision, or a
-retrospective. A null `superseded_by` is a retraction. When the successor is
-not readable the key is absent. `lineage` the qualified ref. Do not force
-`fact:`. `retired_summaries` is `[{"summary_id": Y, "superseded_reason": "…",
-"unsupported": […]}]` on an insight, plus `superseded_by` when that successor
-is readable. An insight shows a non-empty unsupported list when a superseded
+`stale_sources` (`[{"old": N, "superseded_by": M}]`) and `retired_summaries`
+(`[{"summary_id": Y, "superseded_reason": "…", "superseded_by": Z,
+"unsupported": […]}]` on an insight) carry `superseded_by` only when the
+successor is readable. `old` may be a fact, a decision, or a retrospective.
+A null `superseded_by` is a retraction. `lineage` the qualified ref. Do not
+force `fact:`. An insight shows a non-empty unsupported list when a superseded
 fact left a decision without thematic support; restore it by a retrospective
 on that decision grounded on the new fact (validated or refined), or reverse
 the decision. A null `superseded_by` depends on `superseded_reason`:
@@ -134,7 +131,13 @@ review it; `'coverage'` = retired by a larger summary. `lineage summary:Y`.
 An insight's `source_pg_ids` are decisions and retrospectives. A community
 summary's `source_pg_ids` are facts.
 
-`search --ref` entries carry `by_ref: true`. One that was not returned says why: `found: false` with `reason` `missing`, `wrong_type` (then `actual_ref` is the real one) or `not_visible`. `obsolete: "superseded"` comes with `superseded_by` unless the record was retracted; `obsolete: "reversed"` comes with `superseded_by` naming the reversing retrospective. `summary_refs` are an insight's summaries as refs; never pass `metadata.summary_ids` to `--ref`.
+`search --ref` entries carry `by_ref: true`. One that was not returned says
+why: `found: false` with `reason` `missing`, `wrong_type` (then `actual_ref`
+is the real one) or `not_visible`. `obsolete: "superseded"` comes with
+`superseded_by` when the successor is readable (null when retracted);
+`obsolete: "reversed"` comes with `superseded_by` naming the reversing
+retrospective when readable. `summary_refs` are an insight's summaries as
+refs; never pass `metadata.summary_ids` to `--ref`.
 
 ## Lineage
 
@@ -146,7 +149,7 @@ lineage 816
 
 `fact:816` is the fact. `summary:87` is the narrative. A bare `816` is the facts table, so a bare id copied off a summary is the wrong record. A qualified ref of the wrong type is a 404 that names the right ref.
 
-`lineage <ref>` says what happened to a record. The entry shape is in `SKILL.md`. `related` is absent on a summary, and when the graph is unavailable; `related_more` means the list was cut. `grounded_in`, `consolidated_into` and a summary's `sources` are references and carry no text.
+`lineage <ref>` says what happened to a record. The entry shape is in `SKILL.md`. `related` is absent on a summary, and when the graph is unavailable; `related_more` means the list was cut. `grounded_in`, `consolidated_into` and a summary's `sources`: see `SKILL.md`.
 
 ## Supersede
 

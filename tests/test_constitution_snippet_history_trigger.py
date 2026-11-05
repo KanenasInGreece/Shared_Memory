@@ -135,16 +135,23 @@ _HOOK = "Any entry can be expanded by its ref, and a pointer entry must be."
 # MCP read tools. Backticks are the skill's index style; the words are the contract.
 # The skill names search --ref. The MCP docstrings name the tools.
 _DEFINITION = (
-    "text_is summary is a whole shorter summary of the record, including a "
-    "decision's rationale. text_is full_record is the whole record. text_is "
-    "pointer has no text; the ref is the only context, so expand it with "
-    "read_with. full_record carries ref, chars and read_with. A relation names "
-    "from, the relation and to, the stored edge direction, and record is the "
-    "far end. A null end is a record this caller cannot read. Search never "
+    "Every record entry on search graph_context, lineage and /memory/graph is "
+    "looked up in Postgres on each call and carries text (never cut), text_is "
+    "(summary = a whole shorter summary, REM's or a decision's rationale; "
+    "full_record = the whole record; pointer = no text, the ref is the only "
+    "context) and full_record {ref, chars, read_with}. A decision's rationale "
+    "is not the whole decision: read_with gives its choice and alternatives. "
+    "Any entry can be expanded by its ref, and a pointer entry must be. "
+    "Relations are triples {relation: {from, relation, to, props}, record}; a "
+    "null end is a record this caller cannot read. A non-record far end is an "
+    "object {label, name} and that item has no record key. Search never "
     "returns superseded or reversed records. Explicit reads show them with "
-    "obsolete and superseded_by. retired_grounds on a decision hit means its "
-    "evidence was retired: read the successor before relying on it. "
-    "latest_verdict on a retrospective names the verdict that counts most."
+    "obsolete and superseded_by when the successor is readable. retired_grounds "
+    "on a decision hit means its evidence was retired: read the successor "
+    "before relying on it. Each retired_grounds item names a relation, and "
+    "superseded_by when that successor is readable. latest_verdict on a "
+    "retrospective names the verdict that counts most. found: false means "
+    "there is nothing to read."
 )
 
 _SKILL = os.path.join(_REPO, "shared-memory", "SKILL.md")
@@ -248,9 +255,16 @@ def test_f11_skill_says_paths_and_maps_resolve_like_nodes():
 
 
 def test_f11_usage_names_successor_visibility_on_stale_and_retired():
-    """F11: USAGE still shows superseded_by on stale_sources and retired_summaries when the successor is not readable."""
+    """F11: USAGE still shows superseded_by on stale_sources and retired_summaries when the successor is not readable.
+
+    Whitespace is collapsed first, as the SKILL guard does, so the sentence can wrap.
+    """
     clause = "carry `superseded_by` only when the successor is readable"
-    missing = [path for path in (_USAGE, _USAGE_SHIPPED) if clause not in _read(path)]
+
+    def _flat(path):
+        return re.sub(r"\s+", " ", _read(path))
+
+    missing = [path for path in (_USAGE, _USAGE_SHIPPED) if clause not in _flat(path)]
     assert not missing, missing
 
 
@@ -260,8 +274,12 @@ def test_f11_removed_read_keys_are_absent_from_the_doc_surfaces():
              _CLI_SNIPPET, _CLI_SNIPPET_SHIPPED, _MCP_SNIPPET)
     bad = []
     for path in files:
+        # Installer comments are not the pasted contract. The # OUTPUT line's
+        # "SQL/Cypher snippets" is the English word, not the removed JSON key.
+        text = re.sub(r"<!--.*?-->", "", _read(path), flags=re.DOTALL)
+        text = text.replace("SQL/Cypher snippets", "")
         # The splice marker and the file names are the block's identity.
-        text = _read(path).replace("constitution-snippet", "")
+        text = text.replace("constitution-snippet", "")
         text = text.replace("constitution_snippet", "")
         text = text.replace("CONSTITUTION_SNIPPET", "")
         if "snippet" in text:
