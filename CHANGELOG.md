@@ -7,6 +7,26 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-11-05
+
+Every read surface now tells the model what it is reading. A search result's graph neighbours, a lineage reply and the nodes of a graph query used to show a 120-character snippet cut from whatever the graph node held, so a model could not tell whether it had the whole record. From 1.1.0 every record entry is looked up in Postgres on each call and carries its whole text and says what that text is.
+
+**`API_VERSION` 5 → 6: a breaking read contract.** This is why the release raises the minor version. A client or monitor built for API 5 reads the gateway as incompatible until it updates.
+
+- **The record entry.** `text` is never cut. `text_is` says what it is: `summary` is a whole shorter summary (REM's, or a decision's rationale, which is not the whole decision); `full_record` is the whole record; `pointer` has no text, and the model must expand it. `full_record` is `{ref, chars, read_with}`. On the CLI `read_with` is `search --ref <ref>`; on the MCP door it is the `hybrid_search_and_rerank(refs=[...])` call.
+- **Relations are triples** `{relation: {from, relation, to, props}, record}`, in the stored edge direction. A `null` end is a record this caller cannot read. Search expansion no longer follows `REFERENCES` edges; lineage and graph queries still show them.
+- **Superseded and reversed records never appear in search.** Search by ref, lineage and graph queries return them marked `obsolete`, with `superseded_by` when the successor is readable; a reversed decision points to its reversing retrospective.
+- **Two marks computed on read, never stored.** A decision hit lists its superseded grounding facts in `retired_grounds`, one relation per item. A retrospective that a later one on the same decision replaced carries `latest_verdict`. `lifecycle` names the latest readable verdict.
+- **Visibility everywhere.** No reply names or quotes a record the caller cannot read: entries, relation ends, successors, marks, lifecycle, supersession acknowledgements, stale sources, retired summaries, hit metadata id lists and stored cypher queries. Lineage checks visibility before it reveals a record's type. A private retrospective's text no longer reaches another agent's decision hit through `lifecycle`, a leak fixed by this release.
+- **`/memory/graph`** resolves every record node in paths, maps and lists, and no longer cuts at a distinct-node count; the row cap stays. An unreadable node is reduced to its label. Stored `content`, `rem_summary`, `rationale` and `notes` leave hydrated nodes; decision titles stay. A graph query can now return much more text; no cap was added.
+- **Removed keys:** `snippet`, `content_truncated`, `content_chars`, `rel_type`/`direction`, `rel`/`dir`, `adr_props`. SKILL.md, USAGE.md, the MCP docstrings, the system prompt and the constitution snippets describe only the new keys. Snippet markers: CLI v7, MCP v9, so each install re-splices its constitution block.
+- **Proof on real stores.** Every changed SQL and Cypher query ran against throwaway Postgres 17.11 and Neo4j 5.26.32. Visibility was checked both ways through the real CLI and MCP doors, and six mutations were each caught. None of it touched an installed system.
+- **Monitor:** it must update for API 6 before it reads this gateway as compatible.
+
+### Dependency sweep, 2026-11-05
+
+No pin moved. OSV over the 100 pinned (package, version) pairs: 0 with advisories. pip-audit over `requirements.lock`, `requirements-gateway.lock` and `requirements-mcp.lock`: no known vulnerabilities. Images: `neo4j:5.26.32-community` is past every published 5.26 fix; `pgvector/pgvector:0.8.7-pg17` ships PostgreSQL 17.11, past the 2026-05 security release.
+
 ## [1.0.46] - 2026-11-03
 
 NREM now folds only what REM has processed. Until now a fold could take a record REM had not reached yet; that never happened in practice only because REM was always ahead. It is now a rule, and a fold that has to wait says why.

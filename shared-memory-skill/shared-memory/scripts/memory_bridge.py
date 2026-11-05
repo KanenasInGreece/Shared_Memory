@@ -37,7 +37,7 @@ from typing import Any
 
 import httpx
 
-VERSION = "1.0.46"
+VERSION = "1.1.0"
 # API_VERSION is the wire contract; bump only when shape, auth, routes, or a monitor
 # contract change breaks older clients. v6: entries carry text, text_is, full_record.
 API_VERSION = 6
