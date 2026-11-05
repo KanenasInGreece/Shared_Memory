@@ -1,6 +1,6 @@
 ---
 name: shared-memory
-description: Use before every memory search and before answering from memory — prior work, a past decision, whether something was tried or rejected, "what did we decide", a fact:N or decision:N, lineage, or status. Search this store first; do not answer those from the chat or from local notes. Also use it to save a fact, a decision, or a retrospective after the operator confirms.
+description: Use before every memory search and before answering about history, prior work, a past decision ("what did we decide"), whether something was tested, tried, rejected, or done, a fact:N or decision:N, lineage, status, or saving a fact, decision, or retrospective. Search this store first; never answer those from chat or local notes. Do not use for reading or editing the current files, running code or tests, web research, or questions about what the code does NOW.
 ---
 
 # Shared Memory
@@ -31,7 +31,7 @@ The gateway is `:8888`. Never call the embedder `:8070` or the reranker `:8071`.
 | Named structural lookup | `query why-to-check\|who-decided\|agent-decisions\|retrospectives` plus that template's flags |
 | Raw read-only Cypher | `graph "<cypher>"` |
 
-Named templates: `why-to-check` (`--title` required, optional `--project`), `who-decided` (`--title`, `--project`), `agent-decisions` (`--assisted-by`, `--project`), `retrospectives` (`--rating`). They call `POST /memory/graph`. They do not hit search or telemetry. `graph` and named CLI `query` templates require `full` or `admin`. `search`, `lineage`/`status`, and `telemetry` remain for `read`. `/health` is anonymous, not a read-role grant. When auth is configured, a bare curl is only `status`, `version`, and `api_version`. A full payload that includes `"auth_required": false` means auth is off.
+`graph` and named CLI `query` templates require `full` or `admin` (`POST /memory/graph`): `why-to-check` (`--title` required, `--project`), `who-decided` (`--title`, `--project`), `agent-decisions` (`--assisted-by`, `--project`), `retrospectives` (`--rating`). Role `read` keeps `search`, `lineage`/`status`, and `telemetry`. With auth configured, anonymous `/health` returns only `status`, `version` and `api_version`; it is not a read-role grant. A full payload that includes `"auth_required": false` means auth is off.
 
 Reading is two steps: step one ranks and expands, step two is `search --ref
 <ref>`. `read_with` names that call. Every record entry on search
@@ -57,6 +57,14 @@ summary's `sources` are references and carry no text.
 
 `save` has no `--project` flag. The client derives the project, or you set `"project"` in the metadata JSON. An explicit value wins.
 
+## What to expect back and when to stop
+
+1. **Stop after step one when `content` or `text` already answers.** Read each hit's `content` and the `text` of each `graph_context` entry first. If they already answer, stop and answer from them (after lifecycle checks: `stale_sources` and `retired_summaries` → `lineage` before relying; `retired_grounds` → read the successor) — do not call `search --ref` (`read_with`) to confirm (fact:3527: a cold model expanded records whose answer it already held). Expand an entry with `read_with` only when the question needs more than its `text`: a `pointer` entry has no text, so it must be expanded before its relevance can be judged, and a decision's `text` is only its rationale; `read_with` gives its choice and alternatives.
+2. **A `summary` entry is a shorter version of its record, and whether the question needs the whole record is the reader's call.** Before answering that something is not recorded, weigh whether an on-topic summary may hold it (fact:3527: a baseline run concluded "not recorded" without expanding the summary that held the answer).
+3. **Near-zero ranked scores on an unfiltered search mean nothing relevant came back.** When an unfiltered search was ranked (no `EMBEDDING UNAVAILABLE` note, no `fallback: keyword`, no `ranked: false`) and every hit scores near zero on `score_normalized` (if you used a filter, drop it once first; an empty result is not a near-zero result), say "not found" with the scope you searched and stop. An unranked or empty reply in the fallback state is not "nothing known".
+4. **In-domain, the score cannot tell you the answer is missing**, because the score ranks topic, not answerability (fact:3133: an in-domain question with no answer scored above two genuine answers). Judge from the content you read: rephrase once, and drop any filter once (`--domain` misses retrospectives, decisions without sections, and a thematic summary whose section is stored in the singular `metadata.domain`). If a retry finds it, answer from it; answer "not found in the store" (naming the searches you ran) only if the rephrased and unfiltered searches, and any expansions they need, still lack the answer.
+5. **A hit whose `tier` is `insight_summary` or `community_summary` is a thematic narrative over several records.** It answers "what is the pattern, the principle, the history of this theme"; for a summary hit, answer from its `content`. For a specific fact, number, or decision not in its `content`, open the refs in its `graph_context` or run `lineage` with the hit's own `ref` (`summary:N` or `insight:N`) and read its `sources`; never pass a bare `source_pg_ids` number to `lineage`, which reads it as a fact.
+
 ## Always / Ask / Never
 
 **Always.** Search before reasoning about history, prior decisions, or whether something was tested, tried, rejected, or done. Pass `--project`, `--domain`, and `--since` as flags, never as words inside the query string. Quote `fact:N`, `decision:N`, `summary:N` for `lineage` and for index pointers. That form is not a `--grounded-in` id. A bare number to `lineage` means the facts table. On `stale_sources` or `retired_summaries`, run `lineage` before relying, then repair the stale index pointer: rewrite the line that cited the old id to the current id. Checking without rewriting leaves the next session on the stale id.
@@ -73,111 +81,43 @@ summary's `sources` are references and carry no text.
 | decision | asserts its own | asserts its own; omit stores none | none | rarely | `--grounded-in` optional; ungrounded is flagged, not refused |
 | retrospective | do not send | do not send | none | the instrument that measured the outcome | required |
 
-A fact owns project, domain, and entities. A decision owns project and domain, not entities. A retrospective owns rating, notes, `source_ref`, and grounding.
-
 `source_ref` is a path or the sentinel `discussion_context`. It is not the tokens `tested` or `measured`. Those, with `researched`, `discussion`, and `observation`, are derived `fact_kind` values.
 
 ## Patterns
-
-Search, then create, then edit. Copy the command. The line under it is what that command does.
 
 **A — Search.**
 
 ```
 search "reranker cache-ram" 5 --project shared-memory-GitHub --domain delivery --since 2026-09-01
-```
-
-→ hits carry `ref` `fact:2678`. Then:
-
-```
 lineage fact:2678
-```
-
-```
 query why-to-check --title "AGENTS.md recut"
-```
-
-```
 search --ref fact:2672
 ```
 
-→ that record whole, unranked: step two, for a `ref` taken from a neighbour, a node or `lineage`. `"obsolete": "superseded"` with `"superseded_by": "fact:2678"` means read that one.
+`--domain` matches stored `metadata.domains` only (not read-side `belonging` or summary `metadata.domain`; unknown names match nothing). Do not `lineage` a keyword-fallback row (`EMBEDDING UNAVAILABLE`, `ranked: false`, `score` 0.0, `score_normalized` 0.5, no Tier-3). In `stale_sources`, `old` may be a fact, decision, or retrospective (`lineage decision:2522`; a 404 names the real ref).
 
-Filters are flags. `search "reranker --project shared-memory-GitHub --domain delivery"` searches those words. It does not set the flags.
-
-`--domain` matches stored `metadata.domains` only. A miss, and the call returns `[]` with no insight: read-side `belonging`, a retrospective, a decision that omitted a section, a thematic summary's `metadata.domain` string. `--domain delivery` with no `--project` is that literal in every project. A 17th `--domain` is `filters_invalid`. An unknown name matches nothing.
-
-Keyword fallback, do not `lineage` it. Stderr is `EMBEDDING UNAVAILABLE`. `ranked: false` drops Tier-3.
-
-```json
-{"score_normalized": 0.5, "ranked": false}
-```
-
-`stale_sources`: `old` may be a fact, a decision, or a retrospective. A 404 names the real ref.
-
-```
-lineage decision:2522
-```
-
-Then rewrite the index line from `decision:2522` to the successor id.
-
-**B — Create.** Run from the project directory. The walk stops at `.git`, `CLAUDE.md`, `AGENTS.md`, or `GEMINI.md`, not `$HOME`. `SHARED_MEMORY_PROJECT=shared-memory-GitHub` overrides it.
+**B — Create.** Run in the project folder (not `$HOME`; `SHARED_MEMORY_PROJECT` overrides). Omit `--domain` for no section (none inherited; metadata `"domain"` becomes `domains`). Empty project is `project_required`; an unknown name is `project_unknown` (never retry unchanged; see `USAGE.md`).
 
 ```
 save "v0.9.109 shipped" '{"source":"grok","source_ref":"OPERATE.md"}' --domain delivery
-```
-
-Omit `--domain` and the record stores no section. It does not inherit one. A `"domain"` key inside the metadata JSON is still accepted and stored as `domains`.
-
-Operator confirmed a new project:
-
-```
 save "first note" '{"source":"grok","project":"new-name","new_project":true}'
-```
-
-Empty project is `project_required`. The same unknown name again is `project_unknown` and does not succeed. Second submission is in `USAGE.md`.
-
-Operator named the concept:
-
-```
 save "lock order" '{"source":"grok","entities":["LockOrder"],"new_entities":["LockOrder"],"entities_provenance":{"LockOrder":"operator"}}'
-```
-
-Decision, after the operator confirms. Ids are bare. `fact:601` in this slot is dropped with no error; if every id is dropped the decision is stored ungrounded and only flagged.
-
-```
 save_decision --title "Ship the skill index" --decided-by "Xenofon" --rationale "In the context of a 70KB refusal, we chose a 15KB index over keeping the essay, accepting a second file." --grounded-in "2672:based_on" --alternatives "keep the 70KB file" --confidence high
-```
-
-`--new-domain` only after the operator confirms. No entities on this command.
-
-Retrospective. No project, no domain, no entities.
-
-```
 save_retrospective --pg-id 2675 --rating validated --notes "The index loads." --grounded-in "2678" --source-ref OPERATE.md
 ```
+
+On `save_decision`, `--grounded-in` ids are bare (`fact:601` drops silently); `--new-domain` requires confirmation; no entities.
 
 **C — Edit.**
 
 ```
 save "the split shipped in v0.9.109" '{"source":"grok","source_ref":"OPERATE.md"}' --supersedes 2672
-```
-
-When that save is refused with `decision_loses_last_ground`, do not retry the one-step flag. Save the new fact first (no `--supersedes`), then a retrospective grounded on that fact as based_on (`--grounded-in "NEW_ID:based_on"`), then supersede. The one-step flag is only for a fact the decision does not rest on alone. A bare ground defaults to `informed_by` for a discussion fact, so the check would refuse the supersession again.
-
-```
 supersede --pg-id 2672 --acknowledge-standing 2522 "still stands without the new fact"
-```
-
-```
 save_retrospective --pg-id 2522 --rating reversed --notes "The split shipped." --grounded-in "2678" --source-ref OPERATE.md
-```
-
-```
 review-hold --summary-id 411 --pg-id 2672
 ```
 
-`save_decision --supersedes 2522` is not an overturn. Re-saving the same content onto other axes is `axis_conflict`. A renamed section is not resolved on that re-save. `--rating reversed` drops the decision from Tier-1 search and keeps the verdict. A later retrospective on the same `--pg-id` is the live verdict. After `lineage`, the index line uses the successor id.
+On `decision_loses_last_ground`, do not retry `--supersedes`. `save_decision --supersedes 2522` is not an overturn. Re-save does not resolve a renamed section. A newer retrospective on `--pg-id` is the live verdict.
 
 ## Capture index
 
@@ -185,16 +125,16 @@ Meaning-bearing flags. Type the flag form.
 
 | Flag | Use |
 |---|---|
-| `--acknowledge-standing` | Repeat per decision: `--acknowledge-standing ID "operator's words"`. A map of decision id to the operator's non-empty words. A bare id, an empty string, or a placeholder is refused. There is no `id:answer` syntax. |
-| `--alternatives` | One considered option per flag on `save_decision`. Not comma-split. |
+| `--acknowledge-standing` | Repeat per decision: `--acknowledge-standing ID "operator's words"` (map of decision id to non-empty words; bare id, empty string, placeholder, or `id:answer` is refused). |
+| `--alternatives` | One option per flag on `save_decision` (not comma-split). |
 | `--confidence` | `high`, `medium`, or `low` on a decision. |
-| `--domain` | Section of the project. Repeat the flag. On `search`, a filter. |
-| `--grounded-in` | `id[:role],…`. Required on a retrospective. Optional on a decision. |
-| `--rating` | Retrospective outcome state. Also the filter on `query retrospectives`. |
-| `--ref` | On `search`: read these records by ref instead of ranking a query. Repeat the flag. No query with it. |
-| `--since` | Search filter. ISO date or datetime. Not query text. |
-| `--source-ref` | Path or `discussion_context`. On a retrospective, the measuring instrument. |
-| `--supersedes` | Fact only. Soft-retires that pg_id (kept, hidden from search). |
+| `--domain` | Project section (repeat flag); filter on `search`. |
+| `--grounded-in` | `id[:role],…` (required on retrospective, optional on decision). |
+| `--rating` | Retrospective outcome state; filter on `query retrospectives`. |
+| `--ref` | On `search`: read records by ref (repeat flag; no query with it). |
+| `--since` | Search filter (ISO date/datetime, not query text). |
+| `--source-ref` | Path or `discussion_context` (measuring instrument on retrospective). |
+| `--supersedes` | Fact only; soft-retires that pg_id (kept, hidden from search). |
 
 Ratings: `validated` (held), `mixed` (partly), `refined` (evolved), `pending` (not yet judged), `reversed` (withdrawn; supersedes the decision). Nuance goes in `--notes`.
 
@@ -202,48 +142,48 @@ Refusals. Branch on `error`. One recovery; the second-submission essays are in `
 
 | Code | Recovery |
 |---|---|
-| `axis_conflict` | Axes are fixed at first write. Supersede. Do not re-save the same content onto other axes. |
-| `cypher_rejected` | Neo4j rejected the Cypher. Fix the query. Retrying it unchanged will not succeed. |
-| `decision_loses_last_ground` | Ask per decision. The 409 lists them under `decisions_needing_answer`, because `acknowledge_standing` is the map you send and a list is refused. Still stands: re-send `--acknowledge-standing ID "operator's words"` for each decision. Supported or reversal: save the new fact, then a retrospective grounded on it as based_on (`--grounded-in "NEW_ID:based_on"`), then supersede. ⛔ Refuse a supersession that removes a decision's last based-on fact until the operator answers (decision:2802); the operator's words are carried per decision (fact:2809). |
-| `decision_not_visible` | The acknowledgement names a decision this caller cannot read. The viewer is the authenticated agent. Do not send that id. |
-| `domain_confusable` | Ask. If it is a different section, re-send `confirm_distinct_from` naming the near match. Otherwise use the existing name. |
-| `domain_not_allowed_on_judgement` | Do not send a domain. A retrospective does not store sections, and the decision's axes do not move onto it. |
+| `axis_conflict` | Axes are fixed at first write; supersede, do not re-save onto other axes. |
+| `cypher_rejected` | Neo4j rejected the Cypher; fix the query, do not retry unchanged. |
+| `decision_loses_last_ground` | Ask per decision in `decisions_needing_answer` (`acknowledge_standing` is a map; a list is refused). Still stands: `--acknowledge-standing ID "operator's words"`. Save the new fact first on support or reversal, then a retrospective with `--grounded-in "NEW_ID:based_on"`, then supersede. ⛔ Refuse a supersession that removes a decision's last based-on fact until the operator answers (decision:2802); the operator's words are carried per decision (fact:2809). |
+| `decision_not_visible` | Caller cannot read that decision; do not send its id. |
+| `domain_confusable` | Ask: re-send `confirm_distinct_from` naming the near match, or use the existing name. |
+| `domain_not_allowed_on_judgement` | Do not send a domain on a retrospective; it stores no sections and inherits none. |
 | `domain_shape_invalid` | A section is a string or a list of strings. Fix the value. |
-| `domain_spelling_variant` | It is that registered section. Save under that spelling. It cannot be confirmed as new. |
-| `domain_unknown` | Ask. Pick a proposal, or re-send `new_domain: true` after the operator confirms. Omitting the domain is valid. |
+| `domain_spelling_variant` | Save under that registered spelling; it cannot be confirmed as new. |
+| `domain_unknown` | Ask: pick a proposal, re-send `new_domain: true` after confirmation, or omit the domain. |
 | `domain_unnameable` | Name the section with at least one letter or digit. |
-| `domain_without_project` | `general_discussion` has no sections. File under a real project, or drop the domain. |
-| `entities_list_too_long` | Split the save. The cap is `ENTITY_LIST_MAX_LEN` (default 50) on `entities` and on `new_entities`. |
-| `entities_not_allowed_on_judgement` | A decision or retrospective carries no entities. Mint the concept on a fact and cite it. An empty list is the same as omitting it. |
-| `entities_provenance_invalid` | Object only. Each key must be in `entities`. Each value must be `operator` or `agent`. |
-| `entity_confusable` | Ask. Confirm with `confirm_distinct_from` naming the near match, or save the existing name. |
-| `entity_name_too_long` | A concept noun, not a sentence. The cap is `ENTITY_NAME_MAX_LEN` (default 200). |
-| `entity_reserved` | Schema or axis vocabulary is not an entity. Also a registered project name, including this record's own project. Name the concept, or drop it. |
-| `entity_unknown` | Ask. Re-send `new_entities` listing exactly those names, each also in `entities`, or use the registered canonical. |
-| `fact_already_superseded` | The fact is already superseded. Re-read lineage. Nothing was written. |
-| `fact_cannot_carry_decision` | A fact cannot carry a `decision` object. Drop it, or set `metadata.type` to `decision` and include `decided_by`, `project`, and `rationale`. |
-| `filters_invalid` | The search `--domain` list is over the 16-entry cap. Narrow it. |
-| `graph_row_cap_exceeded` | Read-only Cypher returned more than `GRAPH_QUERY_ROW_CAP` rows (default 10000). Narrow the query. |
-| `new_entities_invalid` | A list of strings. Each name must also be in `entities`. A name that normalizes to nothing cannot be minted. |
-| `project_confusable` | Ask. If it is a different project, re-send `confirm_distinct_from` naming the neighbour. Otherwise use the existing name. |
-| `project_spelling_variant` | It is that registered project. Save under that name. A rename is not a save. |
+| `domain_without_project` | `general_discussion` has no sections; use a real project or drop the domain. |
+| `entities_list_too_long` | Split the save; `ENTITY_LIST_MAX_LEN` (default 50) caps `entities` and `new_entities`. |
+| `entities_not_allowed_on_judgement` | Decisions and retrospectives carry no entities (empty list = omit); mint on a fact and cite it. |
+| `entities_provenance_invalid` | Object only: keys must be in `entities`, values must be `operator` or `agent`. |
+| `entity_confusable` | Ask: pass `confirm_distinct_from` naming the near match, or use the existing name. |
+| `entity_name_too_long` | Use a concept noun, not a sentence (cap `ENTITY_NAME_MAX_LEN`, default 200). |
+| `entity_reserved` | Schema/axis vocabulary and registered project names (including this record's own project) cannot be entities; name the concept or drop it. |
+| `entity_unknown` | Ask: re-send `new_entities` (each also in `entities`) after confirmation, or use the canonical name. |
+| `fact_already_superseded` | Already superseded; nothing was written. Re-read lineage. |
+| `fact_cannot_carry_decision` | A fact cannot carry a `decision` object; drop it, or set `metadata.type` to `decision` with `decided_by`, `project`, and `rationale`. |
+| `filters_invalid` | Search `--domain` list exceeds the 16-entry cap; narrow it. |
+| `graph_row_cap_exceeded` | Cypher exceeded `GRAPH_QUERY_ROW_CAP` rows (default 10000); narrow the query. |
+| `new_entities_invalid` | List of non-empty strings, each also in `entities`; a name normalizing to empty cannot be minted. |
+| `project_confusable` | Ask: re-send `confirm_distinct_from` naming the neighbour, or use the existing name. |
+| `project_spelling_variant` | Save under that registered project name; a rename is not a save. |
 | `project_unnameable` | Name the project with at least one letter or digit. |
-| `registry_unavailable` | The registry could not be read (503). Nothing was written. Retry. |
-| `refs_invalid` | `--ref` takes at most 16 refs by default (`type:id`). Fix the list. |
-| `unavailable` | A telemetry probe (`encoders` or `gateway`) failed. Read the sibling block. The rest of the snapshot may still be valid. |
-| `unknown_type` | On `save`, omit `type` or send `fact`. A decision uses its own command. Do not invent a type. |
-| `use_retrospective_endpoint` | A retrospective is not a save. Use `save_retrospective` (`POST /memory/retrospective`) against the target decision. Nothing was written. |
+| `registry_unavailable` | Registry unreadable (503); nothing was written. Retry. |
+| `refs_invalid` | `--ref` takes at most 16 `type:id` refs by default; fix the list. |
+| `unavailable` | Telemetry probe (`encoders` or `gateway`) failed; read the sibling block (the rest may be valid). |
+| `unknown_type` | On `save`, omit `type` or send `fact` (decisions use `save_decision`); do not invent a type. |
+| `use_retrospective_endpoint` | Do not use `save` for a retrospective; nothing was written. Use `save_retrospective` (`POST /memory/retrospective`). |
 
-Graph expansion on a judgement hit returns `belonging`: `{project, domains}`. The key is derived on read, never written. A fact has no such key; its belonging is the axes it stored. The domain set is the same-project union of sections asserted on the decision and sections reached through grounding. Another project's facts do not contribute sections.
+Graph expansion on a judgement hit derives `belonging`: `{project, domains}` on read (never written; facts have no `belonging` key). `domains` is the same-project union of sections on the decision and sections reached through grounding; another project's facts contribute none.
 
 Worked contract. Anonymous `/health`, then `--version`:
 
 ```json
-{"status":"ok","version":"1.1.0","api_version":6}
+{"status":"ok","version":"1.1.1","api_version":6}
 ```
 
 ```json
-{"version": "1.1.0", "api_version": 6, "tool": "shared-memory-framework"}
+{"version": "1.1.1", "api_version": 6, "tool": "shared-memory-framework"}
 ```
 
 `doctor` compares this client's `api_version` with the gateway and names which side to upgrade.

@@ -7,6 +7,21 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.1.1] - 2026-11-05
+
+The skill now tells an agent what a search returns and when it has what it needs. This is a documentation change to SKILL.md, USAGE.md and the MCP search tool's description. The code and the API are unchanged (`API_VERSION` stays 6).
+
+- **When to stop.** Read each hit's `content` and each neighbour's `text` first, and stop when they already answer. A `pointer` entry has no text, so it must be expanded before its relevance can be judged. Whether to expand a summary is the reader's call. Lifecycle marks (`stale_sources`, `retired_summaries`, `retired_grounds`) are still checked before relying on anything.
+- **When the answer is not there.** Near-zero `score_normalized` on a ranked, unfiltered search means nothing relevant came back. For a question inside the store's subject the score ranks topic, not answerability, so it cannot prove absence: the agent rephrases once, drops any filter once, and only then answers "not found", naming the searches it ran. No score threshold is given, because none has been measured to hold across stores.
+- **Thematic hits.** An `insight_summary` or `community_summary` hit answers questions about a pattern or principle. For a specific fact, the agent opens the refs in its `graph_context`, or runs `lineage` with the hit's own ref (`summary:N` or `insight:N`).
+- **Both doors alike.** The MCP tool `hybrid_search_and_rerank` carries the same rules in MCP terms.
+- **Hooks and length.** The skill description names when to use the skill and when not to. SKILL.md is shorter than before (18,057 → 17,953 characters), and detail moved to USAGE.md. USAGE.md now says that keyword-fallback rows carry `score` 0.0 and `score_normalized` 0.5.
+- **How it was made.** agy Gemini 4 Argon refined the text over seven iterations of one fixed prompt. Each iteration was scored by cold Claude Haiku agents answering six fixed questions through a read-only client on the testbed. Codex Sol 6.1 and an Opus 5.5 agent reviewed the brief and two rounds of the diff. The retrieval ceiling was measured first, so the text was not tuned to questions retrieval cannot serve.
+
+### Dependency sweep, 2026-11-05
+
+No pin moved. OSV over the 100 pinned (package, version) pairs: 0 with advisories.
+
 ## [1.1.0] - 2026-11-05
 
 Every read surface now tells the model what it is reading. A search result's graph neighbours, a lineage reply and the nodes of a graph query used to show a 120-character snippet cut from whatever the graph node held, so a model could not tell whether it had the whole record. From 1.1.0 every record entry is looked up in Postgres on each call and carries its whole text and says what that text is.
