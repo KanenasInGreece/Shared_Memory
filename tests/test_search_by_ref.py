@@ -50,6 +50,19 @@ def _request(body, agent=None):
     return req
 
 
+class _Rows:
+    def __init__(self, rows=None):
+        self._rows = list(rows or [])
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        if not self._rows:
+            raise StopAsyncIteration
+        return self._rows.pop(0)
+
+
 def _coord():
     c = MemoryCoordinator()
     conn = AsyncMock()
@@ -59,12 +72,38 @@ def _coord():
     pool.acquire = MagicMock(return_value=_AsyncCtx(conn))
     c._pool = pool
     session = MagicMock()
-    session.run = AsyncMock()
+    session.run = AsyncMock(return_value=_Rows())
     neo = MagicMock()
     neo.session = MagicMock(return_value=_AsyncCtx(session))
     c._neo4j = neo
     c._embed = AsyncMock(return_value=[0.1, 0.2])
     return c, conn
+
+
+def _arm_marks(c, outcomes):
+    """Neo4j returns these outcomes from the marks query and nothing from expansion."""
+
+    async def run(cypher, **kwargs):
+        text = " ".join(cypher.split())
+        if "AS decision_id" in text:
+            return _Rows([
+                {"decision_id": did, "outcomes": outs, "grounds": []}
+                for did, outs in outcomes.items()
+            ])
+        return _Rows([])
+
+    c._neo4j.session.return_value._val.run = AsyncMock(side_effect=run)
+
+
+def _hydrate_row(row):
+    """A stub with no visibility column stays readable, matching a global row."""
+    loaded = dict(row)
+    loaded.setdefault("visibility", "global")
+    loaded.setdefault("scope", "global")
+    loaded.setdefault("content", loaded.get("content") or "")
+    loaded.setdefault("metadata", {})
+    loaded.setdefault("superseded", False)
+    return loaded
 
 
 def _doc(pg_id, content, **extra):
@@ -115,13 +154,23 @@ def _route(docs, summaries, *, retro_rows=None, stale_rows=None, retired_rows=No
 
     async def fetch(sql, *args):
         text = " ".join(sql.split())
-        if "metadata->>'type' AS type" in text:
-            return list(succ_rows or [])
-        if text.startswith("SELECT id, metadata FROM community_summaries"):
+        # Hydrate's self-join carries the successor. The old type-only SELECT is gone.
+        if "successor_id" in text or "AS content_chars" in text:
+            if "community_summaries" in text:
+                pool = [_hydrate_row(row) for row in summaries.values()]
+                pool.extend(_hydrate_row(row) for row in list(ref_rows or []))
+                pool.extend(_hydrate_row(row) for row in list(retired_rows or []))
+            else:
+                pool = [_hydrate_row(row) for row in docs.values()]
+                pool.extend(_hydrate_row(row) for row in list(retro_rows or []))
+                pool.extend(_hydrate_row(row) for row in list(stale_rows or []))
+            return _asked(pool, args)
+        if (text.startswith("SELECT id, metadata")
+                and "community_summaries" in text and "superseded" not in text):
             return _asked(ref_rows, args)
         if "superseded_reason" in text and "community_summaries" in text:
             return _asked(retired_rows, args)
-        if "superseded_by" in text and "AND superseded" in text and "technical_docs" in text:
+        if "superseded_by" in text and "t.superseded" in text and "technical_docs" in text:
             return list(stale_rows or [])
         if text.startswith("SELECT id, content FROM technical_docs"):
             return list(retro_rows or [])
@@ -289,17 +338,20 @@ async def test_r5_missing_and_wrong_type_on_a_readable_record():
 async def test_r6_obsolete_records_are_returned_and_named():
     """R6: A superseded fact is hidden or its pointer is not the qualified ref; a retraction carries superseded_by; a live record carries obsolete."""
     docs = {
-        7: _doc(7, FACT_TEXT, superseded=True, superseded_by=9),
+        7: _doc(7, FACT_TEXT, superseded=True, superseded_by=9,
+              successor_id=9, successor_metadata={"type": "fact"},
+              successor_visibility="global"),
         3: _doc(3, "retracted demo fact with no successor", superseded=True, superseded_by=None),
         4: _doc(4, "live demo fact"),
     }
     summaries = {
-        8: _summary(8, SUMMARY_TEXT, superseded=True, superseded_by=12),
+        8: _summary(8, SUMMARY_TEXT, superseded=True, superseded_by=12,
+                   successor_id=12, successor_metadata={"kind": "thematic"},
+                   successor_visibility="global"),
     }
     resp, _, _ = await _by_ref(
         {"refs": ["fact:7", "summary:8", "fact:3", "fact:4"]},
         docs=docs, summaries=summaries,
-        succ_rows=[{"id": 9, "type": "fact"}],
     )
     results = {r["ref"]: r for r in json.loads(resp.text)["results"]}
     assert results["fact:7"]["content"] == FACT_TEXT
@@ -388,17 +440,24 @@ async def test_r10_graph_context_is_filled_and_a_closed_graph_does_not_fail_the_
     summaries = {8: _summary(8, SUMMARY_TEXT)}
     calls = []
 
-    async def _expand(session, pg_ids, labels, viewer=None, viewer_scope=None):
+    async def _expand(session, pg_ids, labels, viewer=None, viewer_scope=None, **_kwargs):
         calls.append((labels, list(pg_ids)))
-        return {pid: [{"name": "SENTINEL-NEIGHBOUR"}] for pid in pg_ids}
+        return {pid: [{
+            "rel_type": "MENTIONS",
+            "rel_props": {},
+            "start_pg_id": pid,
+            "start_labels": ["Fact"],
+            "end_labels": ["Entity"],
+            "end_name": "SENTINEL-NEIGHBOUR",
+        }] for pid in pg_ids}
 
     c, conn = _coord()
     c._expand_graph_context_batch = _expand
     conn.fetch = AsyncMock(side_effect=_route(docs, summaries))
     resp = await c.handle_search(_request({"refs": ["fact:7", "summary:8"]}))
     results = json.loads(resp.text)["results"]
-    assert results[0]["graph_context"] == [{"name": "SENTINEL-NEIGHBOUR"}]
-    assert results[1]["graph_context"] == [{"name": "SENTINEL-NEIGHBOUR"}]
+    assert results[0]["graph_context"][0]["relation"]["to"]["name"] == "SENTINEL-NEIGHBOUR"
+    assert results[1]["graph_context"][0]["relation"]["to"]["name"] == "SENTINEL-NEIGHBOUR"
     assert len(calls) == 2
     assert calls[0][0] != calls[1][0]
     assert (ONT.community_summary,) in (calls[0][0], calls[1][0])
@@ -465,14 +524,12 @@ async def test_r13_a_found_decision_carries_lifecycle_and_reversed_wins():
     """R13: A found decision lacks lifecycle, or a reversed verdict lacks obsolete reversed."""
     docs = {7: _doc(7, DECISION_TEXT, metadata=DECISION_META, superseded=True, superseded_by=9)}
     c, conn = _coord()
-    c._resolve_decision_lifecycle = AsyncMock(return_value={
-        7: {"rating": "reversed", "retrospective_pg_id": 11},
-    })
+    _arm_marks(c, {7: [{"pg_id": 11, "rating": "reversed"}]})
     conn.fetch = AsyncMock(side_effect=_route(
         docs, {},
         retro_rows=[{"id": 11, "content": "the reversing note",
+                     "metadata": {"type": "retrospective"},
                      "visibility": "global", "agent_id": None, "scope": None}],
-        succ_rows=[{"id": 9, "type": "fact"}],
     ))
     resp = await c.handle_search(_request({"refs": ["decision:7"]}, agent="alice"))
     hit = json.loads(resp.text)["results"][0]
@@ -500,7 +557,9 @@ async def test_r14_found_summaries_carry_stale_sources_and_retired_summaries():
     resp, _, _ = await _by_ref(
         {"refs": ["summary:8", "insight:9"]},
         summaries=summaries,
-        stale_rows=[{"id": 501, "superseded_by": 900}],
+        stale_rows=[{"id": 501, "superseded_by": 900,
+                     "successor_visibility": "global",
+                     "successor_agent_id": "", "successor_scope": "global"}],
         retired_rows=[{
             "id": 12, "superseded": True, "superseded_reason": "coverage",
             "superseded_by": None, "source_pg_ids": [],
@@ -536,13 +595,10 @@ async def test_r16_normal_search_still_attaches_lifecycle_and_stale_sources():
 
     The pre-existing pins, left unedited, are
     tests/test_coordinator.py::test_search_retired_summaries_never_reads_from_a_colliding_technical_docs_id
-    and the source checks in tests/test_lifecycle_retrieval.py
-    (test_lifecycle_attaches_and_does_not_add_rows).
+    and test_read_entry_render.py::test_lifecycle_whole_text.
     """
     c, conn = _coord()
-    c._resolve_decision_lifecycle = AsyncMock(return_value={
-        7: {"rating": "validated", "retrospective_pg_id": 11},
-    })
+    _arm_marks(c, {7: [{"pg_id": 11, "rating": "validated"}]})
     conn.fetchrow = AsyncMock(side_effect=[
         None,
         {"id": 8, "content": SUMMARY_TEXT,
@@ -550,15 +606,36 @@ async def test_r16_normal_search_still_attaches_lifecycle_and_stale_sources():
          "source_pg_ids": [501]},
     ])
 
+    decision = {
+        "id": 7, "content": DECISION_TEXT,
+        "metadata": {"type": "decision", "project": "demo-project",
+                     "decision": {"rationale": "Ship the sorted lock order."}},
+        "created_at": CREATED, "visibility": "global", "agent_id": None,
+        "scope": "global", "superseded": False,
+    }
+    retro = {
+        "id": 11, "content": "validated as written",
+        "metadata": {"type": "retrospective"},
+        "visibility": "global", "agent_id": None, "scope": "global",
+        "superseded": False,
+    }
+    source = {
+        "id": 501, "content": "old source", "metadata": {"type": "fact"},
+        "visibility": "global", "agent_id": None, "scope": "global",
+        "superseded": True, "superseded_by": 900,
+    }
+
     async def fetch(sql, *args):
-        if "ORDER BY embedding" in sql:
-            return [{
-                "id": 7, "content": DECISION_TEXT,
-                "metadata": {"type": "decision", "project": "demo-project"},
-                "created_at": CREATED,
-            }]
-        if "superseded_by" in sql and "AND superseded" in sql:
-            return [{"id": 501, "superseded_by": 900}]
+        text = " ".join(sql.split())
+        if "successor_id" in text or "AS content_chars" in text:
+            wanted = set(args[0]) if args else set()
+            return [row for row in (decision, retro, source) if row["id"] in wanted]
+        if "ORDER BY embedding" in text:
+            return [decision]
+        if "superseded_by" in text and "t.superseded" in text:
+            return [{"id": 501, "superseded_by": 900,
+                     "successor_visibility": "global",
+                     "successor_agent_id": "", "successor_scope": "global"}]
         return []
 
     conn.fetch = AsyncMock(side_effect=fetch)
@@ -591,46 +668,48 @@ async def test_r16_normal_search_still_attaches_lifecycle_and_stale_sources():
 
 @pytest.mark.asyncio
 async def test_r17_by_ref_hides_a_private_retrospective_and_normal_search_does_not():
-    """R17: A found decision's retrospective text is returned to a non-owner on the by-ref path, or withheld from the owner, or a normal search of the same fixture hides it."""
+    """F15: A non-owner's lifecycle names or quotes a private retrospective, on by-ref or on ranked search. The owner still receives its text."""
     docs = {7: _doc(7, DECISION_TEXT, metadata=DECISION_META)}
     retro = {
         "id": 11, "content": RETRO_SECRET, "visibility": "private",
         "agent_id": "alice", "scope": "global",
+        "metadata": {"type": "retrospective"},
     }
 
     async def _by(agent, rows):
         c, conn = _coord()
-        c._resolve_decision_lifecycle = AsyncMock(return_value={
-            7: {"rating": "refined", "retrospective_pg_id": 11},
-        })
+        _arm_marks(c, {7: [{"pg_id": 11, "rating": "refined"}]})
         conn.fetch = AsyncMock(side_effect=_route(docs, {}, retro_rows=rows))
         resp = await c.handle_search(_request({"refs": ["decision:7"]}, agent=agent))
         return json.loads(resp.text)["results"][0], resp.text
 
     bob, bob_raw = await _by("bob", [retro])
-    assert bob["lifecycle"]["rating"] == "refined"
-    assert bob["lifecycle"]["ref"] == "retrospective:11"
-    assert "retrospective_content" not in bob["lifecycle"]
+    assert "lifecycle" not in bob
+    assert "retrospective:11" not in bob_raw
     assert RETRO_SECRET not in bob_raw
 
     alice, _ = await _by("alice", [retro])
-    assert alice["lifecycle"]["retrospective_content"] == RETRO_SECRET
+    assert alice["lifecycle"]["rating"] == "refined"
+    assert alice["lifecycle"]["ref"] == "retrospective:11"
+    assert alice["lifecycle"]["text"] == RETRO_SECRET
 
     c, conn = _coord()
-    c._resolve_decision_lifecycle = AsyncMock(return_value={
-        7: {"rating": "refined", "retrospective_pg_id": 11},
-    })
+    _arm_marks(c, {7: [{"pg_id": 11, "rating": "refined"}]})
     conn.fetchrow = AsyncMock(return_value=None)
+    decision = {
+        "id": 7, "content": DECISION_TEXT,
+        "metadata": json.loads(DECISION_META),
+        "created_at": CREATED, "visibility": "global", "agent_id": None,
+        "scope": "global", "superseded": False,
+    }
 
     async def fetch(sql, *args):
-        if "ORDER BY embedding" in sql:
-            return [{
-                "id": 7, "content": DECISION_TEXT,
-                "metadata": json.loads(DECISION_META),
-                "created_at": CREATED,
-            }]
-        if sql.strip().startswith("SELECT id, content FROM technical_docs"):
-            return [{"id": 11, "content": RETRO_SECRET}]
+        text = " ".join(sql.split())
+        if "successor_id" in text or "AS content_chars" in text:
+            wanted = set(args[0]) if args else set()
+            return [row for row in (decision, retro) if row["id"] in wanted]
+        if "ORDER BY embedding" in text:
+            return [decision]
         return []
 
     conn.fetch = AsyncMock(side_effect=fetch)
@@ -644,7 +723,9 @@ async def test_r17_by_ref_hides_a_private_retrospective_and_normal_search_does_n
         mock_cls.return_value.__aexit__ = AsyncMock(return_value=None)
         resp = await c.handle_search(_request({"query": "demo ledger", "limit": 5}, agent="bob"))
     normal = json.loads(resp.text)["results"][0]
-    assert normal["lifecycle"]["retrospective_content"] == RETRO_SECRET
+    assert "lifecycle" not in normal
+    assert RETRO_SECRET not in resp.text
+    assert "retrospective:11" not in resp.text
 
 
 # ── R18 ───────────────────────────────────────────────────────────────────────
@@ -695,9 +776,11 @@ async def test_an_overlong_refs_item_is_shortened_once():
 @pytest.mark.asyncio
 async def test_a_decision_successor_is_named_decision():
     """A superseded fact whose successor row is a decision is labelled fact."""
-    docs = {7: _doc(7, FACT_TEXT, superseded=True, superseded_by=9)}
-    resp, _, _ = await _by_ref(
-        {"refs": ["fact:7"]}, docs=docs, succ_rows=[{"id": 9, "type": "decision"}])
+    docs = {7: _doc(
+        7, FACT_TEXT, superseded=True, superseded_by=9,
+        successor_id=9, successor_metadata={"type": "decision"},
+        successor_visibility="global")}
+    resp, _, _ = await _by_ref({"refs": ["fact:7"]}, docs=docs)
     hit = json.loads(resp.text)["results"][0]
     assert hit["obsolete"] == "superseded"
     assert hit["superseded_by"] == "decision:9"
@@ -707,7 +790,7 @@ async def test_a_decision_successor_is_named_decision():
 async def test_a_missing_successor_row_omits_superseded_by():
     """A superseded fact whose successor row does not exist still carries superseded_by."""
     docs = {7: _doc(7, FACT_TEXT, superseded=True, superseded_by=9)}
-    resp, _, _ = await _by_ref({"refs": ["fact:7"]}, docs=docs, succ_rows=[])
+    resp, _, _ = await _by_ref({"refs": ["fact:7"]}, docs=docs)
     hit = json.loads(resp.text)["results"][0]
     assert hit["content"] == FACT_TEXT
     assert hit["obsolete"] == "superseded"
@@ -744,25 +827,26 @@ async def test_expansion_and_lifecycle_see_only_the_readable_id():
         8: _doc(8, DECISION_TEXT, metadata=DECISION_META),
     }
     expanded = []
-    lifecycle = []
+    seen_ids = []
 
-    async def _expand(session, pg_ids, labels, viewer=None, viewer_scope=None):
+    async def _expand(session, pg_ids, labels, viewer=None, viewer_scope=None, **_kwargs):
         expanded.append(list(pg_ids))
         return {}
 
-    async def _life(session, pg_ids):
-        lifecycle.append(list(pg_ids))
-        return {}
+    async def run(cypher, **kwargs):
+        if "AS decision_id" in " ".join(cypher.split()):
+            seen_ids.append(sorted(kwargs.get("decision_ids") or []))
+        return _Rows([])
 
     c, conn = _coord()
     c._expand_graph_context_batch = _expand
-    c._resolve_decision_lifecycle = _life
+    c._neo4j.session.return_value._val.run = AsyncMock(side_effect=run)
     conn.fetch = AsyncMock(side_effect=_route(docs, {}))
     resp = await c.handle_search(_request(
         {"refs": ["decision:7", "decision:8"]}, agent="bob"))
     assert resp.status == 200
     assert expanded == [[], [8]]
-    assert lifecycle == [[8]]
+    assert seen_ids == [[8]]
     raw = resp.text
     assert SECRET not in raw
 
@@ -848,7 +932,7 @@ async def test_a_stale_or_retired_fault_on_by_ref_omits_that_key():
         text = " ".join(sql.split())
         if "superseded_reason" in text and "community_summaries" in text:
             raise RuntimeError("retired down")
-        if "AND superseded" in text and "technical_docs" in text:
+        if "t.superseded" in text and "technical_docs" in text:
             raise RuntimeError("stale down")
         return await base(sql, *args)
 
@@ -875,23 +959,36 @@ async def test_summary_refs_on_a_normal_search_follow_the_referenced_rows():
         None,
     ])
 
+    cited = [
+        {"id": 11, "metadata": {"kind": "thematic"}, "visibility": "global",
+         "content": "one", "superseded": False},
+        {"id": 12, "metadata": {"kind": "thematic"}, "visibility": "global",
+         "content": "two", "superseded": False},
+    ]
+    insight = {
+        "id": 9, "content": "An insight that cites two demo summaries.",
+        "metadata": insight_meta, "visibility": "global", "superseded": False,
+        "source_pg_ids": [],
+    }
+    fact = {
+        "id": 1, "content": FACT_TEXT,
+        "metadata": {"type": "fact", "project": "demo-project"},
+        "created_at": CREATED, "visibility": "global", "superseded": False,
+    }
+
     async def fetch(sql, *args):
         text = " ".join(sql.split())
-        if text.startswith("SELECT id, metadata FROM community_summaries"):
-            wanted = set(args[0]) if args else set()
-            rows = [
-                {"id": 11, "metadata": {"kind": "thematic"}},
-                {"id": 12, "metadata": {"kind": "thematic"}},
-            ]
-            return [row for row in rows if row["id"] in wanted]
+        wanted = set(args[0]) if args and isinstance(args[0], (list, tuple)) else set()
+        if "successor_id" in text or "AS content_chars" in text:
+            pool = [insight, *cited] if "community_summaries" in text else [fact]
+            return [row for row in pool if row["id"] in wanted]
+        if (text.startswith("SELECT id, metadata")
+                and "community_summaries" in text and "superseded" not in text):
+            return [row for row in cited if row["id"] in wanted]
         if "superseded_reason" in text and "community_summaries" in text:
             return []
-        if "ORDER BY embedding" in text or "technical_docs" in text:
-            return [{
-                "id": 1, "content": FACT_TEXT,
-                "metadata": {"type": "fact", "project": "demo-project"},
-                "created_at": CREATED,
-            }]
+        if "ORDER BY embedding" in text:
+            return [fact]
         return []
 
     conn.fetch = AsyncMock(side_effect=fetch)
@@ -927,7 +1024,7 @@ async def test_summary_refs_on_a_normal_search_follow_the_referenced_rows():
 
 @pytest.mark.asyncio
 async def test_summary_refs_by_ref_keep_order_kind_and_drop_a_missing_row():
-    """By ref, summary_refs drop a kind, reorder, keep a missing id, or appear without a list of summary_ids."""
+    """By ref, summary_refs drop a kind, reorder, keep an unreadable id, or appear without a list of summary_ids."""
     summaries = {
         9: _summary(
             9, "An insight that cites two demo summaries.",
@@ -964,7 +1061,8 @@ async def test_summary_refs_by_ref_keep_order_kind_and_drop_a_missing_row():
     )
     results = {hit["ref"]: hit for hit in json.loads(resp.text)["results"]}
     assert results["insight:9"]["summary_refs"] == ["summary:11", "insight:12"]
-    assert results["insight:9"]["metadata"]["summary_ids"] == [11, 12, 99]
+    assert results["insight:9"]["metadata"]["summary_ids"] == [11, 12]
+    assert 99 not in results["insight:9"]["metadata"]["summary_ids"]
     assert "summary_refs" not in results["insight:9"]["metadata"]
     assert results["summary:8"]["summary_refs"] == ["summary:11"]
     assert "summary_refs" not in results["summary:7"]

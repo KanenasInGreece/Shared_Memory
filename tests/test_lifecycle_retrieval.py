@@ -101,23 +101,22 @@ def test_graph_context_ranks_lifecycle_edges_by_type():
     MENTIONS with asserted_by set, so a stamp-first sort promotes topical edges
     above the verdict edge that says whether a decision still stands.
 
-    BOTH expansion queries must carry it — the single-anchor one and the
-    batched one. (An earlier version of this test matched the batched query
-    twice, because its marker is a substring of the indented form, and so
-    silently pinned nothing in the single-anchor query.)"""
+    The live batch expander carries it. The single-anchor query is gone, so
+    a second copy of this clause is not a second surface.
+
+    Mutation: drop the ORDER BY from `_expand_graph_context_batch`.
+    """
     marker = "ORDER BY CASE WHEN type(r) IN ["
-    assert SRC.count(marker) == 2, (
-        f"both expansion queries must rank by type; found {SRC.count(marker)}"
+    assert SRC.count(marker) == 1, (
+        f"the live expansion query must rank by type; found {SRC.count(marker)}"
     )
-    pos = -1
-    for _ in range(2):
-        pos = SRC.index(marker, pos + 1)
-        frag = SRC[pos:pos + 320]
-        for rel in ("had_outcome", "supersedes", "grounded_in", "informed_by"):
-            assert f"ONT.{rel}" in frag, f"{rel} missing from a ranking clause"
-        assert frag.index("type(r) IN [") < frag.index("r.asserted_by IS NOT NULL"), (
-            "edge type must be the FIRST sort key in every expansion query"
-        )
+    pos = SRC.index(marker)
+    frag = SRC[pos:pos + 320]
+    for rel in ("had_outcome", "supersedes", "grounded_in", "informed_by"):
+        assert f"ONT.{rel}" in frag, f"{rel} missing from a ranking clause"
+    assert frag.index("type(r) IN [") < frag.index("r.asserted_by IS NOT NULL"), (
+        "edge type must be the FIRST sort key in every expansion query"
+    )
 
 
 def test_asserted_by_still_breaks_ties_below_type():
@@ -138,50 +137,29 @@ def test_lifecycle_is_ordered_by_pg_id_not_date():
     it is non-deterministic; pg_id is monotonic and already present."""
     # Anchor on the QUERY, not the docstring — the docstring names
     # `ORDER BY r.date` precisely to explain why it is wrong.
-    i = SRC.index("async def _resolve_decision_lifecycle")
+    i = SRC.index("async def resolve_marks")
     q = SRC.index("session.run(", i)
-    frag = SRC[q:q + 900]
-    assert "ORDER BY r.pg_id DESC LIMIT 1" in frag
+    frag = SRC[q:q + 1100]
     assert "r.date" not in frag, "date must never order verdicts in the query"
+    render = SRC.index("def render_record_entry")
+    body = SRC[render:SRC.index("\ndef render_relation")]
+    assert 'key=lambda v: v["pg_id"]' in body
+    assert "outcomes[-1]" in body
 
 
 def test_lifecycle_takes_only_the_latest_verdict():
     """Lifecycle is NOT monotonic — measured sequences run
     validated → refined → validated. A rule keyed on 'has a refined
     retrospective' would retire decisions that were later re-validated."""
-    i = SRC.index("async def _resolve_decision_lifecycle")
-    frag = SRC[i:i + 2200]
-    assert "LIMIT 1" in frag, "exactly one verdict — the latest — may be used"
+    render = SRC.index("def render_record_entry")
+    frag = SRC[render:SRC.index("\ndef render_relation")]
+    assert "outcomes[-1]" in frag, "exactly one verdict — the latest readable — may be used"
 
 
-def test_lifecycle_attaches_and_does_not_add_rows():
-    """The caller's limit is a contract (v0.8.51). Resolution must ENRICH the
-    decision row, never append a companion record that inflates the result set
-    past what was asked for."""
-    i = SRC.index("# Attach each returned decision's current verdict in place")
-    frag = SRC[i:i + 3000]
-    assert 'r["lifecycle"] = entry' in frag
-    assert "final.append" not in frag, (
-        "lifecycle resolution must not append rows to the result set"
-    )
-
-
-def test_qualifying_ratings_carry_the_verdict_text():
-    """`refined`/`mixed`/`reversed` mean the reader has to weigh the verdict, and
-    a rating word alone does not carry the reasoning — so the retrospective's own
-    text travels with the decision. `validated`/`pending` need only the rating."""
-    assert '_QUALIFYING_RATINGS = ("refined", "mixed", "reversed")' in SRC
-    i = SRC.index("# Attach each returned decision's current verdict in place")
-    frag = SRC[i:i + 3000]
-    assert "_QUALIFYING_RATINGS" in frag
-    assert "retrospective_content" in frag
-
-
-def test_lifecycle_failure_never_fails_the_search():
-    """Enrichment, not a dependency: a Neo4j or Postgres fault degrades to no
-    lifecycle rather than to no search — the FAILURE != IDLE rule."""
-    i = SRC.index("async def _resolve_decision_lifecycle")
-    assert "return {}" in SRC[i:i + 2200]
-    j = SRC.index("# Attach each returned decision's current verdict in place")
-    frag = SRC[j:j + 3000]
-    assert frag.count("except Exception:") >= 2
+# Attaching lifecycle without adding a row, carrying the verdict text, and
+# returning the search when marks fail are covered by behaviour tests:
+# test_read_entry_render.py::test_lifecycle_whole_text,
+# test_search_by_ref.py::test_r13_a_found_decision_carries_lifecycle_and_reversed_wins,
+# test_search_by_ref.py::test_r16_normal_search_still_attaches_lifecycle_and_stale_sources,
+# test_step2_fix_r1.py::test_item6_keyword_fallback_composes_when_neo4j_cannot_open,
+# test_step2_fix_r1.py::test_item12_by_ref_compose_failure_warns_and_marks_stay_closed.

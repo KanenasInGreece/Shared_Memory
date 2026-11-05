@@ -214,9 +214,9 @@ COORDINATOR_BASE = os.environ.get("COORDINATOR_URL", "http://localhost:8888")
 AGENT_ID = os.environ.get("AGENT_ID", "vector_skill")
 
 # API_VERSION is the wire contract; bump only when shape, auth, routes, or a monitor
-# contract change breaks older clients. v5: telemetry contract key removal.
-API_VERSION = 5
-VERSION = "1.0.46"
+# contract change breaks older clients. v6: entries carry text, text_is, full_record.
+API_VERSION = 6
+VERSION = "1.1.0"
 CLIENT_VERSION_HEADER = "X-SM-Api-Version"
 # Framework build, separate from api_version, so two clients on the same wire contract can still be counted apart in clients.versions_seen.
 CLIENT_BUILD_HEADER = "X-Shared-Memory-Client"
@@ -405,6 +405,32 @@ def _append_log(tool: str, min_level: int, event: str, data: dict, content: str 
 def _as_json(obj) -> str:
     """The text every tool returns: the object the CLI prints for its twin, serialised the way the CLI serialises it."""
     return json.dumps(obj, indent=2)
+
+
+def rewrite_mcp_read_with(payload):
+    """Rebuild every full_record.read_with from full_record.ref.
+
+    The gateway emits the CLI command. This door's call is
+    hybrid_search_and_rerank(refs=["<ref>"]) (decision:3501: read_with is
+    the command for the door in use; decision:3001: parity is of outcome,
+    not of bytes).
+    """
+    if isinstance(payload, dict):
+        full = payload.get("full_record")
+        if isinstance(full, dict) and isinstance(full.get("ref"), str):
+            ref = full["ref"]
+            full["read_with"] = f'hybrid_search_and_rerank(refs=["{ref}"])'
+        for value in payload.values():
+            rewrite_mcp_read_with(value)
+    elif isinstance(payload, list):
+        for item in payload:
+            rewrite_mcp_read_with(item)
+    return payload
+
+
+def _as_read_json(obj) -> str:
+    """A read tool's text: the CLI object with this door's read_with."""
+    return _as_json(rewrite_mcp_read_with(obj))
 
 
 def _error_obj(message: str) -> dict:
@@ -927,16 +953,36 @@ async def hybrid_search_and_rerank(query: str = "", limit: int = 5, project: str
     Tier-1 facts for precision, expanded through the entity graph.
 
     Returns, as JSON text, the same list of record objects the CLI's `search`
-    prints (each with `ref`, `record_type`, `score`, `content`,
-    `graph_context`, and where they apply `lifecycle`, `obsolete` and
-    `stale_sources`). When the CLI would print a note on stderr for the same
-    search (unranked rows, the keyword fallback served because the embedder is
-    down, a stale cost projection), the reply is instead the object
-    {"warnings": [<those exact texts>], "results": [<the list>]}. Read
-    `warnings` first: an empty `results` beside a keyword-fallback warning
-    means the ranked search was unavailable, not that nothing is known. A refusal or a transport failure returns the CLI's error
-    object, {"status": "error", "message": ...}, with the gateway's `error`
-    code beside it when it sent one.
+    prints. Every record entry on search `graph_context`, `lineage` and
+    `/memory/graph` is looked up in Postgres on each call and carries `text`
+    (never cut), `text_is` (`summary` = a whole shorter summary, REM's or a
+    decision's rationale; `full_record` = the whole record; `pointer` = no
+    text, the ref is the only context) and `full_record` `{ref, chars,
+    read_with}`. A decision's rationale is not the whole decision: `read_with`
+    gives its choice and alternatives. Any entry can be expanded by its ref,
+    and a `pointer` entry must be. Relations are triples `{relation: {from,
+    relation, to, props}, record}`; a null end is a record this caller cannot
+    read. A non-record far end is an object `{label, name}` and that item has
+    no `record` key. Search never returns superseded or reversed records.
+    Explicit reads show them with `obsolete` and `superseded_by` when the
+    successor is readable. `retired_grounds` on a decision hit means its
+    evidence was retired: read the successor before relying on it. Each
+    `retired_grounds` item names a relation, and `superseded_by` when that
+    successor is readable. `latest_verdict` on a retrospective names the
+    verdict that counts most. `found: false` means there is nothing to read.
+    Reading is two steps. Step one ranks and expands. Step two is
+    hybrid_search_and_rerank(refs=["<ref>"]). `read_with` names that call.
+    Those explicit reads are record_lineage,
+    hybrid_search_and_rerank(refs=["<ref>"]) and graph_query. When the CLI
+    would print a note on stderr
+    for the same search (unranked rows, the keyword fallback served because
+    the embedder is down, a stale cost projection), the reply is instead the
+    object {"warnings": [<those exact texts>], "results": [<the list>]}.
+    Read `warnings` first: an empty `results` beside a keyword-fallback
+    warning means the ranked search was unavailable, not that nothing is
+    known. A refusal or a transport failure returns the CLI's error object,
+    {"status": "error", "message": ...}, with the gateway's `error` code
+    beside it when it sent one.
 
     Delegates the whole retrieval chain — embedding, vector search, reranking,
     graph expansion, and READ AUTHORIZATION — to the gateway, so this host sees
@@ -953,7 +999,10 @@ async def hybrid_search_and_rerank(query: str = "", limit: int = 5, project: str
     project/domain name is not refused, it simply matches nothing (the read
     path never blocks on registry state).
 
-    `refs` names records to read instead of ranking a query: a non-empty list, or one comma-separated string, returns those records and ignores the query. The named records come back whole, unranked, obsolete ones included and marked.
+    `refs` names records to read instead of ranking a query: a non-empty
+    list, or one comma-separated string, returns those records and ignores
+    the query. The named records come back whole, unranked, obsolete ones
+    included and marked.
 
     The wait for this call is sized from the gateway's own published backend
     capability, not a constant — set SEARCH_TIMEOUT_S (env) to pin an explicit
@@ -961,12 +1010,12 @@ async def hybrid_search_and_rerank(query: str = "", limit: int = 5, project: str
     """
     named = _search_refs(refs)
     if isinstance(named, dict):
-        return _as_json(named)
+        return _as_read_json(named)
     if named:
         logger.info("Search by ref: %d named", len(named))
-        return _as_json(_results_of(await _search_refs_payload(named)))
+        return _as_read_json(_results_of(await _search_refs_payload(named)))
     if not (query or "").strip():
-        return _as_json(_error_obj("query is required"))
+        return _as_read_json(_error_obj("query is required"))
     logger.info(f"Search: {query[:50]}...")
     payload = await _search_payload(query, limit, project=project,
                                      domains=domains, since=since)
@@ -986,8 +1035,8 @@ async def hybrid_search_and_rerank(query: str = "", limit: int = 5, project: str
     for text in warnings:
         print(text, file=sys.stderr)
     if warnings:
-        return _as_json({"warnings": warnings, "results": results})
-    return _as_json(results)
+        return _as_read_json({"warnings": warnings, "results": results})
+    return _as_read_json(results)
 
 
 def _normalize_domains(metadata: dict) -> dict:
@@ -1663,7 +1712,28 @@ async def memory_telemetry() -> str:
 
 @mcp.tool()
 async def record_lineage(ref: str) -> str:
-    """It says what happened to one record and names, in `related`, every record it directly affects or is affected by, with `snippet` and `content_chars`. Read the text with `hybrid_search_and_rerank(refs=...)`. For a record this caller cannot read it carries neither `snippet` nor `content_chars`, and no `related`.
+    """It says what happened to one record. Every record entry on search
+    `graph_context`, `lineage` and `/memory/graph` is looked up in Postgres on
+    each call and carries `text` (never cut), `text_is` (`summary` = a whole
+    shorter summary, REM's or a decision's rationale; `full_record` = the whole
+    record; `pointer` = no text, the ref is the only context) and `full_record`
+    `{ref, chars, read_with}`. A decision's rationale is not the whole
+    decision: `read_with` gives its choice and alternatives. Any entry can be
+    expanded by its ref, and a `pointer` entry must be. Relations are triples
+    `{relation: {from, relation, to, props}, record}`; a null end is a record
+    this caller cannot read. A non-record far end is an object `{label, name}`
+    and that item has no `record` key. Search never returns superseded or
+    reversed records. Explicit reads show them with `obsolete` and
+    `superseded_by` when the successor is readable. `retired_grounds` on a
+    decision hit means its evidence was retired: read the successor before
+    relying on it. Each `retired_grounds` item names a relation, and
+    `superseded_by` when that successor is readable. `latest_verdict` on a
+    retrospective names the verdict that counts most. `found: false` means
+    there is nothing to read. Reading is two steps. Step one ranks and
+    expands. Step two is hybrid_search_and_rerank(refs=["<ref>"]). `read_with`
+    names that call. Those explicit reads are record_lineage,
+    hybrid_search_and_rerank(refs=["<ref>"]) and graph_query. An unreadable
+    record answers as a missing record.
 
     Returns, as JSON text, the same object the CLI's `lineage` prints.
 
@@ -1687,11 +1757,11 @@ async def record_lineage(ref: str) -> str:
         async with _async_client(CALL_TIMEOUT) as client:
             r = await client.get(f"{COORDINATOR_BASE}/memory/status/{ref}",
                                  headers=_auth_headers())
-            return _as_json(_reply_json(r, "record_lineage"))
+            return _as_read_json(_reply_json(r, "record_lineage"))
     except GatewayReplyError as exc:
-        return _as_json(exc.payload)
+        return _as_read_json(exc.payload)
     except Exception as exc:
-        return _as_json(await _warn_on_skew(_coordinator_unavailable(exc)))
+        return _as_read_json(await _warn_on_skew(_coordinator_unavailable(exc)))
 
 
 @mcp.tool()
@@ -1700,12 +1770,30 @@ async def graph_query(cypher: str) -> str:
     Run a READ-ONLY Cypher query against the knowledge graph. Returns, as JSON
     text, the same records list the CLI's `graph` prints.
 
-    A record node returned as a row value or in a returned list is an
-    index entry — its `content` is the node's short copy; `ref`,
-    `content_chars` and `content_truncated` describe the record; read it
-    with `hybrid_search_and_rerank(refs=[ref])`. A projected property is the node's capped
-    copy. A node this caller cannot read keeps its stored properties and
-    gains nothing.
+    Every record entry on search `graph_context`, `lineage` and `/memory/graph`
+    is looked up in Postgres on each call and carries `text` (never cut),
+    `text_is` (`summary` = a whole shorter summary, REM's or a decision's
+    rationale; `full_record` = the whole record; `pointer` = no text, the ref
+    is the only context) and `full_record` `{ref, chars, read_with}`. A
+    decision's rationale is not the whole decision: `read_with` gives its
+    choice and alternatives. Any entry can be expanded by its ref, and a
+    `pointer` entry must be. Relations are triples `{relation: {from, relation,
+    to, props}, record}`; a null end is a record this caller cannot read. A
+    non-record far end is an object `{label, name}` and that item has no
+    `record` key. Search never returns superseded or reversed records.
+    Explicit reads show them with `obsolete` and `superseded_by` when the
+    successor is readable. `retired_grounds` on a decision hit means its
+    evidence was retired: read the successor before relying on it. Each
+    `retired_grounds` item names a relation, and `superseded_by` when that
+    successor is readable. `latest_verdict` on a retrospective names the
+    verdict that counts most. `found: false` means there is nothing to read.
+    Reading is two steps. Step one ranks and expands. Step two is
+    hybrid_search_and_rerank(refs=["<ref>"]). `read_with` names that call.
+    Those explicit reads are record_lineage,
+    hybrid_search_and_rerank(refs=["<ref>"]) and graph_query. On
+    `/memory/graph`, nodes inside paths and maps are resolved like any node.
+    Only a projected property is not the record. A node this caller cannot
+    read is label only.
 
     Requires a token with full or admin role (read-only tokens receive 403).
     The gateway enforces read-only: CREATE, DELETE, DETACH DELETE, SET, MERGE,
@@ -1719,10 +1807,10 @@ async def graph_query(cypher: str) -> str:
                                   headers=_auth_headers())
             payload = _reply_json(r, "graph_query")
     except GatewayReplyError as exc:
-        return _as_json(exc.payload)
+        return _as_read_json(exc.payload)
     except Exception as exc:
-        return _as_json(_coordinator_unavailable(exc))
-    return _as_json(payload.get("records", payload))
+        return _as_read_json(_coordinator_unavailable(exc))
+    return _as_read_json(payload.get("records", payload))
 
 
 if __name__ == "__main__":

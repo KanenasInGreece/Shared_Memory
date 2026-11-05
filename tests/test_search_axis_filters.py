@@ -254,10 +254,15 @@ async def test_project_filter_reaches_tier1_query():
     await _run_search(c, reranker, {"query": "status", "limit": 5, "project": "alpha"})
 
     calls = _fetch_calls_matching(mock_conn, "FROM technical_docs")
-    assert calls, "Tier-1 candidate query never ran"
-    for call in calls:
+    # Hydration looks up ids already chosen. It is not a candidate query and
+    # carries no axis predicate.
+    candidates = [call for call in calls if "content_chars" not in call.args[0]]
+    assert candidates, "Tier-1 candidate query never ran"
+    for call in candidates:
         assert "metadata->>'project' = ANY($" in call.args[0]
         assert ["alpha"] in call.args
+    hydration = [call for call in calls if "content_chars" in call.args[0]]
+    assert hydration, "the chosen ids must reach the hydration lookup"
 
 
 @pytest.mark.asyncio
@@ -418,8 +423,15 @@ async def test_filtered_candidates_flow_straight_to_reranker_no_widening():
                        {"query": "status", "limit": 5, "project": "alpha"},
                        capture=capture)
 
-    # Exactly one Tier-1 fetch call — no retry / widen-and-refilter step.
-    assert len(_fetch_calls_matching(mock_conn, "FROM technical_docs")) == 1
+    # Exactly one Tier-1 candidate fetch — no retry / widen-and-refilter step.
+    # The second technical_docs fetch is the id hydration, and it names only
+    # the two filtered ids.
+    doc_calls = _fetch_calls_matching(mock_conn, "FROM technical_docs")
+    candidates = [call for call in doc_calls if "content_chars" not in call.args[0]]
+    hydration = [call for call in doc_calls if "content_chars" in call.args[0]]
+    assert len(candidates) == 1
+    assert len(hydration) == 1
+    assert hydration[0].args[1] == [1, 2]
 
     post_call = capture["http"].post.await_args
     assert post_call is not None
