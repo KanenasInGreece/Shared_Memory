@@ -56,7 +56,7 @@ One flag, one option, stored verbatim. Why-not stays in `--rationale`.
 save "…" '{"source":"grok","entities":["LockOrder"],"new_entities":["LockOrder"],"entities_provenance":{"LockOrder":"operator"}}'
 ```
 
-A decision or retrospective that sends `entities` is `entities_not_allowed_on_judgement`. A name only in `new_entities` is `new_entities_invalid`. `entity_unknown`: ask, then re-send `new_entities` for the new names, each also in `entities`. `entity_confusable`: ask, then `confirm_distinct_from` naming the near match, or save the existing name. `entity_reserved`: the name is schema vocabulary or a project name. Drop it or name the concept. Caps: 50 names, 200 characters (`entities_list_too_long`, `entity_name_too_long`).
+A decision or retrospective that sends `entities` is `entities_not_allowed_on_judgement`. A name only in `new_entities` is `new_entities_invalid`. `entity_unknown`: ask, then re-send `new_entities` for the new names, each also in `entities`. `entity_confusable`: ask, then `confirm_distinct_from` naming the near match, or save the existing name. `entity_reserved`: the name is schema vocabulary or a project name (including this record's own project). Drop it or name the concept. Caps: 50 names, 200 characters (`entities_list_too_long`, `entity_name_too_long`).
 
 ## Project and domain
 
@@ -95,7 +95,7 @@ save "…" '{"source":"grok","project":"new-name","new_project":true,"new_domain
 save "same words" '{"source":"grok"}' --domain other
 ```
 
-Same content, other axes: `axis_conflict`. Supersede instead. `registry_unavailable` (503): nothing was written. Retry.
+Same content, other axes: `axis_conflict`. Supersede instead. A renamed section is not resolved on a re-save. `registry_unavailable` (503): nothing was written. Retry.
 
 `use_retrospective_endpoint`: `POST /memory/save` was given type `retrospective`. Nothing was written. Send `save_retrospective` against that decision's pg id (`POST /memory/retrospective`). Do not retry the save.
 
@@ -107,9 +107,9 @@ Same content, other axes: `axis_conflict`. Supersede instead. `registry_unavaila
 search "lock acquisition order" 5 --project widget-line --domain operations --since 2026-08-01
 ```
 
-A project name inside the query ranks mentions above members. `--domain` is OR. Repeat it. More than 16 is `filters_invalid`. An unknown name matches nothing. A smaller `limit` does not make the wait shorter. On a timeout, read `backend_capability` on authenticated `/health`. `SEARCH_TIMEOUT_S` only when that projection exceeds the ceiling.
+A project name inside the query ranks mentions above members. `--domain` is OR. Repeat it. More than 16 is `filters_invalid`. An unknown name matches nothing. `--domain` matches stored `metadata.domains` only (missing read-side `belonging`, a retrospective, a decision that omitted a section, and a thematic summary's `metadata.domain` string; without `--project`, it matches that literal in every project). A smaller `limit` does not make the wait shorter. On a timeout, read `backend_capability` on authenticated `/health`. `SEARCH_TIMEOUT_S` only when that projection exceeds the ceiling.
 
-`ranked: false`: vector order, `score` null, no Tier-3. `fallback: keyword` and stderr `EMBEDDING UNAVAILABLE`: the embedder is down. Empty in that state is not "nothing known".
+`ranked: false` drops Tier-3: on reranker timeout it is vector order with `score` null; on `fallback: keyword` (stderr `EMBEDDING UNAVAILABLE`, embedder down) rows carry `score` 0.0 and `score_normalized` 0.5. Empty in that state is not "nothing known".
 
 ```
 lineage fact:816
@@ -121,8 +121,9 @@ review-hold --summary-id 12 --pg-id 42
 (`[{"summary_id": Y, "superseded_reason": "…", "superseded_by": Z,
 "unsupported": […]}]` on an insight) carry `superseded_by` only when the
 successor is readable. `old` may be a fact, a decision, or a retrospective.
-A null `superseded_by` is a retraction. `lineage` the qualified ref. Do not
-force `fact:`. An insight shows a non-empty unsupported list when a superseded
+A null `superseded_by` is a retraction. `lineage` the qualified ref (a 404
+names the real ref). Do not force `fact:`. An insight shows a non-empty
+unsupported list when a superseded
 fact left a decision without thematic support; restore it by a retrospective
 on that decision grounded on the new fact (validated or refined), or reverse
 the decision. A null `superseded_by` depends on `superseded_reason`:

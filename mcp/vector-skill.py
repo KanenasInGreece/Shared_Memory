@@ -1004,6 +1004,32 @@ async def hybrid_search_and_rerank(query: str = "", limit: int = 5, project: str
     the query. The named records come back whole, unranked, obsolete ones
     included and marked.
 
+    Read each hit's `content` and the `text` of each `graph_context` entry first, and stop
+    if they already answer (after lifecycle checks: `stale_sources` and `retired_summaries`
+    → `record_lineage` before relying; `retired_grounds` → read the successor; do not call
+    `read_with` to confirm); call `read_with` (`hybrid_search_and_rerank(refs=[...])`) only
+    when the question needs more than `text`: a `pointer` entry has no text, so it must be
+    expanded before its relevance can be judged;
+    a decision's `text` is only its rationale; `read_with` gives its choice and alternatives;
+    and a `summary` entry is a shorter version of its record where whether the question needs
+    the whole record is the reader's call (before answering that something is not recorded,
+    weigh whether an on-topic summary may hold it). When an unfiltered search is ranked (no
+    keyword-fallback warning and no `ranked: false`) and every hit scores near zero on
+    `score_normalized` (if you used a filter, drop it once first; an empty result is not a
+    near-zero result), nothing relevant came back: say "not found" with the scope searched
+    and stop. For an in-domain question, the score ranks topic, not answerability, so judge
+    from the content you read, rephrase once, and drop any `project`, `domains`, or `since`
+    filter once (`domains` misses retrospectives, decisions without sections, and a thematic
+    summary whose section is stored in the singular `metadata.domain`); if a retry finds it,
+    answer from it, and answer "not found in the store" (naming the searches you ran) only
+    if the rephrased and unfiltered searches, and any expansions they need, still lack the
+    answer. A hit with `tier` `insight_summary` or `community_summary` answers thematic
+    questions ("what is the pattern, principle, or history") — for a summary hit, answer
+    from its `content`; for a specific fact, number, or decision not in its `content`, open
+    the refs in its `graph_context` or call `record_lineage(<the hit's ref>)` (`summary:N`
+    or `insight:N`) and read its `sources`, and never pass a bare `source_pg_ids` number to
+    `record_lineage`.
+
     The wait for this call is sized from the gateway's own published backend
     capability, not a constant — set SEARCH_TIMEOUT_S (env) to pin an explicit
     override instead.
