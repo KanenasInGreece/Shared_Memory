@@ -680,7 +680,8 @@ moment the record is saved, by the person who saved it — never added to or re-
 **NREM, the consolidation pass,** builds two syntheses:
 
 **Thematic summaries — the index** For each project domain, the facts fold into one
-index card: each fact compressed to its tightest form, keyed by its identity, in one block. The
+index card: each fact appears as its shorter summary when it has one, or as its whole text when it
+does not, and every line names the record it comes from and which of the two it is. The
 card is borrowed deliberately from the Zettelkasten tradition, where the card *is the index into
 the whole system of knowledge* — offering compression, token economy, plus a way in. An agent 
 that hits the card spends a few hundred tokens to learn the shape of what a whole section knows, 
