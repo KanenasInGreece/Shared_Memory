@@ -773,12 +773,17 @@ TELEMETRY: dict[str, dict] = {
 
     # ── outbox (NEW section, 0.9.74) ────────────────────────────────────────
     "outbox.pending": _k("int", "outbox", since=INTRODUCED_0_9_74),
-    "outbox.applied": _k("int", "outbox", since=INTRODUCED_0_9_74),
+    "outbox.applied": _k("int", "outbox", since=INTRODUCED_0_9_74, note=(
+        "Decision outbox rows are no longer advanced to rem_reviewed, so a "
+        "decision's apply lands here and outbox.rem_reviewed does not grow "
+        "for it. A decision's lineage rem_reviewed_at stays null.")),
     "outbox.failed": _k("int", "outbox", since=INTRODUCED_0_9_74, log="health.outbox", note=(
         "⛔ ALWAYS PRESENT, 0 when zero. The pre-0.9.74 `postgres.outbox` census "
         "omitted the key entirely at zero, so absence and zero were "
         "indistinguishable to every consumer.")),
-    "outbox.rem_reviewed": _k("int", "outbox", since=INTRODUCED_0_9_74),
+    "outbox.rem_reviewed": _k("int", "outbox", since=INTRODUCED_0_9_74, note=(
+        "REM no longer moves a Decision outbox row to rem_reviewed. The count "
+        "is Fact and Retrospective reviews. A decision stays on applied.")),
     "outbox.oldest_failed_age_s": _k("int|null", "outbox", unit="_s", since=INTRODUCED_0_9_74),
     "outbox.oldest_pending_age_s": _k("int|null", "outbox", unit="_s", since=INTRODUCED_0_9_74,
                                       log="health.warning.outbox_oldest_pending_age_s"),
@@ -839,10 +844,12 @@ TELEMETRY: dict[str, dict] = {
                                  note="the value was removed in 1.0.45"),
     "neo4j.rem_passed_over_total": _k("int", "rem", unit="_total",
                                       moved_to="telemetry:rem.passed_over",
-                                      removed_in=TELEMETRY_DUAL_EMIT_DROP_TARGET),
+                                      removed_in=TELEMETRY_DUAL_EMIT_DROP_TARGET,
+                                      note="Fact and Retrospective only; decisions are not counted (brief §8)"),
     "neo4j.rem_starved_pending": _k("int", "rem",
                                     moved_to="telemetry:rem.starved_pending",
-                                    removed_in=TELEMETRY_DUAL_EMIT_DROP_TARGET),
+                                    removed_in=TELEMETRY_DUAL_EMIT_DROP_TARGET,
+                                    note="Fact and Retrospective only; decisions are not counted (brief §8)"),
     "neo4j.query_p50_ms": _k("float|null", "neo4j", unit="_ms", since=INTRODUCED_0_9_74, note=(
         "over BOTH Neo4j callers — the /memory/graph route and the outbox "
         "apply — so the write path that actually blocks the pipeline is in "
@@ -871,8 +878,10 @@ TELEMETRY: dict[str, dict] = {
                                 "record shows degraded.")),
     "rem.failing": _k("int", "rem", since=INTRODUCED_0_9_74,
                       removed_in=INTRODUCED_1_0_45, note="always 0."),
-    "rem.passed_over": _k("int", "rem", since=INTRODUCED_0_9_74),
-    "rem.starved_pending": _k("int", "rem", since=INTRODUCED_0_9_74),
+    "rem.passed_over": _k("int", "rem", since=INTRODUCED_0_9_74,
+                          note="Fact and Retrospective only; decisions are not counted (brief §8)"),
+    "rem.starved_pending": _k("int", "rem", since=INTRODUCED_0_9_74,
+                              note="Fact and Retrospective only; decisions are not counted (brief §8)"),
     "rem.max_attempts": _k("int", "rem", since=INTRODUCED_0_9_74,
                            removed_in=INTRODUCED_1_0_45, note="always 0."),
     "rem.throughput_per_hour": _k("float|null", "rem", since=INTRODUCED_0_9_74, note=(
@@ -1865,6 +1874,7 @@ CONDITIONAL: frozenset = frozenset({
     "telemetry:rem.error",
     "telemetry:nrem.error",
     "telemetry:nrem.insight_excluded_pending_rem",
+    "telemetry:neo4j.decisions_rem_pending",
     "telemetry:registry.error",
     "telemetry:breakdown.error",
     "telemetry:entity_graph.error",

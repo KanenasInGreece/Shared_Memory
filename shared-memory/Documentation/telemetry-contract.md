@@ -494,7 +494,7 @@ The envelope is `{"status": "success", "telemetry": {…}}`; paths below are rel
 | key | type | unit | since | moved to | removed in | log twin | notes |
 |---|---|---|---|---|---|---|---|
 | `outbox.age_limit_s` | int | _s | 0.9.74 | — | — | — | OUTBOX_AGE_WARN_S — the limit oldest_pending_age_s is compared against |
-| `outbox.applied` | int | — | 0.9.74 | — | — | — | — |
+| `outbox.applied` | int | — | 0.9.74 | — | — | — | Decision outbox rows are no longer advanced to rem_reviewed, so a decision's apply lands here and outbox.rem_reviewed does not grow for it. A decision's lineage rem_reviewed_at stays null. |
 | `outbox.apply_latency_p50_s` | float/null | _s | 0.9.74 | — | — | — | — |
 | `outbox.apply_latency_p95_s` | float/null | _s | 0.9.74 | — | — | — | — |
 | `outbox.apply_latency_window` | int | — | 0.9.74 | — | — | — | — |
@@ -504,7 +504,7 @@ The envelope is `{"status": "success", "telemetry": {…}}`; paths below are rel
 | `outbox.oldest_failed_age_s` | int/null | _s | 0.9.74 | — | — | — | — |
 | `outbox.oldest_pending_age_s` | int/null | _s | 0.9.74 | — | — | `health.warning.outbox_oldest_pending_age_s` | — |
 | `outbox.pending` | int | — | 0.9.74 | — | — | — | — |
-| `outbox.rem_reviewed` | int | — | 0.9.74 | — | — | — | — |
+| `outbox.rem_reviewed` | int | — | 0.9.74 | — | — | — | REM no longer moves a Decision outbox row to rem_reviewed. The count is Fact and Retrospective reviews. A decision stays on applied. |
 
 ### postgres
 
@@ -638,8 +638,8 @@ The envelope is `{"status": "success", "telemetry": {…}}`; paths below are rel
 | `rem.dead_lettered` | int | — | 0.9.74 | — | — | `health.rem_daemon` | pending records that have a backlog row; a superseded record is excluded. A withheld record shows degraded. |
 | `rem.degeneration_firings` | int/null | — | 0.9.74 | — | — | — | Null. The loop check runs in the gateway on a cut-off reply and writes a log line. This key does not count those lines. Reporting 0 would say the check never fired. |
 | `rem.error` | str | — | 0.9.74 | — | — | — | present only when this section's own query failed |
-| `rem.passed_over` | int | — | 0.9.74 | — | — | — | — |
-| `rem.starved_pending` | int | — | 0.9.74 | — | — | — | — |
+| `rem.passed_over` | int | — | 0.9.74 | — | — | — | Fact and Retrospective only; decisions are not counted (brief §8) |
+| `rem.starved_pending` | int | — | 0.9.74 | — | — | — | Fact and Retrospective only; decisions are not counted (brief §8) |
 | `rem.throughput_per_hour` | float/null | — | 0.9.74 | — | — | — | batched facts REM stamped in the last hour, from the durable technical_docs.rem_timing clock, including batched backlog facts; solo work writes no timing |
 
 ### nrem/consolidation

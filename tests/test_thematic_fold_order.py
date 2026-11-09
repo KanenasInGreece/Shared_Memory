@@ -24,8 +24,9 @@ def test_thematic_fold_order_deterministic_and_ascending_by_pg_id():
     contents_2 = ["Content seven", "Content twelve", "Content three"]
     ids_2 = [7, 12, 3]
 
-    summary_1, sorted_ids_1 = render_thematic_fold(contents_1, ids_1, record_map)
-    summary_2, sorted_ids_2 = render_thematic_fold(contents_2, ids_2, record_map)
+    state = {pid: {"rem_processed": True} for pid in (3, 7, 12)}
+    summary_1, sorted_ids_1 = render_thematic_fold(contents_1, ids_1, record_map, state)
+    summary_2, sorted_ids_2 = render_thematic_fold(contents_2, ids_2, record_map, state)
 
     # 1. Permutation equality: identical output across differing input orders
     assert summary_1 == summary_2

@@ -542,8 +542,8 @@ def _thematic_conn_script(insert_id=90):
         #    C4, `entities`); project/domain for GATE PARTITIONING come from
         #    `_ROWS` itself (v2, C1) — this query only feeds `record_map`.
         {"rowcount": 2, "rows": [
-            (1, "general", "fact", "tests/test_x.py", d, {"entities": ["Widget"]}),
-            (2, "general", "fact", None, d, {}),
+            (1, "general", "fact", "tests/test_x.py", d, {"entities": ["Widget"]}, None),
+            (2, "general", "fact", None, d, {}, None),
         ]},
         # 2. coverage census — _fetch_outbox_created_at over the work items'
         #    pg_ids (own-conn SELECT, so it lands on this same stub).
@@ -585,9 +585,9 @@ def _thematic_conn_script(insert_id=90):
 # from these SAME rows.
 _ROWS = [
     {"pg_id": 1, "content": "The consolidation daemon writes summaries",
-     "project": "general", "domain": "ops"},
+     "project": "general", "domain": "ops", "rem_processed": True},
     {"pg_id": 2, "content": "The outbox worker applies rows",
-     "project": "general", "domain": "ops"},
+     "project": "general", "domain": "ops", "rem_processed": True},
 ]
 
 

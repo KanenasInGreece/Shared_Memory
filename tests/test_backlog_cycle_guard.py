@@ -106,7 +106,7 @@ class _Neo:
             ids = list(params.get("ids") or [])
             return _Result([
                 {"pg_id": i, "rem_processed": True, "superseded": False,
-                 "rem_invalid": False}
+                 "rem_invalid": False, "labels": ["Fact"]}
                 for i in ids
             ])
         if "NOT n.pg_id IN $blocked" in query:

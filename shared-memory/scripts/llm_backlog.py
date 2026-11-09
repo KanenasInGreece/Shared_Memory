@@ -2,54 +2,24 @@
 
 Read before a call. A read error fails the cycle closed, so a dark backlog
 cannot send the item again. Writes use their own autocommit connection.
-Retry rules: no_context when the largest context grew,
-cut_off when the largest reply cap grew, loop / unparseable / unrecognised
-when the pool id changed, connection_lost, write_failed and rewrite_failed
-when the boot id changed. An unrelated list change retries neither no_context
-nor cut_off. rewrite_failed is a tier-2 graph write that did not stick
-(brief §3.2); eligible_write_failed still matches only write_failed, so the
-release pass never clears a tier-2 node.
+Retry rules live in llm_eligibility, which has no driver: no_context when the
+largest context grew, cut_off when the largest reply cap grew, loop /
+unparseable / unrecognised when the pool id changed, connection_lost,
+write_failed and rewrite_failed when the boot id changed. An unrelated list
+change retries neither no_context nor cut_off. rewrite_failed is a tier-2
+graph write that did not stick (brief §3.2); eligible_write_failed still
+matches only write_failed, so the release pass never clears a tier-2 node.
 """
-import os
-
 import psycopg2
 import psycopg2.extensions
 
 from secure_env import get_secret, pg_dsn
-
-_POOL_REASONS = frozenset({"loop", "unparseable", "unrecognised"})
-_BOOT_REASONS = frozenset({"connection_lost", "write_failed", "rewrite_failed"})
-
-
-def identity() -> dict:
-    """Spawn values the gateway put on this process."""
-    def _int(name: str) -> int:
-        try:
-            return int(os.environ.get(name) or 0)
-        except (TypeError, ValueError):
-            return 0
-
-    return {
-        "pool_id": os.environ.get("SM_LLM_POOL_ID") or "",
-        "largest_ctx": _int("SM_LLM_LARGEST_CTX"),
-        "largest_reply": _int("SM_LLM_LARGEST_REPLY"),
-        "boot_id": os.environ.get("SM_GATEWAY_BOOT_ID") or "",
-    }
-
-
-def eligible(reason: str, stored_ctx, stored_reply, stored_pool, stored_boot,
-             ident: dict | None = None) -> bool:
-    """True when this stored row may be tried again under ident."""
-    ident = ident or identity()
-    if reason == "no_context":
-        return ident["largest_ctx"] > (stored_ctx or 0)
-    if reason == "cut_off":
-        return ident["largest_reply"] > (stored_reply or 0)
-    if reason in _POOL_REASONS:
-        return ident["pool_id"] != (stored_pool or "")
-    if reason in _BOOT_REASONS:
-        return ident["boot_id"] != (stored_boot or "")
-    return False
+from llm_eligibility import (  # noqa: F401 — re-exported; the gateway imports llm_eligibility itself
+    BOOT_REASONS as _BOOT_REASONS,
+    POOL_REASONS as _POOL_REASONS,
+    eligible,
+    identity,
+)
 
 
 def _connect():

@@ -130,7 +130,7 @@ class FakeSession:
             ids = list(params.get("ids") or [])
             return FakeResult([
                 {"pg_id": i, "rem_processed": True, "superseded": False,
-                 "rem_invalid": False}
+                 "rem_invalid": False, "labels": ["Fact"]}
                 for i in ids
             ])
         return self._results.pop(0) if self._results else FakeResult()

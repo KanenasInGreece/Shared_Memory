@@ -925,7 +925,8 @@ async def test_fold_stop_without_string_content_is_gateway_422(monkeypatch):
                     async def data(_self):
                         return [
                             {"pg_id": i, "rem_processed": True,
-                             "superseded": False, "rem_invalid": False}
+                             "superseded": False, "rem_invalid": False,
+                             "labels": ["Fact"]}
                             for i in ids
                         ]
                 return _R()

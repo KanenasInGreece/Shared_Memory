@@ -138,9 +138,9 @@ def daemon_with_fake_graph(results=None):
 
 _ROWS = [
     {"pg_id": 1, "content": "The consolidation daemon writes summaries",
-     "project": "general", "domain": "ops"},
+     "project": "general", "domain": "ops", "rem_processed": True},
     {"pg_id": 2, "content": "The outbox worker applies rows",
-     "project": "general", "domain": "ops"},
+     "project": "general", "domain": "ops", "rem_processed": True},
 ]
 
 _CURRENT_CONTENT = (
@@ -159,8 +159,8 @@ def _script(active_rows):
     d = datetime.date(2026, 7, 11)
     return [
         {"rowcount": 2, "rows": [
-            (1, "general", "fact", "tests/test_x.py", d, {"entities": ["Widget"]}),
-            (2, "general", "fact", None, d, {}),
+            (1, "general", "fact", "tests/test_x.py", d, {"entities": ["Widget"]}, None),
+            (2, "general", "fact", None, d, {}, None),
         ]},
         {"rowcount": len(active_rows), "rows": active_rows},  # active thematic rows
     ]

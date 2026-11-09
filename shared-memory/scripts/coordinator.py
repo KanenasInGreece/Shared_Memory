@@ -10497,8 +10497,7 @@ class MemoryCoordinator:
                 facts = await fres.data()
                 dres = await session.run(
                     f"MATCH (d:{ONT.decision})"
-                    f" RETURN coalesce(d.rem_processed,false) AS rem,"
-                    f"        coalesce(d.superseded,false) AS superseded, count(*) AS n"
+                    f" RETURN coalesce(d.superseded,false) AS superseded, count(*) AS n"
                 )
                 decisions = await dres.data()
                 rres = await session.run(
@@ -10909,23 +10908,35 @@ class MemoryCoordinator:
     async def _insight_excluded_pending_rem(self):
         """Latest finished insight cycle's excluded_pending_rem, or None.
 
-        Same outcome filter as rem_pending_clusters. A cycle that stopped
-        before the fresh scan has no key, and that absence is not a zero.
+        Same outcome filter as rem_pending_clusters. The latest cycle is
+        read first. A missing key, or a readiness-failure marker, is absent.
+        Skipping to an older cycle that still has the key would report a
+        stale count. Absence is not a zero.
         """
         query = """
-            SELECT (extra->>'excluded_pending_rem')::int AS n
+            SELECT extra
             FROM consolidation_runs
             WHERE cycle_type = 'insight'
               AND outcome IN ('completed', 'crashed')
-              AND extra ? 'excluded_pending_rem'
             ORDER BY started_at DESC
             LIMIT 1
         """
         async with self._acquire() as conn:
             row = await conn.fetchrow(query)
-        if row is None or row["n"] is None:
+        if row is None:
             return None
-        return int(row["n"])
+        extra = row["extra"]
+        if isinstance(extra, str):
+            try:
+                extra = json.loads(extra)
+            except json.JSONDecodeError:
+                return None
+        if not isinstance(extra, dict):
+            return None
+        value = extra.get("excluded_pending_rem")
+        if isinstance(value, bool) or not isinstance(value, int):
+            return None
+        return value
 
     async def _compute_consolidation_health(self) -> dict:
         """Roll up consolidation_runs into per-cycle-type liveness + the stall
@@ -11522,15 +11533,27 @@ class MemoryCoordinator:
         self._registry_census_ok = True
 
     async def _rem_backlog_pg_ids(self) -> list[int]:
-        """item_key values stored as rem backlog rows.
+        """Ineligible rem item keys. An eligible row does not block (brief §3.1).
 
-        A missing table raises; the caller fails the section.
+        A missing table raises; the caller fails the section. Eligibility uses
+        the identity stamped on the daemons, not this process's environment.
         """
+        import llm_eligibility
         async with self._acquire() as conn:
             rows = await conn.fetch(
-                "SELECT item_key FROM llm_backlog WHERE item_kind = 'rem'")
+                "SELECT item_key, reason, largest_ctx, largest_reply, pool_id, boot_id"
+                " FROM llm_backlog WHERE item_kind = 'rem'")
+        ident = None
         ids: list[int] = []
         for row in rows:
+            if ident is None:
+                import hive_mind_proxy
+                ident = hive_mind_proxy.daemon_llm_identity()
+            if llm_eligibility.eligible(
+                row["reason"], row["largest_ctx"], row["largest_reply"],
+                row["pool_id"], row["boot_id"], ident,
+            ):
+                continue
             try:
                 ids.append(int(row["item_key"]))
             except (TypeError, ValueError):
@@ -11859,8 +11882,11 @@ class MemoryCoordinator:
         rem_count = await self._rem_dead_letter_count()
         try:
             blocked = await self._rem_backlog_pg_ids()
+            backlog_readable = True
         except Exception:
+            # A zero would say nothing is withheld. Omit both gauges.
             blocked = []
+            backlog_readable = False
         async with self._neo4j.session(default_access_mode="READ") as session:
             ares = await (await session.run(
                 f"MATCH (n) WHERE (n:{ONT.fact}"
@@ -11880,38 +11906,43 @@ class MemoryCoordinator:
                 f"   AND (n.rem_prompt_version IS NULL"
                 f"        OR n.rem_prompt_version < $v)"
             )
-            if blocked:
-                older_cypher += " AND NOT n.pg_id IN $blocked"
-            older_cypher += " RETURN count(*) AS backlog_older"
-            older = await (await session.run(
-                older_cypher, v=REM_PROMPT_VERSION,
-                **({"blocked": blocked} if blocked else {}),
-            )).data()
-            if blocked:
-                withheld = await (await session.run(
-                    f"MATCH (n) WHERE (n:{ONT.fact} OR n:{ONT.retrospective})"
-                    f"   AND n.pg_id IS NOT NULL"
-                    f"   AND coalesce(n.superseded,false) = false"
-                    f"   AND coalesce(n.rem_processed,false) = true"
-                    f"   AND coalesce(n.rem_invalid,false) = false"
-                    f"   AND (n.rem_prompt_version IS NULL"
-                    f"        OR n.rem_prompt_version < $v)"
-                    f"   AND n.pg_id IN $blocked"
-                    f" RETURN count(*) AS backlog_withheld",
-                    v=REM_PROMPT_VERSION, blocked=blocked,
+            older_n = None
+            withheld_n = None
+            if backlog_readable:
+                if blocked:
+                    older_cypher += " AND NOT n.pg_id IN $blocked"
+                older_cypher += " RETURN count(*) AS backlog_older"
+                older = await (await session.run(
+                    older_cypher, v=REM_PROMPT_VERSION,
+                    **({"blocked": blocked} if blocked else {}),
                 )).data()
-                withheld_n = sum(r["backlog_withheld"] for r in withheld)
-            else:
-                withheld_n = 0
+                older_n = sum(r["backlog_older"] for r in older)
+                if blocked:
+                    withheld = await (await session.run(
+                        f"MATCH (n) WHERE (n:{ONT.fact} OR n:{ONT.retrospective})"
+                        f"   AND n.pg_id IS NOT NULL"
+                        f"   AND coalesce(n.superseded,false) = false"
+                        f"   AND coalesce(n.rem_processed,false) = true"
+                        f"   AND coalesce(n.rem_invalid,false) = false"
+                        f"   AND (n.rem_prompt_version IS NULL"
+                        f"        OR n.rem_prompt_version < $v)"
+                        f"   AND n.pg_id IN $blocked"
+                        f" RETURN count(*) AS backlog_withheld",
+                        v=REM_PROMPT_VERSION, blocked=blocked,
+                    )).data()
+                    withheld_n = sum(r["backlog_withheld"] for r in withheld)
+                else:
+                    withheld_n = 0
         out = {
             "passed_over": sum(r["n"] * r["p"] for r in attempts),
             "starved_pending": sum(r["n"] for r in attempts
                                    if r["p"] >= REM_STARVED_THRESHOLD),
             "throughput_per_hour": float(row["n"]),
             "degeneration_firings": None,
-            "backlog_older_prompt": sum(r["backlog_older"] for r in older),
-            "backlog_withheld": withheld_n,
         }
+        if older_n is not None and withheld_n is not None:
+            out["backlog_older_prompt"] = older_n
+            out["backlog_withheld"] = withheld_n
         if isinstance(rem_count.get("dead_lettered"), int):
             out["dead_lettered"] = rem_count["dead_lettered"]
         return out

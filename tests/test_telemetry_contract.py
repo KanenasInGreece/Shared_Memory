@@ -764,8 +764,8 @@ _NEO4J_PLAN = [
         {"p": 0, "n": 40}]),
     ("MATCH (f:Fact) WHERE f.pg_id IS NOT NULL", [
         {"rem": True, "con": True, "superseded": False, "n": 900}]),
-    ("MATCH (d:Decision) RETURN coalesce(d.rem_processed,false)", [
-        {"rem": True, "superseded": False, "n": 200}]),
+    ("MATCH (d:Decision) RETURN coalesce(d.superseded,false)", [
+        {"superseded": False, "n": 200}]),
     ("RETURN d.pg_id AS pg_id, count(*) AS n", [{"pg_id": 1, "n": 200}]),
     ("AS blocking_ids", [
         {"pg_id": 1, "ready": True, "blocking_ids": [], "spine_nodes": 1}]),

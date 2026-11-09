@@ -8,6 +8,7 @@ import os
 import sys
 
 import pytest
+from unittest.mock import MagicMock
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "shared-memory", "scripts"))
 
@@ -70,7 +71,7 @@ async def test_r1_release_leaves_an_invalid_node_processed(monkeypatch):
     invalid = {"pg_id": 7, "rem_processed": True, "rem_invalid": True}
     healthy = {"pg_id": 8, "rem_processed": True, "rem_invalid": False}
     daemon = _daemon([invalid, healthy])
-    await daemon._release_eligible_write_failed()
+    await daemon._release_eligible_write_failed(MagicMock())
     assert invalid["rem_processed"] is True
     assert healthy["rem_processed"] is False
 

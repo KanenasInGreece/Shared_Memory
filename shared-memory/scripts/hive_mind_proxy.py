@@ -853,6 +853,20 @@ def llm_largest_ctx() -> int:
     return max(vals) if vals else 0
 
 
+def daemon_llm_identity() -> dict:
+    """Identity stamped onto the dream daemons for backlog eligibility.
+
+    The gateway process env is not that identity. The gauge and the children
+    must use this dict, or an eligible row after a boot change still looks blocked.
+    """
+    return {
+        "pool_id": llm_pool_id(),
+        "largest_ctx": llm_largest_ctx(),
+        "largest_reply": llm_largest_reply(),
+        "boot_id": _GATEWAY_BOOT_ID,
+    }
+
+
 def llm_largest_reply() -> int:
     """Largest min(max_output_tokens, n_ctx times (1 - margin)) in the pool.
 

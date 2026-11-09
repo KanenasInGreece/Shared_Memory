@@ -89,7 +89,7 @@ class _Graph:
             return _Result(self.rows_for(ids))
         return _Result([
             {"pg_id": i, "rem_processed": True, "superseded": False,
-             "rem_invalid": False}
+             "rem_invalid": False, "labels": ["Fact"]}
             for i in ids
         ])
 
@@ -97,7 +97,7 @@ class _Graph:
 def _processed(ids, bad=(), superseded=()):
     return [
         {"pg_id": i, "rem_processed": i not in bad, "superseded": i in superseded,
-         "rem_invalid": False}
+         "rem_invalid": False, "labels": ["Fact"]}
         for i in ids
     ]
 
@@ -175,7 +175,7 @@ def test_d_superseded_row_is_exempt():
     """N3. A carried reversed Decision with superseded set and rem_processed
     false is exempt. Dies when that flag is read as unprocessed."""
     rows = [{"pg_id": 10, "rem_processed": False, "superseded": True,
-             "rem_invalid": False}]
+             "rem_invalid": False, "labels": ["Decision"]}]
     unprocessed, duplicated = unprocessed_carried([10], rows)
     assert unprocessed == []
     assert duplicated == []
@@ -186,7 +186,7 @@ def test_f_missing_row_is_unprocessed():
     missing row is read as processed."""
     unprocessed, duplicated = unprocessed_carried([10, 11], [
         {"pg_id": 10, "rem_processed": True, "superseded": False,
-         "rem_invalid": False},
+         "rem_invalid": False, "labels": ["Fact"]},
     ])
     assert unprocessed == [11]
     assert duplicated == []
@@ -198,9 +198,9 @@ def test_i_duplicate_node_defers_and_is_named():
     when the rows are merged or the superseded one exempts the id."""
     base = [
         {"pg_id": 10, "rem_processed": True, "superseded": False,
-         "rem_invalid": False},
+         "rem_invalid": False, "labels": ["Fact"]},
         {"pg_id": 10, "rem_processed": False, "superseded": False,
-         "rem_invalid": False},
+         "rem_invalid": False, "labels": ["Fact"]},
     ]
     for flip in (False, True):
         for order in (base, list(reversed(base))):
@@ -215,9 +215,9 @@ def test_rows_outside_the_carried_set_are_ignored():
     """A row for an id the fold does not carry changes neither list."""
     unprocessed, duplicated = unprocessed_carried([10], [
         {"pg_id": 99, "rem_processed": False, "superseded": False,
-         "rem_invalid": False},
+         "rem_invalid": False, "labels": ["Fact"]},
         {"pg_id": 10, "rem_processed": True, "superseded": False,
-         "rem_invalid": False},
+         "rem_invalid": False, "labels": ["Fact"]},
     ])
     assert unprocessed == []
     assert duplicated == []
@@ -435,7 +435,7 @@ async def test_e_unprocessed_pass_through_fact_does_not_defer(monkeypatch):
                 self.readiness_ids.append(ids)
                 return _Result([
                     {"pg_id": i, "rem_processed": i != 50,
-                     "superseded": False, "rem_invalid": False}
+                     "superseded": False, "rem_invalid": False, "labels": ["Fact"]}
                     for i in ids
                 ])
             if "UNWIND $ids" in query:
@@ -497,7 +497,8 @@ async def test_g1_check1_failure_folds_nothing_with_and_without_refolds(monkeypa
     assert daemon._fold_insight.await_count == 0
     outcome, extra, _kw = _extra(finishes)
     assert outcome == "completed"
-    assert extra is None
+    assert extra["excluded_pending_rem_failed"] is True
+    assert "rem_pending_clusters" not in extra
     assert any("readiness check 1 (refolds) failed" in m for m in _warnings(caplog))
 
     caplog.clear()
@@ -506,7 +507,8 @@ async def test_g1_check1_failure_folds_nothing_with_and_without_refolds(monkeypa
     await daemon2.run_insight_cycle()
     assert daemon2._fold_insight.await_count == 0
     _outcome, extra2, _kw = _extra(finishes2)
-    assert extra2 is None
+    assert extra2["excluded_pending_rem_failed"] is True
+    assert "rem_pending_clusters" not in extra2
     assert graph2.readiness_calls == [[]]
     assert any("readiness check 1 (refolds) failed" in m for m in _warnings(caplog))
 
@@ -653,10 +655,10 @@ async def test_i_duplicate_node_is_logged_as_a_graph_defect(monkeypatch, caplog)
         out = []
         for i in ids:
             out.append({"pg_id": i, "rem_processed": True, "superseded": False,
-                         "rem_invalid": False})
+                         "rem_invalid": False, "labels": ["Fact"]})
             if i == 10:
                 out.append({"pg_id": i, "rem_processed": False, "superseded": True,
-                             "rem_invalid": False})
+                             "rem_invalid": False, "labels": ["Fact"]})
         return out
 
     graph = _Graph(rows_for=_rows)
@@ -688,7 +690,7 @@ async def test_i_check2_duplicate_of_a_pending_set_is_still_an_error(monkeypatch
         rows = _processed(ids, bad={11})
         rows.append({
             "pg_id": 10, "rem_processed": True, "superseded": False,
-            "rem_invalid": False,
+            "rem_invalid": False, "labels": ["Fact"],
         })
         return rows
 

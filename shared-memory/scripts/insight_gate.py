@@ -130,8 +130,8 @@ def unprocessed_carried(carried_ids, rows) -> tuple[list[int], list[int]]:
     both lists are ascending ints without repeats, and a row outside the
     carried ids is ignored. One Decision node is ready on presence alone:
     its stored rem_processed is not a gate (decision:3582). A row with no
-    labels keeps the fact and retrospective rule, so a caller that does not
-    return labels still judges those rows by rem_processed.
+    labels is unprocessed: the stored flag is not a fallback, because a
+    double that forgot labels would otherwise hide an unprocessed fact.
     """
     wanted: list[int] = []
     seen: set[int] = set()
@@ -163,6 +163,8 @@ def unprocessed_carried(carried_ids, rows) -> tuple[list[int], list[int]]:
             # the duplicate error (decision:3582).
             unprocessed.append(pid)
             duplicated.append(pid)
+        elif not _row_labels(group[0]):
+            unprocessed.append(pid)
         elif ONT.decision in _row_labels(group[0]):
             continue
         elif _flag(group[0].get("superseded")):
@@ -178,31 +180,44 @@ def decision_readiness_cypher() -> str:
     A Fact on an outgoing grounding edge, or a Retrospective on an outgoing
     HAD_OUTCOME, blocks while it is live, has a pg_id, and is neither
     rem_processed nor rem_invalid. A node with no pg_id is not a blocker
-    (fact:3587). Ready is false when any Decision twin of that pg_id has
-    such a blocker. spine_nodes counts Fact, Decision and Retrospective
-    nodes that carry the pg_id. This text has no ``AS rem_invalid`` alias:
-    that alias belongs to carried_readiness_cypher so a rig can tell the
-    two reads apart.
+    (fact:3587). Ready is false when no Decision node carries the pg_id, or
+    when any Decision twin has such a blocker. spine_nodes counts Fact,
+    Decision and Retrospective nodes that carry the pg_id, each sought by
+    its label. This text has no ``AS rem_invalid`` alias: that alias belongs
+    to carried_readiness_cypher so a rig can tell the two reads apart.
     """
     grounding = ", ".join(repr(rel) for rel in GROUNDING_RELATIONS)
+    fact, decision, retro = ONT.fact, ONT.decision, ONT.retrospective
     return (
         "UNWIND $ids AS pid "
-        "OPTIONAL MATCH (spine) "
-        "WHERE spine.pg_id = pid "
-        f"AND (spine:{ONT.fact} OR spine:{ONT.decision} OR spine:{ONT.retrospective}) "
-        "WITH pid, count(spine) AS spine_nodes "
-        f"OPTIONAL MATCH (d:{ONT.decision} {{pg_id: pid}})-[rel]->(b) "
-        f"WHERE ((type(rel) IN [{grounding}] AND b:{ONT.fact}) "
-        f"OR (type(rel) = '{ONT.had_outcome}' AND b:{ONT.retrospective})) "
+        "CALL { "
+        "WITH pid "
+        f"MATCH (s:{fact} {{pg_id: pid}}) RETURN s "
+        "UNION "
+        "WITH pid "
+        f"MATCH (s:{decision} {{pg_id: pid}}) RETURN s "
+        "UNION "
+        "WITH pid "
+        f"MATCH (s:{retro} {{pg_id: pid}}) RETURN s "
+        "UNION "
+        "WITH pid "
+        "RETURN null AS s "
+        "} "
+        "WITH pid, count(s) AS spine_nodes, "
+        f"count(CASE WHEN s:{decision} THEN 1 END) AS decision_nodes "
+        f"OPTIONAL MATCH (d:{decision} {{pg_id: pid}})-[rel]->(b) "
+        f"WHERE ((type(rel) IN [{grounding}] AND b:{fact}) "
+        f"OR (type(rel) = '{ONT.had_outcome}' AND b:{retro})) "
         "AND b.pg_id IS NOT NULL "
         "AND coalesce(b.superseded, false) = false "
         "AND coalesce(b.rem_processed, false) = false "
         "AND coalesce(b.rem_invalid, false) = false "
-        "WITH pid, spine_nodes, collect(DISTINCT CASE "
-        f"WHEN b:{ONT.fact} THEN 'fact:' + toString(b.pg_id) "
-        f"WHEN b:{ONT.retrospective} THEN 'retrospective:' + toString(b.pg_id) "
+        "WITH pid, spine_nodes, decision_nodes, collect(DISTINCT CASE "
+        f"WHEN b:{fact} THEN 'fact:' + toString(b.pg_id) "
+        f"WHEN b:{retro} THEN 'retrospective:' + toString(b.pg_id) "
         "ELSE null END) AS blocking_ids "
-        "RETURN pid AS pg_id, (size(blocking_ids) = 0) AS ready, "
+        "RETURN pid AS pg_id, "
+        "(decision_nodes > 0 AND size(blocking_ids) = 0) AS ready, "
         "blocking_ids, spine_nodes"
     )
 

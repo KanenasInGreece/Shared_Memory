@@ -34,7 +34,7 @@ from pool_status import pool_roster_state
 from dream_telemetry import (record_llm_call, embed_ceiling,
                              EMBED_MAX_CHARS, EMBED_MAX_CONTEXT_TOKENS)
 import llm_backlog
-from record_ref import make_ref
+from record_ref import doc_record_type, make_ref
 from secure_env import (
     load_split_env, get_secret, require_db_credentials, read_daemon_token_from_fd,
     require_llm_backends_json_parses, pg_dsn,
@@ -494,7 +494,7 @@ class _CycleRec:
                  "rem_pending_clusters", "rem_pending_incomplete",
                  # Groups or components that fail only because admit_members
                  # dropped a fresh decision. None until the fresh scan finishes.
-                 "excluded_pending_rem")
+                 "excluded_pending_rem", "excluded_pending_rem_failed")
 
     def __init__(self):
         self.attempted = self.succeeded = self.failed = 0
@@ -523,6 +523,7 @@ class _CycleRec:
         self.rem_pending_clusters = None
         self.rem_pending_incomplete = None
         self.excluded_pending_rem = None
+        self.excluded_pending_rem_failed = False
 
     def fold(self, ok):
         self.attempted += 1
@@ -558,6 +559,7 @@ class _CycleRec:
             or self.singleton_clusters
             or self.rem_pending_clusters is not None
             or self.excluded_pending_rem is not None
+            or self.excluded_pending_rem_failed
         ):
             return None
         out = {
@@ -586,6 +588,10 @@ class _CycleRec:
             out["insight_gate_skips"] = self.insight_gate_skips
         if self.excluded_pending_rem is not None:
             out["excluded_pending_rem"] = self.excluded_pending_rem
+        elif self.excluded_pending_rem_failed:
+            # A readiness failure must not leave the key off the row. A later
+            # reader that skips key-less cycles would otherwise serve an older count.
+            out["excluded_pending_rem_failed"] = True
         if self.fold_dead_letter:
             out["fold_dead_letter"] = self.fold_dead_letter
         return out
@@ -750,17 +756,17 @@ def fold_record_line(record, content, node_state=None):
     discussions), so it never invents provenance a fact does not have. Pure →
     testable (the fold's per-line format is unit-checkable without an LLM).
     ``ref`` and ``text_is`` name the record and which text entry_text_is chose
-    (brief §3.4). No node state means the caller already passed the line body."""
+    (brief §3.4). A missing node state is a pointer: inventing rem_processed
+    would fold a record the graph has not summarised."""
     if not isinstance(record, dict):
         return f"[FACT] {content}"
     origin = record.get("origin")
     origin_marker = f' from="{origin}"' if origin else ""
     rtype = str(record.get("rtype", "fact"))
-    # A legacy caller passes the line body and no graph node. A processed
-    # state with no summary makes entry_text_is return that body.
-    state = node_state if isinstance(node_state, dict) else {"rem_processed": True}
+    rtype_norm = doc_record_type({"type": record.get("rtype")})
+    state = node_state if isinstance(node_state, dict) else None
     text_is, text = entry_text_is(
-        rtype.lower(), state, content if isinstance(content, str) else "")
+        rtype_norm, state, content if isinstance(content, str) else "")
     body = text if isinstance(text, str) else ""
     pg_id = record.get("pg_id", "?")
     return (f"[{rtype.upper()}"
@@ -768,7 +774,7 @@ def fold_record_line(record, content, node_state=None):
             f"{origin_marker}"
             f" recorded={record.get('recorded', 'unknown')}"
             f" pg_id={pg_id}"
-            f" ref={rtype.lower()}:{pg_id}"
+            f" ref={rtype_norm}:{pg_id}"
             f" text_is={text_is}] {body}")
 
 
@@ -786,12 +792,18 @@ def render_thematic_fold(contents, pg_ids, record_map=None, state_map=None):
         state = state_map.get(pid)
         invalid = isinstance(state, dict) and bool(
             state.get("rem_invalid") or state.get("fact_invalid"))
-        if invalid and pid not in record_map:
-            logger.warning(
-                "NREM fold: fact:%s is rem_invalid and has no Postgres row "
-                "— left out of the fold",
-                pid,
-            )
+        if pid not in record_map:
+            if invalid:
+                logger.warning(
+                    "NREM fold: fact:%s is rem_invalid and has no Postgres row "
+                    "— left out of the fold",
+                    pid,
+                )
+            else:
+                logger.warning(
+                    "NREM fold: pg_id %s has no Postgres row — left out of the fold",
+                    pid,
+                )
             continue
         rec = dict(
             record_map.get(pid) or
@@ -3361,9 +3373,12 @@ class ConsolidationDaemon:
                                 ]
                 out = {}
                 for r in rows:
-                    # A stub may still return the six columns from before content
-                    # was selected. A missing column is not a missing row.
-                    pg_content = r[6] if len(r) > 6 else None
+                    # Six columns means the content column was not selected.
+                    # Treating that as an empty body would fold a false full_record.
+                    if len(r) < 7:
+                        raise RuntimeError(
+                            "fold record row has no content column")
+                    pg_content = r[6]
                     pid, project, rtype, sref, recorded, meta = r[:6]
                     rtype = rtype or "fact"
                     meta = meta if isinstance(meta, dict) else {}
@@ -4212,6 +4227,7 @@ class ConsolidationDaemon:
                     logger.warning(
                         "NREM insight: readiness check 1 (refolds) failed — "
                         "no fold this cycle: %s", exc)
+                    rec.excluded_pending_rem_failed = True
                     return
                 rec.rem_pending_clusters = 0
                 rec.rem_pending_incomplete = True
@@ -4254,6 +4270,7 @@ class ConsolidationDaemon:
                     logger.warning(
                         "NREM insight: decision readiness read failed — "
                         "no fresh fold this cycle: %s", exc)
+                    rec.excluded_pending_rem_failed = True
                     return
                 if hasattr(self, "_insight_excluded_pending_rem"):
                     rec.excluded_pending_rem = self._insight_excluded_pending_rem

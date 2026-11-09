@@ -17,7 +17,7 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(__file__))
 from aiohttp import web as aw
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 from test_reasoning_routing import (
     LOCAL,
@@ -1025,7 +1025,7 @@ async def test_m20_release_skips_an_ineligible_write_failed_row(monkeypatch):
     daemon = rem.REMDaemon.__new__(rem.REMDaemon)
     daemon._withheld = set()
     daemon.driver = _Graph([8, 9], rem.ONT.fact)
-    await daemon._release_eligible_write_failed()
+    await daemon._release_eligible_write_failed(MagicMock())
     flat = [i for batch in daemon.driver.cleared for i in batch]
     assert flat == [9]
 

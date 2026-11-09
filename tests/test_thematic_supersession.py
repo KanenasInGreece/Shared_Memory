@@ -181,20 +181,20 @@ async def test_t1_superseded_constituent_retires_and_folds_successor_atomically(
 
     # Scanned rows: facts 1, 3, 4, 5
     scan_rows = [
-        {"pg_id": 1, "content": "fact 1", "project": "proj", "domain": "ops"},
-        {"pg_id": 3, "content": "fact 3", "project": "proj", "domain": "ops"},
-        {"pg_id": 4, "content": "fact 4", "project": "proj", "domain": "ops"},
-        {"pg_id": 5, "content": "fact 5", "project": "proj", "domain": "ops"},
+        {"pg_id": 1, "content": "fact 1", "project": "proj", "rem_processed": True, "domain": "ops"},
+        {"pg_id": 3, "content": "fact 3", "project": "proj", "domain": "ops", "rem_processed": True},
+        {"pg_id": 4, "content": "fact 4", "project": "proj", "domain": "ops", "rem_processed": True},
+        {"pg_id": 5, "content": "fact 5", "project": "proj", "domain": "ops", "rem_processed": True},
     ]
     d = datetime.date(2026, 9, 29)
 
     script = [
         # 1. _fetch_records
         {"rowcount": 4, "rows": [
-            (1, "proj", "fact", None, d, {}),
-            (3, "proj", "fact", None, d, {}),
-            (4, "proj", "fact", None, d, {}),
-            (5, "proj", "fact", None, d, {}),
+            (1, "proj", "fact", None, d, {}, None),
+            (3, "proj", "fact", None, d, {}, None),
+            (4, "proj", "fact", None, d, {}, None),
+            (5, "proj", "fact", None, d, {}, None),
         ]},
         # 2. fetch_active_thematic_rows: returns active row 10 with source_pg_ids [1, 2, 3, 4]
         {"rowcount": 1, "rows": [
@@ -314,15 +314,15 @@ async def test_t2_removed_member_not_superseded_and_pure_accumulation_upserts_in
 
     # Active row has [1, 2, 3]. Scan has [1, 3]. Fact 2 is NOT in technical_docs.superseded.
     scan_rows = [
-        {"pg_id": 1, "content": "fact 1", "project": "proj", "domain": "ops"},
-        {"pg_id": 3, "content": "fact 3", "project": "proj", "domain": "ops"},
+        {"pg_id": 1, "content": "fact 1", "project": "proj", "rem_processed": True, "domain": "ops"},
+        {"pg_id": 3, "content": "fact 3", "project": "proj", "domain": "ops", "rem_processed": True},
     ]
     d = datetime.date(2026, 9, 29)
 
     script = [
         {"rowcount": 2, "rows": [
-            (1, "proj", "fact", None, d, {}),
-            (3, "proj", "fact", None, d, {}),
+            (1, "proj", "fact", None, d, {}, None),
+            (3, "proj", "fact", None, d, {}, None),
         ]},
         {"rowcount": 0, "rows": []},
         # Active row: id 10 with source [1, 2, 3]
@@ -381,15 +381,15 @@ async def test_t3_group_drops_below_density_retired_without_successor_and_ledger
 
     # Grounded fact scan has only 2 facts for 'proj/sparse' (below threshold 3)
     scan_rows = [
-        {"pg_id": 1, "content": "fact 1", "project": "proj", "domain": "sparse"},
-        {"pg_id": 2, "content": "fact 2", "project": "proj", "domain": "sparse"},
+        {"pg_id": 1, "content": "fact 1", "project": "proj", "rem_processed": True, "domain": "sparse"},
+        {"pg_id": 2, "content": "fact 2", "project": "proj", "domain": "sparse", "rem_processed": True},
     ]
     d = datetime.date(2026, 9, 29)
 
     script = [
         {"rowcount": 2, "rows": [
-            (1, "proj", "fact", None, d, {}),
-            (2, "proj", "fact", None, d, {}),
+            (1, "proj", "fact", None, d, {}, None),
+            (2, "proj", "fact", None, d, {}, None),
         ]},
         # No eligible clusters because density_threshold=3 > 2 members
         # Step 5: retire_invalidated_summaries(conn, kinds=("thematic",), skip_ids=())
@@ -446,20 +446,20 @@ async def test_t4_unchanged_gating_row_with_pg_superseded_fact_logs_warning_and_
 
     content_ops = "[FACT kind=discussion recorded=2026-09-29 pg_id=1 ref=fact:1 text_is=full_record] fact 1\n[FACT kind=discussion recorded=2026-09-29 pg_id=2 ref=fact:2 text_is=full_record] fact 2"
     scan_rows = [
-        {"pg_id": 1, "content": "fact 1", "project": "proj", "domain": "ops"},
-        {"pg_id": 2, "content": "fact 2", "project": "proj", "domain": "ops"},
-        {"pg_id": 3, "content": "fact 3", "project": "proj", "domain": "dev"},
-        {"pg_id": 4, "content": "fact 4", "project": "proj", "domain": "dev"},
+        {"pg_id": 1, "content": "fact 1", "project": "proj", "rem_processed": True, "domain": "ops"},
+        {"pg_id": 2, "content": "fact 2", "project": "proj", "domain": "ops", "rem_processed": True},
+        {"pg_id": 3, "content": "fact 3", "project": "proj", "domain": "dev", "rem_processed": True},
+        {"pg_id": 4, "content": "fact 4", "project": "proj", "domain": "dev", "rem_processed": True},
     ]
     d = datetime.date(2026, 9, 29)
 
     script = [
         # 1. _fetch_records for 1, 2, 3, 4
         {"rowcount": 4, "rows": [
-            (1, "proj", "fact", None, d, {}),
-            (2, "proj", "fact", None, d, {}),
-            (3, "proj", "fact", None, d, {}),
-            (4, "proj", "fact", None, d, {}),
+            (1, "proj", "fact", None, d, {}, None),
+            (2, "proj", "fact", None, d, {}, None),
+            (3, "proj", "fact", None, d, {}, None),
+            (4, "proj", "fact", None, d, {}, None),
         ]},
         # 2. Active rows:
         #    - (proj, ops) has id 10 matching content -> unchanged gating key
@@ -604,11 +604,11 @@ async def test_step5_calls_graph_marker_with_retired_ids(monkeypatch):
 
     # 1 member below threshold 3 -> no eligible clusters
     scan_rows = [
-        {"pg_id": 1, "content": "fact 1", "project": "proj", "domain": "ops"},
+        {"pg_id": 1, "content": "fact 1", "project": "proj", "rem_processed": True, "domain": "ops"},
     ]
     d = datetime.date(2026, 9, 29)
     script = [
-        {"rowcount": 1, "rows": [(1, "proj", "fact", None, d, {})]},
+        {"rowcount": 1, "rows": [(1, "proj", "fact", None, d, {}, None)]},
         {"rowcount": 0, "rows": []},
         # Drop passes after loop
         {"rowcount": 0, "rows": []},
@@ -637,7 +637,7 @@ async def test_step5_calls_graph_marker_with_retired_ids(monkeypatch):
     # Verify R3: Neo4j exception does not crash _consolidate_clusters
     daemon._mark_summaries_retired_in_graph = AsyncMock(side_effect=RuntimeError("Neo4j connection dropped"))
     conn2 = StubConn(script=[
-        {"rowcount": 1, "rows": [(1, "proj", "fact", None, d, {})]},
+        {"rowcount": 1, "rows": [(1, "proj", "fact", None, d, {}, None)]},
         {"rowcount": 0, "rows": []},
         {"rowcount": 0, "rows": []},
         {"rowcount": 0, "rows": []},
@@ -689,7 +689,7 @@ async def test_t8_run_ledger_sweep_with_empty_backlog_still_consolidates(monkeyp
 
     # Grounded fact scan returns 1 group
     daemon._find_grounded_fact_groups = AsyncMock(return_value=[
-        {"pg_id": 1, "content": "c1", "project": "p", "domain": "d"},
+        {"pg_id": 1, "content": "c1", "project": "p", "domain": "d", "rem_processed": True},
     ])
     daemon._consolidate_clusters = AsyncMock()
 
@@ -1078,12 +1078,12 @@ async def test_s4_regate_links_newest_lineage_retired_row(monkeypatch):
     monkeypatch.setattr(cl, "_crun_finish", lambda *a, **k: None)
     daemon.get_embedding = AsyncMock(return_value=[0.1] * 4)
 
-    scan_rows = [{"pg_id": 1, "content": "fact 1", "project": "proj", "domain": "ops"}]
+    scan_rows = [{"pg_id": 1, "content": "fact 1", "project": "proj", "rem_processed": True, "domain": "ops"}]
     d = datetime.date(2026, 9, 29)
 
     # Subtest 1: Lineage-retired row 40 with superseded_by IS NULL on the key -> found and linked!
     script_1 = [
-        {"rowcount": 1, "rows": [(1, "proj", "fact", None, d, {})]},  # _fetch_records
+        {"rowcount": 1, "rows": [(1, "proj", "fact", None, d, {}, None)]},  # _fetch_records
         {"rowcount": 0, "rows": []},  # fetch_active_thematic_rows: NO active row!
         {"rowcount": 0, "rows": []},  # census outbox
         {"rowcount": 0, "rows": []},  # step 5 retire_invalidated_summaries

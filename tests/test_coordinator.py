@@ -2109,7 +2109,14 @@ async def test_rem_dead_letter_count_uses_the_pending_cypher():
 
     async def _fetch(sql, *args, **kwargs):
         if "llm_backlog" in sql:
-            return [{"item_key": "7"}, {"item_key": "9"}, {"item_key": "nope"}]
+            return [
+                {"item_key": "7", "reason": "no_context", "largest_ctx": 10**9,
+                 "largest_reply": 0, "pool_id": "", "boot_id": ""},
+                {"item_key": "9", "reason": "no_context", "largest_ctx": 10**9,
+                 "largest_reply": 0, "pool_id": "", "boot_id": ""},
+                {"item_key": "nope", "reason": "no_context", "largest_ctx": 10**9,
+                 "largest_reply": 0, "pool_id": "", "boot_id": ""},
+            ]
         return []
 
     mock_conn.fetch = AsyncMock(side_effect=_fetch)

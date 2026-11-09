@@ -101,7 +101,7 @@ async def test_fetch_non_rem_batch_orders_pickups_first_then_attempts_then_pg_id
     mock_session.run = AsyncMock(return_value=mock_result)
 
     with patch.object(rem_mod.llm_backlog, "blocked_keys", return_value=set()):
-        pg_ids, labels, passed_over = await daemon._fetch_non_rem_batch()
+        pg_ids, labels, passed_over = await daemon._fetch_non_rem_batch(MagicMock())
 
     assert pg_ids == [1, 2]
     assert passed_over == {1: 0, 2: 2}
@@ -156,7 +156,7 @@ async def test_fetch_non_rem_batch_selects_fact_and_retrospective_only():
     mock_session.run = AsyncMock(return_value=mock_result)
 
     from rem_loop import ONT
-    await daemon._fetch_non_rem_batch()
+    await daemon._fetch_non_rem_batch(MagicMock())
 
     assert mock_session.run.call_count == 1
     cypher = mock_session.run.call_args_list[0].args[0]
@@ -1458,12 +1458,12 @@ async def test_batch_fetch_content_reads_a_stored_type_in_another_case_as_its_ty
     daemon = REMDaemon.__new__(REMDaemon)
     cur = MagicMock()
     cur.fetchall.return_value = [
-        (5, "body", "Decision", "discussion_context", "9", "held", None)]
+        (5, "body", "Decision", "discussion_context", "9", "validated", None)]
     conn = MagicMock()
     conn.cursor.return_value.__enter__.return_value = cur
     out = await daemon._batch_fetch_content([5], conn, asyncio.get_running_loop())
     assert out[5]["kind"] == "decision"
     assert out[5]["fact_kind"] == "discussion"
     assert out[5]["decision_ref"] == "decision:9"
-    assert out[5]["rating"] == "held"
+    assert out[5]["rating"] == "validated"
     assert out[5]["created_at"] is None

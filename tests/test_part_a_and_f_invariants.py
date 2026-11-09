@@ -624,7 +624,8 @@ async def test_i10_failed_reacquire_aborts_nrem_insight_cycle(monkeypatch):
                 async def data(_self):
                     return [
                         {"pg_id": i, "rem_processed": True,
-                         "superseded": False, "rem_invalid": False}
+                         "superseded": False, "rem_invalid": False,
+                         "labels": ["Fact"]}
                         for i in ids
                     ]
             return _R()
@@ -713,7 +714,8 @@ async def test_i9_one_member_set_bought_at_most_once_across_refold_and_fresh(mon
                 async def data(_self):
                     return [
                         {"pg_id": i, "rem_processed": True,
-                         "superseded": False, "rem_invalid": False}
+                         "superseded": False, "rem_invalid": False,
+                         "labels": ["Fact"]}
                         for i in ids
                     ]
             return _R()
