@@ -11574,12 +11574,17 @@ class MemoryCoordinator:
         ident = provider() if callable(provider) else provider
         if not isinstance(ident, dict):
             return None
+        # {} is false, so eligible() would read this process. A partial dict
+        # raises and the gauges disappear. Either path is not fail-closed.
+        if any(key not in ident for key in ("pool_id", "largest_ctx", "largest_reply", "boot_id")):
+            return None
         return ident
 
     async def _rem_backlog_ineligible_pg_ids(self) -> list[int]:
         """Keys the older-prompt and withheld gauges treat as blocked.
 
-        No provider means every row is blocked. An eligible row is left out.
+        No provider, and a dict missing any of the four identity keys, means
+        every row is blocked. An eligible row is left out.
         The dead-letter count does not use this list.
         """
         import llm_eligibility

@@ -856,6 +856,167 @@ async def test_backlog_gauges_omit_both_keys_when_the_read_fails(monkeypatch):
     assert out["passed_over"] == 0
 
 
+PROXY_SRC = (SCRIPTS / "hive_mind_proxy.py").read_text(encoding="utf-8")
+
+_SM_FROM_DAEMON_IDENTITY = {
+    "SM_LLM_POOL_ID": "pool_id",
+    "SM_LLM_LARGEST_CTX": "largest_ctx",
+    "SM_LLM_LARGEST_REPLY": "largest_reply",
+    "SM_GATEWAY_BOOT_ID": "boot_id",
+}
+
+
+def _call_name(node):
+    func = getattr(node, "func", None)
+    if isinstance(func, ast.Name):
+        return func.id
+    if isinstance(func, ast.Attribute):
+        return func.attr
+    return None
+
+
+def _identity_subscript_key(node, bindings):
+    """Key read from daemon_llm_identity(), or from a name bound to that call. str() is allowed."""
+    if isinstance(node, ast.Call) and _call_name(node) == "str" and len(node.args) == 1 and not node.keywords:
+        node = node.args[0]
+    if not isinstance(node, ast.Subscript) or not isinstance(node.slice, ast.Constant):
+        return None
+    base = node.value
+    if isinstance(base, ast.Call) and _call_name(base) == "daemon_llm_identity" and not base.args and not base.keywords:
+        return node.slice.value
+    if isinstance(base, ast.Name) and bindings.get(base.id) == "daemon_llm_identity":
+        return node.slice.value
+    return None
+
+
+def main_assigns_daemon_identity_provider(source):
+    """True when main assigns coordinator.daemon_identity_provider = daemon_llm_identity."""
+    tree = ast.parse(source)
+    for node in tree.body:
+        if not isinstance(node, ast.AsyncFunctionDef) or node.name != "main":
+            continue
+        for stmt in ast.walk(node):
+            if not isinstance(stmt, ast.Assign):
+                continue
+            for target in stmt.targets:
+                if (
+                    isinstance(target, ast.Attribute)
+                    and target.attr == "daemon_identity_provider"
+                    and isinstance(target.value, ast.Name)
+                    and target.value.id == "coordinator"
+                    and isinstance(stmt.value, ast.Name)
+                    and stmt.value.id == "daemon_llm_identity"
+                ):
+                    return True
+        return False
+    return False
+
+
+def daemon_env_takes_sm_values_from_daemon_llm_identity(source):
+    """True when each SM_* child value is a field of daemon_llm_identity()."""
+    tree = ast.parse(source)
+    for node in tree.body:
+        if not isinstance(node, ast.FunctionDef) or node.name != "_daemon_env_and_token_fd":
+            continue
+        bindings = {}
+        found = {}
+        for stmt in node.body:
+            if not isinstance(stmt, ast.Assign) or len(stmt.targets) != 1:
+                continue
+            target = stmt.targets[0]
+            if isinstance(target, ast.Name):
+                call = stmt.value
+                if (
+                    isinstance(call, ast.Call)
+                    and _call_name(call) == "daemon_llm_identity"
+                    and not call.args
+                    and not call.keywords
+                ):
+                    bindings[target.id] = "daemon_llm_identity"
+                elif target.id in bindings:
+                    bindings[target.id] = None
+            elif (
+                isinstance(target, ast.Subscript)
+                and isinstance(target.value, ast.Name)
+                and target.value.id == "env"
+                and isinstance(target.slice, ast.Constant)
+                and isinstance(target.slice.value, str)
+            ):
+                found[target.slice.value] = _identity_subscript_key(stmt.value, bindings)
+        return all(
+            found.get(env_key) == ident_key
+            for env_key, ident_key in _SM_FROM_DAEMON_IDENTITY.items()
+        )
+    return False
+
+
+def test_main_assigns_daemon_identity_provider_shape_only():
+    """Shape only. Kills: main() dropping coordinator.daemon_identity_provider = daemon_llm_identity (D3)."""
+    assert main_assigns_daemon_identity_provider(PROXY_SRC)
+
+
+def test_daemon_env_takes_sm_values_from_daemon_llm_identity_shape_only():
+    """Shape only. Kills: SM_GATEWAY_BOOT_ID or another SM_* value leaving daemon_llm_identity() (D3)."""
+    assert daemon_env_takes_sm_values_from_daemon_llm_identity(PROXY_SRC)
+
+
+@pytest.mark.asyncio
+async def test_partial_daemon_identity_blocks_every_backlog_row(monkeypatch):
+    """Kills: an empty or partial provider dict falling back to this process environment (D4).
+
+    All four keys must be present. Otherwise every rem backlog row is blocked.
+    """
+    import coordinator as co
+
+    monkeypatch.setenv("SM_LLM_POOL_ID", "env-pool")
+    monkeypatch.setenv("SM_LLM_LARGEST_CTX", "99")
+    monkeypatch.setenv("SM_LLM_LARGEST_REPLY", "99")
+    monkeypatch.setenv("SM_GATEWAY_BOOT_ID", "env-boot")
+    coord = co.MemoryCoordinator.__new__(co.MemoryCoordinator)
+    full = {
+        "pool_id": "pool-a", "largest_ctx": 8, "largest_reply": 8, "boot_id": "boot-current",
+    }
+    rows = [
+        {"item_key": "4", "reason": "write_failed", "largest_ctx": 8,
+         "largest_reply": 8, "pool_id": "pool-a", "boot_id": "env-boot"},
+        {"item_key": "5", "reason": "no_context", "largest_ctx": 1,
+         "largest_reply": 1, "pool_id": "pool-a", "boot_id": "env-boot"},
+        {"item_key": "6", "reason": "write_failed", "largest_ctx": 8,
+         "largest_reply": 8, "pool_id": "pool-a", "boot_id": "boot-current"},
+    ]
+
+    class _Conn:
+        async def fetch(self, sql, *args, **kwargs):
+            assert "FROM llm_backlog" in sql
+            return rows
+
+    class _Acquire:
+        async def __aenter__(self):
+            return _Conn()
+
+        async def __aexit__(self, *_):
+            return False
+
+    coord._acquire = lambda: _Acquire()
+
+    coord.daemon_identity_provider = lambda: {}
+    assert coord._daemon_identity() is None
+    assert await coord._rem_backlog_ineligible_pg_ids() == [4, 5, 6]
+
+    for key in ("pool_id", "largest_ctx", "largest_reply", "boot_id"):
+        partial = dict(full)
+        del partial[key]
+        coord.daemon_identity_provider = lambda ident=partial: dict(ident)
+        assert coord._daemon_identity() is None
+        assert await coord._rem_backlog_ineligible_pg_ids() == [4, 5, 6]
+
+    coord.daemon_identity_provider = lambda: dict(full)
+    got = coord._daemon_identity()
+    assert got["boot_id"] == "boot-current"
+    assert got["pool_id"] == "pool-a"
+    assert await coord._rem_backlog_ineligible_pg_ids() == [6]
+
+
 def test_inv6_shorter_summary_names_summary_and_ref():
     """Kills: a fold body that ignores entry_text_is and keeps the whole record (inv 6)."""
     state = {"rem_processed": True, "rem_summary": "short", "rem_prompt_version": 2}
