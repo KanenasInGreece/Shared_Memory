@@ -7,6 +7,10 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.1.2] - 2026-11-09
+
+Fact and retrospective nodes in the graph now hold only their summary, not a copy of the record's text. The REM daemon writes that summary for every live fact and retrospective, with a prompt per record kind, and keeps it only when it is shorter than the record. Until then, every read surface shows the record as a pointer to its full text in Postgres. Decision nodes keep their title and rationale, and a decision joins an insight only once its facts and retrospectives are processed. Existing summaries are rewritten once in the background while consolidation keeps running, and `REM_SUMMARY_THRESHOLD` is removed. `migrate_retro_edges.py` is removed too, so an install with unconverted legacy retrospectives must run it from 1.1.1 before upgrading. The gateway, both daemons and their gate and backlog helpers, the backfill scripts, the CLI, the MCP connector and system prompt, `.env.example`, the skill, usage, setup, schema and telemetry documents, the changelog and the tests change, and telemetry gains four keys under `API_VERSION` 6. This release cannot be rolled back to 1.1.1, and security dependencies were reviewed.
+
 ## [1.1.1] - 2026-11-05
 
 The skill now tells an agent what a search returns and when it has what it needs. This is a documentation change to SKILL.md, USAGE.md and the MCP search tool's description. The code and the API are unchanged (`API_VERSION` stays 6).

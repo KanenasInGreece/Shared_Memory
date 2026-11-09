@@ -84,7 +84,7 @@ __all__ = [
 ]
 
 #: Not a free-running today: this is the fifth version pin, so a missed bump is visible (decision:1832).
-VERSION = "1.1.1"
+VERSION = "1.1.2"
 
 
 def _version_tuple(v: str) -> tuple:
@@ -168,7 +168,7 @@ INTRODUCED_1_0_41 = "1.0.41"
 INTRODUCED_1_0_42 = "1.0.42"
 INTRODUCED_1_0_44 = "1.0.44"
 INTRODUCED_1_0_45 = "1.0.45"
-#: New REM/NREM keys for release 2. VERSION in this file stays 1.1.1 until the merger stamps 1.1.2.
+#: New REM/NREM keys for release 2.
 INTRODUCED_1_1_2 = "1.1.2"
 #: A lone consolidation stall stopped degrading the top /health status (fact:2996 ruling 3).
 INTRODUCED_1_0_17 = "1.0.17"
@@ -1787,6 +1787,34 @@ MEANING_CHANGES: tuple[dict, ...] = (
         "now": ("with GATEWAY_REQUIRE_PRINCIPAL set, a TCP write during a quiesce is refused "
                 "by the principal check first and counts here as 403"),
         "action": "expect fewer 503 and more 403 during a quiesce on such installs",
+        "shape_changed": False,
+    },
+    {
+        "endpoint": "telemetry",
+        "path": "neo4j.decisions_rem_pending",
+        "in_version": INTRODUCED_1_1_2,
+        "was": "decisions whose stored rem_processed flag was false",
+        "now": ("live decisions not yet REM-processed by the computed rule: every fact and "
+                "retrospective they point to is processed (fact:3541); not REM work"),
+        "action": "never sum it with facts_rem_pending; expect a drop at deploy",
+        "shape_changed": False,
+    },
+    {
+        "endpoint": "telemetry",
+        "path": "neo4j.rem_passed_over_total",
+        "in_version": INTRODUCED_1_1_2,
+        "was": "passed-over count over facts, decisions and retrospectives",
+        "now": "facts and retrospectives only: REM no longer selects a decision",
+        "action": "expect a step down at deploy",
+        "shape_changed": False,
+    },
+    {
+        "endpoint": "telemetry",
+        "path": "neo4j.rem_starved_pending",
+        "in_version": INTRODUCED_1_1_2,
+        "was": "starved records over facts, decisions and retrospectives",
+        "now": "facts and retrospectives only: REM no longer selects a decision",
+        "action": "expect a step down at deploy",
         "shape_changed": False,
     },
 )
