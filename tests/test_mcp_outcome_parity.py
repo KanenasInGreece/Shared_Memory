@@ -376,7 +376,7 @@ async def test_p4c_lineage_graph_and_telemetry_return_the_cli_object(
     lineage = {"pg_id": 5, "exists": True, "related": [{
         "relation": {"from": "fact:5", "relation": "INFORMED_BY", "to": "fact:6",
                      "props": {}},
-        "record": {"ref": "fact:6", "text": "whole", "text_is": "full_record",
+        "record": {"ref": "fact:6", "text_is": "pointer",
                    "full_record": {"ref": "fact:6", "chars": 5,
                                    "read_with": "search --ref fact:6"}}}]}
     graph = {"records": [{"n": {

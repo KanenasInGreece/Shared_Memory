@@ -3,7 +3,7 @@
 
 # The Telemetry Contract
 
-Contract version **1.1.1**. Every key the gateway emits on `GET /health` and `GET /memory/telemetry`, what it means, what it is measured in, when it arrived, and where it is going.
+Contract version **1.1.2**. Every key the gateway emits on `GET /health` and `GET /memory/telemetry`, what it means, what it is measured in, when it arrived, and where it is going.
 
 ## The roles
 
@@ -63,6 +63,9 @@ A key whose **value** changed meaning while its **name** stayed. Enumerated beca
 | health | `status` | 1.0.17 | degraded whenever dependencies.nrem_daemon was degraded, including a consolidation stall alone | a consolidation stall alone (nrem_daemon degraded with reason exactly stalled:insight, stalled:fact_consolidation or both) no longer degrades it; the stall shows on nrem_daemon only | alert on a consolidation stall from dependencies.nrem_daemon.reason, not from status |
 | telemetry | `gateway.by_status.503` | 1.0.18 | on an install without auth, the load-shed valve and pool saturation only; writes were never shed during a backup quiesce there | also every write refused during a quiesce on an install without auth (auth-on installs already counted them) | read gateway.shed_503_total for the load-shed valve alone; a quiesce 503 is the difference |
 | telemetry | `gateway.by_status.403` | 1.0.18 | role and principal refusals; a TCP write during a quiesce was a 503 | with GATEWAY_REQUIRE_PRINCIPAL set, a TCP write during a quiesce is refused by the principal check first and counts here as 403 | expect fewer 503 and more 403 during a quiesce on such installs |
+| telemetry | `neo4j.decisions_rem_pending` | 1.1.2 | decisions whose stored rem_processed flag was false | live decisions not yet REM-processed by the computed rule: every fact and retrospective they point to is processed (fact:3541); not REM work | never sum it with facts_rem_pending; expect a drop at deploy |
+| telemetry | `neo4j.rem_passed_over_total` | 1.1.2 | passed-over count over facts, decisions and retrospectives | facts and retrospectives only: REM no longer selects a decision | expect a step down at deploy |
+| telemetry | `neo4j.rem_starved_pending` | 1.1.2 | starved records over facts, decisions and retrospectives | facts and retrospectives only: REM no longer selects a decision | expect a step down at deploy |
 
 ## Removed outright in 0.9.74
 
@@ -494,7 +497,7 @@ The envelope is `{"status": "success", "telemetry": {…}}`; paths below are rel
 | key | type | unit | since | moved to | removed in | log twin | notes |
 |---|---|---|---|---|---|---|---|
 | `outbox.age_limit_s` | int | _s | 0.9.74 | — | — | — | OUTBOX_AGE_WARN_S — the limit oldest_pending_age_s is compared against |
-| `outbox.applied` | int | — | 0.9.74 | — | — | — | — |
+| `outbox.applied` | int | — | 0.9.74 | — | — | — | Decision outbox rows are no longer advanced to rem_reviewed, so a decision's apply lands here and outbox.rem_reviewed does not grow for it. A decision's lineage rem_reviewed_at stays null. |
 | `outbox.apply_latency_p50_s` | float/null | _s | 0.9.74 | — | — | — | — |
 | `outbox.apply_latency_p95_s` | float/null | _s | 0.9.74 | — | — | — | — |
 | `outbox.apply_latency_window` | int | — | 0.9.74 | — | — | — | — |
@@ -504,7 +507,7 @@ The envelope is `{"status": "success", "telemetry": {…}}`; paths below are rel
 | `outbox.oldest_failed_age_s` | int/null | _s | 0.9.74 | — | — | — | — |
 | `outbox.oldest_pending_age_s` | int/null | _s | 0.9.74 | — | — | `health.warning.outbox_oldest_pending_age_s` | — |
 | `outbox.pending` | int | — | 0.9.74 | — | — | — | — |
-| `outbox.rem_reviewed` | int | — | 0.9.74 | — | — | — | — |
+| `outbox.rem_reviewed` | int | — | 0.9.74 | — | — | — | REM no longer moves a Decision outbox row to rem_reviewed. The count is Fact and Retrospective reviews. A decision stays on applied. |
 
 ### postgres
 
@@ -630,14 +633,17 @@ The envelope is `{"status": "success", "telemetry": {…}}`; paths below are rel
 | `latency.rem_ms.by_model[].wall_ms.p50` | float/null | _ms | <=0.9.73 | — | — | — | — |
 | `latency.rem_ms.by_model[].wall_ms.p95` | float/null | _ms | <=0.9.73 | — | — | — | — |
 | `latency.rem_ms.note` | str | — | <=0.9.73 | — | — | — | — |
-| `neo4j.decisions_rem_pending` | int | — | <=0.9.73 | — | — | — | — |
+| `neo4j.decisions_rem_pending` | int | — | <=0.9.73 | — | — | — | live decisions not ready by the computed builder (decision:3582); not REM work; never sum with facts_rem_pending |
 | `neo4j.facts_rem_pending` | int | — | <=0.9.73 | — | — | — | — |
+| `neo4j.retrospectives_rem_pending` | int | — | 1.1.2 | — | — | — | live Retrospective nodes that are not rem_processed |
+| `rem.backlog_older_prompt` | int | — | 1.1.2 | — | — | — | live, valid, not-withheld Fact\|Retrospective nodes still carrying an older or no rem_prompt_version stamp. Absent when llm_backlog is unreadable |
+| `rem.backlog_withheld` | int | — | 1.1.2 | — | — | — | older-stamp Fact\|Retrospective nodes withheld by a rem backlog row. Absent when llm_backlog is unreadable |
 | `rem.dead_lettered` | int | — | 0.9.74 | — | — | `health.rem_daemon` | pending records that have a backlog row; a superseded record is excluded. A withheld record shows degraded. |
 | `rem.degeneration_firings` | int/null | — | 0.9.74 | — | — | — | Null. The loop check runs in the gateway on a cut-off reply and writes a log line. This key does not count those lines. Reporting 0 would say the check never fired. |
 | `rem.error` | str | — | 0.9.74 | — | — | — | present only when this section's own query failed |
-| `rem.passed_over` | int | — | 0.9.74 | — | — | — | — |
-| `rem.starved_pending` | int | — | 0.9.74 | — | — | — | — |
-| `rem.throughput_per_hour` | float/null | — | 0.9.74 | — | — | — | records REM stamped in the last hour, from the durable technical_docs.rem_timing clock |
+| `rem.passed_over` | int | — | 0.9.74 | — | — | — | Fact and Retrospective only; decisions are not counted (brief §8) |
+| `rem.starved_pending` | int | — | 0.9.74 | — | — | — | Fact and Retrospective only; decisions are not counted (brief §8) |
+| `rem.throughput_per_hour` | float/null | — | 0.9.74 | — | — | — | batched facts REM stamped in the last hour, from the durable technical_docs.rem_timing clock, including batched backlog facts; solo work writes no timing |
 
 ### nrem/consolidation
 
@@ -704,7 +710,8 @@ The envelope is `{"status": "success", "telemetry": {…}}`; paths below are rel
 
 | key | type | unit | since | moved to | removed in | log twin | notes |
 |---|---|---|---|---|---|---|---|
-| `nrem.decision_cycles` | int | — | <=0.9.73 | — | — | — | candidate-group gauge seeded by REM-processed facts; it does not run the insight readiness check, so it overcounts a deferred component |
+| `nrem.decision_cycles` | int | — | <=0.9.73 | — | — | — | candidate-group gauge seeded by REM-processed facts; admit_members drops an unconsolidated decision that is not ready (decision:3582); a component waiting on an unprocessed fact is still counted |
+| `nrem.insight_excluded_pending_rem` | int | — | 1.1.2 | — | — | — | insight groups or components that fail the gate only because admit_members dropped a fresh decision (decision:3582). Absent until an insight cycle records the count |
 | `postgres.community_summaries.insight` | int | — | <=0.9.73 | — | — | — | — |
 | `refold_ledger.by_status_reason[]` | list | — | <=0.9.73 | — | — | — | — |
 | `refold_ledger.by_status_reason[].closed_reason` | str/null | — | <=0.9.73 | — | — | — | — |

@@ -39,7 +39,7 @@ The mutation check for the underlying guard itself
 already covered exhaustively by test_secrets_out_of_process_env.py and
 test_deployer_file_secrets.py (see Local_Documentation/A4_HANDOFF.md for the
 manual mutation-check log). What this file adds is delegation coverage: that
-these twelve callers actually reach that guard rather than re-implementing
+these callers actually reach that guard rather than re-implementing
 their own.
 """
 import importlib
@@ -60,7 +60,6 @@ SWEPT_SCRIPTS = [
     "cleanup_entity_noise.py",
     "cleanup_foreign_schema.py",
     "entity_fragment_rate.py",
-    "migrate_retro_edges.py",
     "normalize_projects.py",
     "reconcile_project_edges.py",
     "reconcile_project_identity.py",

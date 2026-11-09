@@ -106,7 +106,7 @@ async def test_unknown_outbox_type_fails_immediately_without_fact_merge():
     """F-NJ-02. type='project-of' must not fall through to Fact MERGE.
 
     MUTATION: restore the unnamed else-Fact fall-through → this dies
-    (session.run is called with SET f.content, or status='applied').
+    (session.run is called with MERGE (f:Fact, or status='applied').
     """
     c, conn, session = _coord_outbox()
     await c._apply_outbox_row(
@@ -116,7 +116,7 @@ async def test_unknown_outbox_type_fails_immediately_without_fact_merge():
     )
     for call in session.run.await_args_list:
         q = call.args[0] if call.args else ""
-        assert "SET f.content" not in q, q
+        assert "MERGE (f:" not in q, q
     statements = [k.args[0] for k in conn.execute.call_args_list]
     assert any("status='failed'" in s for s in statements), statements
     assert not any("status='applied'" in s for s in statements)
@@ -134,8 +134,10 @@ async def test_missing_and_fact_type_still_merge_a_fact():
         mock_dec.assert_not_awaited()
     assert session.run.await_count >= 1
     await c._apply_outbox_row(3, 44, {"content_snippet": "y", "entities": []}, 0)
-    assert any("SET f.content" in (call.args[0] if call.args else "")
+    assert any("MERGE (f:" in (call.args[0] if call.args else "")
                for call in session.run.await_args_list)
+    assert not any("SET f.content" in (call.args[0] if call.args else "")
+                   for call in session.run.await_args_list)
 
 
 # ── F-NJ-03 one Cypher: OPTIONAL MATCH/DELETE + UNWIND (not FOREACH+MATCH) ───
@@ -549,7 +551,8 @@ async def test_fact_merge_cypher_refuses_a_different_spine_label():
     await c._apply_outbox_row(
         2, 43, {"type": "fact", "content_snippet": "x", "entities": []}, 0)
     merge_q = next(call.args[0] for call in session.run.await_args_list
-                   if "SET f.content" in (call.args[0] if call.args else ""))
+                   if "MERGE (f:" in (call.args[0] if call.args else ""))
+    assert "SET f.content" not in merge_q
     assert "existing" in merge_q
     assert ONT.fact in merge_q
     assert "IS NULL" in merge_q or f"existing:{ONT.fact}" in merge_q
@@ -718,12 +721,6 @@ async def test_retrospective_hash_includes_date_and_rating():
 
     r3 = await _once("validated")
     assert json.loads(r3.text)["pg_id"] == b1["pg_id"]
-
-
-def test_migrate_retro_edges_keeps_the_old_hash_formula():
-    src = (_SCRIPTS / "migrate_retro_edges.py").read_text(encoding="utf-8")
-    assert "retrospective:{p['decision_id']}:{notes}" in src \
-        or 'retrospective:{' in src and ":{notes}" in src
 
 
 # ── read-role comment: graph stays off the allowlist ─────────────────────────

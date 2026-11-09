@@ -106,7 +106,7 @@ class _Neo:
             ids = list(params.get("ids") or [])
             return _Result([
                 {"pg_id": i, "rem_processed": True, "superseded": False,
-                 "rem_invalid": False}
+                 "rem_invalid": False, "labels": ["Fact"]}
                 for i in ids
             ])
         if "NOT n.pg_id IN $blocked" in query:
@@ -146,7 +146,7 @@ async def test_rem_backlog_row_stops_the_second_call(monkeypatch):
     daemon._batch_action = None
     daemon._batch_reason = None
     daemon._batch_specimen = ""
-    long = "z" * (rem.REM_SUMMARY_THRESHOLD + 4)
+    long = "z" * (2004)
     neo = _Neo([{
         "pg_id": 8,
         "rem_attempts": 0,
@@ -349,7 +349,7 @@ async def test_non_string_summary_pays_once_across_three_cycles(monkeypatch):
         calls.append(1)
         return _chat('{"summary": 123}', usage={"completion_tokens": 2})
 
-    long = "z" * (rem.REM_SUMMARY_THRESHOLD + 4)
+    long = "z" * (2004)
     daemon, mem = _rem_ready(monkeypatch, 8, long, _post)
     for _ in range(3):
         await daemon.run_cycle()
@@ -368,7 +368,7 @@ async def test_string_usage_pays_once(monkeypatch):
         calls.append(1)
         return _chat('{"summary": "fine"}', usage="nope")
 
-    long = "z" * (rem.REM_SUMMARY_THRESHOLD + 4)
+    long = "z" * (2004)
     daemon, mem = _rem_ready(monkeypatch, 8, long, _post)
     neo = daemon.driver.session()
     writes = []
@@ -406,7 +406,7 @@ async def test_overflow_idx_does_not_escape_the_cycle(monkeypatch):
     daemon._solo_only = set()
     daemon._withheld = set()
     daemon._batch_paid = True
-    long = "z" * (rem.REM_SUMMARY_THRESHOLD + 4)
+    long = "z" * (2004)
     neo = _Neo([
         {"pg_id": 1, "rem_passed_over": 0, "labels": [rem.ONT.fact]},
         {"pg_id": 2, "rem_passed_over": 0, "labels": [rem.ONT.fact]},
@@ -456,7 +456,7 @@ async def test_rem_other_5xx_writes_no_row(monkeypatch, status_code):
         R.status_code = status_code
         return R()
 
-    long = "z" * (rem.REM_SUMMARY_THRESHOLD + 4)
+    long = "z" * (2004)
     daemon, mem = _rem_ready(monkeypatch, 8, long, _post)
     await daemon.run_cycle()
     await daemon.run_cycle()
@@ -483,7 +483,7 @@ async def test_batch_422_cut_off_falls_back_to_solo(monkeypatch):
         return R()
 
     monkeypatch.setattr("httpx.AsyncClient.post", _post)
-    long = "z" * (rem.REM_SUMMARY_THRESHOLD + 4)
+    long = "z" * (2004)
     await daemon._llm_process_batch([
         {"pg_id": 1, "content": long},
         {"pg_id": 2, "content": long},
@@ -509,7 +509,7 @@ async def test_missing_batch_fact_is_solo_only(monkeypatch):
     daemon._solo_only = set()
     daemon._withheld = set()
     daemon._batch_paid = True
-    long = "z" * (rem.REM_SUMMARY_THRESHOLD + 4)
+    long = "z" * (2004)
     neo = _Neo([
         {"pg_id": 1, "rem_passed_over": 0, "labels": [rem.ONT.fact]},
         {"pg_id": 2, "rem_passed_over": 0, "labels": [rem.ONT.fact]},
@@ -547,7 +547,7 @@ async def test_rem_success_deletes_the_backlog_row(monkeypatch):
     async def _post(self, url, **kwargs):
         return _chat('{"summary": "stored"}')
 
-    long = "z" * (rem.REM_SUMMARY_THRESHOLD + 4)
+    long = "z" * (2004)
     daemon, mem = _rem_ready(monkeypatch, 8, long, _post)
     # A different pool id makes the stored loop eligible. The same pool would withhold it.
     mem.rows[("rem", "8")] = ("loop", 1, 1, "pool-old", "boot-a", "")
@@ -569,7 +569,7 @@ async def test_rem_neo4j_failure_writes_write_failed(monkeypatch):
     async def _boom(*args, **kwargs):
         raise RuntimeError("bolt down")
 
-    long = "z" * (rem.REM_SUMMARY_THRESHOLD + 4)
+    long = "z" * (2004)
     daemon, mem = _rem_ready(monkeypatch, 8, long, _post)
     daemon._write_neo4j_rem = _boom
     await daemon.run_cycle()
@@ -811,7 +811,7 @@ async def test_backlog_insert_failure_withholds_paid_solo(monkeypatch, caplog):
         calls.append(1)
         return _chat("{}", usage={"completion_tokens": 2})
 
-    long = "z" * (rem.REM_SUMMARY_THRESHOLD + 4)
+    long = "z" * (2004)
     daemon, mem = _rem_ready(monkeypatch, 8, long, _post)
 
     def _boom(*args, **kwargs):
@@ -864,7 +864,7 @@ async def test_rem_free_4xx_queues_three_cycles(monkeypatch, code):
         calls.append(code)
         return _status_chat(code, {"error": "no credit"})
 
-    long = "z" * (rem.REM_SUMMARY_THRESHOLD + 4)
+    long = "z" * (2004)
     daemon, mem = _rem_ready(monkeypatch, 8, long, _post)
     for _ in range(3):
         await daemon.run_cycle()
@@ -883,7 +883,7 @@ async def test_rem_4xx_with_usage_backlogs_connection_lost(monkeypatch, code):
         calls.append(code)
         return _status_chat(code, {"error": "no", "usage": {"completion_tokens": 1}})
 
-    long = "z" * (rem.REM_SUMMARY_THRESHOLD + 4)
+    long = "z" * (2004)
     daemon, mem = _rem_ready(monkeypatch, 8, long, _post)
     for _ in range(3):
         await daemon.run_cycle()
@@ -901,7 +901,7 @@ async def test_rem_html_200_queues(monkeypatch):
         calls.append(1)
         return _status_chat(200, "<html>maintenance</html>")
 
-    long = "z" * (rem.REM_SUMMARY_THRESHOLD + 4)
+    long = "z" * (2004)
     daemon, mem = _rem_ready(monkeypatch, 8, long, _post)
     for _ in range(3):
         await daemon.run_cycle()
@@ -919,7 +919,7 @@ async def test_rem_json_without_choices_is_unparseable(monkeypatch):
         calls.append(1)
         return _status_chat(200, {"usage": {"completion_tokens": 1}})
 
-    long = "z" * (rem.REM_SUMMARY_THRESHOLD + 4)
+    long = "z" * (2004)
     daemon, mem = _rem_ready(monkeypatch, 8, long, _post)
     await daemon.run_cycle()
     await daemon.run_cycle()
@@ -938,7 +938,7 @@ async def test_rem_400_naming_context_length_queues(monkeypatch):
         calls.append(1)
         return _status_chat(400, {"error": {"message": "maximum context length"}})
 
-    long = "z" * (rem.REM_SUMMARY_THRESHOLD + 4)
+    long = "z" * (2004)
     daemon, mem = _rem_ready(monkeypatch, 8, long, _post)
     for _ in range(3):
         await daemon.run_cycle()
@@ -1036,7 +1036,7 @@ async def test_failed_revert_retries_write_failed_on_a_new_boot(monkeypatch):
         calls.append(1)
         return _chat('{"summary": "stored"}', usage={"completion_tokens": 3})
 
-    long = "z" * (rem.REM_SUMMARY_THRESHOLD + 4)
+    long = "z" * (2004)
     daemon, mem = _rem_ready(monkeypatch, 8, long, _post)
     state = {"processed": False, "reverts": 0}
 
@@ -1061,7 +1061,7 @@ async def test_failed_revert_retries_write_failed_on_a_new_boot(monkeypatch):
                 raise RuntimeError("bolt")
             if "rem_processed = true" in query:
                 state["processed"] = True
-                return _Result([])
+                return _Result([{"count": 1}])
             if "coalesce(n.rem_processed, false) = false" in query:
                 blocked = set(params.get("blocked") or [])
                 if state["processed"] or 8 in blocked:

@@ -94,5 +94,5 @@ def test_contract_text_for_the_two_keys():
     assert flag["since"] == "1.0.46"
     assert "at least this many, possibly more" in clusters["note"]
     assert "null exactly when rem_pending_clusters is null" in flag["note"]
-    assert "overcounts a deferred component" in tc.TELEMETRY["nrem.decision_cycles"]["note"]
+    assert "unprocessed fact is still counted" in tc.TELEMETRY["nrem.decision_cycles"]["note"]
     assert "REM-processed" in tc.TELEMETRY["consolidation.*.eligible_clusters"]["note"]

@@ -37,7 +37,7 @@ from typing import Any
 
 import httpx
 
-VERSION = "1.1.1"
+VERSION = "1.1.2"
 # API_VERSION is the wire contract; bump only when shape, auth, routes, or a monitor
 # contract change breaks older clients. v6: entries carry text, text_is, full_record.
 API_VERSION = 6
@@ -1260,8 +1260,9 @@ def format_status(payload: dict, health: dict | None = None) -> str:
         lines.append(f"  facts:     {nj.get('facts_total','?')} total | "
                      f"REM pending {nj.get('facts_rem_pending','?')} | "
                      f"unconsolidated {nj.get('facts_unconsolidated','?')}")
+        lines.append(f"  retrospectives: REM pending {nj.get('retrospectives_rem_pending','?')}")
         lines.append(f"  decisions: {nj.get('decisions_total','?')} total | "
-                     f"REM pending {nj.get('decisions_rem_pending','?')}")
+                     f"{nj.get('decisions_rem_pending','?')} waiting on their records")
     # REM is computed apart from the graph census, so a Neo4j error and an enrichment error stay
     # on their own lines.
     rem = t.get("rem", {})
@@ -1636,13 +1637,11 @@ def _build_query(template: str, args) -> str:
         )
         return "\n".join(lines)
 
-    # The payload lives on the record node now; older installs still keep it on the edge. Read
-    # node fields for a Retrospective, edge fields otherwise.
+    # A Retrospective node is returned whole so the gateway renders its entry. A legacy
+    # self-loop is the decision itself (t = d); that row still returns the edge notes.
     _RETRO_FIELDS = (
         "WITH d, o, t,"
         " CASE WHEN t:Retrospective THEN t.rating ELSE o.rating END AS rating,"
-        " CASE WHEN t:Retrospective THEN coalesce(t.rem_summary, t.content)"
-        "      ELSE o.notes END AS notes,"
         " CASE WHEN t:Retrospective THEN t.date ELSE o.date END AS date"
     )
 
@@ -1652,7 +1651,10 @@ def _build_query(template: str, args) -> str:
         if rating:
             lines.append(f"WHERE rating CONTAINS '{rating}'")
         lines.append(
-            "RETURN d.title, d.pg_id, rating, notes, date ORDER BY date DESC"
+            "RETURN d.title, d.pg_id, rating, date, "
+            "CASE WHEN t:Retrospective THEN t END AS retrospective, "
+            "CASE WHEN NOT t:Retrospective THEN o.notes END AS notes "
+            "ORDER BY date DESC"
         )
         return "\n".join(lines)
 
@@ -1670,8 +1672,10 @@ def _build_query(template: str, args) -> str:
         if project:
             lines.append(f"WHERE p.name CONTAINS '{project}'")
         lines.append(
-            "RETURN d.title, d.pg_id, rating, notes, "
-            "date, h.name AS decided_by ORDER BY date DESC"
+            "RETURN d.title, d.pg_id, rating, date, "
+            "CASE WHEN t:Retrospective THEN t END AS retrospective, "
+            "CASE WHEN NOT t:Retrospective THEN o.notes END AS notes, "
+            "h.name AS decided_by ORDER BY date DESC"
         )
         return "\n".join(lines)
 

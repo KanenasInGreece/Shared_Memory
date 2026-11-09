@@ -31,11 +31,11 @@ Mutation table (measured in a scratchpad copy, never in this checkout,
 
 | mutation | must kill | must NOT kill |
 |---|---|---|
-| remove `trust_env=False` from `memory_bridge.py:369` (sync TCP) | `test_census_no_escape_hatch_and_literal_trust_env`, `test_cli_sync_client_tcp_trust_env_false`, `test_environment_proxy_variables_ignored_with_trust_env_false` | aiohttp/MCP/coordinator value tests; `test_census_total_constructor_count_is_20` |
+| remove `trust_env=False` from `memory_bridge.py:369` (sync TCP) | `test_census_no_escape_hatch_and_literal_trust_env`, `test_cli_sync_client_tcp_trust_env_false`, `test_environment_proxy_variables_ignored_with_trust_env_false` | aiohttp/MCP/coordinator value tests; `test_census_total_constructor_count_is_19` |
 | remove it from `memory_bridge.py:362` (async TCP) | `test_census_no_escape_hatch_and_literal_trust_env`, `test_cli_async_client_tcp_trust_env_false`, `test_cli_real_search_action_trust_env_false` | the environment leg; every other value test |
 | remove it from `hive_mind_proxy.py:1845`'s `ClientSession(...)` | `test_census_aiohttp_clientsession_trust_env`, `test_aiohttp_start_session_trust_env_false` | every httpx test |
 | add `proxy="http://127.0.0.1:1"` beside an existing `trust_env=False` | `test_census_no_escape_hatch_and_literal_trust_env` only | everything else |
-| add `httpx.get("http://127.0.0.1:1/")` as an unreachable statement inside `pool_roster_state` (after its final `return`) | `test_census_no_bare_verb_calls` only | all value tests, `test_census_total_constructor_count_is_20` |
+| add `httpx.get("http://127.0.0.1:1/")` as an unreachable statement inside `pool_roster_state` (after its final `return`) | `test_census_no_bare_verb_calls` only | all value tests, `test_census_total_constructor_count_is_19` |
 
 The census COUNT assertion and its PER-CALL keyword assertion are different
 guards — a keyword removal never changes how many constructor calls exist,
@@ -108,17 +108,15 @@ _BARE_VERBS = ("get", "post", "put", "patch", "delete", "head", "options",
 # Measured directly at this base (both `memory_bridge.py` copies count
 # separately — they are byte-identical files, not one file counted twice):
 # shared-memory/scripts/{coordinator,consolidation_loop,memory_bridge,
-# migrate_retro_edges,pool_status,rem_loop}.py, mcp/vector-skill.py, and
-# shared-memory-skill/shared-memory/scripts/memory_bridge.py — EIGHT files.
-# The brief's fold text states this walked-tree import count as 7; a fresh
-# AST count at v0.9.93 (`fact:2106`'s anchor) gives 8, so this test pins the
-# MEASURED value on both sides of the equality (`fact:1309`), not the
-# brief's stated one — a new httpx importer updates this set in the same PR.
+# pool_status,rem_loop}.py, mcp/vector-skill.py, and
+# shared-memory-skill/shared-memory/scripts/memory_bridge.py — SEVEN files.
+# v0.9.93 measured 8 (`fact:2106`); release 2 deletes migrate_retro_edges.py.
+# The set below is the measured set (`fact:1309`). A new importer updates it
+# in the same change.
 _EXPECTED_HTTPX_IMPORTERS = frozenset({
     "shared-memory/scripts/coordinator.py",
     "shared-memory/scripts/consolidation_loop.py",
     "shared-memory/scripts/memory_bridge.py",
-    "shared-memory/scripts/migrate_retro_edges.py",
     "shared-memory/scripts/pool_status.py",
     "shared-memory/scripts/rem_loop.py",
     "mcp/vector-skill.py",
@@ -194,15 +192,13 @@ def test_census_transport_constructors_trust_env_false_and_count_is_5():
             assert bad not in kw, f"{path}:{lineno} {attr} carries escape-hatch keyword {bad}"
 
 
-def test_census_total_constructor_count_is_20():
-    """The 20 sites left after `mcp/vector-skill.py` moved to one client
-    factory (`fact:2106`/`decision:2113` had measured 29: 12 in
-    `coordinator.py`+daemons+CLI, 11 in `vector-skill.py`, 4 in the two
-    `memory_bridge.py` copies + the 2 tooling scripts; `vector-skill.py` now
-    holds 2, one per socket/TCP branch). `pool_has_free_slot` is gone.
-    `pool_roster_state` is the daemon client. These are the ONLY
+def test_census_total_constructor_count_is_19():
+    """The 19 sites left after `migrate_retro_edges.py` was removed (ruling F).
+    Before that, the count was 20: `fact:2106`/`decision:2113` had measured 29,
+    then `vector-skill.py` moved to one client factory. `pool_has_free_slot` is
+    gone. `pool_roster_state` is the daemon client. These are the ONLY
     `httpx.Client`/`httpx.AsyncClient` constructions in the walked trees. A
-    LITERAL 20 (`fact:1309`): a 21st unmarked constructor is a new httpx
+    LITERAL 19 (`fact:1309`): a 20th unmarked constructor is a new httpx
     client the framework grew without this rule.
 
     Mutation: removing a `trust_env=False` keyword from an existing call
@@ -213,8 +209,8 @@ def test_census_total_constructor_count_is_20():
     that failure belongs to `test_census_no_bare_verb_calls`.
     """
     calls = _httpx_constructor_calls()
-    assert len(calls) == 20, (
-        f"expected exactly 20 httpx.Client/AsyncClient constructor calls "
+    assert len(calls) == 19, (
+        f"expected exactly 19 httpx.Client/AsyncClient constructor calls "
         f"under {WALKED_ROOTS}, found {len(calls)}: "
         f"{[(os.path.relpath(p, REPO_ROOT), ln) for p, ln, _, _ in calls]}"
     )
@@ -229,7 +225,7 @@ def test_census_no_bare_verb_calls():
     Mutation: adding `httpx.get("http://127.0.0.1:1/")` as an unreachable
     statement inside `pool_roster_state` (after its own `return`, never
     at module level — the daemons import this module) kills ONLY this test;
-    the constructor count in `test_census_total_constructor_count_is_20`
+    the constructor count in `test_census_total_constructor_count_is_19`
     is unaffected because a bare verb call is not a `Client`/`AsyncClient`
     construction.
     """
@@ -286,9 +282,9 @@ def test_census_import_spelling_and_file_set():
     no `from httpx import ...` (ditto, and also invisible to a `httpx.X`
     attribute match). Tree guard: the set of TRACKED files importing httpx repo-wide
     (git ls-files, excluding `tests/`) equals exactly the walked-tree set —
-    no ninth importer hiding outside the three walked roots.
+    no eighth importer hiding outside the three walked roots.
 
-    Mutation: aliasing any of the 8 known imports, or adding a 9th importer
+    Mutation: aliasing any of the 7 known imports, or adding an 8th importer
     anywhere in the repo (in or out of the walked trees), kills this test
     without touching the constructor-count or per-call assertions above —
     they only ever look at calls whose `func.value` is literally named

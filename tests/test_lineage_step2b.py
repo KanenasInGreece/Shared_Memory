@@ -94,6 +94,11 @@ def _edge(anchor, far, labels, rel, *, inbound=False, rem=None, props=None):
     end_labels = [ONT.fact] if inbound else labels
     return {
         "anchor_rem_summary": rem,
+        "anchor_rem_processed": True if rem else False,
+        "anchor_rem_prompt_version": 2 if rem else None,
+        "rem_summary": rem,
+        "rem_processed": True if rem else False,
+        "rem_prompt_version": 2 if rem else None,
         "rel": rel,
         "start_pg_id": start,
         "start_labels": start_labels,
@@ -234,11 +239,13 @@ async def test_f27_anchor_with_no_neighbour_still_uses_its_rem_summary():
     c._pool.acquire = MagicMock(return_value=_Ctx(c._pool.acquire.return_value))
     # Rebind fetchrow on the connection the pool yields.
     session.run = AsyncMock(return_value=_Rows([{
-        "anchor_rem_summary": REM, "rel": None,
+        "anchor_rem_summary": REM, "anchor_rem_processed": True,
+        "anchor_rem_prompt_version": 2, "rel": None,
     }]))
     # The coordinator built above already holds the connection.
     c2, conn2, session2 = _coord({5: anchor}, [{
-        "anchor_rem_summary": REM, "rel": None,
+        "anchor_rem_summary": REM, "anchor_rem_processed": True,
+        "anchor_rem_prompt_version": 2, "rel": None,
     }])
     conn2.fetchrow = AsyncMock(side_effect=[anchor, None])
     body = json.loads((await c2.handle_status(_status("fact:5"))).text)

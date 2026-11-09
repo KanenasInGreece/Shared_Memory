@@ -17,7 +17,7 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(__file__))
 from aiohttp import web as aw
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 from test_reasoning_routing import (
     LOCAL,
@@ -98,7 +98,7 @@ class _Graph:
             return _Result([])
         if "rem_processed = true" in query and params.get("pg_id") is not None:
             self.processed.add(params["pg_id"])
-            return _Result([])
+            return _Result([{"count": 1}])
         if "NOT n.pg_id IN $blocked" in query:
             blocked = set(params.get("blocked") or [])
             kept = [
@@ -293,8 +293,8 @@ class _Gateway:
 
 
 def _long(marker):
-    import rem_loop as rem
-    return marker + (" z" * (rem.REM_SUMMARY_THRESHOLD // 2 + 4))
+    # A test length, not a product limit (decision:3101). Every record is sent.
+    return marker + (" z" * 1004)
 
 
 async def _run_path(monkeypatch, path, reply, cycles=3, store=False):
@@ -1025,7 +1025,7 @@ async def test_m20_release_skips_an_ineligible_write_failed_row(monkeypatch):
     daemon = rem.REMDaemon.__new__(rem.REMDaemon)
     daemon._withheld = set()
     daemon.driver = _Graph([8, 9], rem.ONT.fact)
-    await daemon._release_eligible_write_failed()
+    await daemon._release_eligible_write_failed(MagicMock())
     flat = [i for batch in daemon.driver.cleared for i in batch]
     assert flat == [9]
 

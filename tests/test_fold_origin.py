@@ -44,6 +44,7 @@ def test_record_type_is_uppercased():
 
 
 def test_missing_keys_fall_back_without_raising():
-    # A dict missing everything still renders with safe defaults.
-    out = line({}, "c")
-    assert out == "[FACT kind=observation recorded=unknown pg_id=?] c"
+    # A dict missing everything still renders with safe defaults. A processed
+    # node with no summary is full_record; a missing node state is a pointer.
+    out = line({}, "c", {"rem_processed": True})
+    assert out == "[FACT kind=observation recorded=unknown pg_id=? ref=fact:? text_is=full_record] c"

@@ -141,7 +141,7 @@ def test_every_reader_actually_imports_the_module():
     # and writes no edges, so it resolves no project at all.
     expected = {
         "coordinator.py", "consolidation_loop.py",
-        "migrate_retro_edges.py", "normalize_projects.py",
+        "normalize_projects.py",
     }
     importers = {name for name, src in _scripts() if "from project_axis import" in src}
     assert expected <= importers, f"no longer importing the axis: {expected - importers}"

@@ -22,8 +22,8 @@ remove. They are the repair path's population, not this script's.
 
 ⚠⚠ **The gateway must already be running the code that HANDLES this row type.**
 An older worker does not recognise ``project_of`` and falls through to its
-ordinary fact branch, which runs ``SET f.content = $content`` with the content
-this row does not carry — blanking the content of every fact it touches. That is
+ordinary fact branch, which writes the fact's text from a parameter this row
+does not carry — blanking the content of every fact it touches. That is
 silent, graph-side data loss, so the version check below is a GUARD, not a
 convenience: enqueue only after the deploy, never before.
 

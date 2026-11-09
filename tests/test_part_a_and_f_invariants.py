@@ -105,7 +105,7 @@ async def test_i1_rem_recovery_write_runs_inside_shared_backup_lock(monkeypatch)
         order.append("take_shared_lock")
         return True
 
-    async def _fake_release_eligible():
+    async def _fake_release_eligible(conn=None):
         order.append("release_eligible_write_failed")
 
     monkeypatch.setattr(rem_loop, "_take_shared_backup_lock", _fake_take_lock)
@@ -156,7 +156,7 @@ async def test_d1_rem_recovery_write_runs_even_with_no_candidates(monkeypatch):
     daemon.driver = mock_driver
 
     recovery_ran = False
-    async def _fake_recovery():
+    async def _fake_recovery(conn=None):
         nonlocal recovery_ran
         recovery_ran = True
 
@@ -347,7 +347,7 @@ async def test_i3_reply_waits_behind_held_exclusive_event_before_store_helper(mo
         }
         return resp
 
-    async def fake_apply(pg_id, kind, result, conn, loop, original_content=""):
+    async def fake_apply(pg_id, kind, result, conn, loop, original_content="", tier=1):
         nonlocal store_helper_executed
         assert exclusive_dump_held.is_set(), "Store helper ran while exclusive lock was still held!"
         store_helper_executed = True
@@ -441,7 +441,7 @@ async def test_i4_rem_reacquire_failed_withholds_and_does_not_mark_unparseable(m
     fake_cm.__aexit__ = AsyncMock(return_value=None)
     monkeypatch.setattr("rem_loop.httpx.AsyncClient", lambda **kw: fake_cm)
 
-    long_content = "x" * (rem_loop.REM_SUMMARY_THRESHOLD + 10)
+    long_content = "x" * (2010)
 
     with pytest.raises(LockReacquireFailed):
         await daemon._llm_process(long_content, "fact", pg_id=42)
@@ -624,7 +624,8 @@ async def test_i10_failed_reacquire_aborts_nrem_insight_cycle(monkeypatch):
                 async def data(_self):
                     return [
                         {"pg_id": i, "rem_processed": True,
-                         "superseded": False, "rem_invalid": False}
+                         "superseded": False, "rem_invalid": False,
+                         "labels": ["Fact"]}
                         for i in ids
                     ]
             return _R()
@@ -713,7 +714,8 @@ async def test_i9_one_member_set_bought_at_most_once_across_refold_and_fresh(mon
                 async def data(_self):
                     return [
                         {"pg_id": i, "rem_processed": True,
-                         "superseded": False, "rem_invalid": False}
+                         "superseded": False, "rem_invalid": False,
+                         "labels": ["Fact"]}
                         for i in ids
                     ]
             return _R()

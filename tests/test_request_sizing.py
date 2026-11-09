@@ -361,7 +361,7 @@ async def test_4_wiring_rem_sends_no_max_tokens_and_does_not_retry(monkeypatch):
         return _MockResp({"choices": [{"finish_reason": "length", "message": {"content": '{"summary":"cut"'}}]})
 
     monkeypatch.setattr("httpx.AsyncClient.post", _mock_post)
-    long_content = "x" * (rem_loop.REM_SUMMARY_THRESHOLD + 1)
+    long_content = "x" * (2001)
     parsed, _model = await daemon._llm_process(long_content, rem_loop.KIND_FACT, pg_id=1)
     assert parsed["summary"] == "s"
     assert "max_tokens" not in calls[0]
@@ -394,7 +394,7 @@ async def test_4_wiring_rem_batch_sends_no_max_tokens(monkeypatch):
         return _MockResp({"choices": [{"finish_reason": "stop", "message": {"content": '{"idx":0,"summary":"s"}\n{"idx":1,"summary":"s2"}'}}]})
 
     monkeypatch.setattr("httpx.AsyncClient.post", _mock_post)
-    long_content = "x" * (rem_loop.REM_SUMMARY_THRESHOLD + 1)
+    long_content = "x" * (2001)
     items = [{"pg_id": 1, "content": long_content}, {"pg_id": 2, "content": long_content}]
     await daemon._llm_process_batch(items)
     assert "max_tokens" not in captured

@@ -251,7 +251,7 @@ async def test_rem_run_cycle_lock_held_and_released_at_post(monkeypatch):
         }
         return resp
 
-    async def fake_apply(pg_id, kind, result, holder, loop, original_content=""):
+    async def fake_apply(pg_id, kind, result, holder, loop, original_content="", tier=1):
         nonlocal lock_state_at_store
         lock_state_at_store = active_conn.lock_held
         return True
@@ -309,7 +309,7 @@ async def test_rem_reconnect_through_run_cycle_uses_second_conn(monkeypatch):
 
     helper_conn_received = None
 
-    async def fake_apply(pg_id, kind, result, holder, loop, original_content=""):
+    async def fake_apply(pg_id, kind, result, holder, loop, original_content="", tier=1):
         nonlocal helper_conn_received
         helper_conn_received = getattr(holder, "conn", holder)
         return True
@@ -351,7 +351,7 @@ async def test_rem_solo_lock_held_states(monkeypatch):
         }
         return resp
 
-    async def fake_apply(pg_id, kind, result, conn, loop, original_content=""):
+    async def fake_apply(pg_id, kind, result, conn, loop, original_content="", tier=1):
         nonlocal lock_state_at_store
         lock_state_at_store = holder.held
         return True

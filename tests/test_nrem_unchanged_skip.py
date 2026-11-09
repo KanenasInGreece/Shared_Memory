@@ -138,15 +138,15 @@ def daemon_with_fake_graph(results=None):
 
 _ROWS = [
     {"pg_id": 1, "content": "The consolidation daemon writes summaries",
-     "project": "general", "domain": "ops"},
+     "project": "general", "domain": "ops", "rem_processed": True},
     {"pg_id": 2, "content": "The outbox worker applies rows",
-     "project": "general", "domain": "ops"},
+     "project": "general", "domain": "ops", "rem_processed": True},
 ]
 
 _CURRENT_CONTENT = (
-    "[FACT kind=tested from=\"tests/test_x.py\" recorded=2026-07-11 pg_id=1] "
+    "[FACT kind=tested from=\"tests/test_x.py\" recorded=2026-07-11 pg_id=1 ref=fact:1 text_is=full_record] "
     "The consolidation daemon writes summaries\n"
-    "[FACT kind=discussion recorded=2026-07-11 pg_id=2] "
+    "[FACT kind=discussion recorded=2026-07-11 pg_id=2 ref=fact:2 text_is=full_record] "
     "The outbox worker applies rows"
 )
 
@@ -159,8 +159,8 @@ def _script(active_rows):
     d = datetime.date(2026, 7, 11)
     return [
         {"rowcount": 2, "rows": [
-            (1, "general", "fact", "tests/test_x.py", d, {"entities": ["Widget"]}),
-            (2, "general", "fact", None, d, {}),
+            (1, "general", "fact", "tests/test_x.py", d, {"entities": ["Widget"]}, None),
+            (2, "general", "fact", None, d, {}, None),
         ]},
         {"rowcount": len(active_rows), "rows": active_rows},  # active thematic rows
     ]

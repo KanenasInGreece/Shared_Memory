@@ -4,7 +4,7 @@ record of G2/G3, the unbounded walk and the reversed-decision exclusion).
 
 Imports only ontology and stdlib; the walk takes an already-built Neo4j driver as a parameter. Server-side only.
 """
-from ontology import ONT
+from ontology import GROUNDING_RELATIONS, ONT
 
 # Grounding edges plus HAD_OUTCOME only. The walk must not follow SUPERSEDES, or a reversed decision pulls the next record in.
 CLOSED_RELATION_TYPES: tuple[str, ...] = (
@@ -93,7 +93,8 @@ def carried_readiness_cypher() -> str:
         f" RETURN n.pg_id AS pg_id,"
         f" coalesce(n.rem_processed, false) AS rem_processed,"
         f" coalesce(n.superseded, false) AS superseded,"
-        f" coalesce(n.rem_invalid, false) AS rem_invalid"
+        f" coalesce(n.rem_invalid, false) AS rem_invalid,"
+        f" labels(n) AS labels"
     )
 
 
@@ -108,6 +109,18 @@ def _flag(value) -> bool:
     return False
 
 
+def _row_labels(row) -> set:
+    raw = row.get("labels")
+    if raw is None:
+        return set()
+    if isinstance(raw, str):
+        return {raw}
+    try:
+        return {str(item) for item in raw}
+    except TypeError:
+        return set()
+
+
 def unprocessed_carried(carried_ids, rows) -> tuple[list[int], list[int]]:
     """Return carried ids that are not ready to fold, and the subset with more than one spine node.
 
@@ -115,7 +128,10 @@ def unprocessed_carried(carried_ids, rows) -> tuple[list[int], list[int]]:
     only when rem_processed is set, an invalid node included; a second spine
     node is never exempted (fact:3458 measured no pg_id with two spine nodes);
     both lists are ascending ints without repeats, and a row outside the
-    carried ids is ignored.
+    carried ids is ignored. One Decision node is ready on presence alone:
+    its stored rem_processed is not a gate (decision:3582). A row with no
+    labels is unprocessed: the stored flag is not a fallback, because a
+    double that forgot labels would otherwise hide an unprocessed fact.
     """
     wanted: list[int] = []
     seen: set[int] = set()
@@ -143,13 +159,156 @@ def unprocessed_carried(carried_ids, rows) -> tuple[list[int], list[int]]:
         if len(group) == 0:
             unprocessed.append(pid)
         elif len(group) > 1:
+            # Multiplicity is first. Two Decision nodes still defer and raise
+            # the duplicate error (decision:3582).
             unprocessed.append(pid)
             duplicated.append(pid)
+        elif not _row_labels(group[0]):
+            unprocessed.append(pid)
+        elif ONT.decision in _row_labels(group[0]):
+            continue
         elif _flag(group[0].get("superseded")):
             continue
         elif not _flag(group[0].get("rem_processed")):
             unprocessed.append(pid)
     return unprocessed, duplicated
+
+
+def decision_readiness_cypher() -> str:
+    """Per pg_id: ready, blocking_ids, and spine_nodes.
+
+    A Fact on an outgoing grounding edge, or a Retrospective on an outgoing
+    HAD_OUTCOME, blocks while it is live, has a pg_id, and is neither
+    rem_processed nor rem_invalid. A node with no pg_id is not a blocker
+    (fact:3587). Ready is false when no Decision node carries the pg_id, or
+    when any Decision twin has such a blocker. spine_nodes counts Fact,
+    Decision and Retrospective nodes that carry the pg_id, each sought by
+    its label. This text has no ``AS rem_invalid`` alias: that alias belongs
+    to carried_readiness_cypher so a rig can tell the two reads apart.
+    """
+    grounding = ", ".join(repr(rel) for rel in GROUNDING_RELATIONS)
+    fact, decision, retro = ONT.fact, ONT.decision, ONT.retrospective
+    return (
+        "UNWIND $ids AS pid "
+        "CALL { "
+        "WITH pid "
+        f"MATCH (s:{fact} {{pg_id: pid}}) RETURN s "
+        "UNION "
+        "WITH pid "
+        f"MATCH (s:{decision} {{pg_id: pid}}) RETURN s "
+        "UNION "
+        "WITH pid "
+        f"MATCH (s:{retro} {{pg_id: pid}}) RETURN s "
+        "UNION "
+        "WITH pid "
+        "RETURN null AS s "
+        "} "
+        "WITH pid, count(s) AS spine_nodes, "
+        f"count(CASE WHEN s:{decision} THEN 1 END) AS decision_nodes "
+        f"OPTIONAL MATCH (d:{decision} {{pg_id: pid}})-[rel]->(b) "
+        f"WHERE ((type(rel) IN [{grounding}] AND b:{fact}) "
+        f"OR (type(rel) = '{ONT.had_outcome}' AND b:{retro})) "
+        "AND b.pg_id IS NOT NULL "
+        "AND coalesce(b.superseded, false) = false "
+        "AND coalesce(b.rem_processed, false) = false "
+        "AND coalesce(b.rem_invalid, false) = false "
+        "WITH pid, spine_nodes, decision_nodes, collect(DISTINCT CASE "
+        f"WHEN b:{fact} THEN 'fact:' + toString(b.pg_id) "
+        f"WHEN b:{retro} THEN 'retrospective:' + toString(b.pg_id) "
+        "ELSE null END) AS blocking_ids "
+        "RETURN pid AS pg_id, "
+        "(decision_nodes > 0 AND size(blocking_ids) = 0) AS ready, "
+        "blocking_ids, spine_nodes"
+    )
+
+
+def _readiness_by_id(readiness) -> dict:
+    by_id: dict = {}
+    if isinstance(readiness, dict) and "pg_id" not in readiness and "ready" not in readiness:
+        for key, row in readiness.items():
+            if not isinstance(row, dict):
+                continue
+            try:
+                pid = int(row.get("pg_id", key))
+            except (TypeError, ValueError):
+                continue
+            by_id[pid] = row
+        return by_id
+    rows = [readiness] if isinstance(readiness, dict) else list(readiness or [])
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        try:
+            by_id[int(row["pg_id"])] = row
+        except (TypeError, ValueError, KeyError):
+            continue
+    return by_id
+
+
+def _as_int(value):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def admit_members(labels, consolidated, components, readiness):
+    """Drop unconsolidated Decisions that are not ready.
+
+    An admitted Decision (consolidated true) stays a member even when it is
+    not ready (decision:3582). A pg_id with spine_nodes greater than 1 stays,
+    so the duplicate refusal still fires. The walk is not repeated. Returns
+    the filtered labels, consolidated map, components, and the excluded
+    decisions as ``{pg_id, blocking_ids}``. A missing readiness row is not
+    an exclusion: a failed read is the caller's exception path.
+    """
+    by_id = _readiness_by_id(readiness)
+    consolidated = consolidated or {}
+    drop: dict[int, list] = {}
+    for raw_pid, label in (labels or {}).items():
+        pid = _as_int(raw_pid)
+        if pid is None or label != ONT.decision:
+            continue
+        if _flag(consolidated.get(raw_pid, consolidated.get(pid))):
+            continue
+        row = by_id.get(pid)
+        if row is None or "ready" not in row:
+            continue
+        ready = row.get("ready")
+        if ready is True or ready == 1:
+            continue
+        if ready is not False and ready != 0:
+            continue
+        raw_spine = row.get("spine_nodes")
+        if raw_spine is None:
+            spine_n = 1
+        else:
+            spine_n = _as_int(raw_spine)
+            if spine_n is None:
+                spine_n = 1
+        if spine_n > 1:
+            continue
+        blockers = row.get("blocking_ids") or []
+        drop[pid] = list(blockers)
+    excluded = [
+        {"pg_id": pid, "blocking_ids": drop[pid]} for pid in sorted(drop)
+    ]
+    if not drop:
+        return labels, consolidated, components, excluded
+    new_labels = {
+        key: label for key, label in (labels or {}).items()
+        if _as_int(key) not in drop
+    }
+    new_consolidated = {
+        key: value for key, value in consolidated.items()
+        if _as_int(key) not in drop
+    }
+    new_components = []
+    for comp in components or []:
+        kept = [item for item in comp if _as_int(item) not in drop]
+        if kept:
+            new_components.append(kept)
+    return new_labels, new_consolidated, new_components, excluded
 
 
 class _UnionFind:

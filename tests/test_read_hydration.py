@@ -147,13 +147,14 @@ def _status_request(ref_str, agent=None):
 
 @pytest.mark.asyncio
 async def test_g1_graph_node_content_never_replaced_or_extended_by_postgres_text():
-    """F3, F4c: stored text is removed and the whole authoritative text is returned."""
+    """Kills: copying node content into the entry, or showing Postgres text before REM (fact:3544)."""
     n = _make_node(["Fact"], {"pg_id": 1, "content": "node copy"})
     c, conn, _ = _coord_with_mocks([_FakeRecord({"n": n})])
     conn.fetch = AsyncMock(return_value=[{"id": 1, "metadata": {}, "visibility": "global", "content": "whole Postgres", "content_chars": 14}])
     response = await c.handle_graph(_graph_request())
     result = json.loads(response.text)["records"][0]["n"]
-    assert result["text"] == "whole Postgres"
+    assert result["text_is"] == "pointer"
+    assert "text" not in result
     assert "content" not in result and "node copy" not in response.text
 
 
@@ -196,23 +197,26 @@ async def test_g2_readable_node_whole_text_without_legacy_keys():
 
     assert r1["ref"] == "fact:1"
     assert r1["full_record"]["chars"] == 100
-    assert r1["text_is"] == "full_record"
+    assert r1["text_is"] == "pointer"
+    assert "text" not in r1
     assert "content_truncated" not in r1
 
     assert r2["ref"] == "fact:2"
     assert r2["full_record"]["chars"] == 9
-    assert r2["text_is"] == "full_record"
+    assert r2["text_is"] == "pointer"
+    assert "text" not in r2
     assert "content_truncated" not in r2
 
     assert r3["ref"] == "fact:3"
     assert r3["full_record"]["chars"] == 5
-    assert r3["text_is"] == "full_record"
+    assert r3["text_is"] == "pointer"
+    assert "text" not in r3
     assert "content_truncated" not in r3
 
     assert r4["ref"] == "decision:4"
     assert r4["full_record"]["chars"] == 46
     assert r4["text_is"] == "full_record"
-    assert all(r["text"] == "whole Postgres" for r in (r1, r2, r3, r4))
+    assert r4["text"] == "whole Postgres"
     assert "content_truncated" not in r4
 
 
@@ -252,6 +256,8 @@ async def test_g3_summary_and_fact_nodes_with_same_id_do_not_swap_ref_or_chars_a
 
     assert r_fact["ref"] == "fact:42"
     assert r_fact["full_record"]["chars"] == 200
+    assert r_fact["text_is"] == "pointer"
+    assert "text" not in r_fact
 
     assert r_sum["ref"] == "summary:42"
     assert r_sum["full_record"]["chars"] == 500
@@ -314,7 +320,8 @@ async def test_g4_unreadable_node_gains_no_index_keys_and_owner_is_not_refused()
     b_alice = json.loads(resp_alice.text)["records"]
     assert b_alice[0]["n"]["ref"] == "fact:1"
     assert b_alice[0]["n"]["full_record"]["chars"] == 100
-    assert b_alice[0]["n"]["text_is"] == "full_record"
+    assert b_alice[0]["n"]["text_is"] == "pointer"
+    assert "text" not in b_alice[0]["n"]
     assert "content_truncated" not in b_alice[0]["n"]
     for k in ("ref", "content_chars", "content_truncated", "snippet", "content_source"):
         assert k not in b_alice[1]["n"]
@@ -603,8 +610,8 @@ async def test_l3_snippet_and_content_chars_follow_visibility():
     ])
     resp = await c.handle_status(_status_request("fact:21"))
     body = json.loads(resp.text)
-    assert body["text"] == text
-    assert body["text_is"] == "full_record"
+    assert "text" not in body
+    assert body["text_is"] == "pointer"
     assert body["full_record"]["chars"] == len(text)
     assert body["full_record"]["read_with"] == "search --ref fact:21"
     assert "snippet" not in body
@@ -618,8 +625,8 @@ async def test_l3_snippet_and_content_chars_follow_visibility():
     ])
     owned = json.loads((await c_owner.handle_status(
         _status_request("fact:22", agent="alice"))).text)
-    assert owned["text"] == text
-    assert owned["text_is"] == "full_record"
+    assert "text" not in owned
+    assert owned["text_is"] == "pointer"
     assert "snippet" not in owned
 
     withheld = [
@@ -808,8 +815,8 @@ async def test_l7_neo4j_down_keeps_the_postgres_lineage():
     assert body["exists"] is True
     assert body["superseded"] is True
     assert body["superseded_by"] == "fact:9"
-    assert body["text"] == _LONG_LINEAGE
-    assert body["text_is"] == "full_record"
+    assert "text" not in body
+    assert body["text_is"] == "pointer"
     assert "snippet" not in body
     assert "content_chars" not in body
     assert "related" not in body
@@ -934,10 +941,10 @@ async def test_f3_unchosen_node_preserves_content_and_gains_source_chars_ref():
     assert resp.status == 200
     body = json.loads(resp.text)
     rec = body["records"][0]["n"]
-    assert rec["text"] == "whole Postgres"
+    assert rec["text_is"] == "pointer"
+    assert "text" not in rec
     assert "content" not in rec
     assert rec["full_record"]["chars"] == 50000
-    assert rec["text_is"] == "full_record"
     assert "content_truncated" not in rec
     assert rec["ref"] == "fact:10"
     assert "content_source" not in rec
@@ -988,8 +995,8 @@ async def test_f4_private_record_withheld_from_non_owner_on_lineage_and_graph():
     assert resp_alice.status == 200
     b_alice = json.loads(resp_alice.text)
     assert "content" not in b_alice
-    assert b_alice["text"] == private_text
-    assert b_alice["text_is"] == "full_record"
+    assert "text" not in b_alice
+    assert b_alice["text_is"] == "pointer"
     assert b_alice["full_record"]["chars"] == len(private_text)
     assert "snippet" not in b_alice
     assert "content_chars" not in b_alice
@@ -1018,12 +1025,12 @@ async def test_f4_private_record_withheld_from_non_owner_on_lineage_and_graph():
     resp_g_alice = await c_graph.handle_graph(_graph_request(agent="alice"))
     assert resp_g_alice.status == 200
     rec_g_alice = json.loads(resp_g_alice.text)["records"][0]["n"]
-    assert rec_g_alice["text"] == "whole Postgres"
+    assert rec_g_alice["text_is"] == "pointer"
+    assert "text" not in rec_g_alice
     assert "content" not in rec_g_alice
     assert "content_source" not in rec_g_alice
     assert rec_g_alice["ref"] == "fact:55"
     assert rec_g_alice["full_record"]["chars"] == 28
-    assert rec_g_alice["text_is"] == "full_record"
     assert "content_truncated" not in rec_g_alice
     assert "graph copy" not in resp_g_alice.text
 
@@ -1103,7 +1110,7 @@ async def test_f6_scalar_projection_entity_node_untouched_and_list_hydrated():
     assert row["scalar"] == "projected"
     assert row["ent"] == {"label": "Entity", "name": "Postgres"}
     assert row["m"]["n"] == row["nlist"][0] == row["path"]["nodes"][0]
-    assert row["m"]["n"]["text"] == "whole" and "content" not in row["m"]["n"]
+    assert row["m"]["n"]["text_is"] == "pointer" and "text" not in row["m"]["n"] and "content" not in row["m"]["n"]
     assert row["rel"] == {"from": "fact:7", "relation": "MENTIONS", "to": row["ent"], "props": {"weight": 1}}
     assert row["path"]["relationships"] == [row["rel"]]
 
@@ -1161,7 +1168,8 @@ async def test_f8_summary_neighbor_removal_and_snippet_replacement():
     assert "text" not in kept[1]["record"]
     assert kept[1]["record"]["full_record"]["chars"] == 120
     assert kept[2]["record"]["ref"] == "fact:4"
-    assert kept[2]["record"]["text"] == "postgres fact text"
+    assert kept[2]["record"]["text_is"] == "pointer"
+    assert "text" not in kept[2]["record"]
     assert "fact snippet" not in json.dumps(kept)
     assert "old Cypher snippet" not in json.dumps(kept)
 
@@ -1222,7 +1230,8 @@ async def test_f8_expand_graph_context_single_anchor_removes_retired_summary():
     res = hit["graph_context"]
     assert len(res) == 1
     assert res[0]["record"]["ref"] == "fact:4"
-    assert res[0]["record"]["text"] == "postgres fact text"
+    assert res[0]["record"]["text_is"] == "pointer"
+    assert "text" not in res[0]["record"]
     assert res[0]["record"]["full_record"]["chars"] == 95
     assert "old Cypher snippet" not in json.dumps(res)
 
@@ -1306,17 +1315,17 @@ async def test_f11_same_node_in_multiple_rows_both_gain_index_keys():
     r1 = body["records"][1]["n"]
     assert "content_source" not in r0
     assert "content_source" not in r1
-    assert r0["text"] == "whole Postgres"
+    assert "text" not in r0
     assert "content" not in r0
-    assert r1["text"] == "whole Postgres"
+    assert "text" not in r1
     assert "content" not in r1
     assert r0["ref"] == "fact:5"
     assert r1["ref"] == "fact:5"
     assert r0["full_record"]["chars"] == 10000
     assert r1["full_record"]["chars"] == 10000
-    assert r0["text_is"] == "full_record"
+    assert r0["text_is"] == "pointer"
     assert "content_truncated" not in r0
-    assert r1["text_is"] == "full_record"
+    assert r1["text_is"] == "pointer"
     assert "content_truncated" not in r1
 
 
@@ -1336,14 +1345,14 @@ async def test_f14_superseded_node_is_hydrated_on_graph():
     resp = await c.handle_graph(_graph_request())
     assert resp.status == 200
     rec = json.loads(resp.text)["records"][0]["n"]
-    assert rec["text"] == "whole Postgres"
+    assert "text" not in rec
     assert "content" not in rec
     assert rec["obsolete"] == "superseded"
     assert rec["superseded"] is True
     assert "content_source" not in rec
     assert rec["ref"] == "fact:9"
     assert rec["full_record"]["chars"] == 30
-    assert rec["text_is"] == "full_record"
+    assert rec["text_is"] == "pointer"
     assert "content_truncated" not in rec
 
 
@@ -1448,12 +1457,12 @@ async def test_f16_private_unreadable_record_spends_no_budget():
     assert "ref" not in r1
     assert "content_truncated" not in r1
 
-    assert r2["text"] == "whole Postgres"
+    assert r2["text_is"] == "pointer"
+    assert "text" not in r2
     assert "content" not in r2
     assert "content_source" not in r2
     assert r2["ref"] == "fact:102"
     assert r2["full_record"]["chars"] == 5000
-    assert r2["text_is"] == "full_record"
     assert "content_truncated" not in r2
 
 
@@ -1471,7 +1480,7 @@ async def test_f19_keys_past_old_cut_are_all_hydrated(monkeypatch):
     assert conn.fetch.await_args.args[1] == list(range(1, 13))
     result = json.loads(response.text)["records"][0]["nodes"]
     assert [n["ref"] for n in result] == [f"fact:{i}" for i in range(1, 13)]
-    assert [n["text"] for n in result] == [f"whole {i}" for i in range(1, 13)]
+    assert all(n["text_is"] == "pointer" and "text" not in n for n in result)
     assert all("content" not in n and "content_truncated" not in n for n in result)
 
 
@@ -1509,7 +1518,8 @@ async def test_f20_private_neighbor_visibility_in_expansion():
     record = hit_alice["graph_context"][0]["record"]
     assert record["ref"] == "fact:66"
     assert record["full_record"]["chars"] == 28
-    assert record["text"] == "private fact body!!"
+    assert record["text_is"] == "pointer"
+    assert "text" not in record
 
 
 # ── Body scope is ignored on graph ───────────────────────────────────────────

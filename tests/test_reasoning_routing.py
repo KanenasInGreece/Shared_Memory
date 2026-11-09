@@ -427,7 +427,7 @@ async def test_daemon_cut_off_is_not_stored(monkeypatch):
 
     daemon = rem_loop.REMDaemon.__new__(rem_loop.REMDaemon)
     monkeypatch.delenv("MOCK_LLM", raising=False)
-    long = "x" * (rem_loop.REM_SUMMARY_THRESHOLD + 1)
+    long = "x" * (2001)
 
     class _R:
         status_code = 200
@@ -925,7 +925,8 @@ async def test_fold_stop_without_string_content_is_gateway_422(monkeypatch):
                     async def data(_self):
                         return [
                             {"pg_id": i, "rem_processed": True,
-                             "superseded": False, "rem_invalid": False}
+                             "superseded": False, "rem_invalid": False,
+                             "labels": ["Fact"]}
                             for i in ids
                         ]
                 return _R()

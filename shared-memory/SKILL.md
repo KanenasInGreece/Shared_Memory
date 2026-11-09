@@ -50,7 +50,8 @@ them with `obsolete` and `superseded_by` when the successor is readable.
 successor before relying on it. Each `retired_grounds` item names a relation,
 and `superseded_by` when that successor is readable. `latest_verdict` on a
 retrospective names the verdict that counts most. `found: false` means there is
-nothing to read. `lineage`, `search --ref` and a graph query are those reads. On
+nothing to read. `lineage`, `search --ref` and a graph query are those reads. An
+unprocessed fact or retrospective is a `pointer` whose ref must be expanded. On
 `/memory/graph`, nodes inside paths and maps are resolved like any node. Only a
 projected property is not the record. `grounded_in`, `consolidated_into` and a
 summary's `sources` are references and carry no text.
@@ -179,11 +180,11 @@ Graph expansion on a judgement hit derives `belonging`: `{project, domains}` on 
 Worked contract. Anonymous `/health`, then `--version`:
 
 ```json
-{"status":"ok","version":"1.1.1","api_version":6}
+{"status":"ok","version":"1.1.2","api_version":6}
 ```
 
 ```json
-{"version": "1.1.1", "api_version": 6, "tool": "shared-memory-framework"}
+{"version": "1.1.2", "api_version": 6, "tool": "shared-memory-framework"}
 ```
 
 `doctor` compares this client's `api_version` with the gateway and names which side to upgrade.

@@ -62,7 +62,10 @@ from domain_axis import (
     DOMAIN_BY_KEY_SQL, _similarity_from_env,
     domain_merge_cypher, names_a_domain, resolve_domains,
 )
-from insight_gate import walk_group_reached_set, passes_insight_gate
+from insight_gate import (
+    walk_group_reached_set, passes_insight_gate, decision_readiness_cypher,
+    admit_members,
+)
 from project_promotion import (
     promote_record, sole_project, METHOD_GROUNDING,
 )
@@ -72,6 +75,9 @@ from framework_defaults import FRAMEWORK_DEFAULTS
 from telemetry_instruments import LatencyRing, Counter, safe
 # A key whose removed_in this release has reached is stripped in handle_telemetry. Leaf module: its only import is annotations, so it cannot cycle back here.
 from telemetry_contract import TELEMETRY as TELEMETRY_CONTRACT, strip_dropped
+from rem_contract import (
+    REM_PROMPT_VERSION, REM_LEGACY_SUMMARY_CUT, entry_text_is,
+)
 
 log = logging.getLogger("coordinator")
 
@@ -131,7 +137,7 @@ def _short(value: Any, cap: int = 200) -> str:
 
 
 # FRAMEWORK_VERSION is the build string and may drift.
-FRAMEWORK_VERSION = "1.1.1"
+FRAMEWORK_VERSION = "1.1.2"
 # API_VERSION is the wire contract; bump only when shape, auth, routes, or a monitor
 # contract change breaks older clients. v6: entries carry text, text_is, full_record.
 API_VERSION = 6
@@ -2356,8 +2362,22 @@ def _eligible_graph_node_info(val: Any) -> tuple[str, int] | None:
     return None
 
 
-# REM writes summary[:2000] in rem_loop.py:850,863; that length may be cut.
-REM_LEGACY_SUMMARY_CUT = 2000
+def _rem_node_state(obj):
+    """Pull rem_summary, rem_processed and rem_prompt_version off a node or adapter row.
+
+    None is a missing state: a fact or retrospective then renders as pointer
+    (Opus r2 F11), so a Neo4j miss cannot look like a full_record.
+    """
+    if obj is None:
+        return None
+    getter = obj.get if hasattr(obj, "get") else None
+    if getter is None:
+        return None
+    return {
+        "rem_summary": getter("rem_summary"),
+        "rem_processed": getter("rem_processed"),
+        "rem_prompt_version": getter("rem_prompt_version"),
+    }
 
 
 def redact_reference_ids(ids, readable):
@@ -2366,13 +2386,15 @@ def redact_reference_ids(ids, readable):
     return [identity for identity in ids if allowed(identity)]
 
 
-def render_record_entry(row, node_rem_summary, ref, marks, *, ranked=False,
+def render_record_entry(row, node_state, ref, marks, *, ranked=False,
                         search_hit=False):
     """None means no entry; row["readable"] distinguishes unreadable from ranked retirement.
 
     ranked drops retired records; search_hit adds decision grounds and lifecycle.
     Check visibility before retirement: dropping only superseded private neighbours
-    would reveal whether a private record is live.
+    would reveal whether a private record is live. node_state is rem_summary,
+    rem_processed and rem_prompt_version; missing state for a fact or
+    retrospective is pointer.
     """
     if not row or not row.get("readable", False):
         return None
@@ -2387,16 +2409,17 @@ def render_record_entry(row, node_rem_summary, ref, marks, *, ranked=False,
                            "read_with": f"search --ref {ref}"}}
     decision_meta = meta.get("decision")
     rationale = decision_meta.get("rationale") if isinstance(decision_meta, dict) else None
-    if kind in ("summary", "insight"):
-        out["text_is"] = "pointer"
-    elif kind == "decision" and isinstance(rationale, str) and rationale.strip():
-        out.update(text=rationale, text_is="summary")
-    elif (kind in ("fact", "retrospective") and isinstance(node_rem_summary, str)
-          and node_rem_summary.strip() and len(node_rem_summary) < len(content)
-          and len(node_rem_summary) != REM_LEGACY_SUMMARY_CUT):
-        out.update(text=node_rem_summary, text_is="summary")
+    if kind == "decision":
+        if isinstance(rationale, str) and rationale.strip():
+            text_is, text = entry_text_is(kind, node_state, rationale)
+        else:
+            text_is, text = "full_record", content
     else:
-        out.update(text=content, text_is="full_record")
+        text_is, text = entry_text_is(kind, node_state, content)
+    if text_is == "pointer":
+        out["text_is"] = "pointer"
+    else:
+        out.update(text=text, text_is=text_is)
     if kind in ("fact", "retrospective"):
         source = meta.get("source_ref")
         out.update(source_ref=source, fact_kind=fact_kind_from_source_ref(source))
@@ -2467,7 +2490,7 @@ def walk_graph_value(value, rows, marks=None, collect=None):
                 collect[key] = value
                 return None
             row = rows.get(key)
-            entry = render_record_entry(row, value.get("rem_summary"),
+            entry = render_record_entry(row, _rem_node_state(value),
                                         row["ref"] if row else "fact:0", marks)
             if entry is None:
                 return {"label": label}
@@ -3195,6 +3218,8 @@ def _expansion_edge(rec, pg_key="pg_id"):
         "rel_type": rel,
         "rel_props": _json_safe(dict(props or {})),
         "rem_summary": _rec_get(rec, "rem_summary"),
+        "rem_processed": _rec_get(rec, "rem_processed"),
+        "rem_prompt_version": _rec_get(rec, "rem_prompt_version"),
         "labels": labels,
         "name": _rec_get(rec, "name"),
         "pg_id": pg,
@@ -3256,14 +3281,14 @@ def _render_search_neighbor(raw, anchor_pg_id, anchor_ref, rows, marks, *,
             return _DROP
         return ("row", row)
 
-    def materialize(value, rem):
+    def materialize(value, rem_state):
         if value is _DROP:
             return _DROP, None
         if value is None or isinstance(value, (str, dict)):
             return value, None
         row = value[1]
         entry = render_record_entry(
-            row, rem, row["ref"], marks or {}, ranked=ranked, search_hit=False)
+            row, rem_state, row["ref"], marks or {}, ranked=ranked, search_hit=False)
         if entry is None:
             return _DROP, None
         return entry["ref"], entry
@@ -3281,9 +3306,9 @@ def _render_search_neighbor(raw, anchor_pg_id, anchor_ref, rows, marks, *,
     start_far = _far(start)
     end_far = _far(end)
     start_out, start_entry = materialize(
-        end_value(start), raw.get("rem_summary") if start_far else None)
+        end_value(start), _rem_node_state(raw) if start_far else None)
     end_out, end_entry = materialize(
-        end_value(end), raw.get("rem_summary") if end_far else None)
+        end_value(end), _rem_node_state(raw) if end_far else None)
     if start_out is _DROP or end_out is _DROP:
         return None
     props = raw.get("rel_props")
@@ -3348,6 +3373,8 @@ def _lineage_edge(rec, anchor_pg):
         "rel": rel, "start_pg": start_pg, "end_pg": end_pg,
         "start_labels": start_labels, "end_labels": end_labels,
         "props": props, "rem_summary": rem if isinstance(rem, str) else None,
+        "rem_processed": _rec_get(rec, "rem_processed"),
+        "rem_prompt_version": _rec_get(rec, "rem_prompt_version"),
     }
 
 
@@ -3387,7 +3414,7 @@ def _render_lineage_related(edges, anchor_pg, anchor_ref, rows, marks, failed):
             row = rows.get((table, _pg_int(far_pg)))
             if row and row.get("readable"):
                 entry = render_record_entry(
-                    row, edge.get("rem_summary"), row["ref"], marks or {},
+                    row, _rem_node_state(edge), row["ref"], marks or {},
                     ranked=False, search_hit=False)
                 if entry is not None:
                     item["record"] = entry
@@ -3899,6 +3926,8 @@ class MemoryCoordinator:
         self._top_paths: dict = {"rows": [], "as_of": None, "error": None, "attempted": None}
         # Proxy-owned telemetry blocks. Importing hive_mind_proxy back would cycle; None means those sections are absent.
         self.telemetry_extras_provider = None
+        # None until main() assigns daemon_llm_identity. The two backlog gauges then block every row, because this process has no boot id of its own.
+        self.daemon_identity_provider = None
 
         # decision:374/fact:375: a never-probed dependency that reads healthy is the failure this avoids. Every state starts unknown, not ok.
         self._dependency_health: dict = {
@@ -4429,7 +4458,7 @@ class MemoryCoordinator:
                     f"OPTIONAL MATCH (existing:{self._SPINE}) WHERE existing.pg_id = $pg_id"
                     f" WITH existing WHERE existing IS NULL OR existing:{ONT.fact}"
                     f" MERGE (f:{ONT.fact} {{pg_id: $pg_id}})"
-                    f" SET f.content = $content, f.source = $source,"
+                    f" SET f.source = $source,"
                     f"     f.fact_kind = $fact_kind"
                     + (" SET f.source_ref = $source_ref" if source_ref else "")
                     + f" WITH f"
@@ -4461,7 +4490,6 @@ class MemoryCoordinator:
                     f" MERGE (e:{ONT.entity} {{name: ename}})"
                     f" MERGE (f)-[:{ONT.entity_link}]->(e)",
                     pg_id=pg_id,
-                    content=params.get("content_snippet", "")[:200],
                     source=params.get("source", "coordinator"),
                     person=params.get("person") or "",
                     project=params.get("project") or "",
@@ -5069,7 +5097,7 @@ class MemoryCoordinator:
                 f"   MERGE (d)-[:{ONT.was_assisted_by}]->(a)"
                 f" )",
                 pg_id=pg_id,
-                title=decision.get("title", params.get("content_snippet", "")[:100]),
+                title=decision.get("title") or "",
                 rationale=decision.get("rationale", ""),
                 date=decision.get("date", ""),
                 source=params.get("source", "coordinator"),
@@ -5148,13 +5176,12 @@ class MemoryCoordinator:
                     f" WITH existing WHERE existing IS NULL OR existing:{ONT.retrospective}"
                     f" MERGE (r:{ONT.retrospective} {{pg_id: $pg_id}})"
                     f" SET r.rating = $rating, r.date = $date,"
-                    f"     r.content = $content, r.source = $source,"
+                    f"     r.source = $source,"
                     f"     r.fact_kind = $fact_kind"
                     + (" SET r.source_ref = $source_ref" if source_ref else ""),
                     pg_id=pg_id,
                     rating=retro.get("rating", ""),
                     date=retro.get("date", ""),
-                    content=params.get("content_snippet", "")[:200],
                     source=params.get("source", "coordinator"),
                     fact_kind=params.get("fact_kind") or "observation",
                     **({"source_ref": source_ref} if source_ref else {}),
@@ -8627,6 +8654,8 @@ class MemoryCoordinator:
                 "          type(r) AS rel_type,"
                 "          properties(r) AS rel_props,"
                 "          related.rem_summary AS rem_summary,"
+                "          related.rem_processed AS rem_processed,"
+                "          related.rem_prompt_version AS rem_prompt_version,"
                 "          startNode(r).pg_id AS start_pg_id,"
                 "          labels(startNode(r)) AS start_labels,"
                 "          startNode(r).name AS start_name,"
@@ -8636,7 +8665,7 @@ class MemoryCoordinator:
                 "          aliases"
                 " }"
                 " RETURN pg_id AS anchor_pg_id, labels, name, rel_pg_id, rel_type,"
-                "        rel_props, rem_summary,"
+                "        rel_props, rem_summary, rem_processed, rem_prompt_version,"
                 "        start_pg_id, start_labels, start_name,"
                 "        end_pg_id, end_labels, end_name,"
                 "        aliases",
@@ -9980,15 +10009,19 @@ class MemoryCoordinator:
         cypher = (
             "MATCH (n) WHERE n.pg_id = $pg_id AND ("
             f"n:{ONT.fact} OR n:{ONT.decision} OR n:{ONT.retrospective}) "
-            "WITH n, n.rem_summary AS anchor_rem_summary "
+            "WITH n, n.rem_summary AS anchor_rem_summary, "
+            "n.rem_processed AS anchor_rem_processed, "
+            "n.rem_prompt_version AS anchor_rem_prompt_version "
             "OPTIONAL MATCH (n)-[r]-(m) "
             "WHERE m.pg_id IS NOT NULL "
             f"AND NOT m:{ONT.community_summary} AND NOT m:{ONT.entity} "
-            "RETURN anchor_rem_summary, type(r) AS rel, "
+            "RETURN anchor_rem_summary, anchor_rem_processed, "
+            "anchor_rem_prompt_version, type(r) AS rel, "
             "startNode(r).pg_id AS start_pg_id, labels(startNode(r)) AS start_labels, "
             "endNode(r).pg_id AS end_pg_id, labels(endNode(r)) AS end_labels, "
             "properties(r) AS rel_props, labels(m) AS labels, m.pg_id AS pg_id, "
-            "m.rem_summary AS rem_summary "
+            "m.rem_summary AS rem_summary, m.rem_processed AS rem_processed, "
+            "m.rem_prompt_version AS rem_prompt_version "
             "ORDER BY m.pg_id "
             "LIMIT $cap"
         )
@@ -9999,12 +10032,18 @@ class MemoryCoordinator:
                 async for rec in result:
                     raw.append(rec)
                 rem_summary = None
+                rem_processed = None
+                rem_prompt_version = None
                 edges = []
                 for rec in raw:
                     if rem_summary is None:
                         found = _rec_get(rec, "anchor_rem_summary")
                         if isinstance(found, str):
                             rem_summary = found
+                    if rem_processed is None:
+                        rem_processed = _rec_get(rec, "anchor_rem_processed")
+                    if rem_prompt_version is None:
+                        rem_prompt_version = _rec_get(rec, "anchor_rem_prompt_version")
                     edge = _lineage_edge(rec, pg_id)
                     if edge is not None:
                         edges.append(edge)
@@ -10028,7 +10067,9 @@ class MemoryCoordinator:
                         if ONT.retrospective in found:
                             retro_ids.add(pid)
                 marks = await self.resolve_marks(session, decision_ids, retro_ids)
-            return {"rem_summary": rem_summary, "edges": edges, "more": more, "marks": marks}
+            return {"rem_summary": rem_summary, "rem_processed": rem_processed,
+                    "rem_prompt_version": rem_prompt_version,
+                    "edges": edges, "more": more, "marks": marks}
         except Exception as exc:
             log.warning("lineage related unavailable (%s)", type(exc).__name__)
             return None
@@ -10189,7 +10230,7 @@ class MemoryCoordinator:
             row = rows.get(("technical_docs", pg_id))
             if row and row.get("readable"):
                 entry = render_record_entry(
-                    row, None if graph is None else graph.get("rem_summary"),
+                    row, None if graph is None else _rem_node_state(graph),
                     row["ref"], marks, ranked=False, search_hit=False)
         resp_dict = {
             "pg_id": pg_id,
@@ -10458,13 +10499,19 @@ class MemoryCoordinator:
                 facts = await fres.data()
                 dres = await session.run(
                     f"MATCH (d:{ONT.decision})"
-                    f" RETURN coalesce(d.rem_processed,false) AS rem,"
-                    f"        coalesce(d.superseded,false) AS superseded, count(*) AS n"
+                    f" RETURN coalesce(d.superseded,false) AS superseded, count(*) AS n"
                 )
                 decisions = await dres.data()
-                # passed_over and starved are read from the node.
+                rres = await session.run(
+                    f"MATCH (r:{ONT.retrospective}) WHERE r.pg_id IS NOT NULL"
+                    f" RETURN coalesce(r.rem_processed,false) AS rem,"
+                    f"        coalesce(r.superseded,false) AS superseded, count(*) AS n"
+                )
+                retrospectives = await rres.data()
+                # passed_over and starved are read from the node. Decisions are
+                # not REM work (brief §3.1); the gauges count Fact|Retrospective.
                 ares = await session.run(
-                    f"MATCH (n) WHERE (n:{ONT.fact} OR n:{ONT.decision}"
+                    f"MATCH (n) WHERE (n:{ONT.fact}"
                     f"                 OR n:{ONT.retrospective})"
                     f"   AND coalesce(n.rem_processed,false) = false"
                     f"   AND coalesce(n.superseded,false) = false"
@@ -10479,7 +10526,8 @@ class MemoryCoordinator:
                 "facts_rem_pending":    sum(r["n"] for r in facts if not r["rem"] and not r["superseded"]),
                 "facts_unconsolidated": sum(r["n"] for r in facts if r["rem"] and not r["con"]),
                 "decisions_total":      sum(r["n"] for r in decisions),
-                "decisions_rem_pending": sum(r["n"] for r in decisions if not r["rem"] and not r["superseded"]),
+                "retrospectives_rem_pending": sum(
+                    r["n"] for r in retrospectives if not r["rem"] and not r["superseded"]),
                 # decision 890: fairness gauge for the batch-versus-solo yield. It reads 0 until a solo backlog re-exercises that path.
                 "rem_passed_over_total": sum(r["n"] * r["p"] for r in attempts),
                 "rem_starved_pending":  sum(r["n"] for r in attempts
@@ -10496,6 +10544,49 @@ class MemoryCoordinator:
                 snap["neo4j"]["rem_dead_lettered"] = rem_count["dead_lettered"]
         except Exception as exc:
             snap["neo4j"] = {"error": str(exc)}
+
+        # Own try (Opus r2 F18). A readiness failure must not replace the
+        # snapshot above with an error dict. No stored-flag fallback: the
+        # key stays absent when this read fails (decision:3582).
+        if isinstance(snap.get("neo4j"), dict) and "error" not in snap["neo4j"]:
+            try:
+                async with self._neo4j.session() as session:
+                    idres = await session.run(
+                        f"MATCH (d:{ONT.decision})"
+                        f" WHERE coalesce(d.superseded, false) = false"
+                        f" AND d.pg_id IS NOT NULL"
+                        f" RETURN d.pg_id AS pg_id, count(*) AS n"
+                    )
+                    id_rows = await idres.data()
+                    pres = await session.run(
+                        decision_readiness_cypher(),
+                        ids=[int(r["pg_id"]) for r in id_rows],
+                    )
+                    ready_rows = await pres.data()
+                not_ready = set()
+                for row in ready_rows:
+                    if row.get("ready") is True or row.get("ready") == 1:
+                        continue
+                    if row.get("ready") is not False and row.get("ready") != 0:
+                        continue
+                    try:
+                        not_ready.add(int(row["pg_id"]))
+                    except (TypeError, ValueError, KeyError):
+                        continue
+                pending = 0
+                for row in id_rows:
+                    try:
+                        pid = int(row["pg_id"])
+                        n = int(row["n"])
+                    except (TypeError, ValueError, KeyError):
+                        continue
+                    if pid in not_ready:
+                        pending += n
+                snap["neo4j"]["decisions_rem_pending"] = pending
+            except Exception as exc:
+                log.warning(
+                    "decisions_rem_pending readiness read failed (%s)",
+                    type(exc).__name__)
 
         # The backlog numbers that used to sit under neo4j because that is where the query ran, plus what rem_timing can already answer.
         try:
@@ -10516,6 +10607,18 @@ class MemoryCoordinator:
             snap["nrem"] = {**nrem, "as_of": dep.get("as_of")}
         else:
             snap["nrem"] = {"error": "not yet computed", "as_of": dep.get("as_of")}
+        # Same filter as rem_pending_clusters: the latest finished insight
+        # cycle. Absent when that cycle did not record the key. A failure
+        # here does not replace an nrem section that is already an error.
+        if isinstance(snap.get("nrem"), dict) and "error" not in snap["nrem"]:
+            try:
+                excluded = await self._insight_excluded_pending_rem()
+                if excluded is not None:
+                    snap["nrem"]["insight_excluded_pending_rem"] = excluded
+            except Exception as exc:
+                log.warning(
+                    "insight_excluded_pending_rem read failed (%s)",
+                    type(exc).__name__)
 
         # Dashboard distributions. Surfaced here so the monitor does not need its own Postgres connection.
         try:
@@ -10733,14 +10836,14 @@ class MemoryCoordinator:
         (survives outbox deletion — migration 019).
 
         ⚠ THIS IS A GATED SUBSET SINCE v0.9.66, and this docstring claimed the
-        opposite for eight releases. REM was chosen as the anchor because it was
-        UNGATED — every saved fact passed through it (fact 567) — but 0.9.66
-        made short records SKIP THE MODEL entirely, so a row only carries
-        rem_timing if its record was long enough to be sent. The percentiles
-        below therefore describe the records REM actually ran on, which is a
-        LONGER population than the corpus average, and they are not comparable
-        with a pre-0.9.66 series. They still reflect model + hardware for that
-        population, which is what the by_model axis is for.
+        opposite for eight releases. rem_timing is written only on the batch
+        path (rem_loop.py); tier-2 batch rows are written the same way without
+        poll_ms, and solo work (every retrospective) writes none. The
+        percentiles therefore describe BATCHED facts REM actually ran on,
+        including batched backlog facts, which is a LONGER population than the
+        corpus average, and they are not comparable with a pre-0.9.66 series.
+        They still reflect model + hardware for that population, which is what
+        the by_model axis is for.
 
         Two REM percentile pairs, grouped by model so the series is a
         model-evolution axis (decision 571):
@@ -10803,6 +10906,39 @@ class MemoryCoordinator:
         return out
 
     # ── Consolidation health (ADR-018) ────────────────────────────────────────
+
+    async def _insight_excluded_pending_rem(self):
+        """Latest finished insight cycle's excluded_pending_rem, or None.
+
+        Same outcome filter as rem_pending_clusters. The latest cycle is
+        read first. A missing key, or a readiness-failure marker, is absent.
+        Skipping to an older cycle that still has the key would report a
+        stale count. Absence is not a zero.
+        """
+        query = """
+            SELECT extra
+            FROM consolidation_runs
+            WHERE cycle_type = 'insight'
+              AND outcome IN ('completed', 'crashed')
+            ORDER BY started_at DESC
+            LIMIT 1
+        """
+        async with self._acquire() as conn:
+            row = await conn.fetchrow(query)
+        if row is None:
+            return None
+        extra = row["extra"]
+        if isinstance(extra, str):
+            try:
+                extra = json.loads(extra)
+            except json.JSONDecodeError:
+                return None
+        if not isinstance(extra, dict):
+            return None
+        value = extra.get("excluded_pending_rem")
+        if isinstance(value, bool) or not isinstance(value, int):
+            return None
+        return value
 
     async def _compute_consolidation_health(self) -> dict:
         """Roll up consolidation_runs into per-cycle-type liveness + the stall
@@ -11398,20 +11534,71 @@ class MemoryCoordinator:
             log.info("health.registry: census recovered")
         self._registry_census_ok = True
 
-    async def _rem_backlog_pg_ids(self) -> list[int]:
-        """item_key values stored as rem backlog rows.
-
-        A missing table raises; the caller fails the section.
-        """
+    async def _rem_backlog_rows(self) -> list:
+        """Every rem backlog row. A missing table raises. The keys are not filtered."""
         async with self._acquire() as conn:
             rows = await conn.fetch(
-                "SELECT item_key FROM llm_backlog WHERE item_kind = 'rem'")
+                "SELECT item_key, reason, largest_ctx, largest_reply, pool_id, boot_id"
+                " FROM llm_backlog WHERE item_kind = 'rem'")
+        return list(rows)
+
+    @staticmethod
+    def _rem_backlog_key(row) -> int | None:
+        try:
+            return int(row["item_key"])
+        except (TypeError, ValueError, KeyError):
+            return None
+
+    async def _rem_backlog_pg_ids(self) -> list[int]:
+        """Every rem backlog key. A pending record that has a row is dead-lettered.
+
+        Eligibility is not applied. The probe, rem.dead_lettered, and the health
+        count share this read, which is the plain key list from 2281f76.
+        """
         ids: list[int] = []
-        for row in rows:
-            try:
-                ids.append(int(row["item_key"]))
-            except (TypeError, ValueError):
+        for row in await self._rem_backlog_rows():
+            key = self._rem_backlog_key(row)
+            if key is not None:
+                ids.append(key)
+        return ids
+
+    def _daemon_identity(self) -> dict | None:
+        """The identity the running proxy injected. None blocks every gauge row.
+
+        Calling the proxy module from here would mint a second boot id, because
+        the unit runs that file as __main__.
+        """
+        provider = getattr(self, "daemon_identity_provider", None)
+        if provider is None:
+            return None
+        ident = provider() if callable(provider) else provider
+        if not isinstance(ident, dict):
+            return None
+        # {} is false, so eligible() would read this process. A partial dict
+        # raises and the gauges disappear. Either path is not fail-closed.
+        if any(key not in ident for key in ("pool_id", "largest_ctx", "largest_reply", "boot_id")):
+            return None
+        return ident
+
+    async def _rem_backlog_ineligible_pg_ids(self) -> list[int]:
+        """Keys the older-prompt and withheld gauges treat as blocked.
+
+        No provider, and a dict missing any of the four identity keys, means
+        every row is blocked. An eligible row is left out.
+        The dead-letter count does not use this list.
+        """
+        import llm_eligibility
+        ident = self._daemon_identity()
+        ids: list[int] = []
+        for row in await self._rem_backlog_rows():
+            key = self._rem_backlog_key(row)
+            if key is None:
                 continue
+            if ident is None or not llm_eligibility.eligible(
+                row["reason"], row["largest_ctx"], row["largest_reply"],
+                row["pool_id"], row["boot_id"], ident,
+            ):
+                ids.append(key)
         return ids
 
     async def _rem_pending_backlog_count(self, rows: list[int]) -> int:
@@ -11424,7 +11611,7 @@ class MemoryCoordinator:
             return 0
         async with self._neo4j.session(default_access_mode="READ") as session:
             rec = await (await session.run(
-                f"MATCH (n) WHERE (n:{ONT.fact} OR n:{ONT.decision}"
+                f"MATCH (n) WHERE (n:{ONT.fact}"
                 f"                 OR n:{ONT.retrospective})"
                 f"   AND coalesce(n.rem_processed,false) = false"
                 f"   AND coalesce(n.superseded,false) = false"
@@ -11606,8 +11793,9 @@ class MemoryCoordinator:
         in `run_insight_cycle` but is not counted (undercount; a legacy case,
         since `_fold_insight` never creates a one-member insight).
         `decision_cycles` is a candidate-group gauge seeded by REM-processed
-        facts. It does not run the insight readiness check, so it overcounts a
-        component whose fold is waiting on an unprocessed carried record.
+        facts. It applies admit_members, so an unconsolidated decision that
+        is not ready is not a member. It does not run the carried-record
+        check, so a component waiting on an unprocessed fact is still counted.
         ⛔ Never import
         `consolidation_loop` here: it imports psycopg2 at the top and the gateway
         does not carry it.
@@ -11634,6 +11822,22 @@ class MemoryCoordinator:
         for _key, _contents, fact_ids in groups:
             labels, consolidated, components = await walk_group_reached_set(
                 self._neo4j, fact_ids)
+            decision_ids = [
+                i for i, lab in labels.items() if lab == ONT.decision]
+            try:
+                async with self._neo4j.session() as session:
+                    res = await session.run(
+                        decision_readiness_cypher(),
+                        ids=[int(i) for i in decision_ids])
+                    ready_rows = await res.data()
+            except Exception as exc:
+                # This group cannot be counted. The other groups still can.
+                log.warning(
+                    "decision_cycles readiness read failed (%s)",
+                    type(exc).__name__)
+                continue
+            labels, consolidated, components, _excluded = admit_members(
+                labels, consolidated, components, ready_rows)
             # Only a component with a Decision and 2+ members folds; see the docstring.
             if passes_insight_gate(labels, consolidated) and any(
                 len(comp) >= 2
@@ -11717,9 +11921,16 @@ class MemoryCoordinator:
             )
             attempts = None
         rem_count = await self._rem_dead_letter_count()
+        try:
+            blocked = await self._rem_backlog_ineligible_pg_ids()
+            backlog_readable = True
+        except Exception:
+            # A zero would say nothing is withheld. Omit both gauges.
+            blocked = []
+            backlog_readable = False
         async with self._neo4j.session(default_access_mode="READ") as session:
             ares = await (await session.run(
-                f"MATCH (n) WHERE (n:{ONT.fact} OR n:{ONT.decision}"
+                f"MATCH (n) WHERE (n:{ONT.fact}"
                 f"                 OR n:{ONT.retrospective})"
                 f"   AND coalesce(n.rem_processed,false) = false"
                 f"   AND coalesce(n.superseded,false) = false"
@@ -11727,6 +11938,42 @@ class MemoryCoordinator:
                 f" RETURN coalesce(n.rem_passed_over,0) AS p, count(*) AS n"
             )).data()
             attempts = ares
+            older_cypher = (
+                f"MATCH (n) WHERE (n:{ONT.fact} OR n:{ONT.retrospective})"
+                f"   AND n.pg_id IS NOT NULL"
+                f"   AND coalesce(n.superseded,false) = false"
+                f"   AND coalesce(n.rem_processed,false) = true"
+                f"   AND coalesce(n.rem_invalid,false) = false"
+                f"   AND (n.rem_prompt_version IS NULL"
+                f"        OR n.rem_prompt_version < $v)"
+            )
+            older_n = None
+            withheld_n = None
+            if backlog_readable:
+                if blocked:
+                    older_cypher += " AND NOT n.pg_id IN $blocked"
+                older_cypher += " RETURN count(*) AS backlog_older"
+                older = await (await session.run(
+                    older_cypher, v=REM_PROMPT_VERSION,
+                    **({"blocked": blocked} if blocked else {}),
+                )).data()
+                older_n = sum(r["backlog_older"] for r in older)
+                if blocked:
+                    withheld = await (await session.run(
+                        f"MATCH (n) WHERE (n:{ONT.fact} OR n:{ONT.retrospective})"
+                        f"   AND n.pg_id IS NOT NULL"
+                        f"   AND coalesce(n.superseded,false) = false"
+                        f"   AND coalesce(n.rem_processed,false) = true"
+                        f"   AND coalesce(n.rem_invalid,false) = false"
+                        f"   AND (n.rem_prompt_version IS NULL"
+                        f"        OR n.rem_prompt_version < $v)"
+                        f"   AND n.pg_id IN $blocked"
+                        f" RETURN count(*) AS backlog_withheld",
+                        v=REM_PROMPT_VERSION, blocked=blocked,
+                    )).data()
+                    withheld_n = sum(r["backlog_withheld"] for r in withheld)
+                else:
+                    withheld_n = 0
         out = {
             "passed_over": sum(r["n"] * r["p"] for r in attempts),
             "starved_pending": sum(r["n"] for r in attempts
@@ -11734,6 +11981,9 @@ class MemoryCoordinator:
             "throughput_per_hour": float(row["n"]),
             "degeneration_firings": None,
         }
+        if older_n is not None and withheld_n is not None:
+            out["backlog_older_prompt"] = older_n
+            out["backlog_withheld"] = withheld_n
         if isinstance(rem_count.get("dead_lettered"), int):
             out["dead_lettered"] = rem_count["dead_lettered"]
         return out

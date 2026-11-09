@@ -84,7 +84,7 @@ __all__ = [
 ]
 
 #: Not a free-running today: this is the fifth version pin, so a missed bump is visible (decision:1832).
-VERSION = "1.1.1"
+VERSION = "1.1.2"
 
 
 def _version_tuple(v: str) -> tuple:
@@ -168,6 +168,8 @@ INTRODUCED_1_0_41 = "1.0.41"
 INTRODUCED_1_0_42 = "1.0.42"
 INTRODUCED_1_0_44 = "1.0.44"
 INTRODUCED_1_0_45 = "1.0.45"
+#: New REM/NREM keys for release 2.
+INTRODUCED_1_1_2 = "1.1.2"
 #: A lone consolidation stall stopped degrading the top /health status (fact:2996 ruling 3).
 INTRODUCED_1_0_17 = "1.0.17"
 #: Quiesce sheds writes on auth-off installs and counts every write in flight (fact:2996 ruling 1: the container check).
@@ -771,12 +773,17 @@ TELEMETRY: dict[str, dict] = {
 
     # ── outbox (NEW section, 0.9.74) ────────────────────────────────────────
     "outbox.pending": _k("int", "outbox", since=INTRODUCED_0_9_74),
-    "outbox.applied": _k("int", "outbox", since=INTRODUCED_0_9_74),
+    "outbox.applied": _k("int", "outbox", since=INTRODUCED_0_9_74, note=(
+        "Decision outbox rows are no longer advanced to rem_reviewed, so a "
+        "decision's apply lands here and outbox.rem_reviewed does not grow "
+        "for it. A decision's lineage rem_reviewed_at stays null.")),
     "outbox.failed": _k("int", "outbox", since=INTRODUCED_0_9_74, log="health.outbox", note=(
         "⛔ ALWAYS PRESENT, 0 when zero. The pre-0.9.74 `postgres.outbox` census "
         "omitted the key entirely at zero, so absence and zero were "
         "indistinguishable to every consumer.")),
-    "outbox.rem_reviewed": _k("int", "outbox", since=INTRODUCED_0_9_74),
+    "outbox.rem_reviewed": _k("int", "outbox", since=INTRODUCED_0_9_74, note=(
+        "REM no longer moves a Decision outbox row to rem_reviewed. The count "
+        "is Fact and Retrospective reviews. A decision stays on applied.")),
     "outbox.oldest_failed_age_s": _k("int|null", "outbox", unit="_s", since=INTRODUCED_0_9_74),
     "outbox.oldest_pending_age_s": _k("int|null", "outbox", unit="_s", since=INTRODUCED_0_9_74,
                                       log="health.warning.outbox_oldest_pending_age_s"),
@@ -821,7 +828,12 @@ TELEMETRY: dict[str, dict] = {
     "neo4j.facts_rem_pending": _k("int", "rem"),
     "neo4j.facts_unconsolidated": _k("int", "nrem/consolidation"),
     "neo4j.decisions_total": _k("int", "neo4j"),
-    "neo4j.decisions_rem_pending": _k("int", "rem"),
+    "neo4j.decisions_rem_pending": _k("int", "rem", note=(
+        "live decisions not ready by the computed builder (decision:3582); "
+        "not REM work; never sum with facts_rem_pending")),
+    "neo4j.retrospectives_rem_pending": _k(
+        "int", "rem", since=INTRODUCED_1_1_2,
+        note="live Retrospective nodes that are not rem_processed"),
     "neo4j.rem_dead_lettered": _k("int", "rem", moved_to="telemetry:rem.dead_lettered",
                                   removed_in=TELEMETRY_DUAL_EMIT_DROP_TARGET),
     "neo4j.rem_failing": _k("int", "rem", moved_to=None,
@@ -832,10 +844,12 @@ TELEMETRY: dict[str, dict] = {
                                  note="the value was removed in 1.0.45"),
     "neo4j.rem_passed_over_total": _k("int", "rem", unit="_total",
                                       moved_to="telemetry:rem.passed_over",
-                                      removed_in=TELEMETRY_DUAL_EMIT_DROP_TARGET),
+                                      removed_in=TELEMETRY_DUAL_EMIT_DROP_TARGET,
+                                      note="Fact and Retrospective only; decisions are not counted (brief §8)"),
     "neo4j.rem_starved_pending": _k("int", "rem",
                                     moved_to="telemetry:rem.starved_pending",
-                                    removed_in=TELEMETRY_DUAL_EMIT_DROP_TARGET),
+                                    removed_in=TELEMETRY_DUAL_EMIT_DROP_TARGET,
+                                    note="Fact and Retrospective only; decisions are not counted (brief §8)"),
     "neo4j.query_p50_ms": _k("float|null", "neo4j", unit="_ms", since=INTRODUCED_0_9_74, note=(
         "over BOTH Neo4j callers — the /memory/graph route and the outbox "
         "apply — so the write path that actually blocks the pipeline is in "
@@ -864,13 +878,25 @@ TELEMETRY: dict[str, dict] = {
                                 "record shows degraded.")),
     "rem.failing": _k("int", "rem", since=INTRODUCED_0_9_74,
                       removed_in=INTRODUCED_1_0_45, note="always 0."),
-    "rem.passed_over": _k("int", "rem", since=INTRODUCED_0_9_74),
-    "rem.starved_pending": _k("int", "rem", since=INTRODUCED_0_9_74),
+    "rem.passed_over": _k("int", "rem", since=INTRODUCED_0_9_74,
+                          note="Fact and Retrospective only; decisions are not counted (brief §8)"),
+    "rem.starved_pending": _k("int", "rem", since=INTRODUCED_0_9_74,
+                              note="Fact and Retrospective only; decisions are not counted (brief §8)"),
     "rem.max_attempts": _k("int", "rem", since=INTRODUCED_0_9_74,
                            removed_in=INTRODUCED_1_0_45, note="always 0."),
     "rem.throughput_per_hour": _k("float|null", "rem", since=INTRODUCED_0_9_74, note=(
-        "records REM stamped in the last hour, from the durable "
-        "technical_docs.rem_timing clock")),
+        "batched facts REM stamped in the last hour, from the durable "
+        "technical_docs.rem_timing clock, including batched backlog facts; "
+        "solo work writes no timing")),
+    "rem.backlog_older_prompt": _k(
+        "int", "rem", since=INTRODUCED_1_1_2,
+        note=("live, valid, not-withheld Fact|Retrospective nodes still "
+              "carrying an older or no rem_prompt_version stamp. Absent when "
+              "llm_backlog is unreadable")),
+    "rem.backlog_withheld": _k(
+        "int", "rem", since=INTRODUCED_1_1_2,
+        note=("older-stamp Fact|Retrospective nodes withheld by a rem backlog "
+              "row. Absent when llm_backlog is unreadable")),
     "rem.degeneration_firings": _k("int|null", "rem", since=INTRODUCED_0_9_74, note=(
         "Null. The loop check runs in the gateway on a cut-off reply and "
         "writes a log line. This key does not count those lines. Reporting 0 "
@@ -1119,8 +1145,10 @@ TELEMETRY: dict[str, dict] = {
         note="groups seeded by REM-processed facts only"),
     "nrem.decision_cycles": _k(
         "int", "insight",
-        note=("candidate-group gauge seeded by REM-processed facts; it does not "
-              "run the insight readiness check, so it overcounts a deferred component")),
+        note=("candidate-group gauge seeded by REM-processed facts; "
+              "admit_members drops an unconsolidated decision that is not "
+              "ready (decision:3582); a component waiting on an unprocessed "
+              "fact is still counted")),
     "nrem.total_cycles": _k("int", "nrem/consolidation"),
     "nrem.fact_threshold": _k("int", "nrem/consolidation",
                               note="ONT.density_threshold"),
@@ -1131,6 +1159,11 @@ TELEMETRY: dict[str, dict] = {
         "the walk has no hop cap), so it moved out of the request path.")),
     "nrem.error": _k("str", "nrem/consolidation",
                      note="present only when the refresher's last pass failed"),
+    "nrem.insight_excluded_pending_rem": _k(
+        "int", "insight", since=INTRODUCED_1_1_2,
+        note=("insight groups or components that fail the gate only because "
+              "admit_members dropped a fresh decision (decision:3582). "
+              "Absent until an insight cycle records the count")),
 
     # ── breakdown ───────────────────────────────────────────────────────────
     "breakdown.record_types[]": _k("list", "spine"),
@@ -1756,6 +1789,34 @@ MEANING_CHANGES: tuple[dict, ...] = (
         "action": "expect fewer 503 and more 403 during a quiesce on such installs",
         "shape_changed": False,
     },
+    {
+        "endpoint": "telemetry",
+        "path": "neo4j.decisions_rem_pending",
+        "in_version": INTRODUCED_1_1_2,
+        "was": "decisions whose stored rem_processed flag was false",
+        "now": ("live decisions not yet REM-processed by the computed rule: every fact and "
+                "retrospective they point to is processed (fact:3541); not REM work"),
+        "action": "never sum it with facts_rem_pending; expect a drop at deploy",
+        "shape_changed": False,
+    },
+    {
+        "endpoint": "telemetry",
+        "path": "neo4j.rem_passed_over_total",
+        "in_version": INTRODUCED_1_1_2,
+        "was": "passed-over count over facts, decisions and retrospectives",
+        "now": "facts and retrospectives only: REM no longer selects a decision",
+        "action": "expect a step down at deploy",
+        "shape_changed": False,
+    },
+    {
+        "endpoint": "telemetry",
+        "path": "neo4j.rem_starved_pending",
+        "in_version": INTRODUCED_1_1_2,
+        "was": "starved records over facts, decisions and retrospectives",
+        "now": "facts and retrospectives only: REM no longer selects a decision",
+        "action": "expect a step down at deploy",
+        "shape_changed": False,
+    },
 )
 
 #: Removed, not moved: each had no writer and had read 0 since it shipped.
@@ -1842,6 +1903,11 @@ CONDITIONAL: frozenset = frozenset({
     "telemetry:outbox.error",
     "telemetry:rem.error",
     "telemetry:nrem.error",
+    "telemetry:nrem.insight_excluded_pending_rem",
+    "telemetry:neo4j.decisions_rem_pending",
+    # Absent when llm_backlog is unreadable. A zero would say nothing is withheld.
+    "telemetry:rem.backlog_older_prompt",
+    "telemetry:rem.backlog_withheld",
     "telemetry:registry.error",
     "telemetry:breakdown.error",
     "telemetry:entity_graph.error",

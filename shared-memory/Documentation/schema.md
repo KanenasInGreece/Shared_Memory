@@ -45,7 +45,7 @@ Written exclusively by the consolidation daemon. Never written directly by agent
 ⚠ **Two rows are NOT the same shape any more (Dreaming Cycle Plan to v2 §3, C4).**
 A **thematic** row's `content` is a **Zettelkasten index** — a deterministic,
 zero/low-inference concatenation of each constituent fact's own tight text
-(`fold_record_line` over `coalesce(rem_summary, content)`); it is **never**
+(`fold_record_line` over the REM summary, or the whole Postgres text when that summary was not shorter); it is **never**
 LLM-synthesised. An **insight** row's `content` **is** LLM-synthesised — the
 causal chain over its ordered judgements, extracting strictly each
 judgement's own Title and Rationale (its `content` verbatim), excluding
@@ -593,7 +593,7 @@ generator does faithfully introspect.
 
 | Label | Written by | Purpose |
 |---|---|---|
-| `Fact` | Outbox worker (on every save) | Primary node — one per `technical_docs` row, keyed by `pg_id` |
+| `Fact` | Outbox worker (on every save) | Primary node — one per `technical_docs` row, keyed by `pg_id`. No `content`. REM may set `rem_summary`, `rem_processed`, and `rem_prompt_version`. |
 | `Entity` | Outbox worker | Named entity extracted from `metadata["entities"]`; anchors consolidation clusters |
 | `CommunitySummary` | Consolidation daemon | Synthesised narrative, keyed by `pg_id`. Thematic: one per `(entity, domain)` hub. Insight (`kind: "insight"` property, decision pg_id 276): cross-project decision synthesis, accumulates + supersedes. |
 | `ReasoningTrace` | Nothing — no writer in shipped code | Root of a reasoning session. The connector tool was removed in 1.0.1 and ingress refuses `type: reasoning_trace`, so the label is defined in `ontology.py` and never written. |
@@ -621,8 +621,8 @@ Written by the outbox worker when `metadata["type"] == "decision"`.
 
 | Label | Purpose |
 |---|---|
-| `Decision` | An architectural or design decision — keyed by `pg_id`, links to all PROV-O edges. Lifecycle flags: `rem_processed` (REM enrichment done), `consolidated` (folded into an insight), `superseded` (reversed via `rating="reversed"`). ⚠ **The options weighed and the confidence held are NOT node properties** — no query filters, orders or matches on them, so they are payload and live once, in Postgres (`metadata->'decision'`), reached by this node's `pg_id`. Graph expansion dereferences them into a search hit's `adr_props`. A record property the graph must *walk* on (a project identity, a lifecycle flag) is duplicated deliberately; one only ever rendered is not. |
-| `Retrospective` | A recorded outcome for a decision (retro-as-record, v2) — keyed by `pg_id` like Fact/Decision. Carries `rating` (outcome-state enum: `validated`\|`mixed`\|`refined`\|`pending`\|`reversed`), `date`, `content` (notes snippet; full notes in Postgres), `source`, `fact_kind`, and `rem_processed`. Reached from its decision via the `HAD_OUTCOME` trigger edge; grounds in evidence facts via typed ROLE edges. Framework-defined — never configurable via `ontology.yaml`. |
+| `Decision` | An architectural or design decision — keyed by `pg_id`, links to all PROV-O edges. Lifecycle flags: `consolidated` (folded into an insight), `superseded` (reversed via `rating="reversed"`). No `rem_summary`, `rem_processed`, `rem_pickups`, or `rem_passed_over`. ⚠ **The options weighed and the confidence held are NOT node properties** — no query filters, orders or matches on them, so they are payload and live once, in Postgres (`metadata->'decision'`), reached by this node's `pg_id`. Graph expansion dereferences them into a search hit's `adr_props`. A record property the graph must *walk* on (a project identity, a lifecycle flag) is duplicated deliberately; one only ever rendered is not. |
+| `Retrospective` | A recorded outcome for a decision (retro-as-record, v2) — keyed by `pg_id` like Fact/Decision. Carries `rating` (outcome-state enum: `validated`\|`mixed`\|`refined`\|`pending`\|`reversed`), `date`, `source`, `fact_kind`, `rem_summary`, `rem_processed`, and `rem_prompt_version` (no `content`; notes stay in Postgres). Reached from its decision via the `HAD_OUTCOME` trigger edge; grounds in evidence facts via typed ROLE edges. Framework-defined — never configurable via `ontology.yaml`. |
 | `Human` | A person who owns or makes a decision (`decided_by` field) |
 | `AIAgent` | An AI tool that assisted in the decision (`assisted_by` list) |
 | `Project` | Project scope — the node every record's belonging edge points at. **Keyed on `project_id`, the registry identity (migration 027); `name` is a display label carried on the node, unique but renameable.** The fold gate counts distinct `project_id`, so a node with none is not counted — see `projects` below. |
@@ -655,7 +655,7 @@ Written by the outbox worker for `type:decision` saves.
 | `SUPERSEDES` | `(:Decision)-[:SUPERSEDES]->(:Decision)` | Replaces a prior decision |
 | `INFORMED_BY` | `(:Decision)-[:INFORMED_BY]->(:Decision)` | Prior decision used as input: soft grounding the operator declared (`--grounded-in N:informed_by`, or a discussion fact's default role), written by the grounding writer with `asserted_by`. Never written from a textual citation (decision:3135: a citation is a reference, never grounding); an edge stamped `resolved_from='content'` is a legacy backfill edge, re-typed to `REFERENCES` by `resolve_references.py --apply`. |
 | `REFERENCES` | `(:Fact\|:Decision)-[:REFERENCES]->(:Fact\|:Decision)` | A record cross-reference resolved from content by the operator-run `resolve_references.py`: a cue-gated id mention (e.g. "refines decision 381") that resolves to a real, non-superseded record. Every citation is `REFERENCES`, whatever the two record types (decision:3135); a citation with a retrospective at either end is not written. Carries `resolved_from='content'` + `cue`; one re-typed from a legacy `INFORMED_BY` also carries `retyped_from='INFORMED_BY'`. Never auto-`SUPERSEDES` (explicit-only). |
-| `HAD_OUTCOME` | `(:Decision)-[:HAD_OUTCOME {date}]->(:Retrospective)` | Retro-as-record (v2): the trigger edge to the retrospective RECORD (rating/date/content live on the node). Legacy pre-conversion shape: a self-loop `(:Decision)-[:HAD_OUTCOME {rating,date,notes}]->(:Decision)` with the payload as edge props — readers accept both during the transition |
+| `HAD_OUTCOME` | `(:Decision)-[:HAD_OUTCOME {date}]->(:Retrospective)` | Retro-as-record (v2): the trigger edge to the retrospective RECORD (rating and date live on the node; the node has no `content`). Legacy pre-conversion shape: a self-loop `(:Decision)-[:HAD_OUTCOME {rating,date,notes}]->(:Decision)` with the payload as edge props — readers accept both during the transition |
 | `SUPERSEDES` | `(:CommunitySummary)-[:SUPERSEDES]->(:CommunitySummary)` | Also written between CommunitySummary nodes when supersession rule fires (v0.4.0) |
 | `SUPERSEDES` | `(:Fact)-[:SUPERSEDES]->(:Fact)` | A correction supersedes an older fact (decision 381); the old `:Fact` also gets `superseded = true` so REM/NREM skip it |
 
@@ -701,9 +701,9 @@ clusters on the `(project, domain)` spine — `GROUNDED_IN`/`DOMAIN_OF`/
 scores, promotes or consumes them. Edges written before provenance stamping
 exist carry no `asserted_by` at all.
 
-**`rem_processed` Fact property:** after REM enriches a Fact node, it sets `rem_processed = true`. NREM (`consolidation_loop.py`) requires this flag before including a Fact in a consolidation cluster — `WHERE coalesce(neighbor.rem_processed, false) = true`. A Fact whose Neo4j write is still pending in the outbox is never marked `rem_processed`.
+**`rem_processed` and `rem_prompt_version`:** a Fact or Retrospective node has no `content` property. REM sets `rem_processed = true` and `rem_prompt_version` on the node it summarises, and `rem_summary` only when that summary is shorter than the Postgres text. NREM (`consolidation_loop.py`) requires `rem_processed` before including a Fact in a consolidation cluster — `WHERE coalesce(neighbor.rem_processed, false) = true`. A Decision node has no `rem_summary`, `rem_processed`, `rem_pickups`, or `rem_passed_over`.
 
-**Entity linking is a first-write capability only.** REM builds no entity registry and proposes no relationship: it summarises a record and writes `rem_summary` (`decision:1664`). An entity reaches the graph when a person names it on a save.
+**Entity linking is a first-write capability only.** REM builds no entity registry and proposes no relationship: it summarises a fact or a retrospective and writes `rem_summary` (`decision:1664`). An entity reaches the graph when a person names it on a save.
 
 ### Retrospective write protocol (v2 — retro-as-record)
 
@@ -719,7 +719,7 @@ A retrospective is a **full record**: its own `technical_docs` row (content = th
 The coordinator validates the rating against the outcome-state enum, verifies the target `pg_id` exists, embeds the notes (hard mandate), inserts the retro's own row (inheriting the target's `project`), and writes a `neo4j_outbox` row **under the retro's own pg_id** (`type=retrospective`, `v: 2`, `target_pg_id` = the decision). The outbox worker materialises:
 
 ```cypher
-MERGE (r:Retrospective {pg_id: $pg_id})            // rating, date, content snippet,
+MERGE (r:Retrospective {pg_id: $pg_id})            // rating, date, fact_kind; no content,
 SET r.rating = ..., r.fact_kind = ...              // source, fact_kind on the node
 MATCH (d:Decision {pg_id: $target})
 MERGE (d)-[:HAD_OUTCOME {date: $date}]->(r)        // the TRIGGER edge
