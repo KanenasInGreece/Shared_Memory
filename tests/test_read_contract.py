@@ -590,6 +590,8 @@ def test_expansion_cypher_projects_adr_node_props_both_forms():
         coordinator_mod.MemoryCoordinator._expand_graph_context_batch)
     for body in (src_batch,):
         assert "related.rem_summary AS rem_summary" in body
+        assert "related.rem_processed AS rem_processed" in body
+        assert "related.rem_prompt_version AS rem_prompt_version" in body
         assert "properties(r) AS rel_props" in body
         assert "startNode(r).pg_id AS start_pg_id" in body
         assert "endNode(r).pg_id AS end_pg_id" in body

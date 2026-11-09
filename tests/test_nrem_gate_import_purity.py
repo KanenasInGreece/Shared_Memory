@@ -82,7 +82,7 @@ class _BlockedImport:
                 self._saved_modules[mod_name] = sys.modules.pop(mod_name)
         # Also evict nrem_gate/consolidation_loop themselves so re-importing
         # them under the block is a genuine fresh import, not a cache hit.
-        for mod_name in ("nrem_gate", "consolidation_loop"):
+        for mod_name in ("nrem_gate", "consolidation_loop", "rem_contract"):
             if mod_name in sys.modules:
                 self._saved_modules[mod_name] = sys.modules.pop(mod_name)
         self._real_import = builtins.__import__
@@ -93,7 +93,7 @@ class _BlockedImport:
         builtins.__import__ = self._real_import
         for mod_name in list(sys.modules):
             if mod_name.split(".")[0] in self._blocked or mod_name in (
-                "nrem_gate", "consolidation_loop",
+                "nrem_gate", "consolidation_loop", "rem_contract",
             ):
                 del sys.modules[mod_name]
         sys.modules.update(self._saved_modules)
@@ -174,6 +174,30 @@ def test_nrem_gate_source_imports_no_db_or_network_driver():
     )
     hits = forbidden_pattern.findall(source)
     assert not hits, f"nrem_gate.py must not import a DB/network driver, found: {hits}"
+
+
+def test_rem_contract_imports_and_runs_with_psycopg2_unimportable():
+    """Kills: a database driver import in rem_contract.py, which the gateway would load (brief §0.2-10)."""
+    with _BlockedImport(_GATEWAY_MISSING_MODULES):
+        rem_contract = importlib.import_module("rem_contract")
+        assert rem_contract.REM_PROMPT_VERSION == 2
+        text_is, text = rem_contract.entry_text_is("fact", None, "body")
+        assert text_is == "pointer" and text is None
+
+
+def test_rem_contract_source_imports_no_db_or_network_driver():
+    """Kills: adding psycopg2/asyncpg/neo4j/httpx/aiohttp to rem_contract.py (brief §0.2-10)."""
+    import re
+
+    path = os.path.join(SCRIPTS_DIR, "rem_contract.py")
+    with open(path, encoding="utf-8") as f:
+        source = f.read()
+    forbidden_pattern = re.compile(
+        r"^\s*(import|from)\s+(psycopg2|psycopg|asyncpg|neo4j|httpx|aiohttp)\b",
+        re.MULTILINE,
+    )
+    hits = forbidden_pattern.findall(source)
+    assert not hits, f"rem_contract.py must not import a DB/network driver, found: {hits}"
 
 
 # ── Guard 3 — the gateway lock itself never gains a blocked module ────────────

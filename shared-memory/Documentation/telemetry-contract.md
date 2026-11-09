@@ -630,14 +630,17 @@ The envelope is `{"status": "success", "telemetry": {…}}`; paths below are rel
 | `latency.rem_ms.by_model[].wall_ms.p50` | float/null | _ms | <=0.9.73 | — | — | — | — |
 | `latency.rem_ms.by_model[].wall_ms.p95` | float/null | _ms | <=0.9.73 | — | — | — | — |
 | `latency.rem_ms.note` | str | — | <=0.9.73 | — | — | — | — |
-| `neo4j.decisions_rem_pending` | int | — | <=0.9.73 | — | — | — | — |
+| `neo4j.decisions_rem_pending` | int | — | <=0.9.73 | — | — | — | live decisions not ready by the computed builder; not REM work; never sum with facts_rem_pending. TODO(step 3): that builder is not in this step, so the count is still the stored rem_processed flag |
 | `neo4j.facts_rem_pending` | int | — | <=0.9.73 | — | — | — | — |
+| `neo4j.retrospectives_rem_pending` | int | — | 1.1.2 | — | — | — | live Retrospective nodes that are not rem_processed |
+| `rem.backlog_older_prompt` | int | — | 1.1.2 | — | — | — | live, valid, not-withheld Fact\|Retrospective nodes still carrying an older or no rem_prompt_version stamp |
+| `rem.backlog_withheld` | int | — | 1.1.2 | — | — | — | older-stamp Fact\|Retrospective nodes withheld by a rem backlog row |
 | `rem.dead_lettered` | int | — | 0.9.74 | — | — | `health.rem_daemon` | pending records that have a backlog row; a superseded record is excluded. A withheld record shows degraded. |
 | `rem.degeneration_firings` | int/null | — | 0.9.74 | — | — | — | Null. The loop check runs in the gateway on a cut-off reply and writes a log line. This key does not count those lines. Reporting 0 would say the check never fired. |
 | `rem.error` | str | — | 0.9.74 | — | — | — | present only when this section's own query failed |
 | `rem.passed_over` | int | — | 0.9.74 | — | — | — | — |
 | `rem.starved_pending` | int | — | 0.9.74 | — | — | — | — |
-| `rem.throughput_per_hour` | float/null | — | 0.9.74 | — | — | — | records REM stamped in the last hour, from the durable technical_docs.rem_timing clock |
+| `rem.throughput_per_hour` | float/null | — | 0.9.74 | — | — | — | batched facts REM stamped in the last hour, from the durable technical_docs.rem_timing clock, including batched backlog facts; solo work writes no timing |
 
 ### nrem/consolidation
 
@@ -705,6 +708,7 @@ The envelope is `{"status": "success", "telemetry": {…}}`; paths below are rel
 | key | type | unit | since | moved to | removed in | log twin | notes |
 |---|---|---|---|---|---|---|---|
 | `nrem.decision_cycles` | int | — | <=0.9.73 | — | — | — | candidate-group gauge seeded by REM-processed facts; it does not run the insight readiness check, so it overcounts a deferred component |
+| `nrem.insight_excluded_pending_rem` | int | — | 1.1.2 | — | — | — | insight groups or components waiting only because a new decision's records are not yet REM-processed. TODO(step 3): the readiness builder is not in this step; this key is not emitted until then |
 | `postgres.community_summaries.insight` | int | — | <=0.9.73 | — | — | — | — |
 | `refold_ledger.by_status_reason[]` | list | — | <=0.9.73 | — | — | — | — |
 | `refold_ledger.by_status_reason[].closed_reason` | str/null | — | <=0.9.73 | — | — | — | — |

@@ -13,10 +13,19 @@ def row(kind='fact', **kw):
 
 @pytest.mark.parametrize('summary', ['longer than the whole record', 'x' * 2000, None])
 def test_summary_fallback(summary):
-    # F1, F2, F3: invalid summaries must use whole Postgres text.
-    r = c.render_record_entry(row(), summary, 'fact:1', {})
-    assert r['text'] == 'whole record'
-    assert r['text_is'] == 'full_record'
+    # Kills: an unprocessed fact showing Postgres text as full_record (fact:3544).
+    r = c.render_record_entry(row(), {'rem_summary': summary} if summary is not None else None, 'fact:1', {})
+    assert 'text' not in r
+    assert r['text_is'] == 'pointer'
+
+
+def test_processed_invalid_summary_is_full_record():
+    # Kills: keeping an invalid rem_summary on a processed fact (F1, F2, F3).
+    for summary in ('longer than the whole record', None, ''):
+        state = {'rem_processed': True, 'rem_summary': summary, 'rem_prompt_version': 2}
+        r = c.render_record_entry(row(), state, 'fact:1', {})
+        assert r['text'] == 'whole record'
+        assert r['text_is'] == 'full_record'
 
 
 def test_decision_and_pointer():
@@ -70,14 +79,22 @@ def test_relation():
 
 
 def test_legacy_cut_and_whole_summary():
-    # F1, F2: the cut check must matter even when the summary is shorter.
+    # Kills: a stamp-less 2,000-character summary counting as summary (brief §0.2-3).
     d = row()
     d['content'] = 'a' * 4001
     d['content_chars'] = 4001
-    for summary, expected in [('s' * 2000, 'full_record'), ('s' * 2001, 'summary')]:
-        r = c.render_record_entry(d, summary, 'fact:1', {})
-        assert r['text_is'] == expected
-        assert r['text'] == (d['content'] if expected == 'full_record' else summary)
+    unstamped = {'rem_processed': True, 'rem_summary': 's' * 2000}
+    r = c.render_record_entry(d, unstamped, 'fact:1', {})
+    assert r['text_is'] == 'full_record'
+    assert r['text'] == d['content']
+    stamped = {'rem_processed': True, 'rem_summary': 's' * 2000, 'rem_prompt_version': 2}
+    r = c.render_record_entry(d, stamped, 'fact:1', {})
+    assert r['text_is'] == 'summary'
+    assert r['text'] == 's' * 2000
+    longer = {'rem_processed': True, 'rem_summary': 's' * 2001, 'rem_prompt_version': 2}
+    r = c.render_record_entry(d, longer, 'fact:1', {})
+    assert r['text_is'] == 'summary'
+    assert r['text'] == 's' * 2001
 
 
 @pytest.mark.parametrize('kind', ['fact', 'retrospective', 'decision', 'summary', 'insight'])
@@ -191,7 +208,11 @@ def test_failed_marks_and_unrated_outcome(superseded):
 
 
 def test_empty_record_is_whole():
-    """N2: an empty authoritative record remains a full record."""
+    """Kills: an unprocessed empty fact showing as full_record (fact:3544)."""
     entry = c.render_record_entry(dict(row(), content='', content_chars=0), None, 'fact:1', {})
-    assert entry['text'] == '' and entry['text_is'] == 'full_record'
+    assert 'text' not in entry and entry['text_is'] == 'pointer'
     assert entry['full_record']['chars'] == 0
+    processed = c.render_record_entry(
+        dict(row(), content='', content_chars=0),
+        {'rem_processed': True, 'rem_prompt_version': 2}, 'fact:1', {})
+    assert processed['text'] == '' and processed['text_is'] == 'full_record'

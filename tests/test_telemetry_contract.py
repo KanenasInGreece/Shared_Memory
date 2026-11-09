@@ -766,6 +766,10 @@ _NEO4J_PLAN = [
         {"rem": True, "con": True, "superseded": False, "n": 900}]),
     ("MATCH (d:Decision) RETURN coalesce(d.rem_processed,false)", [
         {"rem": True, "superseded": False, "n": 200}]),
+    ("MATCH (r:Retrospective) WHERE r.pg_id IS NOT NULL", [
+        {"rem": True, "superseded": False, "n": 3}]),
+    ("AS backlog_older", [{"backlog_older": 0}]),
+    ("AS backlog_withheld", [{"backlog_withheld": 0}]),
     ("RETURN count(e) AS total", [{
         "total": 300, "orphans": 2, "unmentioned": 5, "singletons": 40,
         "genuinely_referenced": 250}]),

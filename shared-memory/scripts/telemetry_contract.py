@@ -168,6 +168,8 @@ INTRODUCED_1_0_41 = "1.0.41"
 INTRODUCED_1_0_42 = "1.0.42"
 INTRODUCED_1_0_44 = "1.0.44"
 INTRODUCED_1_0_45 = "1.0.45"
+#: New REM/NREM keys for release 2. VERSION in this file stays 1.1.1 until the merger stamps 1.1.2.
+INTRODUCED_1_1_2 = "1.1.2"
 #: A lone consolidation stall stopped degrading the top /health status (fact:2996 ruling 3).
 INTRODUCED_1_0_17 = "1.0.17"
 #: Quiesce sheds writes on auth-off installs and counts every write in flight (fact:2996 ruling 1: the container check).
@@ -821,7 +823,13 @@ TELEMETRY: dict[str, dict] = {
     "neo4j.facts_rem_pending": _k("int", "rem"),
     "neo4j.facts_unconsolidated": _k("int", "nrem/consolidation"),
     "neo4j.decisions_total": _k("int", "neo4j"),
-    "neo4j.decisions_rem_pending": _k("int", "rem"),
+    "neo4j.decisions_rem_pending": _k("int", "rem", note=(
+        "live decisions not ready by the computed builder; not REM work; "
+        "never sum with facts_rem_pending. TODO(step 3): that builder is not "
+        "in this step, so the count is still the stored rem_processed flag")),
+    "neo4j.retrospectives_rem_pending": _k(
+        "int", "rem", since=INTRODUCED_1_1_2,
+        note="live Retrospective nodes that are not rem_processed"),
     "neo4j.rem_dead_lettered": _k("int", "rem", moved_to="telemetry:rem.dead_lettered",
                                   removed_in=TELEMETRY_DUAL_EMIT_DROP_TARGET),
     "neo4j.rem_failing": _k("int", "rem", moved_to=None,
@@ -869,8 +877,16 @@ TELEMETRY: dict[str, dict] = {
     "rem.max_attempts": _k("int", "rem", since=INTRODUCED_0_9_74,
                            removed_in=INTRODUCED_1_0_45, note="always 0."),
     "rem.throughput_per_hour": _k("float|null", "rem", since=INTRODUCED_0_9_74, note=(
-        "records REM stamped in the last hour, from the durable "
-        "technical_docs.rem_timing clock")),
+        "batched facts REM stamped in the last hour, from the durable "
+        "technical_docs.rem_timing clock, including batched backlog facts; "
+        "solo work writes no timing")),
+    "rem.backlog_older_prompt": _k(
+        "int", "rem", since=INTRODUCED_1_1_2,
+        note=("live, valid, not-withheld Fact|Retrospective nodes still "
+              "carrying an older or no rem_prompt_version stamp")),
+    "rem.backlog_withheld": _k(
+        "int", "rem", since=INTRODUCED_1_1_2,
+        note="older-stamp Fact|Retrospective nodes withheld by a rem backlog row"),
     "rem.degeneration_firings": _k("int|null", "rem", since=INTRODUCED_0_9_74, note=(
         "Null. The loop check runs in the gateway on a cut-off reply and "
         "writes a log line. This key does not count those lines. Reporting 0 "
@@ -1131,6 +1147,12 @@ TELEMETRY: dict[str, dict] = {
         "the walk has no hop cap), so it moved out of the request path.")),
     "nrem.error": _k("str", "nrem/consolidation",
                      note="present only when the refresher's last pass failed"),
+    "nrem.insight_excluded_pending_rem": _k(
+        "int", "insight", since=INTRODUCED_1_1_2,
+        note=("insight groups or components waiting only because a new "
+              "decision's records are not yet REM-processed. TODO(step 3): "
+              "the readiness builder is not in this step; this key is not "
+              "emitted until then")),
 
     # ── breakdown ───────────────────────────────────────────────────────────
     "breakdown.record_types[]": _k("list", "spine"),
@@ -1842,6 +1864,7 @@ CONDITIONAL: frozenset = frozenset({
     "telemetry:outbox.error",
     "telemetry:rem.error",
     "telemetry:nrem.error",
+    "telemetry:nrem.insight_excluded_pending_rem",
     "telemetry:registry.error",
     "telemetry:breakdown.error",
     "telemetry:entity_graph.error",

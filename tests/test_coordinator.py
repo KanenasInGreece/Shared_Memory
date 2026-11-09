@@ -2051,6 +2051,8 @@ async def test_handle_telemetry_rolls_up_postgres_and_neo4j():
         _result([{"rem": True, "superseded": False, "n": 4},
                   {"rem": False, "superseded": False, "n": 71},
                   {"rem": False, "superseded": True, "n": 2}]),
+        _result([{"rem": True, "superseded": False, "n": 3},
+                  {"rem": False, "superseded": False, "n": 2}]),
         # rem_attempts/rem_passed_over distribution over pending records
         _result([{"a": 0, "p": 0, "n": 60}, {"a": 2, "p": 1, "n": 9},
                   {"a": 5, "p": 3, "n": 3}]),
@@ -2067,6 +2069,7 @@ async def test_handle_telemetry_rolls_up_postgres_and_neo4j():
     assert t["neo4j"]["facts_unconsolidated"] == 0   # only rem=True & con=False counts; here 96 are consolidated
     assert t["neo4j"]["decisions_total"] == 77
     assert t["neo4j"]["decisions_rem_pending"] == 71  # the 2 superseded-pending decisions are excluded
+    assert t["neo4j"]["retrospectives_rem_pending"] == 2
 
     # ⚠ THE ARITHMETIC, READ OFF THE BUILDER. The outbox census and the REM
     # backlog gauges are served from their own sections, which this fixture's
@@ -2136,6 +2139,7 @@ async def test_handle_telemetry_survives_partial_backend_failure():
     mock_session.run = AsyncMock(side_effect=[
         _result([{"rem": True, "con": False, "superseded": False, "n": 5}]),
         _result([{"rem": False, "superseded": False, "n": 2}]),
+        _result([{"rem": True, "superseded": False, "n": 0}]),
         _result([{"a": 0, "p": 0, "n": 2}]),
     ])
 
