@@ -2146,12 +2146,12 @@ def _daemon_env_and_token_fd(agent_name: str) -> "tuple[dict, int | None]":
         _revoke_daemon_token(agent_name)
         raise
     env["AGENT_TOKEN_FD"] = str(read_fd)
-    # The active pool changes only at a restart, which is when these daemons are
-    # respawned. No new route.
-    env["SM_LLM_POOL_ID"] = llm_pool_id()
-    env["SM_LLM_LARGEST_CTX"] = str(llm_largest_ctx())
-    env["SM_LLM_LARGEST_REPLY"] = str(llm_largest_reply())
-    env["SM_GATEWAY_BOOT_ID"] = _GATEWAY_BOOT_ID
+    # The gauge reads this same function. A second copy of the four values would classify a row the children still block.
+    ident = daemon_llm_identity()
+    env["SM_LLM_POOL_ID"] = ident["pool_id"]
+    env["SM_LLM_LARGEST_CTX"] = str(ident["largest_ctx"])
+    env["SM_LLM_LARGEST_REPLY"] = str(ident["largest_reply"])
+    env["SM_GATEWAY_BOOT_ID"] = ident["boot_id"]
     return env, read_fd
 
 
@@ -4393,6 +4393,8 @@ async def main() -> None:
     app["coordinator"] = coordinator  # health reads the cached consolidation snapshot
     # Telemetry for this module's state is a callback, not an import. coordinator cannot import this module. Set it before any request is served.
     coordinator.telemetry_extras_provider = telemetry_extras
+    # This file is __main__ under systemd, so the coordinator must not import it. The probe below starts the daemons only after this assignment, and the children are stamped by the same function.
+    coordinator.daemon_identity_provider = daemon_llm_identity
     coordinator.quiesce_check_hook = _quiesce_backend_check
     # One Server identity on every response, including proxied ones. Registered on the app so a new handler cannot forget it.
     app.on_response_prepare.append(_set_server_header)

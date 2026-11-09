@@ -891,10 +891,12 @@ TELEMETRY: dict[str, dict] = {
     "rem.backlog_older_prompt": _k(
         "int", "rem", since=INTRODUCED_1_1_2,
         note=("live, valid, not-withheld Fact|Retrospective nodes still "
-              "carrying an older or no rem_prompt_version stamp")),
+              "carrying an older or no rem_prompt_version stamp. Absent when "
+              "llm_backlog is unreadable")),
     "rem.backlog_withheld": _k(
         "int", "rem", since=INTRODUCED_1_1_2,
-        note="older-stamp Fact|Retrospective nodes withheld by a rem backlog row"),
+        note=("older-stamp Fact|Retrospective nodes withheld by a rem backlog "
+              "row. Absent when llm_backlog is unreadable")),
     "rem.degeneration_firings": _k("int|null", "rem", since=INTRODUCED_0_9_74, note=(
         "Null. The loop check runs in the gateway on a cut-off reply and "
         "writes a log line. This key does not count those lines. Reporting 0 "
@@ -1875,6 +1877,9 @@ CONDITIONAL: frozenset = frozenset({
     "telemetry:nrem.error",
     "telemetry:nrem.insight_excluded_pending_rem",
     "telemetry:neo4j.decisions_rem_pending",
+    # Absent when llm_backlog is unreadable. A zero would say nothing is withheld.
+    "telemetry:rem.backlog_older_prompt",
+    "telemetry:rem.backlog_withheld",
     "telemetry:registry.error",
     "telemetry:breakdown.error",
     "telemetry:entity_graph.error",

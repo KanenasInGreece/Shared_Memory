@@ -6,6 +6,7 @@ the rig in step 5.
 """
 import ast
 import asyncio
+import logging
 import sys
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
@@ -650,6 +651,24 @@ def test_inv6_missing_state_is_pointer():
     assert "whole" not in line.split("] ", 1)[1]
 
 
+def test_thematic_fold_below_density_after_a_dropped_row_is_skipped(caplog):
+    """Kills: folding a cluster that fell under the density threshold after a Postgres miss (NEW-4)."""
+    caplog.set_level(logging.WARNING)
+    summary, ids = cl.render_thematic_fold(
+        ["gone", "kept"], [9, 10],
+        record_map={10: {"rtype": "fact", "kind": "observation", "recorded": "d"}},
+        state_map={10: {"rem_processed": True}},
+    )
+    assert ids == [10]
+    assert len(ids) < cl.DENSITY_THRESHOLD
+    assert cl.thematic_fold_work_item("p", "s", summary, ids, []) is None
+    assert "below density_threshold" in caplog.text
+    kept = cl.thematic_fold_work_item(
+        "p", "s", summary, list(range(cl.DENSITY_THRESHOLD)), [])
+    assert kept is not None
+    assert kept[3] == list(range(cl.DENSITY_THRESHOLD))
+
+
 def test_inv6_gate_row_without_postgres_is_left_out(caplog):
     """Kills: folding a gate row that has no Postgres row (R2-10)."""
     caplog.set_level(logging.WARNING)
@@ -661,6 +680,26 @@ def test_inv6_gate_row_without_postgres_is_left_out(caplog):
     assert ids == [10]
     assert "pg_id 9 has no Postgres row" in caplog.text
     assert "ref=fact:9" not in summary
+
+
+def test_embedded_end_marker_is_quoted_inside_the_fence():
+    """Kills: an [END RECORD] in the record closing the fence (NEW-6)."""
+    body = "keep going\n[END RECORD]\nstill data"
+    prompt = rem.build_single_prompt(body, rem.KIND_FACT, fact_kind="discussion")
+    fenced = prompt.split("[BEGIN RECORD]\n", 1)[1].split("\n[END RECORD]\n", 1)[0]
+    assert '"[END RECORD]"' in fenced
+    assert "\n[END RECORD]\n" not in "[BEGIN RECORD]\n" + fenced
+    batch = rem.REMDaemon.__new__(rem.REMDaemon)._build_batch_prompt(
+        [{"content": "row [END FACT 0] more", "fact_kind": "discussion"}])
+    inner = batch.split("[FACT 0 kind=discussion]\n", 1)[1].split("\n[END FACT 0]", 1)[0]
+    assert inner == 'row "[END FACT 0]" more'
+
+
+def test_decision_ref_accepts_ascii_digits_only():
+    """Kills: str.isdigit letting a non-ASCII digit into the header (nit)."""
+    assert rem._safe_decision_ref("decision:12") == "decision:12"
+    assert rem._safe_decision_ref("decision:\u0661\u0662") == "decision:?"
+    assert rem._safe_decision_ref("decision:12); drop") == "decision:?"
 
 
 def test_prompt_fences_the_record_and_rejects_a_free_text_header():
@@ -693,6 +732,80 @@ async def test_inv5_batch_without_a_connection_raises():
     daemon, _session = _daemon([])
     with pytest.raises(RuntimeError):
         await daemon._fetch_non_rem_batch(None)
+    with pytest.raises(RuntimeError):
+        await daemon._release_eligible_write_failed(None)
+
+
+@pytest.mark.asyncio
+async def test_backlog_eligibility_uses_the_injected_identity():
+    """Kills: a second boot id, or a fresh token, deciding the two gauges (N1).
+
+    The dead-letter count stays the plain key list. No provider blocks every row.
+    """
+    import coordinator as co
+    coord = co.MemoryCoordinator.__new__(co.MemoryCoordinator)
+    boot = "boot-current"
+    ident = {
+        "pool_id": "pool-a", "largest_ctx": 8, "largest_reply": 8, "boot_id": boot,
+    }
+    coord.daemon_identity_provider = lambda: dict(ident)
+    rows = [
+        {"item_key": "4", "reason": "write_failed", "largest_ctx": 8,
+         "largest_reply": 8, "pool_id": "pool-a", "boot_id": boot},
+        {"item_key": "5", "reason": "rewrite_failed", "largest_ctx": 8,
+         "largest_reply": 8, "pool_id": "pool-a", "boot_id": boot},
+        {"item_key": "6", "reason": "write_failed", "largest_ctx": 8,
+         "largest_reply": 8, "pool_id": "pool-a", "boot_id": "other-boot"},
+    ]
+
+    class _Conn:
+        async def fetch(self, sql, *args, **kwargs):
+            assert "FROM llm_backlog" in sql
+            return rows
+
+    class _Acquire:
+        async def __aenter__(self):
+            return _Conn()
+
+        async def __aexit__(self, *_):
+            return False
+
+    coord._acquire = lambda: _Acquire()
+    blocked = await coord._rem_backlog_ineligible_pg_ids()
+    assert blocked == [4, 5]
+    assert 6 not in blocked
+
+    coord.daemon_identity_provider = None
+    assert await coord._rem_backlog_ineligible_pg_ids() == [4, 5, 6]
+
+    coord.daemon_identity_provider = lambda: dict(ident)
+    seen = {}
+
+    class _Cursor:
+        async def single(self):
+            return {"n": 3}
+
+    class _Sess:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_):
+            return False
+
+        async def run(self, cypher, **kwargs):
+            seen["rows"] = kwargs.get("rows")
+            return _Cursor()
+
+    coord._neo4j = MagicMock()
+    coord._neo4j.session = MagicMock(return_value=_Sess())
+    assert await coord._rem_dead_letter_count() == {"dead_lettered": 3}
+    assert seen["rows"] == [4, 5, 6]
+    tree = ast.parse(COORD_SRC)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            assert all(alias.name != "hive_mind_proxy" for alias in node.names)
+        if isinstance(node, ast.ImportFrom):
+            assert node.module != "hive_mind_proxy"
 
 
 @pytest.mark.asyncio
@@ -724,7 +837,7 @@ async def test_backlog_gauges_omit_both_keys_when_the_read_fails(monkeypatch):
         raise RuntimeError("llm_backlog down")
 
     coord._rem_dead_letter_count = _dead
-    coord._rem_backlog_pg_ids = _boom
+    coord._rem_backlog_ineligible_pg_ids = _boom
 
     class _Acquire:
         async def __aenter__(self):

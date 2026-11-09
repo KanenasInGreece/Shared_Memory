@@ -815,6 +815,22 @@ def render_thematic_fold(contents, pg_ids, record_map=None, state_map=None):
     return "\n".join(lines), kept_ids
 
 
+def thematic_fold_work_item(project, section, summary, sorted_pg_ids, entities):
+    """Skip a rendered fold that no longer meets the density threshold.
+
+    A member with no Postgres row was already dropped. Writing the remainder would store a group the gate would not have admitted.
+    """
+    if len(sorted_pg_ids) < DENSITY_THRESHOLD:
+        logger.warning(
+            "NREM fold: %s/%s has %d member(s) after a Postgres row was dropped "
+            "— below density_threshold=%d, skipped",
+            project or "", section or SECTION_NONE, len(sorted_pg_ids),
+            DENSITY_THRESHOLD,
+        )
+        return None
+    return (project, section, summary, sorted_pg_ids, entities)
+
+
 def _cypher_id_list(pg_ids) -> str:
     """Literal, sorted, de-duplicated Cypher list of integer ids — pure,
     deterministic (stable across re-folds so the stored `cypher_query`
@@ -3466,13 +3482,16 @@ class ConsolidationDaemon:
                     e for pid in sorted_pg_ids
                     for e in (record_map.get(pid) or {}).get("entities") or []
                 })
+                item = thematic_fold_work_item(
+                    project, section, summary, sorted_pg_ids, entities)
+                if item is None:
+                    continue
                 key = (project or "", section or SECTION_NONE)
                 if thematic_fold_is_current(
                         active_rows.get(key), summary, sorted_pg_ids, entities):
                     rec.unchanged_clusters += 1
                     continue
-                fold_work_items.append(
-                    (project, section, summary, sorted_pg_ids, entities))
+                fold_work_items.append(item)
             if rec.unchanged_clusters:
                 logger.info(
                     "NREM fold: %d cluster(s) already current — re-fold would "

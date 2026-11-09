@@ -3926,6 +3926,8 @@ class MemoryCoordinator:
         self._top_paths: dict = {"rows": [], "as_of": None, "error": None, "attempted": None}
         # Proxy-owned telemetry blocks. Importing hive_mind_proxy back would cycle; None means those sections are absent.
         self.telemetry_extras_provider = None
+        # None until main() assigns daemon_llm_identity. The two backlog gauges then block every row, because this process has no boot id of its own.
+        self.daemon_identity_provider = None
 
         # decision:374/fact:375: a never-probed dependency that reads healthy is the failure this avoids. Every state starts unknown, not ok.
         self._dependency_health: dict = {
@@ -11532,32 +11534,66 @@ class MemoryCoordinator:
             log.info("health.registry: census recovered")
         self._registry_census_ok = True
 
-    async def _rem_backlog_pg_ids(self) -> list[int]:
-        """Ineligible rem item keys. An eligible row does not block (brief §3.1).
-
-        A missing table raises; the caller fails the section. Eligibility uses
-        the identity stamped on the daemons, not this process's environment.
-        """
-        import llm_eligibility
+    async def _rem_backlog_rows(self) -> list:
+        """Every rem backlog row. A missing table raises. The keys are not filtered."""
         async with self._acquire() as conn:
             rows = await conn.fetch(
                 "SELECT item_key, reason, largest_ctx, largest_reply, pool_id, boot_id"
                 " FROM llm_backlog WHERE item_kind = 'rem'")
-        ident = None
+        return list(rows)
+
+    @staticmethod
+    def _rem_backlog_key(row) -> int | None:
+        try:
+            return int(row["item_key"])
+        except (TypeError, ValueError, KeyError):
+            return None
+
+    async def _rem_backlog_pg_ids(self) -> list[int]:
+        """Every rem backlog key. A pending record that has a row is dead-lettered.
+
+        Eligibility is not applied. The probe, rem.dead_lettered, and the health
+        count share this read, which is the plain key list from 2281f76.
+        """
         ids: list[int] = []
-        for row in rows:
-            if ident is None:
-                import hive_mind_proxy
-                ident = hive_mind_proxy.daemon_llm_identity()
-            if llm_eligibility.eligible(
+        for row in await self._rem_backlog_rows():
+            key = self._rem_backlog_key(row)
+            if key is not None:
+                ids.append(key)
+        return ids
+
+    def _daemon_identity(self) -> dict | None:
+        """The identity the running proxy injected. None blocks every gauge row.
+
+        Calling the proxy module from here would mint a second boot id, because
+        the unit runs that file as __main__.
+        """
+        provider = getattr(self, "daemon_identity_provider", None)
+        if provider is None:
+            return None
+        ident = provider() if callable(provider) else provider
+        if not isinstance(ident, dict):
+            return None
+        return ident
+
+    async def _rem_backlog_ineligible_pg_ids(self) -> list[int]:
+        """Keys the older-prompt and withheld gauges treat as blocked.
+
+        No provider means every row is blocked. An eligible row is left out.
+        The dead-letter count does not use this list.
+        """
+        import llm_eligibility
+        ident = self._daemon_identity()
+        ids: list[int] = []
+        for row in await self._rem_backlog_rows():
+            key = self._rem_backlog_key(row)
+            if key is None:
+                continue
+            if ident is None or not llm_eligibility.eligible(
                 row["reason"], row["largest_ctx"], row["largest_reply"],
                 row["pool_id"], row["boot_id"], ident,
             ):
-                continue
-            try:
-                ids.append(int(row["item_key"]))
-            except (TypeError, ValueError):
-                continue
+                ids.append(key)
         return ids
 
     async def _rem_pending_backlog_count(self, rows: list[int]) -> int:
@@ -11881,7 +11917,7 @@ class MemoryCoordinator:
             attempts = None
         rem_count = await self._rem_dead_letter_count()
         try:
-            blocked = await self._rem_backlog_pg_ids()
+            blocked = await self._rem_backlog_ineligible_pg_ids()
             backlog_readable = True
         except Exception:
             # A zero would say nothing is withheld. Omit both gauges.

@@ -11,6 +11,7 @@ import contextlib
 import json
 import logging
 import os
+import re
 import sys
 import time
 from datetime import datetime, timezone
@@ -475,13 +476,37 @@ def _summary_to_store(summary: str, original: str):
     return None
 
 
+def _ascii_digits(text) -> bool:
+    """ASCII 0-9 only. str.isdigit is true for other scripts, which must not enter the header."""
+    return isinstance(text, str) and text.isascii() and text.isdigit()
+
+
 def _safe_decision_ref(decision_ref) -> str:
     """A digit id only. Free text in the header would sit in the instruction block."""
     if isinstance(decision_ref, str) and decision_ref.startswith("decision:"):
         rest = decision_ref[len("decision:"):]
-        if rest.isdigit():
+        if _ascii_digits(rest):
             return decision_ref
     return "decision:?"
+
+
+def _quote_fence_markers(text: str) -> str:
+    """Quote a fence or batch tag that arrived inside the record.
+
+    The wrapper still emits the real marker. A copy in the text would close that block early, and the model would treat the rest as instructions.
+    """
+    if not isinstance(text, str) or not text:
+        return text
+    text = re.sub(
+        r"\[(?:BEGIN RECORD|END RECORD)\]",
+        lambda match: '"%s"' % match.group(0),
+        text,
+    )
+    return re.sub(
+        r"\[(?:END FACT \d+|FACT \d+[^\]]*)\]",
+        lambda match: '"%s"' % match.group(0),
+        text,
+    )
 
 
 def _safe_rating(rating) -> str:
@@ -508,7 +533,7 @@ def build_single_prompt(content: str, kind: str, fact_kind: str | None = None,
     return (
         f"{_SHARED_FRAME}\n\n"
         f"{instruction}\n\n"
-        f"[BEGIN RECORD]\n{content}\n[END RECORD]\n\n"
+        f"[BEGIN RECORD]\n{_quote_fence_markers(content)}\n[END RECORD]\n\n"
         '{"summary": "<text>"}'
     )
 
@@ -890,9 +915,8 @@ class REMDaemon:
                 out = {}
                 for row in cur.fetchall():
                     target = row[4]
-                    decision_ref = (
-                        f"decision:{target}" if isinstance(target, str) and target.isdigit()
-                        else "decision:?"
+                    decision_ref = _safe_decision_ref(
+                        "decision:" + target if isinstance(target, str) else None
                     )
                     out[row[0]] = {
                         "content": row[1],
@@ -1468,7 +1492,7 @@ class REMDaemon:
         kind_block = "\n\n".join(_KIND_INSTRUCTIONS[key] for key in kinds)
         facts_block = "\n".join(
             f"[FACT {i} kind={_fact_kind_key(it.get('fact_kind'))}]\n"
-            f"{it['content']}\n[END FACT {i}]"
+            f"{_quote_fence_markers(it['content'])}\n[END FACT {i}]"
             for i, it in enumerate(items)
         )
         n = len(items)
@@ -1698,8 +1722,10 @@ class REMDaemon:
 
     # ── Batch cycle ───────────────────────────────────────────────────────────
 
-    async def _release_eligible_write_failed(self, conn=None) -> None:
+    async def _release_eligible_write_failed(self, conn) -> None:
         """Retry a current-stamped tier-1 write; retire a historical row.
+
+        conn is required. A missing connection used to reach the graph clear and only then fail the historical drop.
 
         rem_processed is cleared only where the stamp is current. A processed
         node whose stamp is absent or older loses the write_failed row and
@@ -1708,6 +1734,8 @@ class REMDaemon:
         is owed (brief §3.2). A Postgres read error propagates and skips the
         cycle. A graph error is logged and the cycle continues.
         """
+        if conn is None:
+            raise RuntimeError("REM write_failed release needs a Postgres connection")
         loop = asyncio.get_running_loop()
         keys = await loop.run_in_executor(
             None, lambda: llm_backlog.eligible_write_failed("rem"))

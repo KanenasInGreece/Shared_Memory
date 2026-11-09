@@ -185,6 +185,31 @@ def test_rem_contract_imports_and_runs_with_psycopg2_unimportable():
         assert text_is == "pointer" and text is None
 
 
+def test_llm_eligibility_imports_and_runs_with_psycopg2_unimportable():
+    """Kills: a database driver import in llm_eligibility.py, which the gateway loads."""
+    with _BlockedImport(_GATEWAY_MISSING_MODULES):
+        llm_eligibility = importlib.import_module("llm_eligibility")
+        assert llm_eligibility.eligible(
+            "write_failed", 1, 1, "pool", "boot-a",
+            {"pool_id": "pool", "largest_ctx": 1, "largest_reply": 1, "boot_id": "boot-a"},
+        ) is False
+
+
+def test_llm_eligibility_source_imports_no_db_or_network_driver():
+    """Kills: adding psycopg2/asyncpg/neo4j/httpx/aiohttp to llm_eligibility.py."""
+    import re
+
+    path = os.path.join(SCRIPTS_DIR, "llm_eligibility.py")
+    with open(path, encoding="utf-8") as f:
+        source = f.read()
+    forbidden_pattern = re.compile(
+        r"^\s*(import|from)\s+(psycopg2|psycopg|asyncpg|neo4j|httpx|aiohttp)\b",
+        re.MULTILINE,
+    )
+    hits = forbidden_pattern.findall(source)
+    assert not hits, f"llm_eligibility.py must not import a DB/network driver, found: {hits}"
+
+
 def test_rem_contract_source_imports_no_db_or_network_driver():
     """Kills: adding psycopg2/asyncpg/neo4j/httpx/aiohttp to rem_contract.py (brief §0.2-10)."""
     import re
@@ -244,6 +269,7 @@ def test_hive_mind_proxy_imports_when_psycopg2_is_blocked():
         "import secure_env\n"
         "import request_sizing\n"
         "import dream_telemetry\n"
+        "import llm_eligibility\n"
         "import coordinator\n"
         "import hive_mind_proxy\n"
     )
