@@ -427,7 +427,7 @@ async def test_daemon_cut_off_is_not_stored(monkeypatch):
 
     daemon = rem_loop.REMDaemon.__new__(rem_loop.REMDaemon)
     monkeypatch.delenv("MOCK_LLM", raising=False)
-    long = "x" * (rem_loop.REM_SUMMARY_THRESHOLD + 1)
+    long = "x" * (2001)
 
     class _R:
         status_code = 200

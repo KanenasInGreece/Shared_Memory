@@ -293,8 +293,8 @@ class _Gateway:
 
 
 def _long(marker):
-    import rem_loop as rem
-    return marker + (" z" * (rem.REM_SUMMARY_THRESHOLD // 2 + 4))
+    # A test length, not a product limit (decision:3101). Every record is sent.
+    return marker + (" z" * 1004)
 
 
 async def _run_path(monkeypatch, path, reply, cycles=3, store=False):

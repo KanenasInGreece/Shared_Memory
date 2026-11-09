@@ -4,8 +4,11 @@ Read before a call. A read error fails the cycle closed, so a dark backlog
 cannot send the item again. Writes use their own autocommit connection.
 Retry rules: no_context when the largest context grew,
 cut_off when the largest reply cap grew, loop / unparseable / unrecognised
-when the pool id changed, connection_lost and write_failed when the boot id
-changed. An unrelated list change retries neither no_context nor cut_off.
+when the pool id changed, connection_lost, write_failed and rewrite_failed
+when the boot id changed. An unrelated list change retries neither no_context
+nor cut_off. rewrite_failed is a tier-2 graph write that did not stick
+(brief §3.2); eligible_write_failed still matches only write_failed, so the
+release pass never clears a tier-2 node.
 """
 import os
 
@@ -15,7 +18,7 @@ import psycopg2.extensions
 from secure_env import get_secret, pg_dsn
 
 _POOL_REASONS = frozenset({"loop", "unparseable", "unrecognised"})
-_BOOT_REASONS = frozenset({"connection_lost", "write_failed"})
+_BOOT_REASONS = frozenset({"connection_lost", "write_failed", "rewrite_failed"})
 
 
 def identity() -> dict:

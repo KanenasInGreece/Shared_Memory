@@ -176,9 +176,8 @@ def test_routing_refusal_ignores_unrecognized_gateway_error(mod):
 
 # ── 2. rem_loop.py — role headers, per call site ──────────────────────────────
 #
-# Only a record OVER the summary threshold reaches an LLM call at all
-# (`decision:1664`), so every REM case below uses one.
-_REM_LONG = "x" * (rem_mod.REM_SUMMARY_THRESHOLD + 1)
+# A test length, not a product limit (decision:3101). Every record is sent.
+_REM_LONG = "x" * 2001
 
 @pytest.mark.asyncio
 async def test_rem_solo_call_sends_no_role_header(monkeypatch):

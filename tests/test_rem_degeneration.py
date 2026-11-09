@@ -37,9 +37,8 @@ reply_is_loop = request_sizing.reply_is_loop
 _truncation_specimen = rem_mod._truncation_specimen
 REM_TRUNCATION_SPECIMEN_CHARS = rem_mod.REM_TRUNCATION_SPECIMEN_CHARS
 
-# Only a record OVER the summary threshold reaches an LLM call at all
-# (`decision:1664`), so every truncation case below uses one.
-_LONG = "x" * (rem_mod.REM_SUMMARY_THRESHOLD + 1)
+# A test length, not a product limit (decision:3101). Every record is sent.
+_LONG = "x" * 2001
 
 
 # ── Fixture bodies (generic entity names only) ────────────────────────────────

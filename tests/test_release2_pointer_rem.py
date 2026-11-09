@@ -1,12 +1,14 @@
-"""Release 2 step 1: pointer first write and entry_text_is (shape only).
+"""Release 2 steps 1 and 2: pointer first write, entry_text_is, REM summary contract.
 
-Each test names the failure it kills (decision:2671). Semantic proof of
-invariants 1 and 7 is the throwaway graph; these pins keep merge_release.sh
-on the shape.
+Each test names the failure it kills (decision:2671). A test whose assertion
+is only Cypher or source text is marked shape only. Semantic legs wait for
+the rig in step 5.
 """
 import ast
+import asyncio
 import sys
 from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -15,6 +17,8 @@ sys.path.insert(0, str(SCRIPTS))
 
 import rem_contract as rc  # noqa: E402
 import coordinator as c  # noqa: E402
+import llm_backlog  # noqa: E402
+import rem_loop as rem  # noqa: E402
 
 
 COORD_SRC = (SCRIPTS / "coordinator.py").read_text(encoding="utf-8")
@@ -152,3 +156,325 @@ def test_render_record_entry_stamped_2000_is_summary():
     entry = c.render_record_entry(d, unstamped, "fact:1", {})
     assert entry["text_is"] == "full_record"
     assert entry["text"] == d["content"]
+
+
+# ── Step 2: REM summary contract (inv 2, inv 3, inv 5) ───────────────────────
+
+REM_SRC = (SCRIPTS / "rem_loop.py").read_text(encoding="utf-8")
+_REM_TREE = ast.parse(REM_SRC)
+BACKLOG_SRC = (SCRIPTS / "llm_backlog.py").read_text(encoding="utf-8")
+
+
+def _rem_method(name):
+    for node in _REM_TREE.body:
+        if isinstance(node, ast.ClassDef) and node.name == "REMDaemon":
+            for item in node.body:
+                if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)) and item.name == name:
+                    return ast.get_source_segment(REM_SRC, item)
+    raise AssertionError(f"REMDaemon.{name} not found")
+
+
+def _backlog_fn(name):
+    tree = ast.parse(BACKLOG_SRC)
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef) and node.name == name:
+            return ast.get_source_segment(BACKLOG_SRC, node)
+    raise AssertionError(f"{name} not found")
+
+
+class _Ctx:
+    def __init__(self, val):
+        self._val = val
+
+    async def __aenter__(self):
+        return self._val
+
+    async def __aexit__(self, *_):
+        return False
+
+
+def _daemon(rows):
+    d = rem.REMDaemon.__new__(rem.REMDaemon)
+    d._withheld = set()
+    d._solo_only = set()
+    d._last_llm_failure = None
+    d._last_backlog = None
+    d._batch_action = None
+    d._batch_paid = True
+    result = MagicMock()
+    result.data = AsyncMock(return_value=rows)
+    session = AsyncMock()
+    session.run = AsyncMock(return_value=result)
+    driver = MagicMock()
+    driver.session = MagicMock(return_value=_Ctx(session))
+    d.driver = driver
+    return d, session
+
+
+def test_inv2_write_is_one_statement_with_stamp_and_no_cut():
+    """Kills: a second statement, a [:2000] cut, or a missing prompt stamp (inv 2). Shape only."""
+    src = _rem_method("_write_neo4j_rem")
+    assert src.count("await session.run") == 1
+    assert "rem_prompt_version" in src
+    assert "RETURN count(n)" in src
+    assert "rem_processed = true" in src
+    assert "[:2000]" not in src
+    assert "f.content" not in src
+    assert "$orig" not in src
+    assert ".content" not in src
+
+
+@pytest.mark.asyncio
+async def test_inv2_shorter_summary_is_stored_whole_and_equal_length_is_null():
+    """Kills: cutting a shorter summary, or dropping the rem_summary SET when it is not shorter (inv 2)."""
+    original = "o" * 9000
+    summary = "s" * 5000
+    daemon, session = _daemon([])
+    await daemon._write_neo4j_rem(7, summary, original_content=original)
+    assert session.run.await_count == 1
+    call = session.run.await_args
+    assert call.kwargs["summary"] == summary
+    assert call.kwargs["v"] == 2
+    assert "n.rem_summary = $summary" in call.args[0]
+
+    original_eq = "o" * 40
+    await daemon._write_neo4j_rem(7, "s" * 40, original_content=original_eq)
+    call = session.run.await_args
+    assert call.kwargs["summary"] is None
+    assert "n.rem_summary = $summary" in call.args[0]
+
+    await daemon._write_neo4j_rem(7, "s", original_content="longer than one")
+    assert session.run.await_args.kwargs["summary"] == "s"
+
+
+def test_inv3_selection_release_and_set_omit_decision():
+    """Kills: OR n:Decision in selection, release, or the pickup SET (inv 3). Shape only."""
+    for name in ("_fetch_non_rem_batch", "_release_eligible_write_failed", "_set_on_records"):
+        src = _rem_method(name)
+        assert "ONT.decision" not in src
+        assert "Decision" not in src
+
+
+@pytest.mark.asyncio
+async def test_inv3_decision_write_and_apply_issue_nothing(monkeypatch):
+    """Kills: a REM write or backlog row for a decision kind (inv 3, fact:3541)."""
+    daemon, session = _daemon([])
+    wrote = await daemon._write_neo4j_rem(
+        7, "a summary", kind=rem.KIND_DECISION, original_content="rationale text")
+    assert wrote == 0
+    session.run.assert_not_awaited()
+
+    reasons = []
+    monkeypatch.setattr(
+        rem.llm_backlog, "upsert",
+        lambda *a, **k: reasons.append(a[2] if len(a) > 2 else k.get("reason")))
+    ok = await daemon._apply_fact_result(
+        7, rem.KIND_DECISION, {"summary": "a summary"}, MagicMock(),
+        asyncio.get_running_loop(), original_content="rationale text")
+    assert ok is False
+    assert reasons == []
+    session.run.assert_not_awaited()
+
+
+def test_inv5_release_clears_only_a_current_stamp():
+    """Kills: clearing rem_processed on every write_failed id regardless of stamp (inv 5). Shape only."""
+    src = _rem_method("_release_eligible_write_failed")
+    assert "coalesce(n.rem_prompt_version, 0) >= $v" in src
+    assert "coalesce(n.rem_prompt_version, 0) < $v" in src
+    assert "llm_backlog.delete" in src
+    assert src.count("rem_processed = false") == 1
+    assert "ONT.decision" not in src
+
+
+def test_inv5_tier2_selection_excludes_write_failed_and_current_stamps():
+    """Kills: a tier-2 match of a write_failed node or a current stamp (inv 5). Shape only."""
+    src = _rem_method("_fetch_non_rem_batch")
+    assert "NOT n.pg_id IN $write_failed" in src
+    assert "coalesce(n.rem_prompt_version, 0) < $v" in src
+    assert "NOT n.pg_id IN $blocked" in src
+
+
+def test_inv5_batch_timing_omits_poll_ms_on_tier_2():
+    """Kills: writing poll_ms on a tier-2 batch (brief §0.2-11). Shape only."""
+    src = _rem_method("run_cycle")
+    idx = src.index('timing["poll_ms"]')
+    assert "if tier == 1" in src[max(0, idx - 120):idx]
+
+
+@pytest.mark.asyncio
+async def test_inv5_deferred_ids_join_blocked_before_limit():
+    """Kills: filtering deferred outbox ids after LIMIT (inv 5, Codex R4-02)."""
+    daemon, session = _daemon([
+        {"pg_id": 1, "rem_passed_over": 0, "labels": [rem.ONT.fact]}])
+
+    class _Cur:
+        def __init__(self):
+            self.sql = ""
+
+        def execute(self, sql, params=None):
+            self.sql = sql
+
+        def fetchall(self):
+            if "neo4j_outbox" in self.sql:
+                return [(11,)]
+            return []
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    conn = MagicMock()
+    conn.cursor.side_effect = lambda: _Cur()
+    await daemon._fetch_non_rem_batch(conn)
+    assert session.run.await_count == 1
+    blocked = session.run.await_args.kwargs["blocked"]
+    assert 11 in blocked
+
+
+@pytest.mark.asyncio
+async def test_inv5_tier2_count_zero_is_rewrite_failed(monkeypatch):
+    """Kills: ignoring a zero count, or writing write_failed, or notifying, on a tier-2 miss (inv 5)."""
+    daemon, session = _daemon([{"count": 0}])
+    reasons = []
+    monkeypatch.setattr(
+        rem.llm_backlog, "upsert",
+        lambda *a, **k: reasons.append(a[2]))
+    daemon._notify_nrem = AsyncMock()
+    daemon._revert_rem_mark = AsyncMock()
+    ok = await daemon._apply_fact_result(
+        7, rem.KIND_FACT, {"summary": "short"}, MagicMock(),
+        asyncio.get_running_loop(), original_content="a much longer original", tier=2)
+    assert ok is False
+    assert reasons == ["rewrite_failed"]
+    assert session.run.await_count == 1
+    daemon._notify_nrem.assert_not_awaited()
+    daemon._revert_rem_mark.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_inv5_tier2_write_exception_is_rewrite_failed(monkeypatch):
+    """Kills: a tier-2 write exception that reverts or uses write_failed (inv 5)."""
+    daemon, session = _daemon([])
+    session.run = AsyncMock(side_effect=RuntimeError("neo4j down"))
+    reasons = []
+    monkeypatch.setattr(
+        rem.llm_backlog, "upsert",
+        lambda *a, **k: reasons.append(a[2]))
+    daemon._revert_rem_mark = AsyncMock()
+    ok = await daemon._apply_fact_result(
+        7, rem.KIND_FACT, {"summary": "short"}, MagicMock(),
+        asyncio.get_running_loop(), original_content="a much longer original", tier=2)
+    assert ok is False
+    assert reasons == ["rewrite_failed"]
+    daemon._revert_rem_mark.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_inv5_tier1_count_zero_is_write_failed(monkeypatch):
+    """Kills: a tier-1 miss that is not write_failed (D6-01)."""
+    daemon, _session = _daemon([{"count": 0}])
+    reasons = []
+    monkeypatch.setattr(
+        rem.llm_backlog, "upsert",
+        lambda *a, **k: reasons.append(a[2]))
+    ok = await daemon._apply_fact_result(
+        7, rem.KIND_FACT, {"summary": "short"}, MagicMock(),
+        asyncio.get_running_loop(), original_content="a much longer original", tier=1)
+    assert ok is False
+    assert reasons == ["write_failed"]
+
+
+def test_inv5_rewrite_failed_retries_on_boot_change_only():
+    """Kills: dropping rewrite_failed from the boot-scoped reasons (brief §3.2b)."""
+    assert "rewrite_failed" in llm_backlog._BOOT_REASONS
+    same = {"pool_id": "p", "largest_ctx": 1, "largest_reply": 1, "boot_id": "boot"}
+    other = dict(same, boot_id="next")
+    assert llm_backlog.eligible("rewrite_failed", 0, 0, "p", "boot", same) is False
+    assert llm_backlog.eligible("rewrite_failed", 0, 0, "p", "boot", other) is True
+    src = _backlog_fn("eligible_write_failed")
+    assert "reason = 'write_failed'" in src
+    assert "rewrite_failed" not in src
+
+
+@pytest.mark.asyncio
+async def test_inv5_tier2_unparseable_stays_the_tier1_reason(monkeypatch):
+    """Kills: rewriting an LLM-level failure as rewrite_failed on tier 2 (brief §3.2)."""
+    daemon, _session = _daemon([])
+    reasons = []
+    monkeypatch.setattr(
+        rem.llm_backlog, "upsert",
+        lambda *a, **k: reasons.append(a[2]))
+
+    async def _llm(*_a, **_k):
+        daemon._last_backlog = ("unparseable", "", True)
+        daemon._last_llm_failure = rem.LLM_FAIL_PARSE
+        return None, "m"
+
+    daemon._llm_process = _llm
+    ok = await daemon._process_fact(
+        3, "content here", rem.KIND_FACT, MagicMock(),
+        asyncio.get_running_loop(), tier=2)
+    assert ok is False
+    assert reasons == ["unparseable"]
+
+
+@pytest.mark.asyncio
+async def test_inv5_tier2_cycle_skips_outbox_filter_and_notify(monkeypatch):
+    """Kills: a tier-2 cycle that filters the outbox or sends pg_notify (inv 5, §0.2-9)."""
+    daemon = rem.REMDaemon.__new__(rem.REMDaemon)
+    daemon._withheld = set()
+    daemon._solo_only = set()
+    daemon._last_llm_failure = None
+    daemon._last_backlog = None
+    daemon._batch_action = None
+    daemon._batch_reason = None
+    daemon._batch_specimen = ""
+    daemon._batch_paid = True
+    conn = MagicMock()
+    monkeypatch.setattr(daemon, "_open_pg_conn", lambda: conn)
+    monkeypatch.setattr(rem, "_take_shared_backup_lock", lambda _c: True)
+    monkeypatch.setattr(rem, "_nrem_is_queuing", lambda _c: False)
+
+    async def _pool(**_k):
+        return "ready"
+
+    monkeypatch.setattr(rem, "pool_roster_state", _pool)
+    daemon._release_eligible_write_failed = AsyncMock()
+
+    async def _fetch(_conn=None):
+        daemon._cycle_tier = 2
+        return (
+            [1, 2],
+            {1: rem.ONT.fact, 2: rem.ONT.fact},
+            {1: 0, 2: 0},
+        )
+
+    daemon._fetch_non_rem_batch = _fetch
+    daemon._recent_write_happened = AsyncMock(return_value=False)
+    daemon._filter_applied_in_outbox = AsyncMock(
+        side_effect=AssertionError("tier 2 filtered the outbox"))
+    daemon._batch_fetch_content = AsyncMock(return_value={
+        1: {"content": "alpha record text", "kind": "fact",
+            "fact_kind": "discussion", "created_at": None},
+        2: {"content": "beta record text", "kind": "fact",
+            "fact_kind": "discussion", "created_at": None},
+    })
+    daemon._bump_rem_pickups = AsyncMock()
+    daemon._llm_process_batch = AsyncMock(return_value=(
+        {1: {"summary": "alpha"}, 2: {"summary": "beta"}},
+        {"wall_ms": 1}, "m"))
+    daemon._write_neo4j_rem = AsyncMock(return_value=1)
+    daemon._notify_nrem = AsyncMock()
+    daemon._write_audit_log = AsyncMock()
+    daemon._clear_backlog = AsyncMock()
+    daemon._write_rem_timing = AsyncMock()
+    monkeypatch.setattr(rem, "AUDIT_LOG_PATH", None)
+
+    processed, attempted = await daemon.run_cycle()
+    assert processed == 2 and attempted == 2
+    daemon._filter_applied_in_outbox.assert_not_awaited()
+    daemon._notify_nrem.assert_not_awaited()
+    timing = daemon._write_rem_timing.await_args_list[0].args[1]
+    assert "poll_ms" not in timing

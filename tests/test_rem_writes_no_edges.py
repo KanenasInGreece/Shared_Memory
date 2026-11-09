@@ -1,15 +1,15 @@
 """REM writes NO edges and NO labels — it summarises (`decision:1664`).
 
 Entities, attribution, grounding and the decision extras are written at FIRST
-WRITE from the operator's own metadata. REM writes `rem_summary`, the
-`rem_processed` mark, its own retry counters, and (for a Fact) the expanded
-content — never an edge or a label, so:
+WRITE from the operator's own metadata. REM writes `rem_summary` (or null),
+the prompt stamp, and the `rem_processed` mark — never content, an edge, or a
+label (decision:1664, fact:3551), so:
 
   * the prompt asks for a summary and nothing else, for every record kind;
   * the Cypher REM builds contains no `MERGE` and no `SET e:<label>`;
-  * a record with no summary to write costs no LLM call at all;
-  * `rem_processed` is still set LAST, so a failed write leaves the record
-    unprocessed and it is retried.
+  * every live fact and retrospective is one LLM call;
+  * a decision kind issues no statement;
+  * one statement sets the summary, the stamp, and rem_processed together.
 
 All Neo4j / Postgres / LLM I/O is mocked; no live infrastructure required.
 """
@@ -41,7 +41,7 @@ rem_mod = load_rem_loop()
 ONT     = rem_mod.ONT
 
 KINDS = (rem_mod.KIND_FACT, rem_mod.KIND_DECISION, rem_mod.KIND_RETRO)
-LONG  = "x" * (rem_mod.REM_SUMMARY_THRESHOLD + 1)
+LONG  = "x" * (2001)
 SHORT = "a short curated fact"
 
 # The relationship vocabulary REM used to advertise. Read off the ontology, not
@@ -105,8 +105,8 @@ def _ok_resp(content):
 @pytest.mark.parametrize("kind", KINDS)
 def test_single_prompt_asks_for_a_summary_and_nothing_else(kind):
     p = rem_mod.build_single_prompt(LONG, kind)
-    assert "summary: one paragraph, at most 5 sentences" in p
-    assert '"summary": "<paragraph>"' in p
+    assert '{"summary": "<text>"}' in p
+    assert "at most 5 sentences" not in p
     # The injection guard survives the strip-down.
     assert "RETRIEVED DATA" in p
     for rel in RETIRED_RELS:
@@ -120,9 +120,10 @@ def test_single_prompt_asks_for_a_summary_and_nothing_else(kind):
 def test_batch_prompt_asks_for_a_summary_and_nothing_else():
     items = [{"pg_id": 1, "content": LONG}, {"pg_id": 2, "content": LONG}]
     p = rem_mod.REMDaemon._build_batch_prompt(None, items)
-    assert "[FACT 0]" in p and "[FACT 1]" in p
+    assert "[FACT 0 kind=" in p and "[FACT 1 kind=" in p
     assert "EXACTLY 2 lines" in p and '"idx"' in p
-    assert '"summary"' in p
+    assert '"summary": "<text>"' in p
+    assert "at most 5 sentences" not in p
     assert "RETRIEVED DATA" in p
     for rel in RETIRED_RELS:
         assert rel not in p, f"the batch prompt still advertises {rel}"
@@ -134,7 +135,10 @@ def test_batch_prompt_asks_for_a_summary_and_nothing_else():
 
 # ── The Cypher REM builds writes no edge and no label ─────────────────────────
 
-@pytest.mark.parametrize("kind", KINDS)
+RECORD_KINDS = (rem_mod.KIND_FACT, rem_mod.KIND_RETRO)
+
+
+@pytest.mark.parametrize("kind", RECORD_KINDS)
 def test_write_builds_no_merge_and_no_sublabel(kind):
     """Asserts on the Cypher text the write actually builds — the only place a
     resurrected edge or sub-label could reach the graph from."""
@@ -142,19 +146,30 @@ def test_write_builds_no_merge_and_no_sublabel(kind):
     asyncio.run(daemon._write_neo4j_rem(42, "a summary", kind=kind,
                                         original_content=LONG))
     cyphers = [c.args[0] for c in session.run.call_args_list]
-    assert cyphers, "the write must still issue its rem_processed statement"
+    assert len(cyphers) == 1, "the write is one statement"
     for c in cyphers:
         assert "MERGE" not in c, f"REM built an edge MERGE: {c}"
         assert "SET e:" not in c, f"REM built a sub-label SET: {c}"
+        assert "content" not in c
 
 
-@pytest.mark.parametrize("kind", KINDS)
-def test_write_marks_rem_processed_in_the_last_statement(kind):
+def test_write_decision_issues_no_statement():
+    """A decision kind is not a REM record (fact:3541)."""
+    daemon, session = _make_daemon()
+    wrote = asyncio.run(daemon._write_neo4j_rem(
+        42, "a summary", kind=rem_mod.KIND_DECISION, original_content=LONG))
+    assert wrote == 0
+    session.run.assert_not_awaited()
+
+
+@pytest.mark.parametrize("kind", RECORD_KINDS)
+def test_write_marks_rem_processed_in_the_statement(kind):
     daemon, session = _make_daemon()
     asyncio.run(daemon._write_neo4j_rem(42, "a summary", kind=kind,
                                         original_content=LONG))
     cyphers = [c.args[0] for c in session.run.call_args_list]
     assert "rem_processed" in cyphers[-1]
+    assert "rem_prompt_version" in cyphers[-1]
     assert "rem_attempts" not in cyphers[-1]
 
 
@@ -166,7 +181,7 @@ async def test_a_long_record_costs_exactly_one_llm_call(monkeypatch):
     a record is one call, never one plus k."""
     monkeypatch.delenv("MOCK_LLM", raising=False)
     monkeypatch.setattr(rem_mod, "AUDIT_LOG_PATH", None)
-    daemon, session = _make_daemon([{"content": LONG[:2000]}])
+    daemon, session = _make_daemon([{"count": 1, "stamp": rem_mod.REM_PROMPT_VERSION}])
     conn, _ = _make_conn()
     calls = []
 
@@ -183,63 +198,65 @@ async def test_a_long_record_costs_exactly_one_llm_call(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_a_short_record_costs_no_llm_call_and_is_marked_processed(monkeypatch):
-    """A record under REM_SUMMARY_THRESHOLD is asked for nothing at all, so it
-    is never sent: it is marked processed without a round-trip."""
+async def test_a_short_record_is_one_llm_call(monkeypatch):
+    """Every live record is sent (fact:3551). A short fact is one call."""
     monkeypatch.delenv("MOCK_LLM", raising=False)
     monkeypatch.setattr(rem_mod, "AUDIT_LOG_PATH", None)
-    daemon, session = _make_daemon([{"content": SHORT}])
+    daemon, session = _make_daemon([{"count": 1, "stamp": rem_mod.REM_PROMPT_VERSION}])
     conn, _ = _make_conn()
     calls = []
 
     async def _fake_post(self, url, **kwargs):
         calls.append(kwargs.get("json", {}))
-        return _ok_resp("{}")
+        return _ok_resp('{"summary": "shorter"}')
     monkeypatch.setattr("httpx.AsyncClient.post", _fake_post)
 
     loop = asyncio.get_running_loop()
     ok = await daemon._process_fact(7, SHORT, rem_mod.KIND_FACT, conn, loop)
 
     assert ok is True
-    assert calls == [], f"a short record must cost no LLM call, got {len(calls)}"
+    assert len(calls) == 1
     cyphers = [c.args[0] for c in session.run.call_args_list]
-    assert any("rem_processed" in c for c in cyphers)
+    assert any("rem_processed" in c and "rem_prompt_version" in c for c in cyphers)
 
 
 @pytest.mark.asyncio
-async def test_a_short_fact_in_a_batch_is_not_sent_to_the_llm(monkeypatch):
-    """Same rule through the batched path: the short fact gets the empty answer
-    without being put in the prompt, and only the long one is sent."""
+async def test_a_short_fact_in_a_batch_is_sent_to_the_llm(monkeypatch):
+    """The short fact is in the prompt, and both lines come back (fact:3551)."""
     monkeypatch.delenv("MOCK_LLM", raising=False)
     daemon, _ = _make_daemon()
     prompts = []
 
     async def _fake_post(self, url, **kwargs):
         prompts.append(kwargs["json"]["messages"][1]["content"])
-        return _ok_resp('{"idx": 0, "summary": "the summary"}')
+        return _ok_resp('{"idx": 0, "summary": "short one"}\n{"idx": 1, "summary": "the summary"}')
     monkeypatch.setattr("httpx.AsyncClient.post", _fake_post)
 
     out, _timing, _model = await daemon._llm_process_batch(
         [{"pg_id": 1, "content": SHORT}, {"pg_id": 2, "content": LONG}])
 
     assert len(prompts) == 1
-    assert SHORT not in prompts[0], "a short fact must not reach the prompt"
-    assert out[1] == {}                      # complete answer, no call
+    assert SHORT in prompts[0]
+    assert out[1]["summary"] == "short one"
     assert out[2]["summary"] == "the summary"
 
 
 @pytest.mark.asyncio
-async def test_a_batch_of_only_short_facts_makes_no_call_at_all(monkeypatch):
+async def test_a_batch_of_only_short_facts_makes_one_call(monkeypatch):
     monkeypatch.delenv("MOCK_LLM", raising=False)
     daemon, _ = _make_daemon()
+    calls = []
 
     async def _fake_post(self, url, **kwargs):
-        raise AssertionError("no LLM call may be made for short facts")
+        calls.append(1)
+        return _ok_resp('{"idx": 0, "summary": "a"}\n{"idx": 1, "summary": "b"}')
     monkeypatch.setattr("httpx.AsyncClient.post", _fake_post)
 
     out, timing, _model = await daemon._llm_process_batch(
         [{"pg_id": 1, "content": SHORT}, {"pg_id": 2, "content": SHORT}])
-    assert out == {1: {}, 2: {}} and timing is None
+    assert calls == [1]
+    assert out[1]["summary"] == "a" and out[2]["summary"] == "b"
+    assert timing is not None
 
 
 # ── The machinery is gone, not merely unused ──────────────────────────────────
@@ -275,31 +292,30 @@ def _apply(daemon, conn, kind, result, original):
 
 
 def test_apply_required_summary_missing_fails():
-    """A record over REM_SUMMARY_THRESHOLD whose result carries no summary is
-    skipped (retries next cycle) — the summary was requested."""
+    """A fact whose result carries no summary is backlogged unparseable."""
     daemon, _ = _make_daemon()
     conn, _ = _make_conn()
-    assert _apply(daemon, conn, rem_mod.KIND_DECISION, {}, LONG) is False
+    assert _apply(daemon, conn, rem_mod.KIND_FACT, {}, LONG) is False
 
 
-def test_apply_unsolicited_summary_dropped():
-    """A short record never stores a volunteered summary — rem_summary must not
-    appear anywhere in the write."""
+def test_apply_decision_writes_nothing():
+    """A decision kind writes no statement and no backlog row (fact:3541)."""
     daemon, session = _make_daemon()
     conn, _ = _make_conn()
 
     ok = _apply(daemon, conn, rem_mod.KIND_DECISION,
                 {"summary": "volunteered anyway"}, SHORT)
 
-    assert ok is True
-    assert not any("rem_summary" in c.args[0] for c in session.run.call_args_list)
+    assert ok is False
+    session.run.assert_not_awaited()
 
 
 def test_process_fact_end_to_end_marks_outbox_and_notifies_nrem(monkeypatch):
-    """Full _process_fact path for a fact anchor: verbatim content out,
-    rem_processed set, outbox marked, NREM notified."""
-    monkeypatch.setattr(rem_mod, "AUDIT_LOG_PATH", None)   # isolate from env leakage
-    daemon, session = _make_daemon([{"content": SHORT}])   # consistency read
+    """Full _process_fact path for a fact: stamp and rem_summary, no content,
+    outbox marked, NREM notified."""
+    monkeypatch.setenv("MOCK_LLM", "1")
+    monkeypatch.setattr(rem_mod, "AUDIT_LOG_PATH", None)
+    daemon, session = _make_daemon([{"count": 1, "stamp": rem_mod.REM_PROMPT_VERSION}])
     conn, executed = _make_conn()
 
     loop = asyncio.new_event_loop()
@@ -311,10 +327,12 @@ def test_process_fact_end_to_end_marks_outbox_and_notifies_nrem(monkeypatch):
 
     assert ok is True
     cyphers = [c.args[0] for c in session.run.call_args_list]
-    assert any("f.content = $orig" in c and "rem_processed" in c for c in cyphers)
-    assert not any("rem_summary" in c for c in cyphers)       # short → no summary
-    assert any("rem_reviewed" in s for s in executed)         # outbox marked
-    assert any("pg_notify" in s for s in executed)            # NREM notified
+    assert cyphers
+    assert "f.content" not in cyphers[0] and "n.content" not in cyphers[0]
+    assert "rem_summary" in cyphers[0] and "rem_prompt_version" in cyphers[0]
+    assert "rem_processed" in cyphers[0]
+    assert any("rem_reviewed" in s for s in executed)
+    assert any("pg_notify" in s for s in executed)
 
 
 # ── An empty object is a PARSED object, not a parse failure ───────────────────
