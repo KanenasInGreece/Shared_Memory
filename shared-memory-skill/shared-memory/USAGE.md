@@ -150,7 +150,9 @@ lineage 816
 
 `fact:816` is the fact. `summary:87` is the narrative. A bare `816` is the facts table, so a bare id copied off a summary is the wrong record. A qualified ref of the wrong type is a 404 that names the right ref.
 
-`lineage <ref>` says what happened to a record. The entry shape is in `SKILL.md`. `related` is absent on a summary, and when the graph is unavailable; `related_more` means the list was cut. `grounded_in`, `consolidated_into` and a summary's `sources`: see `SKILL.md`.
+`lineage <ref>` says what happened to a record. The entry shape is in `SKILL.md`.
+An unprocessed fact or retrospective is a `pointer` whose ref must be expanded.
+`related` is absent on a summary, and when the graph is unavailable; `related_more` means the list was cut. `grounded_in`, `consolidated_into` and a summary's `sources`: see `SKILL.md`.
 
 ## Supersede
 

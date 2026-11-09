@@ -342,6 +342,7 @@ def test_format_status_renders_sections():
             },
             "neo4j": {
                 "facts_total": 97, "facts_rem_pending": 1, "facts_unconsolidated": 20,
+                "retrospectives_rem_pending": 4,
                 "decisions_total": 75, "decisions_rem_pending": 71,
             },
         },
@@ -356,7 +357,9 @@ def test_format_status_renders_sections():
             "{'pending': 2, 'applied': 10, 'rem_reviewed': 3, 'failed': 0}") in out
     assert "drain_rate_per_min" not in out
     assert "decisions: 75 total" in out
-    assert "REM pending 71" in out
+    assert "retrospectives: REM pending 4" in out
+    assert "71 waiting on their records" in out
+    assert "REM pending 71" not in out
 
 
 def test_format_status_omits_an_outbox_count_the_gateway_did_not_report():

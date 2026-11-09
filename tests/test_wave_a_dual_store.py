@@ -723,12 +723,6 @@ async def test_retrospective_hash_includes_date_and_rating():
     assert json.loads(r3.text)["pg_id"] == b1["pg_id"]
 
 
-def test_migrate_retro_edges_keeps_the_old_hash_formula():
-    src = (_SCRIPTS / "migrate_retro_edges.py").read_text(encoding="utf-8")
-    assert "retrospective:{p['decision_id']}:{notes}" in src \
-        or 'retrospective:{' in src and ":{notes}" in src
-
-
 # ── read-role comment: graph stays off the allowlist ─────────────────────────
 
 def test_read_role_comment_does_not_invite_graph_onto_the_allowlist():

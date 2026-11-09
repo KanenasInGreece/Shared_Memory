@@ -101,7 +101,6 @@ FRAMEWORK_DEFAULTS = MappingProxyType({
             "resolve_references.py (NEO4J_URI env fallback)",
             "entity_fragment_rate.py (NEO4J_URI env fallback)",
             "normalize_projects.py (NEO4J_URI env fallback)",
-            "migrate_retro_edges.py (NEO4J_URI env fallback)",
             "migrations/verify_neo4j_init.py (NEO4J_URI env fallback)",
         ),
         "note": (
@@ -126,7 +125,6 @@ FRAMEWORK_DEFAULTS = MappingProxyType({
             "migrations/apply.py (DSN default)",
             "migrations/generate_schema_init.py (DSN default)",
             "normalize_projects.py (PG_CONN default)",
-            "migrate_retro_edges.py (PG_CONN default)",
         ),
         "note": (
             "The host:port segment of the constructed default Postgres DSN "

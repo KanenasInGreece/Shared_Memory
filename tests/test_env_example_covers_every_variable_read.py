@@ -697,14 +697,6 @@ def test_this_prs_templated_keys_carry_the_codes_real_default():
     # only, same as SHARED_MEMORY_PROJECT/PROJECT_ROOTS above.
     assert _template_covers("SMEM_ONTOLOGY_PATH", _FRAMEWORK_TEMPLATE)
 
-    # EMBED_URL (round 3, C1 correction): migrate_retro_edges.py no longer
-    # has its own literal default -- it derives from GATEWAY_URL +
-    # "/v1/embeddings" by default and only reads EMBED_URL as a deprecated
-    # override (os.environ.get("EMBED_URL"), no second arg -- no default to
-    # pin). Presence + staying commented only, same reasoning as
-    # SMEM_ONTOLOGY_PATH above.
-    assert _template_covers("EMBED_URL", _FRAMEWORK_TEMPLATE)
-
     # PG_CONN is DELIBERATELY EXEMPT from the default-value assertion. Its
     # code default (the `PG_DSN` line in coordinator.py) is pg_dsn(_pg_pass) -- it
     # INTERPOLATES A LIVE PASSWORD. This repository is a public mirror and
@@ -758,7 +750,6 @@ def test_templated_keys_stay_commented_not_live():
         "LLM_WEDGE_SUSPECT_AGE",
         "SECURE_ENV_SECRET_FILE_MAX_BYTES",
         "SMEM_ONTOLOGY_PATH",
-        "EMBED_URL",
         "POOL_STATUS_URL",
         "ENTITY_NAME_MAX_LEN",
         "ENTITY_LIST_MAX_LEN",

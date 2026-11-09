@@ -50,7 +50,8 @@ them with `obsolete` and `superseded_by` when the successor is readable.
 successor before relying on it. Each `retired_grounds` item names a relation,
 and `superseded_by` when that successor is readable. `latest_verdict` on a
 retrospective names the verdict that counts most. `found: false` means there is
-nothing to read. `lineage`, `search --ref` and a graph query are those reads. On
+nothing to read. An unprocessed fact or retrospective is a `pointer` whose
+ref must be expanded. `lineage`, `search --ref` and a graph query are those reads. On
 `/memory/graph`, nodes inside paths and maps are resolved like any node. Only a
 projected property is not the record. `grounded_in`, `consolidated_into` and a
 summary's `sources` are references and carry no text.

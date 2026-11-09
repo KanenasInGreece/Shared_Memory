@@ -51,15 +51,17 @@ def test_why_to_check_builds_cypher():
     assert "outbox" in cypher
 
 
-def test_retro_templates_read_both_shapes():
-    """Retro payload lives on the record node post-conversion, on the edge in
-    pre-conversion installs — the templates must read BOTH (the live regression:
-    edge-only reads returned null rating/notes after the migration)."""
+def test_retro_templates_return_the_node_or_the_legacy_notes():
+    """A Retrospective node is returned whole so the gateway renders its entry.
+    A legacy self-loop (t is the decision) still returns o.notes. Both RETURN
+    lines carry that split; the old rem_summary/content coalesce is gone."""
     for tpl in ("retrospectives", "why-to-check"):
         cypher = mb._build_query(tpl, _ns(rating="validated", title="", project=""))
         assert "t:Retrospective" in cypher
         assert "o.rating" in cypher
-        assert "coalesce(t.rem_summary, t.content)" in cypher
+        assert "CASE WHEN t:Retrospective THEN t END AS retrospective" in cypher
+        assert "CASE WHEN NOT t:Retrospective THEN o.notes END AS notes" in cypher
+        assert "coalesce(t.rem_summary, t.content)" not in cypher
 
 
 def test_filter_values_are_sanitised():

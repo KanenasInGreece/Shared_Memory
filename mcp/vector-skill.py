@@ -970,6 +970,7 @@ async def hybrid_search_and_rerank(query: str = "", limit: int = 5, project: str
     `retired_grounds` item names a relation, and `superseded_by` when that
     successor is readable. `latest_verdict` on a retrospective names the
     verdict that counts most. `found: false` means there is nothing to read.
+    An unprocessed fact or retrospective is a `pointer` whose ref must be expanded.
     Reading is two steps. Step one ranks and expands. Step two is
     hybrid_search_and_rerank(refs=["<ref>"]). `read_with` names that call.
     Those explicit reads are record_lineage,
@@ -1755,7 +1756,8 @@ async def record_lineage(ref: str) -> str:
     relying on it. Each `retired_grounds` item names a relation, and
     `superseded_by` when that successor is readable. `latest_verdict` on a
     retrospective names the verdict that counts most. `found: false` means
-    there is nothing to read. Reading is two steps. Step one ranks and
+    there is nothing to read. An unprocessed fact or retrospective is a
+    `pointer` whose ref must be expanded. Reading is two steps. Step one ranks and
     expands. Step two is hybrid_search_and_rerank(refs=["<ref>"]). `read_with`
     names that call. Those explicit reads are record_lineage,
     hybrid_search_and_rerank(refs=["<ref>"]) and graph_query. An unreadable
@@ -1813,6 +1815,7 @@ async def graph_query(cypher: str) -> str:
     `retired_grounds` item names a relation, and `superseded_by` when that
     successor is readable. `latest_verdict` on a retrospective names the
     verdict that counts most. `found: false` means there is nothing to read.
+    An unprocessed fact or retrospective is a `pointer` whose ref must be expanded.
     Reading is two steps. Step one ranks and expands. Step two is
     hybrid_search_and_rerank(refs=["<ref>"]). `read_with` names that call.
     Those explicit reads are record_lineage,
