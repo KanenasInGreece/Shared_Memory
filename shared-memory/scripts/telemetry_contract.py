@@ -824,9 +824,8 @@ TELEMETRY: dict[str, dict] = {
     "neo4j.facts_unconsolidated": _k("int", "nrem/consolidation"),
     "neo4j.decisions_total": _k("int", "neo4j"),
     "neo4j.decisions_rem_pending": _k("int", "rem", note=(
-        "live decisions not ready by the computed builder; not REM work; "
-        "never sum with facts_rem_pending. TODO(step 3): that builder is not "
-        "in this step, so the count is still the stored rem_processed flag")),
+        "live decisions not ready by the computed builder (decision:3582); "
+        "not REM work; never sum with facts_rem_pending")),
     "neo4j.retrospectives_rem_pending": _k(
         "int", "rem", since=INTRODUCED_1_1_2,
         note="live Retrospective nodes that are not rem_processed"),
@@ -1135,8 +1134,10 @@ TELEMETRY: dict[str, dict] = {
         note="groups seeded by REM-processed facts only"),
     "nrem.decision_cycles": _k(
         "int", "insight",
-        note=("candidate-group gauge seeded by REM-processed facts; it does not "
-              "run the insight readiness check, so it overcounts a deferred component")),
+        note=("candidate-group gauge seeded by REM-processed facts; "
+              "admit_members drops an unconsolidated decision that is not "
+              "ready (decision:3582); a component waiting on an unprocessed "
+              "fact is still counted")),
     "nrem.total_cycles": _k("int", "nrem/consolidation"),
     "nrem.fact_threshold": _k("int", "nrem/consolidation",
                               note="ONT.density_threshold"),
@@ -1149,10 +1150,9 @@ TELEMETRY: dict[str, dict] = {
                      note="present only when the refresher's last pass failed"),
     "nrem.insight_excluded_pending_rem": _k(
         "int", "insight", since=INTRODUCED_1_1_2,
-        note=("insight groups or components waiting only because a new "
-              "decision's records are not yet REM-processed. TODO(step 3): "
-              "the readiness builder is not in this step; this key is not "
-              "emitted until then")),
+        note=("insight groups or components that fail the gate only because "
+              "admit_members dropped a fresh decision (decision:3582). "
+              "Absent until an insight cycle records the count")),
 
     # ── breakdown ───────────────────────────────────────────────────────────
     "breakdown.record_types[]": _k("list", "spine"),

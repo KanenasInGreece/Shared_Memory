@@ -32,9 +32,14 @@ def grounded_fact_groups_cypher(with_content: bool) -> str:
         return walk + " RETURN f.pg_id AS pg_id, project, domain"
     return (
         walk
-        # rem_summary when REM condensed a long fact; otherwise the curated text.
+        # Node fields for entry_text_is. The fold reads the text from Postgres
+        # (decision:3582). fact_invalid is not aliased AS rem_invalid: that
+        # alias is the carried-readiness marker a rig matches on.
         + " RETURN f.pg_id AS pg_id,"
-        + "        coalesce(f.rem_summary, f.content) AS content,"
+        + "        f.rem_summary AS rem_summary,"
+        + "        coalesce(f.rem_processed, false) AS rem_processed,"
+        + "        f.rem_prompt_version AS rem_prompt_version,"
+        + "        coalesce(f.rem_invalid, false) AS fact_invalid,"
         + "        project, domain"
     )
 

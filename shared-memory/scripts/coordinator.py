@@ -62,7 +62,10 @@ from domain_axis import (
     DOMAIN_BY_KEY_SQL, _similarity_from_env,
     domain_merge_cypher, names_a_domain, resolve_domains,
 )
-from insight_gate import walk_group_reached_set, passes_insight_gate
+from insight_gate import (
+    walk_group_reached_set, passes_insight_gate, decision_readiness_cypher,
+    admit_members,
+)
 from project_promotion import (
     promote_record, sole_project, METHOD_GROUNDING,
 )
@@ -10522,9 +10525,6 @@ class MemoryCoordinator:
                 "facts_rem_pending":    sum(r["n"] for r in facts if not r["rem"] and not r["superseded"]),
                 "facts_unconsolidated": sum(r["n"] for r in facts if r["rem"] and not r["con"]),
                 "decisions_total":      sum(r["n"] for r in decisions),
-                # TODO(step 3): decisions_rem_pending is live decisions not ready
-                # by the §3.5 builder, in its own try. Do not fake that count.
-                "decisions_rem_pending": sum(r["n"] for r in decisions if not r["rem"] and not r["superseded"]),
                 "retrospectives_rem_pending": sum(
                     r["n"] for r in retrospectives if not r["rem"] and not r["superseded"]),
                 # decision 890: fairness gauge for the batch-versus-solo yield. It reads 0 until a solo backlog re-exercises that path.
@@ -10543,6 +10543,49 @@ class MemoryCoordinator:
                 snap["neo4j"]["rem_dead_lettered"] = rem_count["dead_lettered"]
         except Exception as exc:
             snap["neo4j"] = {"error": str(exc)}
+
+        # Own try (Opus r2 F18). A readiness failure must not replace the
+        # snapshot above with an error dict. No stored-flag fallback: the
+        # key stays absent when this read fails (decision:3582).
+        if isinstance(snap.get("neo4j"), dict) and "error" not in snap["neo4j"]:
+            try:
+                async with self._neo4j.session() as session:
+                    idres = await session.run(
+                        f"MATCH (d:{ONT.decision})"
+                        f" WHERE coalesce(d.superseded, false) = false"
+                        f" AND d.pg_id IS NOT NULL"
+                        f" RETURN d.pg_id AS pg_id, count(*) AS n"
+                    )
+                    id_rows = await idres.data()
+                    pres = await session.run(
+                        decision_readiness_cypher(),
+                        ids=[int(r["pg_id"]) for r in id_rows],
+                    )
+                    ready_rows = await pres.data()
+                not_ready = set()
+                for row in ready_rows:
+                    if row.get("ready") is True or row.get("ready") == 1:
+                        continue
+                    if row.get("ready") is not False and row.get("ready") != 0:
+                        continue
+                    try:
+                        not_ready.add(int(row["pg_id"]))
+                    except (TypeError, ValueError, KeyError):
+                        continue
+                pending = 0
+                for row in id_rows:
+                    try:
+                        pid = int(row["pg_id"])
+                        n = int(row["n"])
+                    except (TypeError, ValueError, KeyError):
+                        continue
+                    if pid in not_ready:
+                        pending += n
+                snap["neo4j"]["decisions_rem_pending"] = pending
+            except Exception as exc:
+                log.warning(
+                    "decisions_rem_pending readiness read failed (%s)",
+                    type(exc).__name__)
 
         # The backlog numbers that used to sit under neo4j because that is where the query ran, plus what rem_timing can already answer.
         try:
@@ -10563,8 +10606,18 @@ class MemoryCoordinator:
             snap["nrem"] = {**nrem, "as_of": dep.get("as_of")}
         else:
             snap["nrem"] = {"error": "not yet computed", "as_of": dep.get("as_of")}
-        # TODO(step 3): nrem.insight_excluded_pending_rem from the insight run
-        # record (brief §3.1 / §3.4). Do not emit a placeholder 0.
+        # Same filter as rem_pending_clusters: the latest finished insight
+        # cycle. Absent when that cycle did not record the key. A failure
+        # here does not replace an nrem section that is already an error.
+        if isinstance(snap.get("nrem"), dict) and "error" not in snap["nrem"]:
+            try:
+                excluded = await self._insight_excluded_pending_rem()
+                if excluded is not None:
+                    snap["nrem"]["insight_excluded_pending_rem"] = excluded
+            except Exception as exc:
+                log.warning(
+                    "insight_excluded_pending_rem read failed (%s)",
+                    type(exc).__name__)
 
         # Dashboard distributions. Surfaced here so the monitor does not need its own Postgres connection.
         try:
@@ -10852,6 +10905,27 @@ class MemoryCoordinator:
         return out
 
     # ── Consolidation health (ADR-018) ────────────────────────────────────────
+
+    async def _insight_excluded_pending_rem(self):
+        """Latest finished insight cycle's excluded_pending_rem, or None.
+
+        Same outcome filter as rem_pending_clusters. A cycle that stopped
+        before the fresh scan has no key, and that absence is not a zero.
+        """
+        query = """
+            SELECT (extra->>'excluded_pending_rem')::int AS n
+            FROM consolidation_runs
+            WHERE cycle_type = 'insight'
+              AND outcome IN ('completed', 'crashed')
+              AND extra ? 'excluded_pending_rem'
+            ORDER BY started_at DESC
+            LIMIT 1
+        """
+        async with self._acquire() as conn:
+            row = await conn.fetchrow(query)
+        if row is None or row["n"] is None:
+            return None
+        return int(row["n"])
 
     async def _compute_consolidation_health(self) -> dict:
         """Roll up consolidation_runs into per-cycle-type liveness + the stall
@@ -11655,8 +11729,9 @@ class MemoryCoordinator:
         in `run_insight_cycle` but is not counted (undercount; a legacy case,
         since `_fold_insight` never creates a one-member insight).
         `decision_cycles` is a candidate-group gauge seeded by REM-processed
-        facts. It does not run the insight readiness check, so it overcounts a
-        component whose fold is waiting on an unprocessed carried record.
+        facts. It applies admit_members, so an unconsolidated decision that
+        is not ready is not a member. It does not run the carried-record
+        check, so a component waiting on an unprocessed fact is still counted.
         ⛔ Never import
         `consolidation_loop` here: it imports psycopg2 at the top and the gateway
         does not carry it.
@@ -11683,6 +11758,22 @@ class MemoryCoordinator:
         for _key, _contents, fact_ids in groups:
             labels, consolidated, components = await walk_group_reached_set(
                 self._neo4j, fact_ids)
+            decision_ids = [
+                i for i, lab in labels.items() if lab == ONT.decision]
+            try:
+                async with self._neo4j.session() as session:
+                    res = await session.run(
+                        decision_readiness_cypher(),
+                        ids=[int(i) for i in decision_ids])
+                    ready_rows = await res.data()
+            except Exception as exc:
+                # This group cannot be counted. The other groups still can.
+                log.warning(
+                    "decision_cycles readiness read failed (%s)",
+                    type(exc).__name__)
+                continue
+            labels, consolidated, components, _excluded = admit_members(
+                labels, consolidated, components, ready_rows)
             # Only a component with a Decision and 2+ members folds; see the docstring.
             if passes_insight_gate(labels, consolidated) and any(
                 len(comp) >= 2

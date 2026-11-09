@@ -34,6 +34,6 @@ def test_thematic_fold_order_deterministic_and_ascending_by_pg_id():
     # 2. Value assertion (fact:1309): verify lines are strictly ascending by pg_id
     lines = summary_1.splitlines()
     assert len(lines) == 3
-    assert "pg_id=3]" in lines[0] and "Content three" in lines[0]
-    assert "pg_id=7]" in lines[1] and "Content seven" in lines[1]
-    assert "pg_id=12]" in lines[2] and "Content twelve" in lines[2]
+    assert "pg_id=3 ref=fact:3 text_is=full_record" in lines[0] and "Content three" in lines[0]
+    assert "pg_id=7 ref=fact:7 text_is=full_record" in lines[1] and "Content seven" in lines[1]
+    assert "pg_id=12 ref=fact:12 text_is=full_record" in lines[2] and "Content twelve" in lines[2]

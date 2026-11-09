@@ -124,6 +124,8 @@ class FakeSession:
         self.calls.append((" ".join(query.split()), params))
         # The insight cycle reads carried-record readiness before any fold.
         # Answer every id as processed without consuming a scripted result.
+        if "AS blocking_ids" in query:
+            return FakeResult()
         if "AS rem_invalid" in query:
             ids = list(params.get("ids") or [])
             return FakeResult([

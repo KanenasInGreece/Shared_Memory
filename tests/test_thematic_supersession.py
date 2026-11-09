@@ -444,7 +444,7 @@ async def test_t4_unchanged_gating_row_with_pg_superseded_fact_logs_warning_and_
     monkeypatch.setattr(cl, "_crun_finish", lambda *a, **k: None)
     daemon.get_embedding = AsyncMock(return_value=[0.1] * 4)
 
-    content_ops = "[FACT kind=discussion recorded=2026-09-29 pg_id=1] fact 1\n[FACT kind=discussion recorded=2026-09-29 pg_id=2] fact 2"
+    content_ops = "[FACT kind=discussion recorded=2026-09-29 pg_id=1 ref=fact:1 text_is=full_record] fact 1\n[FACT kind=discussion recorded=2026-09-29 pg_id=2 ref=fact:2 text_is=full_record] fact 2"
     scan_rows = [
         {"pg_id": 1, "content": "fact 1", "project": "proj", "domain": "ops"},
         {"pg_id": 2, "content": "fact 2", "project": "proj", "domain": "ops"},

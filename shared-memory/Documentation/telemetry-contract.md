@@ -630,7 +630,7 @@ The envelope is `{"status": "success", "telemetry": {…}}`; paths below are rel
 | `latency.rem_ms.by_model[].wall_ms.p50` | float/null | _ms | <=0.9.73 | — | — | — | — |
 | `latency.rem_ms.by_model[].wall_ms.p95` | float/null | _ms | <=0.9.73 | — | — | — | — |
 | `latency.rem_ms.note` | str | — | <=0.9.73 | — | — | — | — |
-| `neo4j.decisions_rem_pending` | int | — | <=0.9.73 | — | — | — | live decisions not ready by the computed builder; not REM work; never sum with facts_rem_pending. TODO(step 3): that builder is not in this step, so the count is still the stored rem_processed flag |
+| `neo4j.decisions_rem_pending` | int | — | <=0.9.73 | — | — | — | live decisions not ready by the computed builder (decision:3582); not REM work; never sum with facts_rem_pending |
 | `neo4j.facts_rem_pending` | int | — | <=0.9.73 | — | — | — | — |
 | `neo4j.retrospectives_rem_pending` | int | — | 1.1.2 | — | — | — | live Retrospective nodes that are not rem_processed |
 | `rem.backlog_older_prompt` | int | — | 1.1.2 | — | — | — | live, valid, not-withheld Fact\|Retrospective nodes still carrying an older or no rem_prompt_version stamp |
@@ -707,8 +707,8 @@ The envelope is `{"status": "success", "telemetry": {…}}`; paths below are rel
 
 | key | type | unit | since | moved to | removed in | log twin | notes |
 |---|---|---|---|---|---|---|---|
-| `nrem.decision_cycles` | int | — | <=0.9.73 | — | — | — | candidate-group gauge seeded by REM-processed facts; it does not run the insight readiness check, so it overcounts a deferred component |
-| `nrem.insight_excluded_pending_rem` | int | — | 1.1.2 | — | — | — | insight groups or components waiting only because a new decision's records are not yet REM-processed. TODO(step 3): the readiness builder is not in this step; this key is not emitted until then |
+| `nrem.decision_cycles` | int | — | <=0.9.73 | — | — | — | candidate-group gauge seeded by REM-processed facts; admit_members drops an unconsolidated decision that is not ready (decision:3582); a component waiting on an unprocessed fact is still counted |
+| `nrem.insight_excluded_pending_rem` | int | — | 1.1.2 | — | — | — | insight groups or components that fail the gate only because admit_members dropped a fresh decision (decision:3582). Absent until an insight cycle records the count |
 | `postgres.community_summaries.insight` | int | — | <=0.9.73 | — | — | — | — |
 | `refold_ledger.by_status_reason[]` | list | — | <=0.9.73 | — | — | — | — |
 | `refold_ledger.by_status_reason[].closed_reason` | str/null | — | <=0.9.73 | — | — | — | — |

@@ -478,3 +478,180 @@ async def test_inv5_tier2_cycle_skips_outbox_filter_and_notify(monkeypatch):
     daemon._notify_nrem.assert_not_awaited()
     timing = daemon._write_rem_timing.await_args_list[0].args[1]
     assert "poll_ms" not in timing
+
+
+import logging
+
+import insight_gate  # noqa: E402
+import consolidation_loop as cl  # noqa: E402
+import nrem_gate  # noqa: E402
+
+
+def test_inv4_readiness_cypher_is_outgoing_and_not_the_stored_flag():
+    """Kills: an incoming HAD_OUTCOME, a Decision blocker, or AS rem_invalid (inv 4). Shape only."""
+    q = insight_gate.decision_readiness_cypher()
+    assert "-[rel]->(b)" in q
+    assert "<-" not in q
+    assert "HAD_OUTCOME" in q
+    assert "b:Decision" not in q
+    assert "AS rem_invalid" not in q
+    assert "d.rem_processed" not in q
+    assert "AS ready" in q
+    assert "blocking_ids" in q
+    assert "spine_nodes" in q
+    assert "b.pg_id IS NOT NULL" in q
+
+
+def test_inv4_admit_drops_only_an_unconsolidated_not_ready_decision():
+    """Kills: leaving a not-ready fresh decision in the gate set (inv 4, decision:3556)."""
+    labels = {1: "Decision", 2: "Retrospective"}
+    consolidated = {1: False, 2: True}
+    components = [[1, 2]]
+    readiness = [{
+        "pg_id": 1, "ready": False,
+        "blocking_ids": ["fact:4", "retrospective:5"], "spine_nodes": 1,
+    }]
+    new_labels, _cons, comps, excluded = insight_gate.admit_members(
+        labels, consolidated, components, readiness)
+    assert excluded == [{
+        "pg_id": 1, "blocking_ids": ["fact:4", "retrospective:5"]}]
+    assert 1 not in new_labels
+    assert 2 in new_labels
+    assert comps == [[2]]
+
+
+def test_inv4_admit_keeps_an_admitted_decision_and_a_twin():
+    """Kills: dropping an admitted decision, or a twin before the duplicate check (inv 4, decision:3582)."""
+    labels = {1: "Decision", 2: "Decision", 3: "Retrospective"}
+    consolidated = {1: True, 2: False, 3: False}
+    components = [[1, 3], [2]]
+    readiness = [
+        {"pg_id": 1, "ready": False, "blocking_ids": ["fact:8"], "spine_nodes": 1},
+        {"pg_id": 2, "ready": False, "blocking_ids": ["fact:9"], "spine_nodes": 2},
+    ]
+    new_labels, _cons, comps, excluded = insight_gate.admit_members(
+        labels, consolidated, components, readiness)
+    assert excluded == []
+    assert new_labels == labels
+    assert comps == components
+
+
+def test_inv4_decision_presence_ignores_stored_rem_processed():
+    """Kills: reading a Decision's stored rem_processed in refold checks 1 and 2 (inv 4)."""
+    rows = [{
+        "pg_id": 10, "rem_processed": False, "superseded": False,
+        "labels": ["Decision"],
+    }]
+    unprocessed, duplicated = insight_gate.unprocessed_carried([10], rows)
+    assert unprocessed == []
+    assert duplicated == []
+
+
+def test_inv4_decision_twins_still_defer():
+    """Kills: treating two Decision nodes as one ready member (inv 4)."""
+    rows = [
+        {"pg_id": 10, "rem_processed": True, "labels": ["Decision"]},
+        {"pg_id": 10, "rem_processed": True, "labels": ["Decision"]},
+    ]
+    unprocessed, duplicated = insight_gate.unprocessed_carried([10], rows)
+    assert unprocessed == [10]
+    assert duplicated == [10]
+
+
+def test_inv4_decision_cycles_calls_admit_members_and_not_the_daemon():
+    """Kills: decision_cycles counting a not-ready fresh decision, or importing consolidation_loop (inv 4). Shape only."""
+    src = _fn_source(_TREE, "_nrem_cycle_counts")
+    assert "admit_members(" in src
+    assert "decision_readiness_cypher()" in src
+    assert "from consolidation_loop import" not in src
+    assert "import consolidation_loop" not in src
+    telem = _fn_source(_TREE, "_build_telemetry")
+    err = telem.index('snap["neo4j"] = {"error": str(exc)}')
+    pend = telem.index('["decisions_rem_pending"]')
+    assert err < pend
+    assert "decision_readiness_cypher()" in telem[err:pend]
+
+
+def test_inv6_shorter_summary_names_summary_and_ref():
+    """Kills: a fold body that ignores entry_text_is and keeps the whole record (inv 6)."""
+    state = {"rem_processed": True, "rem_summary": "short", "rem_prompt_version": 2}
+    line = cl.fold_record_line(
+        {"rtype": "fact", "kind": "observation", "recorded": "2026-01-01", "pg_id": 4},
+        "the whole postgres text", state)
+    assert "ref=fact:4" in line
+    assert "text_is=summary" in line
+    assert line.endswith("] short")
+    assert "the whole postgres text" not in line
+
+
+def test_inv6_no_summary_is_the_whole_postgres_text():
+    """Kills: dropping the whole record when rem_summary is absent (inv 6)."""
+    state = {"rem_processed": True, "rem_summary": None, "rem_prompt_version": 2}
+    line = cl.fold_record_line(
+        {"rtype": "fact", "kind": "observation", "recorded": "2026-01-01", "pg_id": 4},
+        "the whole postgres text", state)
+    assert "text_is=full_record" in line
+    assert "ref=fact:4" in line
+    assert line.endswith("] the whole postgres text")
+
+
+def test_inv6_unstamped_2000_is_full_record_and_stamped_2000_is_summary():
+    """Kills: keeping a stamp-less 2000-character summary, or discarding a stamped one (inv 6)."""
+    body = "b" * 4000
+    summary = "s" * 2000
+    rec = {"rtype": "fact", "kind": "observation", "recorded": "d", "pg_id": 8}
+    full = cl.fold_record_line(
+        rec, body, {"rem_processed": True, "rem_summary": summary})
+    summed = cl.fold_record_line(
+        rec, body, {"rem_processed": True, "rem_summary": summary, "rem_prompt_version": 2})
+    assert "text_is=full_record" in full
+    assert full.endswith(body)
+    assert "text_is=summary" in summed
+    assert summed.endswith(summary)
+
+
+def test_inv6_unprocessed_fact_is_a_pointer():
+    """Kills: folding an unprocessed fact as full_record (inv 6)."""
+    line = cl.fold_record_line(
+        {"rtype": "fact", "kind": "observation", "recorded": "d", "pg_id": 3},
+        "whole", {"rem_processed": False})
+    assert "text_is=pointer" in line
+    assert line.endswith("] ")
+    assert "whole" not in line.split("] ", 1)[1]
+
+
+def test_inv6_invalid_fact_without_a_postgres_row_is_left_out(caplog):
+    """Kills: folding a rem_invalid fact that has no Postgres row (inv 6, Opus r2 F19)."""
+    caplog.set_level(logging.WARNING)
+    summary, ids = cl.render_thematic_fold(
+        ["gone", "kept"], [9, 10],
+        record_map={10: {"rtype": "fact", "kind": "observation", "recorded": "d"}},
+        state_map={9: {"rem_invalid": True, "rem_processed": True}},
+    )
+    assert ids == [10]
+    assert "fact:9" in caplog.text
+    assert "pg_id=9" not in summary
+    assert "kept" in summary
+
+
+def test_inv6_gate_projects_node_fields_not_coalesced_content():
+    """Kills: coalesce(f.rem_summary, f.content) in the fact gate (inv 6). Shape only."""
+    q = nrem_gate.grounded_fact_groups_cypher(True)
+    assert "coalesce(f.rem_summary, f.content)" not in q
+    assert "f.rem_summary AS rem_summary" in q
+    assert "AS rem_processed" in q
+    assert "AS rem_prompt_version" in q
+    assert "AS fact_invalid" in q
+    assert "AS rem_invalid" not in q
+    assert "coalesce(f.rem_processed, false) = true" in q
+
+
+@pytest.mark.asyncio
+async def test_step2_finding1_empty_or_countless_write_is_failure():
+    """Kills: an empty write result, or a row with no count, counting as success (step 2 finding 1)."""
+    daemon, _session = _daemon([])
+    assert await daemon._write_neo4j_rem(7, "short", original_content="o" * 20) == 0
+    daemon, _session = _daemon([{"ok": True}])
+    assert await daemon._write_neo4j_rem(7, "short", original_content="o" * 20) == 0
+    daemon, _session = _daemon([{"count": 1}])
+    assert await daemon._write_neo4j_rem(7, "short", original_content="o" * 20) == 1

@@ -1061,7 +1061,7 @@ async def test_failed_revert_retries_write_failed_on_a_new_boot(monkeypatch):
                 raise RuntimeError("bolt")
             if "rem_processed = true" in query:
                 state["processed"] = True
-                return _Result([])
+                return _Result([{"count": 1}])
             if "coalesce(n.rem_processed, false) = false" in query:
                 blocked = set(params.get("blocked") or [])
                 if state["processed"] or 8 in blocked:

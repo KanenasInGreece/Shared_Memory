@@ -1057,8 +1057,9 @@ class REMDaemon:
                 return int(rows[0]["count"])
             except (TypeError, ValueError):
                 return 0
-        # A stub result has no count row. The statement was still sent.
-        return 1
+        # No count value means the write did not land. An empty result or a
+        # row without count is a failure, not a success (step 2 finding 1).
+        return 0
 
     # ── LLM calls ─────────────────────────────────────────────────────────────
 

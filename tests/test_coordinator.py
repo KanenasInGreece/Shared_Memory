@@ -2056,6 +2056,15 @@ async def test_handle_telemetry_rolls_up_postgres_and_neo4j():
         # rem_attempts/rem_passed_over distribution over pending records
         _result([{"a": 0, "p": 0, "n": 60}, {"a": 2, "p": 1, "n": 9},
                   {"a": 5, "p": 3, "n": 3}]),
+        # Live decision nodes, then the computed readiness rows. pg_id 9's
+        # 71 nodes are not ready; pg_id 4's 4 nodes are. Superseded nodes
+        # are not in this id query.
+        _result([{"pg_id": 9, "n": 71}, {"pg_id": 4, "n": 4}]),
+        _result([
+            {"pg_id": 9, "ready": False, "blocking_ids": ["fact:1"],
+             "spine_nodes": 1},
+            {"pg_id": 4, "ready": True, "blocking_ids": [], "spine_nodes": 1},
+        ]),
     ])
 
     resp = await c.handle_telemetry(_make_request({}))
@@ -2068,7 +2077,7 @@ async def test_handle_telemetry_rolls_up_postgres_and_neo4j():
     assert t["neo4j"]["facts_rem_pending"] == 1       # the 12 superseded-pending facts are excluded
     assert t["neo4j"]["facts_unconsolidated"] == 0   # only rem=True & con=False counts; here 96 are consolidated
     assert t["neo4j"]["decisions_total"] == 77
-    assert t["neo4j"]["decisions_rem_pending"] == 71  # the 2 superseded-pending decisions are excluded
+    assert t["neo4j"]["decisions_rem_pending"] == 71  # nodes whose pg_id the builder marks not ready
     assert t["neo4j"]["retrospectives_rem_pending"] == 2
 
     # ⚠ THE ARITHMETIC, READ OFF THE BUILDER. The outbox census and the REM

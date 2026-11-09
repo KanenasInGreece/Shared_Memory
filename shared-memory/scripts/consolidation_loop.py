@@ -22,8 +22,10 @@ from ontology import ONT, fact_kind_from_source_ref, origin_location
 from insight_gate import (
     INSIGHT_AGE_CENSUS_K, CLOSED_RELATION_TYPES, CARRIED_READINESS_CYPHER,
     walk_group_reached_set, passes_insight_gate, order_components,
-    match_existing_insight, unprocessed_carried,
+    match_existing_insight, unprocessed_carried, decision_readiness_cypher,
+    admit_members,
 )
+from rem_contract import entry_text_is
 from project_axis import PROJECT_SQL, fold_eligible
 from nrem_gate import eligible_domain_level_clusters, project_domain_maps, grounded_fact_groups_cypher
 from nrem_gate import count_domain_level_cycles  # noqa: F401 — re-exported from nrem_gate; importing this file pulls psycopg2, which telemetry does not ship
@@ -489,7 +491,10 @@ class _CycleRec:
                  # succeeds. The flag is True from that moment until every
                  # fresh set has been checked (fact:3459: a stop in between
                  # leaves the count as a lower bound).
-                 "rem_pending_clusters", "rem_pending_incomplete")
+                 "rem_pending_clusters", "rem_pending_incomplete",
+                 # Groups or components that fail only because admit_members
+                 # dropped a fresh decision. None until the fresh scan finishes.
+                 "excluded_pending_rem")
 
     def __init__(self):
         self.attempted = self.succeeded = self.failed = 0
@@ -517,6 +522,7 @@ class _CycleRec:
         # succeeds, and a fact-consolidation row never sets them.
         self.rem_pending_clusters = None
         self.rem_pending_incomplete = None
+        self.excluded_pending_rem = None
 
     def fold(self, ok):
         self.attempted += 1
@@ -551,6 +557,7 @@ class _CycleRec:
             or self.unchanged_clusters
             or self.singleton_clusters
             or self.rem_pending_clusters is not None
+            or self.excluded_pending_rem is not None
         ):
             return None
         out = {
@@ -577,6 +584,8 @@ class _CycleRec:
             out["embed_failed"] = self.embed_failed
         if self.insight_gate_skips is not None:
             out["insight_gate_skips"] = self.insight_gate_skips
+        if self.excluded_pending_rem is not None:
+            out["excluded_pending_rem"] = self.excluded_pending_rem
         if self.fold_dead_letter:
             out["fold_dead_letter"] = self.fold_dead_letter
         return out
@@ -732,42 +741,66 @@ async def _post_nrem(client: httpx.AsyncClient, payload: dict,
     return resp
 
 
-def fold_record_line(record, content):
+def fold_record_line(record, content, node_state=None):
     """Render one fold-prompt line for a record, differentiating it by TYPE,
     evidential KIND, ORIGIN locus (decision 916) and capture date — differentiated
     capture in, differentiated synthesis out. `record` is None (or non-dict) for a
     fact predating capture metadata → a bare [FACT] line. The origin marker is
     emitted ONLY when there is a citable locus (absent for observations and
     discussions), so it never invents provenance a fact does not have. Pure →
-    testable (the fold's per-line format is unit-checkable without an LLM)."""
+    testable (the fold's per-line format is unit-checkable without an LLM).
+    ``ref`` and ``text_is`` name the record and which text entry_text_is chose
+    (brief §3.4). No node state means the caller already passed the line body."""
     if not isinstance(record, dict):
         return f"[FACT] {content}"
     origin = record.get("origin")
     origin_marker = f' from="{origin}"' if origin else ""
-    return (f"[{str(record.get('rtype', 'fact')).upper()}"
+    rtype = str(record.get("rtype", "fact"))
+    # A legacy caller passes the line body and no graph node. A processed
+    # state with no summary makes entry_text_is return that body.
+    state = node_state if isinstance(node_state, dict) else {"rem_processed": True}
+    text_is, text = entry_text_is(
+        rtype.lower(), state, content if isinstance(content, str) else "")
+    body = text if isinstance(text, str) else ""
+    pg_id = record.get("pg_id", "?")
+    return (f"[{rtype.upper()}"
             f" kind={record.get('kind', 'observation')}"
             f"{origin_marker}"
             f" recorded={record.get('recorded', 'unknown')}"
-            f" pg_id={record.get('pg_id', '?')}] {content}")
+            f" pg_id={pg_id}"
+            f" ref={rtype.lower()}:{pg_id}"
+            f" text_is={text_is}] {body}")
 
 
-def render_thematic_fold(contents, pg_ids, record_map=None):
+def render_thematic_fold(contents, pg_ids, record_map=None, state_map=None):
     """Render deterministic fold text for a thematic cluster in ascending pg_id
     order, so the byte-identical skip of decision:1242 (skip an unchanged fold) holds. Returns
-    (summary, sorted_pg_ids). Pure, no I/O."""
+    (summary, sorted_pg_ids). A rem_invalid fact with no Postgres row is left
+    out of both (Opus r2 F19); the warning names it."""
     record_map = record_map or {}
+    state_map = state_map or {}
     paired = sorted(zip(pg_ids, contents), key=lambda x: int(x[0]))
-    sorted_pg_ids = [pid for pid, _ in paired]
-    recs = [
-        dict(record_map.get(pid) or
-             {"rtype": "fact", "kind": "observation", "recorded": "unknown"},
-             pg_id=pid)
-        for pid in sorted_pg_ids
-    ]
-    summary = "\n".join(
-        fold_record_line(r, content) for (_, content), r in zip(paired, recs)
-    )
-    return summary, sorted_pg_ids
+    lines = []
+    kept_ids = []
+    for pid, content in paired:
+        state = state_map.get(pid)
+        invalid = isinstance(state, dict) and bool(
+            state.get("rem_invalid") or state.get("fact_invalid"))
+        if invalid and pid not in record_map:
+            logger.warning(
+                "NREM fold: fact:%s is rem_invalid and has no Postgres row "
+                "— left out of the fold",
+                pid,
+            )
+            continue
+        rec = dict(
+            record_map.get(pid) or
+            {"rtype": "fact", "kind": "observation", "recorded": "unknown"},
+            pg_id=pid,
+        )
+        lines.append(fold_record_line(rec, content, state))
+        kept_ids.append(pid)
+    return "\n".join(lines), kept_ids
 
 
 def _cypher_id_list(pg_ids) -> str:
@@ -2470,6 +2503,10 @@ def merge_logs(log_dir: str) -> None:
             pass
 
 
+class _DecisionReadinessFailed(Exception):
+    """Fresh-fold readiness read failed. Refolds already done stay done."""
+
+
 class ConsolidationDaemon:
     def __init__(self):
         self.pending_pg_ids = set()
@@ -3281,7 +3318,7 @@ class ConsolidationDaemon:
                         f"SELECT id, {PROJECT_SQL},"
                         " COALESCE(metadata->>'type', 'fact'),"
                         " metadata->>'source_ref', created_at::date,"
-                        " metadata"
+                        " metadata, content"
                         " FROM technical_docs WHERE id = ANY(%s)",
                         (ids,),
                     )
@@ -3324,7 +3361,10 @@ class ConsolidationDaemon:
                                 ]
                 out = {}
                 for r in rows:
-                    pid, project, rtype, sref, recorded, meta = r
+                    # A stub may still return the six columns from before content
+                    # was selected. A missing column is not a missing row.
+                    pg_content = r[6] if len(r) > 6 else None
+                    pid, project, rtype, sref, recorded, meta = r[:6]
                     rtype = rtype or "fact"
                     meta = meta if isinstance(meta, dict) else {}
                     sections = resolve_domains(meta)
@@ -3344,12 +3384,34 @@ class ConsolidationDaemon:
                         "origin": origin_location(sref),
                         "recorded": str(recorded) if recorded else "unknown",
                         "entities": entities,
+                        "content": pg_content if isinstance(pg_content, str) else None,
                     }
                 return out
             record_map = await loop.run_in_executor(None, _fetch_records)
 
             # Axis membership comes from the graph walk already in these rows, not a second Postgres lookup. A DOMAIN_OF edge exists only for a registered section.
-            content_by_pid: dict = {r["pg_id"]: r["content"] for r in rows}
+            content_by_pid: dict = {}
+            state_by_pid: dict = {}
+            for r in rows:
+                pid = r["pg_id"]
+                if any(k in r for k in (
+                    "rem_summary", "rem_processed", "rem_prompt_version",
+                    "fact_invalid", "rem_invalid",
+                )):
+                    state_by_pid[pid] = {
+                        "rem_summary": r.get("rem_summary"),
+                        "rem_processed": r.get("rem_processed"),
+                        "rem_prompt_version": r.get("rem_prompt_version"),
+                        "rem_invalid": bool(r.get("fact_invalid") or r.get("rem_invalid")),
+                    }
+                stored = record_map.get(pid)
+                pg_text = stored.get("content") if isinstance(stored, dict) else None
+                if isinstance(pg_text, str):
+                    content_by_pid[pid] = pg_text
+                elif r.get("content") is not None:
+                    content_by_pid[pid] = r.get("content")
+                else:
+                    content_by_pid[pid] = ""
             project_map, domains_map, registered_sections, pg_ids_all = \
                 project_domain_maps(rows)
             contents_all = [content_by_pid[pid] for pid in pg_ids_all]
@@ -3383,7 +3445,7 @@ class ConsolidationDaemon:
             fold_work_items = []
             for project, section, contents, pg_ids in eligible_work_items:
                 summary, sorted_pg_ids = render_thematic_fold(
-                    contents, pg_ids, record_map)
+                    contents, pg_ids, record_map, state_by_pid)
                 # Union of the members' human-asserted entities. Payload only, not a gate key.
                 entities = sorted({
                     e for pid in sorted_pg_ids
@@ -3787,6 +3849,17 @@ class ConsolidationDaemon:
 
     # Insight consolidation (decision pg_id 276).
 
+    async def _fetch_decision_readiness(self, ids) -> list:
+        """Readiness rows for these decision pg_ids. An empty list is still issued.
+
+        A graph outage must fail this read. An empty result is not that
+        failure: the caller stops the fresh folds only when this raises.
+        """
+        async with self.driver.session() as session:
+            result = await session.run(
+                decision_readiness_cypher(), ids=[int(i) for i in ids])
+            return await result.data()
+
     async def _find_fresh_insight_clusters(self):
         """✅ THE v2 INSIGHT GATE (plan §2.2-§2.4) — replaces the pre-v2 1-hop
         shared-Entity match wholesale. No entity anchor (I1), no
@@ -3854,6 +3927,7 @@ class ConsolidationDaemon:
         than folded with nothing to name.
         """
         self._insight_gate_skips = 0
+        self._insight_excluded_pending_rem = 0
         rows = await self._find_grounded_fact_groups()
         if not rows:
             return []
@@ -3872,7 +3946,43 @@ class ConsolidationDaemon:
         for (project, section), _contents, fact_ids in groups:
             labels, consolidated, components = await walk_group_reached_set(
                 self.driver, fact_ids)
-            if not passes_insight_gate(labels, consolidated):  # G2 + G3
+            passed_before = passes_insight_gate(labels, consolidated)
+            decision_ids_all = [
+                i for i, lab in labels.items() if lab == ONT.decision]
+            try:
+                readiness = await self._fetch_decision_readiness(decision_ids_all)
+            except Exception as exc:
+                raise _DecisionReadinessFailed(exc) from exc
+            labels0, cons0, comps0 = labels, consolidated, components
+            labels, consolidated, components, excluded = admit_members(
+                labels, consolidated, components, readiness)
+            for item in excluded:
+                logger.info(
+                    "excluded pending REM: decision:%s waits on [%s]",
+                    item["pg_id"], ", ".join(str(b) for b in item["blocking_ids"]),
+                )
+            drop = {int(item["pg_id"]) for item in excluded}
+            passed_after = passes_insight_gate(labels, consolidated)
+            # By effect (brief §3.4): a group that passed and now fails counts
+            # once. A group that still passes counts each component that lost
+            # every Decision. Neither is an insight_gate_skips line.
+            lost_remainders = set()
+            if passed_before and not passed_after:
+                self._insight_excluded_pending_rem += 1
+                continue
+            if passed_before and passed_after and drop:
+                for orig in comps0:
+                    had = any(labels0.get(i) == ONT.decision for i in orig)
+                    if not had:
+                        continue
+                    kept = [i for i in orig if int(i) not in drop]
+                    kept_has = any(
+                        labels0.get(i) == ONT.decision for i in kept)
+                    if not kept_has:
+                        self._insight_excluded_pending_rem += 1
+                        if kept:
+                            lost_remainders.add(frozenset(int(i) for i in kept))
+            if not passed_after:
                 gate_skips += 1
                 logger.warning(
                     "Insight gate: %s/%s failed G2 or G3 — skipped, not folded "
@@ -3884,6 +3994,8 @@ class ConsolidationDaemon:
                 decision_ids = [i for i in comp if labels.get(i) == ONT.decision]
                 has_retro = any(labels.get(i) == ONT.retrospective for i in comp)
                 if not decision_ids:
+                    if frozenset(int(i) for i in comp) in lost_remainders:
+                        continue
                     logger.warning(
                         "Insight gate: component %s in %s/%s reached with no "
                         "Decision member (retrospective-only, §2.2a edge case) "
@@ -4136,7 +4248,15 @@ class ConsolidationDaemon:
                     if ok:
                         folded.update(src_ids)
 
-                clusters = await self._find_fresh_insight_clusters()
+                try:
+                    clusters = await self._find_fresh_insight_clusters()
+                except _DecisionReadinessFailed as exc:
+                    logger.warning(
+                        "NREM insight: decision readiness read failed — "
+                        "no fresh fold this cycle: %s", exc)
+                    return
+                if hasattr(self, "_insight_excluded_pending_rem"):
+                    rec.excluded_pending_rem = self._insight_excluded_pending_rem
                 # Normalise once per cluster: judgement_ids come from the walk's own label
                 # keys (ints, never None), so every later pass over `clusters` reads this.
                 for c in clusters:

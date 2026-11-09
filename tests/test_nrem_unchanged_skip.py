@@ -144,9 +144,9 @@ _ROWS = [
 ]
 
 _CURRENT_CONTENT = (
-    "[FACT kind=tested from=\"tests/test_x.py\" recorded=2026-07-11 pg_id=1] "
+    "[FACT kind=tested from=\"tests/test_x.py\" recorded=2026-07-11 pg_id=1 ref=fact:1 text_is=full_record] "
     "The consolidation daemon writes summaries\n"
-    "[FACT kind=discussion recorded=2026-07-11 pg_id=2] "
+    "[FACT kind=discussion recorded=2026-07-11 pg_id=2 ref=fact:2 text_is=full_record] "
     "The outbox worker applies rows"
 )
 

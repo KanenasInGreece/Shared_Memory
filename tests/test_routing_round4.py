@@ -98,7 +98,7 @@ class _Graph:
             return _Result([])
         if "rem_processed = true" in query and params.get("pg_id") is not None:
             self.processed.add(params["pg_id"])
-            return _Result([])
+            return _Result([{"count": 1}])
         if "NOT n.pg_id IN $blocked" in query:
             blocked = set(params.get("blocked") or [])
             kept = [
