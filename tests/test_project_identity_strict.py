@@ -26,6 +26,8 @@ has been rewritten rather than edited around.
 
 Mutation checks (RUN, recorded in HANDOFF.md) — see each test.
 """
+from tests.save_mocks import save_fetchrow
+
 import json
 import os
 import sys
@@ -59,7 +61,7 @@ def _coord(fetchval):
     conn.fetchval = AsyncMock(side_effect=fetchval)
     conn.fetch = AsyncMock(return_value=[])
     conn.execute = AsyncMock(return_value="")
-    conn.fetchrow = AsyncMock(return_value={"id": 99})
+    conn.fetchrow = save_fetchrow(return_value={"id": 99})
     conn.transaction = MagicMock(return_value=_AsyncCtx(None))
     pool = MagicMock()
     pool.acquire = MagicMock(return_value=_AsyncCtx(conn))

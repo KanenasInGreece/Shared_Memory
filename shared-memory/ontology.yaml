@@ -2,7 +2,7 @@
 #
 # The spine is not configurable (decision 550). Those keys are pinned in code and ignored if copied here. `Domain` in the spine list is a project's section, not these sub-types. NREM reads only the spine, so this file never decides when consolidation runs.
 # Spine labels: Fact, Entity, CommunitySummary, Insight, Decision, Human, AIAgent, Project, Domain, Activity, Milestone, ReasoningTrace, ReasoningStep.
-# Spine relationships: MENTIONS, REPORTS_ON, ALIASES, SUMMARIZED_BY, NEXT_STEP, WAS_ATTRIBUTED_TO, WAS_ASSISTED_BY, WAS_GENERATED_BY, PROJECT_OF, DOMAIN_OF, ACTED_ON_BEHALF_OF, SUPERSEDES, INFORMED_BY, HAD_OUTCOME, REFERENCES, GROUNDED_IN, CONSIDERED, REJECTED, UNDER_CONDITIONS, PRODUCES_INSIGHT.
+# Spine relationships: MENTIONS, REPORTS_ON, ALIASES, SUMMARIZED_BY, NEXT_STEP, WAS_ATTRIBUTED_TO, WAS_ASSISTED_BY, WAS_GENERATED_BY, PROJECT_OF, DOMAIN_OF, ACTED_ON_BEHALF_OF, SUPERSEDES, INFORMED_BY, HAD_OUTCOME, GROUNDED_IN, CONSIDERED, REJECTED, UNDER_CONDITIONS, PRODUCES_INSIGHT.
 
 # Entity sub-types under :Entity. Rename or extend to fit the domain.
 labels:

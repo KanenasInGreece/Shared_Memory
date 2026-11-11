@@ -638,7 +638,7 @@ def test_item9_expansion_where_does_not_trust_the_graph_superseded_flag():
     for fn in (MemoryCoordinator._expand_graph_context_batch,):
         src = inspect.getsource(fn)
         assert "coalesce(related.superseded,false)" not in src
-        assert "ONT.references" in src
+        assert "'REFERENCES'" in src
 
 
 @pytest.mark.asyncio

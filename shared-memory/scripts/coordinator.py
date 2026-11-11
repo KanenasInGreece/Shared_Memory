@@ -148,8 +148,10 @@ CLIENT_BUILD_HEADER = "X-Shared-Memory-Client"
 # A record id is unique only inside its table; qualify as fact:N / summary:N (bare ints still mean technical_docs) (decision:882).
 from record_ref import (             # noqa: E402
     REF_TYPES_DOCS, REF_TYPES_SUMMARIES, REF_SEPARATOR,
-    make_ref, parse_ref, summary_record_type, doc_record_type,
+    make_ref, parse_ref, summary_record_type, doc_record_type, ID_MAX,
 )
+
+from reference_resolver import extract_citations, references_from
 
 # Throttle: remember (agent, version) pairs already logged so a misversioned
 # client does not flood the gateway log on every request.
@@ -3450,12 +3452,31 @@ def _collect_lineage_mark_ids(marks, ids):
             _add_pg(ids, "technical_docs", sib)
 
 
-def _collect_hit_reference_ids(hit, ids):
+_STORED_CITATION_RE = re.compile(r"(fact|decision|retrospective):([1-9][0-9]{0,18})")
+
+
+def _validated_citation(entry):
+    """Validate stored entries before any SQL binding or read-side use."""
+    if not isinstance(entry, str):
+        return None
+    match = _STORED_CITATION_RE.fullmatch(entry)
+    if match is None:
+        return None
+    pid = int(match.group(2))
+    return (match.group(1), pid) if pid <= ID_MAX else None
+
+
+def _collect_hit_reference_ids(hit, ids, citation_ids=None):
     rtype = hit.get("record_type")
     table = ("community_summaries" if rtype in ("summary", "insight")
              else "technical_docs")
     _add_pg(ids, table, hit.get("pg_id"))
     meta = hit.get("metadata") if isinstance(hit.get("metadata"), dict) else {}
+    if citation_ids is not None and isinstance(meta.get("references"), list):
+        for entry in meta["references"]:
+            parsed = _validated_citation(entry)
+            if parsed is not None:
+                citation_ids.add(parsed[1])
     for key in ("grounded_in", "source_pg_ids"):
         for item in meta.get(key) or []:
             _add_pg(ids, "technical_docs", item)
@@ -3558,10 +3579,17 @@ def _cypher_source_ids(meta, hit):
     return named
 
 
-def _redact_hit_reference_fields(hit, rows):
+def _redact_hit_reference_fields(hit, rows, citation_kinds=None):
     """Omit ids the viewer cannot read. Prose citations are left as text."""
     meta = hit.get("metadata")
     if isinstance(meta, dict):
+        if "references" in meta:
+            if rows is None or citation_kinds is None or not isinstance(meta["references"], list):
+                meta.pop("references", None)
+            else:
+                meta["references"] = [entry for entry in meta["references"]
+                                      if (parsed := _validated_citation(entry)) is not None
+                                      and citation_kinds.get(parsed[1]) == parsed[0]]
         if "cypher_query" in meta:
             # A stored query string cannot be edited safely. Omit it unless
             # every id it was built from is readable (decision:3505 ruling 2:
@@ -7754,20 +7782,23 @@ class MemoryCoordinator:
                                 return web.json_response(refusal_body, status=409)
 
                         # The pre-check is not the guard. Only FOR UPDATE stops a concurrent save of the same content between the read and the insert.
-                        prior = await conn.fetchval(
-                            "SELECT metadata FROM technical_docs"
+                        prior = await conn.fetchrow(
+                            "SELECT id, metadata FROM technical_docs"
                             " WHERE content_hash = $1 FOR UPDATE",
                             content_hash,
                         )
                         if prior is not None:
                             conflict = await self._axis_conflict_error(
-                                prior, incoming_project, incoming_domains,
+                                prior["metadata"], incoming_project, incoming_domains,
                                 entities, is_judgement,
                                 incoming_type=metadata.get("type"),
                                 incoming_metadata=metadata)
                             if conflict is not None:
                                 self._count_refusal(conflict)
                                 return web.json_response(conflict, status=409)
+
+                        metadata["references"] = await self._references_for_save(
+                            conn, content, prior["id"] if prior else None)
 
                         row = await conn.fetchrow(
                             """
@@ -7789,6 +7820,7 @@ class MemoryCoordinator:
                             content_hash, agent_id, scope, visibility,
                         )
                         pg_id = row["id"]
+                        await self._remove_returned_self_reference(conn, metadata, pg_id)
 
                         # decision 582: pick the role from the stored label and fact_kind. Advisory only; the flat grounded_in list stays for telemetry.
                         grounded_ids = [
@@ -8384,6 +8416,11 @@ class MemoryCoordinator:
                             {"status": "error", "message": f"No record found with pg_id={pg_id}"},
                             status=404,
                         )
+                    prior = await conn.fetchrow(
+                        "SELECT id FROM technical_docs WHERE content_hash = $1 FOR UPDATE",
+                        content_hash)
+                    metadata["references"] = await self._references_for_save(
+                        conn, notes, prior["id"] if prior else None)
                     # Copy the decision's project onto the retrospective when the decision has one.
                     if target["project"]:
                         metadata["project"] = target["project"]
@@ -8404,6 +8441,7 @@ class MemoryCoordinator:
                         agent_id, scope, visibility,
                     )
                     retro_pg_id = row["id"]
+                    await self._remove_returned_self_reference(conn, metadata, retro_pg_id)
 
                     grounded_typed = await self._resolve_typed_grounding(
                         conn, grounded_ids, metadata.get("grounded_roles") or {}
@@ -8471,6 +8509,39 @@ class MemoryCoordinator:
         })
 
     # ── POST /memory/search ───────────────────────────────────────────────────
+
+    async def _references_for_save(self, conn, content, self_id):
+        citations = extract_citations(content)
+        rows = await conn.fetch(
+            "SELECT id, metadata FROM technical_docs WHERE id = ANY($1::bigint[])",
+            sorted({pid for _, pid in citations})) if citations else []
+        return references_from(citations, {row["id"]: row["metadata"] if isinstance(row["metadata"], dict) else None
+                                          for row in rows}, self_id)
+
+    async def _remove_returned_self_reference(self, conn, metadata, pg_id):
+        refs = metadata["references"]
+        kept = [ref for ref in refs if int(ref.partition(":")[2]) != pg_id]
+        if kept != refs:
+            await conn.execute(
+                "UPDATE technical_docs SET metadata = jsonb_set(metadata, '{references}', $2) WHERE id = $1",
+                pg_id, kept)
+            metadata["references"] = kept
+
+    async def _lookup_citation_kinds(self, ids, viewer, viewer_scope):
+        """Read citation kind and visibility without hydrating corpus text."""
+        if not ids:
+            return {}
+        try:
+            async with self._acquire() as conn:
+                rows = await conn.fetch(
+                    "SELECT id, visibility, agent_id, scope, metadata->>'type' AS type "
+                    "FROM technical_docs WHERE id = ANY($1::bigint[])", sorted(ids))
+            return {row["id"]: doc_record_type({"type": row["type"]}) for row in rows
+                    if _is_doc_visible(row["visibility"], row["agent_id"] or "",
+                                       row["scope"] or "global", viewer, viewer_scope)}
+        except Exception:
+            log.warning("citation visibility lookup failed")
+            return None
 
     async def hydrate(self, ids, viewer, viewer_scope=None):
         """Read each table once with viewer scope and successor visibility.
@@ -8623,8 +8694,9 @@ class MemoryCoordinator:
 
         The per-anchor cap stays inside the correlated subquery. A query error
         returns an empty list per anchor: graph context enriches a search and
-        must never fail one. REFERENCES is excluded (decision:3482: search
-        stops following those edges; lineage and graph still show them).
+        must never fail one. REFERENCES stays excluded for installations awaiting
+        the backfill (decision:3482: citations live only in Postgres). Legacy
+        edges still appear in lineage and graph until that backfill runs.
         """
         if not pg_ids:
             return {}
@@ -8636,7 +8708,7 @@ class MemoryCoordinator:
                 " CALL (pg_id) {"
                 f"   MATCH (n {{pg_id: pg_id}}) WHERE {anchor_where}"
                 "   OPTIONAL MATCH (n)-[r]-(related)"
-                f"     WHERE r IS NULL OR type(r) <> '{ONT.references}'"
+                f"     WHERE r IS NULL OR type(r) <> 'REFERENCES'"
                 f"   OPTIONAL MATCH (related)-[:{ONT.aliases}]-(al:{ONT.entity})"
                 f"     WHERE EXISTS {{"
                 f"       MATCH (related)<-[:{ONT.entity_link}]-(m)"
@@ -8723,8 +8795,10 @@ class MemoryCoordinator:
         else:
             marks = await self.resolve_marks(session, decision_ids, retro_ids)
         ids = set()
+        citation_ids = set()
         for hit in hits:
-            _collect_hit_reference_ids(hit, ids)
+            _collect_hit_reference_ids(hit, ids, citation_ids)
+        citation_kinds = await self._lookup_citation_kinds(citation_ids, viewer, viewer_scope)
         for dec in (marks.get("decisions") or {}).values():
             for outcome in dec.get("outcomes") or []:
                 _add_pg(ids, "technical_docs", outcome.get("pg_id"))
@@ -8750,7 +8824,7 @@ class MemoryCoordinator:
                     rendered.append(item)
             hit["graph_context"] = rendered
             _apply_search_hit_marks(hit, usable, marks, explicit=not ranked)
-            _redact_hit_reference_fields(hit, usable)
+            _redact_hit_reference_fields(hit, usable, citation_kinds)
         return hits
 
     async def _resolve_search_filters(
@@ -9368,7 +9442,7 @@ class MemoryCoordinator:
                         f"""
                         SELECT id, content, metadata FROM technical_docs
                         WHERE NOT superseded
-                          AND (content ILIKE $1 ESCAPE '\\' OR metadata::text ILIKE $1 ESCAPE '\\')
+                          AND (content ILIKE $1 ESCAPE '\\' OR CASE WHEN jsonb_typeof(metadata) = 'object' THEN (metadata - 'references')::text ELSE metadata::text END ILIKE $1 ESCAPE '\\')
                           AND {vis_sql} {scope_sql} {axis_sql}
                         LIMIT $2
                         """,

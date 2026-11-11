@@ -5,8 +5,7 @@ Two guards, both structural because the subject is an ABSENCE:
 
 1. The sweep's module is gone — deleted, not fenced off.
 2. `reference_resolver` exposes no judge surface and no relation choice at all:
-   every citation is REFERENCES (decision:3135), so there is no
-   classification left to regain a network branch.
+   there is no classification left to regain a network branch.
 
 Deliberately NOT guarded: whether the retired name appears anywhere in the
 shipped Python. A string-absence check is a taboo-word guard — it breaks on

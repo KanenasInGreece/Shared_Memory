@@ -748,7 +748,7 @@ def test_t9_coordinator_expanders_exclude_superseded_community_summaries():
 
     for src in (src_batch,):
         assert "coalesce(related.superseded,false)" not in src
-        assert "ONT.references" in src
+        assert "'REFERENCES'" in src
         assert "coalesce(m.superseded,false)" in src
 
 

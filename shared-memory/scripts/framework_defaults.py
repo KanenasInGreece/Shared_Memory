@@ -98,7 +98,7 @@ FRAMEWORK_DEFAULTS = MappingProxyType({
             "backfill_project_of.py (NEO4J_URI env fallback)",
             "reconcile_project_edges.py (NEO4J_URI env fallback)",
             "reconcile_project_identity.py (NEO4J_URI env fallback)",
-            "resolve_references.py (NEO4J_URI env fallback)",
+            "backfill_references.py (NEO4J_URI env fallback)",
             "entity_fragment_rate.py (NEO4J_URI env fallback)",
             "normalize_projects.py (NEO4J_URI env fallback)",
             "migrations/verify_neo4j_init.py (NEO4J_URI env fallback)",

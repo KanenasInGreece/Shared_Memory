@@ -595,7 +595,7 @@ def test_expansion_cypher_projects_adr_node_props_both_forms():
         assert "properties(r) AS rel_props" in body
         assert "startNode(r).pg_id AS start_pg_id" in body
         assert "endNode(r).pg_id AS end_pg_id" in body
-        assert "ONT.references" in body
+        assert "'REFERENCES'" in body
         assert "adr_fact_kind" not in body
         assert "adr_confidence" not in body
         assert "adr_alternatives" not in body

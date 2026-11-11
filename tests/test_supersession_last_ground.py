@@ -9,6 +9,8 @@ Every test names the mutation it kills.
 Unit tests never reach the network.
 """
 
+from tests.save_mocks import save_fetchrow
+
 import importlib.util
 import inspect
 import json
@@ -66,7 +68,7 @@ def _make_request(body: dict, principal: dict | None = None, authenticated_agent
 def _coord():
     c = MemoryCoordinator()
     conn = AsyncMock()
-    conn.fetchrow = AsyncMock(return_value={"id": 100})
+    conn.fetchrow = save_fetchrow(return_value={"id": 100})
     conn.fetchval = AsyncMock(return_value=1)
     conn.fetch = AsyncMock(return_value=[])
     conn.execute = AsyncMock(return_value="UPDATE 1")
@@ -550,7 +552,7 @@ async def test_t8_save_path_refusal_and_ack_handling():
         axis_commit_mock.assert_not_called()
 
         # 2. Acknowledged save -> passes, INSERT metadata lacks acknowledge_standing and supersession_ack
-        conn.fetchrow = AsyncMock(side_effect=[
+        conn.fetchrow = save_fetchrow(side_effect=[
             {"superseded": False, "type": "fact"},  # pre-check
             {"superseded": False},                   # in-transaction FOR UPDATE
             {"id": 999},                             # INSERT RETURNING id
@@ -1344,7 +1346,7 @@ async def test_update_zero_rolls_back_on_both_paths():
     c2, conn2, _ = _coord()
     tx2 = _recording_tx()
     conn2.transaction = MagicMock(return_value=tx2)
-    conn2.fetchrow = AsyncMock(side_effect=_fetchrow_success)
+    conn2.fetchrow = save_fetchrow(side_effect=_fetchrow_success)
     conn2.execute = AsyncMock(side_effect=exec_zero)
     with patch.object(c2, "_thread_grounds", new=AsyncMock(return_value=[_losing_decision()])), \
          patch.object(c2, "_embed", new=AsyncMock(return_value=[0.1])), \

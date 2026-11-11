@@ -12,6 +12,8 @@ Covers:
       * fetch_ledger_backlog excludes superseded facts (census safety)
       * _FACT_ROW excludes 'supersede' rows
 """
+from tests.save_mocks import save_fetchrow
+
 import importlib.util
 import json
 import os
@@ -65,7 +67,7 @@ def _coord():
     """MemoryCoordinator with mocked pool + neo4j. Caller tunes conn.* mocks."""
     c = MemoryCoordinator()
     conn = AsyncMock()
-    conn.fetchrow = AsyncMock(return_value={"id": 99})
+    conn.fetchrow = save_fetchrow(return_value={"id": 99})
     # fetchval also answers the project-registry lookup at ingress (v0.8.33);
     # 1 = 'this project is registered', so these tests reach the behaviour
     # they are actually about instead of stopping at the project gate.
@@ -211,7 +213,7 @@ async def test_save_supersedes_target_not_found():
 async def test_save_supersedes_success_flags_and_piggybacks():
     c, conn, _ = _coord()
     # 1st fetchrow = supersedes target check; 2nd = FOR UPDATE; 3rd = INSERT RETURNING id
-    conn.fetchrow = AsyncMock(side_effect=[{"superseded": False, "type": None}, {"superseded": False}, {"id": 100}])
+    conn.fetchrow = save_fetchrow(side_effect=[{"superseded": False, "type": None}, {"superseded": False}, {"id": 100}])
     with patch.object(c, "_embed", new=AsyncMock(return_value=[0.1] * 1024)), \
          patch.object(c, "_thread_grounds", new=AsyncMock(return_value=[])):
         req = _make_request({"content": "corrected",

@@ -19,6 +19,8 @@ Coverage:
   - handle_search: keyword fallback (embeddings down) is gated too
 """
 
+from tests.save_mocks import save_fetchrow
+
 import importlib.util
 import json
 import os
@@ -291,7 +293,7 @@ async def test_handle_save_visibility_valid_options_accepted():
     """S4: valid visibility values ('global', 'private', 'scope') pass validation."""
     c, mock_conn = _coordinator_with_mocks()
     mock_conn.fetchval = AsyncMock(return_value=None)
-    mock_conn.fetchrow = AsyncMock(return_value={"id": 100})
+    mock_conn.fetchrow = save_fetchrow(return_value={"id": 100})
     mock_conn.execute = AsyncMock(return_value="INSERT 0 1")
     mock_tx = MagicMock()
     mock_tx.__aenter__ = AsyncMock(return_value=mock_tx)

@@ -66,7 +66,7 @@ def _coordinator_with_mocks():
 
     # asyncpg connection mock — transaction() must return an async ctx manager
     mock_conn = AsyncMock()
-    mock_conn.fetchrow   = AsyncMock(return_value={"id": 99})
+    mock_conn.fetchrow   = AsyncMock(side_effect=lambda sql, *args: None if "content_hash = $1 FOR UPDATE" in sql else {"id": 99})
     # asyncpg's execute() returns the COMMAND STATUS STRING ("DELETE 3"), and
     # callers here parse it for a row count — the outbox recovery at startup and
     # the alternatives reconciler both do. A bare AsyncMock returns a mock whose
@@ -1788,6 +1788,7 @@ async def test_retrospective_binds_cypher_params_as_object():
     c, mock_conn, _ = _coordinator_with_mocks()
     mock_conn.fetchrow = AsyncMock(side_effect=[
         {"id": 240, "type": "decision", "project": "shared-memory-GitHub"},  # target
+        None,                                                                # citation self lookup
         {"id": 911},                                                          # retro row
     ])
     with patch.object(c, "_embed", new=AsyncMock(return_value=[0.1] * 1024)):
@@ -1824,6 +1825,7 @@ async def test_retrospective_v2_inherits_target_project_and_stores_record():
     c, mock_conn, _ = _coordinator_with_mocks()
     mock_conn.fetchrow = AsyncMock(side_effect=[
         {"id": 240, "type": "decision", "project": "project-b"},
+        None,
         {"id": 912},
     ])
     # _resolve_typed_grounding looks the grounded fact up in technical_docs
@@ -1835,8 +1837,8 @@ async def test_retrospective_v2_inherits_target_project_and_stores_record():
                              "grounded_in": [601], "elicited": True})
         resp = await c.handle_retrospective(req)
     assert resp.status == 200
-    # technical_docs INSERT metadata (2nd fetchrow call): row content + metadata
-    meta = mock_conn.fetchrow.await_args_list[1].args[2]
+    # technical_docs INSERT metadata: row content + metadata
+    meta = next(call.args[2] for call in mock_conn.fetchrow.await_args_list if "INSERT INTO technical_docs" in call.args[0])
     assert meta["type"] == "retrospective"
     assert meta["project"] == "project-b"
     assert meta["target_pg_id"] == 240
@@ -1846,7 +1848,7 @@ async def test_retrospective_v2_inherits_target_project_and_stores_record():
     # Identity includes the target decision: same notes on another decision is
     # a DIFFERENT record (and can never collide with a plain fact's hash).
     import hashlib as _hl
-    assert mock_conn.fetchrow.await_args_list[1].args[4] == _hl.sha256(
+    assert next(call.args[4] for call in mock_conn.fetchrow.await_args_list if "INSERT INTO technical_docs" in call.args[0]) == _hl.sha256(
         f"retrospective:240:{meta['date']}:mixed:partly held".encode()).hexdigest()
 
 
@@ -2289,6 +2291,7 @@ async def test_retrospective_reversed_marks_decision_superseded():
     c, mock_conn, _ = _coordinator_with_mocks()
     mock_conn.fetchrow = AsyncMock(side_effect=[
         {"id": 42, "type": "decision", "project": "p1"},   # target FOR SHARE
+        None,
         {"id": 915},                                        # retro's own row
     ])
 
@@ -2312,6 +2315,7 @@ async def test_retrospective_normal_rating_has_no_reversal_side_effects():
     c, mock_conn, _ = _coordinator_with_mocks()
     mock_conn.fetchrow = AsyncMock(side_effect=[
         {"id": 42, "type": "decision", "project": "p1"},
+        None,
         {"id": 916},
     ])
 
