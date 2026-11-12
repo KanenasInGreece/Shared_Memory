@@ -11,6 +11,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'shared-memory/scripts'))
 import backfill_references as b
 from neo4j.time import DateTime
+from neo4j.exceptions import ClientError
 
 
 def edge(eid='e', kind='REFERENCES', properties=None, source=1, target=2):
@@ -308,7 +309,8 @@ def cli_stores(monkeypatch):
 
 
 @pytest.mark.parametrize('phase', ['postgres', 'graph'])
-@pytest.mark.parametrize('error_type', [RuntimeError, ValueError])
+@pytest.mark.parametrize('error_type', [RuntimeError, ValueError, b.psycopg2.OperationalError,
+                                         ClientError])
 def test_main_driver_payload_never_printed(phase, error_type, cli_stores, monkeypatch, tmp_path, capsys):
     connect, driver = cli_stores
     error = error_type('FAKE-PASSWORD-9182 private-cue-123')
@@ -435,3 +437,232 @@ def test_operation_refuses_leftover_log_before_writing(tmp_path):
     with pytest.raises(ValueError, match='use --resume or a new path'):
         b.run_operation(None, None, before)
     assert not before.exists()
+
+
+def test_plan_error_does_not_suggest_resume(cli_stores, capsys):
+    connect, _ = cli_stores
+    connect.side_effect = b.psycopg2.OperationalError('FAKE-PASSWORD-9182')
+    assert b.main([]) == 2
+    output = capsys.readouterr()
+    assert output.err.strip() == 'backfill failed; no error payload printed; plan wrote no before-file; rerun the plan'
+    assert 'FAKE-PASSWORD-9182' not in output.out + output.err
+
+
+def test_resume_unreadable_before_refuses_without_connecting(cli_stores, monkeypatch, tmp_path, capsys):
+    connect, _ = cli_stores
+    def unreadable(path):
+        raise PermissionError('FAKE-PASSWORD-9182')
+    monkeypatch.setattr(Path, 'read_bytes', unreadable)
+    assert b.main(['--resume', str(tmp_path / 'before')]) == 2
+    output = capsys.readouterr()
+    assert output.err.strip() == 'cannot read before-file: no store was touched; check file permissions'
+    assert 'FAKE-PASSWORD-9182' not in output.out + output.err
+    connect.assert_not_called()
+
+
+@pytest.mark.parametrize('temporal', [False, True])
+@pytest.mark.parametrize('kind', ['REFERENCES', 'INFORMED_BY'])
+@pytest.mark.parametrize('source', [None, 1])
+@pytest.mark.parametrize('target', [None, 2])
+def test_graph_statements_exact(kind, source, target, temporal):
+    identity = ('s.pg_id IS NULL' if source is None else 's.pg_id = $source')
+    identity += ' AND ' + ('t.pg_id IS NULL' if target is None else 't.pg_id = $target')
+    identity += (' AND type(r) = $type'
+                 ' AND size(labels(s)) = size($source_labels) AND all(l IN labels(s) WHERE l IN $source_labels)'
+                 ' AND size(labels(t)) = size($target_labels) AND all(l IN labels(t) WHERE l IN $target_labels)')
+    lock = ('MATCH (s)-[r]->(t) WHERE elementId(r) = $eid AND ' + identity +
+            ' AND properties(r) = $properties SET r.backfill_op = $op RETURN count(r) AS n')
+    recheck = ('MATCH (s)-[r]->(t) WHERE elementId(r) = $eid WITH s, r, t, coalesce((' + identity +
+               ' AND all(k IN keys($fresh_properties) WHERE r[k] = $fresh_properties[k])' +
+               " AND size([k IN keys(r) WHERE k <> 'backfill_op']) = size(keys($fresh_properties))" +
+               (' AND r.asserted_by IS NULL' if kind == 'INFORMED_BY' else '') +
+               '), false) AS matches '
+               'FOREACH (_ IN CASE WHEN matches THEN [1] ELSE [] END | DELETE r) '
+               'FOREACH (_ IN CASE WHEN NOT matches THEN [1] ELSE [] END | REMOVE r.backfill_op) '
+               'RETURN CASE WHEN matches THEN 1 ELSE 0 END AS n')
+    properties = {}
+    if temporal:
+        properties = {'created_at': {'t': 'ZONED DATETIME NOT NULL', 'v': '2026-11-11T15:25:38Z'}}
+        lock = lock.replace('properties(r) = $properties',
+            'all(k IN keys($properties) WHERE r[k] = $properties[k])'
+            ' AND all(p IN $temporal WHERE toString(r[p.k]) = p.v AND valueType(r[p.k]) = p.t)'
+            ' AND size(keys(r)) = size(keys($properties)) + size($temporal)')
+        recheck = recheck.replace('size(keys($fresh_properties))',
+            'size(keys($fresh_properties)) + size($fresh_temporal)')
+        recheck = recheck.replace(' AND r.asserted_by IS NULL', '')
+        recheck = recheck.replace('), false) AS matches',
+            ' AND all(p IN $fresh_temporal WHERE toString(r[p.k]) = p.v AND valueType(r[p.k]) = p.t)'
+            + (' AND r.asserted_by IS NULL' if kind == 'INFORMED_BY' else '') + '), false) AS matches')
+    actual = b.graph_statements(dict(type=kind, source=source, target=target, properties=properties))
+    assert actual == (lock, recheck)
+
+
+@pytest.mark.parametrize('mode', ['apply', 'resume'])
+def test_mutating_mode_error_pins_recovery(mode, cli_stores, monkeypatch, tmp_path, capsys):
+    connect, _ = cli_stores
+    monkeypatch.setattr(b, 'read_before', lambda path: {})
+    connect.side_effect = b.psycopg2.OperationalError('FAKE-PASSWORD-9182')
+    args = ['--apply', '--before', str(tmp_path / 'before')] if mode == 'apply' else ['--resume', str(tmp_path / 'before')]
+    assert b.main(args) == 2
+    output = capsys.readouterr()
+    assert output.out == ''
+    assert output.err.strip() == ('backfill failed; no error payload printed; ' +
+        ('no before-file was written; rerun --apply' if mode == 'apply' else 'resume with the complete before-file'))
+
+
+def test_resume_directory_refuses_without_connecting(cli_stores, tmp_path, capsys):
+    connect, _ = cli_stores
+    assert b.main(['--resume', str(tmp_path)]) == 2
+    output = capsys.readouterr()
+    assert output.out == ''
+    assert output.err.strip() == 'cannot read before-file: no store was touched; not a readable file'
+    connect.assert_not_called()
+
+
+@pytest.mark.parametrize('zone', ['Europe/Athens', '+02:00', 'Z'])
+def test_datetime_round_trip_preserves_zone_identity(zone):
+    import pytz
+    text = '2026-11-11T17:25:38.758000001' + ('Z' if zone == 'Z' else '+02:00')
+    original = DateTime.from_iso_format(text)
+    if zone == 'Europe/Athens':
+        original = original.as_timezone(pytz.timezone(zone))
+    captured = b.encode_value(original)
+    restored = b.decode_value(json.loads(json.dumps(captured)))
+    assert captured['t'] == 'DateTime'
+    assert restored == original
+    assert restored.nanosecond == original.nanosecond
+    # Bolt distinguishes named-zone datetimes from offset-only datetimes.
+    assert restored.iso_format() == original.iso_format()
+    assert getattr(restored.tzinfo, "zone", None) == getattr(original.tzinfo, "zone", None)
+
+
+def test_binding_shape_mismatch_refuses_without_key_error():
+    fallback = {'postgres': {'oid': 1, 'database': 'db', 'address': '127.0.0.1', 'port': 5432}, 'neo4j': 'n'}
+    privileged = {'postgres': {'oid': 1, 'database': 'db', 'system_identifier': 'cluster'}, 'neo4j': 'n'}
+    for expected, actual in ((fallback, privileged), (privileged, fallback)):
+        with pytest.raises(b.Refusal, match='store binding mismatch; refusing mutation'):
+            b.check_binding(expected, actual)
+
+
+
+@pytest.mark.parametrize('text', ['2026-11-11T15:25:38.758000001Z',
+                                    '2026-11-11T17:25:38.758000001+02:00',
+                                    '2026-11-11T17:25:38.758000001+02:00[Europe/Athens]'])
+def test_server_temporal_capture_and_recheck(text):
+    raw = edge(properties={'created_at': object(), 'cue': 'same'})
+    raw['temporal'] = [{'k': 'created_at', 't': 'ZONED DATETIME NOT NULL', 'v': text}]
+    captured = b.plan_changes([], [raw])['edges'][0]
+    assert captured['properties']['created_at'] == {'t': 'ZONED DATETIME NOT NULL', 'v': text}
+    assert 'toString(r[k])' in b.GRAPH_READ and 'valueType(r[k])' in b.GRAPH_READ
+    session = MagicMock()
+    tx = session.begin_transaction.return_value.__enter__.return_value
+    tx.run.return_value.single.return_value = {'n': 1}
+    assert b.apply_graph(session, [captured], 'op')[0]['event'] == 'graph_committed'
+    for call in tx.run.call_args_list:
+        query = call.args[0]
+        assert 'toString(r[p.k]) = p.v' in query
+        assert 'valueType(r[p.k]) = p.t' in query
+        assert call.kwargs['temporal'] == raw['temporal']
+        assert 'created_at' not in call.kwargs['properties']
+
+
+
+
+@pytest.mark.parametrize('kind,text', [
+    ('ZONED DATETIME', '2026-11-11T15:25:38Z'),
+    ('LOCAL DATETIME', '2026-11-11T15:25:38'),
+    ('DATE', '2026-11-11'), ('ZONED TIME', '15:25:38Z'),
+    ('LOCAL TIME', '15:25:38'), ('DURATION', 'P1M2DT3S')])
+def test_all_server_temporal_types_use_text_without_driver_decode(kind, text, monkeypatch):
+    raw = edge(properties={'at': object()})
+    raw['temporal'] = [dict(k='at', t=kind + ' NOT NULL', v=text)]
+    captured = b.plan_changes([], [raw])['edges']
+    monkeypatch.setattr(b, 'decode_value', lambda value: pytest.fail('server temporal passed through Python'))
+    session = MagicMock()
+    tx = session.begin_transaction.return_value.__enter__.return_value
+    tx.run.return_value.single.return_value = {'n': 1}
+    assert b.apply_graph(session, captured, 'op')[0]['event'] == 'graph_committed'
+    assert tx.run.call_args.kwargs['temporal'] == raw['temporal']
+    assert kind in b.GRAPH_READ
+
+
+def test_legacy_temporal_before_file_remains_readable_with_strict_recheck(tmp_path):
+    old = edge(properties={'at': {'t': 'DateTime', 'v': '2026-11-11T15:25:38.000000001+00:00', 'zone': 'UTC'}})
+    path = tmp_path / 'before'
+    b.write_before(path, {'edges': [old]})
+    restored = b.read_before(path)['edges'][0]
+    assert restored == old
+    lock, recheck = b.graph_statements(restored)
+    assert 'properties(r) = $properties' in lock
+    assert 'r[k] = $fresh_properties[k]' in recheck
+    assert 'toString(r[p.k])' not in lock + recheck
+    assert b.decode_value(restored['properties']['at']).nanosecond == 1
+
+
+def test_pytz_is_lazy_and_temporal_types_are_a_set():
+    import ast
+    source = ast.parse(Path(b.__file__).read_text())
+    assert not any(isinstance(n, ast.Import) and any(a.name == 'pytz' for a in n.names) for n in source.body)
+    assert b.TEMPORAL_CONSTRUCTORS == {'ZONED DATETIME', 'LOCAL DATETIME', 'DATE', 'ZONED TIME', 'LOCAL TIME', 'DURATION'}
+
+
+def test_apply_error_after_before_file_suggests_resume(cli_stores, monkeypatch, tmp_path, capsys):
+    before = tmp_path / 'before'
+    def fail(*args, **kwargs):
+        b.write_before(before, {'op': 'op'})
+        raise RuntimeError('private')
+    monkeypatch.setattr(b, 'run_operation', fail)
+    assert b.main(['--apply', '--before', str(before)]) == 2
+    assert capsys.readouterr().err.strip().endswith('; resume with the complete before-file')
+
+
+@pytest.mark.parametrize('drift_at', ['lock', 'recheck', 'extra_property', 'extra_at_lock', 'none'])
+def test_temporal_graph_drift_is_not_deleted(drift_at):
+    raw = edge(properties={'cue': 'captured', 'created_at': object()})
+    tag = dict(k='created_at', t='ZONED DATETIME NOT NULL', v='2026-11-11T15:25:38Z')
+    raw['temporal'] = [tag]
+    captured = b.plan_changes([], [raw])['edges']
+    current = dict(cue='captured', created_at=(tag['t'], tag['v']))
+    if drift_at == 'lock':
+        current['created_at'] = (tag['t'], '2026-11-12T15:25:38Z')
+    if drift_at == 'extra_at_lock':
+        current['extra'] = 1
+    deleted = []
+    session = MagicMock()
+    tx = session.begin_transaction.return_value.__enter__.return_value
+    def run(query, **params):
+        result = MagicMock()
+        fresh = 'DELETE r' in query
+        if 'SET r.backfill_op' in query or fresh:
+            ordinary = params['fresh_properties' if fresh else 'properties']
+            temporal = params['fresh_temporal' if fresh else 'temporal']
+            matches = all(current.get(k) == v for k, v in ordinary.items())
+            # Evaluate the temporal all predicate and Cypher OR precedence, not just presence.
+            token = '$fresh_temporal' if fresh else '$temporal'
+            if 'all(p IN ' + token in query:
+                # toString itself contains a closing parenthesis; OR true is tested on the full clause.
+                clause = query.split('all(p IN ' + token + ' WHERE ', 1)[1].split("'", 1)[0]
+                bypass = 'OR true' in clause
+                matches &= bypass or all(current.get(p['k']) == (p['t'], p['v']) for p in temporal)
+            if ('size([k IN keys(r)' if fresh else 'size(keys(r)) =') in query:
+                count = len(ordinary)
+                if ('+ size($fresh_temporal)' if fresh else '+ size($temporal)') in query:
+                    count += len(temporal)
+                matches &= len([k for k in current if not fresh or k != 'backfill_op']) == count
+            if matches:
+                if fresh:
+                    deleted.append(True)
+                else:
+                    current['backfill_op'] = params['op']
+                    if drift_at == 'recheck':
+                        current['created_at'] = (tag['t'], '2026-11-12T15:25:38Z')
+                    if drift_at == 'extra_property':
+                        current['extra'] = 1
+        else:
+            matches = True
+        result.single.return_value = {'n': int(matches)}
+        return result
+    tx.run.side_effect = run
+    events = b.apply_graph(session, captured, 'op')
+    assert bool(deleted) == (drift_at == 'none')
+    assert events[0]['event'] == ('graph_committed' if drift_at == 'none' else 'skipped')

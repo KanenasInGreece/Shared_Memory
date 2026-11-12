@@ -32,7 +32,14 @@ GRAPH_READ = """MATCH (s)-[r]->(t)
 WHERE type(r) IN ['REFERENCES', 'INFORMED_BY']
 RETURN elementId(r) AS eid, type(r) AS type, labels(s) AS source_labels,
 labels(t) AS target_labels, s.pg_id AS source, t.pg_id AS target,
-properties(r) AS properties"""
+properties(r) AS properties,
+[k IN keys(r) WHERE split(valueType(r[k]), ' NOT NULL')[0] IN
+ ['ZONED DATETIME', 'LOCAL DATETIME', 'DATE', 'ZONED TIME', 'LOCAL TIME', 'DURATION'] |
+ {k:k, t:valueType(r[k]), v:toString(r[k])}] AS temporal"""
+
+
+TEMPORAL_CONSTRUCTORS = {'ZONED DATETIME', 'LOCAL DATETIME', 'DATE', 'ZONED TIME',
+                         'LOCAL TIME', 'DURATION'}
 
 
 def encode_value(value):
@@ -53,6 +60,10 @@ def encode_value(value):
         return {'t': 'Point', 'v': {'srid': value.srid, 'coordinates': list(value)}}
     for name in ('DateTime', 'Date', 'Time', 'Duration'):
         if isinstance(value, getattr(time, name)):
+            if name == 'DateTime':
+                zone = getattr(value.tzinfo, 'zone', None) or getattr(value.tzinfo, 'key', None)
+                if zone:
+                    return {'t': name, 'v': value.iso_format(), 'zone': zone}
             return {'t': name, 'v': value.iso_format()}
     if isinstance(value, (list, tuple)):
         return {'t': 'List', 'v': [encode_value(item) for item in value]}
@@ -72,7 +83,11 @@ def decode_value(tagged):
                7203: spatial.CartesianPoint, 9157: spatial.CartesianPoint}[value['srid']]
         return cls(value['coordinates'])
     if kind in ('DateTime', 'Date', 'Time', 'Duration'):
-        return getattr(time, kind).from_iso_format(value)
+        restored = getattr(time, kind).from_iso_format(value)
+        if kind == 'DateTime' and tagged.get('zone'):
+            import pytz
+            restored = restored.as_timezone(pytz.timezone(tagged['zone']))
+        return restored
     if kind == 'List':
         return [decode_value(item) for item in value]
     raise Refusal('unsupported captured graph property type')
@@ -147,7 +162,9 @@ def plan_changes(rows, edges):
             counts['c'] += 1
         else:
             continue
-        captured.append(dict(edge, properties={key: encode_value(value) for key, value in props.items()}))
+        temporal = {item['k']: {'t': item['t'], 'v': item['v']} for item in edge.get('temporal', [])}
+        captured.append(dict(edge, properties={key: temporal[key] if key in temporal else encode_value(value)
+                                               for key, value in props.items()}))
     return {'rows': changes, 'edges': captured, 'counts': counts}
 
 
@@ -183,6 +200,10 @@ def read_before(path):
         return json.loads(lines[0])
     except FileNotFoundError:
         raise Refusal('missing before-file: no store was touched; provide the complete before-file') from None
+    except IsADirectoryError:
+        raise Refusal('cannot read before-file: no store was touched; not a readable file') from None
+    except OSError:
+        raise Refusal('cannot read before-file: no store was touched; check file permissions') from None
     except (ValueError, KeyError, TypeError):
         raise Refusal('incomplete before-file: no store was touched; remove it and rerun --apply') from None
 
@@ -288,17 +309,29 @@ def apply_postgres(conn, rows):
 
 
 def graph_statements(edge):
-    """Lock identity first; read properties again in a separate statement after locking."""
+    """Lock and recheck server temporal text; legacy tags keep strict Bolt equality.
+
+    Old before-files remain readable, but ambiguous legacy UTC tags can still
+    skip as drift. Never weaken equality to guess the original zone identity.
+    """
     ends = []
     for name, key in (('s', 'source'), ('t', 'target')):
         ends.append(f'{name}.pg_id IS NULL' if edge[key] is None else f'{name}.pg_id = ${key}')
     identity = ' AND '.join(ends) + ' AND type(r) = $type'
     identity += ' AND size(labels(s)) = size($source_labels) AND all(l IN labels(s) WHERE l IN $source_labels)'
     identity += ' AND size(labels(t)) = size($target_labels) AND all(l IN labels(t) WHERE l IN $target_labels)'
+    temporal = any(value['t'].split(' NOT NULL')[0] in TEMPORAL_CONSTRUCTORS
+                   for value in edge.get('properties', {}).values())
+    exact = ('all(k IN keys($properties) WHERE r[k] = $properties[k])'
+             ' AND all(p IN $temporal WHERE toString(r[p.k]) = p.v AND valueType(r[p.k]) = p.t)'
+             ' AND size(keys(r)) = size(keys($properties)) + size($temporal)') if temporal else 'properties(r) = $properties'
     lock = ('MATCH (s)-[r]->(t) WHERE elementId(r) = $eid AND ' + identity
-            + ' AND properties(r) = $properties SET r.backfill_op = $op RETURN count(r) AS n')
+            + ' AND ' + exact + ' SET r.backfill_op = $op RETURN count(r) AS n')
     fresh = (identity + ' AND all(k IN keys($fresh_properties) WHERE r[k] = $fresh_properties[k])'
              + " AND size([k IN keys(r) WHERE k <> 'backfill_op']) = size(keys($fresh_properties))")
+    if temporal:
+        fresh = fresh.replace('size(keys($fresh_properties))', 'size(keys($fresh_properties)) + size($fresh_temporal)')
+        fresh += ' AND all(p IN $fresh_temporal WHERE toString(r[p.k]) = p.v AND valueType(r[p.k]) = p.t)'
     if edge['type'] == 'INFORMED_BY':
         fresh += ' AND r.asserted_by IS NULL'
     recheck = ('MATCH (s)-[r]->(t) WHERE elementId(r) = $eid WITH s, r, t, coalesce((' + fresh + '), false) AS matches '
@@ -311,9 +344,13 @@ def graph_statements(edge):
 def apply_graph(session, edges, op, committed=None):
     events = []
     for edge in edges:
-        props = {key: decode_value(value) for key, value in edge['properties'].items()}
+        temporal = [dict(k=key, **value) for key, value in edge['properties'].items()
+                    if value['t'].split(' NOT NULL')[0] in TEMPORAL_CONSTRUCTORS]
+        props = {key: decode_value(value) for key, value in edge['properties'].items()
+                 if value['t'].split(' NOT NULL')[0] not in TEMPORAL_CONSTRUCTORS}
         params = {key: value for key, value in edge.items() if key != 'properties'}
         params.update(properties=props, fresh_properties={k: v for k, v in props.items() if k != 'backfill_op'}, op=op)
+        params.update(temporal=temporal, fresh_temporal=[p for p in temporal if p['k'] != 'backfill_op'])
         lock, recheck = graph_statements(edge)
         with session.begin_transaction() as tx:
             matched = tx.run(lock, **params).single()['n']
@@ -434,7 +471,13 @@ def main(argv=None):
         return 2
     except Exception:
         # Driver exceptions can contain connection settings or private captured properties.
-        print('backfill failed; no error payload printed; resume with the complete before-file', file=sys.stderr)
+        if args.apply and not Path(args.before).exists():
+            recovery = 'no before-file was written; rerun --apply'
+        elif args.apply or args.resume:
+            recovery = 'resume with the complete before-file'
+        else:
+            recovery = 'plan wrote no before-file; rerun the plan'
+        print('backfill failed; no error payload printed; ' + recovery, file=sys.stderr)
         return 2
     finally:
         if conn is not None:
