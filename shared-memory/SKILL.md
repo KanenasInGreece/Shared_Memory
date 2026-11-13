@@ -180,11 +180,11 @@ Graph expansion on a judgement hit derives `belonging`: `{project, domains}` on 
 Worked contract. Anonymous `/health`, then `--version`:
 
 ```json
-{"status":"ok","version":"1.1.2","api_version":6}
+{"status":"ok","version":"1.1.3","api_version":6}
 ```
 
 ```json
-{"version": "1.1.2", "api_version": 6, "tool": "shared-memory-framework"}
+{"version": "1.1.3", "api_version": 6, "tool": "shared-memory-framework"}
 ```
 
 `doctor` compares this client's `api_version` with the gateway and names which side to upgrade.
