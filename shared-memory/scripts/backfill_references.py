@@ -1,5 +1,14 @@
 #!/usr/bin/env python3
-"""Plan or ledger a canonical Postgres citation backfill and legacy graph removal."""
+"""Plan or ledger a canonical Postgres citation backfill and legacy graph removal.
+
+Usage:
+  uv run --no-project --with psycopg2-binary --with neo4j python shared-memory/scripts/backfill_references.py
+  uv run --no-project --with psycopg2-binary --with neo4j python shared-memory/scripts/backfill_references.py --apply --before PATH
+  uv run --no-project --with psycopg2-binary --with neo4j python shared-memory/scripts/backfill_references.py --resume PATH
+
+PATH is sensitive (mode 0600, private citations and edge cues); keep it on the host
+and never share or commit it.
+"""
 import argparse
 import base64
 import hashlib
@@ -38,8 +47,8 @@ properties(r) AS properties,
  {k:k, t:valueType(r[k]), v:toString(r[k])}] AS temporal"""
 
 
-TEMPORAL_CONSTRUCTORS = {'ZONED DATETIME', 'LOCAL DATETIME', 'DATE', 'ZONED TIME',
-                         'LOCAL TIME', 'DURATION'}
+TEMPORAL_TYPES = {'ZONED DATETIME', 'LOCAL DATETIME', 'DATE', 'ZONED TIME',
+                  'LOCAL TIME', 'DURATION'}
 
 
 def encode_value(value):
@@ -310,17 +319,14 @@ def apply_postgres(conn, rows):
 
 def graph_statements(edge):
     """Lock and recheck server temporal text; legacy tags keep strict Bolt equality.
-
-    Old before-files remain readable, but ambiguous legacy UTC tags can still
-    skip as drift. Never weaken equality to guess the original zone identity.
-    """
+    Never weaken equality to guess the original zone identity."""
     ends = []
     for name, key in (('s', 'source'), ('t', 'target')):
         ends.append(f'{name}.pg_id IS NULL' if edge[key] is None else f'{name}.pg_id = ${key}')
     identity = ' AND '.join(ends) + ' AND type(r) = $type'
     identity += ' AND size(labels(s)) = size($source_labels) AND all(l IN labels(s) WHERE l IN $source_labels)'
     identity += ' AND size(labels(t)) = size($target_labels) AND all(l IN labels(t) WHERE l IN $target_labels)'
-    temporal = any(value['t'].split(' NOT NULL')[0] in TEMPORAL_CONSTRUCTORS
+    temporal = any(value['t'].split(' NOT NULL')[0] in TEMPORAL_TYPES
                    for value in edge.get('properties', {}).values())
     exact = ('all(k IN keys($properties) WHERE r[k] = $properties[k])'
              ' AND all(p IN $temporal WHERE toString(r[p.k]) = p.v AND valueType(r[p.k]) = p.t)'
@@ -345,9 +351,9 @@ def apply_graph(session, edges, op, committed=None):
     events = []
     for edge in edges:
         temporal = [dict(k=key, **value) for key, value in edge['properties'].items()
-                    if value['t'].split(' NOT NULL')[0] in TEMPORAL_CONSTRUCTORS]
+                    if value['t'].split(' NOT NULL')[0] in TEMPORAL_TYPES]
         props = {key: decode_value(value) for key, value in edge['properties'].items()
-                 if value['t'].split(' NOT NULL')[0] not in TEMPORAL_CONSTRUCTORS}
+                 if value['t'].split(' NOT NULL')[0] not in TEMPORAL_TYPES}
         params = {key: value for key, value in edge.items() if key != 'properties'}
         params.update(properties=props, fresh_properties={k: v for k, v in props.items() if k != 'backfill_op'}, op=op)
         params.update(temporal=temporal, fresh_temporal=[p for p in temporal if p['k'] != 'backfill_op'])
@@ -422,7 +428,7 @@ def refuse_existing_log(before):
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument('--apply', action='store_true')
     mode.add_argument('--resume', type=Path)

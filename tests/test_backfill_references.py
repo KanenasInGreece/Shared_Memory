@@ -603,7 +603,7 @@ def test_pytz_is_lazy_and_temporal_types_are_a_set():
     import ast
     source = ast.parse(Path(b.__file__).read_text())
     assert not any(isinstance(n, ast.Import) and any(a.name == 'pytz' for a in n.names) for n in source.body)
-    assert b.TEMPORAL_CONSTRUCTORS == {'ZONED DATETIME', 'LOCAL DATETIME', 'DATE', 'ZONED TIME', 'LOCAL TIME', 'DURATION'}
+    assert b.TEMPORAL_TYPES == {'ZONED DATETIME', 'LOCAL DATETIME', 'DATE', 'ZONED TIME', 'LOCAL TIME', 'DURATION'}
 
 
 def test_apply_error_after_before_file_suggests_resume(cli_stores, monkeypatch, tmp_path, capsys):

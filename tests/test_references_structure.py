@@ -132,14 +132,11 @@ def test_shipped_references_occurrences():
       'start_labels, start_name,        end_pg_id, end_labels, end_name,        aliases'),
      ('shared-memory/scripts/coordinator.py',
       'Expr',
-      "One Neo4j round-trip for every anchor. Rendering is the caller's hydration pass.\n"
-      '\n'
-      '        The per-anchor cap stays inside the correlated subquery. A query error\n'
-      '        returns an empty list per anchor: graph context enriches a search and\n'
-      '        must never fail one. REFERENCES stays excluded for installations awaiting\n'
-      '        the backfill (decision:3482: citations live only in Postgres). Legacy\n'
-      '        edges still appear in lineage and graph until that backfill runs.\n'
-      '        ')]
+      'One Neo4j round-trip for every anchor, rendered by the caller. The per-anchor\n'
+      '        cap stays inside the correlated subquery. A query error returns an empty list\n'
+      '        per anchor because graph context enriches search and must never fail one. Legacy\n'
+      '        REFERENCES edges are excluded until the backfill removes them (decision:3482:\n'
+      '        citations live only in Postgres), while lineage and graph still show them.')]
     assert references_occurrences(SCRIPTS.parents[1]) == sorted(allowed)
 
 
