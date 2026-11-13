@@ -63,7 +63,7 @@ SWEPT_SCRIPTS = [
     "normalize_projects.py",
     "reconcile_project_edges.py",
     "reconcile_project_identity.py",
-    "resolve_references.py",
+    "backfill_references.py",
     "sync_project_registry.py",
 ]
 

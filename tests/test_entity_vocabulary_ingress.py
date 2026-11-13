@@ -46,6 +46,8 @@ are monkeypatched directly) — see CLAUDE.md's "green suite is not an
 all-clear" rule. The raw SQL is verified against the live database
 separately; see EG_LEG1_HANDOFF.md's FIX ROUND section for the numbers.
 """
+from tests.save_mocks import save_fetchrow
+
 import json
 import os
 import sys
@@ -1038,7 +1040,7 @@ def _full_coord(vocabulary=None):
     c._entity_vocab_mint = AsyncMock(side_effect=lambda n, agent: n)
 
     conn = MagicMock()
-    conn.fetchrow = AsyncMock(return_value={"id": 99})
+    conn.fetchrow = save_fetchrow(return_value={"id": 99})
     conn.fetchval = AsyncMock(return_value=1)  # "registered"/"exists" for every other lookup
     conn.fetch = AsyncMock(return_value=[])
     conn.execute = AsyncMock(return_value="INSERT 0 1")

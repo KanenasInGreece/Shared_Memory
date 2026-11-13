@@ -5,6 +5,8 @@ normalised once. Each test names the failure it kills (G1..G14 of the brief).
 All SQL is stubbed here; what migration 044 changes is proven on a real
 Postgres by the coordinator, not by this file.
 """
+from tests.save_mocks import save_fetchrow
+
 import importlib.util
 import json
 import os
@@ -73,7 +75,7 @@ def _request(body: dict) -> MagicMock:
 def _coordinator():
     c = _STATE["coordinator"].MemoryCoordinator()
     conn = AsyncMock()
-    conn.fetchrow = AsyncMock(return_value={"id": 99})
+    conn.fetchrow = save_fetchrow(return_value={"id": 99})
     conn.execute = AsyncMock(return_value="DELETE 0")
     conn.fetch = AsyncMock(return_value=[])
     conn.transaction = MagicMock(return_value=_ctx(None))
@@ -467,7 +469,7 @@ async def test_t2d_the_dedicated_retrospective_endpoint_never_runs_the_project_c
     c, conn = _coordinator()
     _registry(c, registered=())
     c._project_ingress_error = AsyncMock(side_effect=AssertionError("project check called"))
-    conn.fetchrow = AsyncMock(side_effect=[
+    conn.fetchrow = save_fetchrow(side_effect=[
         {"id": 240, "type": "decision", "project": "unlisted_thing"},
         {"id": 911},
     ])

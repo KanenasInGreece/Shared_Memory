@@ -5,6 +5,8 @@ docstrings: restore the old behaviour and the named test dies.
 """
 from __future__ import annotations
 
+from tests.save_mocks import save_fetchrow
+
 import hashlib
 import json
 import os
@@ -73,7 +75,9 @@ def _save_coord(stored_metadata=None):
         return 1
 
     conn.fetchval = AsyncMock(side_effect=_fetchval)
-    conn.fetchrow = AsyncMock(return_value={"id": 99})
+    conn.fetchrow = save_fetchrow(
+        prior={"id": 99, "metadata": stored_metadata} if stored_metadata is not None else None,
+        return_value={"id": 99})
     conn.fetch = AsyncMock(return_value=[])
     conn.execute = AsyncMock(return_value="INSERT 0 1")
     conn.transaction = MagicMock(return_value=_AsyncCtx(None))
@@ -431,7 +435,7 @@ async def test_wait_failed_returns_false_without_spinning():
 async def test_handle_save_consistency_neo4j_maps_rem_reviewed_to_applied():
     """True from wait (rem_reviewed) still serialises as neo4j='applied', not failed."""
     c, conn = _save_coord(stored_metadata=None)
-    conn.fetchrow = AsyncMock(side_effect=lambda sql, *a: (
+    conn.fetchrow = save_fetchrow(side_effect=lambda sql, *a: (
         {"status": "rem_reviewed"} if "neo4j_outbox" in sql and "SELECT" in sql
         else {"id": 99}))
     with patch.object(c, "_embed", new=AsyncMock(return_value=[0.1] * 1024)):
@@ -449,7 +453,7 @@ async def test_handle_save_consistency_neo4j_maps_rem_reviewed_to_applied():
 async def test_handle_save_consistency_neo4j_maps_failed_to_failed():
     """A permanently failed dream-cycle row is neo4j='failed', not 'timeout'."""
     c, conn = _save_coord(stored_metadata=None)
-    conn.fetchrow = AsyncMock(side_effect=lambda sql, *a: (
+    conn.fetchrow = save_fetchrow(side_effect=lambda sql, *a: (
         {"status": "failed"} if "neo4j_outbox" in sql and "SELECT" in sql
         else {"id": 99}))
     with patch.object(c, "_embed", new=AsyncMock(return_value=[0.1] * 1024)):

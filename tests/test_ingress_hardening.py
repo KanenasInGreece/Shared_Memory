@@ -4,6 +4,8 @@ fact cannot carry a decision object.
 The dedicated POST /memory/retrospective handler is unchanged. A decision,
 including a differently cased type, still saves through handle_save.
 """
+from tests.save_mocks import save_fetchrow
+
 import importlib.util
 import json
 import sys
@@ -78,7 +80,7 @@ def _request(body: dict) -> MagicMock:
 def _coordinator():
     c = _STATE["coordinator"].MemoryCoordinator()
     conn = AsyncMock()
-    conn.fetchrow = AsyncMock(return_value={"id": 99})
+    conn.fetchrow = save_fetchrow(return_value={"id": 99})
     conn.fetchval = AsyncMock(return_value=1)
     conn.execute = AsyncMock(return_value="DELETE 0")
     conn.fetch = AsyncMock(return_value=[])
@@ -178,7 +180,7 @@ async def test_save_accepts_a_legitimate_decision(spelling):
 @pytest.mark.asyncio
 async def test_the_retrospective_endpoint_still_accepts_a_verdict():
     c, conn = _coordinator()
-    conn.fetchrow = AsyncMock(side_effect=[
+    conn.fetchrow = save_fetchrow(side_effect=[
         {"id": 240, "type": "decision", "project": "widget_works"},
         {"id": 911},
     ])

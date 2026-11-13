@@ -21,6 +21,8 @@ Coverage:
 All SQL/Cypher is stubbed here — see CLAUDE.md's "green suite is not an
 all-clear" rule; nothing new is exercised on the live database by this PR.
 """
+from tests.save_mocks import save_fetchrow
+
 import importlib.util
 import json
 import os
@@ -82,7 +84,7 @@ def _coordinator_with_mocks():
     c = MemoryCoordinator()
 
     mock_conn = AsyncMock()
-    mock_conn.fetchrow = AsyncMock(return_value={"id": 99})
+    mock_conn.fetchrow = save_fetchrow(return_value={"id": 99})
     mock_conn.execute = AsyncMock(return_value="DELETE 0")
     mock_conn.fetch = AsyncMock(return_value=[])
     mock_conn.transaction = MagicMock(return_value=_async_ctx(None))

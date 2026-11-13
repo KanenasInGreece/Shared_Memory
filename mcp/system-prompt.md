@@ -140,7 +140,9 @@ the index decays.
 
 *(Rule 2 above is why every id here is written as a `ref`: facts, decisions and retrospectives share
 one table, while community summaries and insights run a separate sequence, so the same integer names
-one of each. Every search result carries `record_type` alongside the qualified `ref`.)*
+one of each. Every search result carries `record_type` alongside the qualified `ref`. In record text,
+cite as `fact:N`, `decision:N` or `retrospective:N`; only those forms are recorded in
+`metadata.references`, which the gateway sets.)*
 
 ## Involve the operator before you save — this is what makes the memory high-signal
 

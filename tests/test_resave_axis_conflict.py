@@ -68,7 +68,9 @@ def _coord(stored_metadata=None):
         return 1                      # every registry lookup: "registered"
 
     conn.fetchval = AsyncMock(side_effect=_fetchval)
-    conn.fetchrow = AsyncMock(return_value={"id": 99})
+    conn.fetchrow = AsyncMock(side_effect=lambda sql, *args:
+        ({"id": 99, "metadata": stored_metadata} if stored_metadata is not None else None)
+        if "content_hash = $1 FOR UPDATE" in sql else {"id": 99})
     conn.fetch = AsyncMock(return_value=[])
     conn.execute = AsyncMock(return_value="INSERT 0 1")
     conn.transaction = MagicMock(return_value=_AsyncCtx(None))
@@ -244,7 +246,8 @@ async def test_a_row_that_appears_between_the_precheck_and_the_insert_is_refused
     every other refusal test in this file keeps passing on the pre-check
     alone, which is exactly why this case has to exist separately."""
     c, conn = _coord(stored_metadata=None)
-    answers = iter([None, {"project": "alpha", "entities": []}])
+    answers = iter([None])
+    conn.fetchrow = AsyncMock(return_value={"id": 99, "metadata": {"project": "alpha", "entities": []}})
 
     async def _fetchval(sql, *args):
         if "content_hash" in sql:
@@ -258,7 +261,7 @@ async def test_a_row_that_appears_between_the_precheck_and_the_insert_is_refused
     # It got as far as the embedding — the pre-check genuinely saw nothing.
     embed.assert_awaited_once()
     # …and nothing was written.
-    conn.fetchrow.assert_not_awaited()
+    assert all("INSERT INTO technical_docs" not in call.args[0] for call in conn.fetchrow.call_args_list)
 
 
 # ── R-3 — a record whose entities are ALL shape-noise stays re-savable ────────

@@ -32,6 +32,8 @@ enforced by a fixture list the migration re-asserts at apply time rather than by
 anything in this file.
 """
 
+from tests.save_mocks import save_fetchrow
+
 import importlib.util
 import json
 import os
@@ -657,7 +659,7 @@ def _full_coord(registered=(), aliases=None):
     c._entity_vocab_resolve_many = AsyncMock(return_value={})
 
     conn = MagicMock()
-    conn.fetchrow = AsyncMock(return_value={"id": 99})
+    conn.fetchrow = save_fetchrow(return_value={"id": 99})
     conn.fetchval = AsyncMock(return_value=1)
     conn.fetch = AsyncMock(return_value=[])
     conn.execute = AsyncMock(return_value="INSERT 0 1")

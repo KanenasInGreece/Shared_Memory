@@ -11,13 +11,15 @@ with what compliance reports.
 Three categories (all shown in dry-run; --apply executes):
   A. Junk nodes      — every label is foreign  → DETACH DELETE (removes the node
                        and all its edges; this clears most foreign rels, whose
-                       endpoints are these nodes).
+                       endpoints are these nodes). A node incident to a
+                       REFERENCES edge is kept.
   B. Spurious labels — node has a valid label AND a foreign one (e.g.
                        :Entity:Object) → REMOVE the foreign label, keep the node.
   C. Foreign rels    — type is foreign and BOTH endpoints survive A → DELETE the
-                       relationship. Use --preserve-rel TYPE (repeatable) to keep
-                       a type pending a decision (e.g. a legacy-but-meaningful
-                       relationship between legitimate nodes).
+                       relationship (REFERENCES is always preserved). Use
+                       --preserve-rel TYPE (repeatable) to keep a type pending
+                       a decision (e.g. a legacy-but-meaningful relationship
+                       between legitimate nodes).
 
 Dry-run is the DEFAULT. Nothing changes unless you pass --apply.
 
@@ -41,6 +43,8 @@ import secure_env  # noqa: E402
 NEO4J_URI = "bolt://localhost:7687"
 NEO4J_USER = "neo4j"
 _VALID_IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+# Never deleted here: removing them is backfill_references.py's job, which records them first.
+PRESERVED_ALWAYS = ("REFERENCES",)
 
 
 def _load_env() -> None:
@@ -53,12 +57,21 @@ def _load_env() -> None:
 
 def survey(session, preserve_rels: set[str]) -> dict:
     known_labels = list(KNOWN_LABELS)
-    known_rels = list(KNOWN_RELATIONSHIPS)
+    known_rels = [r for r in KNOWN_RELATIONSHIPS if r not in PRESERVED_ALWAYS]
+    rel_pattern = "|".join(PRESERVED_ALWAYS)
     # A: nodes whose every label is foreign
     junk = session.run(
-        "MATCH (n) WHERE size(labels(n)) > 0 "
-        "  AND none(l IN labels(n) WHERE l IN $kl) "
-        "RETURN labels(n) AS labels, coalesce(n.name, '<' + toString(n.pg_id) + '>') AS name",
+        f"MATCH (n) WHERE size(labels(n)) > 0 "
+        f"  AND none(l IN labels(n) WHERE l IN $kl) "
+        f"  AND NOT (n)-[:{rel_pattern}]-() "
+        f"RETURN labels(n) AS labels, coalesce(n.name, '<' + toString(n.pg_id) + '>') AS name",
+        kl=known_labels,
+    ).data()
+    skipped_nodes = session.run(
+        f"MATCH (n) WHERE size(labels(n)) > 0 "
+        f"  AND none(l IN labels(n) WHERE l IN $kl) "
+        f"  AND (n)-[:{rel_pattern}]-() "
+        f"RETURN labels(n) AS labels, coalesce(n.name, '<' + toString(n.pg_id) + '>') AS name",
         kl=known_labels,
     ).data()
     # B: mixed nodes (>=1 valid AND >=1 foreign label)
@@ -79,21 +92,25 @@ def survey(session, preserve_rels: set[str]) -> dict:
     foreign_labels_on_mixed = sorted({
         l for row in mixed for l in row["labels"] if l not in KNOWN_LABELS
     })
+    preserve_all = preserve_rels | set(PRESERVED_ALWAYS)
     return {
         "junk_nodes": junk,
+        "skipped_nodes": skipped_nodes,
         "mixed_nodes": mixed,
         "foreign_labels_on_mixed": foreign_labels_on_mixed,
-        "foreign_rels": [r for r in rels if r["rel"] not in preserve_rels],
-        "preserved_rels": [r for r in rels if r["rel"] in preserve_rels],
+        "foreign_rels": [r for r in rels if r["rel"] not in preserve_all],
+        "preserved_rels": [r for r in rels if r["rel"] in preserve_all],
     }
 
 
 def apply(session, foreign_labels_on_mixed: list[str], foreign_rel_types: list[str]) -> dict:
     known_labels = list(KNOWN_LABELS)
+    rel_pattern = "|".join(PRESERVED_ALWAYS)
     # A: delete all-foreign-label nodes
     a = session.run(
-        "MATCH (n) WHERE size(labels(n)) > 0 AND none(l IN labels(n) WHERE l IN $kl) "
-        "DETACH DELETE n RETURN count(*) AS n", kl=known_labels,
+        f"MATCH (n) WHERE size(labels(n)) > 0 AND none(l IN labels(n) WHERE l IN $kl) "
+        f"  AND NOT (n)-[:{rel_pattern}]-() "
+        f"DETACH DELETE n RETURN count(*) AS n", kl=known_labels,
     ).single()["n"]
     # B: strip each foreign label from mixed nodes (label can't be parametrised;
     #    validated as a Cypher identifier before interpolation)
@@ -108,10 +125,11 @@ def apply(session, foreign_labels_on_mixed: list[str], foreign_rel_types: list[s
         ).single()["n"]
     # C: delete remaining foreign rels (between surviving nodes)
     c = 0
-    if foreign_rel_types:
+    types = [t for t in foreign_rel_types if t not in PRESERVED_ALWAYS]
+    if types:
         c = session.run(
             "MATCH ()-[r]->() WHERE type(r) IN $types DELETE r RETURN count(*) AS n",
-            types=foreign_rel_types,
+            types=types,
         ).single()["n"]
     return {"nodes_deleted": a, "labels_stripped": b, "rels_deleted": c}
 
@@ -137,15 +155,30 @@ def main() -> int:
             print(f"A. Junk nodes (all labels foreign): {len(s['junk_nodes'])}")
             for n in s["junk_nodes"]:
                 print(f"     {n['name']!r:<26} labels={n['labels']}")
+            if s["skipped_nodes"]:
+                print(f"   SKIPPED (incident to {', '.join(PRESERVED_ALWAYS)}): {len(s['skipped_nodes'])}")
+                for n in s["skipped_nodes"]:
+                    print(f"     {n['name']!r:<26} labels={n['labels']}")
             print(f"\nB. Spurious foreign labels to strip from valid nodes: "
                   f"{s['foreign_labels_on_mixed']} on {len(s['mixed_nodes'])} node(s)")
             for n in s["mixed_nodes"][:20]:
                 print(f"     {n['name']!r:<26} labels={n['labels']}")
             print(f"\nC. Foreign rels between surviving nodes (to delete): "
                   f"{[(r['rel'], r['c']) for r in s['foreign_rels']]}")
-            if s["preserved_rels"]:
+            always_preserved = [r for r in s["preserved_rels"] if r["rel"] in PRESERVED_ALWAYS]
+            flag_preserved = [r for r in s["preserved_rels"] if r["rel"] not in PRESERVED_ALWAYS]
+            if always_preserved:
+                print(f"   PRESERVED (always): "
+                      f"{[(r['rel'], r['c']) for r in always_preserved]}")
+            if flag_preserved:
                 print(f"   PRESERVED (--preserve-rel): "
-                      f"{[(r['rel'], r['c']) for r in s['preserved_rels']]}")
+                      f"{[(r['rel'], r['c']) for r in flag_preserved]}")
+
+            if any(r["rel"] in PRESERVED_ALWAYS for r in s["preserved_rels"]) or s["skipped_nodes"]:
+                ref_names = ", ".join(PRESERVED_ALWAYS)
+                print(f"   {ref_names} edges and incident nodes are kept; "
+                      f"shared-memory/scripts/backfill_references.py is the way to remove them; "
+                      f"after that backfill, a rerun of this script cleans those nodes normally.")
 
             if not args.apply:
                 print("\nDRY-RUN: nothing changed. Re-run with --apply to execute A+B+C.")

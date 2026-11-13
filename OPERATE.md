@@ -262,6 +262,34 @@ Do not run `docker image prune -a` or `docker system prune -a`: they delete imag
 
 If a constitution snippet's version marker moved after sync, propose the new block. Do not overwrite it silently.
 
+#### Upgrading to 1.1.3: citation backfill
+
+Run once per install on the gateway host, from the repository root, after the gateway is running 1.1.3. The script reads `shared-memory/.env` (`PG_*` and `NEO4J_*`). Plan first (writes nothing) and show the counts to the operator:
+
+```bash
+uv run --no-project --with psycopg2-binary --with neo4j python shared-memory/scripts/backfill_references.py
+```
+
+On the operator's word, apply with a new before-file path outside the repository (the script writes `<path>` and `<path>.log` with mode `0600` before touching either store, and refuses an existing path):
+
+```bash
+uv run --no-project --with psycopg2-binary --with neo4j python shared-memory/scripts/backfill_references.py --apply --before "$HOME/backfill-references-before.json"
+```
+
+If `--apply` fails or is interrupted, resume as the same Postgres user:
+
+```bash
+uv run --no-project --with psycopg2-binary --with neo4j python shared-memory/scripts/backfill_references.py --resume "$HOME/backfill-references-before.json"
+```
+
+- Keep the before-file on the host (`0600`, never shared or committed): it holds private citation lists and removed edge properties (`cue` text) and is the only record of removed `REFERENCES` edges.
+- `--resume` finishes the recorded plan and skips any record or edge that drifted since planning; run a new `--apply` with a new `--before` path to pick up drifted items.
+- Do not swap databases between `--apply` and `--resume`: where the Postgres role cannot read the cluster identifier, store-binding checks cannot detect a replacement database at the same address, port, and OID.
+- Read the verification line: `complete` (exit `0`) means `(a1)`, `(b)`, and `(c)` are `0`; `completed with skips` (exit `1`) lists remaining owed items.
+- Report any non-zero `(d)`, `(e)`, or `(f)` (`UNRESOLVED`) to the operator unchanged.
+- Check `outbox.failed` in client `status` or `GET /memory/telemetry` after the graph phase; if non-zero, stop and report the failed rows to the operator so any declared `INFORMED_BY` can be re-driven (do not edit outbox rows).
+- `cleanup_foreign_schema.py --apply` always preserves `REFERENCES` edges and any foreign-only nodes carrying them so nothing deletes them before this backfill records them.
+
 ## Start, stop, backup
 
 Start brings the stores and the gateway up. It does not install or mint.

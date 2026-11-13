@@ -56,7 +56,6 @@ class OntologyConfig:
     supersedes: str = "SUPERSEDES"
     informed_by: str = "INFORMED_BY"
     had_outcome: str = "HAD_OUTCOME"
-    references: str = "REFERENCES"   # record→record cross-reference resolved from content (Stage 1.2b)
     grounded_in: str = "GROUNDED_IN"  # judgement → fact (decision:550)
     # Spine names kept for compliance; REM writes none of these edges (decision:1664).
     produces_insight: str = "PRODUCES_INSIGHT"
@@ -426,7 +425,7 @@ SPINE_RELATIONSHIPS: frozenset[str] = frozenset({
     ONT.entity_link, ONT.entity_link_alias, ONT.aliases, ONT.summarized_by,
     ONT.reasoning_next, ONT.was_attributed_to, ONT.was_assisted_by,
     ONT.was_generated_by, ONT.project_of, ONT.domain_of, ONT.acted_on_behalf_of,
-    ONT.supersedes, ONT.informed_by, ONT.had_outcome, ONT.references,
+    ONT.supersedes, ONT.informed_by, ONT.had_outcome,
     ONT.produces_insight, ONT.under_conditions, ONT.considered, ONT.rejected,
     ONT.grounded_in,
 })
