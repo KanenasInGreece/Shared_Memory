@@ -1320,15 +1320,15 @@ def test_the_dropped_row_counts_are_what_this_release_ships(at_the_drop_release)
     """The absence check below iterates `dropped_paths`, so a row whose stamp
     moved would leave that loop rather than fail it — silently proving nothing.
     The counts are what makes a changed stamp visible."""
-    # 94: the four llm_routing.routed_role_* health rows left this dict (removed outright, not a 0.9.90 dual-emit drop). priority, last_call, and max_output_tokens are telemetry-only.
-    assert len(tc.dropped_paths(tc.HEALTH)) == 94
+    # 93: the four llm_routing.routed_role_* health rows left this dict (removed outright, not a 0.9.90 dual-emit drop). priority, last_call, and max_output_tokens are telemetry-only. 1.1.4: config.llm_affinity.max_inflight left the dict outright (unread setting), so 94 becomes 93.
+    assert len(tc.dropped_paths(tc.HEALTH)) == 93
     assert len(tc.dropped_paths(tc.TELEMETRY)) == 0  # 16 rows wait for 0.9.91 (monitor gate, fact:1989)
 
 
 def test_the_dropped_row_counts_at_the_telemetry_drop_release(at_the_telemetry_drop_release):
     """One release later the telemetry-side copies go too — and the /health
     count is unchanged, because a stamp already reached stays reached."""
-    assert len(tc.dropped_paths(tc.HEALTH)) == 94
+    assert len(tc.dropped_paths(tc.HEALTH)) == 93
     assert len(tc.dropped_paths(tc.TELEMETRY)) == 16
 
 
