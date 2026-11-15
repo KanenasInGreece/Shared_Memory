@@ -84,7 +84,7 @@ __all__ = [
 ]
 
 #: Not a free-running today: this is the fifth version pin, so a missed bump is visible (decision:1832).
-VERSION = "1.1.3"
+VERSION = "1.1.4"
 
 
 def _version_tuple(v: str) -> tuple:
@@ -583,9 +583,6 @@ HEALTH: dict[str, dict] = {
     "config.llm_affinity.ttl_s": _k(
         "float|int", "llm", unit="_s",
         moved_to="telemetry:config.llm_affinity.ttl_s", removed_in=DUAL_EMIT_DROP_TARGET),
-    "config.llm_affinity.max_inflight": _k(
-        "int", "llm", moved_to="telemetry:config.llm_affinity.max_inflight",
-        removed_in=DUAL_EMIT_DROP_TARGET),
     "config.embed_max_chars": _k(
         "int", "encoders", unit="_chars",
         moved_to="telemetry:config.embed_max_chars", removed_in=DUAL_EMIT_DROP_TARGET),
@@ -1114,7 +1111,6 @@ TELEMETRY: dict[str, dict] = {
     "config.llm_pool_tuning.cooldown_s": _k("float|int", "llm", unit="_s", since=INTRODUCED_0_9_74),
     "config.llm_affinity.prefix_chars": _k("int", "llm", unit="_chars", since=INTRODUCED_0_9_74),
     "config.llm_affinity.ttl_s": _k("float|int", "llm", unit="_s", since=INTRODUCED_0_9_74),
-    "config.llm_affinity.max_inflight": _k("int", "llm", since=INTRODUCED_0_9_74),
     "config.embed_max_chars": _k("int", "encoders", unit="_chars", since=INTRODUCED_0_9_74),
     "config.embedder_key_configured": _k(
         "bool", "credentials", since=INTRODUCED_1_0_42,

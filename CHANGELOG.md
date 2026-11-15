@@ -7,6 +7,11 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.1.4] - 2026-11-15
+
+### Removed
+- The `LLM_AFFINITY_MAX_INFLIGHT` setting and its `config.llm_affinity.max_inflight` health key. Nothing read the setting for routing; it was copied to telemetry only. Removed from `hive_mind_proxy.py`, the telemetry contract, `Documentation/telemetry-contract.md` and `.env.example`. A deployment that still sets the variable has it ignored.
+
 ## [1.1.3] - 2026-11-13
 
 A saved record's citations now live in Postgres, not in the graph, so the graph holds only relations an operator declared or the framework derives. On every save the gateway stores the records the text cites as `metadata.references`, using one fixed rule: `fact:N`, `decision:N` or `retrospective:N`, checked against the whole corpus, without the record's own id. A client cannot set the list, a reader never sees a cited record it cannot read, and keyword search does not match it. The `REFERENCES` relationship leaves the ontology, and its writer and `resolve_references.py` are removed. Each install upgrades by running the new `backfill_references.py` once, as `OPERATE.md` describes. It first records every value it will change in an owner-only file it can resume from, then fills the list on existing records and removes legacy `REFERENCES` edges and undeclared decision-to-decision `INFORMED_BY` edges written from text. Until it runs, leftover `REFERENCES` edges count as non-compliant in telemetry's `compliance` section, search still skips them, and `cleanup_foreign_schema.py` keeps them. The removed `INFORMED_BY` edges can split insight groups at the next consolidation. The gateway, the ontology files, the citation resolver, the cleanup script, `.env.example`, the skill, the MCP system prompt, the schema and operator documents, the version pins, the telemetry contract and the tests change, `API_VERSION` stays 6, and security dependencies were reviewed.

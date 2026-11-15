@@ -3,7 +3,7 @@
 
 # The Telemetry Contract
 
-Contract version **1.1.3**. Every key the gateway emits on `GET /health` and `GET /memory/telemetry`, what it means, what it is measured in, when it arrived, and where it is going.
+Contract version **1.1.4**. Every key the gateway emits on `GET /health` and `GET /memory/telemetry`, what it means, what it is measured in, when it arrived, and where it is going.
 
 ## The roles
 
@@ -143,7 +143,6 @@ Each key below was moved to a new home and served from both places while consume
 | `GET /health` | `capacity.trigger` | `telemetry:capacity.trigger` |
 | `GET /health` | `config.allow_unauthenticated_provider_keys` | `telemetry:config.allow_unauthenticated_provider_keys` |
 | `GET /health` | `config.embed_max_chars` | `telemetry:config.embed_max_chars` |
-| `GET /health` | `config.llm_affinity.max_inflight` | `telemetry:config.llm_affinity.max_inflight` |
 | `GET /health` | `config.llm_affinity.prefix_chars` | `telemetry:config.llm_affinity.prefix_chars` |
 | `GET /health` | `config.llm_affinity.ttl_s` | `telemetry:config.llm_affinity.ttl_s` |
 | `GET /health` | `config.llm_backends[]` | `telemetry:config.llm_backends` |
@@ -544,7 +543,6 @@ The envelope is `{"status": "success", "telemetry": {…}}`; paths below are rel
 
 | key | type | unit | since | moved to | removed in | log twin | notes |
 |---|---|---|---|---|---|---|---|
-| `config.llm_affinity.max_inflight` | int | — | 0.9.74 | — | — | — | — |
 | `config.llm_affinity.prefix_chars` | int | _chars | 0.9.74 | — | — | — | — |
 | `config.llm_affinity.ttl_s` | float/int | _s | 0.9.74 | — | — | — | — |
 | `config.llm_backends[]` | list | — | 0.9.74 | — | — | — | — |

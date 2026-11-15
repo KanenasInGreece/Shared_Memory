@@ -409,8 +409,6 @@ _llm_reserved: set[str] = set()
 # Cache-affinity: sticky routing for a repeated prompt prefix (llama.cpp KV cache).
 AFFINITY_PREFIX_CHARS = int(os.environ.get("LLM_AFFINITY_PREFIX_CHARS", "6144"))
 AFFINITY_TTL          = float(os.environ.get("LLM_AFFINITY_TTL", "600"))
-AFFINITY_MAX_INFLIGHT = int(os.environ.get("LLM_AFFINITY_MAX_INFLIGHT", "4"))
-AFFINITY_PROTECT_HITS = 2
 _llm_affinity: dict[str, list] = {}   # key -> [backend, last_ts, hits]
 _llm_affinity_hits = 0
 _llm_affinity_misses = 0
@@ -3654,7 +3652,6 @@ def _config_snapshot(*, for_telemetry: bool = False) -> dict:
         "llm_affinity": {
             "prefix_chars": AFFINITY_PREFIX_CHARS,
             "ttl_s": AFFINITY_TTL,
-            "max_inflight": AFFINITY_MAX_INFLIGHT,
         },
         "embed_max_chars": dream_telemetry.EMBED_MAX_CHARS,
         # Whether a key is configured. The token is not a config value.
