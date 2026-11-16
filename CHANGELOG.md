@@ -7,6 +7,11 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.1.7] - 2026-11-16
+
+### Changed
+- Comments and docstrings in `shared-memory/scripts/dream_telemetry.py`: the module docstring now names everything the file does (call telemetry, per-call REM timing, grounding record, and the embed and rerank timeout ceilings callers apply), every record id carries a short statement of what it says, and the grounding docstring drops the history of the gate change. No code changed.
+
 ## [1.1.6] - 2026-11-16
 
 ### Changed
