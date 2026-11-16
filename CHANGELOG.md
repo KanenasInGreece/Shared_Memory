@@ -7,6 +7,11 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.1.5] - 2026-11-16
+
+### Changed
+- Docstrings in `shared-memory/scripts/telemetry_instruments.py`: the `Counter` docstring now says the credential counters gave it its count-and-timestamp pairing, and the private `_r` helper has a docstring. Only docstrings changed, so behaviour is unchanged.
+
 ## [1.1.4] - 2026-11-15
 
 ### Removed

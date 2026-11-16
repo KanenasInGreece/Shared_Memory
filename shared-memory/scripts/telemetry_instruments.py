@@ -126,10 +126,10 @@ class LatencyRing:
 class Counter:
     """A named set of monotonic counters with a paired last-event timestamp.
 
-    The pairing is the point (fact:1314's shape): a bare count resets with the
-    process, so a poll-delta INVERTS across a restart and reads as "never
-    happened" while the event was minutes ago. Stamped at the increment so the
-    pair can never disagree.
+    The pairing is the point (the shape fact:1314 gave the credential
+    counters): a bare count resets with the process, so a poll-delta INVERTS
+    across a restart and reads as "never happened" while the event was minutes
+    ago. Stamped at the increment so the pair can never disagree.
     """
 
     __slots__ = ("_counts", "_last_ts")
@@ -178,4 +178,5 @@ def safe(fn, *args, default=None, **kwargs):
 
 
 def _r(v: float | None) -> float | None:
+    """Round a millisecond value for the wire; None stays None (never measured)."""
     return round(v, 1) if v is not None else None
