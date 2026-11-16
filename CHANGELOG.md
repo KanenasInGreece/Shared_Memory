@@ -7,6 +7,11 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.1.6] - 2026-11-16
+
+### Changed
+- The `LLM_BACKENDS_JSON` comment in `shared-memory/.env.example` now states the order in which the gateway tries backends: only backends whose context room covers the prompt estimate qualify, they are tried by priority ascending, then `n_ctx` ascending, self-hosted first, in-flight count and cache affinity, a failed backend hands the walk to the next one, and every new query starts at the lowest tier. The example shows a self-hosted tier 1 and a hosted tier 2. Only comments changed, so behaviour is unchanged.
+
 ## [1.1.5] - 2026-11-16
 
 ### Changed
