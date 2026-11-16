@@ -84,7 +84,7 @@ __all__ = [
 ]
 
 #: Not a free-running today: this is the fifth version pin, so a missed bump is visible (decision:1832).
-VERSION = "1.1.6"
+VERSION = "1.1.7"
 
 
 def _version_tuple(v: str) -> tuple:

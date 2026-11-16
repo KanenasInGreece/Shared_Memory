@@ -1,9 +1,10 @@
-"""Dream-cycle LLM telemetry, plus the embed/rerank timeout ceilings and
-pair-prefix helpers this module also owns. Telemetry logs a structured line
-always (and JSONL to ``DREAM_METRICS_PATH`` when set) from llama.cpp's
-``timings`` and the gateway's backend header — observability only, nothing
-here aborts or reroutes. Embed and rerank ceilings scale with payload size.
-The chat call has no daemon timeout: ceiling_s stays null.
+"""Dream-cycle LLM telemetry: ``record_llm_call`` logs each call's timings (to
+``DREAM_METRICS_PATH`` when set), ``call_timing_summary`` builds the per-call REM
+timing kept on the fact row, and ``record_grounding`` records how well REM grounding
+resolved entity names; none of them aborts or reroutes a call. The module also holds
+the rerank pair-prefix helpers and ``embed_ceiling`` / ``rerank_ceiling``, request
+timeouts that callers apply, scaled with payload size. The chat call has no daemon
+timeout, so ``ceiling_s`` stays null.
 """
 from __future__ import annotations
 
@@ -36,18 +37,24 @@ def _model_name(resp: dict):
     model = resp.get("model")
     return model if isinstance(model, str) else None
 
+
 DREAM_METRICS_PATH = os.environ.get("DREAM_METRICS_PATH", "").strip() or None
 
-# Throughput falls as the input grows, so a constant timeout kills the large calls and looks fine on small ones. Anchor this floor on the slowest observation, not the mean.
+# Throughput falls as the input grows, so a constant timeout kills the large calls
+# and looks fine on small ones. Anchor this floor on the slowest observation, not
+# the mean.
 EMBED_MIN_TOK_S = float(os.environ.get("EMBED_MIN_TOK_S", "100"))
-# BGE-M3 refuses past its window instead of truncating, so the longest call is a known size. Tunable only because another embedder may differ.
+# BGE-M3 refuses past its window instead of truncating, so the longest call is a
+# known size. Tunable only because another embedder may differ.
 EMBED_MAX_CONTEXT_TOKENS = int(os.environ.get(
     "EMBED_MAX_CONTEXT_TOKENS", str(FRAMEWORK_DEFAULTS["EMBED_MAX_CONTEXT_TOKENS"]["default"])))
-# Below measured English prose so denser text truncates early and the timeout is over-estimated. Both mistakes stay on the safe side.
+# Below measured English prose so denser text truncates early and the timeout is
+# over-estimated. Both mistakes stay on the safe side.
 EMBED_CHARS_PER_TOKEN = float(os.environ.get(
     "EMBED_CHARS_PER_TOKEN", str(FRAMEWORK_DEFAULTS["EMBED_CHARS_PER_TOKEN"]["default"])))
 # Special-token reserve (BOS/EOS/CLS/SEP) so raw text sent to the tokenizer
-# never pushes the final sequence over the model window. Valid range: [0, EMBED_MAX_CONTEXT_TOKENS).
+# never pushes the final sequence over the model window. Valid range:
+# [0, EMBED_MAX_CONTEXT_TOKENS).
 def _parse_special_token_reserve(max_ctx: int) -> int:
     raw = os.environ.get(
         "EMBED_SPECIAL_TOKEN_RESERVE",
@@ -92,9 +99,13 @@ def embed_ceiling(input_chars: int) -> float:
                est_tokens / EMBED_MIN_TOK_S * EMBED_SAFETY_FACTOR)
 
 
-# Cost tracks total text, not document count. A fixed 5s timeout hid a 64s rerank behind a plausible unranked score. Throughput drops as the payload grows, so this floor is the slowest observation, not the mean.
+# Cost tracks total text, not document count. A fixed 5s timeout hid a 64s rerank
+# behind a plausible unranked score. Throughput drops as the payload grows, so this
+# floor is the slowest observation, not the mean.
 RERANK_MIN_CHARS_S = float(os.environ.get("RERANK_MIN_CHARS_S", "800"))
-# Defaults to the embedding window. Ranking a narrower slice demotes a record for lacking the text it was selected for. Lowering it is the latency lever; that is a deliberate loss of ranking, not a free speedup.
+# Defaults to the embedding window. Ranking a narrower slice demotes a record for
+# lacking the text it was selected for. Lowering it is the latency lever; that is a
+# deliberate loss of ranking, not a free speedup.
 RERANK_MAX_DOC_CHARS = int(os.environ.get(
     "RERANK_MAX_DOC_CHARS", str(EMBED_MAX_CHARS)))
 # Same role as EMBED_SAFETY_FACTOR — headroom over the derived time, because
@@ -151,22 +162,18 @@ def rerank_ceiling(docs) -> float:
 def record_grounding(grounding_n: int, referenced: int, matched: int,
                      minted: int, *, pg_id: int | None = None,
                      shown: int | None = None, mode: str | None = None) -> dict:
-    """Record REM grounding effectiveness per record (Task 15, measure-first).
+    """Record REM grounding effectiveness for one record.
 
     `grounding_n` is the ACCEPT set (every name the link gate will resolve),
-    `shown` the SHOW set (candidates this record's prompt actually listed), and
-    `mode` how the show set was chosen — "knn" (semantic recall) or "fallback"
-    (alphabetical slice; the embedder or the entity store was unavailable).
+    `shown` the SHOW set (candidates the record's prompt listed), and `mode` how
+    the show set was chosen: "knn" (semantic recall) or "fallback" (alphabetical
+    slice, used when the embedder or the entity store was unavailable).
 
-    `minted` is retained as the on-disk key but its meaning changed with the
-    link-only gate: a referenced name absent from the accept set is now DROPPED,
-    not created. It is therefore emitted as `unresolved` / `unresolved_rate` too,
-    and read as LOST LINKS — a fact whose mention of a real entity never became
-    an edge, so that entity's cluster stopped growing toward the fold threshold.
-    Lower is better, and it is the metric a grounding change is judged on.
-
-    `mode` is what keeps that judgement honest: a spike in unresolved_rate under
-    "fallback" is an embedder outage, not a regression in recall. Never raises.
+    A referenced name outside the accept set is dropped, not created. So `minted`
+    (kept as the on-disk key) is also written as `unresolved` / `unresolved_rate`,
+    read as LOST LINKS (lower is better), and it is the metric a grounding change
+    is judged on. A spike under "fallback" points at an embedder or entity-store
+    outage, not a recall regression. Never raises for integer counts.
     """
     rate = round(minted / referenced, 3) if referenced else None
     rec = {
@@ -196,28 +203,38 @@ def call_timing_summary(
     batch_size: int | None = None,
     prompt_chars: int | None = None,
 ) -> dict:
-    """Compact per-call REM timing for DURABLE persistence on the fact row (decisions
-    570/571) — distinct from record_llm_call, which streams to the JSONL metrics file.
+    """Compact per-call REM timing, kept on the fact row. `decision:570`: REM is
+    stamped as three intervals (poll wait, contention wait, service). `decision:571`:
+    capture the model tag, batch_size and prompt size so model and hardware series
+    stay comparable. Distinct from record_llm_call, which streams to the JSONL file.
 
-    Splits the one client-observed number into its honest parts:
-      service_ms    = llama.cpp prompt_ms + predicted_ms — pure inference = MODEL + HARDWARE,
-                      load-invariant (the anchor metric, decision 568).
-      wall_ms       = wall_s * 1000 — what the caller experienced (service + contention + net).
-      contention_ms = max(0, wall_ms - service_ms) — time queued behind a busy backend = the
-                      CAPACITY signal that falls toward 0 as the pool absorbs load. This is the
-                      one-backend example resolved: the second REM's busy-wait lands HERE, never
-                      folded into service_ms (fact 569).
-    model tags the model-evolution axis; batch_size/prompt_chars carry the workload context that
-    makes cross-model service_ms comparable. All best-effort — any missing input yields None, and
-    the caller persists whatever is present. Never raises.
+    Splits the one client-observed number into its parts:
+      service_ms    = llama.cpp prompt_ms + predicted_ms, pure inference (model plus
+                      hardware), load-invariant. It is the model-and-hardware part
+                      of the anchor metric `decision:568`: REM latency, created_at
+                      to rem_reviewed_at.
+      wall_ms       = wall_s * 1000, what the caller experienced (service +
+                      contention + network).
+      contention_ms = max(0, wall_ms - service_ms), time queued behind a busy
+                      backend. It is the capacity signal and falls toward 0 as the
+                      pool absorbs load. A second REM's busy-wait lands here, never
+                      in service_ms (`fact:569`: REM time is measured as three
+                      separate intervals, not one "time to REM").
+    `model` tags the model-evolution axis; batch_size and prompt_chars carry the
+    workload context that makes service_ms comparable across models. All
+    best-effort: any missing input yields None, and the caller persists whatever is
+    present. `poll_ms` is None here; the caller fills it. Never raises.
 
-    completion_tokens/tok_s_wall (fact:1621) are the OpenAI-compatible fallback for backends that
-    return no ``timings`` block at all (external, non-llama.cpp providers): tok_s_wall is an
-    EFFECTIVE rate — completion_tokens / wall_s — so it includes TTFT and network time, unlike
-    service_ms's pure-inference rate. It is present precisely where the server gives no timings.
-    completion_tokens accepts int or float usage.completion_tokens (some providers send a float);
-    bool is explicitly rejected (bool is a subclass of int in Python — True/False are not token
-    counts); NaN/±inf are also rejected (math.isfinite) rather than raising out of int()."""
+    completion_tokens and tok_s_wall are filled whenever usage carries
+    completion_tokens. They are the OpenAI-compatible fallback for backends that
+    return no ``timings`` block (`fact:1621`: external OpenAI-compatible backends
+    send no `timings`, so completion_tokens and tok_s_wall fill in).
+    tok_s_wall is an EFFECTIVE rate, completion_tokens / wall_s, so it includes
+    time-to-first-token and network time, unlike service_ms's pure-inference rate.
+    completion_tokens accepts an int or float usage.completion_tokens (some
+    providers send a float). A bool is rejected (bool is a subclass of int in
+    Python, and True/False are not token counts), as are NaN and infinity
+    (math.isfinite), rather than raising out of int()."""
     resp = resp_json if isinstance(resp_json, dict) else {}
     t = resp.get("timings")
     t = t if isinstance(t, dict) else {}
@@ -245,7 +262,8 @@ def call_timing_summary(
     usage = resp.get("usage")
     usage = usage if isinstance(usage, dict) else {}
     ct_n = _finite_number(usage.get("completion_tokens"))
-    # Overflow and NaN are absent, so a good batch is not discarded and JSON stays strict.
+    # Overflow and NaN are absent, so a good batch is not discarded and JSON stays
+    # strict.
     try:
         completion_tokens = int(ct_n) if ct_n is not None else None
     except (OverflowError, ValueError):
@@ -287,13 +305,13 @@ def record_llm_call(
     """Record one dream-cycle LLM call. Never raises (telemetry must not break a
     daemon cycle). Returns the record dict for callers that want to inspect it.
 
-    `specimen` is an additive, optional pass-through (L0-a) — a bounded tail
-    of a truncated completion body, already size-capped by the caller
-    (REM_TRUNCATION_SPECIMEN_CHARS). It is written verbatim into the JSONL
-    row when present and omitted (None) otherwise; this function does not
-    bound or validate it. `note`/`ok` keep their existing meanings — a
-    truncation classification (L0-b) is carried in `note`, it never flips `ok`
-    (N4: additive keys only, no existing key changes meaning).
+    `specimen` is an additive, optional pass-through: a bounded tail of a truncated
+    completion body, already size-capped by the caller
+    (REM_TRUNCATION_SPECIMEN_CHARS). It is written verbatim into the JSONL row when
+    present and is None otherwise; this function does not bound or validate it.
+    `ok` and `note` are written as the caller passes them. REM carries a truncation
+    classification in `note` and leaves `ok` True; NREM sets `ok` False on
+    truncation. Add keys only; never change an existing key's meaning.
 
     `prompt_chars` is the caller's own char-count of the prompt it built, additive
     and optional — it pairs with `prompt_n` so chars/token can be re-measured from
