@@ -360,10 +360,10 @@ full-payload requests up to `EMBED_MAX_CHARS`.
 
 **Check.** Read the top-level `encoder_window` block from the authenticated `/health` payload
 (conduct constraints: reads authenticated `/health` only; writes nothing).
-If `full_payload_ok` is `null` (background one-shot probe still in flight after startup), wait
-and poll `/health` up to the derived timeout ceiling
-(`embed_ceiling(EMBED_MAX_CHARS) + rerank_ceiling([one max doc])` plus a small margin), never
-a flat 30s timeout. Reranker advertised/empirical still both `null` after that wait is skip-null
+If `full_payload_ok` is `null` (background one-shot probe still in flight after startup),
+it waits `A9_WAIT_S` seconds for the first capability reading while polling `/health`.
+The default is 60 seconds, the script's own unmeasured patience, set by the operator's
+environment. No encoder call is cut by this wait. Reranker advertised/empirical still both `null` after that wait is skip-null
 (warn, not a fail) when the embedder empirical is already `true`.
 
 **Pass criterion.**
@@ -375,7 +375,7 @@ a flat 30s timeout. Reranker advertised/empirical still both `null` after that w
 
 **Failure meaning.**
 - Embedder `full_payload_ok` is `false`, or `advertised_tokens < required_tokens` (`window_short`),
-  or the embedder probe timed out (`full_payload_ok` still `null` after waiting the derived ceiling).
+  or the embedder probe did not report (`full_payload_ok` still `null` after waiting `A9_WAIT_S` seconds).
   A reranker that never advertises after that wait is skip-null (warn), not this failure.
 - The failure message names `--max-model-len` (vLLM), `-c` (llama.cpp), `EMBED_MAX_CONTEXT_TOKENS`,
   and warns about any leftover `EMBED_MAX_CHARS` setting.

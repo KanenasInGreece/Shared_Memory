@@ -211,7 +211,7 @@ async def test_capability_probe_302_is_not_ok_and_does_not_parse_json(monkeypatc
     out = await g._probe_capability(session)
     for backend in ("reranker", "embedder"):
         assert out[backend]["status"] == "failing"
-        assert out[backend].get("serves_full_payload") is not True
+        assert "serves_full_payload" not in out[backend]
     assert out["status"] == "degraded"
     assert session.tracker["json_calls"] == 0, (
         "capability must not .json() a 3xx body"

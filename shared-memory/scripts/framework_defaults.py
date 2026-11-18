@@ -58,6 +58,27 @@ FRAMEWORK_DEFAULTS = MappingProxyType({
         "consumers": ("dream_telemetry.py (EMBED_CHARS_PER_TOKEN)",),
         "note": "Conservative characters-per-token ratio for text clamping.",
     }),
+    "ENCODER_TCP_KEEPALIVE_IDLE_S": MappingProxyType({
+        "default": 60,
+        "kind": "env-default",
+        "idiom": "get",
+        "consumers": ("coordinator.py (encoder_keepalive_options)",),
+        "note": "Dead-peer detection; invalid or nonpositive values use the default.",
+    }),
+    "ENCODER_TCP_KEEPALIVE_INTERVAL_S": MappingProxyType({
+        "default": 15,
+        "kind": "env-default",
+        "idiom": "get",
+        "consumers": ("coordinator.py (encoder_keepalive_options)",),
+        "note": "Dead-peer detection; invalid or nonpositive values use the default.",
+    }),
+    "ENCODER_TCP_KEEPALIVE_COUNT": MappingProxyType({
+        "default": 4,
+        "kind": "env-default",
+        "idiom": "get",
+        "consumers": ("coordinator.py (encoder_keepalive_options)",),
+        "note": "Dead-peer detection; invalid or nonpositive values use the default.",
+    }),
     "EMBED_SPECIAL_TOKEN_RESERVE": MappingProxyType({
         "default": 2,
         "kind": "env-default",

@@ -1,7 +1,6 @@
 """INVARIANT: the capability probe's sleep is a function of the LAST PROBE'S
 OUTCOME — a failing (or never-landed) backend is re-probed on the short
-retry interval; a serving backend (`ok`, and `too_slow` — which IS serving,
-only expensively) waits the full interval.
+retry interval; a serving backend (`ok`) waits the full interval.
 
 The defect (measured, fact:1609): after a reboot the first probe hit the
 encoders ~30 s before they finished loading and the daemon then slept the
@@ -50,14 +49,6 @@ def test_never_probed_retries_short(monkeypatch):
 def test_ok_waits_full_interval(monkeypatch):
     g = _g(monkeypatch)
     assert g._probe_sleep_s(_cap("ok", "ok")) == 600.0
-
-
-def test_too_slow_is_serving_and_waits_full_interval(monkeypatch):
-    """A fast re-probe of a too_slow backend adds load to the encoder that is
-    already struggling — the reason the interval is long in the first place."""
-    g = _g(monkeypatch)
-    assert g._probe_sleep_s(_cap("too_slow", "ok")) == 600.0
-    assert g._probe_sleep_s(_cap("too_slow", "too_slow")) == 600.0
 
 
 def test_env_overrides_are_honoured(monkeypatch):

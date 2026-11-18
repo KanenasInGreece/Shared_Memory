@@ -15,7 +15,7 @@ from framework_defaults import FRAMEWORK_DEFAULTS  # noqa: E402
 
 _CLEARED = (
     "EMBED_MAX_CONTEXT_TOKENS", "EMBED_CHARS_PER_TOKEN", "EMBED_SPECIAL_TOKEN_RESERVE",
-    "EMBED_MAX_CHARS", "EMBED_SAFETY_FACTOR",
+    "EMBED_MAX_CHARS", "RERANK_MAX_DOC_CHARS",
     "PROXY_BIND", "EMBEDDER_URL", "RERANKER_URL",
 )
 
@@ -109,10 +109,10 @@ def test_non_number_context_is_noted_on_its_row_only(env):
 
 
 def test_unlisted_bad_variable_gets_an_extra_line(env):
-    env.setenv("EMBED_SAFETY_FACTOR", "abc")
+    env.setenv("RERANK_MAX_DOC_CHARS", "abc")
     lines, ok = check_config.phase_a_render()
     assert ok
-    assert any(line.strip().startswith("EMBED_SAFETY_FACTOR:") and "would not start" in line
+    assert any(line.strip().startswith("RERANK_MAX_DOC_CHARS:") and "would not start" in line
                for line in lines)
     assert "derived" not in _row(lines, "EMBED_MAX_CHARS")
 
@@ -155,11 +155,11 @@ def test_phase_a_leaves_the_shared_module_untouched(env):
 
 def test_a_failing_private_import_leaves_the_shared_module_alone(env):
     import dream_telemetry
-    before = dream_telemetry.EMBED_SAFETY_FACTOR
-    env.setenv("EMBED_SAFETY_FACTOR", "abc")
+    before = dream_telemetry.RERANK_MAX_DOC_CHARS
+    env.setenv("RERANK_MAX_DOC_CHARS", "abc")
     check_config.phase_a_render()
     assert sys.modules.get("dream_telemetry") is dream_telemetry
-    assert dream_telemetry.EMBED_SAFETY_FACTOR == before
+    assert dream_telemetry.RERANK_MAX_DOC_CHARS == before
 
 
 # 7. A non-finite ratio passes float() but crashes the derived int(); it must be reported.
@@ -200,7 +200,7 @@ def test_a_nan_floor_does_not_hide_a_bad_context(env):
     assert not any(line.strip().startswith("LLM_CEILING_FLOOR:") for line in lines)
 
 
-def test_a_nan_min_tok_s_does_not_hide_a_bad_ratio(env):
+def test_retired_embed_knob_does_not_hide_a_bad_ratio(env):
     env.setenv("EMBED_MIN_TOK_S", "nan")
     env.setenv("EMBED_CHARS_PER_TOKEN", "nan")
     lines, _ok = check_config.phase_a_render()

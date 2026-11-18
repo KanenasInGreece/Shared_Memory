@@ -971,17 +971,9 @@ except Exception:
     if [[ "$embedder_down" == "1" ]]; then
         warn "A9 skipped — embedder backend is down (see A1)"
     else
-        ceiling_s="$(python3 -c '
-import sys, math
-sys.path.insert(0, "'"$SCRIPT_DIR"'")
-try:
-    import dream_telemetry as dt
-    e_ceil = dt.embed_ceiling(dt.EMBED_MAX_CHARS)
-    r_ceil = dt.rerank_ceiling(["x" * int(dt.RERANK_MAX_DOC_CHARS)])
-    print(int(math.ceil(e_ceil + r_ceil)) + 5)
-except Exception:
-    print(60)
-' 2>/dev/null || echo 60)"
+        # A9_WAIT_S bounds only this operator-run script's wait for the first capability reading.
+        # It is not an encoder timeout and cuts no encoder call; 60 is the pre-existing UNMEASURED fallback.
+        ceiling_s="${A9_WAIT_S:-60}"
 
         start_s=$SECONDS
         grade_res="$(printf '%s' "${health_full:-}" | a9_grade_window)"
@@ -1006,11 +998,11 @@ except Exception:
                 ok "A9 encoder window contract verified ($detail)"
                 ;;
             STILL_NULL_RERANK)
-                warn "A9 reranker probe in-flight timed out after ${ceiling_s}s (skip-null); search will fall back or truncate on large candidate sets"
+                warn "A9 reranker probe did not report within ${ceiling_s}s (skip-null); search will fall back or truncate on large candidate sets"
                 ok "A9 encoder window contract verified ($detail)"
                 ;;
             STILL_NULL|STILL_NULL_EMBED)
-                bad A9 "encoder window probe timed out after ${ceiling_s}s (still null). Verify upstream encoder is started with --max-model-len or -c matching EMBED_MAX_CONTEXT_TOKENS, and check for leftover EMBED_MAX_CHARS"
+                bad A9 "encoder window probe did not report within ${ceiling_s}s (still null). Verify upstream encoder is started with --max-model-len or -c matching EMBED_MAX_CONTEXT_TOKENS, and check for leftover EMBED_MAX_CHARS"
                 ;;
             FAIL_WINDOW_SHORT|FAIL_EMBED_OVERRUN)
                 bad A9 "$detail"

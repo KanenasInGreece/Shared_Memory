@@ -388,20 +388,19 @@ def test_a_short_response_is_an_error_not_a_silent_misalignment():
         asyncio.run(MemoryCoordinator._embed_many(None, ["a", "b"], Client()))
 
 
-def test_each_item_is_clamped_and_the_timeout_covers_the_whole_payload():
+def test_each_item_is_clamped_and_batch_post_has_no_timeout():
     captured = {}
 
     class Client:
-        async def post(self, url, json=None, timeout=None):
+        async def post(self, url, json=None, **kwargs):
             captured["lens"] = [len(t) for t in json["input"]]
-            captured["timeout"] = timeout
+            captured["kwargs"] = kwargs
             return _Resp({"data": [{"index": i, "embedding": [0.0]} for i in range(2)]})
 
     long = "x" * (coord.EMBED_MAX_CHARS + 500)
     asyncio.run(MemoryCoordinator._embed_many(None, [long, "short"], Client()))
     assert captured["lens"] == [coord.EMBED_MAX_CHARS, len("short")]
-    assert captured["timeout"] == coord.embed_ceiling(
-        coord.EMBED_MAX_CHARS + len("short"))
+    assert "timeout" not in captured["kwargs"]
 
 
 def test_an_empty_batch_never_reaches_the_network():

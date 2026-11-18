@@ -31,7 +31,7 @@ from nrem_gate import eligible_domain_level_clusters, project_domain_maps, groun
 from nrem_gate import count_domain_level_cycles  # noqa: F401 — re-exported from nrem_gate; importing this file pulls psycopg2, which telemetry does not ship
 from domain_axis import resolve_domains
 from pool_status import pool_roster_state
-from dream_telemetry import (record_llm_call, embed_ceiling,
+from dream_telemetry import (record_llm_call,
                              EMBED_MAX_CHARS, EMBED_MAX_CONTEXT_TOKENS)
 import llm_backlog
 from record_ref import doc_record_type, make_ref
@@ -2783,16 +2783,13 @@ class ConsolidationDaemon:
         )
         reserved_snap = reserved_clamp_chars()
         max_overflow_attempts = 8
-        ceiling = embed_ceiling(len(text))
         try:
-            async with httpx.AsyncClient(timeout=ceiling, trust_env=False) as client:
+            async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
                 for attempt in range(1, max_overflow_attempts + 1):
-                    ceiling = embed_ceiling(len(text))
                     resp = await client.post(
                         RETRIEVER_URL,
                         headers=_auth_headers(),
                         json={"input": text, "model": "bge-m3"},
-                        timeout=ceiling,
                     )
                     if resp.status_code in (400, 413):
                         from encoder_window import overflow_from_response_json
@@ -2861,8 +2858,8 @@ class ConsolidationDaemon:
                     return resp.json()["data"][0]["embedding"]
         except Exception as e:
             # An httpx timeout's str() is empty, so log the exception class or the line says nothing.
-            logger.error("Embedding error after %.0fs ceiling on %d chars: %s: %s",
-                         ceiling, len(text), type(e).__name__, e)
+            logger.error("Embedding error on %d chars: %s: %s",
+                         len(text), type(e).__name__, e)
             return None
         return None
 

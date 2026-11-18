@@ -55,13 +55,13 @@ def _ok_reading(probed_at="2026-08-25T10:00:00+00:00",
             "probe_chars": 4000, "latency_s": 4.0,
             "throughput_chars_s": rr_chars_s,
             "projected_full_payload_s": rr_projected,
-            "ceiling_s": 30.0, "serves_full_payload": True, "status": "ok",
+            "status": "ok",
         },
         "embedder": {
             "probe_chars": 1000, "latency_s": 0.5,
             "throughput_chars_s": emb_chars_s,
             "projected_full_payload_s": emb_projected,
-            "ceiling_s": 30.0, "serves_full_payload": True, "status": "ok",
+            "status": "ok",
         },
     }
 
@@ -116,11 +116,11 @@ def test_failing_after_ok_keeps_the_measured_projection(monkeypatch, tmp_path):
     # The measured set survives -- pinned to VALUES, not merely "present"
     # (fact:1309: an equality between two expressions is half a guard).
     assert rr["projected_full_payload_s"] == 10.0
-    assert rr["ceiling_s"] == 30.0
+    assert "ceiling_s" not in rr
     assert rr["throughput_chars_s"] == 1000
     assert rr["latency_s"] == 4.0
     # ...but the VERDICT does not travel with it (A-1 / ADV-1).
-    assert rr["serves_full_payload"] is None
+    assert "serves_full_payload" not in rr
     # ...and it is honestly labelled as ageing, with the age of the NUMBERS.
     assert rr["projection_stale"] is True
     assert rr["last_ok_at"] == "2026-08-25T10:00:00+00:00"
@@ -172,10 +172,7 @@ def test_never_measured_backend_stays_shapeless_and_invents_nothing(monkeypatch,
             assert "ceiling_s" not in block
             assert block["projection_stale"] is None
             assert "last_ok_at" not in block
-            # R2-N6: "we make no claim" has ONE shape -- explicit null --
-            # whether the block never measured or is carrying an ageing
-            # reading. Two shapes for one meaning is a reader's trap.
-            assert block["serves_full_payload"] is None
+            assert "serves_full_payload" not in block
 
 
 def test_last_ok_at_is_chained_not_reset_by_repeated_failures(monkeypatch, tmp_path):
@@ -195,22 +192,18 @@ def test_last_ok_at_is_chained_not_reset_by_repeated_failures(monkeypatch, tmp_p
     assert snapshot["probed_at"] == "2026-08-25T10:30:00+00:00"
 
 
-def test_a_too_slow_reading_is_a_measurement_and_survives(monkeypatch, tmp_path):
-    """`too_slow` means the probe SUCCEEDED and the answer was alarming --
-    exactly the value a client must not lose on the next failing cycle."""
+def test_a_slow_reading_is_a_measurement_and_survives(monkeypatch, tmp_path):
+    """A slow measured projection survives the next failing cycle."""
     g = _load_gateway(monkeypatch, tmp_path / "cap.jsonl")
 
     slow = _ok_reading(rr_projected=64.0)
-    slow["reranker"]["status"] = "too_slow"
-    slow["reranker"]["serves_full_payload"] = False
-    slow["status"] = "degraded"
 
     merged = g._merge_capability_projection(slow, _failing_reading())
 
     assert merged["reranker"]["projected_full_payload_s"] == 64.0
     assert merged["reranker"]["projection_stale"] is True
-    # The alarming NUMBER survives; the verdict beside it does not (A-1).
-    assert merged["reranker"]["serves_full_payload"] is None
+    assert merged["reranker"]["status"] == "failing"
+    assert "serves_full_payload" not in merged["reranker"]
 
 
 def test_merge_leaves_a_malformed_block_alone(monkeypatch, tmp_path):
@@ -386,11 +379,7 @@ def test_capacity_record_keys_are_additive_only(monkeypatch, tmp_path):
 # ── A-1 (ADV-1): a verdict is not a reading ────────────────────────────────
 
 def test_no_affirmative_verdict_survives_onto_a_failing_backend(monkeypatch, tmp_path):
-    """The carry must never publish an affirmative green beside a backend
-    that answered nothing. `serves_full_payload` is the one derived
-    JUDGEMENT in the measured set, and it is the one that inverts: `true`
-    next to `status: "failing"` is a false green for any renderer that does
-    not also happen to show the sibling stale flag."""
+    """A carried projection cannot claim the failing backend is healthy."""
     g = _load_gateway(monkeypatch, tmp_path / "cap.jsonl")
 
     merged = g._merge_capability_projection(_ok_reading(), _failing_reading())
@@ -398,26 +387,21 @@ def test_no_affirmative_verdict_survives_onto_a_failing_backend(monkeypatch, tmp
     for backend in ("reranker", "embedder"):
         block = merged[backend]
         assert block["status"] == "failing"
-        assert block["serves_full_payload"] is None
+        assert "serves_full_payload" not in block
         # Nothing else in the block asserts present-tense capability either.
         assert not any(v is True for k, v in block.items()
                        if k != "projection_stale"), block
     assert "serves_full_payload" not in g._PROJECTION_CARRY_KEYS
 
 
-def test_a_fresh_cycle_still_publishes_the_real_verdict(monkeypatch, tmp_path):
-    """A-1 nulls the verdict only while the reading is ageing -- a measured
-    cycle publishes the verdict it actually computed, both ways."""
+def test_a_fresh_cycle_publishes_projection_without_retired_verdict(monkeypatch, tmp_path):
     g = _load_gateway(monkeypatch, tmp_path / "cap.jsonl")
-
-    good = g._merge_capability_projection(None, _ok_reading())
-    assert good["reranker"]["serves_full_payload"] is True
-
-    slow = _ok_reading()
-    slow["reranker"]["serves_full_payload"] = False
-    slow["reranker"]["status"] = "too_slow"
-    assert g._merge_capability_projection(
-        None, slow)["reranker"]["serves_full_payload"] is False
+    fresh = g._merge_capability_projection(None, _ok_reading())
+    assert fresh["reranker"]["status"] == "ok"
+    assert fresh["reranker"]["projected_full_payload_s"] == 10.0
+    assert fresh["reranker"]["projection_stale"] is False
+    assert "serves_full_payload" not in fresh["reranker"]
+    assert "ceiling_s" not in fresh["reranker"]
 
 
 # ── A-2 (ADV-2): the age is published, and it is the age at READ time ──────

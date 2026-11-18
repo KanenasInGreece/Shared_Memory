@@ -2,9 +2,10 @@
 ``DREAM_METRICS_PATH`` when set), ``call_timing_summary`` builds the per-call REM
 timing kept on the fact row, and ``record_grounding`` records how well REM grounding
 resolved entity names; none of them aborts or reroutes a call. The module also holds
-the rerank pair-prefix helpers and ``embed_ceiling`` / ``rerank_ceiling``, request
-timeouts that callers apply, scaled with payload size. The chat call has no daemon
-timeout, so ``ceiling_s`` stays null.
+the rerank pair-prefix helpers and payload clamps. The embedding clamp keeps text
+inside the embedder's context window; the rerank clamps keep documents and pairs
+inside the reranker's context window. These clamps do not impose time limits.
+``ceiling_s`` belongs to LLM-call telemetry, not encoder calls.
 """
 from __future__ import annotations
 
@@ -40,16 +41,11 @@ def _model_name(resp: dict):
 
 DREAM_METRICS_PATH = os.environ.get("DREAM_METRICS_PATH", "").strip() or None
 
-# Throughput falls as the input grows, so a constant timeout kills the large calls
-# and looks fine on small ones. Anchor this floor on the slowest observation, not
-# the mean.
-EMBED_MIN_TOK_S = float(os.environ.get("EMBED_MIN_TOK_S", "100"))
 # BGE-M3 refuses past its window instead of truncating, so the longest call is a
 # known size. Tunable only because another embedder may differ.
 EMBED_MAX_CONTEXT_TOKENS = int(os.environ.get(
     "EMBED_MAX_CONTEXT_TOKENS", str(FRAMEWORK_DEFAULTS["EMBED_MAX_CONTEXT_TOKENS"]["default"])))
-# Below measured English prose so denser text truncates early and the timeout is
-# over-estimated. Both mistakes stay on the safe side.
+# Below measured English prose so denser text truncates early to fit the context window.
 EMBED_CHARS_PER_TOKEN = float(os.environ.get(
     "EMBED_CHARS_PER_TOKEN", str(FRAMEWORK_DEFAULTS["EMBED_CHARS_PER_TOKEN"]["default"])))
 # Special-token reserve (BOS/EOS/CLS/SEP) so raw text sent to the tokenizer
@@ -76,45 +72,11 @@ EMBED_SPECIAL_TOKEN_RESERVE = _parse_special_token_reserve(EMBED_MAX_CONTEXT_TOK
 # Default: (8192 - 2) * 3.0 = 24570 chars (leaving 2 tokens for specials).
 EMBED_MAX_CHARS = int(os.environ.get(
     "EMBED_MAX_CHARS", str(int((EMBED_MAX_CONTEXT_TOKENS - EMBED_SPECIAL_TOKEN_RESERVE) * EMBED_CHARS_PER_TOKEN))))
-# Margin over the derived time. Not the invariant — just headroom, because
-# measured throughput falls as the input grows, so a ceiling fitted exactly to
-# the floor has nothing left for the slowest run at the largest size.
-EMBED_SAFETY_FACTOR = float(os.environ.get("EMBED_SAFETY_FACTOR", "1.5"))
-# Floor for small inputs — connection setup, and queueing behind another
-# request, because the embedder serialises.
-EMBED_TIMEOUT_FLOOR_S = float(os.environ.get("EMBED_TIMEOUT_FLOOR_S", "20"))
-
-
-def embed_ceiling(input_chars: int) -> float:
-    """Per-request embedding timeout in seconds, derived from input SIZE.
-
-    Bounded by construction: callers clamp input to ``EMBED_MAX_CHARS``, so the
-    ceiling can never exceed the full-context time — at the shipped defaults
-    8192 / 100 * 1.5 = 123 s, against a measured true cost of ~59 s at that
-    size. Pure → unit-testable without an embedder."""
-    if EMBED_CHARS_PER_TOKEN <= 0 or EMBED_MIN_TOK_S <= 0:
-        return EMBED_TIMEOUT_FLOOR_S
-    est_tokens = min(max(0, int(input_chars)), EMBED_MAX_CHARS) / EMBED_CHARS_PER_TOKEN
-    return max(EMBED_TIMEOUT_FLOOR_S,
-               est_tokens / EMBED_MIN_TOK_S * EMBED_SAFETY_FACTOR)
-
-
-# Cost tracks total text, not document count. A fixed 5s timeout hid a 64s rerank
-# behind a plausible unranked score. Throughput drops as the payload grows, so this
-# floor is the slowest observation, not the mean.
-RERANK_MIN_CHARS_S = float(os.environ.get("RERANK_MIN_CHARS_S", "800"))
 # Defaults to the embedding window. Ranking a narrower slice demotes a record for
 # lacking the text it was selected for. Lowering it is the latency lever; that is a
 # deliberate loss of ranking, not a free speedup.
 RERANK_MAX_DOC_CHARS = int(os.environ.get(
     "RERANK_MAX_DOC_CHARS", str(EMBED_MAX_CHARS)))
-# Same role as EMBED_SAFETY_FACTOR — headroom over the derived time, because
-# throughput falls with size and a ceiling fitted exactly to the floor leaves
-# nothing for the slowest run at the largest payload.
-RERANK_SAFETY_FACTOR = float(os.environ.get("RERANK_SAFETY_FACTOR", "1.5"))
-# Floor for small payloads — connection setup, and queueing behind another
-# request, because the reranker serialises across its slots.
-RERANK_TIMEOUT_FLOOR_S = float(os.environ.get("RERANK_TIMEOUT_FLOOR_S", "10"))
 
 special_reserve_chars = int(EMBED_SPECIAL_TOKEN_RESERVE * EMBED_CHARS_PER_TOKEN)
 pair_budget = max(0, RERANK_MAX_DOC_CHARS - special_reserve_chars)
@@ -137,26 +99,9 @@ def prefix_rerank_doc(query, doc) -> str:
 
 
 def clamp_rerank_doc(text: str) -> str:
-    """The slice of one record the reranker SCORES. Bounding this is what makes
-    the ceiling below a known, fixed quantity rather than a guess — the same
-    relationship EMBED_MAX_CHARS has with embed_ceiling. Pure."""
+    """The slice of one record the reranker scores within its context window."""
     return (text or "")[:RERANK_MAX_DOC_CHARS]
 
-
-def rerank_ceiling(docs) -> float:
-    """Per-request rerank timeout in seconds, derived from the TOTAL size of the
-    payload against a throughput floor.
-
-    Bounded by construction: every document is clamped to RERANK_MAX_DOC_CHARS,
-    so the ceiling can never exceed the full-candidate-set time — at the shipped
-    defaults (24,570-char cap) 20 x 24570 / 800 * 1.5 ≈ 921 s; a realistic
-    20 x 2000-char payload measured ~30 s true cost on the reference CPU
-    deployment. Pure → unit-testable without a reranker."""
-    if RERANK_MIN_CHARS_S <= 0:
-        return RERANK_TIMEOUT_FLOOR_S
-    total = sum(len(clamp_rerank_doc(d)) for d in (docs or []))
-    return max(RERANK_TIMEOUT_FLOOR_S,
-               total / RERANK_MIN_CHARS_S * RERANK_SAFETY_FACTOR)
 
 
 def record_grounding(grounding_n: int, referenced: int, matched: int,

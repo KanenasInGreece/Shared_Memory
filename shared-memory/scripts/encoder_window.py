@@ -18,10 +18,8 @@ from dream_telemetry import (
     EMBED_MAX_CONTEXT_TOKENS,
     EMBED_SPECIAL_TOKEN_RESERVE,
     RERANK_MAX_DOC_CHARS,
-    embed_ceiling,
     prefix_rerank_doc,
     prefix_rerank_query,
-    rerank_ceiling,
 )
 
 log = logging.getLogger("EncoderWindow")
@@ -81,6 +79,7 @@ async def probe_encoder(
     base_url: str,
     route: str,
     model_id: str,
+    calls=None,
 ) -> dict:
     """Probe an encoder backend for advertised tokens and empirical full payload capability."""
     encoder_name = "embedder" if "embed" in route else "reranker"
@@ -168,12 +167,13 @@ async def probe_encoder(
         post_url = _upstream_url(base_url, "/v1/embeddings")
         text = "x" * EMBED_MAX_CHARS
         payload = {"input": text, "model": model_id}
-        ceiling = embed_ceiling(EMBED_MAX_CHARS)
+        token = calls.begin() if calls is not None else None
+        completed = False
         try:
-            timeout = ClientTimeout(total=ceiling)
-            async with session.post(post_url, json=payload, timeout=timeout, allow_redirects=False,
+            async with session.post(post_url, json=payload, allow_redirects=False,
                                     **_encoder_auth_kwargs(base_url, route)) as r:
                 await r.read()
+                completed = True
                 if encoder_key_refused("embedder", r.status):
                     # A refused key is not a window overrun.
                     full_ok = None
@@ -181,6 +181,9 @@ async def probe_encoder(
                     full_ok = (r.status == 200)
         except Exception:
             full_ok = False
+        finally:
+            if calls is not None:
+                calls.end(token, completed=completed)
     else:
         full_ok = None
         post_url = _upstream_url(base_url, "/v1/reranking")
@@ -188,12 +191,13 @@ async def probe_encoder(
         query = prefix_rerank_query(raw_query)
         doc = prefix_rerank_doc(query, "x" * RERANK_MAX_DOC_CHARS)
         payload = {"query": query, "documents": [doc], "model": model_id}
-        ceiling = rerank_ceiling([doc])
+        token = calls.begin() if calls is not None else None
+        completed = False
         try:
-            timeout = ClientTimeout(total=ceiling)
-            async with session.post(post_url, json=payload, timeout=timeout, allow_redirects=False,
+            async with session.post(post_url, json=payload, allow_redirects=False,
                                     **_encoder_auth_kwargs(base_url, route)) as r:
                 await r.read()
+                completed = True
                 if r.status == 200:
                     full_ok = True
                 elif r.status == 400:
@@ -202,6 +206,9 @@ async def probe_encoder(
                     full_ok = None
         except Exception:
             full_ok = None
+        finally:
+            if calls is not None:
+                calls.end(token, completed=completed)
 
 
     res = {
@@ -213,10 +220,12 @@ async def probe_encoder(
     return res
 
 
-async def probe_encoder_window(session: Any, embed_base: str, rerank_base: str) -> dict:
+async def probe_encoder_window(session: Any, embed_base: str, rerank_base: str, calls=None) -> dict:
     """Probe both encoders and return the updated snapshot."""
-    await probe_encoder(session, embed_base, "/v1/embeddings", "bge-m3")
-    await probe_encoder(session, rerank_base, "/v1/reranking", "bge-reranker-v2-m3")
+    await probe_encoder(session, embed_base, "/v1/embeddings", "bge-m3",
+                        calls=calls["embedder"] if calls is not None else None)
+    await probe_encoder(session, rerank_base, "/v1/reranking", "bge-reranker-v2-m3",
+                        calls=calls["reranker"] if calls is not None else None)
     return get_encoder_window_snapshot()
 
 _embed_window_overruns_total: int = 0

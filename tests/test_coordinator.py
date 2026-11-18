@@ -2358,17 +2358,13 @@ def test_embed_truncates_oversized_input():
         def raise_for_status(self): pass
         def json(self): return {"data": [{"embedding": [0.1, 0.2]}]}
     class FakeClient:
-        async def post(self, url, json=None, timeout=None):
-            captured["len"] = len(json["input"]); captured["timeout"] = timeout
+        async def post(self, url, json=None, **kwargs):
+            captured["len"] = len(json["input"]); captured["kwargs"] = kwargs
             return FakeResp()
     long = "x" * (coord.EMBED_MAX_CHARS + 5000)
     out = asyncio.run(coord.MemoryCoordinator._embed(None, long, FakeClient()))
     assert captured["len"] == coord.EMBED_MAX_CHARS and out == [0.1, 0.2]
-    # The timeout is sized on the CLAMPED length, and a maximally-sized input
-    # must get the full-context ceiling — the shared client default (30s) was
-    # not even enough for this function's own clamp.
-    assert captured["timeout"] == coord.embed_ceiling(coord.EMBED_MAX_CHARS)
-    assert captured["timeout"] > 30.0
+    assert "timeout" not in captured["kwargs"]
 
 
 def test_embed_passes_short_input_untruncated():
@@ -2379,12 +2375,12 @@ def test_embed_passes_short_input_untruncated():
         def raise_for_status(self): pass
         def json(self): return {"data": [{"embedding": [0.0]}]}
     class FakeClient:
-        async def post(self, url, json=None, timeout=None):
-            captured["len"] = len(json["input"]); captured["timeout"] = timeout
+        async def post(self, url, json=None, **kwargs):
+            captured["len"] = len(json["input"]); captured["kwargs"] = kwargs
             return FakeResp()
     asyncio.run(coord.MemoryCoordinator._embed(None, "short text", FakeClient()))
     assert captured["len"] == len("short text")
-    assert captured["timeout"] == coord.EMBED_TIMEOUT_FLOOR_S
+    assert "timeout" not in captured["kwargs"]
 
 
 def test_embed_mismatch_fails_with_named_error_in_one_post():

@@ -83,8 +83,6 @@ LIVE_CAPABILITY = {
         "latency_s": 1.03,
         "throughput_chars_s": 3870,
         "projected_full_payload_s": 127.0,
-        "ceiling_s": 921.6,
-        "serves_full_payload": True,
         "status": "ok",
     },
     "embedder": {
@@ -92,8 +90,6 @@ LIVE_CAPABILITY = {
         "latency_s": 0.26,
         "throughput_chars_s": 3906,
         "projected_full_payload_s": 6.3,
-        "ceiling_s": 122.9,
-        "serves_full_payload": True,
         "status": "ok",
     },
 }
@@ -375,7 +371,7 @@ def test_s7e_documented_ok_status_with_no_projection_lands_on_plain_floor(client
     absent/empty/non-dict block, or an explicit failing/stale signal, floors
     at the fallback."""
     capability = {
-        "reranker": {"status": "ok", "serves_full_payload": False},  # no projected_full_payload_s
+        "reranker": {"status": "ok"},  # no projected_full_payload_s
         "embedder": {"projected_full_payload_s": 0.01, "status": "ok"},
     }
     assert client.search_ceiling(capability) == client.SEARCH_TIMEOUT_FLOOR_S
@@ -607,10 +603,8 @@ FACT_1560_STALE_WITH_CARRIED = {
         "status": "failing",
         "error": "TimeoutError",
         "projected_full_payload_s": 127.0,   # carried from the last OK cycle
-        "ceiling_s": 921.6,
         "throughput_chars_s": 3870,
         "latency_s": 1.03,
-        "serves_full_payload": None,          # the verdict does NOT travel
         "projection_stale": True,
         "last_ok_at": "2026-08-25T10:42:29.900000+00:00",
         "projection_age_s": 4650.1,
@@ -619,10 +613,8 @@ FACT_1560_STALE_WITH_CARRIED = {
         "probe_chars": 1000,
         "status": "ok",
         "projected_full_payload_s": 6.3,
-        "ceiling_s": 122.9,
         "throughput_chars_s": 3906,
         "latency_s": 0.26,
-        "serves_full_payload": True,
         "projection_stale": False,
         "last_ok_at": "2026-08-25T12:00:00+00:00",
         "projection_age_s": 0.0,
@@ -636,14 +628,12 @@ FACT_1560_NEVER_MEASURED = {
         "probe_chars": 4000,
         "status": "failing",
         "error": "ConnectError",
-        "serves_full_payload": None,
         "projection_stale": None,   # PR-A's third state: never measured
     },
     "embedder": {
         "probe_chars": 1000,
         "status": "failing",
         "error": "ConnectError",
-        "serves_full_payload": None,
         "projection_stale": None,
     },
 }
