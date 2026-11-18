@@ -185,7 +185,7 @@ def _extract_a9_section() -> str:
 
 
 def run_a9_live(*, health_full: dict | str, auth_on="0", token_missing="0",
-                gateway_down="0", agent_token="tok"):
+                gateway_down="0", agent_token="tok", wait_s=None):
     a9_grade_window_def = _extract_marked_block(
         "# >>> A9_GRADE_WINDOW",
         "# <<< A9_GRADE_WINDOW",
@@ -195,6 +195,7 @@ def run_a9_live(*, health_full: dict | str, auth_on="0", token_missing="0",
     script_dir = str(POSTFLIGHT.parent)
     lines = [
         "set -uo pipefail",
+        "unset A9_WAIT_S" if wait_s is None else f"A9_WAIT_S={shlex.quote(str(wait_s))}",
         f"SCRIPT_DIR={shlex.quote(script_dir)}",
         f"GATEWAY_URL='http://127.0.0.1:8888'",
         f"auth_on={shlex.quote(auth_on)}",
@@ -209,11 +210,13 @@ def run_a9_live(*, health_full: dict | str, auth_on="0", token_missing="0",
         'ok()   { echo "OK: $*"; }',
         'warn() { echo "WARN: $*"; }',
         'bad()  { local a="$1"; shift; echo "BAD: $a $*"; afail["$a"]=1; }',
-        'sleep() { SECONDS=$(( SECONDS + 100 )); }',
+        'sleeps=0',
+        'sleep() { sleeps=$(( sleeps + 1 )); SECONDS=$(( SECONDS + 100 )); }',
         'curl() { printf \'%s\' "$health_full"; }',
         a9_grade_window_def,
         a9_section,
         'echo "AFAIL_A9=${afail[A9]:-0}"',
+        'echo "SLEEPS=$sleeps"',
     ]
     harness = "\n".join(lines)
     return subprocess.run(
@@ -244,7 +247,8 @@ def test_a9_postflight_timeout_rerank_still_null_warns_and_passes():
     assert "AFAIL_A9=0" in result.stdout
 
 
-def test_a9_postflight_timeout_embed_still_null_fails():
+@pytest.mark.parametrize("wait_s, expected, sleeps", [(None, 60, 1), (120, 120, 2)])
+def test_a9_wait_override_and_default_embed_still_null_fails(wait_s, expected, sleeps):
     payload = {
         "dependencies": {"embedder": {"state": "ok"}},
         "embedder": "ok",
@@ -255,9 +259,10 @@ def test_a9_postflight_timeout_embed_still_null_fails():
             "reranker": {"advertised_tokens": 8192, "source": "v1_models", "full_payload_ok": True},
         },
     }
-    result = run_a9_live(health_full=payload)
+    result = run_a9_live(health_full=payload, wait_s=wait_s)
     assert result.returncode == 0, f"script failed: {result.stderr}"
-    assert "BAD: A9 encoder window probe timed out" in result.stdout
+    assert f"BAD: A9 encoder window probe did not report within {expected}s" in result.stdout
+    assert f"SLEEPS={sleeps}" in result.stdout
     assert "AFAIL_A9=1" in result.stdout
 
 
@@ -293,14 +298,15 @@ def test_a9_premarked_on_missing_token():
     assert "afail[A9]=1" in text
 
 
-def test_a9_derived_ceiling_used():
+def test_a9_wait_loop_does_not_import_encoder_ceilings():
     text = POSTFLIGHT.read_text()
     a9 = _extract_a9_section()
-    assert "embed_ceiling" in a9
-    assert "rerank_ceiling" in a9
+    assert "embed_ceiling" not in a9
+    assert "rerank_ceiling" not in a9
+    assert "dream_telemetry" not in a9
     assert "ceiling_s=30" not in a9
     assert "30s" not in a9.split("\n")[0]
-    # Substring of embed_ceiling is not enough: pin the wait loop that
+    # Pin the wait loop that
     # re-curls /health while the probe is still null, then skip-null
     # STILL_NULL_RERANK (ok, not bad A9). Mutation: drop curl from the
     # loop body → this fails.

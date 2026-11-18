@@ -22,12 +22,10 @@ The invariants:
       FAILURE != a plausible score (the Group 3 rule: a behaviour with no
       metric is unfalsifiable).
 
-  R3  The rerank timeout is DERIVED from the size of the payload against a
-      throughput floor, not a constant. Constant timeouts under-provision
-      exactly the large requests that need them most (the rule established for
-      the embedder and the LLM backend, which the reranker was never covered by).
+  R3  Encoder posts have no gateway timeout; context-window clamps remain.
 """
 
+import asyncio
 import importlib.util
 import json
 import os
@@ -221,58 +219,7 @@ async def test_successful_rerank_is_marked_ranked():
     assert all(isinstance(r.get("score"), float) for r in fact_rows)
 
 
-# ── R3 — the timeout is derived from the payload, not constant ───────────────
-
-def test_rerank_timeout_scales_with_the_payload():
-    """A constant timeout under-provisions exactly the large requests that need
-    it most. The reranker scores each (query, document) pair, so its cost grows
-    with the total size of the candidate set — the timeout must follow it.
-
-    Named and shaped to match embed_ceiling: the embedder is the sibling CPU
-    backend that was already brought under this rule, and the two must not
-    drift apart."""
-    from dream_telemetry import rerank_ceiling
-
-    small = rerank_ceiling(["short doc"] * 4)
-    large = rerank_ceiling(["x" * 12000] * 20)
-
-    assert large > small, "the timeout must grow with the payload"
-    assert small >= 5.0, "a small payload still needs a sane floor"
-    assert large >= 60.0, (
-        "a full 20-candidate set measured ~64s at the reference deployment's "
-        "thread count — a ceiling below that guarantees a timeout"
-    )
-
-
-def test_rerank_payload_is_bounded_so_the_ceiling_is_finite():
-    """The ceiling is only a known quantity because the payload is clamped —
-    the same relationship EMBED_MAX_CHARS has with embed_ceiling. Without the
-    clamp a single huge record makes the timeout unbounded."""
-    import dream_telemetry
-
-    cap = dream_telemetry.RERANK_MAX_DOC_CHARS
-    assert len(dream_telemetry.clamp_rerank_doc("x" * 99999)) == cap
-    # Doubling the size of already-oversized documents must not move the ceiling.
-    a = dream_telemetry.rerank_ceiling(["x" * 50000] * 20)
-    b = dream_telemetry.rerank_ceiling(["x" * 100000] * 20)
-    assert a == b, "the ceiling must be bounded by the clamp, not by the input"
-
-
-def test_rerank_throughput_floor_is_env_overridable():
-    """Portability: the throughput floor is the REFERENCE deployment's measured
-    number, so it is an env-overridable default and never a literal baked into
-    a code path. A GPU-backed reranker raises it; a slower box lowers it."""
-    import dream_telemetry
-
-    baseline = dream_telemetry.rerank_ceiling(["x" * 4000] * 20)
-    with patch.dict(os.environ, {"RERANK_MIN_CHARS_S": "50"}):
-        importlib.reload(dream_telemetry)
-        slower = dream_telemetry.rerank_ceiling(["x" * 4000] * 20)
-    importlib.reload(dream_telemetry)   # restore for later tests
-
-    assert slower > baseline, (
-        "a lower throughput floor must produce a longer timeout"
-    )
+# ── R3 — no encoder timeout; context-window clamps remain ───────────────
 
 
 # ── The relevance window is COHERENT with the embedding window by default ────
@@ -364,3 +311,21 @@ async def test_fallback_drops_tier3_rather_than_pinning_it_on_top():
     # …and the facts must be the vector-order prefix, not offset by the dropped
     # narrative — an off-by-one here would silently skip the nearest fact.
     assert [r["pg_id"] for r in results] == [100, 101, 102, 103, 104]
+
+
+@pytest.mark.asyncio
+async def test_rerank_post_has_no_timeout():
+    c, conn, _ = _coordinator_with_mocks()
+    conn.fetch = AsyncMock(return_value=_candidates(20))
+    post = _reranker_returning(20)
+    payload = await asyncio.wait_for(_search(c, post, limit=5), 10)
+    assert len(payload["results"]) == 5
+    assert post.await_count == 1
+    assert "timeout" not in post.await_args.kwargs
+
+
+def test_rerank_document_clamp_keeps_exact_prefix():
+    from dream_telemetry import RERANK_MAX_DOC_CHARS, clamp_rerank_doc
+    text = "x" * RERANK_MAX_DOC_CHARS + "discarded"
+    assert clamp_rerank_doc(text) == "x" * RERANK_MAX_DOC_CHARS
+    assert clamp_rerank_doc("short") == "short"

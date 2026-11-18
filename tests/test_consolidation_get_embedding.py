@@ -269,3 +269,32 @@ def test_get_embedding_malformed_overflow_string_does_not_crash(monkeypatch):
     result, posts = _run_embed("x" * 2000, handler, monkeypatch)
     assert result is None or isinstance(result, list)
     assert len(posts) >= 1
+
+
+def test_consolidation_embed_client_and_post_have_no_timeout(monkeypatch):
+    constructors, posts = [], []
+
+    class Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            pass
+
+        async def post(self, url, **kwargs):
+            posts.append(kwargs)
+            return _FakeResp(200, embedding=VEC_1024)
+
+    def make_client(**kwargs):
+        constructors.append(kwargs)
+        return Client()
+
+    monkeypatch.setattr(cl.httpx, 'AsyncClient', make_client)
+    result = asyncio.run(asyncio.wait_for(
+        ConsolidationDaemon.get_embedding(None, 'x' * (cl.EMBED_MAX_CHARS + 1)), 10))
+    assert result == VEC_1024
+    assert len(constructors) == 1
+    assert constructors[0]['timeout'] is None
+    assert len(posts) == 1
+    assert 'timeout' not in posts[0]
+    assert posts[0]['json']['input'] == 'x' * cl.EMBED_MAX_CHARS

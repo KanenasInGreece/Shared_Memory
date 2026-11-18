@@ -289,10 +289,10 @@ def test_the_a1_shape_check_names_only_keys_the_gateway_keeps_serving():
         for key in keys:
             rows = [p for p in tc.HEALTH if p == key or p.startswith(key + ".")]
             assert rows, f"A1 requires {key!r}, which /health does not document"
-            stamped = sorted(p for p in rows if tc.HEALTH[p]["removed_in"])
-            assert not stamped, (
+            serving = [p for p in rows if not tc.HEALTH[p]["removed_in"]]
+            assert serving, (
                 f"A1 requires {key!r}, and the contract stops serving "
-                f"{stamped} — the gate would fail on every install")
+                f"all documented fields — the gate would fail on every install")
 
 
 def test_a6_baseline_writer_markers_present_exactly_once():

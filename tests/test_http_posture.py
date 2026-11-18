@@ -171,18 +171,27 @@ def _httpx_transport_calls():
     return calls
 
 
-def test_census_transport_constructors_trust_env_false_and_count_is_5():
-    """The five UNIX-socket transports (two per `memory_bridge.py` copy, one
-    in `mcp/vector-skill.py`'s single client factory) each pass a literal
-    trust_env=False and carry no escape-hatch keyword. Count pinned at 5 (a
-    VALUE, `fact:1309`) — a sixth transport updates this number in the same PR.
+def test_census_transport_constructors_trust_env_false_and_count_is_9():
+    """The nine transports each pass a literal trust_env=False and carry no
+    escape-hatch keyword: five UNIX-socket transports (two per
+    `memory_bridge.py` copy, one in `mcp/vector-skill.py`'s single client
+    factory) and four `httpx.AsyncHTTPTransport` in `coordinator.py` (the
+    encoder clients, which set TCP keepalive through `socket_options` so a
+    dead peer is detected without any gateway timeout, decision:3731). Count
+    pinned at 9 (a VALUE, `fact:1309`) — a tenth transport updates this number
+    in the same PR.
 
     Mutation: remove `trust_env=False` from one `httpx.HTTPTransport(uds=uds, …)`
     call and only this test dies; add `verify=…` or `proxy=…` to one and only
     this test dies.
     """
     calls = _httpx_transport_calls()
-    assert len(calls) == 5, [(p, ln) for p, ln, _, _ in calls]
+    assert len(calls) == 9, [(p, ln) for p, ln, _, _ in calls]
+    keepalive = [c for c in calls if str(c[0]).endswith("coordinator.py")]
+    assert len(keepalive) == 4, [(p, ln) for p, ln, _, _ in keepalive]
+    for path, lineno, attr, node in keepalive:
+        assert "socket_options" in {k.arg for k in node.keywords}, \
+            f"{path}:{lineno} encoder transport sets no keepalive socket_options"
     for path, lineno, attr, node in calls:
         kw = {k.arg: k.value for k in node.keywords}
         assert "trust_env" in kw, f"{path}:{lineno} {attr} has no trust_env"

@@ -1,82 +1,8 @@
-"""OBS CG — declare the warning-key vocabulary; fix the stale annotations.
+"""Pin the four current health warning producers and their contract annotations.
 
-THE DEFECT
-----------
-`warnings[].key` (`telemetry_contract.py`) was a free `str` — a renamed or
-added warning key was invisible to every guard. Independently, FIVE existing
-`log="health.warning.*"` annotations elsewhere in the same file named keys NO
-producer ever emits (verified against `hive_mind_proxy.py`'s health-build
-function, the only place `_warning(...)` is ever called):
-
-  - `encoders.embed.p95_ms`   → `health.warning.encoder_p95_ms`   (no such
-    producer — the real key is `encoder_embedder_projected_ms`)
-  - `encoders.rerank.p95_ms`  → `health.warning.encoder_p95_ms`   (same wrong
-    string, on the OTHER encoder — real key: `encoder_reranker_projected_ms`)
-  - `gateway.shed_503_total`  → `health.warning.pool_shedding`    (real key:
-    `gateway_shed_503_total`)
-  - `outbox.oldest_pending_age_s` → `health.warning.outbox_age`   (real key:
-    `outbox_oldest_pending_age_s`)
-  - `credentials.token_verify_failed` → `health.warning.token_verify_failed`
-    (missing `_per_min` — the real key is `token_verify_failed_per_min`)
-
-(Five occurrences, four distinct wrong strings — more than the brief's
-"three", since `encoder_p95_ms` is wrong on two different fields. Verified
-exhaustively here rather than stopping at three; noted in HANDOFF as a
-discrepancy from the brief's own count.)
-
-THE FIX
--------
-`telemetry_contract.WARNING_KEYS` — the enumerated, re-derived set of the six
-real `_warning(...)` first-argument literals. Three of the five stale `log=`
-annotations were renamed to the string their OWN field's producer actually
-emits. `WARNING_KEYS` is rendered into the generated doc.
-
-QA FIX ROUND (finding 3) — the encoder pair's `log=` was dropped, not renamed
------------------------------------------------------------------------------
-The first pass renamed `encoders.embed.p95_ms`/`encoders.rerank.p95_ms`'s
-`log=` to the real key names (`encoder_{embedder,reranker}_projected_ms`),
-which made the STRING real but left it pointing at the WRONG QUANTITY: that
-warning compares `backend_capability.<name>.projected_full_payload_s`
-against `encoders.limit_ms`, never the p95 ring — a different wrong answer,
-not a right one (QA measured this; the CG guard cannot see it, because it
-checks membership in `WARNING_KEYS`, never attribution to the right field).
-The field that DOES carry the observed value,
-`backend_capability.*.projected_full_payload_s`, is WILDCARDED — one contract
-entry standing for both `embedder` and `reranker` — and `log=` is a single
-string, so it cannot correctly name either backend's specific warning key
-without being wrong for the other. No field in the contract can carry a
-correct per-encoder `log=` for this pair, so the fix round dropped `log=`
-from both p95 rows entirely (per the brief's own stated fallback) and
-corrected `encoders.limit_ms`'s note, which had the same "the p95s" claim.
-
-THIS FILE
----------
-An AST/source walk of `hive_mind_proxy.py`, scoped to `_warning(...)` call
-sites (never a flatten-the-whole-file string scan, which would also catch
-unrelated string literals). Two directions, both required:
-
-  1. Every literal first-arg `_warning(...)` can produce is a member of
-     `WARNING_KEYS` (nothing emitted is undocumented).
-  2. Every member of `WARNING_KEYS` has a producer (nothing documented is
-     dead — the reverse of D5's registry.error lesson: a set with no
-     structural link to its producers drifts the same way a duplicate dict
-     key does).
-
-The encoder pair's `_warning(f"encoder_{name}_projected_ms", ...)` is a
-`JoinedStr`, not a plain string constant — this file's walker resolves it by
-finding the nearest enclosing `for name in (...)` loop over a literal tuple
-of strings and substituting each value, rather than special-casing the two
-resulting strings by hand (which would silently stop tracking the real code
-the moment the loop's tuple changed).
-
-PROVE-FAILING-FIRST (recorded in the commit body): this file's own
-`test_ast_walker_actually_resolves_the_encoder_pair` proves the walker
-resolves the f-string at all (a walker that gave up on `JoinedStr` nodes
-would silently report ZERO encoder keys and both directional tests would
-pass vacuously — checked explicitly). The stale-annotation fix was proved by
-running this file BEFORE the `log=` renames and confirming
-`test_no_log_annotation_names_a_key_without_a_producer` failed, listing all
-five (see commit body for the captured output).
+The walker also handles f-strings over literal loops, exercised by a synthetic
+fixture independently of the production warning vocabulary. Encoder projections
+are measurements and produce no latency warnings.
 """
 import ast
 import inspect
@@ -174,20 +100,17 @@ def _hive_mind_proxy_source() -> str:
 # The walker itself actually works (guards against a silently-vacuous pin)
 # ═══════════════════════════════════════════════════════════════════════════
 
-def test_ast_walker_actually_resolves_the_encoder_pair():
-    keys = _warning_producer_keys(_hive_mind_proxy_source())
-    assert "encoder_embedder_projected_ms" in keys
-    assert "encoder_reranker_projected_ms" in keys
+def test_ast_walker_resolves_a_synthetic_encoder_pair():
+    keys = _warning_producer_keys('for name in ("embedder", "reranker"):\n    _warning(f"encoder_{name}_projected_ms", 0, 1, "ms")')
+    assert keys == {"encoder_embedder_projected_ms", "encoder_reranker_projected_ms"}
     # And it did NOT invent a literal "encoder_{name}_projected_ms" or an
     # unresolved f-string artifact.
     assert not any("{" in k or "}" in k for k in keys)
 
 
-def test_ast_walker_finds_all_six_producers():
+def test_ast_walker_finds_all_four_producers():
     keys = _warning_producer_keys(_hive_mind_proxy_source())
     assert keys == {
-        "encoder_embedder_projected_ms",
-        "encoder_reranker_projected_ms",
         "outbox_oldest_pending_age_s",
         "rem_dead_lettered",
         "gateway_shed_503_total",
@@ -255,15 +178,7 @@ def test_the_three_renamed_annotations_are_now_correct():
 
 
 def test_the_encoder_p95_pair_has_no_log_annotation():
-    """QA fix round, finding 3: renaming the encoder pair's `log=` to the
-    real producer key made the STRING real but left it naming the WRONG
-    QUANTITY (the warning observes `projected_full_payload_s`, never the
-    p95 ring) — and no field in the contract can carry a correct per-encoder
-    `log=` for it, because the field that DOES carry the right quantity
-    (`backend_capability.*.projected_full_payload_s`) is wildcarded across
-    both encoders while `log=` is a single string. Dropped, not renamed
-    again — pin the absence so a future "helpful" re-add of the old wrong
-    string is caught."""
+    """Encoder latency measurements have no associated warning producer."""
     assert tc.TELEMETRY["encoders.embed.p95_ms"]["log"] is None
     assert tc.TELEMETRY["encoders.rerank.p95_ms"]["log"] is None
     assert tc.HEALTH["backend_capability.*.projected_full_payload_s"]["log"] is None

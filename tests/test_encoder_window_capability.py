@@ -52,11 +52,11 @@ def test_encoder_dependency_reranker_full_payload_false_is_not_window_overrun():
     assert dep.get("reason") is None
 
 
-def test_encoder_dependency_reranker_too_slow_still_degrades():
+def test_encoder_dependency_reranker_failing_still_degrades():
     window = {"advertised_tokens": 8192, "source": "v1_models", "full_payload_ok": False}
-    dep = g._encoder_dependency("ok", {"status": "too_slow"}, window, kind="reranker")
+    dep = g._encoder_dependency("ok", {"status": "failing"}, window, kind="reranker")
     assert dep["state"] == "degraded"
-    assert dep["reason"] == "capability:too_slow"
+    assert dep["reason"] == "capability:failing"
 
 
 def test_encoder_dependency_reranker_window_short_still_degrades():
@@ -116,8 +116,8 @@ async def test_probe_matches_served_model_id_not_data_zero():
                 return FakeResponse(404, {})
             return FakeResponse(404, {})
 
-        def post(self, url, json=None, timeout=None, **kwargs):
-            self.posts.append((url, json, timeout))
+        def post(self, url, json=None, **kwargs):
+            self.posts.append((url, json, kwargs))
             return FakeResponse(200, {"data": [{"embedding": [0.1]}]})
 
 
@@ -133,10 +133,10 @@ async def test_probe_matches_served_model_id_not_data_zero():
     assert res["full_payload_ok"] is True
     # Verify embed one-shot payload size
     assert len(session.posts) == 1
-    post_url, post_json, post_timeout = session.posts[0]
+    post_url, post_json, post_kwargs = session.posts[0]
     assert post_url.endswith("/v1/embeddings")
     assert len(post_json["input"]) == dream_telemetry.EMBED_MAX_CHARS
-    assert post_timeout.total == dream_telemetry.embed_ceiling(dream_telemetry.EMBED_MAX_CHARS)
+    assert "timeout" not in post_kwargs
 
 
 @pytest.mark.asyncio
@@ -169,8 +169,8 @@ async def test_rerank_one_shot_leaves_query_and_specials_in_window():
                 return FakeResponse(200, {"default_generation_settings": {"n_ctx": 8192}})
             return FakeResponse(404, {})
 
-        def post(self, url, json=None, timeout=None, **kwargs):
-            self.posts.append((url, json, timeout))
+        def post(self, url, json=None, **kwargs):
+            self.posts.append((url, json, kwargs))
             return FakeResponse(200, {"results": []})
 
     session = FakeSession()
@@ -184,8 +184,9 @@ async def test_rerank_one_shot_leaves_query_and_specials_in_window():
     assert res["source"] == "props"
     assert res["full_payload_ok"] is True
     assert len(session.posts) == 1
-    post_url, post_json, post_timeout = session.posts[0]
+    post_url, post_json, post_kwargs = session.posts[0]
     assert post_url.endswith("/v1/reranking")
+    assert "timeout" not in post_kwargs
     assert post_json["query"] == "encoder window probe"
     doc = post_json["documents"][0]
     # Doc length must leave room for query and specials
@@ -390,3 +391,88 @@ async def test_probe_encoder_disallows_redirects():
     for method, url, allow_red in calls:
         assert allow_red is False, f"{method} {url} had allow_redirects={allow_red}"
 
+
+
+@pytest.mark.asyncio
+async def test_slow_probe_is_ok_without_timeout_or_retired_keys(monkeypatch):
+    import asyncio
+    clock = [0.0]
+    posts = []
+
+    class Response:
+        status = 200
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            pass
+
+        async def read(self):
+            clock[0] += 1000.0
+            return b"{}"
+
+    class Session:
+        def post(self, url, **kwargs):
+            posts.append(kwargs)
+            return Response()
+
+    # Only the gateway clock changes; asyncio's deadline clock keeps running.
+    from types import SimpleNamespace
+    monkeypatch.setattr(g, "time", SimpleNamespace(monotonic=lambda: clock[0]))
+    monkeypatch.setattr(g, "CAPABILITY_PROBE_DOCS", 4)
+    monkeypatch.setattr(g, "CAPABILITY_PROBE_DOC_CHARS", 1000)
+    result = await asyncio.wait_for(g._probe_capability(Session()), 10)
+    assert result["status"] == "ok"
+    assert len(posts) == 2
+    for kwargs in posts:
+        assert "timeout" not in kwargs
+    for backend, throughput, projection in (
+        ("embedder", 1, float(dream_telemetry.EMBED_MAX_CHARS)),
+        ("reranker", 4, float(5 * dream_telemetry.RERANK_MAX_DOC_CHARS)),
+    ):
+        block = result[backend]
+        assert block["status"] == "ok"
+        assert block["latency_s"] == 1000.0
+        assert block["throughput_chars_s"] == throughput
+        assert block["projected_full_payload_s"] == projection
+        assert "ceiling_s" not in block
+        assert "serves_full_payload" not in block
+
+
+@pytest.mark.asyncio
+async def test_slow_projection_does_not_warn_or_degrade_health(monkeypatch):
+    import asyncio
+    from types import SimpleNamespace
+    # Legacy cached ceilings must not resurrect the removed warning comparison.
+    monkeypatch.setattr(g, "ENCODER_LATENCY_WARN_MS", None, raising=False)
+    monkeypatch.setattr(g, "_capability", {
+        "status": "ok",
+        "embedder": {"status": "ok", "projected_full_payload_s": 24570.0, "ceiling_s": 30.0},
+        "reranker": {"status": "ok", "projected_full_payload_s": 122850.0, "ceiling_s": 30.0},
+    })
+
+    class Response:
+        status = 200
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            pass
+
+    class Coordinator:
+        pgvector_version = "0.7.0"
+        hnsw_iterative_scan = True
+
+        def dependency_snapshot(self):
+            return {"postgres": {"state": "ok"}, "neo4j": {"state": "ok"}}
+
+    session = SimpleNamespace(get=lambda *a, **kw: Response())
+    checks = await asyncio.wait_for(g._build_health_checks(
+        SimpleNamespace(session=session), Coordinator()), 10)
+    for backend in ("embedder", "reranker"):
+        assert checks["dependencies"][backend]["state"] == "ok"
+    keys = {warning["key"] for warning in checks["warnings"]}
+    assert "encoder_embedder_projected_ms" not in keys
+    assert "encoder_reranker_projected_ms" not in keys

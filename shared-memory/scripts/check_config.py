@@ -25,6 +25,9 @@ ENV_ROW_ORDER = (
     "EMBEDDER_URL",
     "RERANKER_URL",
     "PROXY_BIND",
+    "ENCODER_TCP_KEEPALIVE_IDLE_S",
+    "ENCODER_TCP_KEEPALIVE_INTERVAL_S",
+    "ENCODER_TCP_KEEPALIVE_COUNT",
     "EMBED_MAX_CONTEXT_TOKENS",
     "EMBED_CHARS_PER_TOKEN",
     "EMBED_SPECIAL_TOKEN_RESERVE",
@@ -67,17 +70,13 @@ def _idiom_for(key: str) -> str:
     return FRAMEWORK_DEFAULTS[key]["idiom"]
 
 
-# Module-level float()/int() env reads of dream_telemetry.py, in module order. A parse failure
+# Module-level encoder window float()/int() env reads of dream_telemetry.py, in module order. A parse failure
 # in any of them stops the gateway at import, so _gateway_embed_values names the first to raise.
 # A non-finite EMBED_CHARS_PER_TOKEN (nan, inf, 1e309) counts too: it is the only float fed to
 # the derived int((ctx - reserve) * ratio) and int(reserve * ratio), which raise on it.
 _DREAM_TELEMETRY_PARSES = (
-    ("EMBED_MIN_TOK_S", float),
     ("EMBED_MAX_CONTEXT_TOKENS", int), ("EMBED_CHARS_PER_TOKEN", float),
-    ("EMBED_MAX_CHARS", int), ("EMBED_SAFETY_FACTOR", float),
-    ("EMBED_TIMEOUT_FLOOR_S", float), ("RERANK_MIN_CHARS_S", float),
-    ("RERANK_MAX_DOC_CHARS", int), ("RERANK_SAFETY_FACTOR", float),
-    ("RERANK_TIMEOUT_FLOOR_S", float),
+    ("EMBED_MAX_CHARS", int), ("RERANK_MAX_DOC_CHARS", int),
 )
 _EMBED_KEYS = ("EMBED_MAX_CONTEXT_TOKENS", "EMBED_CHARS_PER_TOKEN",
                "EMBED_SPECIAL_TOKEN_RESERVE", "EMBED_MAX_CHARS")
@@ -153,6 +152,15 @@ def _verdict(key: str, gateway: "tuple[dict | None, str | None] | None" = None) 
     elif key == "PROXY_BIND" and raw is not None:
         # hive_mind_proxy._resolve_proxy_bind_host: strip, empty falls back to loopback.
         effective = raw.strip() or _GATEWAY_BIND_DEFAULT
+    elif key in ("ENCODER_TCP_KEEPALIVE_IDLE_S", "ENCODER_TCP_KEEPALIVE_INTERVAL_S",
+                 "ENCODER_TCP_KEEPALIVE_COUNT"):
+        try:
+            effective = int(effective)
+            if effective <= 0:
+                raise ValueError
+        except ValueError:
+            effective = default
+            note = f"invalid — the gateway uses {effective}"
     elif key in _EMBED_KEYS:
         values, failed = gateway if gateway is not None else _gateway_embed_values()
         if values is None:

@@ -154,6 +154,7 @@ Refusals. Branch on `error`. One recovery; the second-submission essays are in `
 | `domain_unknown` | Ask: pick a proposal, re-send `new_domain: true` after confirmation, or omit the domain. |
 | `domain_unnameable` | Name the section with at least one letter or digit. |
 | `domain_without_project` | `general_discussion` has no sections; use a real project or drop the domain. |
+| `embed_deadline_exceeded` | 503, nothing was saved: the embedder did not answer within this call's `wait_s`, which the client sets from its own timeout. Retry; if it repeats, read the embedder's `oldest_outstanding_age_s` on `/health`. |
 | `entities_list_too_long` | Split the save; `ENTITY_LIST_MAX_LEN` (default 50) caps `entities` and `new_entities`. |
 | `entities_not_allowed_on_judgement` | Decisions and retrospectives carry no entities (empty list = omit); mint on a fact and cite it. |
 | `entities_provenance_invalid` | Object only: keys must be in `entities`, values must be `operator` or `agent`. |
@@ -180,11 +181,11 @@ Graph expansion on a judgement hit derives `belonging`: `{project, domains}` on 
 Worked contract. Anonymous `/health`, then `--version`:
 
 ```json
-{"status":"ok","version":"1.1.7","api_version":6}
+{"status":"ok","version":"1.2.0","api_version":7}
 ```
 
 ```json
-{"version": "1.1.7", "api_version": 6, "tool": "shared-memory-framework"}
+{"version": "1.2.0", "api_version": 7, "tool": "shared-memory-framework"}
 ```
 
 `doctor` compares this client's `api_version` with the gateway and names which side to upgrade.

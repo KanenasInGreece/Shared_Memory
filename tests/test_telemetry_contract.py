@@ -241,12 +241,12 @@ _FULL_CAPABILITY = {
                  "projected_full_payload_s": 1.0, "ceiling_s": 5.0,
                  "serves_full_payload": True, "status": "ok",
                  "projection_stale": False, "last_ok_at": "2026-08-28T00:00:00+00:00",
-                 "projection_age_s": 1.0},
+                 "projection_age_s": 1.0, "probe_outstanding_age_s": None},
     "reranker": {"probe_chars": 100, "latency_s": 0.1, "throughput_chars_s": 1000,
                  "projected_full_payload_s": 1.0, "ceiling_s": 5.0,
                  "serves_full_payload": True, "status": "ok",
                  "projection_stale": False, "last_ok_at": "2026-08-28T00:00:00+00:00",
-                 "projection_age_s": 1.0},
+                 "projection_age_s": 1.0, "probe_outstanding_age_s": None},
 }
 
 _FULL_CAPACITY = {
@@ -312,6 +312,11 @@ class _StubCoordinator:
 
     def consolidation_health(self):
         return dict(_FULL_CONSOLIDATION)
+
+    def encoder_calls_snapshot(self):
+        quiet = {"outstanding_count": 0, "oldest_outstanding_age_s": None,
+                 "last_completed_at": None, "last_deadline_cancelled_at": None}
+        return {"embedder": dict(quiet), "reranker": dict(quiet)}
 
     def dependency_snapshot(self):
         return {

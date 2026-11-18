@@ -1291,3 +1291,20 @@ def test_phase_b_ignores_leftover_weight_in_backend_json(tmp_path):
     assert proc.returncode == 0, text
     assert "weight=" not in text
     assert "ignores leftover key weight" in text
+
+
+@pytest.mark.parametrize('name, default', [
+    ('ENCODER_TCP_KEEPALIVE_IDLE_S', 60),
+    ('ENCODER_TCP_KEEPALIVE_INTERVAL_S', 15),
+    ('ENCODER_TCP_KEEPALIVE_COUNT', 4),
+])
+@pytest.mark.parametrize('raw', ['60s', '0', '-5', ''])
+def test_keepalive_invalid_value_reported(monkeypatch, name, default, raw):
+    monkeypatch.setenv('SECURE_ENV_FILE', '')
+    monkeypatch.setenv(name, raw)
+    lines, ok = check_config.phase_a_render()
+    assert ok
+    row = next(line for line in lines if name in line)
+    assert 'invalid' in row
+    assert f'the gateway uses {default}' in row
+    assert check_config._verdict(name)['effective'] == default

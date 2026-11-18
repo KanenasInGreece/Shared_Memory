@@ -8,6 +8,7 @@ import re
 import secrets
 import shutil
 import signal
+import socket
 import sys
 import itertools
 import urllib.parse
@@ -56,6 +57,8 @@ import request_sizing
 
 from coordinator import (
     MemoryCoordinator,
+    OutstandingCalls,
+    encoder_keepalive_options,
     attach as attach_coordinator,
     CONSOLIDATION_CYCLE_TYPES,
     auth_middleware,
@@ -85,7 +88,6 @@ from coordinator import (
     _short,
     # Same limits /health compares against and /memory/telemetry reports. Two spellings of one limit make the payload contradict itself.
     OUTBOX_AGE_WARN_S,
-    ENCODER_LATENCY_WARN_MS,
     TOKEN_VERIFY_WARN_PER_MIN,
     NREM_FOLD_ATTEMPT_WARN,
     telemetry_gateway_counters,
@@ -1314,6 +1316,18 @@ def _next_index(ordered: list[str], index: int, est: float,
 
 
 # Proxy
+def _encoder_socket_factory(addr_info):
+    family, type_, proto, _, _ = addr_info
+    sock = socket.socket(family=family, type=type_, proto=proto)
+    try:
+        for option in encoder_keepalive_options():
+            sock.setsockopt(*option)
+        return sock
+    except BaseException:
+        sock.close()
+        raise
+
+
 class AsyncHiveMindProxy:
     def __init__(self):
         self.session: ClientSession | None = None
@@ -1321,6 +1335,7 @@ class AsyncHiveMindProxy:
 
     async def start_session(self) -> None:
         connector = TCPConnector(
+            socket_factory=_encoder_socket_factory,
             limit=200,                  # total concurrent connections across all upstreams
             limit_per_host=80,          # prevents embedding bursts from starving LLM backend
             ttl_dns_cache=300,
@@ -2460,7 +2475,6 @@ async def handle_pool_status(request: web.Request) -> web.Response:
 CAPABILITY_PROBE_INTERVAL_S = float(
     os.environ.get("CAPABILITY_PROBE_INTERVAL_S", "600"))
 # fact:1609: retry a failing probe soon. Waiting the full interval turned a short encoder cold-start into a long degraded window.
-# A too_slow backend is still serving, so it keeps the full interval.
 CAPABILITY_PROBE_RETRY_S = float(
     os.environ.get("CAPABILITY_PROBE_RETRY_S", "15"))
 # Large enough to represent a real payload. A one-token ping would not measure the cost that matters.
@@ -2470,6 +2484,7 @@ CAPABILITY_PROBE_DOC_CHARS = int(
 
 # Probe result for /health. Stays unknown until the first probe; decision 928 says not-yet-probed must not read as verified clean.
 _capability: dict = {"status": "unknown", "probed_at": None}
+_capability_probe_calls = {name: OutstandingCalls() for name in ("reranker", "embedder")}
 
 
 def _projection_age_s(last_ok_at, now=None) -> float | None:
@@ -2498,15 +2513,19 @@ def capability_snapshot() -> dict:
             continue
         block = dict(block)
         block["projection_age_s"] = _projection_age_s(block.get("last_ok_at"), now)
+        age = _capability_probe_calls[backend].oldest_age_s()
+        block["probe_outstanding_age_s"] = round(age, 1) if age is not None else None
+        if (age is not None and age > CAPABILITY_PROBE_INTERVAL_S
+                and block.get("projected_full_payload_s") is not None):
+            block["projection_stale"] = True
         snap[backend] = block
     return snap
 
 
 async def _probe_capability(session) -> dict:
     """Measure backend throughput on a representative payload and project latency
-    against worst-case timeouts to verify full payload service."""
-    from dream_telemetry import (EMBED_MAX_CHARS, RERANK_MAX_DOC_CHARS,
-                                 embed_ceiling, rerank_ceiling)
+    for a full payload without comparing it against a timeout."""
+    from dream_telemetry import EMBED_MAX_CHARS, RERANK_MAX_DOC_CHARS
 
     out: dict = {"probed_at": datetime.now(timezone.utc).isoformat()}
     try:
@@ -2519,16 +2538,19 @@ async def _probe_capability(session) -> dict:
     docs = [d[:CAPABILITY_PROBE_DOC_CHARS] for d in docs]
     probe_chars = sum(len(d) for d in docs)
     entry: dict = {"probe_chars": probe_chars}
+    calls = _capability_probe_calls["reranker"]
+    token = calls.begin()
+    completed = False
     try:
         t0 = time.monotonic()
         async with session.post(
             f"{RERANKER_URL}/v1/reranking",
             json={"query": "capability probe", "documents": docs, "top_n": len(docs)},
-            timeout=ClientTimeout(total=max(30.0, rerank_ceiling(docs))),
             allow_redirects=False,
             **encoder_auth_kwargs("reranker", RERANKER_URL),
         ) as r:
             await r.read()
+            completed = True
             ok = 200 <= r.status < 300
         dt = max(time.monotonic() - t0, 1e-6)
         entry["latency_s"] = round(dt, 2)
@@ -2539,31 +2561,33 @@ async def _probe_capability(session) -> dict:
             # Worst case this framework can send: a full candidate set of fully clamped documents.
             full_chars = 20 * RERANK_MAX_DOC_CHARS
             projected = full_chars / entry["throughput_chars_s"]
-            allowed = rerank_ceiling(["x" * RERANK_MAX_DOC_CHARS] * 20)
             entry["projected_full_payload_s"] = round(projected, 1)
-            entry["ceiling_s"] = round(allowed, 1)
-            entry["serves_full_payload"] = projected <= allowed
-            entry["status"] = "ok" if projected <= allowed else "too_slow"
+            entry["status"] = "ok"
         else:
             entry["status"] = "failing"
     except Exception as exc:
         entry["status"] = "failing"
         entry["error"] = type(exc).__name__
+    finally:
+        calls.end(token, completed=completed)
     out["reranker"] = entry
 
     # ── embedder ────────────────────────────────────────────────────────────
     text = ("lorem ipsum dolor sit amet " * 40)[:CAPABILITY_PROBE_DOC_CHARS]
     entry = {"probe_chars": len(text)}
+    calls = _capability_probe_calls["embedder"]
+    token = calls.begin()
+    completed = False
     try:
         t0 = time.monotonic()
         async with session.post(
             f"{EMBEDDER_URL}/v1/embeddings",
             json={"input": text, "model": "bge-m3"},
-            timeout=ClientTimeout(total=max(30.0, embed_ceiling(len(text)))),
             allow_redirects=False,
             **encoder_auth_kwargs("embedder", EMBEDDER_URL),
         ) as r:
             await r.read()
+            completed = True
             ok = 200 <= r.status < 300
         dt = max(time.monotonic() - t0, 1e-6)
         entry["latency_s"] = round(dt, 2)
@@ -2572,16 +2596,15 @@ async def _probe_capability(session) -> dict:
             entry["status"] = "auth_failed"
         elif ok and entry["throughput_chars_s"] > 0:
             projected = EMBED_MAX_CHARS / entry["throughput_chars_s"]
-            allowed = embed_ceiling(EMBED_MAX_CHARS)
             entry["projected_full_payload_s"] = round(projected, 1)
-            entry["ceiling_s"] = round(allowed, 1)
-            entry["serves_full_payload"] = projected <= allowed
-            entry["status"] = "ok" if projected <= allowed else "too_slow"
+            entry["status"] = "ok"
         else:
             entry["status"] = "failing"
     except Exception as exc:
         entry["status"] = "failing"
         entry["error"] = type(exc).__name__
+    finally:
+        calls.end(token, completed=completed)
     out["embedder"] = entry
 
     out["status"] = ("ok" if all(out[k].get("status") == "ok"
@@ -2590,8 +2613,8 @@ async def _probe_capability(session) -> dict:
     return out
 
 
-# Capability measured keys travel together; serves_full_payload is a present-tense verdict and is not carried here (null while the reading ages).
-_PROJECTION_CARRY_KEYS = ("projected_full_payload_s", "ceiling_s",
+# Capability measured keys travel together.
+_PROJECTION_CARRY_KEYS = ("projected_full_payload_s",
                           "throughput_chars_s", "latency_s")
 
 
@@ -2600,7 +2623,7 @@ def _merge_capability_projection(previous: dict | None, fresh: dict) -> dict:
     the client's search timeout collapsed to its 30 s floor exactly when the
     reranker was busy, because a failing probe wrote only status and the
     measured projection vanished).
-    Marks projections stale when carried over and sets serves_full_payload to None.
+    Marks projections stale when carried over.
     A backend that has NEVER measured keeps today's shape with projection_stale
     None: "never measured" is a third state, and no number is invented to fill it."""
     if not isinstance(fresh, dict):
@@ -2616,8 +2639,7 @@ def _merge_capability_projection(previous: dict | None, fresh: dict) -> dict:
         prev_block = (previous or {}).get(backend)
         if (not isinstance(prev_block, dict)
                 or prev_block.get("projected_full_payload_s") is None):
-            # Nothing was measured, so carry nothing and invent nothing. Null the verdict too, the same shape as an ageing block.
-            block["serves_full_payload"] = None
+            # Nothing was measured, so carry nothing and invent nothing.
             block["projection_stale"] = None
             continue
         for key in _PROJECTION_CARRY_KEYS:
@@ -2625,8 +2647,6 @@ def _merge_capability_projection(previous: dict | None, fresh: dict) -> dict:
                 block[key] = prev_block[key]
             else:
                 block.pop(key, None)
-        # The verdict does not travel with a carried-forward reading. Null, not absent, so a missing key is not read as false and a failed probe cannot stay green.
-        block["serves_full_payload"] = None
         block["projection_stale"] = True
         # The previous block may itself have been carried forward. The age is the age of the numbers, not of the cycle that last copied them.
         block["last_ok_at"] = (prev_block.get("last_ok_at")
@@ -2643,7 +2663,8 @@ async def _capability_probe_daemon(proxy, stop_event, coordinator=None) -> None:
     while not stop_event.is_set():
         try:
             from encoder_window import probe_encoder_window
-            await probe_encoder_window(proxy.session, EMBEDDER_URL, RERANKER_URL)
+            await probe_encoder_window(proxy.session, EMBEDDER_URL, RERANKER_URL,
+                                       calls=_capability_probe_calls)
             _capability = _merge_capability_projection(
                 _capability, await _probe_capability(proxy.session))
             await _maybe_derive_capacity(_capability, coordinator)
@@ -3302,7 +3323,7 @@ def _encoder_dependency(probe: str, capability: object, window: dict | None = No
             return _dep(_STATE_DEGRADED, "window_overrun")
     if isinstance(capability, dict):
         status = capability.get("status")
-        if status in ("too_slow", "failing", "degraded"):
+        if status in ("failing", "degraded"):
             return _dep(_STATE_DEGRADED, f"capability:{status}")
     return _dep(_STATE_OK)
 
@@ -4094,22 +4115,23 @@ async def _build_health_checks(proxy: "AsyncHiveMindProxy", coordinator) -> dict
             if coordinator is not None else 0),
     }
 
+    try:
+        snapshotter = getattr(coordinator, "encoder_calls_snapshot", None)
+        if snapshotter is not None:
+            snapshot = snapshotter()
+            # Only these observations belong here; they never determine health state.
+            fields = ("outstanding_count", "oldest_outstanding_age_s",
+                      "last_completed_at", "last_deadline_cancelled_at")
+            additions = {
+                name: {key: snapshot[name][key] for key in fields}
+                for name in ("embedder", "reranker")
+            }
+            for name, values in additions.items():
+                dependencies[name].update(values)
+    except Exception:
+        pass
+
     warnings: list = []
-    # fact:1338: the encoder p95 limit comes from the capability probe unless an operator pinned one. A flat default would be a number nobody measured.
-    for name in ("embedder", "reranker"):
-        block = capability.get(name)
-        if not isinstance(block, dict):
-            continue
-        limit_ms = ENCODER_LATENCY_WARN_MS
-        if limit_ms is None:
-            ceiling = block.get("ceiling_s")
-            limit_ms = ceiling * 1000.0 if isinstance(ceiling, (int, float)) else None
-        observed = block.get("projected_full_payload_s")
-        if (limit_ms is not None and isinstance(observed, (int, float))
-                and observed * 1000.0 > limit_ms):
-            warnings.append(_warning(f"encoder_{name}_projected_ms",
-                                     round(limit_ms, 1),
-                                     round(observed * 1000.0, 1), "ms"))
     if isinstance(outbox_census, dict):
         age = outbox_census.get("oldest_pending_age_s")
         if isinstance(age, (int, float)) and age > OUTBOX_AGE_WARN_S:
