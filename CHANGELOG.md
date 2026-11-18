@@ -7,6 +7,28 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-11-19
+
+This release raises `API_VERSION` from 6 to 7, so the minor version rises with it. Update every client to 1.2.0: an older client works but sends no deadline, so its calls wait without a limit.
+
+### Changed
+- The caller now decides how long an embed or rerank call may take. The clients send `wait_s` on a save and `encoder_wait_s` on a search (the save wait minus 15 seconds), and the gateway cancels the one encoder call when that deadline passes or the client disconnects (HTTP 499). A late reranker returns the vector order with `ranked: false`. A late embedder on a search falls back to keyword search. A late embedder on a save returns 503 with reason `embed_deadline_exceeded` and writes nothing. A plain HTTP caller that sends no deadline is served without a limit.
+- The gateway no longer chooses a timeout for any embed or rerank call: the timeouts that were derived from payload size are gone from the coordinator, the consolidation daemon, the capability probe and the encoder-window probe.
+- Encoder connections now carry TCP keepalive, so a half-open connection to a remote encoder is detected. The defaults (idle 60 s, interval 15 s, 4 probes, about two minutes to detect a dead peer) are unmeasured and can be changed with `ENCODER_TCP_KEEPALIVE_IDLE_S`, `ENCODER_TCP_KEEPALIVE_INTERVAL_S` and `ENCODER_TCP_KEEPALIVE_COUNT`.
+- The postflight A9 check waits `A9_WAIT_S` seconds (default 60) for the first capability reading. This bounds only how long the script waits; no encoder call is cut.
+
+### Added
+- `/health` shows, for the embedder and the reranker, `outstanding_count`, `oldest_outstanding_age_s`, `last_completed_at` and `last_deadline_cancelled_at`, so a hung encoder call is visible by its age. The age never changes the health state.
+- `/health` adds `backend_capability.<encoder>.probe_outstanding_age_s` to report how long an in-flight capability probe has been waiting. When a capability probe has waited longer than the probe interval, `projection_stale` reads true.
+- The `embed_deadline_exceeded` refusal is documented in `SKILL.md`.
+
+### Security
+- Security dependencies were reviewed. No pin moved in this release.
+
+### Removed
+- `embed_ceiling`, `rerank_ceiling` and the settings `EMBED_MIN_TOK_S`, `EMBED_SAFETY_FACTOR`, `EMBED_TIMEOUT_FLOOR_S`, `RERANK_MIN_CHARS_S`, `RERANK_SAFETY_FACTOR`, `RERANK_TIMEOUT_FLOOR_S` and `ENCODER_LATENCY_WARN_MS` are removed. If a deployment still sets them, the gateway ignores them.
+- The capability status `too_slow`, the `/health` keys `backend_capability.*.ceiling_s`, `backend_capability.*.serves_full_payload` and `encoders.limit_ms`, and the `encoder_*_projected_ms` warning are removed. A slow encoder now reads `ok`, and its measured `projected_full_payload_s` stays. The three keys are retired in the telemetry contract with `removed_in` 1.2.0. This changes what the monitor receives.
+
 ## [1.1.7] - 2026-11-16
 
 ### Changed

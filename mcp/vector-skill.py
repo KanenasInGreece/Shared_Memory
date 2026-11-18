@@ -215,8 +215,8 @@ AGENT_ID = os.environ.get("AGENT_ID", "vector_skill")
 
 # API_VERSION is the wire contract; bump only when shape, auth, routes, or a monitor
 # contract change breaks older clients. v6: entries carry text, text_is, full_record.
-API_VERSION = 6
-VERSION = "1.1.7"
+API_VERSION = 7
+VERSION = "1.2.0"
 CLIENT_VERSION_HEADER = "X-SM-Api-Version"
 # Framework build, separate from api_version, so two clients on the same wire contract can still be counted apart in clients.versions_seen.
 CLIENT_BUILD_HEADER = "X-Shared-Memory-Client"
@@ -327,7 +327,8 @@ async def _fetch_health_blocks() -> None:
             async with _async_client(HEALTH_PROBE_TIMEOUT_S) as client:
                 health = _reply_json(await client.get(f"{COORDINATOR_BASE}/health",
                                                       headers=_auth_headers()),
-                                     "_fetch_health_blocks")
+                                     "_fetch_health_blocks", accept_status=(503,),
+                                     log_auth=False)
             block = health.get("backend_capability")
             _CAPABILITY_CACHE = block if isinstance(block, dict) else {}
             capacity = health.get("capacity")
@@ -438,7 +439,7 @@ def _error_obj(message: str) -> dict:
     return {"status": "error", "message": message}
 
 
-def _auth_rejected(tool: str) -> dict:
+def _auth_rejected(tool: str, log: bool = True) -> dict:
     """The one 401 object, logged under the calling tool's name so the audit trail says which call was rejected.
 
     It branches on whether a credential was sent, because a 401 with no
@@ -448,13 +449,15 @@ def _auth_rejected(tool: str) -> dict:
     where = ("this client's own .env (beside this script, or wherever "
              "VECTOR_SKILL_ENV points), or in the MCP host's env block")
     if presented:
-        _append_log(tool, 2, "auth_failed",
-                    {"hint": "Check AGENT_TOKEN matches a gateway AGENT_TOKENS entry"})
+        if log:
+            _append_log(tool, 2, "auth_failed",
+                        {"hint": "Check AGENT_TOKEN matches a gateway AGENT_TOKENS entry"})
         return _error_obj(
             f"The gateway rejected this client's token. Set AGENT_TOKEN in "
             f"{where}. It must match an entry in the gateway's AGENT_TOKENS.")
-    _append_log(tool, 2, "auth_failed",
-                {"hint": "No AGENT_TOKEN was sent; the gateway requires auth"})
+    if log:
+        _append_log(tool, 2, "auth_failed",
+                    {"hint": "No AGENT_TOKEN was sent; the gateway requires auth"})
     return _error_obj(
         f"No AGENT_TOKEN was sent and the gateway requires "
         f"authentication. Set AGENT_TOKEN in {where}.")
@@ -517,7 +520,7 @@ async def check_gateway_compat() -> dict:
         async with _async_client(3.0) as client:
             h = _reply_json(await client.get(f"{COORDINATOR_BASE}/health",
                                              headers=_auth_headers()),
-                            "check_gateway_compat")
+                            "check_gateway_compat", accept_status=(503,))
     except GatewayReplyError as exc:
         # The gateway answered. Marking this unreachable would send the reader to restart a
         # service that is only refusing.
@@ -638,12 +641,13 @@ def _refusal_object(message: str, parsed: object) -> dict:
     return out
 
 
-def _reply_json(r, tool: str, accept_status: tuple = ()) -> dict:
+def _reply_json(r, tool: str, accept_status: tuple = (), log_auth: bool = True) -> dict:
     """Decode JSON only after the status class is known (fact:1503)."""
     # _auth_rejected has already logged `auth_failed`, which is what
     # `logged_event` tells the catch block.
     if r.status_code == 401:
-        raise GatewayReplyError(_auth_rejected(tool), logged_event="auth_failed")
+        raise GatewayReplyError(_auth_rejected(tool, log_auth),
+                                logged_event="auth_failed" if log_auth else None)
 
     # The gateway's own words come before this client's framing.
     # The error code is part of that answer: decision_not_visible is not a role refusal, and the sentence alone hides the code.
@@ -886,7 +890,10 @@ async def _search_payload(query: str, limit: int = 5, project: str = "",
     """Make the search call and return the decoded payload, or the error object the CLI would print, so one round trip feeds both the unranked and the keyword-fallback warnings."""
     # Sized from the gateway's published cost, never a constant.
     ceiling = search_ceiling(await _gateway_capability(), await _gateway_capacity())
-    body = {"query": query, "limit": limit, "agent_id": AGENT_ID}
+    body = {"query": query, "limit": limit, "agent_id": AGENT_ID, "wait_s": ceiling}
+    encoder_wait = ceiling - SEARCH_OVERHEAD_S
+    if encoder_wait > 0:
+        body["encoder_wait_s"] = encoder_wait
     if project:
         body["project"] = project
     _domains = _domain_names(domains)
@@ -1229,11 +1236,25 @@ async def save_artifact(content: str, metadata_json: str = "{}") -> str:
 
 async def _post_save(tool: str, content: str, metadata: dict):
     """POST /memory/save with the body the CLI posts: content, metadata exactly as the caller built it, and agent_id; the reply object, or the JSON text of the error object."""
+    body = {"content": content, "metadata": metadata, "agent_id": AGENT_ID}
+    capability = await _gateway_capability()
+    embedder = (capability or {}).get("embedder")
     try:
-        async with _async_client(60.0) as client:
+        projected = float(embedder.get("projected_full_payload_s") or 0) if isinstance(embedder, dict) else 0
+    except (TypeError, ValueError):
+        projected = 0
+    # Save uses only the embedder projection; without one, do not invent a deadline.
+    if projected > 0:
+        body["wait_s"] = min(SEARCH_TIMEOUT_MAX_S, max(
+            SEARCH_TIMEOUT_FLOOR_S, projected * SEARCH_SAFETY_FACTOR + SEARCH_OVERHEAD_S))
+
+    try:
+        # Leave time for the gateway's deadline response to reach the caller.
+        timeout = body["wait_s"] + SEARCH_OVERHEAD_S if "wait_s" in body else 60.0
+        async with _async_client(timeout) as client:
             r = await client.post(
                 f"{COORDINATOR_BASE}/memory/save",
-                json={"content": content, "metadata": metadata, "agent_id": AGENT_ID},
+                json=body,
                 headers=_auth_headers(),
             )
             return _reply_json(r, tool)

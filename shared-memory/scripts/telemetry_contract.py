@@ -67,6 +67,7 @@ __all__ = [
     "INTRODUCED_0_9_97",
     "INTRODUCED_0_9_104",
     "INTRODUCED_1_0_45",
+    "INTRODUCED_1_2_0",
     "DUAL_EMIT_DROP_TARGET",
     "WARNING_KEYS",
     "CATEGORIES",
@@ -84,7 +85,7 @@ __all__ = [
 ]
 
 #: Not a free-running today: this is the fifth version pin, so a missed bump is visible (decision:1832).
-VERSION = "1.1.7"
+VERSION = "1.2.0"
 
 
 def _version_tuple(v: str) -> tuple:
@@ -170,6 +171,8 @@ INTRODUCED_1_0_44 = "1.0.44"
 INTRODUCED_1_0_45 = "1.0.45"
 #: New REM/NREM keys for release 2.
 INTRODUCED_1_1_2 = "1.1.2"
+#: Outstanding encoder waits are published instead of a gateway timeout.
+INTRODUCED_1_2_0 = "1.2.0"
 #: A lone consolidation stall stopped degrading the top /health status (fact:2996 ruling 3).
 INTRODUCED_1_0_17 = "1.0.17"
 #: Quiesce sheds writes on auth-off installs and counts every write in flight (fact:2996 ruling 1: the container check).
@@ -181,8 +184,6 @@ TELEMETRY_DUAL_EMIT_DROP_TARGET = "0.9.91"
 
 #: Enumerated so a renamed warning key cannot slip past the guards. Must match the `_warning(` producers, both ways.
 WARNING_KEYS: frozenset[str] = frozenset({
-    "encoder_embedder_projected_ms",
-    "encoder_reranker_projected_ms",
     "outbox_oldest_pending_age_s",
     "rem_dead_lettered",
     "gateway_shed_503_total",
@@ -229,7 +230,7 @@ HEALTH: dict[str, dict] = {
         "ok | degraded | down. down when the liveness probe failed, or when a "
         "configured key is refused (the probe or the capability status is "
         "auth_failed). degraded when the encoder is live but capability is "
-        "too_slow or failing, or the window is short or overrun. A refused "
+        "failing, or the window is short or overrun. A refused "
         "key is judged before the window, so a window verdict cannot mask it.")),
     "dependencies.embedder.reason": _k("str|null", "dependencies", since=INTRODUCED_0_9_74),
     "dependencies.reranker.state": _k("str", "dependencies", since=INTRODUCED_0_9_74,
@@ -239,6 +240,22 @@ HEALTH: dict[str, dict] = {
         "(probe or capability auth_failed, including /health 401 or 403) is "
         "degraded, not down. Any other probe failure is still down.")),
     "dependencies.reranker.reason": _k("str|null", "dependencies", since=INTRODUCED_0_9_74),
+    "dependencies.embedder.outstanding_count": _k("int", "dependencies", since=INTRODUCED_1_2_0,
+        note="Reports how many calls are currently waiting on this encoder (0 means none). The gateway publishes this count and the waiting age instead of imposing a gateway timeout."),
+    "dependencies.embedder.oldest_outstanding_age_s": _k("float|null", "dependencies", since=INTRODUCED_1_2_0,
+        note="Reports in seconds how long the oldest in-flight call has been waiting on this encoder, rounded to one decimal, or null when none is waiting. The gateway publishes this age instead of imposing a gateway timeout; it never changes health state or triggers a warning."),
+    "dependencies.embedder.last_completed_at": _k("str|null", "dependencies", since=INTRODUCED_1_2_0,
+        note="Reports the ISO UTC wall time when an upstream POST last returned a response (including an error response), or null if none has completed yet. It complements the waiting-age fields that replace a gateway timeout."),
+    "dependencies.embedder.last_deadline_cancelled_at": _k("str|null", "dependencies", since=INTRODUCED_1_2_0,
+        note="Reports the ISO UTC wall time of the last caller-deadline cancellation, or null if none has occurred. Client disconnects do not update this timestamp."),
+    "dependencies.reranker.outstanding_count": _k("int", "dependencies", since=INTRODUCED_1_2_0,
+        note="Reports how many calls are currently waiting on this encoder (0 means none). The gateway publishes this count and the waiting age instead of imposing a gateway timeout."),
+    "dependencies.reranker.oldest_outstanding_age_s": _k("float|null", "dependencies", since=INTRODUCED_1_2_0,
+        note="Reports in seconds how long the oldest in-flight call has been waiting on this encoder, rounded to one decimal, or null when none is waiting. The gateway publishes this age instead of imposing a gateway timeout; it never changes health state or triggers a warning."),
+    "dependencies.reranker.last_completed_at": _k("str|null", "dependencies", since=INTRODUCED_1_2_0,
+        note="Reports the ISO UTC wall time when an upstream POST last returned a response (including an error response), or null if none has completed yet. It complements the waiting-age fields that replace a gateway timeout."),
+    "dependencies.reranker.last_deadline_cancelled_at": _k("str|null", "dependencies", since=INTRODUCED_1_2_0,
+        note="Reports the ISO UTC wall time of the last caller-deadline cancellation, or null if none has occurred. Client disconnects do not update this timestamp."),
     "dependencies.llm_pool.state": _k("str", "dependencies", since=INTRODUCED_0_9_74,
                                       log="health.llm_pool", note=(
         "ok | degraded | down | unknown. unknown iff no backend has been "
@@ -309,12 +326,20 @@ HEALTH: dict[str, dict] = {
     "backend_capability.*.probe_chars": _k("int", "encoders", unit="_chars"),
     "backend_capability.*.latency_s": _k("float", "encoders", unit="_s"),
     "backend_capability.*.throughput_chars_s": _k("int|float", "encoders"),
-    "backend_capability.*.projected_full_payload_s": _k("float", "encoders", unit="_s"),
-    "backend_capability.*.ceiling_s": _k("float", "encoders", unit="_s"),
-    "backend_capability.*.serves_full_payload": _k("bool", "encoders"),
+    "backend_capability.*.projected_full_payload_s": _k("float", "encoders", unit="_s",
+        note="Projects the full-payload duration in seconds from measured throughput; the gateway compares no timeout limit against it."),
+    "backend_capability.*.ceiling_s": _k("float", "encoders", unit="_s",
+                                            removed_in=INTRODUCED_1_2_0),
+    "backend_capability.*.serves_full_payload": _k("bool", "encoders",
+                                                      removed_in=INTRODUCED_1_2_0),
     "backend_capability.*.status": _k("str", "encoders", note=(
-        "ok | too_slow | failing | auth_failed. auth_failed means a configured "
+        "ok | failing | auth_failed. auth_failed means a configured "
         "key was refused on the probe POST. With no key configured, a 401 stays failing.")),
+    "backend_capability.*.probe_outstanding_age_s": _k(
+        "float|null", "encoders", since=INTRODUCED_1_2_0, unit="_s",
+        note="Reports in seconds how long a capability probe request has been waiting, or null when no probe is in flight. "
+             "It replaces a probe timeout; while it exceeds the probe interval, "
+             "a measured projection reports projection_stale=true."),
     "backend_capability.*.projection_stale": _k("bool", "encoders"),
     "backend_capability.*.last_ok_at": _k("str|null", "encoders"),
     "backend_capability.*.projection_age_s": _k("float|null", "encoders", unit="_s"),
@@ -698,13 +723,7 @@ TELEMETRY: dict[str, dict] = {
     "encoders.embed.errors": _k("int", "encoders", since=INTRODUCED_0_9_74),
     "encoders.embed.p50_ms": _k("float|null", "encoders", unit="_ms", since=INTRODUCED_0_9_74),
     "encoders.embed.p95_ms": _k("float|null", "encoders", unit="_ms", since=INTRODUCED_0_9_74,
-                                note=(
-        "NOT the field `encoder_embedder_projected_ms` observes — that warning "
-        "compares backend_capability.embedder.projected_full_payload_s against "
-        "encoders.limit_ms, never this p95 ring. No `log=` here: the wildcarded "
-        "backend_capability.*.projected_full_payload_s entry cannot carry a "
-        "single per-encoder log string, so there is no field this p95 can "
-        "correctly point at (QA fix round, finding 3).")),
+        note="Reports the measured call-latency percentile, which is distinct from the full-payload throughput projection."),
     "encoders.embed.max_ms": _k("float|null", "encoders", unit="_ms", since=INTRODUCED_0_9_74),
     "encoders.embed.last_ms": _k("float|null", "encoders", unit="_ms", since=INTRODUCED_0_9_74),
     "encoders.embed.last_payload_chars": _k("int|null", "encoders", unit="_chars",
@@ -716,24 +735,14 @@ TELEMETRY: dict[str, dict] = {
     "encoders.rerank.errors": _k("int", "encoders", since=INTRODUCED_0_9_74),
     "encoders.rerank.p50_ms": _k("float|null", "encoders", unit="_ms", since=INTRODUCED_0_9_74),
     "encoders.rerank.p95_ms": _k("float|null", "encoders", unit="_ms", since=INTRODUCED_0_9_74,
-                                 note=(
-        "NOT the field `encoder_reranker_projected_ms` observes — same "
-        "reasoning as encoders.embed.p95_ms's note: the warning compares "
-        "backend_capability.reranker.projected_full_payload_s against "
-        "encoders.limit_ms, and the wildcarded capability field cannot carry "
-        "a per-encoder `log=` either. No `log=` here (QA fix round, finding 3).")),
+        note="Reports the measured call-latency percentile, which is distinct from the full-payload throughput projection."),
     "encoders.rerank.max_ms": _k("float|null", "encoders", unit="_ms", since=INTRODUCED_0_9_74),
     "encoders.rerank.last_ms": _k("float|null", "encoders", unit="_ms", since=INTRODUCED_0_9_74),
     "encoders.rerank.last_payload_chars": _k("int|null", "encoders", unit="_chars",
                                              since=INTRODUCED_0_9_74),
     "encoders.rerank.window": _k("int", "encoders", since=INTRODUCED_0_9_74),
-    "encoders.limit_ms": _k("float|null", "encoders", unit="_ms", since=INTRODUCED_0_9_74, note=(
-        "ENCODER_LATENCY_WARN_MS — the limit "
-        "backend_capability.*.projected_full_payload_s (NOT the p95s above) is "
-        "compared against, per encoder, to raise "
-        "encoder_{embedder,reranker}_projected_ms; null means it is derived "
-        "per-encoder from backend_capability.*.ceiling_s rather than pinned by "
-        "env (QA fix round, finding 3: this note previously named the p95s).")),
+    "encoders.limit_ms": _k("float|null", "encoders", unit="_ms", since=INTRODUCED_0_9_74,
+                            removed_in=INTRODUCED_1_2_0),
     "encoders.embed_window_overruns_total": _k("int", "encoders", unit="_total",
                                                since=INTRODUCED_0_9_104,
                                                note="every overshoot the gateway snapped and retried"),

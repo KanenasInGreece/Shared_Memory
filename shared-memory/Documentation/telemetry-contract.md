@@ -3,7 +3,7 @@
 
 # The Telemetry Contract
 
-Contract version **1.1.7**. Every key the gateway emits on `GET /health` and `GET /memory/telemetry`, what it means, what it is measured in, when it arrived, and where it is going.
+Contract version **1.2.0**. Every key the gateway emits on `GET /health` and `GET /memory/telemetry`, what it means, what it is measured in, when it arrived, and where it is going.
 
 ## The roles
 
@@ -19,8 +19,6 @@ The logs are the final word on *what happened at 03:12*: every dependency state 
 
 `warnings[].key` (CG, OBS round) is one of this enumerated set — never a free string. Each is produced by exactly one `_warning(...)` call site in `hive_mind_proxy.py`'s health-build function; the log line it writes when raised or cleared is `health.warning.<key>`.
 
-- `encoder_embedder_projected_ms`
-- `encoder_reranker_projected_ms`
 - `gateway_shed_503_total`
 - `outbox_oldest_pending_age_s`
 - `rem_dead_lettered`
@@ -240,6 +238,14 @@ Each key below was moved to a new home and served from both places while consume
 | `GET /memory/telemetry` | `rem.failing` | removed, no replacement |
 | `GET /memory/telemetry` | `rem.max_attempts` | removed, no replacement |
 
+### Dropped in 1.2.0
+
+| endpoint | old key | read instead |
+|---|---|---|
+| `GET /health` | `backend_capability.*.ceiling_s` | removed, no replacement |
+| `GET /health` | `backend_capability.*.serves_full_payload` | removed, no replacement |
+| `GET /memory/telemetry` | `encoders.limit_ms` | removed, no replacement |
+
 ## `GET /health`
 
 Paths are relative to the response object.
@@ -259,8 +265,12 @@ Paths are relative to the response object.
 
 | key | type | unit | since | moved to | removed in | log twin | notes |
 |---|---|---|---|---|---|---|---|
+| `dependencies.embedder.last_completed_at` | str/null | — | 1.2.0 | — | — | — | Reports the ISO UTC wall time when an upstream POST last returned a response (including an error response), or null if none has completed yet. It complements the waiting-age fields that replace a gateway timeout. |
+| `dependencies.embedder.last_deadline_cancelled_at` | str/null | — | 1.2.0 | — | — | — | Reports the ISO UTC wall time of the last caller-deadline cancellation, or null if none has occurred. Client disconnects do not update this timestamp. |
+| `dependencies.embedder.oldest_outstanding_age_s` | float/null | — | 1.2.0 | — | — | — | Reports in seconds how long the oldest in-flight call has been waiting on this encoder, rounded to one decimal, or null when none is waiting. The gateway publishes this age instead of imposing a gateway timeout; it never changes health state or triggers a warning. |
+| `dependencies.embedder.outstanding_count` | int | — | 1.2.0 | — | — | — | Reports how many calls are currently waiting on this encoder (0 means none). The gateway publishes this count and the waiting age instead of imposing a gateway timeout. |
 | `dependencies.embedder.reason` | str/null | — | 0.9.74 | — | — | — | — |
-| `dependencies.embedder.state` | str | — | 0.9.74 | — | — | `health.embedder` | ok \| degraded \| down. down when the liveness probe failed, or when a configured key is refused (the probe or the capability status is auth_failed). degraded when the encoder is live but capability is too_slow or failing, or the window is short or overrun. A refused key is judged before the window, so a window verdict cannot mask it. |
+| `dependencies.embedder.state` | str | — | 0.9.74 | — | — | `health.embedder` | ok \| degraded \| down. down when the liveness probe failed, or when a configured key is refused (the probe or the capability status is auth_failed). degraded when the encoder is live but capability is failing, or the window is short or overrun. A refused key is judged before the window, so a window verdict cannot mask it. |
 | `dependencies.llm_pool.reason` | str/null | — | 0.9.74 | — | — | — | — |
 | `dependencies.llm_pool.state` | str | — | 0.9.74 | — | — | `health.llm_pool` | ok \| degraded \| down \| unknown. unknown iff no backend has been probed at all. down iff every probed backend is down — liveness is never softened by configuration. degraded: some (not all) backends down, OR a declared fleet was entirely excluded (the legacy fallback is serving instead), OR nothing was declared at all (W2, decision:1832 — the built-in fallback IS serving), OR every probed backend answers but none is ELIGIBLE for any traffic class (W2, fleet-wide only — see MEANING_CHANGES) |
 | `dependencies.neo4j.reason` | str/null | — | 0.9.74 | — | — | — | — |
@@ -275,6 +285,10 @@ Paths are relative to the response object.
 | `dependencies.registry.state` | str | — | 0.9.74 | — | — | `health.registry` | ok \| degraded \| unknown — unknown before the first registry census; degraded iff a read failure or a census failure has been counted. Never down: an unreadable registry degrades axis resolution, it does not take the gateway down |
 | `dependencies.rem_daemon.reason` | str/null | — | 0.9.74 | — | — | — | — |
 | `dependencies.rem_daemon.state` | str | — | 0.9.74 | — | — | `health.rem_daemon` | ok \| degraded \| down. down when the REM process is not running, or when llm_backlog cannot be read (reason: llm_backlog unreadable; the daemons stay stopped). degraded: dead_letters:N counts pending records with a backlog row, OR no backend counts toward dream slots (REM structurally cannot run against this fleet) — both reasons appear together when both apply |
+| `dependencies.reranker.last_completed_at` | str/null | — | 1.2.0 | — | — | — | Reports the ISO UTC wall time when an upstream POST last returned a response (including an error response), or null if none has completed yet. It complements the waiting-age fields that replace a gateway timeout. |
+| `dependencies.reranker.last_deadline_cancelled_at` | str/null | — | 1.2.0 | — | — | — | Reports the ISO UTC wall time of the last caller-deadline cancellation, or null if none has occurred. Client disconnects do not update this timestamp. |
+| `dependencies.reranker.oldest_outstanding_age_s` | float/null | — | 1.2.0 | — | — | — | Reports in seconds how long the oldest in-flight call has been waiting on this encoder, rounded to one decimal, or null when none is waiting. The gateway publishes this age instead of imposing a gateway timeout; it never changes health state or triggers a warning. |
+| `dependencies.reranker.outstanding_count` | int | — | 1.2.0 | — | — | — | Reports how many calls are currently waiting on this encoder (0 means none). The gateway publishes this count and the waiting age instead of imposing a gateway timeout. |
 | `dependencies.reranker.reason` | str/null | — | 0.9.74 | — | — | — | — |
 | `dependencies.reranker.state` | str | — | 0.9.74 | — | — | `health.reranker` | ok \| degraded \| down. down when the liveness probe failed for a reason other than a refused key. A configured key the reranker refuses (probe or capability auth_failed, including /health 401 or 403) is degraded, not down. Any other probe failure is still down. |
 
@@ -302,15 +316,14 @@ Paths are relative to the response object.
 
 | key | type | unit | since | moved to | removed in | log twin | notes |
 |---|---|---|---|---|---|---|---|
-| `backend_capability.*.ceiling_s` | float | _s | <=0.9.73 | — | — | — | — |
 | `backend_capability.*.last_ok_at` | str/null | — | <=0.9.73 | — | — | — | — |
 | `backend_capability.*.latency_s` | float | _s | <=0.9.73 | — | — | — | — |
 | `backend_capability.*.probe_chars` | int | _chars | <=0.9.73 | — | — | — | — |
-| `backend_capability.*.projected_full_payload_s` | float | _s | <=0.9.73 | — | — | — | — |
+| `backend_capability.*.probe_outstanding_age_s` | float/null | _s | 1.2.0 | — | — | — | Reports in seconds how long a capability probe request has been waiting, or null when no probe is in flight. It replaces a probe timeout; while it exceeds the probe interval, a measured projection reports projection_stale=true. |
+| `backend_capability.*.projected_full_payload_s` | float | _s | <=0.9.73 | — | — | — | Projects the full-payload duration in seconds from measured throughput; the gateway compares no timeout limit against it. |
 | `backend_capability.*.projection_age_s` | float/null | _s | <=0.9.73 | — | — | — | — |
 | `backend_capability.*.projection_stale` | bool | — | <=0.9.73 | — | — | — | — |
-| `backend_capability.*.serves_full_payload` | bool | — | <=0.9.73 | — | — | — | — |
-| `backend_capability.*.status` | str | — | <=0.9.73 | — | — | — | ok \| too_slow \| failing \| auth_failed. auth_failed means a configured key was refused on the probe POST. With no key configured, a 401 stays failing. |
+| `backend_capability.*.status` | str | — | <=0.9.73 | — | — | — | ok \| failing \| auth_failed. auth_failed means a configured key was refused on the probe POST. With no key configured, a 401 stays failing. |
 | `backend_capability.*.throughput_chars_s` | int/float | — | <=0.9.73 | — | — | — | — |
 | `backend_capability.gateway_host_load1` | float/null | — | <=0.9.73 | — | — | — | — |
 | `backend_capability.probed_at` | str/null | — | <=0.9.73 | — | — | — | — |
@@ -451,18 +464,17 @@ The envelope is `{"status": "success", "telemetry": {…}}`; paths below are rel
 | `encoders.embed.last_payload_chars` | int/null | _chars | 0.9.74 | — | — | — | — |
 | `encoders.embed.max_ms` | float/null | _ms | 0.9.74 | — | — | — | — |
 | `encoders.embed.p50_ms` | float/null | _ms | 0.9.74 | — | — | — | — |
-| `encoders.embed.p95_ms` | float/null | _ms | 0.9.74 | — | — | — | NOT the field `encoder_embedder_projected_ms` observes — that warning compares backend_capability.embedder.projected_full_payload_s against encoders.limit_ms, never this p95 ring. No `log=` here: the wildcarded backend_capability.*.projected_full_payload_s entry cannot carry a single per-encoder log string, so there is no field this p95 can correctly point at (QA fix round, finding 3). |
+| `encoders.embed.p95_ms` | float/null | _ms | 0.9.74 | — | — | — | Reports the measured call-latency percentile, which is distinct from the full-payload throughput projection. |
 | `encoders.embed.window` | int | — | 0.9.74 | — | — | — | observations the percentiles were computed over — NOT the ring's capacity. p95 over 3 calls is not a p95. |
 | `encoders.embed_window_overruns_last_ts` | str/null | — | 0.9.104 | — | — | — | — |
 | `encoders.embed_window_overruns_total` | int | _total | 0.9.104 | — | — | — | every overshoot the gateway snapped and retried |
-| `encoders.limit_ms` | float/null | _ms | 0.9.74 | — | — | — | ENCODER_LATENCY_WARN_MS — the limit backend_capability.*.projected_full_payload_s (NOT the p95s above) is compared against, per encoder, to raise encoder_{embedder,reranker}_projected_ms; null means it is derived per-encoder from backend_capability.*.ceiling_s rather than pinned by env (QA fix round, finding 3: this note previously named the p95s). |
 | `encoders.rerank.calls` | int | — | 0.9.74 | — | — | — | — |
 | `encoders.rerank.errors` | int | — | 0.9.74 | — | — | — | — |
 | `encoders.rerank.last_ms` | float/null | _ms | 0.9.74 | — | — | — | — |
 | `encoders.rerank.last_payload_chars` | int/null | _chars | 0.9.74 | — | — | — | — |
 | `encoders.rerank.max_ms` | float/null | _ms | 0.9.74 | — | — | — | — |
 | `encoders.rerank.p50_ms` | float/null | _ms | 0.9.74 | — | — | — | — |
-| `encoders.rerank.p95_ms` | float/null | _ms | 0.9.74 | — | — | — | NOT the field `encoder_reranker_projected_ms` observes — same reasoning as encoders.embed.p95_ms's note: the warning compares backend_capability.reranker.projected_full_payload_s against encoders.limit_ms, and the wildcarded capability field cannot carry a per-encoder `log=` either. No `log=` here (QA fix round, finding 3). |
+| `encoders.rerank.p95_ms` | float/null | _ms | 0.9.74 | — | — | — | Reports the measured call-latency percentile, which is distinct from the full-payload throughput projection. |
 | `encoders.rerank.window` | int | — | 0.9.74 | — | — | — | — |
 | `rerank_fallbacks_last_ts` | str/null | — | <=0.9.73 | — | — | — | — |
 | `rerank_fallbacks_total` | int | _total | <=0.9.73 | — | — | — | — |

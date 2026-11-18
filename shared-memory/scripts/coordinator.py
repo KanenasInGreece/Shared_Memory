@@ -137,10 +137,10 @@ def _short(value: Any, cap: int = 200) -> str:
 
 
 # FRAMEWORK_VERSION is the build string and may drift.
-FRAMEWORK_VERSION = "1.1.7"
+FRAMEWORK_VERSION = "1.2.0"
 # API_VERSION is the wire contract; bump only when shape, auth, routes, or a monitor
 # contract change breaks older clients. v6: entries carry text, text_is, full_record.
-API_VERSION = 6
+API_VERSION = 7
 CLIENT_VERSION_HEADER = "X-SM-Api-Version"
 #: Client build, not API_VERSION. The same wire version can hide an older build, and a client that omits the header is not counted.
 CLIENT_BUILD_HEADER = "X-Shared-Memory-Client"
@@ -2331,9 +2331,8 @@ EMBED_BACKOFF = 0.5      # seconds × attempt number  (0.5 s, 1 s, 1.5 s, 2 s)
 # Truncate embedding input to the dream_telemetry char budget from the 8192-token context; full text stays in Tier 1.
 from dream_telemetry import (EMBED_CHARS_PER_TOKEN, EMBED_MAX_CHARS,  # noqa: E402
                              EMBED_MAX_CONTEXT_TOKENS, EMBED_SPECIAL_TOKEN_RESERVE,
-                             EMBED_TIMEOUT_FLOOR_S, RERANK_MAX_DOC_CHARS,
-                             clamp_rerank_doc, prefix_rerank_doc, prefix_rerank_query,
-                             embed_ceiling, rerank_ceiling)
+                             RERANK_MAX_DOC_CHARS,
+                             clamp_rerank_doc, prefix_rerank_doc, prefix_rerank_query)
 
 
 # Edges shown per search hit. The Cypher orders asserted and typed relations ahead of bare MENTIONS so the cap keeps the signal.
@@ -2642,9 +2641,6 @@ ENCODER_LATENCY_WINDOW = int(os.environ.get("ENCODER_LATENCY_WINDOW", "200"))
 #: Own window for the pool-wait and Neo4j rings. Sharing the encoder window let one rename move three instruments. Both unmeasured.
 POOL_WAIT_WINDOW = int(os.environ.get("POOL_WAIT_WINDOW", str(ENCODER_LATENCY_WINDOW)))
 NEO4J_LATENCY_WINDOW = int(os.environ.get("NEO4J_LATENCY_WINDOW", str(ENCODER_LATENCY_WINDOW)))
-#: Encoder p95 warning. None means derive it from the measured capability ceiling; set the env only to pin a flat one.
-_ENCODER_WARN_RAW = os.environ.get("ENCODER_LATENCY_WARN_MS", "").strip()
-ENCODER_LATENCY_WARN_MS = float(_ENCODER_WARN_RAW) if _ENCODER_WARN_RAW else None
 #: Pending-outbox age that marks the dependency degraded. Unmeasured: one hour is a round number, not an observed drain time.
 OUTBOX_AGE_WARN_S = int(os.environ.get("OUTBOX_AGE_WARN_S", "3600"))
 #: token_verify_failed climbing faster than this raises a /health warning.
@@ -3886,6 +3882,106 @@ def _outbox_public_view(census: dict) -> dict:
 
 # ── Coordinator ───────────────────────────────────────────────────────────────
 
+_keepalive_warned = set()
+
+
+def encoder_keepalive_options() -> list[tuple[int, int, int]]:
+    """Detect dead encoder peers without limiting a live peer's response time."""
+    # UNMEASURED defaults: dead-peer detection in about two minutes, not an inference deadline.
+    settings = (
+        ("SOL_SOCKET", "SO_KEEPALIVE", None, 1),
+        ("IPPROTO_TCP", "TCP_KEEPIDLE", "ENCODER_TCP_KEEPALIVE_IDLE_S", 60),
+        ("IPPROTO_TCP", "TCP_KEEPINTVL", "ENCODER_TCP_KEEPALIVE_INTERVAL_S", 15),
+        ("IPPROTO_TCP", "TCP_KEEPCNT", "ENCODER_TCP_KEEPALIVE_COUNT", 4),
+    )
+    options = []
+    for level, option, env, default in settings:
+        value = default
+        if env:
+            try:
+                value = int(os.environ.get(env, default))
+                if value <= 0:
+                    raise ValueError
+            except ValueError:
+                value = default
+                if env not in _keepalive_warned:
+                    _keepalive_warned.add(env)
+                    log.warning("%s must be a positive integer; using %s", env, default)
+        if hasattr(socket, level) and hasattr(socket, option):
+            options.append((getattr(socket, level), getattr(socket, option), value))
+    return options
+
+
+class OutstandingCalls:
+    """Calls waiting on the encoder, measured without imposing a time limit."""
+
+    def __init__(self):
+        self._waiting = {}
+        self._next_token = 0
+        self._last_completed_at = None
+        self._last_deadline_cancelled_at = None
+
+    def begin(self) -> int:
+        self._next_token += 1
+        self._waiting[self._next_token] = time.monotonic()
+        return self._next_token
+
+    def end(self, token, completed: bool):
+        if token not in self._waiting:
+            return
+        del self._waiting[token]
+        if completed:
+            self._last_completed_at = datetime.now(timezone.utc).isoformat()
+
+    def mark_deadline_cancelled(self):
+        self._last_deadline_cancelled_at = datetime.now(timezone.utc).isoformat()
+
+    def oldest_age_s(self) -> float | None:
+        return time.monotonic() - min(self._waiting.values()) if self._waiting else None
+
+    def snapshot(self) -> dict:
+        age = self.oldest_age_s()
+        return {
+            "outstanding_count": len(self._waiting),
+            "oldest_outstanding_age_s": (
+                round(age, 1) if age is not None else None),
+            "last_completed_at": self._last_completed_at,
+            "last_deadline_cancelled_at": self._last_deadline_cancelled_at,
+        }
+
+
+async def _tracked(calls, coro):
+    token = calls.begin()
+    completed = False
+    try:
+        response = await coro
+        completed = True
+        return response
+    finally:
+        calls.end(token, completed=completed)
+
+
+def encoder_deadline(arrived, seconds):
+    """Convert a positive, finite numeric caller budget to a monotonic deadline."""
+    if isinstance(seconds, bool) or not isinstance(seconds, (int, float)):
+        return None
+    if seconds <= 0 or (isinstance(seconds, float) and not math.isfinite(seconds)):
+        return None
+    try:
+        deadline = arrived + seconds
+        return deadline if math.isfinite(deadline) else None
+    except OverflowError:
+        return None
+
+
+class EncoderDeadlineExceeded(Exception):
+    """The caller's encoder deadline passed."""
+
+
+class CallerDisconnected(Exception):
+    """The caller left before the encoder call completed."""
+
+
 class MemoryCoordinator:
     """
     Single-process coordinator for all memory writes and reads.
@@ -3893,6 +3989,41 @@ class MemoryCoordinator:
     Instantiate once, await start() during app startup, await stop() on shutdown.
     Routes are registered via attach() — the only coupling point with aiohttp.
     """
+
+    def encoder_calls_snapshot(self) -> dict:
+        return {
+            "embedder": self._embed_calls.snapshot(),
+            "reranker": self._rerank_calls.snapshot(),
+        }
+
+    async def _await_encoder(self, request, call, deadline, calls=None):
+        """Await one encoder call until it finishes or its caller leaves or expires."""
+        task = asyncio.create_task(call)
+        try:
+            while not task.done():
+                transport = request.transport
+                if transport is None or transport.is_closing() is True:
+                    raise CallerDisconnected()
+                # Polling detects disconnects; the gateway imposes no total timeout.
+                interval = 0.25
+                if deadline is not None:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise EncoderDeadlineExceeded()
+                    interval = min(interval, remaining)
+                await asyncio.wait({task}, timeout=interval)
+            return task.result()
+        except BaseException as exc:
+            if isinstance(exc, EncoderDeadlineExceeded) and calls is not None:
+                calls.mark_deadline_cancelled()
+            if not task.done():
+                task.cancel()
+            # Drain upstream cleanup before propagating the caller's termination.
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+            raise
 
     def __init__(self) -> None:
         self._pool: asyncpg.Pool | None = None
@@ -3904,6 +4035,8 @@ class MemoryCoordinator:
         self.hnsw_iterative_scan: bool = False
 
         # Work-path instruments go through telemetry_instruments (never await). Encoder per-call latency is observed here, not the 600s probe.
+        self._embed_calls = OutstandingCalls()
+        self._rerank_calls = OutstandingCalls()
         self._embed_ring = LatencyRing(ENCODER_LATENCY_WINDOW)
         self._rerank_ring = LatencyRing(ENCODER_LATENCY_WINDOW)
         # How long _acquire blocked. This climbs before saturation becomes a 503.
@@ -3929,6 +4062,8 @@ class MemoryCoordinator:
         # The reranker falls back to vector order and still answers, so a failure is silent unless failures rise against a flat success count.
         self._rerank_successes = 0
         self._rerank_failures = 0
+        self._rerank_deadline_cancelled_total = 0
+        self._rerank_deadline_last_ts: str | None = None
         # Stamped with _rerank_failures, never taken from the log, so the pair cannot disagree. None until the first fallback.
         self._rerank_fallback_last_ts: str | None = None
         # fact:1314: a failed axis read changes the answer while looking like an unregistered name. This counter is the only signal of that outside one request, and it resets on restart like the rerank pair.
@@ -4166,15 +4301,20 @@ class MemoryCoordinator:
             log.warning("embed input %d chars > %d — truncating to fit BGE-M3 8192-ctx "
                         "(full text kept in Tier 1)", len(text), EMBED_MAX_CHARS)
             text = text[:EMBED_MAX_CHARS]
-        # Timeout follows the clamped length. A constant sized for a short fact under-provisions a long decision, and the 30s client default missed this clamp.
-        ceiling = embed_ceiling(len(text))
         reserved_snap = int((EMBED_MAX_CONTEXT_TOKENS - EMBED_SPECIAL_TOKEN_RESERVE) * EMBED_CHARS_PER_TOKEN)
         for attempt in range(1, EMBED_RETRIES + 1):
             # Time one attempt. The retry loop's sleeps are the retry policy, not the encoder.
             _t0 = time.monotonic()
             try:
-                r = await client.post(EMBED_URL, json={"input": text, "model": "bge-m3"},
-                                      timeout=ceiling, **encoder_auth_kwargs("embedder", EMBED_URL))
+                # safe() so a stubbed owner cannot AttributeError the embed path.
+                token = safe(lambda: self._embed_calls.begin())
+                completed = False
+                try:
+                    r = await client.post(EMBED_URL, json={"input": text, "model": "bge-m3"},
+                                          **encoder_auth_kwargs("embedder", EMBED_URL))
+                    completed = True
+                finally:
+                    safe(lambda: self._embed_calls.end(token, completed))
                 if getattr(r, "status_code", None) == 400:
                     from encoder_window import (
                         classify_overflow,
@@ -4211,7 +4351,6 @@ class MemoryCoordinator:
                                 f"(currently {EMBED_CHARS_PER_TOKEN})."
                             )
                         text = text[:new_len]
-                        ceiling = embed_ceiling(len(text))
                         continue
                 r.raise_for_status()
                 vec = r.json()["data"][0]["embedding"]
@@ -4261,22 +4400,27 @@ class MemoryCoordinator:
         shuffled would otherwise attach every vector to the wrong alternative,
         which is invisible in the data and fatal to the similarity it exists for.
 
-        Same clamp as `_embed`, applied per item, and the timeout is sized on
-        the TOTAL payload because the whole batch travels as one request.
+        Same context-window clamp as `_embed`, applied per item.
         """
         if not texts:
             return []
         clamped = [t[:EMBED_MAX_CHARS] for t in texts]
         total_chars = sum(len(t) for t in clamped)
-        ceiling = embed_ceiling(total_chars)
         reserved_snap = int((EMBED_MAX_CONTEXT_TOKENS - EMBED_SPECIAL_TOKEN_RESERVE) * EMBED_CHARS_PER_TOKEN)
         for attempt in range(1, EMBED_RETRIES + 1):
             _t0 = time.monotonic()
             try:
-                r = await client.post(
-                    EMBED_URL, json={"input": clamped, "model": "bge-m3"},
-                    timeout=ceiling, **encoder_auth_kwargs("embedder", EMBED_URL),
-                )
+                # safe() so a stubbed owner cannot AttributeError the embed path.
+                token = safe(lambda: self._embed_calls.begin())
+                completed = False
+                try:
+                    r = await client.post(
+                        EMBED_URL, json={"input": clamped, "model": "bge-m3"},
+                        **encoder_auth_kwargs("embedder", EMBED_URL),
+                    )
+                    completed = True
+                finally:
+                    safe(lambda: self._embed_calls.end(token, completed))
                 if getattr(r, "status_code", None) == 400:
                     from encoder_window import (
                         classify_overflow,
@@ -4326,7 +4470,6 @@ class MemoryCoordinator:
                             for t in clamped
                         ]
                         total_chars = sum(len(t) for t in clamped)
-                        ceiling = embed_ceiling(total_chars)
                         continue
                 r.raise_for_status()
                 data = r.json()["data"]
@@ -4337,7 +4480,7 @@ class MemoryCoordinator:
                     )
                 ordered = sorted(data, key=lambda d: d.get("index", 0))
                 # A batch is ONE call and is recorded as one — its payload is
-                # the whole batch, which is what the ceiling was sized on.
+                # the whole batch.
                 safe(lambda: self._embed_ring.record(
                     (time.monotonic() - _t0) * 1000.0, payload_chars=total_chars))
                 return [d["embedding"] for d in ordered]
@@ -4768,7 +4911,11 @@ class MemoryCoordinator:
             return 0
 
         try:
-            async with httpx.AsyncClient(timeout=30.0, trust_env=False) as client:
+            # No total timeout by design: keepalive detects dead peers; caller deadlines and disconnects cancel calls.
+            async with httpx.AsyncClient(
+                timeout=None, trust_env=False,
+                transport=httpx.AsyncHTTPTransport(
+                    trust_env=False, socket_options=encoder_keepalive_options())) as client:
                 vectors = await self._embed_many([r["text"] for r in rows], client)
         except Exception as exc:
             await self._defer_pending_alternatives([r["id"] for r in rows], exc)
@@ -7350,6 +7497,7 @@ class MemoryCoordinator:
         return body
 
     async def handle_save(self, request: web.Request) -> web.Response:
+        arrived = time.monotonic()
         try:
             body = await request.json()
         except Exception:
@@ -7357,6 +7505,7 @@ class MemoryCoordinator:
                 {"status": "error", "message": "request body must be JSON"}, status=400
             )
 
+        deadline = encoder_deadline(arrived, body.get("wait_s"))
         content    = body.get("content", "")
         metadata   = _coerce_jsonb_obj(body.get("metadata", {}))
         agent_id   = body.get("agent_id", "unknown")
@@ -7738,9 +7887,21 @@ class MemoryCoordinator:
         entities_rewritten = entities if entities != entities_before else None
 
         # Embedding — hard mandate; no save without a vector
+        # A deadline or departure here leaves entity names already minted but no document or outbox row.
         try:
-            async with httpx.AsyncClient(timeout=30.0, trust_env=False) as client:
-                embedding = await self._embed(content, client)
+            async with httpx.AsyncClient(
+                timeout=None, trust_env=False,
+                transport=httpx.AsyncHTTPTransport(
+                    trust_env=False, socket_options=encoder_keepalive_options())) as client:
+                embedding = await self._await_encoder(request, self._embed(content, client), deadline, calls=self._embed_calls)
+        except EncoderDeadlineExceeded:
+            return web.json_response({
+                "status": "error",
+                "reason": "embed_deadline_exceeded",
+                "message": "The embedder did not finish in time within the caller's wait_s, so nothing was saved.",
+            }, status=503)
+        except CallerDisconnected:
+            return web.Response(status=499)
         except RuntimeError as exc:
             return web.json_response({"status": "error", "message": str(exc)}, status=503)
 
@@ -8282,12 +8443,15 @@ class MemoryCoordinator:
         carry the nuance. Optional grounding (grounded_in + roles) records the
         evidence that measured the outcome — the test-grounded-retrospectives
         rule (decision 542), now structural."""
+        arrived = time.monotonic()
         try:
             body = await request.json()
         except Exception:
             return web.json_response(
                 {"status": "error", "message": "request body must be JSON"}, status=400
             )
+
+        deadline = encoder_deadline(arrived, body.get("wait_s"))
 
         pg_id    = body.get("pg_id")            # TARGET decision's id
         rating   = (body.get("rating") or "").strip().lower()
@@ -8391,8 +8555,19 @@ class MemoryCoordinator:
             f"retrospective:{pg_id}:{date}:{rating}:{notes}".encode()
         ).hexdigest()
         try:
-            async with httpx.AsyncClient(timeout=30.0, trust_env=False) as client:
-                embedding = await self._embed(notes, client)
+            async with httpx.AsyncClient(
+                timeout=None, trust_env=False,
+                transport=httpx.AsyncHTTPTransport(
+                    trust_env=False, socket_options=encoder_keepalive_options())) as client:
+                embedding = await self._await_encoder(request, self._embed(notes, client), deadline, calls=self._embed_calls)
+        except EncoderDeadlineExceeded:
+            return web.json_response({
+                "status": "error",
+                "reason": "embed_deadline_exceeded",
+                "message": "The embedder did not finish in time within the caller's wait_s, so nothing was saved.",
+            }, status=503)
+        except CallerDisconnected:
+            return web.Response(status=499)
         except RuntimeError as exc:
             return web.json_response({"status": "error", "message": str(exc)}, status=503)
 
@@ -9334,6 +9509,7 @@ class MemoryCoordinator:
             entry["summary_refs"] = refs
 
     async def handle_search(self, request: web.Request) -> web.Response:
+        arrived = time.monotonic()
         try:
             body = await request.json()
         except Exception:
@@ -9411,14 +9587,22 @@ class MemoryCoordinator:
                     status=400,
                 )
 
+        deadline = encoder_deadline(arrived, body.get("encoder_wait_s"))
+
         # Resolve typed names once, for every query below. The cap applies to the supplied list, before the registry adds spellings.
         project_values, domain_values, filters_resolved = \
             await self._resolve_search_filters(project, domains_filter)
 
-        async with httpx.AsyncClient(timeout=30.0, trust_env=False) as client:
+        async with httpx.AsyncClient(
+            timeout=None, trust_env=False,
+            transport=httpx.AsyncHTTPTransport(
+                trust_env=False, socket_options=encoder_keepalive_options())) as client:
             try:
-                q_vec = await self._embed(query, client)
-            except RuntimeError:
+                q_vec = await self._await_encoder(
+                    request, self._embed(query, client), deadline, calls=self._embed_calls)
+            except CallerDisconnected:
+                return web.Response(status=499)
+            except (RuntimeError, EncoderDeadlineExceeded):
                 q_vec = None
 
             if q_vec is None:
@@ -9578,45 +9762,53 @@ class MemoryCoordinator:
             reranked = False
             _rr_t0 = time.monotonic()
             try:
-                rr = await client.post(
+                if deadline is not None and time.monotonic() >= deadline:
+                    self._rerank_calls.mark_deadline_cancelled()
+                    raise EncoderDeadlineExceeded()
+                rr = await self._await_encoder(request, _tracked(self._rerank_calls, client.post(
                     RERANK_URL,
                     # llama.cpp honours top_n and ignored top_k. Both are sent; neither is trusted. The slice below enforces the limit.
                     json={"query": prefix_rerank_query(query), "documents": rerank_docs,
                           "top_n": limit, "top_k": limit},
-                    # Derived from the payload, never constant — a constant
-                    # under-provisions exactly the large sets that need it most.
-                    timeout=rerank_ceiling(rerank_docs),
                     **encoder_auth_kwargs("reranker", RERANK_URL),
-                )
+                )), deadline, calls=self._rerank_calls)
                 rr.raise_for_status()
                 ranked = rr.json()["results"]
                 reranked = True
                 safe(lambda: self._rerank_ring.record(
                     (time.monotonic() - _rr_t0) * 1000.0,
                     payload_chars=rerank_payload_chars))
+            except CallerDisconnected:
+                return web.Response(status=499)
             except Exception as exc:
-                safe(lambda: self._rerank_ring.record_error())
-                # Rerank fallback is vector order (logged/counted); a dropped connection adds the OOM-kill sentence, a timeout does not.
-                is_dropped_connection = isinstance(
-                    exc,
-                    (httpx.RemoteProtocolError, httpx.ConnectError, httpx.ReadError),
-                )
-                msg = ("rerank failed (%s: %s) — serving vector order "
-                       "for %d candidates")
-                if is_dropped_connection:
-                    msg += (
-                        " — a dropped connection mid-rerank on a "
-                        "memory-constrained host is most often the kernel "
-                        "OOM-killing the reranker: check your reranker "
-                        "container (llama-reranker or llama-reranker-gpu) — "
-                        "`docker inspect <name> --format '{{.State.OOMKilled}} "
-                        "{{.RestartCount}}'` — and the kernel log (dmesg), and "
-                        "see the capacity record on authenticated /health "
-                        "for this host's derived limits"
+                if isinstance(exc, EncoderDeadlineExceeded):
+                    self._rerank_deadline_cancelled_total += 1
+                    self._rerank_deadline_last_ts = datetime.now(timezone.utc).isoformat()
+                    log.warning("caller deadline passed — serving vector order for %d candidates",
+                                len(rerank_docs))
+                else:
+                    safe(lambda: self._rerank_ring.record_error())
+                    # Rerank fallback is vector order (logged/counted); a dropped connection adds the OOM-kill sentence, while an expired caller deadline does not.
+                    is_dropped_connection = isinstance(
+                        exc,
+                        (httpx.RemoteProtocolError, httpx.ConnectError, httpx.ReadError),
                     )
-                log.warning(msg, type(exc).__name__, scrub_url_credentials(str(exc)), len(rerank_docs))
-                self._rerank_failures += 1
-                self._rerank_fallback_last_ts = datetime.now(timezone.utc).isoformat()
+                    msg = ("rerank failed (%s: %s) — serving vector order "
+                           "for %d candidates")
+                    if is_dropped_connection:
+                        msg += (
+                            " — a dropped connection mid-rerank on a "
+                            "memory-constrained host is most often the kernel "
+                            "OOM-killing the reranker: check your reranker "
+                            "container (llama-reranker or llama-reranker-gpu) — "
+                            "`docker inspect <name> --format '{{.State.OOMKilled}} "
+                            "{{.RestartCount}}'` — and the kernel log (dmesg), and "
+                            "see the capacity record on authenticated /health "
+                            "for this host's derived limits"
+                        )
+                    log.warning(msg, type(exc).__name__, scrub_url_credentials(str(exc)), len(rerank_docs))
+                    self._rerank_failures += 1
+                    self._rerank_fallback_last_ts = datetime.now(timezone.utc).isoformat()
                 # Unranked fallback omits Tier-3: vector distances are not comparable across tables, so narratives get no guessed slot.
                 ranked = [
                     {"index": i + n_t3, "relevance_score": None}
@@ -12124,7 +12316,6 @@ class MemoryCoordinator:
         return {
             "embed": self._embed_ring.snapshot(),
             "rerank": self._rerank_ring.snapshot(),
-            "limit_ms": ENCODER_LATENCY_WARN_MS,
             "embed_window_overruns_total": overruns_total,
             "embed_window_overruns_last_ts": overruns_last_ts,
         }

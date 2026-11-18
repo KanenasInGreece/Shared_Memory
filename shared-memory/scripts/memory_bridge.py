@@ -37,10 +37,10 @@ from typing import Any
 
 import httpx
 
-VERSION = "1.1.7"
+VERSION = "1.2.0"
 # API_VERSION is the wire contract; bump only when shape, auth, routes, or a monitor
 # contract change breaks older clients. v6: entries carry text, text_is, full_record.
-API_VERSION = 6
+API_VERSION = 7
 
 # Must mirror ontology.RETRO_RATINGS on the gateway; this client never imports server modules.
 # Outcome states, not valence: 'reversed' drives the supersession cascade; nuance goes in notes.
@@ -285,7 +285,7 @@ async def _fetch_health_blocks() -> None:
         try:
             async with _async_client(HEALTH_PROBE_TIMEOUT_S) as client:
                 health = _reply_json(await client.get(f"{COORDINATOR_BASE}/health",
-                                                      headers=_request_headers()))
+                                                      headers=_request_headers()), accept_status=(503,))
             block = health.get("backend_capability")
             _CAPABILITY_CACHE = block if isinstance(block, dict) else {}
             capacity = health.get("capacity")
@@ -716,7 +716,7 @@ async def check_gateway_compat() -> dict:
     try:
         async with _async_client(3.0) as client:
             h = _reply_json(await client.get(f"{COORDINATOR_BASE}/health",
-                                             headers=_request_headers()))
+                                             headers=_request_headers()), accept_status=(503,))
     except GatewayReplyError as exc:
         # The gateway answered. Marking this unreachable would send doctor to restart a service
         # that is only refusing.
@@ -872,11 +872,25 @@ async def save_artifact(content: str, metadata_json: str = "{}") -> dict:
             metadata["project"] = derived
             _append_log("memory_bridge", 3, "project_derived", {"project": derived})
 
+    body = {"content": content, "metadata": metadata, "agent_id": AGENT_ID}
+    capability = await _gateway_capability()
+    embedder = (capability or {}).get("embedder")
     try:
-        async with _async_client(60.0) as client:
+        projected = float(embedder.get("projected_full_payload_s") or 0) if isinstance(embedder, dict) else 0
+    except (TypeError, ValueError):
+        projected = 0
+    # Save uses only the embedder projection; without one, do not invent a deadline.
+    if projected > 0:
+        body["wait_s"] = min(SEARCH_TIMEOUT_MAX_S, max(
+            SEARCH_TIMEOUT_FLOOR_S, projected * SEARCH_SAFETY_FACTOR + SEARCH_OVERHEAD_S))
+
+    try:
+        # Leave time for the gateway's deadline response to reach the caller.
+        timeout = body["wait_s"] + SEARCH_OVERHEAD_S if "wait_s" in body else 60.0
+        async with _async_client(timeout) as client:
             r = await client.post(
                 f"{COORDINATOR_BASE}/memory/save",
-                json={"content": content, "metadata": metadata, "agent_id": AGENT_ID},
+                json=body,
                 headers=_request_headers(),
             )
             result = _reply_json(r, log_auth=True)
@@ -967,9 +981,11 @@ async def _search_payload(query: str, limit: int = 5, project: str = None,
     # The reranker dominates this call and its cost tracks the payload, so the wait comes from
     # the gateway's published ceiling, not a constant.
     ceiling = search_ceiling(await _gateway_capability(), await _gateway_capacity())
-    body = {"query": query, "limit": limit, "agent_id": AGENT_ID}
-    # Extra fields are filters, not query text. An unfiltered call must send the same body it
-    # always sent.
+    body = {"query": query, "limit": limit, "agent_id": AGENT_ID, "wait_s": ceiling}
+    encoder_wait = ceiling - SEARCH_OVERHEAD_S
+    if encoder_wait > 0:
+        body["encoder_wait_s"] = encoder_wait
+    # Filters stay separate from query text; an unfiltered call must not gain filters.
     if project:
         body["project"] = project
     if domains:
