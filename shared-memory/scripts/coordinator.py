@@ -137,7 +137,7 @@ def _short(value: Any, cap: int = 200) -> str:
 
 
 # FRAMEWORK_VERSION is the build string and may drift.
-FRAMEWORK_VERSION = "1.2.0"
+FRAMEWORK_VERSION = "1.2.1"
 # API_VERSION is the wire contract; bump only when shape, auth, routes, or a monitor
 # contract change breaks older clients. v6: entries carry text, text_is, full_record.
 API_VERSION = 7
@@ -3908,8 +3908,44 @@ def encoder_keepalive_options() -> list[tuple[int, int, int]]:
                     _keepalive_warned.add(env)
                     log.warning("%s must be a positive integer; using %s", env, default)
         if hasattr(socket, level) and hasattr(socket, option):
-            options.append((getattr(socket, level), getattr(socket, option), value))
+            level_id, option_id = getattr(socket, level), getattr(socket, option)
+            # A positive integer the platform's setsockopt rejects is as unusable
+            # as a non-integer.
+            if env and value != default and _kernel_accepts(level_id, option_id, option, value) is False:
+                if env not in _keepalive_warned:
+                    _keepalive_warned.add(env)
+                    log.warning("%s=%s is rejected by this platform's socket options; using %s",
+                                env, value, default)
+                value = default
+            options.append((level_id, option_id, value))
     return options
+
+
+_keepalive_accepted = {}
+
+
+def _kernel_accepts(level_id, option_id, option, value):
+    """Return whether setsockopt takes `value` for this option on a throwaway socket,
+    tried once per (option, value). Return None and remember nothing when no throwaway
+    socket can be made, because that says nothing about the value.
+    """
+    key = (option, value)
+    if key in _keepalive_accepted:
+        return _keepalive_accepted[key]
+    try:
+        probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    except OSError:
+        return None
+    try:
+        try:
+            probe.setsockopt(level_id, option_id, value)
+            accepted = True
+        except (OSError, TypeError, OverflowError):
+            accepted = False
+    finally:
+        probe.close()
+    _keepalive_accepted[key] = accepted
+    return accepted
 
 
 class OutstandingCalls:
@@ -3982,6 +4018,79 @@ class CallerDisconnected(Exception):
     """The caller left before the encoder call completed."""
 
 
+async def await_encoder_call(request, call, deadline=None, calls=None):
+    """Await one encoder call until it finishes, its caller leaves, or its deadline
+    passes, stamping the deadline-cancelled time on `calls` on a deadline. It never
+    counts the call in `/health` because the caller does, avoiding a double count.
+    """
+    task = asyncio.create_task(call)
+    try:
+        while not task.done():
+            transport = request.transport
+            if transport is None or transport.is_closing() is True:
+                raise CallerDisconnected()
+            # Polling detects disconnects; the gateway imposes no total timeout.
+            interval = 0.25
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise EncoderDeadlineExceeded()
+                interval = min(interval, remaining)
+            await asyncio.wait({task}, timeout=interval)
+        return task.result()
+    except BaseException as exc:
+        if isinstance(exc, EncoderDeadlineExceeded) and calls is not None:
+            calls.mark_deadline_cancelled()
+        if not task.done():
+            task.cancel()
+        # Drain upstream cleanup before propagating the caller's termination.
+        try:
+            await task
+        except (asyncio.CancelledError, Exception):
+            pass
+        raise
+
+
+def _later_timestamp(first, second):
+    """Return the later of two ISO timestamps, compared as times rather than strings.
+
+    A stamp without a timezone is read as UTC; an unreadable one is skipped.
+    """
+    parsed = []
+    for value in (first, second):
+        if value is None:
+            continue
+        try:
+            when = datetime.fromisoformat(value)
+        except (TypeError, ValueError):
+            continue
+        if when.tzinfo is None:
+            when = when.replace(tzinfo=timezone.utc)
+        parsed.append((when, value))
+    return max(parsed, key=lambda pair: pair[0])[1] if parsed else None
+
+
+def combine_encoder_calls(coordinator_view, passthrough_view):
+    """Combine the coordinator's calls and raw passthrough calls into one encoder's
+    `/health` figures (leaving passthrough figures as they are if the coordinator view
+    is missing). Count is the sum, age is the larger waiting age (None when neither
+    waits), completion is the later time, and the deadline stamp is the coordinator's
+    alone because a disconnect is not a deadline.
+    """
+    coordinator_view = coordinator_view or {}
+    passthrough_view = passthrough_view or {}
+    ages = [view["oldest_outstanding_age_s"] for view in (coordinator_view, passthrough_view)
+            if view.get("oldest_outstanding_age_s") is not None]
+    return {
+        "outstanding_count": (coordinator_view.get("outstanding_count") or 0)
+        + (passthrough_view.get("outstanding_count") or 0),
+        "oldest_outstanding_age_s": max(ages) if ages else None,
+        "last_completed_at": _later_timestamp(coordinator_view.get("last_completed_at"),
+                                              passthrough_view.get("last_completed_at")),
+        "last_deadline_cancelled_at": coordinator_view.get("last_deadline_cancelled_at"),
+    }
+
+
 class MemoryCoordinator:
     """
     Single-process coordinator for all memory writes and reads.
@@ -3998,32 +4107,7 @@ class MemoryCoordinator:
 
     async def _await_encoder(self, request, call, deadline, calls=None):
         """Await one encoder call until it finishes or its caller leaves or expires."""
-        task = asyncio.create_task(call)
-        try:
-            while not task.done():
-                transport = request.transport
-                if transport is None or transport.is_closing() is True:
-                    raise CallerDisconnected()
-                # Polling detects disconnects; the gateway imposes no total timeout.
-                interval = 0.25
-                if deadline is not None:
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0:
-                        raise EncoderDeadlineExceeded()
-                    interval = min(interval, remaining)
-                await asyncio.wait({task}, timeout=interval)
-            return task.result()
-        except BaseException as exc:
-            if isinstance(exc, EncoderDeadlineExceeded) and calls is not None:
-                calls.mark_deadline_cancelled()
-            if not task.done():
-                task.cancel()
-            # Drain upstream cleanup before propagating the caller's termination.
-            try:
-                await task
-            except (asyncio.CancelledError, Exception):
-                pass
-            raise
+        return await await_encoder_call(request, call, deadline, calls=calls)
 
     def __init__(self) -> None:
         self._pool: asyncpg.Pool | None = None

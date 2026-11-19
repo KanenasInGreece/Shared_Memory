@@ -34,6 +34,7 @@ from test_reasoning_routing import (
     _stop,
 )
 from test_backlog_cycle_guard import _Result, _arm_backlog, _fold_daemon
+from tests.test_await_encoder import Transport as _LiveTransport
 
 pytestmark = pytest.mark.usefixtures("chat_caller_is_consolidation")
 
@@ -1270,6 +1271,7 @@ def test_d3_encoder_401_scrubs_and_400_keeps_overflow(monkeypatch):
     proxy = g.AsyncHiveMindProxy()
 
     class _Enc:
+        transport = _LiveTransport()  # a live connection; production sets None once it is lost
         method = "POST"
         can_read_body = False
         content_length = None

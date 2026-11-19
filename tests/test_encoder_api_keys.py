@@ -25,6 +25,7 @@ if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
 import secure_env
+from tests.test_await_encoder import Transport as _LiveTransport
 
 
 CANARY_EMBED = "CANARY-EMBEDDER-TOKEN"
@@ -56,6 +57,7 @@ def _load_keys():
 
 
 class _Req:
+    transport = _LiveTransport()  # a live connection; production sets None once it is lost
     def __init__(self, path, headers=None):
         self.method = "POST"
         self.rel_url = URL(path)

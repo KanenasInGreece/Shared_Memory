@@ -9,6 +9,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "shared-memory"
 
 import dream_telemetry
 import encoder_window
+from tests.test_await_encoder import Transport as _LiveTransport
 
 
 def test_classify_overflow_vllm_8193_overrun():
@@ -266,6 +267,7 @@ def _encoder_req(path, content, content_length, *, raw_for_request_read=None):
     from yarl import URL
 
     class _Req:
+        transport = _LiveTransport()  # a live connection; production sets None once it is lost
         method = "POST"
         headers = {}
         can_read_body = True

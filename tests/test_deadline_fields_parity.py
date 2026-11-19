@@ -137,3 +137,79 @@ def test_compat_readers_accept_degraded_health(clients, gateway):
             assert result["gateway_status"] in ("ok", "degraded")
 
     asyncio.run(run())
+
+
+@pytest.mark.parametrize("projection", [1, 80, 400])
+def test_save_wire_body_and_timeout_are_pinned_exactly(clients, gateway, monkeypatch, projection):
+    """Pin the whole save body, not only wait_s, to match the behaviour before the
+    wait helper was extracted.
+    """
+    async def run():
+        for client in clients:
+            monkeypatch.setattr(client, "_CAPABILITY_CACHE", {
+                "embedder": {"projected_full_payload_s": projection}})
+            await client.save_artifact("fact", json.dumps({"project": "test"}))
+
+    asyncio.run(run())
+    wait = min(300, max(30, projection * 1.5 + 15))
+    for _, body, timeout in gateway[:2]:
+        assert body == {"content": "fact", "metadata": {"project": "test"},
+                        "agent_id": "shared_agent", "wait_s": wait}
+        assert timeout == wait + 15
+
+
+async def _both_retros(clients):
+    bridge, mcp = clients
+    await bridge.save_retrospective_artifact(7, "validated", "notes", date="2026-01-01",
+                                             source="shared_agent", grounded_in="3:measured,4")
+    await mcp.save_retrospective(7, "validated", "notes", "shared_agent", date="2026-01-01",
+                                 grounded_in="3:measured,4")
+
+
+@pytest.mark.parametrize("projection", [1, 80, 400])
+def test_retrospective_wire_bodies_match_and_carry_the_save_deadline(clients, gateway, monkeypatch, projection):
+    for client in clients:
+        monkeypatch.setattr(client, "_CAPABILITY_CACHE", {
+            "embedder": {"projected_full_payload_s": projection}})
+    asyncio.run(_both_retros(clients))
+    cli, mcp = gateway[:2]
+    assert cli == mcp
+    url, body, timeout = cli
+    assert url.endswith("/memory/retrospective")
+    wait = min(300, max(30, projection * 1.5 + 15))
+    assert body == {"pg_id": 7, "rating": "validated", "notes": "notes", "date": "2026-01-01",
+                    "agent_id": "shared_agent", "grounded_in": [3, 4],
+                    "grounded_roles": {"3": "measured"}, "wait_s": wait}
+    assert timeout == wait + 15 > wait
+
+
+@pytest.mark.parametrize("projection", [None, "bad", 0])
+def test_retrospective_without_projection_invents_no_deadline(clients, gateway, monkeypatch, projection):
+    for client in clients:
+        monkeypatch.setattr(client, "_CAPABILITY_CACHE", {
+            "embedder": {"projected_full_payload_s": projection}})
+    asyncio.run(_both_retros(clients))
+    assert gateway[0] == gateway[1]
+    assert "wait_s" not in gateway[0][1]
+    assert gateway[0][2] == 60.0
+
+
+def test_invalid_rating_is_refused_before_any_network_call(clients, gateway, monkeypatch):
+    async def boom(*a, **k):
+        raise AssertionError("network or capability call before rating check")
+
+    async def run():
+        for client in clients:
+            monkeypatch.setattr(client, "_gateway_capability", boom)
+        bridge, mcp = clients
+        assert (await bridge.save_retrospective_artifact(1, "great", "n"))["status"] == "error"
+        assert json.loads(await mcp.save_retrospective(1, "great", "n", "a"))["status"] == "error"
+
+    asyncio.run(run())
+    assert gateway == []
+
+
+def test_the_two_memory_bridge_copies_are_byte_identical():
+    root = Path(__file__).resolve().parents[1]
+    assert ((root / "shared-memory/scripts/memory_bridge.py").read_bytes()
+            == (root / "shared-memory-skill/shared-memory/scripts/memory_bridge.py").read_bytes())

@@ -30,6 +30,7 @@ pytestmark = pytest.mark.usefixtures("chat_caller_is_consolidation")
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "shared-memory", "scripts"))
 
 from aiohttp import web  # noqa: E402
+from tests.test_await_encoder import Transport as _LiveTransport
 
 
 # ── shared test doubles ──────────────────────────────────────────────────────
@@ -81,6 +82,7 @@ class _EmbedReq:
     """Mirrors test_llm_fault_origin.py's _EmbedReq — its own registered route,
     served by handle_encoder, so llm_backend stays None throughout: the
     non-pool-route case."""
+    transport = _LiveTransport()  # a live connection; production sets None once it is lost
     method = "POST"
     path = "/v1/embeddings"
     rel_url = URL("/v1/embeddings", encoded=True)

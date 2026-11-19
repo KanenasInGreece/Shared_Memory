@@ -20,6 +20,7 @@ from dream_telemetry import (
     special_reserve_chars,
 )
 import hive_mind_proxy as g
+from tests.test_await_encoder import Transport as _LiveTransport
 
 
 class _ReqBodyStream:
@@ -113,6 +114,7 @@ def test_handle_encoder_rerank_prefixes_query_and_documents():
             return _FakeUpstream()
 
     class _RerankReq:
+        transport = _LiveTransport()  # a live connection; production sets None once it is lost
         method = "POST"
         path = "/v1/reranking"
         rel_url = URL("/v1/reranking", encoded=True)
@@ -192,6 +194,7 @@ def test_handle_encoder_rerank_invalid_json_forwarded_unchanged():
     raw_invalid = b"not valid json {"
 
     class _InvalidReq:
+        transport = _LiveTransport()  # a live connection; production sets None once it is lost
         method = "POST"
         path = "/v1/reranking"
         rel_url = URL("/v1/reranking", encoded=True)
@@ -253,6 +256,7 @@ def test_handle_encoder_rerank_coerces_non_str_query_to_empty(non_str_query):
             return _FakeUpstream()
 
     class _RerankReq:
+        transport = _LiveTransport()  # a live connection; production sets None once it is lost
         method = "POST"
         path = "/v1/reranking"
         rel_url = URL("/v1/reranking", encoded=True)
@@ -323,6 +327,7 @@ def test_handle_encoder_rerank_oversize_query_pins_pair_budget():
     oversize_query = "q" * (pair_budget + 1000)
 
     class _RerankReq:
+        transport = _LiveTransport()  # a live connection; production sets None once it is lost
         method = "POST"
         path = "/v1/reranking"
         rel_url = URL("/v1/reranking", encoded=True)

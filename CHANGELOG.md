@@ -7,6 +7,22 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.2.1] - 2026-11-19
+
+This release closes three gaps left open by 1.2.0 and changes no API: `API_VERSION` stays 7.
+
+### Fixed
+- A call to the raw `/v1/embeddings` or `/v1/reranking` route now ends on the gateway side when its caller hangs up, whether that happens before the encoder answers or while the response is being read. The gateway stops waiting or reading and closes its connection to the encoder. If the caller leaves before the encoder answers, the gateway ends the request with HTTP 499. Whether the encoder stops its own work depends on its server and build: measured, one llama.cpp embedder build and the vLLM embedder stopped, while one older llama.cpp embedder build and every reranker measured finished the abandoned call.
+- Raw passthrough calls are now counted in the embedder and reranker `outstanding_count` and `oldest_outstanding_age_s` on `/health`, next to the calls the coordinator makes. No key was added, so the monitor needs no change; the two figures now cover every call waiting on that encoder.
+- The CLI skill and the MCP server now send `wait_s` when they save a retrospective, as they already do for other saves. A late embedder now gives the 503 `embed_deadline_exceeded` instead of making the caller wait out a fixed 60 seconds. The client timeout is `wait_s` plus 15 seconds, at least 45 seconds, where it was a fixed 60 seconds.
+- An encoder keepalive setting that the operating system rejects, for example `ENCODER_TCP_KEEPALIVE_IDLE_S=1000000000000`, now falls back to its default and logs one warning. Before, the gateway failed when it opened a connection to the encoder.
+
+### Changed
+- The gateway's client-disconnect count now also includes encoder callers who leave before the response headers arrive.
+
+### Security
+- Security dependencies were reviewed. No pin moved in this release.
+
 ## [1.2.0] - 2026-11-19
 
 This release raises `API_VERSION` from 6 to 7, so the minor version rises with it. Update every client to 1.2.0: an older client works but sends no deadline, so its calls wait without a limit.
