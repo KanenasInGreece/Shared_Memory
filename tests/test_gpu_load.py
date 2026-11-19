@@ -504,3 +504,95 @@ async def test_bad_env_value_falls_back_to_default_and_still_reaps(monkeypatch, 
     with pytest.raises(ProcessLookupError):
         os.kill(proc.pid, 0)
     assert proc.returncode == -9
+
+
+# ── a typo'd telemetry knob must not raise out of the probe ──────────────────
+# NVTOP_TIMEOUT_SEC and GPU_BUSY_PERCENT were once parsed with a raw float()/int()
+# outside every try, so a typo raised ValueError into the coordinator's health
+# refresher, which then marked the whole snapshot stale on every cycle. Failure
+# list: F-A a bad NVTOP_TIMEOUT_SEC raises; F-B a bad GPU_BUSY_PERCENT raises after a
+# good snapshot; F-C after a bad value the probe must still work on the default
+# (wrong fallback, or the hang reap skipped).
+
+def _busy_60_nvtop(tmp_path):
+    return _write_fake_nvtop(tmp_path, """echo '[{"gpu_util":"60%"}]'""")
+
+
+@pytest.mark.asyncio
+async def test_bad_gpu_busy_percent_does_not_raise_and_uses_default(monkeypatch, tmp_path, caplog):
+    """F-B and F-C. MUTATION: restore the raw `int(os.environ.get("GPU_BUSY_PERCENT",
+    ...))` read -> this test dies with ValueError. MUTATION: make the fallback
+    something above 60 -> the "busy" assertion dies."""
+    monkeypatch.setenv("SLOT_AWARE", "1")
+    monkeypatch.setenv("NVTOP_BIN", str(_busy_60_nvtop(tmp_path)))
+    monkeypatch.setenv("GPU_BUSY_PERCENT", "abc")
+
+    with caplog.at_level("WARNING", logger="gpu_load"):
+        assert await inference_gpu_busy() is True      # 60% >= the default 50
+        assert await inference_busy_state() == "busy"  # second call, same warning set
+
+    warned = [r for r in caplog.records if "GPU_BUSY_PERCENT" in r.getMessage()]
+    assert len(warned) == 1
+
+
+@pytest.mark.asyncio
+async def test_bad_nvtop_timeout_does_not_raise(monkeypatch, tmp_path, caplog):
+    """F-A. MUTATION: restore the raw `float(os.environ.get("NVTOP_TIMEOUT_SEC",
+    ...))` read -> this test dies with ValueError."""
+    monkeypatch.setenv("SLOT_AWARE", "1")
+    monkeypatch.setenv("NVTOP_BIN", str(_busy_60_nvtop(tmp_path)))
+    monkeypatch.setenv("NVTOP_TIMEOUT_SEC", "abc")
+
+    with caplog.at_level("WARNING", logger="gpu_load"):
+        assert await inference_gpu_busy() is True
+        assert await inference_busy_state() == "busy"
+
+    warned = [r for r in caplog.records if "NVTOP_TIMEOUT_SEC" in r.getMessage()]
+    assert len(warned) == 1
+
+
+@pytest.mark.asyncio
+async def test_bad_nvtop_timeout_still_applies_default_and_counts_hang(monkeypatch, tmp_path):
+    """F-C. With a non-numeric NVTOP_TIMEOUT_SEC the snapshot wait must use the 5.0 s
+    default, and a hanging nvtop must still be killed and advance the hang streak.
+    The test shortens only that one 5.0 s wait (after recording it) so it does not
+    take 5 s. MUTATION: change the fallback from 5.0 -> the recorded value differs
+    and the test dies. MUTATION: skip the `_reap_after_timeout` call on timeout ->
+    the streak stays 0, so the test dies."""
+    fake_nvtop = _write_fake_nvtop(tmp_path, "exec sleep 30")
+    monkeypatch.setenv("SLOT_AWARE", "1")
+    monkeypatch.setenv("NVTOP_BIN", str(fake_nvtop))
+    monkeypatch.setenv("NVTOP_TIMEOUT_SEC", "abc")
+    monkeypatch.setenv("NVTOP_KILL_WAIT_SEC", "3.0")
+    calls = _capture_create_subprocess_exec(monkeypatch)
+
+    seen = []
+    real_wait_for = asyncio.wait_for
+
+    async def _spy(aw, timeout=None):
+        seen.append(timeout)
+        return await real_wait_for(aw, timeout=0.2 if timeout == 5.0 else timeout)
+
+    monkeypatch.setattr(gpu_load.asyncio, "wait_for", _spy)
+
+    assert await inference_gpu_busy() is False
+
+    assert seen[0] == 5.0                    # the default applied to the snapshot wait
+    assert gpu_load._consecutive_hangs == 1  # counted, not skipped
+    proc = calls[0]
+    with pytest.raises(ProcessLookupError):
+        os.kill(proc.pid, 0)
+    assert proc.returncode == -9
+
+
+@pytest.mark.asyncio
+async def test_bad_gpu_busy_percent_default_leaves_a_40_percent_gpu_idle(monkeypatch, tmp_path):
+    """F-C. A bad GPU_BUSY_PERCENT falls back to 50, so a 40% GPU is idle.
+    MUTATION: change the fallback to 0 -> 40% reads busy and this test dies."""
+    fake_nvtop = _write_fake_nvtop(tmp_path, """echo '[{"gpu_util":"40%"}]'""")
+    monkeypatch.setenv("SLOT_AWARE", "1")
+    monkeypatch.setenv("NVTOP_BIN", str(fake_nvtop))
+    monkeypatch.setenv("GPU_BUSY_PERCENT", "abc")
+
+    assert await inference_gpu_busy() is False
+    assert await inference_busy_state() == "idle"

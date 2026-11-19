@@ -7,6 +7,19 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.2.3] - 2026-11-19
+
+This release changes no API: `API_VERSION` stays 7.
+
+### Fixed
+- A mistyped `NVTOP_TIMEOUT_SEC` or `GPU_BUSY_PERCENT` no longer makes the GPU-busy probe raise. Before, the exception reached the coordinator's health refresher, which marked the whole health snapshot stale on every cycle, so one typo in a telemetry setting made a healthy system read as stale. The probe now falls back to the default (5.0 seconds and 50 percent), warns once per setting, and keeps working.
+
+### Changed
+- The comments and docstrings of `gpu_load.py` now describe the probe as it is: a display signal for the monitor that nothing gates on, used only by the coordinator's health refresher and the hardware fingerprint. They state when the busy state reads `unknown` (the probe was unavailable before the call) and when it reads `idle` (including a probe that failed during the call). The `nvtop` block in `.env.example` was rewritten to match. No default, timeout or log message changed.
+
+### Security
+- Security dependencies were reviewed.
+
 ## [1.2.2] - 2026-11-19
 
 This release changes no API: `API_VERSION` stays 7.
