@@ -72,6 +72,7 @@ from project_promotion import (
 from project_alias import ALIAS_RESOLVE_SQL, ACTIVE_ALIASES_SQL
 from secure_env import get_secret, pg_dsn, encoder_auth_kwargs, encoder_plaintext_warnings
 from framework_defaults import FRAMEWORK_DEFAULTS
+from keepalive_probe import KEEPALIVE_OPTIONS, try_setsockopt
 from telemetry_instruments import LatencyRing, Counter, safe
 # A key whose removed_in this release has reached is stripped in handle_telemetry. Leaf module: its only import is annotations, so it cannot cycle back here.
 from telemetry_contract import TELEMETRY as TELEMETRY_CONTRACT, strip_dropped
@@ -137,7 +138,7 @@ def _short(value: Any, cap: int = 200) -> str:
 
 
 # FRAMEWORK_VERSION is the build string and may drift.
-FRAMEWORK_VERSION = "1.2.1"
+FRAMEWORK_VERSION = "1.2.2"
 # API_VERSION is the wire contract; bump only when shape, auth, routes, or a monitor
 # contract change breaks older clients. v6: entries carry text, text_is, full_record.
 API_VERSION = 7
@@ -3890,9 +3891,10 @@ def encoder_keepalive_options() -> list[tuple[int, int, int]]:
     # UNMEASURED defaults: dead-peer detection in about two minutes, not an inference deadline.
     settings = (
         ("SOL_SOCKET", "SO_KEEPALIVE", None, 1),
-        ("IPPROTO_TCP", "TCP_KEEPIDLE", "ENCODER_TCP_KEEPALIVE_IDLE_S", 60),
-        ("IPPROTO_TCP", "TCP_KEEPINTVL", "ENCODER_TCP_KEEPALIVE_INTERVAL_S", 15),
-        ("IPPROTO_TCP", "TCP_KEEPCNT", "ENCODER_TCP_KEEPALIVE_COUNT", 4),
+        *((*KEEPALIVE_OPTIONS[env], env, default) for env, default in (
+            ("ENCODER_TCP_KEEPALIVE_IDLE_S", 60),
+            ("ENCODER_TCP_KEEPALIVE_INTERVAL_S", 15),
+            ("ENCODER_TCP_KEEPALIVE_COUNT", 4))),
     )
     options = []
     for level, option, env, default in settings:
@@ -3932,19 +3934,9 @@ def _kernel_accepts(level_id, option_id, option, value):
     key = (option, value)
     if key in _keepalive_accepted:
         return _keepalive_accepted[key]
-    try:
-        probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    except OSError:
-        return None
-    try:
-        try:
-            probe.setsockopt(level_id, option_id, value)
-            accepted = True
-        except (OSError, TypeError, OverflowError):
-            accepted = False
-    finally:
-        probe.close()
-    _keepalive_accepted[key] = accepted
+    accepted = try_setsockopt(level_id, option_id, value)
+    if accepted is not None:
+        _keepalive_accepted[key] = accepted
     return accepted
 
 

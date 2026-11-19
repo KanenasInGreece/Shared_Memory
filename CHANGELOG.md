@@ -7,6 +7,20 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.2.2] - 2026-11-19
+
+This release changes no API: `API_VERSION` stays 7.
+
+### Fixed
+- `check_config.py` now reports an encoder keepalive setting as invalid and names the default the gateway will use when the operating system rejects the value (such as `ENCODER_TCP_KEEPALIVE_IDLE_S=1000000000000`). Before, it called that value valid while the gateway fell back to its default and logged a warning.
+- `check_config.py` now also says when the platform has no socket option for a keepalive setting, because the gateway leaves that option out whatever the value.
+
+### Changed
+- The test of which keepalive values the platform accepts moved into a new module, `shared-memory/scripts/keepalive_probe.py`, that the gateway and `check_config.py` both use. The gateway's behaviour is unchanged.
+
+### Security
+- Security dependencies were reviewed. No pin moved in this release.
+
 ## [1.2.1] - 2026-11-19
 
 This release closes three gaps left open by 1.2.0 and changes no API: `API_VERSION` stays 7.

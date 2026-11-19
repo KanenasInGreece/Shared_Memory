@@ -19,8 +19,13 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from framework_defaults import FRAMEWORK_DEFAULTS  # noqa: E402
 import secure_env  # noqa: E402
 from log_hygiene import scrub_url_credentials  # noqa: E402
+# Never import coordinator here: Phase A must survive a coordinator import crash
+# (fact:1585, Phase A is stdlib-only).
+from keepalive_probe import (  # noqa: E402
+    KEEPALIVE_OPTIONS, option_exists, platform_accepts)
 
-# Only names with a real os.environ read. Each row's idiom lives in framework_defaults so this file does not keep a second table.
+# This table lists only settings that the codebase reads from os.environ. Each
+# row's idiom lives in framework_defaults, so this file keeps no second table.
 ENV_ROW_ORDER = (
     "EMBEDDER_URL",
     "RERANKER_URL",
@@ -154,13 +159,25 @@ def _verdict(key: str, gateway: "tuple[dict | None, str | None] | None" = None) 
         effective = raw.strip() or _GATEWAY_BIND_DEFAULT
     elif key in ("ENCODER_TCP_KEEPALIVE_IDLE_S", "ENCODER_TCP_KEEPALIVE_INTERVAL_S",
                  "ENCODER_TCP_KEEPALIVE_COUNT"):
+        # This check mirrors coordinator.encoder_keepalive_options via keepalive_probe.
+        level_name, option_name = KEEPALIVE_OPTIONS[key]
         try:
             effective = int(effective)
             if effective <= 0:
                 raise ValueError
+            # The gateway never probes a value equal to the default, because it would
+            # use the default anyway, so neither does this check.
+            if (effective != default
+                    and platform_accepts(level_name, option_name, effective) is False):
+                raise ValueError
         except ValueError:
             effective = default
             note = f"invalid — the gateway uses {effective}"
+        if not option_exists(level_name, option_name):
+            # The gateway leaves a missing option out whatever the value.
+            missing = (f"this platform has no {option_name}; "
+                       "the gateway does not set it")
+            note = f"{note}; {missing}" if note else missing
     elif key in _EMBED_KEYS:
         values, failed = gateway if gateway is not None else _gateway_embed_values()
         if values is None:
