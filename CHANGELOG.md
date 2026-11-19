@@ -7,6 +7,21 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.2.5] - 2026-11-19
+
+This release changes no API: `API_VERSION` stays 7. It removes one key from the `/pool/status` response, described under Changed.
+
+### Fixed
+- The REM and NREM daemons ask `/pool/status` whether a backend is free. A reply whose `free_slots` is not a whole number of zero or more (`null`, a string, a float, a boolean or a negative number) used to be accepted, and a `null` beside an empty backend list read as "empty", so the daemons went ahead. Such a reply now reads as "unreachable", which also lets the daemons go ahead, but it is logged.
+- A pool status that could not be read left no trace in the log, so a wrong token or a failing gateway went unnoticed. The helper now logs one warning with a fixed reason code (for example `http_401` or `timeout`) when the status first becomes unreadable, and one info line when it reads again. It never logs the URL, the headers or the error text.
+- `/pool/status` used to probe each backend for a wedged inference server before it answered. With one wedged backend that took four seconds, longer than the daemons' three-second wait, so they read "unreachable" when the true answer was "busy". The route now probes nothing and answers in milliseconds.
+
+### Changed
+- The per-backend `suspect_wedged` key is gone from `/pool/status`. The same diagnostic is served at `/memory/telemetry` under `llm.suspect_wedged`. The telemetry contract lists the removal, and a monitor that read the old key must read the new place.
+
+### Security
+- Security dependencies were reviewed. No pin moved in this release.
+
 ## [1.2.4] - 2026-11-19
 
 This release changes no API: `API_VERSION` stays 7, and it changes no behaviour.
