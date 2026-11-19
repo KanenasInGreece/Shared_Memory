@@ -3,7 +3,7 @@
 
 # The Telemetry Contract
 
-Contract version **1.2.4**. Every key the gateway emits on `GET /health` and `GET /memory/telemetry`, what it means, what it is measured in, when it arrived, and where it is going.
+Contract version **1.2.5**. Every key the gateway emits on `GET /health` and `GET /memory/telemetry`, what it means, what it is measured in, when it arrived, and where it is going.
 
 ## The roles
 
@@ -105,6 +105,14 @@ Not moved. Role counters and privacy flags left the payload. VERSION in this fil
 | refusal | `declaration` | a routing refusal no longer names a declaration gap |
 | /pool/status | `backends.*.serves_all` | free_slots is availability only |
 | /pool/status | `backends.*.counts_free_slot` | free_slots is availability only |
+
+## Removed outright in 1.2.5
+
+Not moved. `GET /pool/status` no longer probes a backend, so its entries no longer carry the probe's verdict.
+
+| endpoint | key | why |
+|---|---|---|
+| /pool/status | `backends.*.suspect_wedged` | this route no longer probes a backend; `/memory/telemetry` `llm.suspect_wedged` reports the diagnostic |
 
 ## Dual-emitted copies dropped
 

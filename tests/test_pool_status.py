@@ -271,8 +271,21 @@ def _stub_pool_server():
 
 @pytest.mark.parametrize("status, body, expected", [
     (200, b'{"free_slots":0,"backends":{}}', "empty"),
+    (200, b'{"free_slots":1,"backends":{}}', "empty"),
+    (200, b'{"free_slots":1}', "empty"),
+    (200, b'{"free_slots":1,"backends":[]}', "empty"),
+    (200, b'{"free_slots":1,"backends":["a"]}', "empty"),
     (200, b'{"free_slots":2,"backends":{"a":{}}}', "free"),
     (200, b'{"free_slots":0,"backends":{"a":{}}}', "busy"),
+    (200, b'{"free_slots":null,"backends":{"a":{}}}', "unreachable"),
+    (200, b'{"free_slots":"x","backends":{"a":{}}}', "unreachable"),
+    (200, b'{"free_slots":"2","backends":{"a":{}}}', "unreachable"),
+    (200, b'{"free_slots":1.5,"backends":{"a":{}}}', "unreachable"),
+    (200, b'{"free_slots":true,"backends":{"a":{}}}', "unreachable"),
+    (200, b'{"free_slots":false,"backends":{"a":{}}}', "unreachable"),
+    (200, b'{"free_slots":-1,"backends":{"a":{}}}', "unreachable"),
+    (200, b'{"free_slots":1e999,"backends":{"a":{}}}', "unreachable"),
+    (200, b'{"free_slots":null,"backends":{}}', "unreachable"),
     (200, b"{}", "unreachable"),          # anonymous caller, auth-configured gateway
     (200, b"[]", "unreachable"),
     (200, b"nope", "unreachable"),
@@ -283,12 +296,12 @@ def _stub_pool_server():
     (None, None, "unreachable"),          # connection refused
 ])
 def test_pool_roster_state_over_real_http(
-    monkeypatch, _stub_pool_server, status, body, expected
+    monkeypatch, _stub_pool_server, _fresh_outage_state, status, body, expected
 ):
     """The real pool_roster_state against a local server returns one word per answer.
 
-    Bodies with a null, non-numeric, negative or float free_slots, or no backends key,
-    are left unpinned on purpose: how they should read is undecided.
+    `free_slots` is checked first and must be a non-negative integer (a bool is not
+    one); only then is `backends` looked at.
     """
     import socket
     import pool_status
@@ -308,3 +321,330 @@ def test_pool_roster_state_over_real_http(
     url = _stub_pool_server(status, body)
     monkeypatch.setattr(pool_status, "POOL_STATUS_URL", url)
     assert asyncio.run(_ask()) == expected
+
+
+# -- one log line per outage ----------------------------------------------------------
+
+@pytest.fixture
+def _scripted_pool_server():
+    """Start a local server that answers GET with the next scripted (status, body).
+
+    The last answer repeats once the script runs out; `delay` holds each reply back.
+    """
+    import http.server
+    import threading
+    import time
+
+    started = []
+
+    def _start(answers, delay=0.0):
+        queue = list(answers)
+
+        class _Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                status, body = queue.pop(0) if len(queue) > 1 else queue[0]
+                time.sleep(delay)
+                try:
+                    self.send_response(status)
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                except OSError:
+                    pass
+
+            def log_message(self, fmt, *args):
+                return
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        started.append((server, thread))
+        return f"http://127.0.0.1:{server.server_port}/pool/status"
+
+    yield _start
+    for server, thread in started:
+        try:
+            server.shutdown()
+        finally:
+            server.server_close()
+        thread.join()
+
+
+@pytest.fixture
+def _fresh_outage_state():
+    import pool_status
+    pool_status._was_unreachable = False
+    yield pool_status
+    pool_status._was_unreachable = False
+
+
+def _pool_records(caplog):
+    return [r for r in caplog.records if r.name == "pool_status"]
+
+
+def _ask_n(pool_status, n, **kwargs):
+    async def _go():
+        return [await pool_status.pool_roster_state(**kwargs) for _ in range(n)]
+    return asyncio.run(_go())
+
+
+_ROSTER_FREE_2 = b'{"free_slots":2,"backends":{"a":{}}}'
+
+
+def test_one_warning_per_outage_and_one_info_on_recovery(
+    monkeypatch, caplog, _scripted_pool_server, _fresh_outage_state
+):
+    """Four 401s around a recovery log two warnings and one info, not four lines."""
+    import logging
+    pool_status = _fresh_outage_state
+    url = _scripted_pool_server([
+        (401, b"{}"), (401, b"{}"), (401, b"{}"), (200, _ROSTER_FREE_2), (401, b"{}"),
+    ])
+    monkeypatch.setattr(pool_status, "POOL_STATUS_URL", url)
+    caplog.set_level(logging.INFO, logger="pool_status")
+    words = _ask_n(pool_status, 5, timeout=2)
+    assert words == ["unreachable"] * 3 + ["free", "unreachable"]
+    recs = _pool_records(caplog)
+    warnings = [r for r in recs if r.levelno == logging.WARNING]
+    infos = [r for r in recs if r.levelno == logging.INFO]
+    assert len(warnings) == 2 and len(infos) == 1
+    assert all("http_401" in r.getMessage() for r in warnings)
+    assert "(free)" in infos[0].getMessage()
+
+
+def test_a_first_call_failure_in_a_fresh_process_is_logged(
+    monkeypatch, caplog, _scripted_pool_server
+):
+    """A daemon's very first call may fail: the module must start as not unreachable."""
+    import importlib
+    import logging
+    import pool_status
+    importlib.reload(pool_status)
+    try:
+        assert pool_status._was_unreachable is False
+        url = _scripted_pool_server([(401, b"{}")])
+        monkeypatch.setattr(pool_status, "POOL_STATUS_URL", url)
+        caplog.set_level(logging.INFO, logger="pool_status")
+        assert _ask_n(pool_status, 1, timeout=2) == ["unreachable"]
+        recs = _pool_records(caplog)
+        assert len(recs) == 1 and recs[0].levelno == logging.WARNING
+        assert "http_401" in recs[0].getMessage()
+    finally:
+        importlib.reload(pool_status)
+
+
+def test_a_changed_reason_during_an_outage_is_not_logged_again(
+    monkeypatch, caplog, _scripted_pool_server, _fresh_outage_state
+):
+    import logging
+    pool_status = _fresh_outage_state
+    url = _scripted_pool_server([(200, b"{}"), (503, b"{}")])
+    monkeypatch.setattr(pool_status, "POOL_STATUS_URL", url)
+    caplog.set_level(logging.INFO, logger="pool_status")
+    assert _ask_n(pool_status, 2, timeout=2) == ["unreachable", "unreachable"]
+    recs = _pool_records(caplog)
+    assert len(recs) == 1
+    assert recs[0].levelno == logging.WARNING
+    assert "no_free_slots" in recs[0].getMessage()
+
+
+@pytest.mark.parametrize("status, body, delay, code", [
+    (503, b"{}", 0.0, "http_503"),
+    (200, b"nope", 0.0, "bad_json"),
+    (200, b"[]", 0.0, "not_a_mapping"),
+    (200, b"{}", 0.0, "no_free_slots"),
+    (200, b'{"free_slots":"x"}', 0.0, "bad_free_slots"),
+    (200, b"{}", 1.5, "timeout"),
+    (None, None, 0.0, "error"),
+])
+def test_the_warning_names_one_reason_code(
+    monkeypatch, caplog, _scripted_pool_server, _fresh_outage_state,
+    status, body, delay, code,
+):
+    import logging
+    import socket
+    pool_status = _fresh_outage_state
+    caplog.set_level(logging.INFO, logger="pool_status")
+    if status is None:
+        # Bound and never listening: the connection is refused.
+        with socket.socket() as s:
+            s.bind(("127.0.0.1", 0))
+            url = f"http://127.0.0.1:{s.getsockname()[1]}/pool/status"
+            monkeypatch.setattr(pool_status, "POOL_STATUS_URL", url)
+            assert _ask_n(pool_status, 1, timeout=2) == ["unreachable"]
+    else:
+        url = _scripted_pool_server([(status, body)], delay=delay)
+        monkeypatch.setattr(pool_status, "POOL_STATUS_URL", url)
+        timeout = 0.3 if delay else 2
+        assert _ask_n(pool_status, 1, timeout=timeout) == ["unreachable"]
+    recs = _pool_records(caplog)
+    assert len(recs) == 1 and recs[0].levelno == logging.WARNING
+    assert f"({code})" in recs[0].getMessage()
+
+
+def test_a_connect_timeout_reads_timeout(caplog, monkeypatch, _fresh_outage_state):
+    import logging
+    import httpx
+    pool_status = _fresh_outage_state
+
+    async def _connect_times_out(self, *a, **k):
+        raise httpx.ConnectTimeout("x")
+
+    monkeypatch.setattr(httpx.AsyncClient, "get", _connect_times_out)
+    caplog.set_level(logging.INFO, logger="pool_status")
+    assert _ask_n(pool_status, 1, timeout=2) == ["unreachable"]
+    recs = _pool_records(caplog)
+    assert len(recs) == 1 and recs[0].levelno == logging.WARNING
+    assert "(timeout)" in recs[0].getMessage()
+
+
+def test_a_failing_logger_changes_no_answer_and_raises_nothing(
+    monkeypatch, _scripted_pool_server, _fresh_outage_state
+):
+    pool_status = _fresh_outage_state
+
+    calls = []
+
+    class _Boom:
+        def warning(self, *a, **k):
+            calls.append("warning")
+            raise RuntimeError("warning boom")
+
+        def info(self, *a, **k):
+            calls.append("info")
+            raise OSError("info boom")
+
+    monkeypatch.setattr(pool_status, "logger", _Boom())
+    url = _scripted_pool_server([(503, b"{}"), (200, _ROSTER_FREE_2)])
+    monkeypatch.setattr(pool_status, "POOL_STATUS_URL", url)
+    # The first call enters "unreachable" (a raising warning); the second recovers
+    # (a raising info) and must still read "free". The recovery info is only
+    # attempted if the state was updated before the warning was logged.
+    assert _ask_n(pool_status, 2, timeout=2) == ["unreachable", "free"]
+    assert calls == ["warning", "info"]
+
+
+def test_healthy_answers_log_nothing(
+    monkeypatch, caplog, _scripted_pool_server, _fresh_outage_state
+):
+    import logging
+    pool_status = _fresh_outage_state
+    healthy = [(200, _ROSTER_FREE_2), (200, b'{"free_slots":0,"backends":{"a":{}}}'),
+               (200, b'{"free_slots":0,"backends":{}}')]
+    url = _scripted_pool_server(healthy + [(503, b"{}")] + healthy)
+    monkeypatch.setattr(pool_status, "POOL_STATUS_URL", url)
+    caplog.set_level(logging.INFO, logger="pool_status")
+    assert _ask_n(pool_status, 3, timeout=2) == ["free", "busy", "empty"]
+    assert _pool_records(caplog) == []
+    # One outage and its recovery log two lines; later healthy answers add none.
+    assert _ask_n(pool_status, 4, timeout=2) == ["unreachable", "free", "busy", "empty"]
+    assert [r.levelno for r in _pool_records(caplog)] == [logging.WARNING, logging.INFO]
+
+
+def test_the_log_never_carries_the_token_or_the_url(
+    monkeypatch, caplog, _scripted_pool_server, _fresh_outage_state
+):
+    import logging
+    pool_status = _fresh_outage_state
+    url = _scripted_pool_server([(401, b"{}"), (200, _ROSTER_FREE_2)])
+    monkeypatch.setattr(pool_status, "POOL_STATUS_URL", url)
+    caplog.set_level(logging.INFO, logger="pool_status")
+    _ask_n(pool_status, 2, timeout=2, headers={"Authorization": "Bearer CANARY-xyz"})
+    texts = [r.getMessage() for r in _pool_records(caplog)]
+    assert len(texts) == 2
+    leaked = any("CANARY" in t or "127.0.0.1" in t for t in texts)
+    assert not leaked
+
+
+# -- /pool/status does not probe a backend ---------------------------------------------
+
+def test_pool_status_answers_at_once_while_a_backend_is_wedged(monkeypatch):
+    """A backend that accepts and never replies, past the wedge age, must not slow the
+    route: the real client reads "busy" in well under its 3.0 s timeout.
+
+    The 1.0 s bound is a test threshold, not a product limit: measured 0.01-0.02 s
+    without the probe on loopback and 3.0 s (an "unreachable" answer) with it.
+    """
+    import time
+    from types import SimpleNamespace
+
+    import aiohttp
+    from aiohttp import web
+
+    import pool_status
+    import telemetry_contract
+
+    g = _auth_off_gateway(monkeypatch)
+    result = {}
+
+    async def _go():
+        tasks, writers = [], []
+
+        async def _never_replies(reader, writer):
+            tasks.append(asyncio.current_task())
+            writers.append(writer)
+            await asyncio.Event().wait()
+
+        stub = await asyncio.start_server(_never_replies, "127.0.0.1", 0)
+        backend = f"http://127.0.0.1:{stub.sockets[0].getsockname()[1]}"
+        monkeypatch.setattr(g, "LLM_POOL", [backend])
+        monkeypatch.setattr(g, "LLM_WEDGE_SUSPECT_AGE", 1.0)
+        monkeypatch.setitem(g._llm_inflight, backend, 1)       # at its declared maximum
+        monkeypatch.setitem(g._llm_inflight_started, backend, [time.monotonic() - 60.0])
+
+        http_session = aiohttp.ClientSession()
+        app = web.Application()
+        app["proxy"] = SimpleNamespace(session=http_session)
+        app.router.add_get("/pool/status", g.handle_pool_status)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        await web.TCPSite(runner, "127.0.0.1", 0).start()
+        url = f"http://127.0.0.1:{runner.addresses[0][1]}/pool/status"
+        monkeypatch.setattr(pool_status, "POOL_STATUS_URL", url)
+        pool_status._was_unreachable = False
+        try:
+            started = time.perf_counter()
+            result["word"] = await pool_status.pool_roster_state(timeout=3.0)
+            result["elapsed"] = time.perf_counter() - started
+            async with http_session.get(url) as r:
+                result["body"] = await r.json()
+            # A test pause so a background probe, if any, could connect; not a timer.
+            await asyncio.sleep(0.2)
+            result["connections"] = len(tasks)
+        finally:
+            pool_status._was_unreachable = False
+            await runner.cleanup()
+            await http_session.close()
+            for t in tasks:
+                t.cancel()
+            for w in writers:
+                w.close()
+            stub.close()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            await stub.wait_closed()
+        result["backend"] = backend
+
+    asyncio.run(_go())
+    print(f"pool_roster_state -> {result['word']!r} in {result['elapsed']:.3f} s")
+    entry = result["body"]["backends"][result["backend"]]
+    assert result["word"] == "busy"
+    assert result["elapsed"] < 1.0
+    assert result["connections"] == 0          # the route never contacted the backend
+    assert "oldest_inflight_age_s" in entry and entry["oldest_inflight_age_s"] > 1.0
+    assert "suspect_wedged" not in entry
+    # The declaration must exist, and every row declared removed from this route must
+    # be absent from the reply.
+    declared = [rm for rm in telemetry_contract.REMOVED_IN_1_2_5
+                if rm["endpoint"] == "/pool/status"]
+    assert any(rm["path"] == "backends.*.suspect_wedged" for rm in declared)
+    checked = 0
+    for rm in declared:
+        head, star, *rest = rm["path"].split(".")
+        assert head == "backends" and star == "*" and rest
+        for per_backend in result["body"]["backends"].values():
+            node = per_backend
+            for part in rest[:-1]:
+                node = node.get(part, {})
+            assert rest[-1] not in node
+        checked += 1
+    assert checked >= 1
