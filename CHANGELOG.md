@@ -7,6 +7,18 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.2.4] - 2026-11-19
+
+This release changes no API: `API_VERSION` stays 7, and it changes no behaviour.
+
+### Changed
+- The comments and docstrings of `pool_status.py` now say what the helper does. It asks the gateway whether the LLM pool has a free backend before a REM or NREM dream cycle, and it returns one of four words, documented in the module in the order the rules apply. An empty pool is not busy, and an unreachable gateway lets the daemons carry on.
+- The `POOL_STATUS_URL` comment in `.env.example` now says the daemons' own LLM calls always go to `http://localhost:8888`, so this setting must name the same gateway.
+- A new test starts a real HTTP server and checks every answer the helper returns, including a non-200 reply, a body that is not JSON, an anonymous reply and a refused connection.
+
+### Security
+- Security dependencies were reviewed. No pin moved in this release.
+
 ## [1.2.3] - 2026-11-19
 
 This release changes no API: `API_VERSION` stays 7.
