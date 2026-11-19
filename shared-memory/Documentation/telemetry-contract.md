@@ -3,7 +3,7 @@
 
 # The Telemetry Contract
 
-Contract version **1.2.0**. Every key the gateway emits on `GET /health` and `GET /memory/telemetry`, what it means, what it is measured in, when it arrived, and where it is going.
+Contract version **1.2.1**. Every key the gateway emits on `GET /health` and `GET /memory/telemetry`, what it means, what it is measured in, when it arrived, and where it is going.
 
 ## The roles
 
@@ -267,8 +267,8 @@ Paths are relative to the response object.
 |---|---|---|---|---|---|---|---|
 | `dependencies.embedder.last_completed_at` | str/null | — | 1.2.0 | — | — | — | Reports the ISO UTC wall time when an upstream POST last returned a response (including an error response), or null if none has completed yet. It complements the waiting-age fields that replace a gateway timeout. |
 | `dependencies.embedder.last_deadline_cancelled_at` | str/null | — | 1.2.0 | — | — | — | Reports the ISO UTC wall time of the last caller-deadline cancellation, or null if none has occurred. Client disconnects do not update this timestamp. |
-| `dependencies.embedder.oldest_outstanding_age_s` | float/null | — | 1.2.0 | — | — | — | Reports in seconds how long the oldest in-flight call has been waiting on this encoder, rounded to one decimal, or null when none is waiting. The gateway publishes this age instead of imposing a gateway timeout; it never changes health state or triggers a warning. |
-| `dependencies.embedder.outstanding_count` | int | — | 1.2.0 | — | — | — | Reports how many calls are currently waiting on this encoder (0 means none). The gateway publishes this count and the waiting age instead of imposing a gateway timeout. |
+| `dependencies.embedder.oldest_outstanding_age_s` | float/null | — | 1.2.0 | — | — | — | Reports in seconds how long the oldest in-flight call, raw /v1/embeddings passthrough calls included, has been waiting on this encoder, rounded to one decimal, or null when none is waiting. The gateway publishes this age instead of imposing a gateway timeout; it never changes health state or triggers a warning. |
+| `dependencies.embedder.outstanding_count` | int | — | 1.2.0 | — | — | — | Reports how many calls are currently waiting on this encoder (0 means none), including raw passthrough calls to /v1/embeddings. The gateway publishes this count and the waiting age instead of imposing a gateway timeout. |
 | `dependencies.embedder.reason` | str/null | — | 0.9.74 | — | — | — | — |
 | `dependencies.embedder.state` | str | — | 0.9.74 | — | — | `health.embedder` | ok \| degraded \| down. down when the liveness probe failed, or when a configured key is refused (the probe or the capability status is auth_failed). degraded when the encoder is live but capability is failing, or the window is short or overrun. A refused key is judged before the window, so a window verdict cannot mask it. |
 | `dependencies.llm_pool.reason` | str/null | — | 0.9.74 | — | — | — | — |
@@ -287,8 +287,8 @@ Paths are relative to the response object.
 | `dependencies.rem_daemon.state` | str | — | 0.9.74 | — | — | `health.rem_daemon` | ok \| degraded \| down. down when the REM process is not running, or when llm_backlog cannot be read (reason: llm_backlog unreadable; the daemons stay stopped). degraded: dead_letters:N counts pending records with a backlog row, OR no backend counts toward dream slots (REM structurally cannot run against this fleet) — both reasons appear together when both apply |
 | `dependencies.reranker.last_completed_at` | str/null | — | 1.2.0 | — | — | — | Reports the ISO UTC wall time when an upstream POST last returned a response (including an error response), or null if none has completed yet. It complements the waiting-age fields that replace a gateway timeout. |
 | `dependencies.reranker.last_deadline_cancelled_at` | str/null | — | 1.2.0 | — | — | — | Reports the ISO UTC wall time of the last caller-deadline cancellation, or null if none has occurred. Client disconnects do not update this timestamp. |
-| `dependencies.reranker.oldest_outstanding_age_s` | float/null | — | 1.2.0 | — | — | — | Reports in seconds how long the oldest in-flight call has been waiting on this encoder, rounded to one decimal, or null when none is waiting. The gateway publishes this age instead of imposing a gateway timeout; it never changes health state or triggers a warning. |
-| `dependencies.reranker.outstanding_count` | int | — | 1.2.0 | — | — | — | Reports how many calls are currently waiting on this encoder (0 means none). The gateway publishes this count and the waiting age instead of imposing a gateway timeout. |
+| `dependencies.reranker.oldest_outstanding_age_s` | float/null | — | 1.2.0 | — | — | — | Reports in seconds how long the oldest in-flight call, raw /v1/reranking passthrough calls included, has been waiting on this encoder, rounded to one decimal, or null when none is waiting. The gateway publishes this age instead of imposing a gateway timeout; it never changes health state or triggers a warning. |
+| `dependencies.reranker.outstanding_count` | int | — | 1.2.0 | — | — | — | Reports how many calls are currently waiting on this encoder (0 means none), including raw passthrough calls to /v1/reranking. The gateway publishes this count and the waiting age instead of imposing a gateway timeout. |
 | `dependencies.reranker.reason` | str/null | — | 0.9.74 | — | — | — | — |
 | `dependencies.reranker.state` | str | — | 0.9.74 | — | — | `health.reranker` | ok \| degraded \| down. down when the liveness probe failed for a reason other than a refused key. A configured key the reranker refuses (probe or capability auth_failed, including /health 401 or 403) is degraded, not down. Any other probe failure is still down. |
 
