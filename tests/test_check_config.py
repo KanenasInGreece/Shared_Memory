@@ -51,10 +51,13 @@ def test_phase_a_only_runs_under_a_stdlib_only_interpreter():
     anywhere on Phase A's path would surface here as ModuleNotFoundError.
     This is the PRIMARY proof (a real subprocess), not the secondary
     static-import check below."""
-    proc = _run(["--phase-a-only"], env_overrides={"SECURE_ENV_FILE": ""}, python_flags=["-S"])
+    # A non-default keepalive value makes the keepalive_probe socket probe really run.
+    proc = _run(["--phase-a-only"], env_overrides={
+        "SECURE_ENV_FILE": "", "ENCODER_TCP_KEEPALIVE_IDLE_S": str(10 ** 12)}, python_flags=["-S"])
     assert proc.returncode == 0, f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
     assert "Traceback" not in proc.stderr
     assert "environment-only" in proc.stdout
+    assert "the gateway uses 60" in proc.stdout
 
 
 def test_phase_a_module_imports_are_a_stdlib_only_subset():
