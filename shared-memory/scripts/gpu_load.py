@@ -1,49 +1,48 @@
-"""Cross-architecture GPU-load probe, surfaced as inference_busy telemetry.
+"""Cross-architecture GPU-load probe, surfaced as `inference_busy` telemetry.
 
-This module used to be a direct gate the sleep-cycle daemons (rem_loop.py,
-consolidation_loop.py) checked before dreaming. That direct gate has since been
-removed — neither daemon imports this module any more. The only remaining
-caller is coordinator.py::_consolidation_health_refresher, which polls
-inference_busy_state() every CONSOLIDATION_HEALTH_REFRESH_SEC (~60s) purely to
-populate the "inference_busy" telemetry surfaced on /health and
-/memory/telemetry (a "GPU is busy — a user chatting with the LLM, or any other
-GPU workload" signal for the monitor's LLM tile, not a load-bearing gate on
-anything today).
+This is a DISPLAY signal for the monitor's LLM tile ("the GPU is busy": a user
+chatting with the LLM, or any other GPU workload); nothing gates on it. Neither
+rem_loop.py nor consolidation_loop.py imports this module. The only callers are
+coordinator.py (`_consolidation_health_refresher` polls `inference_busy_state()`
+and `probe_status()` every CONSOLIDATION_HEALTH_REFRESH_SEC, about 60 s, for
+/health and /memory/telemetry) and hive_mind_proxy.py (`gpu_probe_installed()`,
+for the hardware fingerprint).
 
-We deliberately make **no assumption about what is driving the GPU**. The only
-contract is that :5000 serves an OpenAI-compatible completions endpoint; the
-server platform (LM Studio, vLLM, llama-server, Ollama, TGI, a bare script, …)
-is irrelevant. So the gate is purely "is the GPU busy", not "is a process whose
-name we recognise busy" — the latter both coupled us to specific platforms and
-ignored direct chats and unrelated GPU apps, which are exactly what we want to
-yield to.
+The probe makes **no assumption about what is driving the GPU** (decision:228,
+the ruling that the probe reads raw GPU utilisation, not process names): the server platform (LM Studio,
+vLLM, llama-server, Ollama, a bare script, ...) is irrelevant, and any consumer,
+including a direct chat or an unrelated GPU app, counts as busy.
 
-Detecting GPU utilisation portably is the hard part: driver-specific paths
-(`nvidia-smi`, `rocm-smi`, i915/xe sysfs `gpu_busy_percent`) each break on some
-hardware — e.g. Intel Arc exposes no `gpu_busy_percent`. We therefore shell out
-to **nvtop --snapshot**, which already abstracts Nvidia (NVML), AMD and Intel
-behind one JSON output. nvtop is a prerequisite for this feature.
+Driver-specific paths (`nvidia-smi`, `rocm-smi`, i915/xe sysfs `gpu_busy_percent`)
+each break on some hardware; Intel Arc, for one, exposes no `gpu_busy_percent`.
+So the probe shells out to **nvtop --snapshot**, which abstracts Nvidia (NVML),
+AMD and Intel behind one JSON output. nvtop is a prerequisite for this feature.
 
-Fail-open by design: if nvtop is absent, times out, or returns unparseable
-output, the probe reports *not busy* so dreaming is never permanently blocked —
-the daemons still honour their WRITE_QUIESCE_SEC time-guard, and NREM's hard
-backstop always fires regardless of GPU state.
+Fail-open by design, so a broken probe never reads as a busy GPU.
+`inference_busy_state` answers "unknown" only when `gpu_probe_available()` is
+false BEFORE the call (SLOT_AWARE=0, nvtop absent, or the hang cap already
+tripped). A failure DURING the call (timeout, bad JSON, spawn error) makes
+`inference_gpu_busy` return False, which `inference_busy_state` reports as "idle"
+for that cycle.
 
-A timed-out nvtop child is always reaped (SIGKILL + a short wait) or, failing
-that, counted as leaked on every NON-CANCELLATION path (fact:1645: a host
-where nvtop blocks in a GPU-fence wait left 926 D-state children, 2.98GB RSS,
-over 17h, because the old code returned False on timeout without touching the
-child). On CANCELLATION (asyncio.CancelledError, e.g. gateway shutdown mid
-snapshot) the child is best-effort killed only — no await, no counting; see
-inference_gpu_busy's `finally`. After NVTOP_MAX_CONSECUTIVE_HANGS consecutive
-snapshot timeouts (any cycle that ends in anything other than a snapshot
-timeout resets the count), the probe disables itself for the rest of the
-process lifetime rather than keep spawning children that are likely to hang
-the same way — permanent until the gateway restarts.
+A timed-out nvtop child is reaped (SIGKILL plus a short wait) or, failing that,
+counted as leaked, on every NON-CANCELLATION path. fact:1645 (measured) is why:
+a host where nvtop blocked in a GPU-fence wait left 926 D-state children
+(2.98 GB RSS) over 17 h, because the old code returned False on timeout without
+touching the child. On CANCELLATION (asyncio.CancelledError, e.g. gateway shutdown
+mid snapshot) the child is only best-effort killed, with no await and no
+counting; see the `finally` in inference_gpu_busy. A counted leaked child is
+never awaited again.
 
-Runs on the gateway host (coordinator.py), which is where inference actually
-gets served, including generation that remote clients route through the
-gateway. nvtop is an infrastructure-host prerequisite, not a remote-client one.
+After NVTOP_MAX_CONSECUTIVE_HANGS consecutive snapshot timeouts (any cycle that
+ends in anything other than a snapshot timeout resets the count) the probe
+disables itself rather than keep spawning children likely to hang the same way
+(decision:1656: reap on timeout, then self-disable after N timeouts). That is
+permanent until the gateway restarts; there is no re-arm.
+
+The probe runs on the gateway host (coordinator.py), where inference is served,
+including generation that remote clients route through the gateway. nvtop is an
+infrastructure-host prerequisite, not a remote-client one.
 """
 import asyncio
 import json
@@ -53,28 +52,25 @@ import shutil
 
 log = logging.getLogger("gpu_load")
 
-# Re-read at call time, not import, so a late .env load is visible. NVTOP_MAX_CONSECUTIVE_HANGS is an unmeasured default (fact:1645).
+# The env knobs are re-read at call time, not import, so a late .env load is
+# visible.
 DEFAULT_GPU_BUSY_PERCENT = 50
 
 _warned = False  # rate-limit the "nvtop unavailable" warning to once per process
 _consecutive_hangs = 0  # snapshot timeouts in a row; reset by any cycle that is not a snapshot timeout
-_leaked_children = 0  # nvtop children still in D state after SIGKILL+wait; monotonic
-                      # for the process lifetime (reset-on-restart, like the rerank
-                      # counters) — never awaited again once counted here
-_disabled_reason = None  # None while armed; "disabled_after_hangs" once tripped by
-                         # rule 2 — permanent until the gateway restarts (no re-arm)
+_leaked_children = 0  # nvtop children still in D state after SIGKILL+wait; only
+                      # grows until the gateway restarts; never awaited again
+_disabled_reason = None  # None while armed; "disabled_after_hangs" once the
+                         # hang-cap self-disable trips, permanent until restart
 _env_parse_warned: set = set()  # var names already warned about a bad value, once each
 
 
 def _env_float(name: str, default: float) -> float:
     """Read a float env var, falling back to `default` (with a once-per-name
-    WARNING) on anything that doesn't parse. F6 (fix round, Gemini): the raw
-    `float(os.environ.get(...))` calls this replaces used to live INSIDE
-    _reap_after_timeout's own try/except -- a non-numeric operator value threw
-    ValueError, the defensive except swallowed it, and the whole reap aborted
-    BEFORE _consecutive_hangs was ever incremented, so the self-disable in
-    rule 2 could never trip. Parsing here, before that try block, keeps a
-    typo'd knob from silently defeating the cap it's supposed to bound."""
+    WARNING) on anything that doesn't parse. Never raises, so a typo'd knob
+    cannot stale the /health snapshot, and _reap_after_timeout calls it BEFORE
+    its own try: a parse error inside that try would be swallowed and abort the
+    reap before the hang count advanced, defeating the hang-cap self-disable."""
     raw = os.environ.get(name)
     if raw is None:
         return default
@@ -115,8 +111,8 @@ def parse_busy(snapshot, threshold=DEFAULT_GPU_BUSY_PERCENT, gpu_indices=None) -
     """Pure decision function over a parsed `nvtop -s` snapshot (list of GPU dicts).
 
     GPU selection:
-      * if ``gpu_indices`` is given, gate on those GPU positions;
-      * otherwise gate on **every** GPU in the snapshot.
+      * if ``gpu_indices`` is given, select those GPU positions;
+      * otherwise select **every** GPU in the snapshot.
 
     Returns True iff a gated GPU's ``gpu_util`` is >= ``threshold``. The signal is
     platform-agnostic: any GPU consumer (the local LLM, a direct chat, an
@@ -133,19 +129,19 @@ def parse_busy(snapshot, threshold=DEFAULT_GPU_BUSY_PERCENT, gpu_indices=None) -
 
 async def _reap_after_timeout(proc, timeout: float, exc: Exception) -> None:
     """Reap (or count as leaked) an nvtop child that blew NVTOP_TIMEOUT_SEC, and
-    advance the hang-streak counter rule 2's self-disable keys on.
+    advance the hang-streak counter the hang-cap self-disable keys on.
 
     Wrapped so NOTHING escapes this function: a probe that cannot be reaped must
     never blank the whole /health snapshot — inference_gpu_busy() always returns
     False on this path regardless of what happens in here.
     """
     global _leaked_children, _consecutive_hangs, _disabled_reason
-    # F6 (fix round, Gemini): parsed OUTSIDE the try below, via helpers that
-    # never raise. A raw float()/int() in here used to be able to throw on a
-    # malformed operator value, get swallowed by the try's own defensive
-    # except, and abort the reap BEFORE _consecutive_hangs was incremented —
-    # silently defeating rule 2's cap.
+    # Parsed OUTSIDE the try below, by helpers that never raise: an exception in
+    # here would be swallowed by the try's defensive except and abort the reap
+    # before _consecutive_hangs advanced, silently defeating the hang cap.
     kill_wait = _env_float("NVTOP_KILL_WAIT_SEC", 1.0)
+    # Default 3 is UNMEASURED (fact:1338: a parameter value is a measurement
+    # claim); fact:1645 measured a 926-child nvtop leak, not this cap.
     max_hangs = _env_int("NVTOP_MAX_CONSECUTIVE_HANGS", 3)
     try:
         try:
@@ -159,7 +155,10 @@ async def _reap_after_timeout(proc, timeout: float, exc: Exception) -> None:
         try:
             await asyncio.wait_for(proc.wait(), timeout=kill_wait)
         except asyncio.TimeoutError:
-            # Still in D state after SIGKILL; the kernel keeps it until reboot. Count it and do not await it again. The hang cap does not bound an alternating pattern (decision:1656 follow-up).
+            # Still in D state after SIGKILL; the kernel keeps it until reboot.
+            # Count it and do not await it again. The hang cap does not bound an
+            # alternating pattern (decision:1656 follow-up: a non-timeout failure
+            # resets the streak).
             reaped = False
             _leaked_children += 1
 
@@ -191,10 +190,10 @@ async def _reap_after_timeout(proc, timeout: float, exc: Exception) -> None:
 
 
 async def inference_gpu_busy() -> bool:
-    """Async probe: True if a gated GPU is busy at/above GPU_BUSY_PERCENT.
+    """Async probe: True if a monitored GPU is busy at/above GPU_BUSY_PERCENT.
 
     Fail-open: returns False when SLOT_AWARE is disabled, nvtop is unavailable,
-    the snapshot times out, or the probe has disabled itself after repeated
+    the snapshot times out or fails, or the probe has disabled itself after repeated
     hangs (NVTOP_MAX_CONSECUTIVE_HANGS). Every subprocess this spawns is always
     either reaped or counted as leaked on every NON-CANCELLATION path — see
     _reap_after_timeout. On cancellation (asyncio.CancelledError, a BaseException
@@ -205,8 +204,8 @@ async def inference_gpu_busy() -> bool:
     if os.environ.get("SLOT_AWARE", "1") == "0":
         return False
     if _disabled_reason is not None:
-        # Rule 2: no-recovery self-disable. Never spawn another child this
-        # process once the hang streak has tripped the cap.
+        # The hang-cap self-disable (decision:1656: no re-arm). Never spawn another
+        # child this process once the hang streak has tripped the cap.
         return False
     nvtop_bin = os.environ.get("NVTOP_BIN", "nvtop")
     if shutil.which(nvtop_bin) is None:
@@ -219,11 +218,10 @@ async def inference_gpu_busy() -> bool:
             _warned = True
         return False
 
-    timeout = float(os.environ.get("NVTOP_TIMEOUT_SEC", "5.0"))
-    proc = None  # F1 (fix round): must exist before the try -- create_subprocess_
-                 # exec itself raising (a missing-binary race) left this name
-                 # unbound, and an UnboundLocalError out of the except below used
-                 # to escape to the refresher and stale the whole /health snapshot.
+    timeout = _env_float("NVTOP_TIMEOUT_SEC", 5.0)
+    # proc must exist before the try: create_subprocess_exec itself can raise,
+    # and an unbound name in the handlers would escape and stale /health.
+    proc = None
     try:
         proc = await asyncio.create_subprocess_exec(
             nvtop_bin, "-s",
@@ -234,10 +232,9 @@ async def inference_gpu_busy() -> bool:
         snapshot = json.loads(out.decode("utf-8", "replace"))
     except asyncio.TimeoutError as exc:
         # The nvtop child is still running past NVTOP_TIMEOUT_SEC (observed
-        # cause: a GPU-fence D-state wait, fact:1645). It must be reaped or
-        # counted — never left to leak silently. proc can still be None here
-        # (see F1 above) if create_subprocess_exec itself is what timed out;
-        # there is nothing to reap in that case.
+        # cause: a GPU-fence D-state wait, fact:1645, the measured 926-child
+        # leak). It must be reaped or counted, never left to leak silently. proc
+        # is None if create_subprocess_exec itself timed out; nothing to reap.
         if proc is not None:
             await _reap_after_timeout(proc, timeout, exc)
         return False
@@ -250,27 +247,29 @@ async def inference_gpu_busy() -> bool:
                         type(exc).__name__, exc)
             _warned = True
         # A non-timeout failure is not evidence of a persistent hang, so it
-        # resets the streak (operator ruling, decision:1656 follow-up).
+        # resets the streak (operator ruling, decision:1656 follow-up: the cap
+        # counts only consecutive timeouts).
         if _consecutive_hangs:
             log.debug("non-timeout nvtop failure cleared a hang streak of %d.", _consecutive_hangs)
         _consecutive_hangs = 0
         return False
     finally:
-        # CancelledError is a BaseException, so the excepts above miss a shutdown mid-spawn and leave the child. Do not await here; that await would be cancelled too.
+        # CancelledError is a BaseException, so the excepts above miss a shutdown
+        # mid-spawn and leave the child. Do not await here; that await would be
+        # cancelled too.
         if proc is not None and proc.returncode is None:
             try:
                 proc.kill()
             except ProcessLookupError:
                 pass
 
-    # A full successful cycle clears any hang streak — only CONSECUTIVE
-    # snapshot timeouts count toward the self-disable in rule 2 (any cycle
-    # that ends in anything other than a snapshot timeout resets the count —
-    # the generic `except Exception` branch above resets it the same way, and
-    # for the same reason: OPERATOR RULING, decision:1656 follow-up).
+    # A full successful cycle clears the hang streak: only CONSECUTIVE snapshot
+    # timeouts count toward the hang-cap self-disable. The generic
+    # `except Exception` branch above resets it the same way (operator ruling,
+    # decision:1656 follow-up: a non-timeout cycle resets the streak).
     _consecutive_hangs = 0
 
-    threshold = int(os.environ.get("GPU_BUSY_PERCENT", str(DEFAULT_GPU_BUSY_PERCENT)))
+    threshold = _env_int("GPU_BUSY_PERCENT", DEFAULT_GPU_BUSY_PERCENT)
     gpu_indices_env = os.environ.get("GPU_INDICES", "").strip()
     indices = (
         [int(x) for x in gpu_indices_env.split(",") if x.strip().isdigit()]
@@ -278,8 +277,8 @@ async def inference_gpu_busy() -> bool:
     )
     busy = parse_busy(snapshot, threshold, indices)
     if busy:
-        # Detail at debug; the deferral itself is logged at WARNING by the caller
-        # (REM/NREM) so the warning names which dreaming cycle was deferred.
+        # Debug detail only: nothing defers on this signal, which feeds the
+        # `inference_busy` telemetry.
         log.debug("GPU busy (>=%d%%).", threshold)
     return busy
 
@@ -339,16 +338,17 @@ def probe_status() -> dict:
 async def inference_busy_state() -> str:
     """Tri-state view of the inference GPU for /health + /memory/telemetry:
 
-      "busy"    — a gated GPU is at/above GPU_BUSY_PERCENT (same gate REM/NREM
-                  used to defer on, so the monitor can show the LLM "Busy" truthfully)
-      "idle"    — the probe ran and no gated GPU is busy
+      "busy"    — a monitored GPU is at/above GPU_BUSY_PERCENT (so the monitor can
+                  show the LLM "Busy" truthfully)
+      "idle"    — the probe ran and no monitored GPU is busy (also a failure
+                  DURING the call, e.g. a timeout, for that cycle)
       "unknown" — the probe is unavailable (SLOT_AWARE=0, nvtop absent, or the
                   probe has disabled itself after repeated hangs — see
                   probe_status()), so the fail-open False from
                   inference_gpu_busy() must NOT read as "idle"
 
-    This is the read-only surface for the busy signal; inference_gpu_busy() remains
-    the boolean the daemons gate on. nvtop sees raw GPU utilisation, so this also
+    This is the read-only surface for the busy signal; inference_gpu_busy() is the
+    boolean probe it is built from. nvtop sees raw GPU utilisation, so this also
     reflects a user chatting directly with :5000 (which bypasses the gateway)."""
     if not gpu_probe_available():
         return "unknown"
