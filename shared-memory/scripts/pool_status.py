@@ -1,24 +1,15 @@
-"""Client helper: is the reasoning-LLM pool available?
+"""Client helper: does the gateway's LLM pool have a free backend?
 
-The dreaming daemons (REM/NREM) gate on this instead of a global nvtop GPU-busy
-check. Rationale (measured): a GLOBAL "any GPU busy" gate SELF-DEFERS to the
-daemons' own dream LLM calls and, being global, ignores a free card — on a
-multi-backend pool that starves the dream cycle (measured 482 NREM + 487 REM
-defers / 45 min). Because ALL LLM traffic (dream cycles AND user chats) flows
-through the gateway. The chat route serves the framework's daemons; other
-clients call a model directly. Per-backend in-flight is the usage signal: a
-free backend can take a dream call, and a fleet that is entirely in flight or
-cooling is busy. An empty roster is not busy. Desktop GPU use is ignored.
+The REM and NREM dreaming daemons ask this before a dream cycle instead of a global
+GPU-busy check, which deferred to their own dream calls and ignored a free card (one
+measured run: 482 NREM + 487 REM defers in 45 min). The daemons reach their model
+through the gateway, so its pool signal counts their traffic. A backend is available
+when its in-flight count is below its declared maximum, it is not cooling down after
+failures, and it is not reserved. An empty roster is not busy. Desktop GPU use is
+ignored.
 
-Fail-OPEN: if the gateway can't be reached, assume available so dreaming is never
-permanently blocked (matches the old nvtop probe's fail-open contract).
-
-SEC-A5-01 (PR A5 fix round): /pool/status gates its roster behind an agent
-bearer token on an auth-configured install (same split as /health). An
-anonymous body has no free_slots key. pool_roster_state treats that as
-unreachable, the same as a non-200, so a daemon that omits its token does
-not read an empty roster as free. `headers` lets rem_loop.py and
-consolidation_loop.py attach the daemon's AGENT_TOKEN.
+Fail-OPEN: when the roster cannot be learned the answer is "unreachable", and callers
+go on, so dreaming is never blocked by a failed probe.
 """
 import os
 
@@ -28,9 +19,15 @@ POOL_STATUS_URL = os.environ.get("POOL_STATUS_URL", "http://localhost:8888/pool/
 
 
 async def pool_roster_state(timeout: float = 3.0, headers: dict | None = None) -> str:
-    """empty, busy, free, or unreachable. Unreachable fail-opens; empty is not busy.
+    """Return "unreachable", "empty", "busy" or "free" for the gateway's pool.
 
-    An anonymous body has no free_slots key and is unreachable, the same as a non-200. A 200 with no backends is an empty roster.
+    "unreachable": any non-200, any error, or a body that is not a mapping or has no
+    `free_slots`. An anonymous caller on an auth-configured gateway gets such a body,
+    so it must never read as "empty"; `headers` lets the daemons send their token.
+    "empty": `free_slots` is present but `backends` is not a non-empty mapping.
+    "busy": `backends` is a non-empty mapping and `free_slots` is not above 0.
+    "free": `backends` is a non-empty mapping and `free_slots` is above 0; the gateway
+    counts available backends in it.
     """
     try:
         async with httpx.AsyncClient(timeout=timeout, trust_env=False) as client:

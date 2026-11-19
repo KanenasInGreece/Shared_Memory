@@ -230,3 +230,81 @@ def test_embed_body_buffered_under_cap_is_retry_eligible(monkeypatch):
 
     assert session.calls == 2             # the embeddings leg also got the retry
     assert resp.status == 503
+
+
+_ROSTER_FREE = b'{"free_slots":1,"backends":{"a":{}}}'
+
+
+@pytest.fixture
+def _stub_pool_server():
+    """Start a local server answering every GET with a stated status and body."""
+    import http.server
+    import threading
+
+    started = []
+
+    def _start(status, body):
+        class _Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(status)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, fmt, *args):
+                return
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        started.append((server, thread))
+        return f"http://127.0.0.1:{server.server_port}/pool/status"
+
+    yield _start
+    for server, thread in started:
+        try:
+            server.shutdown()
+        finally:
+            server.server_close()
+        thread.join()
+
+
+@pytest.mark.parametrize("status, body, expected", [
+    (200, b'{"free_slots":0,"backends":{}}', "empty"),
+    (200, b'{"free_slots":2,"backends":{"a":{}}}', "free"),
+    (200, b'{"free_slots":0,"backends":{"a":{}}}', "busy"),
+    (200, b"{}", "unreachable"),          # anonymous caller, auth-configured gateway
+    (200, b"[]", "unreachable"),
+    (200, b"nope", "unreachable"),
+    (401, b"{}", "unreachable"),
+    (401, _ROSTER_FREE, "unreachable"),
+    (503, _ROSTER_FREE, "unreachable"),
+    (302, b"", "unreachable"),
+    (None, None, "unreachable"),          # connection refused
+])
+def test_pool_roster_state_over_real_http(
+    monkeypatch, _stub_pool_server, status, body, expected
+):
+    """The real pool_roster_state against a local server returns one word per answer.
+
+    Bodies with a null, non-numeric, negative or float free_slots, or no backends key,
+    are left unpinned on purpose: how they should read is undecided.
+    """
+    import socket
+    import pool_status
+
+    async def _ask():
+        return await pool_status.pool_roster_state(timeout=2)
+
+    if status is None:
+        # Bound and never listening for the whole call: connect is refused and no
+        # other process can take the port.
+        with socket.socket() as s:
+            s.bind(("127.0.0.1", 0))
+            url = f"http://127.0.0.1:{s.getsockname()[1]}/pool/status"
+            monkeypatch.setattr(pool_status, "POOL_STATUS_URL", url)
+            assert asyncio.run(_ask()) == expected
+        return
+    url = _stub_pool_server(status, body)
+    monkeypatch.setattr(pool_status, "POOL_STATUS_URL", url)
+    assert asyncio.run(_ask()) == expected
