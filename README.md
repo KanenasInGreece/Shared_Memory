@@ -999,9 +999,10 @@ NEO4J_PAGECACHE=256M
 
 `RERANK_MAX_DOC_CHARS` defaults to the embedding window (24570). It is the latency knob for a
 CPU reranker: narrowing a 20-candidate set to 2000 characters took it from 64 s to 30 s and kept
-about half of reranking's gain over plain vector order. `RERANK_MIN_CHARS_S` ships at 800, which
-is a CPU floor; raise it when the reranker is on a GPU. `LLAMA_CPU_THREADS` is per encoder
-container. The full list is `shared-memory/.env.example`.
+about half of reranking's gain over plain vector order. The gateway sets no timeout on an
+encoder call. The caller sends its own deadline, and `/health` shows how long each encoder's
+oldest call has been waiting, without changing the health state. `LLAMA_CPU_THREADS` is per
+encoder container. The full list is `shared-memory/.env.example`.
 
 A third option, on hardware vLLM supports, is to serve the encoders with **vLLM** rather than
 `llama-server`. The embedder needs nothing extra, but **vLLM serving the reranker needs
