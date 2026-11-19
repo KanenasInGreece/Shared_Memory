@@ -309,7 +309,7 @@ LLM_MAX_INFLIGHT_POLL_S = max(0.05, float(os.environ.get("LLM_MAX_INFLIGHT_POLL_
 LLM_POOL: list[str] = list(LLM_BACKENDS)
 
 _llm_inflight: dict[str, int] = {b: 0 for b in LLM_BACKENDS}
-# Inflight count cannot tell busy from stuck. Record start times so status can flag suspect_wedged after a lazy health probe.
+# Inflight count cannot tell busy from stuck. Start times give /pool/status its oldest_inflight_age_s and let /memory/telemetry flag llm.suspect_wedged after a lazy health probe.
 _llm_inflight_started: dict[str, list[float]] = {b: [] for b in LLM_BACKENDS}
 LLM_WEDGE_SUSPECT_AGE = float(os.environ.get("LLM_WEDGE_SUSPECT_AGE", "900"))
 
@@ -2532,14 +2532,13 @@ async def _watchdog_daemon(stop_event: asyncio.Event) -> None:
 async def handle_pool_status(request: web.Request) -> web.Response:
     """GET /pool/status — report in-memory LLM pool availability for daemons.
     Returns backend availability and free slots, redacting details for anonymous callers
-    when auth is configured."""
+    when auth is configured. It probes no backend, so it answers at once; the wedge
+    diagnostic is `/memory/telemetry` key `llm.suspect_wedged`, filled by the health
+    computation."""
     if AUTH_CONFIGURED_AT_STARTUP and not bool(_safe_resolve_identity(request)):
         return web.json_response({})
 
     now = time.monotonic()
-    # The session is only for the rare suspect-wedged probe. Tests call this handler with no real app.
-    _app = getattr(request, "app", None)
-    _session = _app["proxy"].session if _app is not None and "proxy" in _app else None
     backends, free = {}, 0
     for b in LLM_POOL:
         # Available means "has spare capacity", not "is idle": a hosted backend that declares max_inflight 32 has 31 slots free while one request is in flight, and reading it as busy stalled every dream cycle for the length of every request.
@@ -2555,9 +2554,6 @@ async def handle_pool_status(request: web.Request) -> web.Response:
             "available": avail,
             "priority": LLM_BACKEND_PRIORITY.get(b, 1),
         }
-        # Probe a backend only when a request has been in flight past the suspect age. A busy generator still answers /health; a hung driver cannot.
-        if age is not None and age > LLM_WEDGE_SUSPECT_AGE and _session is not None:
-            entry["suspect_wedged"] = not await _probe_backend_alive(_session, b)
         backends[b] = entry
         free += 1 if avail else 0
     # Scrub backend URL keys before this response leaves. A clean query-less URL is unchanged; collapsing two distinct keys must not merge them.

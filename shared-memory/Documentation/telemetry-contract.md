@@ -106,6 +106,14 @@ Not moved. Role counters and privacy flags left the payload. VERSION in this fil
 | /pool/status | `backends.*.serves_all` | free_slots is availability only |
 | /pool/status | `backends.*.counts_free_slot` | free_slots is availability only |
 
+## Removed outright in 1.2.5
+
+Not moved. `GET /pool/status` no longer probes a backend, so its entries no longer carry the probe's verdict.
+
+| endpoint | key | why |
+|---|---|---|
+| /pool/status | `backends.*.suspect_wedged` | this route no longer probes a backend; `/memory/telemetry` `llm.suspect_wedged` reports the diagnostic |
+
 ## Dual-emitted copies dropped
 
 Each key below was moved to a new home and served from both places while consumers migrated; from the release its table names, only the new path is served. This is the map — read the right-hand column.

@@ -1882,6 +1882,14 @@ REMOVED_IN_1_0_41: tuple[dict, ...] = (
 )
 
 
+#: Removed, not moved: `/pool/status` no longer probes a backend, so its entries lose the probe's verdict.
+REMOVED_IN_1_2_5: tuple[dict, ...] = (
+    {"endpoint": "/pool/status", "path": "backends.*.suspect_wedged",
+     "reason": "this route no longer probes a backend; `/memory/telemetry` "
+               "`llm.suspect_wedged` reports the diagnostic"},
+)
+
+
 # Keys that may be absent from a full payload. Adding one is the cheap way to silence the completeness check.
 # Each entry is identity, a live condition, or an empty-versus-populated shape.
 CONDITIONAL: frozenset = frozenset({
@@ -2338,6 +2346,15 @@ def render_markdown() -> str:
     a("| endpoint | key | why |")
     a("|---|---|---|")
     for rm in REMOVED_IN_1_0_41:
+        a(f"| {rm['endpoint']} | `{rm['path']}` | {rm['reason']} |")
+    a("")
+    a("## Removed outright in 1.2.5")
+    a("")
+    a("Not moved. `GET /pool/status` no longer probes a backend, so its entries no longer carry the probe's verdict.")
+    a("")
+    a("| endpoint | key | why |")
+    a("|---|---|---|")
+    for rm in REMOVED_IN_1_2_5:
         a(f"| {rm['endpoint']} | `{rm['path']}` | {rm['reason']} |")
     a("")
     a("## Dual-emitted copies dropped")
