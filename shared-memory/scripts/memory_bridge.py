@@ -841,6 +841,26 @@ def _normalize_domains(metadata: dict) -> dict:
     return metadata
 
 
+async def _embedder_deadline() -> tuple:
+    """Return (wait_s, client_timeout) for a call that waits on the embedder.
+
+    wait_s is None when the gateway published no embedder projection, because a
+    deadline is never invented; the timeout is then 60.0.
+    """
+    capability = await _gateway_capability()
+    embedder = (capability or {}).get("embedder")
+    try:
+        projected = float(embedder.get("projected_full_payload_s") or 0) if isinstance(embedder, dict) else 0
+    except (TypeError, ValueError):
+        projected = 0
+    if projected <= 0:
+        return None, 60.0
+    wait_s = min(SEARCH_TIMEOUT_MAX_S, max(
+        SEARCH_TIMEOUT_FLOOR_S, projected * SEARCH_SAFETY_FACTOR + SEARCH_OVERHEAD_S))
+    # Leave time for the gateway's deadline response to reach the caller.
+    return wait_s, wait_s + SEARCH_OVERHEAD_S
+
+
 async def save_artifact(content: str, metadata_json: str = "{}") -> dict:
     if isinstance(metadata_json, str):
         try:
@@ -873,20 +893,12 @@ async def save_artifact(content: str, metadata_json: str = "{}") -> dict:
             _append_log("memory_bridge", 3, "project_derived", {"project": derived})
 
     body = {"content": content, "metadata": metadata, "agent_id": AGENT_ID}
-    capability = await _gateway_capability()
-    embedder = (capability or {}).get("embedder")
-    try:
-        projected = float(embedder.get("projected_full_payload_s") or 0) if isinstance(embedder, dict) else 0
-    except (TypeError, ValueError):
-        projected = 0
     # Save uses only the embedder projection; without one, do not invent a deadline.
-    if projected > 0:
-        body["wait_s"] = min(SEARCH_TIMEOUT_MAX_S, max(
-            SEARCH_TIMEOUT_FLOOR_S, projected * SEARCH_SAFETY_FACTOR + SEARCH_OVERHEAD_S))
+    wait_s, timeout = await _embedder_deadline()
+    if wait_s is not None:
+        body["wait_s"] = wait_s
 
     try:
-        # Leave time for the gateway's deadline response to reach the caller.
-        timeout = body["wait_s"] + SEARCH_OVERHEAD_S if "wait_s" in body else 60.0
         async with _async_client(timeout) as client:
             r = await client.post(
                 f"{COORDINATOR_BASE}/memory/save",
@@ -1597,8 +1609,13 @@ async def save_retrospective_artifact(
                             "states, not valence; put the nuance in --notes")}
     payload = build_retrospective_payload(pg_id, rating, notes, date, source,
                                           grounded_in, source_ref, elicited)
+    # Send the same wait as the save path; the gateway answers 503
+    # embed_deadline_exceeded or 499 on it.
+    wait_s, timeout = await _embedder_deadline()
+    if wait_s is not None:
+        payload["wait_s"] = wait_s
     try:
-        async with _async_client(60.0) as client:
+        async with _async_client(timeout) as client:
             r = await client.post(
                 f"{COORDINATOR_BASE}/memory/retrospective",
                 json=payload,

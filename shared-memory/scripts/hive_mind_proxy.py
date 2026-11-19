@@ -58,6 +58,9 @@ import request_sizing
 from coordinator import (
     MemoryCoordinator,
     OutstandingCalls,
+    CallerDisconnected,
+    await_encoder_call,
+    combine_encoder_calls,
     encoder_keepalive_options,
     attach as attach_coordinator,
     CONSOLIDATION_CYCLE_TYPES,
@@ -661,6 +664,50 @@ def _strip_llm_steering_headers(headers) -> "CIMultiDict[str]":
 
 # Upstream reset while reading iter_any(): an aiohttp client error, not a downstream disconnect. A clean close just ends the iterator.
 UPSTREAM_DISCONNECT = (ServerDisconnectedError,)
+
+
+class _WatchedRequest:
+    """Open an upstream request context whose wait for headers ends when the caller
+    hangs up. The gateway stops waiting and closes its connection; whether the encoder
+    stops its own work depends on the server and build.
+    """
+
+    def __init__(self, request, context):
+        self._request = request
+        self._context = context
+
+    async def __aenter__(self):
+        acquired = []
+
+        async def enter():
+            response = await self._context.__aenter__()
+            acquired.append(response)
+            return response
+
+        try:
+            return await await_encoder_call(self._request, enter())
+        except BaseException:
+            # The response may have arrived just as the caller left or the task was
+            # cancelled; __aexit__ will never run for it, so release it here.
+            if acquired:
+                try:
+                    await self._context.__aexit__(None, None, None)
+                except Exception:
+                    pass
+            raise
+
+    async def __aexit__(self, *exc_info):
+        return await self._context.__aexit__(*exc_info)
+
+
+async def _next_chunk(chunks):
+    """Read one chunk of an upstream body, returning (False, chunk) or (True, None)
+    at its end.
+    """
+    try:
+        return False, await chunks.__anext__()
+    except StopAsyncIteration:
+        return True, None
 
 
 class _EncoderBodyTooLarge(Exception):
@@ -1332,6 +1379,9 @@ class AsyncHiveMindProxy:
     def __init__(self):
         self.session: ClientSession | None = None
         self.llm_session: ClientSession | None = None
+        # Track raw passthrough calls waiting on each encoder so /health can add
+        # them to the coordinator's own calls.
+        self._passthrough_calls = {"embedder": OutstandingCalls(), "reranker": OutstandingCalls()}
 
     async def start_session(self) -> None:
         connector = TCPConnector(
@@ -1968,16 +2018,25 @@ class AsyncHiveMindProxy:
         have_buffered_body = llm_body is not None or embed_body is not None
         max_attempts = 2 if have_buffered_body else 1
 
+        # Count the call here, never in the waiter, so a call is not counted twice.
+        # Completed means the upstream answered with headers.
+        calls = self._passthrough_calls.get(encoder_kind)
+        token = calls.begin() if calls is not None else None
+        completed = False
         try:
             for attempt in range(max_attempts):
                 try:
-                    async with self.session.request(
+                    upstream_request = self.session.request(
                         method=request.method,
                         url=target_url,
                         headers=upstream_headers,
                         data=upstream_data,
                         allow_redirects=False,  # proxy must pass redirects through, never chase them
-                    ) as upstream:
+                    )
+                    if calls is not None:
+                        upstream_request = _WatchedRequest(request, upstream_request)
+                    async with upstream_request as upstream:
+                        completed = True
 
                         proxy_resp = web.StreamResponse(
                             status=upstream.status,
@@ -1988,7 +2047,15 @@ class AsyncHiveMindProxy:
                             # Read only a prefix of a >=400 body. Classification does not need the rest, and an oversized body must not be buffered.
                             content_encoding = upstream.headers.get("Content-Encoding")
                             try:
-                                body_bytes = await upstream.content.read(_ERROR_BODY_PARSE_CAP)
+                                if calls is None:
+                                    body_bytes = await upstream.content.read(_ERROR_BODY_PARSE_CAP)
+                                else:
+                                    # A caller who leaves while the error body
+                                    # stalls gets 499 below.
+                                    body_bytes = await await_encoder_call(
+                                        request, upstream.content.read(_ERROR_BODY_PARSE_CAP))
+                            except CallerDisconnected:
+                                raise
                             except Exception:
                                 body_bytes = b""
                             try:
@@ -2039,7 +2106,16 @@ class AsyncHiveMindProxy:
                         # write_eof() lives inside the same try as the chunk loop so that
                         # an EOF-time disconnect is handled by the same except clauses.
                         try:
-                            async for chunk in upstream.content.iter_any():
+                            chunks = upstream.content.iter_any().__aiter__()
+                            while True:
+                                # An upstream stalled between chunks must not outlive
+                                # its caller.
+                                if calls is None:
+                                    finished, chunk = await _next_chunk(chunks)
+                                else:
+                                    finished, chunk = await await_encoder_call(request, _next_chunk(chunks))
+                                if finished:
+                                    break
                                 await proxy_resp.write(chunk)
                             await proxy_resp.write_eof()
 
@@ -2047,6 +2123,14 @@ class AsyncHiveMindProxy:
                             # CancelledError is task cancellation, not a disconnect. Re-raise it or graceful shutdown stalls.
                             log.warning("Handler task cancelled during stream: %s", scrubbed_target_url)
                             raise
+
+                        except CallerDisconnected:
+                            # The status line is committed, so no 499 can
+                            # follow: the gateway stops waiting, the exit below
+                            # closes the upstream connection, and the disconnect
+                            # is counted once.
+                            log.warning("Client disconnected mid-stream: %s", scrubbed_target_url)
+                            record_llm_client_disconnect()
 
                         except UPSTREAM_DISCONNECT as e:
                             # Upstream dropped the connection after headers were sent. Log and return the partial response; a new reply is no longer possible.
@@ -2074,6 +2158,13 @@ class AsyncHiveMindProxy:
         except asyncio.CancelledError:
             # CancelledError is a BaseException, so except Exception will not see it. Do not absorb cancellation here either.
             raise
+
+        except CallerDisconnected:
+            # The caller left before any response was prepared, so a 499 can still
+            # be sent.
+            log.warning("Client disconnected before response headers: %s", scrubbed_target_url)
+            record_llm_client_disconnect()
+            return web.Response(status=499)
 
         except ClientError as ce:
             # Upstream is down or refused the connection: 503, the proxy itself is fine. Log scrubbed text only; a ClientError string can contain the URL and a credential. The client sees the exception class, not that text.
@@ -2105,6 +2196,10 @@ class AsyncHiveMindProxy:
                 return proxy_resp
             return web.json_response({"error": f"Proxy error: {type(e).__name__}"}, status=500,
                                       headers={"X-SM-Fault-Origin": "gateway"})
+
+        finally:
+            if calls is not None:
+                calls.end(token, completed=completed)
 
 
 # Daemon token helpers
@@ -4119,6 +4214,15 @@ async def _build_health_checks(proxy: "AsyncHiveMindProxy", coordinator) -> dict
         snapshotter = getattr(coordinator, "encoder_calls_snapshot", None)
         if snapshotter is not None:
             snapshot = snapshotter()
+            # Raw passthrough calls wait on the same encoders, so their figures
+            # join the coordinator's.
+            passthrough = getattr(proxy, "_passthrough_calls", {})
+            snapshot = {
+                name: combine_encoder_calls(
+                    snapshot[name],
+                    passthrough[name].snapshot() if name in passthrough else None)
+                for name in ("embedder", "reranker")
+            }
             # Only these observations belong here; they never determine health state.
             fields = ("outstanding_count", "oldest_outstanding_age_s",
                       "last_completed_at", "last_deadline_cancelled_at")

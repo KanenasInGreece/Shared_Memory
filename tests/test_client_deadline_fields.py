@@ -149,3 +149,31 @@ def test_save_http_timeout_uses_caller_deadline(bridge, http_layer):
     _, body, timeout = http_layer["post"][0]
     assert body["wait_s"] == 135
     assert timeout == body["wait_s"] + bridge.SEARCH_OVERHEAD_S == 150
+
+
+@pytest.mark.parametrize("projection, expected", [(40, 75), (80, 135), (1, 30), (400, 300)])
+def test_retrospective_sends_the_save_wait_and_a_timeout_above_it(bridge, http_layer, projection, expected):
+    http_layer["health"] = {"backend_capability": {"embedder": {"projected_full_payload_s": projection}}}
+    result = asyncio.run(bridge.save_retrospective_artifact(1, "validated", "notes", source="a"))
+    assert result["status"] == "success"
+    url, body, timeout = http_layer["post"][0]
+    assert url.endswith("/memory/retrospective")
+    assert body["wait_s"] == expected
+    assert timeout == expected + bridge.SEARCH_OVERHEAD_S
+    assert {"pg_id", "rating", "notes", "date", "agent_id"} <= set(body)
+
+
+@pytest.mark.parametrize("embedder", [None, {}, "invalid", {"projected_full_payload_s": "bad"},
+                                      {"projected_full_payload_s": 0}, {"projected_full_payload_s": -1}])
+def test_retrospective_omits_deadline_without_embedder_projection(bridge, http_layer, embedder):
+    http_layer["health"] = {"backend_capability": {"embedder": embedder}}
+    asyncio.run(bridge.save_retrospective_artifact(1, "validated", "notes", source="a"))
+    _, body, timeout = http_layer["post"][0]
+    assert timeout == 60.0
+    assert "wait_s" not in body
+
+
+def test_retrospective_invalid_rating_makes_no_network_call(bridge, http_layer):
+    result = asyncio.run(bridge.save_retrospective_artifact(1, "great", "notes"))
+    assert result["status"] == "error"
+    assert http_layer["post"] == [] and http_layer["get"] == []

@@ -125,6 +125,8 @@ def test_keepalive_options(gateway, monkeypatch):
     names = ['ENCODER_TCP_KEEPALIVE_IDLE_S', 'ENCODER_TCP_KEEPALIVE_INTERVAL_S', 'ENCODER_TCP_KEEPALIVE_COUNT']
     for name in names:
         monkeypatch.delenv(name, raising=False)
+    c._keepalive_warned.clear()
+    c._keepalive_accepted.clear()
     expected = [(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1),
                 (socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 60),
                 (socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 15),
@@ -228,6 +230,8 @@ def test_invalid_keepalive_uses_defaults_and_warns_once(gateway, monkeypatch, ca
              'ENCODER_TCP_KEEPALIVE_COUNT']
     for name in names:
         monkeypatch.delenv(name, raising=False)
+    c._keepalive_warned.clear()
+    c._keepalive_accepted.clear()
     defaults = c.encoder_keepalive_options()
     for name in names:
         monkeypatch.setenv(name, value)
@@ -299,3 +303,152 @@ def test_window_probe_hang_marks_projection_stale(gateway, monkeypatch, backend)
         assert calls.snapshot()['last_completed_at'] is None
 
     asyncio.run(scenario())
+
+
+# A value the platform's setsockopt rejects falls back at parse time like a
+# non-integer one.
+KEEPALIVE_SETTINGS = [
+    ('ENCODER_TCP_KEEPALIVE_IDLE_S', 'TCP_KEEPIDLE', 60),
+    ('ENCODER_TCP_KEEPALIVE_INTERVAL_S', 'TCP_KEEPINTVL', 15),
+    ('ENCODER_TCP_KEEPALIVE_COUNT', 'TCP_KEEPCNT', 4),
+]
+
+
+# List candidate inputs only; whether each is accepted is measured on the
+# running machine, never assumed.
+KEEPALIVE_VALUES = [10 ** 12, 2 ** 31, 40000, 32767, 128, 127]
+
+
+def _reset_keepalive(c, monkeypatch):
+    for name, _, _ in KEEPALIVE_SETTINGS:
+        monkeypatch.delenv(name, raising=False)
+    c._keepalive_warned.clear()
+    c._keepalive_accepted.clear()
+
+
+def _platform_accepts(attr, value):
+    """Measure the real acceptance on this machine; never assume a literal ceiling."""
+    probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        probe.setsockopt(socket.IPPROTO_TCP, getattr(socket, attr), value)
+        return True
+    except (OSError, TypeError, OverflowError):
+        return False
+    finally:
+        probe.close()
+
+
+@pytest.mark.parametrize('env, attr, default', KEEPALIVE_SETTINGS)
+@pytest.mark.parametrize('value', KEEPALIVE_VALUES)
+def test_value_the_platform_rejects_falls_back_and_accepted_one_is_kept(
+        gateway, monkeypatch, caplog, env, attr, default, value):
+    import coordinator as c
+    _reset_keepalive(c, monkeypatch)
+    monkeypatch.setenv(env, str(value))
+    accepted = _platform_accepts(attr, value)
+    row = [r for r in c.encoder_keepalive_options() if r[1] == getattr(socket, attr)]
+    assert row == [(socket.IPPROTO_TCP, getattr(socket, attr), value if accepted else default)]
+    for _ in range(3):
+        c.encoder_keepalive_options()
+    warnings = [r.getMessage() for r in caplog.records if env in r.getMessage()]
+    assert len(warnings) == (0 if accepted else 1)
+    if not accepted:
+        assert str(value) in warnings[0] and 'rejected' in warnings[0]
+
+
+def test_the_measurement_is_not_vacuous_on_this_platform(gateway):
+    """The parametrised test above must see both an accepted and a rejected value."""
+    outcomes = [_platform_accepts(attr, value)
+                for _, attr, _ in KEEPALIVE_SETTINGS for value in KEEPALIVE_VALUES]
+    assert any(outcomes), 'the platform accepted none of the probe values'
+    if all(outcomes):
+        pytest.skip('this platform has no ceiling on these options')
+
+
+class _ProbeSocket:
+    made = []
+
+    def __init__(self, *args, accept=True, exc=OSError('rejected'), **kwargs):
+        self.accept, self.exc, self.closed, self.options = accept, exc, False, []
+        _ProbeSocket.made.append(self)
+
+    def setsockopt(self, *args):
+        self.options.append(args)
+        if not self.accept:
+            raise self.exc
+
+    def close(self):
+        self.closed = True
+
+
+def _use_probe_sockets(monkeypatch, c, **kwargs):
+    _ProbeSocket.made = []
+    monkeypatch.setattr(c.socket, 'socket', lambda *a, **kw: _ProbeSocket(*a, **kwargs))
+
+
+def test_the_check_is_memoised_per_setting_and_value(gateway, monkeypatch):
+    import coordinator as c
+    _reset_keepalive(c, monkeypatch)
+    monkeypatch.setenv('ENCODER_TCP_KEEPALIVE_IDLE_S', '77')
+    _use_probe_sockets(monkeypatch, c)
+    for _ in range(5):
+        c.encoder_keepalive_options()
+    assert len(_ProbeSocket.made) == 1
+    monkeypatch.setenv('ENCODER_TCP_KEEPALIVE_IDLE_S', '78')
+    c.encoder_keepalive_options()
+    assert len(_ProbeSocket.made) == 2
+
+
+@pytest.mark.parametrize('accept, exc', [(True, None), (False, OSError('no')),
+                                         (False, TypeError('no')), (False, OverflowError('no'))])
+def test_the_throwaway_socket_is_always_closed_and_any_rejection_means_default(
+        gateway, monkeypatch, accept, exc):
+    import coordinator as c
+    _reset_keepalive(c, monkeypatch)
+    monkeypatch.setenv('ENCODER_TCP_KEEPALIVE_COUNT', '9')
+    _use_probe_sockets(monkeypatch, c, accept=accept, exc=exc)
+    row = [r for r in c.encoder_keepalive_options() if r[1] == socket.TCP_KEEPCNT]
+    assert row[0][2] == (9 if accept else 4)
+    assert len(_ProbeSocket.made) == 1 and _ProbeSocket.made[0].closed
+
+
+def test_a_throwaway_socket_that_cannot_be_made_keeps_the_value_and_is_not_remembered(
+        gateway, monkeypatch, caplog):
+    import coordinator as c
+    _reset_keepalive(c, monkeypatch)
+    monkeypatch.setenv('ENCODER_TCP_KEEPALIVE_INTERVAL_S', '33')
+    real = socket.socket
+
+    def refuse(*args, **kwargs):
+        raise OSError('no descriptors')
+
+    monkeypatch.setattr(c.socket, 'socket', refuse)
+    row = [r for r in c.encoder_keepalive_options() if r[1] == socket.TCP_KEEPINTVL]
+    assert row[0][2] == 33
+    assert not [r for r in caplog.records if 'ENCODER_TCP_KEEPALIVE_INTERVAL_S' in r.getMessage()]
+    assert not c._keepalive_accepted
+    monkeypatch.setattr(c.socket, 'socket', real)
+    monkeypatch.setenv('ENCODER_TCP_KEEPALIVE_INTERVAL_S', str(10 ** 12))
+    assert [r for r in c.encoder_keepalive_options() if r[1] == socket.TCP_KEEPINTVL][0][2] == 15
+
+
+def test_a_missing_platform_option_runs_no_check_and_remembers_nothing(gateway, monkeypatch):
+    import coordinator as c
+    _reset_keepalive(c, monkeypatch)
+    monkeypatch.setenv('ENCODER_TCP_KEEPALIVE_IDLE_S', str(10 ** 12))
+    idle_option = socket.TCP_KEEPIDLE
+    monkeypatch.delattr(socket, 'TCP_KEEPIDLE')
+    _use_probe_sockets(monkeypatch, c, accept=False)
+    rows = c.encoder_keepalive_options()
+    assert len(rows) == 3 and all(row[1] != idle_option for row in rows)
+    assert not [s for s in _ProbeSocket.made if s.options]
+    assert not c._keepalive_accepted
+
+
+def test_the_defaults_are_never_checked_even_when_the_platform_would_reject_them(
+        gateway, monkeypatch, caplog):
+    import coordinator as c
+    _reset_keepalive(c, monkeypatch)
+    _use_probe_sockets(monkeypatch, c, accept=False)
+    assert [r[2] for r in c.encoder_keepalive_options()] == [1, 60, 15, 4]
+    assert not _ProbeSocket.made and not caplog.records

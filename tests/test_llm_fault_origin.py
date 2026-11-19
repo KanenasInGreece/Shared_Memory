@@ -39,6 +39,7 @@ from aiohttp import web  # noqa: E402
 
 
 from yarl import URL  # noqa: E402
+from tests.test_await_encoder import Transport as _LiveTransport
 
 
 class _ReqBodyStream:
@@ -297,6 +298,7 @@ def test_embedding_400_attaches_overflow_without_provider_text(monkeypatch):
     importlib.reload(g)
 
     class _EmbedReq:
+        transport = _LiveTransport()  # a live connection; production sets None once it is lost
         method = "POST"
         path = "/v1/embeddings"
         rel_url = URL("/v1/embeddings", encoded=True)
@@ -339,6 +341,7 @@ def test_reranking_400_has_no_overflow_key(monkeypatch):
     importlib.reload(g)
 
     class _RerankReq:
+        transport = _LiveTransport()  # a live connection; production sets None once it is lost
         method = "POST"
         path = "/v1/reranking"
         rel_url = URL("/v1/reranking", encoded=True)
@@ -376,6 +379,7 @@ def test_embedding_route_fault_also_gets_upstream_origin_header(monkeypatch):
     importlib.reload(g)
 
     class _EmbedReq:
+        transport = _LiveTransport()  # a live connection; production sets None once it is lost
         method = "POST"
         path = "/v1/embeddings"           # its own registered route -> handle_encoder
         rel_url = URL("/v1/embeddings", encoded=True)
