@@ -11,14 +11,22 @@ unit) — this module deliberately does NOT rotate, so the two never fight over
 the same file. The writers open-append-close per line (no persistent handle),
 so logrotate ``create`` mode is clean: the next write reopens the fresh file.
 
+It also holds the journal filter for Neo4j driver notifications
+(``install_notification_filter``). Three entry points install it once at
+start, beside their httpx log level: ``hive_mind_proxy`` (the gateway; the
+coordinator runs in that process), ``rem_loop`` and ``consolidation_loop``.
+
 Thin-client note: ``memory_bridge.py`` / ``vector-skill.py`` ship alone and do
 NOT import this; they set 0600 inline and their per-tool logs are rotated by
 ``consolidation_loop.merge_logs()``. This module is server-side only
-(coordinator, rem_loop).
+(the gateway and its coordinator, rem_loop, consolidation_loop, and the
+server-side helpers dream_telemetry and check_config).
 """
 from __future__ import annotations
 
+import ast
 import asyncio
+import logging
 import os
 import re
 import urllib.parse
@@ -252,3 +260,121 @@ def scrub_url_credentials(text: str) -> str:
         except Exception:
             return "<url-redacted>"
     return _URL_RE.sub(_scrub, text)
+
+
+# ── Neo4j notification filter ────────────────────────────────────────────────
+#
+# The Neo4j driver logs every server notification on one logger. The readiness
+# and walk queries name properties and relationship types that a healthy graph
+# can lack, so the server answers each run with a "does not exist" notice and
+# the journal fills with them (fact:3775: optional properties and relations in
+# recurring Cypher queries produce tens of thousands of 01N51/01N52 notices a
+# day across the gateway, REM and NREM journals). This filter drops ONLY those
+# notices, for the names below. Every other notice still reaches the journal:
+# a DEPRECATION, or an absent name not listed here (a misspelt label, type or
+# property).
+
+NOTIFICATION_LOGGER = "neo4j.notifications"
+
+# Property keys a graph can lack. rem_loop.py sets both, and only when REM
+# marks a node invalid, so a graph with no invalid node has neither.
+EXPECTED_ABSENT_PROPERTIES = frozenset({
+    "rem_invalid",
+    "rem_invalid_reason",
+})
+
+# Relationship types a graph can lack.
+EXPECTED_ABSENT_RELATIONSHIPS = frozenset({
+    # These three exist only once a decision is saved with the matching
+    # grounding role word (ontology.GROUNDING_ROLES maps role word to relation).
+    "CONSIDERED",
+    "REJECTED",
+    "UNDER_CONDITIONS",
+    # coordinator.py queries ALIASES, but no writer creates it, so it is absent
+    # on every graph. Remove ALIASES from this set once a writer creates the
+    # relationship or the query drops it.
+    "ALIASES",
+})
+
+# A name leaves its set when a writer guarantees it on every graph. ⛔ These sets
+# are NOT a configuration knob: no env variable, no timer, no limit
+# (decision:3101: a timer or fixed limit enters only once shown needed and no
+# limit-free design works).
+
+# The driver (neo4j 6.2.0, neo4j/_async/work/result.py, _handle_warnings) logs
+# each notice as
+#     log_call("Received notification from DBMS server: %s",
+#              NotificationPrinter(notification, query, one_line=True))
+# at a level set by the notice's severity, and the printer renders
+#     <GqlStatusObject gql_status='…', status_description='…', position=…,
+#      raw_classification='…', …> for query: '…'
+# ⛔ The message is formatted lazily: read record.getMessage(), never
+# record.msg, which is only the template and would keep every notice.
+# The pattern is anchored at the start of the message, so it reads the notice's
+# own fields and never the query text that follows them.
+_NOTICE_RE = re.compile(
+    r"Received notification from DBMS server: <GqlStatusObject "
+    r"gql_status='(?P<gql_status>[^'\\]*)', "
+    r"""status_description=(?P<description>'(?:[^'\\]|\\.)*'|"(?:[^"\\]|\\.)*"), """
+    r"position=(?:None|<SummaryInputPosition [^<>]*>), "
+    r"raw_classification='(?P<raw_classification>[^'\\]*)', "
+)
+
+# One row per kind: its GQL status, the description that status carries, and
+# the set its names are checked against. A name is only checked in its own kind.
+_ABSENT_NAME_KINDS = (
+    ("01N52",
+     re.compile(r"warn: property key does not exist\. "
+                r"The property `(?P<name>[^`]+)` does not exist\."
+                r"(?: Verify that the spelling is correct\.)?"),
+     EXPECTED_ABSENT_PROPERTIES),
+    ("01N51",
+     re.compile(r"warn: relationship type does not exist\. "
+                r"The relationship type `(?P<name>[^`]+)` does not exist\."
+                r"(?: Verify that the spelling is correct\.)?"),
+     EXPECTED_ABSENT_RELATIONSHIPS),
+)
+
+
+def _is_expected_absent_name(message: str) -> bool:
+    """True only for an UNRECOGNIZED absent-name notice naming an expected name of its own kind."""
+    head = _NOTICE_RE.match(message)
+    if head is None or head.group("raw_classification") != "UNRECOGNIZED":
+        return False
+    description = ast.literal_eval(head.group("description"))
+    for gql_status, description_re, expected in _ABSENT_NAME_KINDS:
+        if head.group("gql_status") == gql_status:
+            found = description_re.fullmatch(description)
+            return found is not None and found.group("name") in expected
+    return False
+
+
+class NotificationFilter(logging.Filter):
+    """Drop the driver's notices for expected-absent names and keep every other record.
+
+    Fails open: a record that does not parse, or any exception, is kept.
+    """
+
+    # Marks the filter this module owns: a second install adds none, and other
+    # filters on the same logger are left alone.
+    shared_memory_owned = True
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            return not _is_expected_absent_name(record.getMessage())
+        except Exception:
+            return True
+
+
+def install_notification_filter() -> NotificationFilter:
+    """Attach the notification filter to the driver's notification logger, once.
+
+    A second call adds nothing and returns the filter already attached.
+    """
+    target = logging.getLogger(NOTIFICATION_LOGGER)
+    for existing in target.filters:
+        if getattr(existing, "shared_memory_owned", False):
+            return existing
+    owned = NotificationFilter()
+    target.addFilter(owned)
+    return owned

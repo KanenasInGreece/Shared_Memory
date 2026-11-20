@@ -32,7 +32,7 @@ from secure_env import (  # noqa: E402
     _bearer_transport_ok, encoder_auth_headers, encoder_auth_kwargs,
     encoder_key_configured, encoder_key_refused,
 )
-from log_hygiene import append_secure, secure_path, scrub_url_credentials, FILE_MODE  # noqa: E402
+from log_hygiene import append_secure, install_notification_filter, secure_path, scrub_url_credentials, FILE_MODE  # noqa: E402
 from framework_defaults import FRAMEWORK_DEFAULTS  # noqa: E402
 # Use effective_role, not a bare _AGENT_ROLES lookup: that misses read_only_agents() and would call a confined identity write-capable.
 from agent_roles import effective_role  # noqa: E402
@@ -107,6 +107,7 @@ logging.basicConfig(
 )
 # coordinator imports httpx and runs in this process. WARNING hides per-request chatter; a real client failure still logs. The aiohttp access log stays the per-request record.
 logging.getLogger("httpx").setLevel(logging.WARNING)
+install_notification_filter()  # drops Neo4j notices for names a graph may lack; every other notice still logs
 log = logging.getLogger("hive-proxy")
 
 # Watchdog configuration
