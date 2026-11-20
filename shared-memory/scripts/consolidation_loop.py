@@ -31,6 +31,7 @@ from nrem_gate import eligible_domain_level_clusters, project_domain_maps, groun
 from nrem_gate import count_domain_level_cycles  # noqa: F401 — re-exported from nrem_gate; importing this file pulls psycopg2, which telemetry does not ship
 from domain_axis import resolve_domains
 from pool_status import pool_roster_state
+from log_hygiene import install_notification_filter
 from dream_telemetry import (record_llm_call,
                              EMBED_MAX_CHARS, EMBED_MAX_CONTEXT_TOKENS)
 import llm_backlog
@@ -668,6 +669,7 @@ def _routing_refusal(resp) -> dict | None:
 logging.basicConfig(level=logging.INFO)
 # This process's root logger is INFO, which would journal every httpx call. WARNING keeps real client failures.
 logging.getLogger("httpx").setLevel(logging.WARNING)
+install_notification_filter()  # drops Neo4j notices for names a graph may lack; every other notice still logs
 logger = logging.getLogger("ConsolidationDaemon")
 
 

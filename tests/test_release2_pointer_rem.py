@@ -550,7 +550,7 @@ def test_inv4_readiness_cypher_is_outgoing_and_not_the_stored_flag():
     assert "blocking_ids" in q
     assert "spine_nodes" in q
     assert "b.pg_id IS NOT NULL" in q
-    assert "CALL {" in q
+    assert "CALL (pid) {" in q
     assert "UNION" in q
     assert "MATCH (s:Fact {pg_id: pid})" in q
     assert "MATCH (s:Decision {pg_id: pid})" in q

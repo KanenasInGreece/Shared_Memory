@@ -190,17 +190,13 @@ def decision_readiness_cypher() -> str:
     fact, decision, retro = ONT.fact, ONT.decision, ONT.retrospective
     return (
         "UNWIND $ids AS pid "
-        "CALL { "
-        "WITH pid "
+        "CALL (pid) { "
         f"MATCH (s:{fact} {{pg_id: pid}}) RETURN s "
         "UNION "
-        "WITH pid "
         f"MATCH (s:{decision} {{pg_id: pid}}) RETURN s "
         "UNION "
-        "WITH pid "
         f"MATCH (s:{retro} {{pg_id: pid}}) RETURN s "
         "UNION "
-        "WITH pid "
         "RETURN null AS s "
         "} "
         "WITH pid, count(s) AS spine_nodes, "

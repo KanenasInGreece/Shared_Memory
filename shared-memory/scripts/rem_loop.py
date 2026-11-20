@@ -26,7 +26,7 @@ from ontology import ONT, RETRO_RATINGS, fact_kind_from_source_ref
 from record_ref import doc_record_type
 from rem_contract import REM_PROMPT_VERSION
 from pool_status import pool_roster_state
-from log_hygiene import append_secure, scrub_url_credentials
+from log_hygiene import append_secure, install_notification_filter, scrub_url_credentials
 from dream_telemetry import (
     record_llm_call, call_timing_summary,
 )
@@ -317,6 +317,7 @@ LLM_FAIL_ROUTING_REFUSED = "routing_refused"   # gateway left the item queued, o
 logging.basicConfig(level=logging.INFO)
 # httpx on this process's root logger would journal every request at INFO; WARNING keeps real client failures.
 logging.getLogger("httpx").setLevel(logging.WARNING)
+install_notification_filter()  # drops Neo4j notices for names a graph may lack; every other notice still logs
 logger = logging.getLogger("REMDaemon")
 
 
