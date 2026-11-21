@@ -11,6 +11,9 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - The decision readiness query used a `CALL { WITH pid … }` subquery, which Neo4j 5.26 reports as deprecated, so every run of it by the gateway or the NREM daemon put a deprecation notice in the journal. The query now uses the scoped form `CALL (pid) { … }`. It returns the same rows; only the deprecation notice disappears.
 - The gateway, REM and NREM journals carried tens of thousands of Neo4j "does not exist" notices a day, so a real warning was hard to find. They came from six names a healthy graph can lack: the properties `rem_invalid` and `rem_invalid_reason`, and the relationship types `CONSIDERED`, `REJECTED`, `UNDER_CONDITIONS` and `ALIASES`. A log filter in the three processes now drops those notices and nothing else. Any other notice still appears, including a deprecation and a "does not exist" notice for a misspelt or unexpected name. No query result changes, and `/health` and `/memory/telemetry` are unchanged.
 
+### Changed
+- Comments and documents now say what the code does, with no behaviour change. In `shared-memory/.env.example` they say who reads each setting and from where, which lines have no effect when written in the framework `.env`, and that the backup values must be uncommented as bare values. The same kind of correction is made to comments in `hive_mind_proxy.py`, `coordinator.py` and `postflight.sh`, to `shared-memory/Documentation/server-setup.md` and `shared-memory/Documentation/postflight.md`, and to the wording pinned by `tests/test_server_setup_doc_matches_the_shipped_scripts.py`.
+
 ## [1.2.5] - 2026-11-19
 
 This release changes no API: `API_VERSION` stays 7. It removes one key from the `/pool/status` response, described under Changed.

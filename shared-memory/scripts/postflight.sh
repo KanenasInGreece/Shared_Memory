@@ -471,9 +471,9 @@ else
             bad A4 "neo4j_outbox row for pg_id $pg_id is '${obst:-<none>}' after 30s — worker mid-backoff (transient store trouble re-queues with exponential backoff) or not running; check /health failed_age and the gateway journal before concluding"
         fi
 
-        # (c) The :Fact node exists in Neo4j. Password read with grep/cut
-        # (never source) and passed via the environment, never argv
-        # (same idiom as init_db.sh).
+        # (c) The :Fact node exists in Neo4j. Password read through
+        # read_env_key.py (never source) and passed via the environment,
+        # never argv (same idiom as init_db.sh).
         NEO4J_PASSWORD="$(read_env NEO4J_PASSWORD)"
         if [[ -z "$NEO4J_PASSWORD" ]]; then
             bad A4 "NEO4J_PASSWORD not found in $ENV_FILE — cannot verify the graph mirror"

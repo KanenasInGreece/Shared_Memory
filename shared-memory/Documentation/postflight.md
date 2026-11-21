@@ -24,10 +24,11 @@ bash shared-memory/scripts/postflight.sh
   right after an update. A recorded status outside 2xx warns with that status and does not fail
   A8. A telemetry read that is not HTTP 200, or a body that is not JSON, names that failure
   instead of saying the chat was not exercised. Exit 0 does not mean a completion was posted.
-- **Configuration:** `GATEWAY_URL` (default `http://localhost:8888`), `AGENT_TOKEN` (environment
-  only), `PG_CONTAINER`/`NEO4J_CONTAINER`/`PG_DB` (defaults `postgres-vector`/`neo4j-memory`/
-  `agent_data`, as in `init_db.sh`). `shared-memory/.env` is read key-by-key (grep/cut), never
-  sourced.
+- **Configuration:** `GATEWAY_URL` (default `http://localhost:8888`), `AGENT_TOKEN`,
+  `PG_CONTAINER`/`NEO4J_CONTAINER`/`PG_DB` (defaults `postgres-vector`/`neo4j-memory`/
+  `agent_data`, as in `init_db.sh`) — all five come from the shell environment only.
+  From `shared-memory/.env` it reads just `AGENT_TOKENS` and `NEO4J_PASSWORD`, key by
+  key through `read_env_key.py`, never sourced.
 - **Timeouts are generous by design:** saves can take over 60 s on small hosts (measured on a
   2-core machine), so save/search invocations get client timeouts of at least 180 s. Slowness is
   A6's business — it is never a failure of A4/A5.
@@ -130,8 +131,9 @@ with `AGENT_TOKEN` exported), then verify it in the stores:
 - **(b) Outbox drained** — the `neo4j_outbox` row for that `pg_id` reaches status `'applied'`
   (polled briefly — the worker drains within seconds).
 - **(c) Graph mirror exists** — the `:Fact` node with that `pg_id` exists in Neo4j
-  (`cypher-shell` inside `neo4j-memory`; `NEO4J_PASSWORD` read from `shared-memory/.env` with
-  grep/cut, never by sourcing the file, and passed via the environment, never argv).
+  (`cypher-shell` inside `neo4j-memory`; `NEO4J_PASSWORD` read from `shared-memory/.env`
+  through `read_env_key.py`, never by sourcing the file, and passed via the environment,
+  never argv).
 
 **Pass criterion.** Save returns `success` with a `pg_id`; (a) returns exactly `1024`; (b) reaches
 `applied`; (c) counts exactly one node.

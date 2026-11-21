@@ -66,11 +66,13 @@ bash shared-memory/scripts/install_framework.sh
 #    answer generates a strong value inside the script (never displayed,
 #    never logged); when an existing .env is being overwritten it re-prompts
 #    instead, because the databases already hold the old one.
-#    TAVILY_API_KEY is real but is NOT prompted for: it is edited into
-#    shared-memory/.env afterwards, and only if you use the web-search MCP.
-#    Same for the optional knobs — MEMORY_LOG_LEVEL, AUDIT_LOG_PATH,
-#    PROXY_BIND, WRITE_QUIESCE_SEC are template lines you uncomment, not
-#    questions the installer asks.
+#    TAVILY_API_KEY is real but is NOT prompted for: it goes in the
+#    tavily-mcp env block of mcp/mcp.json, and only if you use the web-search
+#    MCP. No framework process uses it from shared-memory/.env.
+#    Same for the optional knobs — AUDIT_LOG_PATH, PROXY_BIND,
+#    WRITE_QUIESCE_SEC are template lines you set by hand, not questions the
+#    installer asks. MEMORY_LOG_LEVEL is a client setting read only by
+#    memory_bridge.py and the MCP server.
 
 # 3. Start the database + inference layer.
 docker compose -f shared-memory/ops/postgres_neo4j_limits.yaml --env-file shared-memory/.env up -d
@@ -250,6 +252,12 @@ is out of scope for what this document walks you through:
    `PG_PASSWORD_FILE=/run/secrets/pg_password` in `shared-memory/.env`, or
    export it directly. Works with any secret store that can hand you a file
    (`pass`, a mounted Docker/Kubernetes secret, a vault-agent template).
+   Only programs that load the file through `secure_env.py`'s
+   `load_split_env` resolve tier 1 and `<KEY>_FILE`: the gateway, both
+   daemons and the maintenance scripts that call it. `init_db.sh`,
+   `preflight.sh`, `postflight.sh`, `ops/backup.sh`, `ops/restore.sh`, the
+   `migrations/` scripts and the compose file read only the plaintext
+   `PG_PASSWORD` and `NEO4J_PASSWORD`.
 3. **The plaintext `.env` value** — the default tier above, always the
    fallback.
 

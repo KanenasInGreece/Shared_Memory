@@ -407,7 +407,8 @@ _llm_latency_max_s: dict[str, float] = {b: 0.0 for b in LLM_BACKENDS}
 _llm_latency_last_ts: dict[str, "str | None"] = {b: None for b in LLM_BACKENDS}
 # In-memory only. Null until a chat response status is known; a refusal before the upstream call does not write it.
 _llm_last_call: dict[str, dict] = {b: {"ts": None, "status": None, "origin": None} for b in LLM_BACKENDS}
-# LLM_USAGE_CAPTURE_CAP_BYTES bounds compressed bytes accumulated for a trailing usage parse; over the cap, capture is abandoned.
+# A compressed chat reply body larger than LLM_USAGE_CAPTURE_CAP_BYTES is not decompressed: the LLM walk empties it, and a 2xx is backlogged as unparseable.
+# The whole body is read before that comparison, so the cap limits what is decompressed, not what is read.
 LLM_USAGE_CAPTURE_CAP_BYTES = int(os.environ.get("LLM_USAGE_CAPTURE_CAP_BYTES", str(2 * 1024 * 1024)))
 # In-process reservation set, not env or user config. Selection holds these backends out of the ordinary pool while another eligible one exists.
 _llm_reserved: set[str] = set()
@@ -1387,8 +1388,8 @@ class AsyncHiveMindProxy:
     async def start_session(self) -> None:
         connector = TCPConnector(
             socket_factory=_encoder_socket_factory,
-            limit=200,                  # total concurrent connections across all upstreams
-            limit_per_host=80,          # prevents embedding bursts from starving LLM backend
+            limit=200,                  # total concurrent connections on this session (encoder traffic and backend probes)
+            limit_per_host=80,          # per upstream host; unmeasured. Chat calls use llm_session, not this pool
             ttl_dns_cache=300,
         )
         # Encoders keep connect=5s. total=None never cuts a generation.
@@ -1402,7 +1403,9 @@ class AsyncHiveMindProxy:
             trust_env=False,
         )
         # The LLM walk opens a fresh connection per call so a stale pooled socket cannot
-        # look like a lost connection. No connect limit: the operating system decides.
+        # look like a lost connection. No connect timeout (ClientTimeout(total=None)): the
+        # operating system decides. No connection limit is passed either, so aiohttp's
+        # default cap of 100 open connections applies to all backends together.
         self.llm_session = ClientSession(
             connector=TCPConnector(force_close=True),
             timeout=ClientTimeout(total=None),
