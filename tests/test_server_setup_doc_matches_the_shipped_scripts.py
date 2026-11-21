@@ -15,8 +15,8 @@ types on a fresh host.
   2. THE PROMPT LIST promised prompts for `TAVILY_API_KEY` and four
      "optional" keys the installer has never asked for. It asks for paths,
      two encoder devices, a render gid and the two database passwords.
-     `TAVILY_API_KEY` is real -- five files read it -- but it is edited into
-     `shared-memory/.env` afterwards.
+     `TAVILY_API_KEY` is real, but tavily-mcp reads it from the env block of
+     `mcp/mcp.json`; no framework process uses it from `shared-memory/.env`.
   3. THE REMOTE-TOKEN RECOVERY named `generate_tokens.py --reveal`.
      `bootstrap_tokens.sh` is the shipped entry point, and `--reveal` prints a
      LIVE token, so the line must also say it is an operator-only step:
@@ -73,8 +73,19 @@ def test_the_installer_prompt_list_matches_what_the_script_asks():
     )
     assert re.search(r"TAVILY_API_KEY is real but is NOT prompted", after), (
         "the corrected prompt list must still say TAVILY_API_KEY is a real "
-        "variable (five files read it), edited in afterwards — dropping it "
+        "variable (tavily-mcp reads it from mcp/mcp.json) — dropping it "
         "entirely would trade one wrong statement for a missing one"
+    )
+    flat = re.sub(r"\s*\n#\s*", " ", after)
+    assert re.search(
+        r"TAVILY_API_KEY is real but is NOT prompted for: it goes in the "
+        r"tavily-mcp env block of mcp/mcp\.json", flat), (
+        "the prompt list must send TAVILY_API_KEY to the tavily-mcp env block "
+        "of mcp/mcp.json; no framework process uses it from shared-memory/.env"
+    )
+    assert not re.search(r"TAVILY_API_KEY[^.]*edited into", flat), (
+        "the prompt list tells the operator to edit TAVILY_API_KEY into "
+        "shared-memory/.env again, where no framework process uses it"
     )
     for asked in ("password", "device"):
         assert asked in after.lower(), (

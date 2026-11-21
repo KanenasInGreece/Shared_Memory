@@ -1570,6 +1570,7 @@ def _decompress_prefix_for_parse(body: bytes, content_encoding: str | None) -> b
 
 
 # Decompressed-output cap for usage capture. Measured gzip is about 2.9:1, so 32× the 2 MiB compressed cap stays above real bodies and cuts the measured 1028:1 worst case.
+# gzip and deflate stop one byte past it; br is inflated in full and only then measured, so for br it refuses the body without bounding memory.
 LLM_USAGE_DECOMPRESS_CAP_BYTES = int(os.environ.get(
     "LLM_USAGE_DECOMPRESS_CAP_BYTES", str(64 * 1024 * 1024)))
 
@@ -1580,10 +1581,12 @@ def _decompress_full_for_usage(body: bytes, content_encoding: str) -> bytes:
     fault-body prefix `_decompress_prefix_for_parse` above peeks at. Supports
     exactly the same encodings as that function (see
     SUPPORTED_CONTENT_ENCODINGS — gzip/deflate/br, no new encodings added).
-    LLM_USAGE_CAPTURE_CAP_BYTES bounds the COMPRESSED bytes the caller
-    accumulates; LLM_USAGE_DECOMPRESS_CAP_BYTES bounds what this function
-    will inflate them to (gzip/deflate never allocate past it; br is checked
-    after the fact, matching the prefix helper's own unbounded br call).
+    LLM_USAGE_CAPTURE_CAP_BYTES is the largest COMPRESSED body the caller
+    passes in; LLM_USAGE_DECOMPRESS_CAP_BYTES bounds what this function
+    will inflate it to (gzip/deflate stop at cap + 1 bytes, so an over-cap
+    body is caught by the length check below without inflating further; br
+    inflates in full and is checked after the fact, matching the prefix
+    helper's own unbounded br call).
 
     Unlike `_decompress_prefix_for_parse`, this RAISES on any failure
     (unsupported encoding, corrupt/truncated body, over-cap decompressed
@@ -6595,7 +6598,7 @@ class MemoryCoordinator:
         itself REFUSES the insert outright (`asyncpg.RaiseError`, migration
         033's `entity_vocabulary_before_write` trigger). The only such RAISE
         reachable from this gate fires when NAME normalizes to the empty
-        string: `MIN_ENTITY_NAME_LEN` is 2, so a two-character
+        string: `MIN_ENTITY_NAME_LEN` defaults to 2, so a two-character
         punctuation/emoji name (`'!!'`, `'🔥🔥'`) survives
         `sanitize_entity_name` intact and can reach here. Before this fix that
         exception propagated uncaught past `auth_middleware` (which maps only
@@ -6629,7 +6632,7 @@ class MemoryCoordinator:
         must not drift. `axis_key` is the Python twin of migration 033's
         `entity_normalize()`, whose BEFORE-write trigger RAISEs on an empty
         key — so a two-character punctuation name (`'!!'`, `'🔥🔥'`) survives
-        `sanitize_entity_name` (MIN_ENTITY_NAME_LEN is 2), reaches the mint,
+        `sanitize_entity_name` (MIN_ENTITY_NAME_LEN defaults to 2), reaches the mint,
         and is refused by Postgres.
 
         ⛔ IT HAD TO MOVE EARLIER (v0.9.72, R1). The refusal used to fire
