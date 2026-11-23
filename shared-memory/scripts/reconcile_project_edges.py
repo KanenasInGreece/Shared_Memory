@@ -39,6 +39,14 @@ guard, which FAILS CLOSED.
 
 Dry-run by default. Idempotent: a re-run after the worker drains finds nothing.
 
+A Postgres that accepts the connection and never answers is waited for
+without a limit, and Ctrl-C does not stop that wait (kill the process
+instead; over ssh, on the remote host). To bound it, put
+PGCONNECT_TIMEOUT=<seconds> in front of the command, inside the remote
+command over ssh; the number is yours to choose (libpq treats 0 as no
+limit and raises 1 to 2, and applies the limit to each address a host
+name resolves to).
+
     python reconcile_project_edges.py                 # report only
     python reconcile_project_edges.py --apply         # enqueue
 """
@@ -89,10 +97,14 @@ PG_CONN = secure_env.pg_dsn(
 
 
 def gateway_version() -> tuple[str, tuple[int, ...] | None]:
-    """(raw, parsed) version of the RUNNING gateway; parsed is None whenever the
-    answer is not knowable — unreachable, refused, or unparseable."""
+    """(raw, parsed) version of the RUNNING gateway. parsed is None when the
+    gateway refuses the connection, cannot be reached, or reports a version
+    whose first three dot-separated parts are not whole numbers. A host that
+    never answers the connection attempt fails when the operating system gives
+    up. A gateway that accepts the connection and never answers is waited for
+    without a limit; in a terminal, Ctrl-C stops that wait."""
     try:
-        with urllib.request.urlopen(f"{GATEWAY_URL}/health", timeout=10) as r:
+        with urllib.request.urlopen(f"{GATEWAY_URL}/health") as r:
             raw = json.load(r).get("version", "")
     except Exception as exc:
         return f"unreachable ({exc})", None
@@ -193,7 +205,7 @@ def main() -> int:
         return 2
 
     driver = GraphDatabase.driver(NEO4J_URI, auth=NEO4J_AUTH)
-    conn = psycopg2.connect(PG_CONN, connect_timeout=5)
+    conn = psycopg2.connect(PG_CONN)
     try:
         graph = graph_project_edges(driver)
         pg = postgres_projects(conn)
@@ -227,6 +239,10 @@ def main() -> int:
             print("\nNothing to do.")
             return 0
 
+        # The read phase is finished and its facts are held in memory. The
+        # wait on the gateway has no limit, so the transaction must not stay
+        # open through it. The inserts below begin a new transaction.
+        conn.rollback()
         raw, parsed = gateway_version()
         if not gateway_replaces_project_edges(parsed):
             need = ".".join(str(p) for p in MIN_GATEWAY_VERSION)

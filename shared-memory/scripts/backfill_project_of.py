@@ -31,6 +31,14 @@ Dry-run by default. Idempotent: re-running enqueues nothing for facts that
 already have the edge, and skips any fact with a row already pending or
 in_progress (failed rows are excluded so a re-run enqueues a new repair).
 
+A Postgres that accepts the connection and never answers is waited for
+without a limit, and Ctrl-C does not stop that wait (kill the process
+instead; over ssh, on the remote host). To bound it, put
+PGCONNECT_TIMEOUT=<seconds> in front of the command, inside the remote
+command over ssh; the number is yours to choose (libpq treats 0 as no
+limit and raises 1 to 2, and applies the limit to each address a host
+name resolves to).
+
     python backfill_project_of.py                 # report only
     python backfill_project_of.py --apply         # enqueue
 """
@@ -50,10 +58,14 @@ GATEWAY_URL = os.environ.get("GATEWAY_URL", "http://localhost:8888")
 
 
 def gateway_version() -> tuple[str, tuple[int, ...] | None]:
-    """(raw, parsed) version of the RUNNING gateway. parsed is None whenever the
-    answer is not knowable — unreachable, refused, or unparseable."""
+    """(raw, parsed) version of the RUNNING gateway. parsed is None when the
+    gateway refuses the connection, cannot be reached, or reports a version
+    whose first three dot-separated parts are not whole numbers. A host that
+    never answers the connection attempt fails when the operating system gives
+    up. A gateway that accepts the connection and never answers is waited for
+    without a limit; in a terminal, Ctrl-C stops that wait."""
     try:
-        with urllib.request.urlopen(f"{GATEWAY_URL}/health", timeout=10) as r:
+        with urllib.request.urlopen(f"{GATEWAY_URL}/health") as r:
             raw = json.load(r).get("version", "")
     except Exception as exc:
         return f"unreachable ({exc})", None
@@ -149,7 +161,7 @@ def main() -> int:
         return 2
 
     driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASS))
-    conn = psycopg2.connect(PG_CONN, connect_timeout=5)
+    conn = psycopg2.connect(PG_CONN)
     try:
         ids, no_pg_id = edgeless_fact_pg_ids(driver)
         resolved = resolve(conn, ids)
@@ -181,6 +193,10 @@ def main() -> int:
             return 0
 
         # GUARD, not a courtesy — see the module docstring.
+        # The read phase is finished and its facts are held in memory. The
+        # wait on the gateway has no limit, so the transaction must not stay
+        # open through it. The inserts below begin a new transaction.
+        conn.rollback()
         raw, parsed = gateway_version()
         if not gateway_handles_project_of(parsed):
             need = ".".join(str(p) for p in MIN_GATEWAY_VERSION)

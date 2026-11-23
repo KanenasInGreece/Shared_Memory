@@ -324,6 +324,8 @@ export PATH="$HOME/.local/bin:$PATH"
 
 ⛔ `--reveal` is the opposite case: it refuses when stdout is not a terminal, and that is deliberate. Do not reach for the override to get it working over ssh — run it in your own terminal.
 
+Most one-time scripts set no time limit of their own (`backfill_domain_of.py` keeps its limits). ssh carries no environment from your shell, so write the bound on the remote command line: `ssh -t <host> 'PGCONNECT_TIMEOUT=<seconds> uv run … <script>'`. The variable bounds a Postgres connect only. Without `-t`, ssh gives the command no terminal, and Ctrl-C then ends only your local ssh while the script keeps running. With `-t`, Ctrl-C reaches the script and ends a wait on the gateway (press it twice for `backfill_promote_grounded.py`). Ctrl-C does not end a Postgres connect, so kill that process on the remote host.
+
 ## Uninstall
 
 **Capture these first when the level removes `shared-memory/.env`** — `data` and `all` both do, and it holds every credential this install has. Restoring a credentialed reasoning backend needs TWO lines and only the first is obvious (measured on a d9400 rebuild).

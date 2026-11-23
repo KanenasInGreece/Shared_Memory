@@ -95,8 +95,15 @@ SELECT f.id                                   AS pg_id,
 
 
 def gateway_version() -> tuple[str, tuple[int, ...] | None]:
+    """(raw, parsed) version of the RUNNING gateway. parsed is None when the
+    gateway refuses the connection, cannot be reached, or reports a version
+    whose first three dot-separated parts are not whole numbers. A host that
+    never answers the connection attempt fails when the operating system gives
+    up. A gateway that accepts the connection and never answers is waited for
+    without a limit; this script runs inside an event loop, so in a terminal
+    press Ctrl-C twice to stop that wait."""
     try:
-        with urllib.request.urlopen(f"{GATEWAY_URL}/health", timeout=10) as r:
+        with urllib.request.urlopen(f"{GATEWAY_URL}/health") as r:
             raw = json.load(r).get("version", "")
     except Exception as exc:
         return f"unreachable ({exc})", None

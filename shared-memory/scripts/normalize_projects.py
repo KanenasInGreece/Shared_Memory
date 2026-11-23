@@ -44,6 +44,14 @@ no inactive rows, so the block is latent; the resolution is registry identity (a
 surrogate key), where the mapping refers to the project rather than to the
 spelling it had that day, and neither re-pointing nor a veto arises at all.
 
+A Postgres that accepts the connection and never answers is waited for
+without a limit, and Ctrl-C does not stop that wait (kill the process
+instead; over ssh, on the remote host). To bound it, put
+PGCONNECT_TIMEOUT=<seconds> in front of the command, inside the remote
+command over ssh; the number is yours to choose (libpq treats 0 as no
+limit and raises 1 to 2, and applies the limit to each address a host
+name resolves to).
+
 Usage:
     uv run --with psycopg2-binary --with neo4j python \\
         shared-memory/scripts/normalize_projects.py \\
@@ -369,7 +377,7 @@ def main() -> int:
 
     # Connect to BOTH stores before writing to either. A rename whose graph half
     # cannot be reached should fail before the first commit, not after the last.
-    conn = psycopg2.connect(PG_CONN, connect_timeout=5)
+    conn = psycopg2.connect(PG_CONN)
     driver = GraphDatabase.driver(NEO4J_URI, auth=NEO4J_AUTH)
     committed, failed = [], []
     try:
