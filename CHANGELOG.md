@@ -7,6 +7,16 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.2.7] - 2026-11-23
+
+This release changes no API and no behaviour: `API_VERSION` stays 7. It adds one paragraph to the README.
+
+### Changed
+- The README section on databases now says that the one-time maintenance scripts wait without a limit (`backfill_promote_grounded.py` connects through asyncpg, which gives up after 60 seconds), that `backfill_domain_of.py` keeps its limits, how to bound a Postgres connect with `PGCONNECT_TIMEOUT=<seconds>` (inside the remote command over ssh), and that Ctrl-C does not stop a Postgres connect. This documents the change in 1.2.6.
+
+### Security
+- Security dependencies were reviewed; no pin moved. The detail is in `SECURITY.md`.
+
 ## [1.2.6] - 2026-11-23
 
 This release changes no API: `API_VERSION` stays 7. It ships two clean-ups merged since 1.2.5, a change to how long the one-time scripts wait, and two dependency pin moves.
