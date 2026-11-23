@@ -929,6 +929,18 @@ passing on the test hosts and the Main workstation ([§23](#23-testing)). The la
   the capacity history belong to the host, not the installation — and the checkout itself, whose
   removal is printed for you to run deliberately.
 
+Some upgrades also need a one-time maintenance script, which you run by hand from `shared-memory/scripts/`:
+`backfill_project_of.py`, `backfill_promote_grounded.py`, `normalize_projects.py`, `reconcile_project_edges.py`
+and `sync_project_registry.py`. The three that ask the gateway for its version (`backfill_project_of.py`,
+`backfill_promote_grounded.py`, `reconcile_project_edges.py`) wait for it without a limit, and all but
+`backfill_promote_grounded.py` wait for a Postgres connect without one, so a Postgres or gateway that accepts
+the connection and never answers is waited for until you stop it. To bound a Postgres connect, put
+`PGCONNECT_TIMEOUT=<seconds>` in front of the command; over ssh, write it inside the remote command.
+Ctrl-C does not stop a Postgres connect, so kill the process (over ssh, on the remote host).
+`backfill_promote_grounded.py` connects through asyncpg, which gives up after 60 seconds, and Ctrl-C pressed
+twice stops its gateway wait. `backfill_domain_of.py` keeps its limits (5 seconds for the Postgres connect,
+10 for the gateway check), because `update_framework.sh --domain-backfill` runs it unattended.
+
 Two verifiers prove what re-running files cannot — that a fresh install matches a live one, and
 that the graph constraints are actually in force:
 
