@@ -34,6 +34,14 @@ Configure the roots with PROJECT_ROOTS (os.pathsep-separated). There is no
 default: this deployment's layout is one valid configuration, not the
 configuration.
 
+A Postgres that accepts the connection and never answers is waited for
+without a limit, and Ctrl-C does not stop that wait (kill the process
+instead; over ssh, on the remote host). To bound it, put
+PGCONNECT_TIMEOUT=<seconds> in front of the command, inside the remote
+command over ssh; the number is yours to choose (libpq treats 0 as no
+limit and raises 1 to 2, and applies the limit to each address a host
+name resolves to).
+
     PROJECT_ROOTS=~/labs/projects python sync_project_registry.py
     PROJECT_ROOTS=~/labs/projects python sync_project_registry.py --apply
 """
@@ -273,7 +281,7 @@ def main() -> int:
         print("No project directories found under the given roots.", file=sys.stderr)
         return 2
 
-    conn = psycopg2.connect(PG_CONN, connect_timeout=5)
+    conn = psycopg2.connect(PG_CONN)
     try:
         with conn.cursor() as cur:
             cur.execute("SELECT name FROM projects")
